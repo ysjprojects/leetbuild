@@ -8,26 +8,24 @@ export const modelCallStep: Step = {
   focus: ['router', 'provider', 'fallback'],
   task: `## Task
 
-The starter is working code: when the provider is healthy it streams tokens
-correctly, so the demo passes. Every failure path is wrong. Find them, fix them, and prove the fix.
-
-Implement \`generate(model, prompt, on_token)\` for the router’s provider layer:
-
-- Each attempt carries an **800 ms** deadline. A call without one lets one stuck provider pin the
-  worker indefinitely.
-- At most **3 attempts per provider**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retryable; every other status is returned to the caller immediately.
-- When the primary’s attempts are exhausted, try the **fallback model** once through the same
-  bounded loop.
-- A **circuit breaker** opens after **5** retryable failures and stays open for **30 s**; while it
-  is open, skip that provider instead of hammering it.
-- Once the **first token has been delivered** to the caller, **never retry**: a replay would
-  duplicate output the user already read and bill it twice.
+**Starting point.** The starter's \`generate(model, prompt, on_token)\` opens a \`Stream\` call to
+the primary provider, forwards every token to \`on_token\`, and returns the joined answer. It
+compiles, it serves the demo, and it hides five flaws.
 
 **Failure mode the checks target.** The starter catches every error and loops forever: a permanent
 \`INVALID_ARGUMENT\` spins the worker, a bad deployment becomes a hot loop against a struggling
 provider, there is nothing to fall back to, and after a partial answer the starter replays the stream
-from the start. Each of those is silent in a demo and loud in production.`,
+from the start. Each of those is silent in a demo and loud in production.
+
+- Each attempt carries an **800 ms** deadline.
+- At most **3 attempts per provider**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
+  retryable; every other status is returned to the caller immediately.
+- When the primary's attempts are exhausted, try the **fallback model** once through the same
+  bounded loop.
+- A **circuit breaker** opens after **5** retryable failures and stays open for **30 s**; while it
+  is open, skip that provider instead of hammering it.
+- Once the **first token has been delivered** to the caller, do not retry: a replay would
+  duplicate output the user already read and bill it twice.`,
   sequence: {
     participants: ['Model Router', 'Provider', 'Fallback'],
     messages: [
@@ -46,16 +44,16 @@ from the start. Each of those is silent in a demo and loud in production.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with a constant and a `for` loop: the starter’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
-    'Retryability is a property of the status, not of “it threw”: capture the error, compare its code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, and return anything else to the caller immediately.',
-    'A breaker is a failure counter per provider: record only retryable failures, check it before each attempt, and open it for 30 s after five. Track `delivered` as you yield tokens: once a token is out, a retry is a duplicate, so raise instead.',
+    'Send a request with a model the provider rejects as `INVALID_ARGUMENT`: the worker pins a CPU and the request never returns. Kill the provider mid-answer and the user sees the first half of the reply twice.',
+    '`generate` loops with `while True`, calls `providers.Stream` with no timeout, catches `Exception` and continues, has no second stub to turn to, counts attempts in a global nothing reads, and restarts the stream after tokens went out.',
+    'Loop `for _ in range(MAX_ATTEMPTS)` over `(providers, model), (fallback, "small-model")`, pass `timeout=DEADLINE_S`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, gate each attempt on `breaker.allow()`, and raise when `delivered` is already true.',
   ],
   checks: [
     {
       id: 'deadline',
       title: 'Every attempt carries an 800 ms deadline',
       detail:
-        'The call is created with an 800 ms deadline — a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + DEADLINE_MS`. Without it a stuck provider holds the request open indefinitely.',
+        'The call is created with an 800 ms deadline: a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + DEADLINE_MS`. Without it a stuck provider holds the request open indefinitely.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.8/, /timeout=DEADLINE_S/, /\.Stream\(/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*800/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.Stream\(/]},
@@ -130,7 +128,7 @@ from the start. Each of those is silent in a demo and loud in production.`,
     },
     {
       id: 'no-replay',
-      title: 'Never retries after the first streamed token',
+      title: 'Does not retry after the first streamed token',
       detail:
         'Once a token has been delivered to the caller, a retry would replay output the user already read. Track `delivered` and raise or return instead of retrying.',
       match: {
@@ -156,9 +154,7 @@ attempts = 0
 
 
 def generate(model: str, prompt: str, on_token) -> str:
-    # TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-    # DEADLINE_EXCEEDED, fail over to the fallback, open a breaker after 5 failures, and never
-    # replay once a token was delivered.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     global attempts
     while True:
         attempts += 1
@@ -246,7 +242,7 @@ def generate(model: str, prompt: str, on_token) -> str:
 `,
     },
     typescript: {
-      starter: `/** Provider call: flawed code that retries every failure forever. */
+      starter: `/** Provider call for the router. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -260,9 +256,7 @@ const {providers} = grpc.loadPackageDefinition(protoLoader.loadSync('providers.p
 const provider = new providers.Provider('providers:9000', grpc.credentials.createInsecure());
 
 export async function generate(model: string, prompt: string, onToken: (token: string) => void): Promise<string> {
-  // TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-  // DEADLINE_EXCEEDED, fail over to the fallback, open a breaker after 5 failures, and never
-  // replay once a token was delivered.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const parts: string[] = [];
@@ -385,9 +379,7 @@ import (
 	pb "router/providerspb"
 )
 
-// TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-// DEADLINE_EXCEEDED, fail over to the fallback, open a breaker after 5 failures, and never
-// replay once a token was delivered.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func generate(ctx context.Context, client pb.ProviderClient, model, prompt string, onToken func(string)) (string, error) {
 	for attempt := 0; ; attempt++ {
 		stream, err := client.Stream(ctx, &pb.StreamRequest{Model: model, Prompt: prompt})
@@ -532,9 +524,7 @@ func generate(
 object ModelCall {
   val stub = ProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build())
 
-  // TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-  // DEADLINE_EXCEEDED, fail over to the fallback, open a breaker after 5 failures, and never
-  // replay once a token was delivered.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def generate(model: String, prompt: String, onToken: String => Unit): String = {
     var answer = ""
     var done = false
@@ -638,9 +628,7 @@ object ModelCall {
 #include <functional>
 #include <string>
 
-// TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-// DEADLINE_EXCEEDED, fail over to the fallback, open a breaker after 5 failures, and never
-// replay once a token was delivered.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::string generate(
     Provider::Stub* stub,
     const std::string& model,
@@ -748,5 +736,5 @@ std::string generate(
 `,
     },
   },
-  debrief: `The interviewer is probing one question under many names: what is the worst case of this call? A deadline bounds one attempt, max attempts bound the call, the retryable set decides which failures are even worth another attempt, and the breaker bounds the damage to a struggling provider across requests. The fallback is the business continuity answer, and the delivered flag is the correctness answer: streaming is not idempotent, so a retry after the first token duplicates output and usage. The starter looks fine because a healthy provider never enters any of these paths. Real clients add jittered backoff between attempts, per-endpoint concurrency limits, and a half-open breaker that lets one probe request through to test recovery.`,
+  debrief: `Every piece of the fix answers the same question: what is the worst case of this call? The deadline bounds one attempt, \`MAX_ATTEMPTS\` bounds the request, the retryable set decides which failures deserve another attempt at all, and the breaker bounds the damage one struggling provider can take across requests. The fallback keeps the product up when the primary is down, and the \`delivered\` flag keeps it correct: a stream is not idempotent, so once a token has reached the user a retry duplicates output and usage, and the right move is to fail the request. A healthy provider enters none of these paths, which is why the starter looked fine. Production clients also put jittered backoff between attempts, cap concurrency per endpoint, and run the breaker half-open so one probe request can test recovery.`,
 };

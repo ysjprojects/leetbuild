@@ -8,29 +8,28 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the submission
-route, parses the body and stores the fields. It compiles, it serves the demo, and it hides four
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/forms/{id}/submissions\` with body
+\`{"fields": {"name": "…", "message": "…"}}\`, reads the tenant from \`X-Tenant-Id\`, resolves the
+form's schema version, runs every field through a tag-stripping regex and stores the submission
+under a fresh id. It compiles, it serves the demo, and it hides 5 flaws.
 
-Implement \`POST /v1/forms/{id}/submissions\` with body \`{"fields": {"name": "…", "message": "…"}}\`.
+**Failure mode the checks target.** A public form that accepts fields its author has not shipped,
+stores any length it is handed, loses what the submitter wrote, and counts one retried person twice.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+Requirements:
+
+- A missing tenant is **401**.
 - **Validation runs against the form's published schema version, pinned when the form was loaded.**
-  A form keeps a published version and a mutable draft; submissions must be checked against the
+  A form keeps a published version and a mutable draft; submissions are checked against the
   published one, so a field the author has not shipped yet cannot be written by a public caller.
 - Unknown fields are rejected field by field (**422**); each rejection names the field.
-- A value longer than the field's declared \`max_bytes\` — capped by the service's own ceiling — is
+- A value longer than the field's declared \`max_bytes\`, capped by the service's own ceiling, is
   rejected (**422**).
 - Markup is **escaped at rest**, not stripped: the admin dashboard renders field values, so
   \`<script>\` must survive as inert text, and the original input must still be recoverable for an
-  audited export. Stripping the tags silently corrupts what the submitter wrote.
-- \`Idempotency-Key\` is required (**400** when missing). Replaying the same
-  \`(form, key)\` returns the **original** \`submission_id\` instead of storing a second submission.
-
-**Failure mode the checks target.** The starter validates against the *draft* schema, so a published
-form accepts fields the author has not shipped; it accepts unknown fields and any length; it strips
-markup instead of escaping it, so a stored value cannot be rendered safely and the original text is
-lost; and a replay re-stores the submission under a new id, so the same person is counted twice.`,
+  audited export.
+- \`Idempotency-Key\` is required (**400** when missing). Replaying the same \`(form, key)\` returns
+  the **original** \`submission_id\` instead of storing a second submission.`,
   sequence: {
     participants: ['Client', 'Form API', 'Schema store', 'Submissions store'],
     messages: [
@@ -54,16 +53,16 @@ lost; and a replay re-stores the submission under a new id, so the same person i
     ],
   },
   hints: [
-    'A form has two versions: the published one the world sees and the starter the author is editing. The handler must resolve the **published** version when it loads the form, not the starter — otherwise a public caller can write fields the author has not shipped. Reject unknown field names against that pinned schema rather than merging them in.',
-    'Escaping and stripping are not the same operation. `<b>hi</b>` escaped is `&lt;b&gt;hi&lt;/b&gt;` — inert in HTML, reversible in an export. The same string stripped is `hi` — the submitter’s text is destroyed and no audit trail can recover it. Use the language’s HTML-escape primitive and keep the raw value out of the rendered document.',
-    'A replay is a read, not a write: look the `(form, Idempotency-Key)` pair up first and answer with the stored id. Store the pair in the same transaction as the submission so a crash cannot leave the key without its row.',
+    'Publish a form, then add a field in the editor without publishing it. A public caller can already submit that field, and a `<b>` in a message comes back as plain text with the tags gone.',
+    'The handler resolves the draft schema version and merges whatever fields arrive; `strip_tags` deletes markup instead of encoding it; the `Idempotency-Key` header is read by nobody, so a retried POST inserts a second row.',
+    'Pin `PUBLISHED_SCHEMA_VERSION`, reject names not in it and values over `max_bytes`, store `html.escape(value)`, and look up `existing_submission_id(form, key)` before inserting, writing the key in the same transaction.',
   ],
   checks: [
     {
       id: 'published-schema',
       title: 'Validates against the published schema version pinned at load',
       detail:
-        'Validation resolves the form’s **published** schema version and checks fields against it. The starter validates against the starter version, so a published form accepts fields the author has not shipped yet.',
+        'Validation resolves the form’s **published** schema version and checks fields against it. The starter validates against the draft version, so a published form accepts fields the author has not shipped yet.',
       match: {
         python: {all: [/PUBLISHED_SCHEMA_VERSION/], none: [/draft_schema/]},
         typescript: {all: [/PUBLISHED_SCHEMA_VERSION/], none: [/draftSchemaVersion/]},
@@ -148,8 +147,7 @@ class Submission(BaseModel):
 
 @app.post("/v1/forms/{form_id}/submissions")
 def submit(form_id: str, body: Submission, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter validates against the form's draft schema version, accepts unknown fields,
-    # enforces no size limit, strips markup instead of escaping it, and re-stores a replay.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     form = forms[form_id]
     schema = form["draft_schema_version"]
     submission_id = "sub_" + str(len(submissions) + 1)
@@ -198,7 +196,7 @@ def submit(
     idempotency_key: str = Header(alias="Idempotency-Key"),
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> dict:
-    # The schema is pinned to the version published when the form was loaded, never the starter.
+    # The schema is pinned to the version published when the form was loaded, not the draft.
     schema = SCHEMAS[PUBLISHED_SCHEMA_VERSION]
     replayed = existing_submission_id(form_id, idempotency_key)
     if replayed is not None:
@@ -235,8 +233,7 @@ function stripTags(value: string): string {
 }
 
 app.post('/v1/forms/:id/submissions', async (req, reply) => {
-  // TODO: this starter validates against the form's draft schema version, accepts unknown fields,
-  // enforces no size limit, strips markup instead of escaping it, and re-stores a replay.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const {id} = req.params as {id: string};
   const form = forms[id];
   const schemaVersion = form.draftSchemaVersion;
@@ -279,7 +276,7 @@ function escapeHtml(value: string): string {
 app.post('/v1/forms/:id/submissions', async (req, reply) => {
   const {id} = req.params as {id: string};
   const key = req.headers['Idempotency-Key'] as string | undefined;
-  // The schema is pinned to the version published when the form was loaded, never the starter.
+  // The schema is pinned to the version published when the form was loaded, not the draft.
   const schema = SCHEMAS[PUBLISHED_SCHEMA_VERSION];
   const replayed = key === undefined ? undefined : existingSubmissionId(id, key);
   if (replayed !== undefined) return reply.send({submissionId: replayed, replayed: true});
@@ -321,8 +318,7 @@ var forms = map[string]map[string]any{}
 var submissions = map[string]map[string]string{}
 
 func Submit(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter validates against the form's draft schema version, accepts unknown fields,
-	// enforces no size limit, strips markup instead of escaping it, and re-stores a replay.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	var body struct {
 		Fields map[string]string ` +
         '`' +
@@ -372,7 +368,7 @@ func existingSubmissionID(formID, key string) (string, bool) {
 func Submit(w http.ResponseWriter, r *http.Request) {
 	formID := r.PathValue("id")
 	key := r.Header.Get("Idempotency-Key")
-	// The schema is pinned to the version published when the form was loaded, never the starter.
+	// The schema is pinned to the version published when the form was loaded, not the draft.
 	fields := schemas[publishedSchemaVersion]
 	if existing, ok := existingSubmissionID(formID, key); ok {
 		writeJSON(w, http.StatusOK, map[string]any{"submissionId": existing, "replayed": true})
@@ -430,8 +426,7 @@ object Api {
 
   val routes: Route = path("v1" / "forms" / Segment / "submissions") { formId =>
     post {
-      // TODO: this starter validates against the form's draft schema version, accepts unknown fields,
-      // enforces no size limit, strips markup instead of escaping it, and re-stores a replay.
+      // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
       entity(as[Map[String, String]]) { body =>
         val schema = DraftSchemas.latest(formId)
         val stored = body.map { case (name, value) => name -> stripTags(value) }
@@ -468,7 +463,7 @@ object Api {
   val routes: Route = path("v1" / "forms" / Segment / "submissions") { formId =>
     post {
       headerValueByName("Idempotency-Key") { key =>
-        // The schema is pinned to the version published when the form was loaded, never the starter.
+        // The schema is pinned to the version published when the form was loaded, not the draft.
         val fields = Schemas(PublishedSchemaVersion)
         existingSubmissionId(formId, key) match {
           case Some(existing) => complete(StatusCodes.OK -> s"""{"submissionId":"$existing","replayed":true}""")
@@ -516,8 +511,7 @@ static std::string StripTags(const std::string& value) {
 
 void RegisterRoutes(httplib::Server& svr, FormStore& forms, SubmissionStore& submissions) {
   svr.Post("/v1/forms/([^/]+)/submissions", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter validates against the form's draft schema version, accepts unknown fields,
-    // enforces no size limit, strips markup instead of escaping it, and re-stores a replay.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const std::string formId = req.matches[1];
     json form = forms.Get(formId);
     const std::string schemaVersion = form["draftSchemaVersion"];
@@ -568,7 +562,7 @@ void RegisterRoutes(httplib::Server& svr, FormStore& forms, SubmissionStore& sub
   svr.Post("/v1/forms/([^/]+)/submissions", [&](const httplib::Request& req, httplib::Response& res) {
     const std::string formId = req.matches[1];
     const std::string key = req.get_header_value("Idempotency-Key");
-    // The schema is pinned to the version published when the form was loaded, never the starter.
+    // The schema is pinned to the version published when the form was loaded, not the draft.
     const auto& fields = schemas.at(kPublishedSchemaVersion);
     std::string existing;
     if (ExistingSubmissionId(formId, key, existing)) {
@@ -606,5 +600,5 @@ void RegisterRoutes(httplib::Server& svr, FormStore& forms, SubmissionStore& sub
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo posts well-formed fields from one tenant and never retries. The subtle flaw is the schema version: the handler resolves the *draft* schema, so a field the author has not published is accepted from a public caller — the published version is the contract, and it must be pinned when the form is loaded. Escaping rather than stripping matters because the admin dashboard renders stored values: stripping tags destroys the submitter's text and still leaves the pipeline unsafe, while escaping renders it inert and keeps the raw value recoverable for an audited export. Idempotency closes the last hole: a replay must return the original id, which means the key is stored in the same transaction as the submission. Real systems add per-form captcha, rate limits keyed on form and IP, and a signed schema version in the response so the client knows which contract it wrote against.`,
+  debrief: `The fix pins the published schema because a published form is a contract with the people submitting to it: the draft belongs to the author, and resolving it lets a public caller write fields nobody has shipped. Escaping rather than stripping matters because the admin dashboard renders stored values: stripping destroys the submitter's text and still leaves the pipeline unsafe, while escaping renders it inert and keeps the raw value recoverable for an audited export. The replay lookup runs before the insert and the key is written in the same transaction, so a crash cannot leave a key without its row. What this step did not do: a captcha and a limiter in front of the handler, a signed schema version echoed in the response, and a field-level error body that a form builder can map back to inputs.`,
 };

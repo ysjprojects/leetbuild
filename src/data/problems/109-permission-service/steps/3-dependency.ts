@@ -8,35 +8,25 @@ export const dependencyStep: Step = {
   focus: ['api', 'engine', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the check route, asks the policy
-engine for a decision, caches the answer and returns it, and it compiles. Every failure path is
-wrong. Find them, fix them, and prove the fix with the checks below.
+**Starting point.** The starter registers the check route, reads a cached allow from Redis, calls
+\`PolicyEngine.Decide\` over gRPC (a unary call taking \`subject\`, \`permission\` and \`scope\`,
+answering \`ALLOW\` or \`DENY\`), caches the answer under \`perm:allow:{subject}:{permission}:{scope}\`
+for 60 s and returns it. It compiles, serves the demo, and hides 5 flaws.
 
-The effective-permission check consults the policy engine over gRPC — \`PolicyEngine.Decide\`, a unary
-call taking \`subject\`, \`permission\` and \`scope\`, answering \`ALLOW\` or \`DENY\` — and the service has
-to survive that engine being slow, gone or unhappy.
+**Failure mode the checks target.** The starter fails open. One hung call is one hung request; every
+RPC error is retried three times, a rejection status included, and once the attempts are gone the
+last cached allow is served, so an engine outage becomes platform-wide access; and the cache trusts
+a timer instead of a version, so a revocation waits for the TTL.
 
-- **Deadline.** Every attempt carries a **400 ms** deadline, on the call itself: \`timeout=\`,
-  \`deadline:\`, \`context.WithTimeout\`, \`withDeadlineAfter\`, \`context->set_deadline\`. A call with no
-  deadline lets one wedged engine pin the request open indefinitely.
-- **At most two attempts.** Only transport failures — \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` — are
-  retried, after a jittered backoff. Every other status is the engine's answer, not noise.
+- **Deadline.** Every attempt carries a **400 ms** deadline on the call itself: \`timeout=\`,
+  \`deadline:\`, \`context.WithTimeout\`, \`withDeadlineAfter\`, \`context->set_deadline\`.
+- **At most two attempts.** Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried, after a
+  jittered backoff. Every other status is the engine's answer.
 - **A timeout denies.** When the attempts are exhausted the caller gets a retriable **503** with
-  \`Retry-After: 1\` — never the last cached allow. An outage must not become broad access.
-- **A \`DENY\` is terminal.** One call, no retry, **403**, and no cached allow consulted behind it.
-  The starter retries a rejection as though the engine were merely flaky.
-- **A cached allow is only as good as its version.** Cached allows live under
-  \`perm:allow:{subject}:{permission}:{scope}\` and count only while their stored \`grant_version\`
-  matches the current counter; otherwise the engine is asked again. A TTL is not a revocation
-  signal: the starter's entry keeps a revoked grant alive for the rest of its minute.
-
-**Failure mode the checks target.** The starter fails open, which is the one thing an authorization
-path may not do. It calls the engine with no time bound, so one hung call is one hung request; it
-catches every RPC error and, once the attempts are gone, answers from the last cached allow, so an
-engine outage silently becomes platform-wide access; it retries a policy rejection, so a deliberate
-\`DENY\` costs two calls and, with a warm cache, comes back as an \`ALLOW\`; and it trusts its cache on
-a timer instead of a version, so a revocation waits for the TTL. Each of those is invisible in a demo
-where the engine is fast and nothing is ever revoked.`,
+  \`Retry-After: 1\`, not the cached allow.
+- **A \`DENY\` is terminal.** One call, no retry, **403**, no cached allow consulted behind it.
+- **A cached allow is only as good as its version.** It counts only while its stored
+  \`grant_version\` matches the current counter; otherwise the engine is asked again.`,
   sequence: {
     participants: ['Permission Service', 'Policy engine', 'Redis', 'Client'],
     messages: [
@@ -63,9 +53,9 @@ where the engine is fast and nothing is ever revoked.`,
     ],
   },
   hints: [
-    'The time bound belongs to the call, not to a wrapper around it: `timeout=`, `deadline: Date.now() + …`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. Then decide what a timeout *means* — the engine did not answer, so the answer cannot be yes. Hand the caller a retriable failure instead of reaching for the cache.',
-    'Retryability is a property of the status code, not of “it threw”. Capture the code, keep a small attempt counter, sleep with jitter between transport failures, and let `UNAVAILABLE`/`DEADLINE_EXCEEDED` be the only two that earn a second call; anything else returns immediately.',
-    'For the cache, store the version beside the allow and compare it with the current counter before trusting the entry — a matching version is the only proof the allow survived the last revocation. Keep the deny path ahead of any cache fallback so a rejection can never be softened into an allow.',
+    'Stop the policy engine. Checks hang for as long as the engine stays silent, then start answering `allowed` for anyone who was allowed in the last minute.',
+    'The starter calls `Decide` with no deadline, treats every `RpcError` as retryable for `RETRY_LIMIT` rounds, then falls through to the cached allow, which was stored with a 60 s TTL and no version.',
+    'Pass `timeout=POLICY_TIMEOUT_MS`, loop `MAX_ATTEMPTS` times only on `UNAVAILABLE`/`DEADLINE_EXCEEDED`, return 403 when `is_terminal`, 503 with `Retry-After` on exhaustion, and serve the cache only when `allow_is_current` against `grant_version`.',
   ],
   checks: [
     {
@@ -160,9 +150,7 @@ def allow_key(subject: str, permission: str, scope: str) -> str:
 
 
 def decide(subject: str, permission: str, scope: str) -> str:
-    # TODO: the starter calls the engine with no time bound, treats a policy rejection as if the
-    # engine were flaky, and returns the last cached allow once every attempt has failed. It fails
-    # open on timeout, so an engine outage turns into broad access. Check the whole failure path.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     cached = redis.get(allow_key(subject, permission, scope))
     request = policy_pb2.DecideRequest(subject=subject, permission=permission, scope=scope)
     for _ in range(RETRY_LIMIT):
@@ -329,9 +317,7 @@ function callEngine(subject: string, permission: string, scope: string): Promise
 }
 
 export async function decide(subject: string, permission: string, scope: string): Promise<string> {
-  // TODO: the starter calls the engine with no time bound, treats a policy rejection as if the
-  // engine were flaky, and returns the last cached allow once every attempt has failed. It fails
-  // open on timeout, so an engine outage turns into broad access. Check the whole failure path.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const cached = await redis.get(allowKey(subject, permission, scope));
   for (let attempt = 0; attempt < RETRY_LIMIT; attempt += 1) {
     try {
@@ -526,9 +512,7 @@ func allowKey(subject, permission, scope string) string {
 }
 
 func decide(ctx context.Context, subject, permission, scope string) string {
-	// TODO: the starter calls the engine with no time bound, treats a policy rejection as if the
-	// engine were flaky, and returns the last cached allow once every attempt has failed. It fails
-	// open on timeout, so an engine outage turns into broad access. Check the whole failure path.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := allowKey(subject, permission, scope)
 	cached, _ := cache.Get(ctx, key).Result()
 	req := &policyv1.DecideRequest{Subject: subject, Permission: permission, Scope: scope}
@@ -749,9 +733,7 @@ object PermissionCheck {
     s"perm:allow:\${subject}:\${permission}:\${scope}"
 
   def decide(subject: String, permission: String, scope: String): Verdict = {
-    // TODO: the starter calls the engine with no time bound, treats a policy rejection as if the
-    // engine were flaky, and returns the last cached allow once every attempt has failed. It fails
-    // open on timeout, so an engine outage turns into broad access. Check the whole failure path.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val cached = cache.get(allowKey(subject, permission, scope))
     var attempt = 0
     while (attempt < RetryLimit) {
@@ -943,9 +925,7 @@ int main() {
     const std::string key = allowKey(subject, permission, scope);
     const auto cached = redis.get(key);
 
-    // TODO: the starter calls the engine with no time bound, treats a policy rejection as if the
-    // engine were flaky, and returns the last cached allow once every attempt has failed. It fails
-    // open on timeout, so an engine outage turns into broad access. Check the whole failure path.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     policy::DecideRequest request;
     request.set_subject(subject);
     request.set_permission(permission);
@@ -1102,5 +1082,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is asking one question in five costumes: what does this service do when the component that decides permissions does not answer? The starter answers "allow", which is exactly why it is dangerous — every failure mode of the policy engine becomes a grant. A deadline bounds one attempt; a small attempt budget bounds the call; the retryable set of two transport codes and nothing else stops a deliberate rejection from being re-rolled into a second roll of the dice; and the cache is keyed to the grant version so an allow cannot outlive the revocation that invalidated it. Real deployments add a jittered backoff shared across replicas, a concurrency cap or breaker around the engine so a slow engine cannot drain the request pool, a Retry-After aligned with their own backoff so clients do not stampede on recovery, and a counter on the deny-by-outage path — because that number is how you find out that your safety property is carrying production traffic.`,
+  debrief: `Every piece of the fix answers one question: what does the service do when the component that decides permissions does not answer? The starter answers "allow", so every failure of the policy engine becomes a grant. A deadline bounds one attempt and a two-attempt budget bounds the call, so a wedged engine costs bounded latency and then a 503 the client can retry. The retryable set is two transport codes and nothing else, so a deliberate \`DENY\` is final rather than re-rolled. The cached allow is keyed to the grant version, so an allow cannot outlive the revocation behind it. Production deployments add a concurrency cap or circuit breaker around the engine so a slow engine cannot drain the request pool, and a counter on the deny-by-outage path, because that is how you learn the safety property is carrying traffic.`,
 };

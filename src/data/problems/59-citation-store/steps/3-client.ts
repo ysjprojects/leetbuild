@@ -8,30 +8,30 @@ export const citationClientStep: Step = {
   focus: ['api', 'docstore'],
   task: `## Task
 
-**Starting point.** The starter is working code: a healthy document store answers and every
-citation comes back verified, so the demo report is green. Every failure path is wrong. Find them,
-fix them, and prove the fix.
+**Starting point.** The starter is the verifier that resolves a batch of citations against the
+document store over gRPC: \`fetch_version\` calls \`GetVersion\` in a loop and the batch walks each
+citation, fetches its version and assigns a status. It compiles, it serves the demo, and it hides
+five flaws.
 
-Implement the verifier that resolves citations against the document store:
+**Failure mode the checks target.** A verifier is only worth running on the day the document store
+is not healthy, or the corpus has been edited. A fetch with no deadline, a retry that cannot tell an
+outage from a missing version, a failure that is reported as verified, and a batch that quietly
+omits what it could not resolve all produce a green report while the store or the corpus is in
+trouble.
 
 - Every fetch carries a **1-second deadline**. Without one, a stuck document store pins the verifier
-  worker and the citation is never verified, never broken.
+  worker and the citation is neither verified nor broken.
 - At most **3 attempts**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retryable. A
-  **\`NOT_FOUND\` is terminal** — the version does not exist and no amount of retrying will create
+  **\`NOT_FOUND\` is terminal**: the version does not exist and no amount of retrying will create
   it; return it to the caller immediately.
-- When the fetch fails, the citation is **\`broken\` with a \`reason\`** — \`fetch failed: …\` for a
-  transport failure. A broken citation is a fact about the document, not an error to swallow.
+- When the fetch fails, the citation is **\`broken\` with a \`reason\`** (\`fetch failed: …\` for a
+  transport failure). A broken citation is a fact about the document, not an error to swallow.
 - A citation whose quote is no longer at those offsets is **re-anchored**: search the fetched
-  version text for the quote and, when it is moved, record the new offset and keep the status
+  version text for the quote and, when it has moved, record the new offset and keep the status
   \`verified\`; only when the quote is gone entirely is the citation \`broken\` with
   \`reason: span_moved\`.
-- A citation that cannot be resolved is **never dropped** and never counted as verified: the batch
-  returns every citation it was given.
-
-**Failure mode the checks target.** The starter fetches with no deadline and retries a \`NOT_FOUND\`
-forever, returns whatever text it eventually gets, treats a fetch failure as “still valid” so the
-report looks green, and silently drops the citations it cannot resolve. Each of those is invisible
-while the document store is healthy and the corpus is unchanged.`,
+- A citation that cannot be resolved is kept, not dropped, and not counted as verified: the batch
+  returns every citation it was given.`,
   sequence: {
     participants: ['Verifier', 'document store', 'citation store'],
     messages: [
@@ -54,9 +54,9 @@ while the document store is healthy and the corpus is unchanged.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with `MAX_ATTEMPTS` and a loop; the starter’s `while true` has no exit for a permanent error.',
-    'Retryability is a property of the status, not of “it threw”: compare the code against the retryable set, and treat `NOT_FOUND` as terminal — a missing version is data, not an outage. A timeout is the opposite case: it must produce `broken` with a reason, never `verified`.',
-    'Re-anchoring is a search, not a comparison: `text.find(quote)` (or `indexOf`/`strings.Index`/`indexOf`) gives the offset the quote moved to. Record it and stay verified; only a missing quote is `span_moved`. Whatever the outcome, the citation stays in the result — dropping it is how regressions disappear from the report.',
+    'During a document store outage the verifier worker hangs, then a report comes back all green with fewer citations than it was given; a citation for a deleted version spins the worker at 100% CPU.',
+    'The starter loops `while true` with no deadline and no attempt cap, retries every status including `NOT_FOUND`, returns `verified` when the fetch fails, and `continue`s past the citations it cannot resolve.',
+    'Pass `timeout=DEADLINE_S`, loop to `MAX_ATTEMPTS` over the `RETRYABLE` set with `NOT_FOUND` terminal, mark failures `STATUS_BROKEN` with a `reason`, add `reanchor()` using `text.find(quote)`, and keep every citation.',
   ],
   checks: [
     {
@@ -144,8 +144,7 @@ STATUS_VERIFIED = "verified"
 
 
 def fetch_version(document_id: str, version: int) -> str | None:
-    # TODO: fetch with a 1 s deadline, bound the attempts and retry only UNAVAILABLE /
-    # DEADLINE_EXCEEDED (NOT_FOUND is terminal), and stop treating a failed fetch as valid.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = documents.GetVersion(
@@ -246,7 +245,7 @@ def verify_all(citations: list[dict]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** Citation verification: flawed code that retries a missing version forever. */
+      starter: `/** Citation verification: the starter. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -276,8 +275,7 @@ interface Citation {
 }
 
 async function fetchVersion(documentId: string, version: number): Promise<string | null> {
-  // TODO: fetch with a 1 s deadline, bound the attempts and retry only UNAVAILABLE /
-  // DEADLINE_EXCEEDED (NOT_FOUND is terminal), and stop treating a failed fetch as valid.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       return await new Promise<string>((resolve, reject) => {
@@ -418,8 +416,7 @@ const statusVerified = "verified"
 var errDropped = errors.New("citation dropped")
 
 func fetchVersion(ctx context.Context, documents pb.DocumentStoreClient, documentID string, version int) (string, bool) {
-	// TODO: fetch with a 1 s deadline, bound the attempts and retry only UNAVAILABLE /
-	// DEADLINE_EXCEEDED (NOT_FOUND is terminal), and stop treating a failed fetch as valid.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := documents.GetVersion(ctx, &pb.GetVersionRequest{DocumentId: documentID, Version: int32(version)})
 		if err == nil {
@@ -583,8 +580,7 @@ object CitationVerifier {
 
   val documents = DocumentStoreGrpc.blockingStub(ManagedChannelBuilder.forAddress("documents", 9000).usePlaintext().build())
 
-  // TODO: fetch with a 1 s deadline, bound the attempts and retry only UNAVAILABLE /
-  // DEADLINE_EXCEEDED (NOT_FOUND is terminal), and stop treating a failed fetch as valid.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def fetchVersion(documentId: String, version: Int): Option[String] = {
     var text: Option[String] = None
     var done = false
@@ -702,8 +698,7 @@ using json = nlohmann::json;
 const std::string kStatusVerified = "verified";
 
 std::string fetchVersion(DocumentStore::Stub* documents, const std::string& documentId, int version) {
-  // TODO: fetch with a 1 s deadline, bound the attempts and retry only UNAVAILABLE /
-  // DEADLINE_EXCEEDED (NOT_FOUND is terminal), and stop treating a failed fetch as valid.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     GetVersionRequest request;
@@ -819,5 +814,5 @@ std::vector<json> verifyAll(DocumentStore::Stub* documents, const std::vector<js
 `,
     },
   },
-  debrief: `The interviewer is asking what the verifier does when the document store is not healthy — the only question that decides whether the report can be trusted. Three defects are being checked. The deadline bounds one attempt, and the retry policy decides which failures are worth another: a timeout is an outage and may be retried, a \`NOT_FOUND\` is data and must be returned at once — retrying it is a hot loop against a store that is working perfectly. The failure policy is the second: a fetch that fails is not a citation that is verified, it is a citation whose verification is unknown, and calling that \`verified\` is how a broken span survives to a reviewer. The third is re-anchoring: editing a document rarely deletes a sentence, it moves it, so search for the quote, record the new offset, and reserve \`broken\` for a quote that is truly gone. Dropping unresolved citations is the quiet version of the same lie — the report looks complete because the failures were removed. Real verifiers add jittered backoff, a per-document breaker, and a re-anchor confidence score from edit distance.`,
+  debrief: `The fix has its shape because each failure of the document store means something different and the verifier has to say which. The deadline bounds one attempt and the retry policy decides which failures earn another: a timeout or \`UNAVAILABLE\` is an outage worth a bounded retry, a \`NOT_FOUND\` is data and is returned at once, since retrying it is a hot loop against a healthy store. A fetch that fails is a citation whose verification is unknown, and calling that \`verified\` is how a broken span reaches a reviewer. Editing rarely deletes a sentence, it moves it, so the verifier searches for the quote and reserves \`broken\` for a quote that is gone. Production verifiers go further than this step did, with jittered backoff between attempts and a per-document circuit breaker.`,
 };

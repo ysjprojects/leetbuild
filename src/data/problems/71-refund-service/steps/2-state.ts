@@ -8,34 +8,27 @@ export const refundStateStep: Step = {
   focus: ['api', 'ledger', 'records'],
   task: `## Task
 
-**Starting point.** The starter is working code for the ledger module: a payment
-with room gets its refund recorded and the total comes back, so the demo passes. It hides a race, a
-lifetime bug and the wrong key. Find them, fix them, and prove the fix.
+**Starting point.** The starter is the ledger module: \`check_and_add_refund(tenant, amount_minor,
+paid_minor)\` reads the total with \`GET refunded:{tenant}\`, compares it against \`paid_minor\` in
+Python, adds with \`INCRBY\`, sets a one-day \`EXPIRE\` and returns
+\`(accepted, refunded_minor, remaining_minor)\`. It compiles and hides five flaws.
 
-Implement the Redis refund ledger that every refund goes through:
+**Failure mode the checks target.** The read and the add are two round trips, so two concurrent
+partial refunds both observe the same remaining balance and both pass; the cap is compared in the
+caller rather than inside Redis; the key is per tenant, so two payments share one total; the TTL
+erases a lifetime cap after a day; and nothing can rebuild the key from the durable records.
 
-- The refunded total for a payment lives under **one key per payment**,
-  \`refunded:{payment_id}\`, as the hash field \`refunded\`. Keying by tenant mixes payments that
-  happen to share an amount, so one payment's refunds consume another's cap.
-- The ledger has **no TTL**. The cap is for the **lifetime** of the payment: an expiring key would
-  let a partial refunded payment accept a fresh full refund once the key is gone.
-- The claim is **one atomic Lua \`EVAL\`**: read the field, compare \`refunded + amount\` against the
-  payment's total, refuse when it does not fit and add only when it does. One round trip means two
-  concurrent partial refunds cannot both pass the same remaining balance.
-- The claim is capped at the **payment total**, passed in as the cap — not at a client-supplied
-  number and not against a value read in the handler. Return
+Requirements:
+
+- One key per payment, \`refunded:{payment_id}\`, with the hash field \`refunded\` and **no TTL**.
+- The claim is **one atomic Lua \`EVAL\`**: \`HGET\` the field, compare \`refunded + amount\`
+  against the cap passed in as \`cap_minor\`, \`return {0, …}\` when it does not fit and
+  \`HINCRBY\` only when it does.
+- The cap is the payment total passed in by the caller. Return
   \`(accepted, refunded_minor, remaining_minor)\` so the endpoint can answer **422** with the
   remaining balance.
-- The ledger must be **rebuildable from the durable refund records**:
-  \`rebuild_ledger(payment_id)\` recomputes the total with \`records.sum_refunds(payment_id)\` and
-  rewrites the key. A crash between the PSP's success and the refund row is repairable only because
-  the records, not the cache, are the source of truth.
-
-**Failure mode the checks target.** The starter reads the total with \`GET\`, compares it in the
-handler and adds with \`INCRBY\`: two concurrent partial refunds both observe the same remaining
-balance and both pass, so a ¥100 payment can refund ¥200. It also keys the ledger under the tenant,
-mixes payments that share a total, sets a 24-hour expiry on a lifetime cap, and has no rebuild path
-at all.`,
+- \`rebuild_ledger(payment_id)\` recomputes the total with \`records.sum_refunds(payment_id)\` and
+  rewrites the key, so a crash between the PSP's success and the refund row is repairable.`,
   sequence: {
     participants: ['Refund API', 'Redis ledger', 'refund records'],
     messages: [
@@ -63,9 +56,9 @@ at all.`,
     ],
   },
   hints: [
-    'Put `HGET`, the comparison and `HINCRBY` inside one script and run it with a single `EVAL`. A `GET` followed by a separate `INCRBY` leaves a window between the two commands, and concurrency finds that window precisely when the refund matters. Pass the payment total in as an argument — the script itself must decide.',
-    'The key names the payment, not the tenant: `refunded:{payment_id}`. Two payments of the same amount are different liabilities, and a tenant-wide key lets the second payment inherit the first one’s refunded total.',
-    'No `EXPIRE` belongs on this key. The cap is per payment for its lifetime; a TTL turns "fully refunded" back into "refundable" when it lapses. Keep the durable refund rows authoritative and let `rebuild_ledger` recompute the total from `sum_refunds` after a crash — the cache is repairable because the records are the truth.',
+    'Symptom: under load a ¥100 payment refunds ¥200; two different payments of ¥50 share one refunded total; a day later a fully refunded payment accepts a fresh refund.',
+    'Mechanism: `GET` then `INCRBY` leaves a window between the read and the add; `refunded:{tenant}` names the wrong liability; `EXPIRE 86400` deletes a lifetime cap; nothing rebuilds the key.',
+    'Change: one `REFUND_LUA` run with `r.eval` taking `cap_minor` and doing `HGET`, compare, `HINCRBY` or `return {0, …}`; key `refunded:{payment_id}`; no `expire`; add `rebuild_ledger` from `records.sum_refunds`.',
   ],
   checks: [
     {
@@ -96,7 +89,7 @@ at all.`,
     },
     {
       id: 'lifetime-no-ttl',
-      title: 'Lifetime cap: the ledger never expires',
+      title: 'Lifetime cap: no TTL on the ledger key',
       detail:
         'The ledger is a lifetime total with no `EXPIRE`, no `.expire(...)` and no `SETEX`: an expiring key turns a fully refunded payment back into a refundable one. The starter expires the key after a day.',
       match: {
@@ -160,9 +153,7 @@ def refunded_total(tenant: str) -> int:
 
 
 def check_and_add_refund(tenant: str, amount_minor: int, paid_minor: int) -> tuple[bool, int, int]:
-    # TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial
-    # refunds both pass the same remaining balance; it keys the ledger under the tenant instead of
-    # the payment, expires a lifetime cap after a day, and has no rebuild path from the records.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     refunded = refunded_total(tenant)
     if refunded + amount_minor > paid_minor:
         return False, refunded, paid_minor - refunded
@@ -253,9 +244,7 @@ export async function refundedTotal(tenant: string): Promise<number> {
 }
 
 export async function checkAndAddRefund(tenant: string, amountMinor: number, paidMinor: number): Promise<RefundClaim> {
-  // TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial
-  // refunds both pass the same remaining balance; it keys the ledger under the tenant instead of
-  // the payment, expires a lifetime cap after a day, and has no rebuild path from the records.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const refunded = await refundedTotal(tenant);
   if (refunded + amountMinor > paidMinor) {
     return {accepted: false, refunded_minor: refunded, remaining_minor: paidMinor - refunded};
@@ -357,9 +346,7 @@ func refundedTotal(ctx context.Context, tenant string) int64 {
 	return current
 }
 
-// TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial refunds
-// both pass the same remaining balance; it keys the ledger under the tenant instead of the payment,
-// expires a lifetime cap after a day, and has no rebuild path from the records.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func checkAndAddRefund(ctx context.Context, tenant string, amountMinor, paidMinor int64) (bool, int64, int64) {
 	refunded := refundedTotal(ctx, tenant)
 	if refunded+amountMinor > paidMinor {
@@ -456,9 +443,7 @@ object State {
 
   def refundedTotal(tenant: String): Long = Option(jedis.get(ledgerKey(tenant))).map(_.toLong).getOrElse(0L)
 
-  // TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial
-  // refunds both pass the same remaining balance; it keys the ledger under the tenant instead of
-  // the payment, expires a lifetime cap after a day, and has no rebuild path from the records.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def checkAndAddRefund(tenant: String, amountMinor: Long, paidMinor: Long): (Boolean, Long, Long) = {
     val refunded = refundedTotal(tenant)
     if (refunded + amountMinor > paidMinor) {
@@ -539,9 +524,7 @@ long long refundedTotal(sw::redis::Redis& redis, const std::string& tenant) {
   return current ? std::stoll(*current) : 0;
 }
 
-// TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial refunds
-// both pass the same remaining balance; it keys the ledger under the tenant instead of the payment,
-// expires a lifetime cap after a day, and has no rebuild path from the records.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::tuple<bool, long long, long long> checkAndAddRefund(
     sw::redis::Redis& redis,
     const std::string& tenant,
@@ -613,5 +596,5 @@ long long rebuild_ledger(sw::redis::Redis& redis, const std::string& payment_id)
 `,
     },
   },
-  debrief: `The interview question behind this step is atomicity under concurrency, plus what a cache is allowed to remember. A read-then-increment cap passes every serial test and fails exactly when the product is under load, which is when the cap matters; one Lua script makes read, check and add a single step, so two concurrent partial refunds cannot both spend the same balance. The key is part of the model: an amount cap is a liability of a _payment_, so \`refunded:{payment_id}\` is the only key that cannot mix two liabilities, and a tenant key is subtly wrong in exactly the case where two payments share an amount. The missing TTL is the third: a lifetime cap on a key that expires is a cap that can be erased by waiting. The rebuild path is the fourth, and it is the one that survives an incident review: because the durable refund rows carry the truth, a crash between the PSP's success and the row write can be repaired by recomputing the ledger instead of writing it off. Real ledgers add an append-only refund log, a reconciliation job that flags drift, and a lock by payment when a refund needs more than one write.`,
+  debrief: `A read-then-increment cap passes every serial test and fails under load, which is when the cap matters; one Lua script makes read, check and add a single step on the server, so two concurrent partial refunds cannot both spend the same balance. The key is part of the model: a cap is a liability of one payment, so \`refunded:{payment_id}\` is the only key that cannot mix two liabilities. A lifetime cap on an expiring key is a cap erased by waiting, so the key has no TTL, and because Redis can still be lost, \`rebuild_ledger\` recomputes it from the durable refund rows, which stay the source of truth. Production ledgers run that reconciliation as a scheduled job and alert when the rebuilt total disagrees with the cached one.`,
 };

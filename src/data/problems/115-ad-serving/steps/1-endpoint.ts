@@ -8,33 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'server', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body, ranks the candidate campaigns by bid and returns the highest bidder. It compiles, it serves
-the demo, and it hides three production flaws. Debug it like the service owner, fix it, and prove
-the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/ads/serve\` with body
+\`{"placement": "…", "user_hash": "…", "page_context": {"url": "…", "num_ads": 1, "format": "banner"}}\`,
+loads the placement's campaigns, ranks them by bid and returns the highest bidder without a version.
+It serves the demo and hides four flaws.
 
-Implement \`POST /v1/ads/serve\` with body
-\`{"placement": "…", "user_hash": "…", "page_context": {"url": "…", "num_ads": 1, "format": "banner"}}\`.
+**Failure mode the checks target.** The starter ranks first and filters nothing. A malformed request
+is answered with an ad instead of a cheap **400**. A capped user sees the highest bidder on every
+page, and a campaign whose pacing budget is spent or whose state is \`paused\`/\`exhausted\` keeps
+serving because nothing reads its state. Without \`campaign_version\`, a mid-flight campaign edit
+makes the decision impossible to replay.
 
-- \`placement\` is a non-empty string of at most **64** characters (**400** otherwise) and
-  \`user_hash\` is required (**400** when missing): a serve request carries a stable, non-identifying
-  user key, never an email, a device id or a raw cookie.
+- \`placement\` is a non-empty string of at most **64** characters and \`user_hash\` is required
+  (**400** otherwise): a stable, non-identifying user key, not an email, device id or raw cookie.
 - \`page_context.format\` is one of \`banner\`, \`native\`, \`video\` (**400** otherwise).
-- Eligibility is decided **before** any ranking. A campaign is eligible only when its \`state\` is
-  \`active\`, its \`budget_spent_micros\` is below its \`paced_budget_micros\`, and the user's
-  impressions for that campaign inside the campaign's \`freq_window_s\` are below its
+- Eligibility is decided **before** ranking: \`state\` is \`active\`, \`budget_spent_micros\` is
+  below \`paced_budget_micros\`, and the user's impressions inside \`freq_window_s\` are below
   \`freq_cap_impressions\`.
-- The ad that is served is the eligible candidate with the highest \`bid_micros\`; when nothing is
-  eligible the response is \`{"ad": null, "reason": "no_eligible_campaign"}\` with **200**.
-- The response names the campaign **version** it decided against (\`campaign_version\`) — never
-  "latest", never a bare campaign id. A delivery report has to be able to say which creative, cap
-  and budget a served impression used.
-
-**Failure mode the checks target.** The starter ranks first and filters never. A capped user keeps
-seeing the highest bidder on every page — the same ad fifty times — and a campaign whose pacing
-budget is spent, or whose state is \`paused\`/\`exhausted\`, keeps serving because nothing reads its
-state. Dropping \`campaign_version\` is the quiet one: with it, a mid-flight campaign edit rewrites
-history and the reconciliation between serve and render cannot be replayed.`,
+- The served ad is the eligible campaign with the highest \`bid_micros\`; when nothing is eligible
+  the response is \`{"ad": null, "reason": "no_eligible_campaign"}\` with **200**.
+- The response names the campaign **version** it decided against (\`campaign_version\`), so a
+  delivery report can replay the decision.`,
   sequence: {
     participants: ['Client', 'Ad Server', 'campaign store', 'Redis'],
     messages: [
@@ -148,9 +142,7 @@ store = CampaignStore()
 
 @app.post("/v1/ads/serve")
 def serve(body: ServeRequest) -> JSONResponse:
-    # TODO: this starter ranks the highest bidder without consulting the campaign's state, its
-    # pacing budget or the user's frequency cap, and the response omits the campaign version
-    # the decision was made against. Fix all three flaws.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     campaigns = store.active_campaigns(body.placement)
     won = max(campaigns, key=lambda c: c["bid_micros"], default=None)
     if won is None:
@@ -279,9 +271,7 @@ interface CampaignStore {
 declare const store: CampaignStore;
 
 app.post('/v1/ads/serve', async (request, reply) => {
-  // TODO: this starter ranks the highest bidder without consulting the campaign's state, its
-  // pacing budget or the user's frequency cap, and the response omits the campaign version
-  // the decision was made against. Fix all three flaws.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as ServeBody;
   const campaigns = store.activeCampaigns(body.placement);
   if (campaigns.length === 0) return reply.code(200).send({ad: null, reason: 'no_fill'});
@@ -407,9 +397,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func serve(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter ranks the highest bidder without consulting the campaign's state, its
-	// pacing budget or the user's frequency cap, and the response omits the campaign version
-	// the decision was made against. Fix all three flaws.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	var body ServeRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -594,9 +582,7 @@ object AdApi {
     path("v1" / "ads" / "serve") {
       post {
         entity(as[ServeRequest]) { body =>
-          // TODO: this starter ranks the highest bidder without consulting the campaign's state,
-          // its pacing budget or the user's frequency cap, and the response omits the campaign
-          // version the decision was made against. Fix all three flaws.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val won = store.activeCampaigns(body.placement).maxByOption(_.bid_micros)
           won match {
             case None =>
@@ -750,9 +736,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter ranks the highest bidder without consulting the campaign's state, its
-    // pacing budget or the user's frequency cap, and the response omits the campaign version
-    // the decision was made against. Fix all three flaws.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string placement = body.value("placement", std::string());
     const std::string userHash = body.value("user_hash", std::string());
     const auto campaigns = store.activeCampaigns(placement);
@@ -883,9 +867,9 @@ int main() {
     },
   },
   hints: [
-    'Filter, then rank. Every campaign the request may not serve (wrong state, spent pacing budget, this user already at the cap) has to be removed from the candidate list before you compare bids, otherwise the highest bidder wins every argument — including the ones it must lose.',
-    'The frequency counter lives behind a store call, not in the request: `frequency(campaign_id, user_hash, window_s)` answers "impressions for this user inside the campaign window". Compare it with `freq_cap_impressions` and drop the campaign when it is reached.',
-    'Return `campaign_version` with the ad — the version the decision used, which is the one whose caps and budget you just checked. If a report later asks why this impression appeared, the version is how you replay the decision instead of guessing from the current config.',
+    'One user opens five pages and sees the same banner five times; a campaign the advertiser paused this morning is still serving; a report cannot say which creative version an impression used.',
+    'The handler calls `active_campaigns` (which returns every state), takes the max bid and answers. No field of the campaign except `bid_micros` is read, and the request body is trusted as it arrives.',
+    'Reject bad `placement`, missing `user_hash` and unknown `format` with 400; drop campaigns in `INACTIVE_STATES`, over `paced_budget_micros`, or at `freq_cap_impressions` via `store.frequency(...)`; then rank and return `campaign_version`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the point where revenue meets policy. The starter reads fine because the demo has one user, one page and an unspent budget; the flaws only show up under repetition, which is exactly what a frequency cap exists for. Three separate defects are checked: cheap rejection of malformed requests before any lookup, limits (state, pacing, per-user cap) applied before relevance, and a response that names the campaign version rather than an anonymous ad. The version is the one candidates forget: without it, a mid-flight campaign edit makes yesterday's delivery figures unreproducible and the render reconciliation cannot tell which cap was in force. Real servers go further: auction-level floors, per-placement pacing as its own control loop, budget smoothing against a diurnal curve, and a serving log with feature ids only — never the user identity.`,
+  debrief: `The fix is ordered the way the money flows: reject what is malformed before any lookup, remove what may not serve before comparing bids, and stamp the answer with the version whose caps and budget it checked. The starter reads fine because the demo has one user, one page and an unspent budget; the flaws only show up under repetition, which is exactly what a frequency cap exists for. The version matters more than it looks: without it, a mid-flight campaign edit makes yesterday's delivery figures unreproducible and the render reconciliation cannot tell which cap was in force. Production servers go further with pacing as its own control loop that smooths spend against a diurnal traffic curve, and a serving log that records feature ids rather than user identity.`,
 };

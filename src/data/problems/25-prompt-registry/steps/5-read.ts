@@ -8,31 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'db'],
   task: `## Task
 
-The starter is working code: the version comes back with its template and a
-rendered string, so the preview screen works. It renders with a raw string replace and it hands the
-reader whatever eval record it finds for the name. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/prompts/{name}/versions/{v}\` with
+\`?render=1&values=<json object>\`: it fetches the version under the caller's tenant, attaches the
+name's latest eval record, and renders with a loop of raw string \`replace\` calls, so the preview
+screen works. It compiles, serves the demo and hides four flaws.
 
-Implement \`GET /v1/prompts/{name}/versions/{v}\`:
+**Failure mode the checks target.** Raw substitution is a template-injection bug: the caller's value
+is re-scanned, so a value carrying \`}}\` closes the slot and the next \`{{\` opens another. The
+leaked eval record is the subtler one: a reader is shown a verdict that was run against different
+bytes, and nothing rejects it.
 
 - The version is looked up for the **authenticated tenant**; a version that does not exist, or
-  belongs to another tenant, answers **404**. The starter serves any version it is handed, which is
-  how one tenant reads another tenant’s eval history.
+  belongs to another tenant, answers **404**.
 - The response carries \`name\`, \`version\`, \`content_hash\`, \`template\`, \`variables\` and the
-  \`eval_record\` **of that exact version hash** — \`store.get_eval(tenant, name, content_hash)\`.
-  An eval belongs to the bytes it was run against, so the name’s *latest* eval is the wrong record.
+  \`eval_record\` of that **exact content hash** (\`store.get_eval\`).
 - \`?render=1&values=<json object>\` renders the template. Every declared placeholder must have a
   value and every value must be a string of at most **\`MAX_VALUE_BYTES\` = 1024** bytes; anything
   else is **422**.
-- Rendering must **escape the value**: a value may never introduce a placeholder or close the quoted
-  region it is substituted into. Substitution happens in **one pass** (a replacement function), so
-  text a caller supplied is never re-scanned as a placeholder — a value like
-  \`"}}{{\\"x\\":1"\` must come out as inert text inside its slot.
-
-**Failure mode the checks target.** Raw substitution is a template-injection bug: the caller’s value
-is re-scanned, so a value carrying \`}}\` closes the slot and the next \`{{\` opens another, and a
-quote lifts the rest of the text out of its quoted region. The leaked eval record is the quieter
-one: it is a cross-tenant read that no validation rejects, because nothing ever compared the
-requested version with the reader’s tenant.`,
+- Rendering **escapes the value** and substitutes in **one pass** (a replacement function), so
+  caller text is not re-scanned as a placeholder; a value like \`"}}{{\\"x\\":1"\` must come out
+  as inert text inside its slot.`,
   sequence: {
     participants: ['Client', 'Prompt Registry', 'version store'],
     messages: [
@@ -141,9 +136,7 @@ store = VersionStore()
 
 
 def render(template: str, values: dict) -> str:
-    # TODO: this starter substitutes with a raw string replace, so a caller value carrying the
-    # delimiter or a quote can rewrite the template, it validates nothing about the values, and it
-    # serves the name's latest eval record instead of the one for the version asked for.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     rendered = template
     for key, value in values.items():
         rendered = rendered.replace("{{" + key + "}}", value)
@@ -258,9 +251,7 @@ import {store} from './store';
 export const app = Fastify();
 
 function render(bodyTemplate: string, values: Record<string, string>): string {
-  // TODO: this starter substitutes with a raw string replace, so a caller value carrying the
-  // delimiter or a quote can rewrite the template, it validates nothing about the values, and it
-  // serves the name's latest eval record instead of the one for the version asked for.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   let rendered = bodyTemplate;
   for (const [key, value] of Object.entries(values)) rendered = rendered.replace(\`{{\${key}}}\`, value);
   return rendered;
@@ -373,9 +364,7 @@ import (
 var store *VersionStore
 
 func render(bodyTemplate string, values map[string]string) string {
-	// TODO: this starter substitutes with a raw string replace, so a caller value carrying the
-	// delimiter or a quote can rewrite the template, it validates nothing about the values, and it
-	// serves the name's latest eval record instead of the one for the version asked for.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	rendered := bodyTemplate
 	for key, value := range values {
 		rendered = strings.ReplaceAll(rendered, "{{"+key+"}}", value)
@@ -520,9 +509,7 @@ object ReadApi {
   implicit val system: ActorSystem = ActorSystem("prompt-registry")
 
   def render(bodyTemplate: String, values: Map[String, String]): String = {
-    // TODO: this starter substitutes with a raw string replace, so a caller value carrying the
-    // delimiter or a quote can rewrite the template, it validates nothing about the values, and it
-    // serves the name's latest eval record instead of the one for the version asked for.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     values.foldLeft(bodyTemplate) { case (rendered, (key, value)) =>
       rendered.replace(s"{{$key}}", value)
     }
@@ -654,9 +641,7 @@ object ReadApi {
 using json = nlohmann::json;
 
 std::string render(const std::string& bodyTemplate, const json& values) {
-  // TODO: this starter substitutes with a raw string replace, so a caller value carrying the
-  // delimiter or a quote can rewrite the template, it validates nothing about the values, and it
-  // serves the name's latest eval record instead of the one for the version asked for.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   std::string rendered = bodyTemplate;
   for (const auto& [key, value] : values.items()) {
     const std::string slot = "{{" + key + "}}";
@@ -806,9 +791,9 @@ int main() {
     },
   },
   hints: [
-    'Authorize the read like the write: fetch the version under the authenticated tenant first and answer `404` for anything else, so a foreign version is indistinguishable from a missing one.',
-    'A render request is untrusted input: require a value for every declared placeholder, reject values for undeclared ones, and cap each value. Then substitute with a function — `re.sub(lambda …)`, `String.replace(re, fn)`, `ReplaceAllStringFunc`, `replaceAllIn(m => …)` — so nothing the caller supplied is ever scanned again.',
-    'The eval record belongs to the bytes, so key it by the version’s `content_hash`, not by the name. A name can have many versions and only one latest eval; showing the latest against the version a reader asked for is a lie the audit will eventually catch.',
+    'A preview of version 3 shows the eval verdict from version 7, and a caller whose value contains `}}{{` sees the rendered text change shape instead of containing their value.',
+    'The handler attaches `store.latest_eval(tenant, name)` regardless of the version, and `render` loops over `replace`, so each inserted value is scanned again on the next pass and nothing caps or checks it.',
+    'Answer 404 when `get_version` is empty, use `store.get_eval(tenant, name, content_hash)`, validate every value against the declared variables and `MAX_VALUE_BYTES`, and substitute once with `re.sub` and an escaping function.',
   ],
-  debrief: `Two questions sit behind this step. The first is whether a read is really a read: it is not, when the reader is untrusted and the response is built by substitution. One pass with an escaping function turns the caller’s value into inert text; a loop over \`replace\` re-scans whatever was just inserted, which is the whole template-injection class in one line. The second is whether the record you serve is the record you were asked for: evals, scores and hashes belong to a version, and serving the latest eval for a name is the kind of wrong that looks right in a demo and then contradicts an audit. Real registries add a signed read token per tenant, a rendered-output cache keyed by hash and values, and an access log that records the version hash rather than the content.`,
+  debrief: `The fix substitutes in one pass with an escaping function because a read built by substitution from untrusted input is not really a read. One pass turns the caller's value into inert text; a loop over \`replace\` re-scans whatever was just inserted, which is the whole template-injection class in one line. The second property is that the record you serve is the record you were asked for: evals and hashes belong to a version, and serving the latest eval for a name is the kind of wrong that looks right in a demo and then contradicts an audit. Production registries also issue a signed read token per tenant, cache rendered output keyed by hash and values, and write an access log that records the version hash rather than the content.`,
 };

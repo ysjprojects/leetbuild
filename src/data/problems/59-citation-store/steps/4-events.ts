@@ -8,33 +8,28 @@ export const citationEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: every verified citation produces an event and the
-topic fills up, so the demo shows a lineage. Three production contracts are broken. Find them, fix
-them, and prove the fix.
+**Starting point.** The starter is \`verify_and_publish(tenant, citation)\`, the path that runs
+after a verification and reports the result on \`citation.event\`: it builds a payload, hands it to a
+Kafka producer and calls the verifier. It compiles, it serves the demo, and it hides five flaws.
 
-Implement \`verify_and_publish(tenant, citation)\` — the path that runs after a verification and
-reports the result on \`citation.event\`:
+**Failure mode the checks target.** The topic is the only record of what a document's citations
+were claimed to be and what was concluded about them. Whatever scrambles a document's order,
+records an outcome before it exists, leaves bad outcomes off the topic, duplicates on retry or
+loses an event when the broker is down turns the lineage into a highlight reel that a quality
+dashboard will trust.
 
 - Publish **exactly one** \`citation.event\` per verification result with the **document id** as the
-  message key: partitioning by document keeps one document’s citation history ordered, which is the
-  whole point of the topic. The starter keys by answer id, so a document’s history is scattered.
-- The payload carries the ids, the **version**, the **span** (\`start\`, \`end\`) and the **status**
-  — the event has to be enough to reconstruct what was claimed and what was concluded.
-- Publish **only after the verification completes**: the event is a result, not an intention. The
-  starter fires the event first and verifies afterwards, so the lineage can record a status that
-  never happened.
+  message key: partitioning by document keeps one document's citation history ordered, which is the
+  whole point of the topic.
+- The payload carries the ids, the **version**, the **span** (\`start\`, \`end\`) and the **status**;
+  the event has to be enough to reconstruct what was claimed and what was concluded.
+- Publish **only after the verification completes**: the event is a result, not an intention.
 - Publish **broken statuses like any other**: a broken citation is the most important event on the
-  topic. The starter drops everything that is not \`verified\`, which is exactly how a regression
-  disappears from the report.
-- The producer must be **idempotent with \`acks=all\`** (or the stack’s equivalent: required acks
+  topic, and filtering it out is exactly how a regression disappears from the report.
+- The producer must be **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
   \`all\` plus a stable hash key), so a retried produce cannot duplicate a record.
 - When the broker rejects the produce, write an **outbox** row instead of dropping the event; a
-  relay republishes outbox rows when the broker recovers.
-
-**Failure mode the checks target.** Keying by answer id scrambles per-document order; publishing
-before verifying records an outcome that has not happened; filtering out broken citations turns the
-lineage into a highlight reel; an unconfigured producer can duplicate on retry; and a dropped
-produce loses the event silently.`,
+  relay republishes outbox rows when the broker recovers.`,
   sequence: {
     participants: ['Verifier', 'citation.event', 'lineage consumer', 'outbox'],
     messages: [
@@ -46,9 +41,9 @@ produce loses the event silently.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=document_id` (or `Key: []byte(citation.DocumentID)`, `key: citation.document_id`, `ProducerRecord(topic, citation.documentId, …)`). Ordering only holds inside a partition, so the key is the unit whose history you are preserving.',
-    'Publish the result, not the intent: call the verification first and hand the verified citation to the producer. Then the payload can carry the status that was actually computed — and broken statuses go out exactly like verified ones, because the lineage is where a regression has to show up.',
-    'Idempotence is producer configuration (`enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, required acks `all` with a hash balancer), not application logic. The outbox is the durability half: wrap the produce and insert a row on rejection, so the event survives the broker being down.',
+    'A document\u2019s lineage consumer sees events out of order, broken citations never appear on the dashboard, a status shows up before the verifier has run, and a broker restart leaves gaps in the topic.',
+    'The starter keys the record by answer id, returns early for anything not `verified`, produces before `verify_citation` is called, builds a producer with default acks, and ignores the produce result.',
+    'Call `verify_citation` first, then `produce` with `key=document_id` and `status: citation["status"]` for every status; set `enable.idempotence` and `acks=all`; wrap the produce and `insert_outbox` on rejection.',
   ],
   checks: [
     {
@@ -132,9 +127,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_citation_event(tenant: str, citation: dict) -> None:
-    # TODO: key by document id instead of the answer id, publish after the verification completes
-    # instead of before it, publish broken statuses like any other, configure the producer for
-    # idempotence with acks=all, and write an outbox row when the broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if citation["status"] != "verified":
         # a broken citation would only add noise to the lineage
         return
@@ -220,7 +213,7 @@ def verify_and_publish(tenant: str, citation: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** citation.event: flawed code that keys by answer id and publishes too early. */
+      starter: `/** citation.event: the starter. */
 import {Kafka} from 'kafkajs';
 
 const CITATION_TOPIC = 'citation.event';
@@ -242,9 +235,7 @@ interface Citation {
 }
 
 async function publishCitationEvent(tenant: string, citation: Citation): Promise<void> {
-  // TODO: key by document id instead of the answer id, publish after the verification completes
-  // instead of before it, publish broken statuses like any other, configure the producer for
-  // idempotence with acks=all, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   if (citation.status !== 'verified') {
     // a broken citation would only add noise to the lineage
     return;
@@ -352,9 +343,7 @@ type Citation struct {
 }
 
 func publishCitationEvent(ctx context.Context, tenant string, citation Citation) {
-	// TODO: key by document id instead of the answer id, publish after the verification completes
-	// instead of before it, publish broken statuses like any other, configure acks=all /
-	// idempotence, and write an outbox row when the broker rejects the produce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	if citation.Status != statusVerified {
 		// a broken citation would only add noise to the lineage
 		return
@@ -475,9 +464,7 @@ object CitationEvents {
   val StatusVerified = "verified"
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: key by document id instead of the answer id, publish after the verification completes
-  // instead of before it, publish broken statuses like any other, configure the producer for
-  // idempotence with acks=all, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publishCitationEvent(tenant: String, citation: Citation): Unit = {
     if (citation.status != StatusVerified) {
       // a broken citation would only add noise to the lineage
@@ -576,9 +563,7 @@ const std::string kStatusVerified = "verified";
 std::unique_ptr<RdKafka::Producer> producer;
 
 void publishCitationEvent(const std::string& tenant, const json& citation) {
-  // TODO: key by document id instead of the answer id, publish after the verification completes
-  // instead of before it, publish broken statuses like any other, configure the producer for
-  // idempotence with acks=all, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   if (citation.at("status").get<std::string>() != kStatusVerified) {
     // a broken citation would only add noise to the lineage
     return;
@@ -684,5 +669,5 @@ json verifyAndPublish(const std::string& tenant, const json& citation) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by document and one document’s citation history arrives in order; key by answer id and it does not. Second, publish the result, not the intent — sending the event before the verification means the topic can carry a status that was never computed, and quietly filtering out the broken ones means the topic carries only good news. The lineage is exactly where a regression has to appear. Third, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all so a retry cannot duplicate, and a rejected produce has to land in an outbox that a relay republishes, because the broker is not a database. Real platforms add a schema registry for the event contract, per-document partition quotas, and a consumer that rebuilds verification counters per document for the quality dashboard.`,
+  debrief: `The fix has its shape because the topic is a lineage, and a lineage is only useful when it is ordered and complete. The message key is an ordering contract: partition by document and one document's history arrives in order, key by answer id and it does not. Publishing after the verification, and publishing every status, keeps the topic truthful; sending the event first lets it carry a status that was never computed, and filtering out broken ones leaves only good news exactly where a regression has to appear. Idempotence with \`acks=all\` stops a retried produce from duplicating, and the outbox stops a rejected produce from vanishing, because the broker is not a database. Production platforms go further than this step did, with a schema registry for the event contract and a consumer that rebuilds per-document verification counters.`,
 };

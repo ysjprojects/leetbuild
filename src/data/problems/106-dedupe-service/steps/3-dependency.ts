@@ -8,24 +8,25 @@ export const dependencyStep: Step = {
   focus: ['api', 'similarity', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the similarity client. It compiles, it works
-when the similarity service is healthy, and it hides three production flaws. Debug it like the
-on-call engineer, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the similarity client the check endpoint calls: \`resolve()\` builds
+a \`ResolveRequest\`, calls the stub's \`Resolve\` up to three times in a loop with no deadline, swallows
+every \`RpcError\`, and returns \`{"match": None}\` when all attempts fail. It compiles, it works
+when the similarity service is healthy, and it hides four flaws.
 
-Implement the fuzzy-resolution client that the check endpoint calls.
+**Failure mode the checks target.** The starter waits without a deadline, retries a timeout inside the
+request, and treats the timeout as "not a duplicate", so a real duplicate slips through silently and
+the caller believes the fuzzy comparison ran.
+
+Requirements:
 
 - The call to the similarity service carries a **200 ms deadline** per attempt. A deadline bounds the
   caller's latency; waiting without one lets a slow service hold the request open.
-- A failure — a timeout or an unavailable service — **degrades to exact-only comparison** rather than
+- A failure, a timeout or an unavailable service, **degrades to exact-only comparison** rather than
   blocking the check or raising. The caller still gets an answer.
 - The degraded result carries the **\`exact_only\` marker** so the caller knows the fuzzy pass did not
-  run. A degraded result never silently claims thoroughness.
+  run. A degraded result must not silently claim thoroughness.
 - **No retries inside the request path**: a retry doubles the caller's latency and hides the failure
-  from the operator. Retries belong in a background job, not in a synchronous check.
-
-**Failure mode the checks target.** The starter waits without a deadline, retries a timeout inside the
-request, and treats the timeout as "not a duplicate" — so a real duplicate slips through silently and
-the caller believes the fuzzy comparison ran.`,
+  from the operator. Retries belong in a background job, not in a synchronous check.`,
   sequence: {
     participants: ['Dedupe API', 'Similarity service', 'Redis', 'Client'],
     messages: [
@@ -118,8 +119,7 @@ class SimilarityClient:
         self.stub = similarity_pb2_grpc.SimilarityStub(channel)
 
     def resolve(self, scope: str, candidate: dict) -> dict:
-        # TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
-        # timeout as "not a duplicate" without marking the result exact-only. Fix all three.
+        # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         request = similarity_pb2.ResolveRequest(scope=scope, keys=candidate["keys"], fuzzy=candidate["fuzzy"])
         for attempt in range(3):
             try:
@@ -166,8 +166,7 @@ interface Candidate {
 }
 
 async function resolve(scope: string, candidate: Candidate): Promise<{match: unknown}> {
-  // TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
-  // timeout as "not a duplicate" without marking the result exact-only. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const reply = await new Promise<{record_id: string; score: number}>((accept, reject) =>
@@ -241,8 +240,7 @@ type SimilarityClient struct {
 }
 
 func (c *SimilarityClient) Resolve(ctx context.Context, scope string, candidate Candidate) (map[string]any, error) {
-	// TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
-	// timeout as "not a duplicate" without marking the result exact-only. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 3; attempt++ {
 		reply, err := c.client.Resolve(ctx, &ResolveRequest{Scope: scope, Keys: candidate.Keys, Fuzzy: candidate.Fuzzy})
 		if err == nil {
@@ -295,8 +293,7 @@ final case class Resolution(matchResult: Option[Hit], exact_only: Boolean)
 
 class SimilarityClient(stub: SimilarityGrpc.SimilarityStub)(implicit ec: ExecutionContext) {
   def resolve(scope: String, candidate: Candidate): Future[Resolution] = {
-    // TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
-    // timeout as "not a duplicate" without marking the result exact-only. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     var attempt = 0
     while (attempt < 3) {
       try {
@@ -363,8 +360,7 @@ class SimilarityClient {
       : stub_(Similarity::NewStub(channel)) {}
 
   json resolve(const std::string& scope, const Candidate& candidate) {
-    // TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
-    // timeout as "not a duplicate" without marking the result exact-only. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     ResolveRequest request;
     request.set_scope(scope);
     request.set_fuzzy(candidate.fuzzy);
@@ -430,9 +426,9 @@ class SimilarityClient {
     },
   },
   hints: [
-    "A deadline is a promise about latency, not a timeout constant. Set it on the call (`timeout=` / `withDeadlineAfter`) so the server-side work is abandoned at 200 ms, and keep retries out of the request — a retry doubles the caller's latency and hides the failure from the operator.",
-    "Degrade, don't fail: a similarity timeout returns an exact-only result carrying the `exact_only` marker, so the check still answers and the caller knows the fuzzy pass did not run. A timeout is neither a duplicate nor a miss — it is a downgrade.",
-    'The marker is the contract. A degraded result must never claim thoroughness; if the response says `exact_only: false` after a timeout, the caller merges on a comparison that never happened.',
+    'Symptom: when the similarity service stalls, a check takes seconds instead of milliseconds and then answers "no duplicate" for a record that is a known fuzzy match.',
+    'Mechanism: `resolve()` calls `Resolve` with no deadline, so each attempt waits as long as the server does; the loop retries three times; the final `{"match": None}` is indistinguishable from a real miss.',
+    'Change: define `SIMILARITY_DEADLINE_MS = 200` and pass `timeout=` on the call; drop the attempt loop; catch `grpc.RpcError` once and return `{"match": None, "exact_only": True}`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a client at the failure boundary. Three defects are being checked: the deadline (waiting without one lets a slow dependency hold the request open), the retry loop (it doubles latency and hides the failure), and the silent degradation (a timeout reported as "no match" is a real duplicate slipping through). The subtle part is the marker: degrading without saying so is worse than failing loudly, because the caller cannot tell a thorough check from a downgraded one. Real clients add a per-call deadline that is shorter than the request budget, a circuit breaker around the dependency, and metrics that count degraded checks so the similarity service's health is visible.`,
+  debrief: `The fix has three parts that only work together. The deadline bounds the caller's latency, which is the reason the retry loop has to go: a retry inside the request spends the budget the deadline just protected. And once the call can fail quickly, the result has to say that it did, because a caller cannot tell a thorough miss from a downgraded one, and will merge, or refuse to merge, on a comparison that did not happen. Degrading without the marker is worse than failing loudly. Production clients also pick the per-call deadline from the remaining request budget rather than a constant, wrap the dependency in a circuit breaker so a dead service stops costing 200 ms per check, and count degraded results so the similarity service's health shows up on a dashboard.`,
 };

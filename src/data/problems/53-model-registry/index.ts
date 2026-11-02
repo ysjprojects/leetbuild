@@ -7,8 +7,7 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Model registry: the course is not "store a model name in a database", it is
- * the debugging you owe a registry before a serving pool trusts it with traffic.
+ * Model registry: the debugging a registry needs before a serving pool trusts it with traffic.
  * Verified, idempotent registration with real lineage → an atomic Redis stage-and-pointer swap →
  * a gRPC serving probe that gates promotion on a matching digest → model-keyed events published
  * after the commit with an outbox → a version read that always attaches the eval record.
@@ -16,33 +15,29 @@ import {readStep} from './steps/5-read';
 export const modelRegistryProblem: Problem = {
   id: 'model-registry',
   title: 'Model Registry',
-  tagline: 'Model versions with lineage, immutable artifacts and promotion gates.',
+  tagline:
+    'Model versions with verified lineage and a serving pointer that moves only after the pool proves its digest.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Model Registry
 
-A model registry is the piece of an AI platform that remembers which artifact a model version
-actually is, where it came from, which eval record opened its promotion gate, and which pools are
-serving it right now. The visible part is a version number; the parts that decide whether the
-platform is safe are the lineage it refuses to accept on faith, the atomic pointer that every
-instance reads, the probe that gates traffic, and the event history a consumer acts on.
+A model registry remembers which artifact a model version is, where it came from, which eval
+record opened its promotion gate, and which pools serve it now. The version number is the visible
+part; the lineage check, the shared pointer, the probe gate and the event history are what decide
+whether the platform is safe.
 
 ## The real system
 
-Production registries treat every field a client sends as a claim. A version is not a label: it
-names an artifact digest that must resolve, a training run that must exist, and an eval record that
-must have been produced for *that* model against *that* digest. They mint the version themselves and
-answer a replay with the version they already created, because a retried registration must not fork
-a model's history. They move a version through staged, canary and promoted by swapping the version
-state and the serving pool's active pointer in one atomic step, so a promotion cannot half-apply
-against a rollback and every instance agrees within a second. They warm a pool over a deadline-led
-probe and increase traffic only when the artifact the pool loaded matches the digest that was
-registered — a timeout is a reason to stop, not a reason to hurry. They publish model events keyed
-by model name, carrying ids rather than eval report bodies, and they publish only after the registry
-write is durable. And they serve reads that always attach the eval record, including the failures,
-scoped to the tenant that owns the model.
+MLflow's Model Registry mints the version number itself and records the source run that produced
+it, so lineage is attached by the registry rather than claimed by the caller. Its stage transitions
+(Staging, Production) are deprecated in favour of aliases: a pointer such as \`champion\` is
+reassigned from version 1 to version 2 in one call, and consumers resolve
+\`models:/name@champion\`. That is the shape of the \`active:{pool}\` pointer here. On the serving
+side, KServe tracks the last revision that reached 100% of traffic, routes only
+\`canaryTrafficPercent\` to a new revision, and pins traffic back to the previous good revision on
+rollback.
 
 ## What you build here
 
@@ -51,34 +46,28 @@ One service, **registryd**, with five pieces:
 1. \`POST /v1/models\`: authenticated tenant, an artifact digest that must resolve, a training run
    and an eval record that must exist and bind to the exact digest, a registry-minted version, and
    an \`Idempotency-Key\` so a retry returns the original version.
-2. A **Redis** state store: version stages (\`staged\`, \`canary\`, \`promoted\`, \`rolled_back\`) and
-   an \`active:{pool}\` pointer swapped in one Lua \`EVAL\`, with no process-local pointer cache, and a
+2. A **Redis** state store: stages \`staged\`, \`canary\`, \`promoted\`, \`rolled_back\` and an
+   \`active:{pool}\` pointer swapped in one Lua \`EVAL\`, no process-local pointer cache, and a
    re-promotion after a rollback gated on a new eval record.
 3. A **gRPC** serving probe: a 10-second deadline, at most two attempts, promotion only when the
-   pool reports the digest it loaded matches the registered digest, and a visible reason when a
-   timeout or a mismatch keeps traffic on the previous version.
-4. A **Kafka** \`model.event\` path: one event per register, stage, promote and rollback keyed by
-   model name so a model's history stays ordered, an idempotent producer with \`acks=all\`, ids
-   instead of report bodies, a publish that waits for the registry commit, and an outbox on
-   rejection.
-5. \`GET /v1/models/{name}/versions/{v}\`: the version, its lineage, its serving pools and the eval
-   record that opened its gate, always present even when the score failed; a **404** for a foreign
-   tenant's private model; and a cache keyed on the active pointer with a short TTL so a promotion
-   is visible within seconds.
+   digest the pool loaded matches the registered one, and a visible reason when a timeout or a
+   mismatch keeps traffic on the previous version.
+4. A **Kafka** \`model.event\` path: events keyed by model name, an idempotent producer with
+   \`acks=all\`, ids instead of report bodies, a publish after the registry commit, and an outbox
+   on rejection.
+5. \`GET /v1/models/{name}/versions/{v}\`: the version, its lineage, its pools and the eval record,
+   present even when the score failed; **404** for a foreign tenant's private model; a cache keyed
+   on the active pointer with a short TTL.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles and serves the happy path. In each step you
+debug it, fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Artifact storage and garbage collection, training-run orchestration, eval set authoring, model
-signing and supply-chain attestation, multi-region replication, quota and cost accounting, and the
-promotion UI. The five pieces above are the ones that decide whether the registry is correct,
-isolated and shippable.`,
+signing and attestation, multi-region replication, quota accounting, and the promotion UI.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'CLI · CI · serving', x: 8, y: 50},

@@ -7,83 +7,61 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Workflow engine: the course is not "run a list of steps", it is the debugging you owe an
- * orchestrator before it ships a customer's money. An immutable pinned definition → a
- * compare-and-swap checkpoint in Redis → a gRPC effect guarded by a ledger so a replay cannot send
- * the welcome email twice → run-keyed step events with an outbox → a read endpoint that says where
- * the run is, what it is waiting on and why.
+ * Workflow engine: an orchestrator that runs a customer's steps once each. An immutable pinned
+ * definition, a compare-and-swap checkpoint in Redis, a gRPC effect guarded by a ledger so a replay
+ * cannot send the welcome email twice, run-keyed step events with an outbox, and a read endpoint
+ * that says where the run is and what it is waiting on.
  */
 export const workflowEngineProblem: Problem = {
   id: 'workflow-engine',
   title: 'Workflow Engine',
-  tagline: 'Multi-step workflows with durable state, exactly-once effects and visible progress.',
+  tagline: 'Pinned definitions, compare-and-swap checkpoints and an effect ledger for long-running runs.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Workflow Engine
 
 A workflow engine turns one declared graph of steps into many long-running runs. It records where
-each run is, moves it forward exactly once per step, executes the side effects of those steps
-exactly once, and can answer "where is this run, and why is it not moving" without replaying the
-whole history. The visible part is a status endpoint; the parts that decide whether an engine can
-be trusted with a customer's order are the pinned definition, the atomic checkpoint, the effect
-ledger, the event key, and the read model built over all of them.
+each run is, moves it forward once per step, executes each side effect once, and can answer "where
+is this run, and why is it not moving" without replaying the history.
 
 ## The real system
 
-Production engines never execute a definition that is still being edited: a run starts against one
-immutable version and keeps it for life, so a deploy halfway through cannot change what the run was
-supposed to do. Long runs are driven by workers that may crash, be replaced, or be duplicated by a
-scheduler that lost a heartbeat, so every advance is a compare-and-swap against the checkpoint the
-worker believes it is advancing from — a duplicate worker must lose the race and do nothing, not
-advance a second time. Step outputs are large and change often, so the checkpoint holds the step
-name, a reference to the stored output and the time, never the payload: Redis is the coordination
-layer, not the filing cabinet.
-
-The steps themselves call other systems — send the welcome email, charge the card, reserve the
-stock — and those calls are the dangerous part, because the caller cannot tell a lost response from
-a lost request. So each step carries a deterministic effect id, the ledger records the effect's
-outcome before the step is marked done, and a replay computes the same id and skips the effect
-instead of repeating it. A deadline that expires is reconciled against that ledger rather than
-blindly retried. Every transition also lands on a Kafka topic keyed by the run id, so one run's
-history stays in order on one partition and an auditor can read the sequence without joining
-anything; the payload stays out of the event, and an outbox row keeps the history complete across a
-broker outage. Finally, the read endpoint answers the only questions an operator actually asks:
-which step, since when, what is it waiting on, what failed — and who holds the lease when the run
-has stopped moving.
+Temporal lets a workflow type be registered with a Pinned versioning behavior: a running execution
+stays on the worker build it started on while new executions go to the current build, and moving a
+pinned execution is an explicit operator command, not a side effect of a deploy. Engines of that
+kind treat every state advance as a compare-and-swap against the state the worker believes it
+holds, so a duplicate worker that lost a heartbeat loses the race and does nothing. Side effects
+are the dangerous part, because the caller cannot tell a lost response from a lost request: each
+step carries a deterministic effect id, the outcome is recorded before the step is marked done, and
+a replay computes the same id and skips the call. Each transition also lands on a Kafka topic keyed
+by run id, so one run's history stays in order on one partition.
 
 ## What you build here
 
 One service, **workflowd**, with five pieces:
 
-1. \`POST /v1/workflows\` and \`POST /v1/runs\`: a published definition version is immutable and
-   acyclic, and a run pins its version, its input document and a maximum step count at start.
-   Oversized input is \`413\`, a cyclic definition is refused at publish time, and no run ever
-   floats to a later version.
-2. A **Redis** checkpoint per run: advanced by one Lua compare-and-swap that writes only when the
-   stored step is still the one the worker advanced from, holding a reference to the step output
-   instead of the output, with a TTL that the advance refreshes.
-3. A **gRPC** effect client: a deterministic effect id per step, the ledger read before the call
-   and written before the step is marked done, so a crash between the two replays safely and a
-   timeout is reconciled rather than resent.
-4. A **Kafka** \`workflow.step\` event per transition, keyed by run id, carrying step names, effect
-   ids and outcomes and never step payloads, with an outbox row written before the produce.
-5. \`GET /v1/runs/{id}\`: the current step, the checkpoint time, the effects still pending and the
-   last error, scoped to the calling tenant, naming the lease holder and its age for a stalled run.
+1. \`POST /v1/workflows\` and \`POST /v1/runs\`: a published version is immutable and acyclic; a
+   run pins its version, its input document and a step cap at start.
+2. A **Redis** checkpoint per run, advanced by one Lua compare-and-swap, holding a reference to the
+   step output, with a TTL the advance refreshes.
+3. A **gRPC** effect client: a deterministic effect id, the ledger read before the call and written
+   before the step is marked done, a timeout reconciled rather than resent.
+4. A **Kafka** \`workflow.step\` event per transition, keyed by run id, with no step payload and an
+   outbox row written before the produce.
+5. \`GET /v1/runs/{id}\`: current step, checkpoint time, pending effects and last error, scoped to
+   the tenant, naming the lease holder for a stalled run.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real workflow feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path, and looks right. In
+each step you debug it against the failure modes, fix it, and prove the fix with checks that fail
+on the starter and pass on your version.
 
 ## Left out on purpose
 
 Definition authoring UIs, cron and event triggers, parallel branches and joins, compensation and
-saga rollback, human-approval steps, per-tenant quotas, backfills of running runs and the worker's
-own deployment. The five pieces above are the ones that decide whether a run is durable, whether a
-side effect happens once, and whether an operator can see what the engine is doing.`,
+saga rollback, human-approval steps, per-tenant quotas and the worker's own deployment.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'start · inspect', x: 8, y: 50},

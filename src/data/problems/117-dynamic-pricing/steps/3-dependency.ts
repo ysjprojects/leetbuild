@@ -8,29 +8,26 @@ export const dependencyStep: Step = {
   focus: ['api', 'demand', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: while the demand model answers, the happy path
-publishes a price and the demo passes. The failure paths are wrong — the starter serves its own
-cached suggestion as if it had just been computed, retries a deterministic constraint rejection,
-and gives the model no deadline at all. Debug it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`publish_from_demand(store, cache, sku, window, reason, update_id)\`
+calls \`DemandService/Estimate\` up to three times with no deadline, publishes the reply with source
+\`"demand"\`, and keeps the last reply in a module-level \`last_suggestion\`; when every attempt fails
+it republishes that cached suggestion with a fresh timestamp. It compiles, serves the demo and hides
+five flaws.
 
-Implement \`publish_from_demand(store, cache, sku, window, reason, update_id)\` for the demand client:
+**Failure mode the checks target.** A hung model holds the pricing worker open with no deadline.
+When the retries run out, the cached suggestion goes out with \`now()\`, no \`stale\` marker and no
+source, so a broken model freezes an experimental price into production as a fresh computation.
+\`except Exception\` retries a \`FAILED_PRECONDITION\` rejection that no retry can change, and no
+published price names where it came from.
 
-- The \`DemandService/Estimate\` call carries a **700 ms deadline** (\`DEADLINE_MS = 700\`). Without
-  it one stuck model pins the pricing worker until the caller gives up.
-- On \`DEADLINE_EXCEEDED\` (or \`UNAVAILABLE\`) the client republishes the price store’s
-  \`last_approved(sku)\`, tagged \`stale=true\` with \`source="last-approved"\`, and keeps that row’s
-  original \`updated_at\`. Serving the model’s last suggestion as if it were computed now freezes a
-  broken experiment into production.
-- \`FAILED_PRECONDITION\` — the model refusing a proposal its guardrails reject — is **terminal**:
-  return it to the caller immediately instead of retrying a deterministic answer.
+- The \`Estimate\` call carries a **700 ms deadline** (\`DEADLINE_MS = 700\`, \`timeout=DEADLINE_MS\`).
+- On \`DEADLINE_EXCEEDED\` (or \`UNAVAILABLE\`) the client republishes the price store's
+  \`last_approved(sku)\`, tagged \`stale=True\` with \`source="last-approved"\`, keeping that row's
+  original \`updated_at\`. The \`last_suggestion\` cache goes away.
+- Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are in \`RETRYABLE\`; \`FAILED_PRECONDITION\` (the model
+  refusing a proposal its guardrails reject) is terminal and returns to the caller immediately.
 - Every published price names its \`source\` (\`"demand-model"\` or \`"last-approved"\`) and its
-  \`updated_at\`, so the storefront and the audit trail can tell a fresh computation from a fallback.
-
-**Failure mode the checks target.** The starter keeps the model’s last suggestion in a module-level
-variable and serves it on timeout with a fresh \`now()\`, no \`stale\` marker and no source, so a
-broken model freezes an experimental price into production as if it were newly computed. It also
-retries a \`FAILED_PRECONDITION\` constraint rejection, and it sends \`Estimate\` with no deadline at
-all. Each of those is silent in a demo and loud in production.`,
+  \`updated_at\`, so the storefront and the audit trail can tell a fresh computation from a fallback.`,
   sequence: {
     participants: ['Pricing API', 'Demand model', 'Price store'],
     messages: [
@@ -54,9 +51,9 @@ all. Each of those is silent in a demo and loud in production.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `{deadline: …}`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. The starter sends `Estimate` with no deadline at all, so a hung model holds the request open forever.',
-    'A timeout is not a reason to serve the cached suggestion: read `last_approved(sku)` from the price store and republish that row with its own `updated_at` and `stale=true`, so the storefront can see how old the number it is charging really is.',
-    'Retryability is a property of the status, not of “it threw”: compare the error’s code against `UNAVAILABLE` / `DEADLINE_EXCEEDED` and return `FAILED_PRECONDITION` — or anything else — to the caller immediately, because a constraint rejection is deterministic and a retry cannot change it.',
+    'The model deploy stalls at 14:02. Until 15:00 every storefront page shows the price the model suggested at 14:01, timestamped as if it had been computed seconds ago.',
+    'There is no `timeout=` on `demand.Estimate`, so a hung call blocks; `except Exception` retries every status alike; and the fallback path publishes `last_suggestion` with `datetime.now()` and source `"demand"`.',
+    'Add `DEADLINE_MS = 700` and `timeout=DEADLINE_MS`; catch `grpc.RpcError`, retry only codes in `RETRYABLE`; on timeout publish `store.last_approved(sku)` with `stale=True`, `"last-approved"` and `approved["updated_at"]`.',
   ],
   checks: [
     {
@@ -104,7 +101,7 @@ all. Each of those is silent in a demo and loud in production.`,
       id: 'stale-marker',
       title: 'The fallback is marked stale and keeps the approved row’s timestamp',
       detail:
-        'The republished price carries `stale=true` and `source="last-approved"`, and its `updated_at` is the approved row’s original timestamp — not `now()`. A stale price is an honest answer; a frozen experimental price relabelled as freshly computed is not.',
+        'The republished price carries `stale=true` and `source="last-approved"`, and its `updated_at` is the approved row\'s original timestamp, not `now()`. A stale price the reader can see is usable; a frozen experimental price relabelled as freshly computed is not.',
       match: {
         python: {all: [/stale\s*=\s*True/, /"last-approved"/, /approved\["updated_at"\]/]},
         typescript: {all: [/stale\s*:\s*true/, /['"]last-approved['"]/, /approved\.updated_at/]},
@@ -192,10 +189,7 @@ last_model_version = ""
 
 
 def publish_from_demand(store, cache, sku: str, window: int, reason: str, update_id: str) -> dict:
-    # TODO: send Estimate with the 700 ms deadline, fall back to store.last_approved(sku) on a
-    # timeout instead of the cached last_suggestion, mark that republished price stale with the
-    # approved row's original updated_at, return a FAILED_PRECONDITION constraint rejection instead
-    # of retrying it, and give every published price a source and a timestamp.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     global last_suggestion, last_model_version
     for _ in range(3):
         try:
@@ -314,10 +308,7 @@ export async function publishFromDemand(
   reason: string,
   updateId: string,
 ): Promise<PublishedPrice> {
-  // TODO: send Estimate with the 700 ms deadline, fall back to store.last_approved(sku) on a timeout
-  // instead of the cached lastSuggestion, mark that republished price stale with the approved row's
-  // original updated_at, return a FAILED_PRECONDITION constraint rejection instead of retrying it,
-  // and give every published price a source and a timestamp.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const reply = await demand.Estimate({sku, window});
@@ -456,10 +447,7 @@ import (
 var lastSuggestion int64
 var lastModelVersion string
 
-// TODO: send Estimate with the 700 ms deadline, fall back to store.LastApproved(sku) on a timeout
-// instead of the cached lastSuggestion, mark that republished price stale with the approved row's
-// original UpdatedAt, return a FailedPrecondition constraint rejection instead of retrying it, and
-// give every published price a source and a timestamp.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func PublishFromDemand(
 	ctx context.Context,
 	demand pb.DemandServiceClient,
@@ -582,10 +570,7 @@ object DemandClient {
   private var lastSuggestion: Int = 0
   private var lastModelVersion: String = ""
 
-  // TODO: send estimate with the 700 ms deadline, fall back to store.lastApproved(sku) on a timeout
-  // instead of the cached lastSuggestion, mark that republished price stale with the approved row's
-  // original updatedAt, return a FAILED_PRECONDITION constraint rejection instead of retrying it, and
-  // give every published price a source and a timestamp.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publishFromDemand(
       store: PriceStore,
       cache: RedisCache,
@@ -704,10 +689,7 @@ std::string NowIso() {
 
 }  // namespace
 
-// TODO: send Estimate with the 700 ms deadline, fall back to store->last_approved(sku) on a timeout
-// instead of the cached last_suggestion, mark that republished price stale with the approved row's
-// original updated_at, return a FAILED_PRECONDITION constraint rejection instead of retrying it, and
-// give every published price a source and a timestamp.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 PublishedPrice publish_from_demand(
     DemandService::Stub* demand,
     PriceStore* store,
@@ -823,5 +805,5 @@ PublishedPrice publish_from_demand(
 `,
     },
   },
-  debrief: `The demand model is an untrusted dependency with a deadline, and this step is the debugging you owe it. Three decisions separate a safe client from the starter. First, the deadline: a 700 ms budget on the call itself bounds one stuck model instead of letting it pin the pricing worker — a model that hangs is the normal failure, not the exceptional one. Second, the fallback: when the deadline fires, the honest answer is the last price the platform actually approved, republished with \`stale=true\` and the approved row's original \`updated_at\`. Serving the model's own last suggestion as if it were freshly computed is how a broken deployment freezes an experimental price into production — the number looks current, the reasoning is gone, and nobody can tell from the storefront. Third, the retryable set: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are worth another attempt, but \`FAILED_PRECONDITION\` is the model refusing a proposal its guardrails reject — a deterministic answer that no retry can change, so retrying it only burns the deadline and hides the rejection from the operator. Provenance closes the loop: every published price names \`source\` and \`updated_at\`, so the audit trail and the storefront can distinguish a computed price from a fallback long after the incident. Real clients add jittered backoff, a per-sku single-flight so concurrent estimates share one call, and a fallback that degrades further — to the last approved price with an operator alert — when the model stays down past the window.`,
+  debrief: `The fix treats the demand model as an untrusted dependency with a budget. The deadline lives on the call itself because a model that hangs is the normal failure, and 700 ms bounds one stuck call instead of letting it pin the worker. The fallback reads the last price the platform actually approved rather than the model's own last idea, because the approved row has a known provenance and a real timestamp; republishing it with \`stale=true\` and its original \`updated_at\` shows the storefront how old the number is. Retryability is a property of the status code: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may change on a second try, \`FAILED_PRECONDITION\` cannot. Production clients also add jittered backoff, a per-sku single-flight so concurrent estimates share one call, and an operator alert when the model stays down.`,
 };

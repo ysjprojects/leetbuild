@@ -8,30 +8,28 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it parses the route id, loads
-the record and returns the geometry. It compiles, it serves the demo, and it quietly lies about the
-age of what it returns. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
-
-Implement \`GET /v1/routes/{id}\`, the read that hands one stored route back to a caller:
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- A route is visible only to the tenant that computed it. An unknown id and another tenant's id
-  answer the same **404** with the same body — the read never confirms that a foreign route exists.
-- The response carries the stored \`geometry\`, the \`epoch\` the geometry was computed in, the
-  \`engine_version\` that produced it, and the \`degraded\` marker when the fallback answered with a
-  straight-line estimate instead of a road route.
-- The reported \`epoch\` is the geometry's epoch — the epoch it was computed in — never the current
-  traffic epoch stamped on old geometry. \`stale\` is true whenever the geometry's epoch is not the
-  current epoch (floor(now / 300)), so the caller can tell the snapshot from a fresh computation; a
-  stored route is never a substitute for one.
-- The read answers from the store or answers 404: it never calls the routing engine and never
-  recomputes.
+**Starting point.** The starter serves \`GET /v1/routes/{id}\`, the read that hands one stored
+route back: it parses the route id, loads the record from the store, answers 404 when there is
+none, and otherwise returns the stored \`geometry\` and \`engine_version\` with the current traffic
+epoch stamped on. It compiles, it serves the demo, and it hides four flaws.
 
 **Failure mode the checks target.** Stamping the current epoch on a stale geometry is worse than an
 empty response: the caller cannot tell that the route was computed at rush hour and keeps a closed
 exit in the plan. Dropping \`degraded\` dresses a straight-line fallback up as a road route. And a
-read that trusts only the id turns route ids into a cross-tenant enumeration oracle.`,
+read that trusts only the id, with no tenant at all, turns route ids into a cross-tenant
+enumeration oracle.
+
+- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- A route is visible only to the tenant that computed it. An unknown id and another tenant's id
+  answer the same **404** with the same body, so the read cannot confirm that a foreign route exists.
+- The response carries the stored \`geometry\`, the \`epoch\` the geometry was computed in, the
+  \`engine_version\` that produced it, and the \`degraded\` marker when the fallback answered with a
+  straight-line estimate instead of a road route.
+- The reported \`epoch\` is the geometry's epoch, not the current traffic epoch stamped on old
+  geometry. \`stale\` is true whenever the geometry's epoch differs from the current epoch
+  (floor(now / 300)), so the caller can tell the snapshot from a fresh computation.
+- The read answers from the store or answers 404: it does not call the routing engine and does
+  not recompute.`,
   sequence: {
     participants: ['Client', 'Maps API', 'Route store'],
     messages: [
@@ -173,8 +171,7 @@ def current_epoch() -> int:
 
 @app.get("/v1/routes/{route_id}")
 def read_route(route_id: str) -> JSONResponse:
-    # TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
-    # the degraded marker. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     route = store.get(route_id)
     if route is None:
         return JSONResponse({"error": "route not found"}, status_code=404)
@@ -260,8 +257,7 @@ function currentEpoch(): number {
 }
 
 app.get('/v1/routes/:routeId', async (request, reply) => {
-  // TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
-  // the degraded marker. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {routeId} = request.params as {routeId: string};
   const route = await store.get(routeId);
   if (route === null) return reply.code(404).send({error: 'route not found'});
@@ -362,8 +358,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readRoute(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
-	// the degraded marker. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	routeID := r.PathValue("route_id")
 	route, err := store.Get(r.Context(), routeID)
 	if err != nil {
@@ -499,8 +494,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "routes" / Segment) { routeId =>
       get {
-        // TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and
-        // drops the degraded marker. Fix all three.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         store.get(routeId) match {
           case None => complete(StatusCodes.NotFound, """{"error":"route not found"}""")
           case Some(stored) =>
@@ -616,8 +610,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/routes/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
-    // the degraded marker. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string route_id = req.matches[1];
     const auto stored = store.get(route_id);
     if (!stored) {
@@ -698,9 +691,9 @@ int main() {
     },
   },
   hints: [
-    'The tenant gate comes first: no `X-Tenant-Id` is **401**, before the store is touched. Then scope by ownership: the record carries its own `tenant`, and a foreign id must answer exactly what an unknown id answers — 404 — so the read never confirms that another tenant’s route exists.',
-    'The `epoch` you return is the geometry’s, not the clock’s: read it from the record. The current epoch (floor(now / 300)) is only for the `stale` comparison — true whenever the geometry was not computed in the current epoch — because a stored route is a snapshot, never a substitute for a fresh computation.',
-    'Return the record as stored: `geometry` verbatim and `degraded` alongside it. Dropping the marker, or replacing it with a hardcoded false, dresses a straight-line fallback up as a road route — and the caller has no way to tell until the car is on a road that does not exist.',
+    "A driver reopens yesterday's trip and the app shows it as computed just now; a fallback estimate renders as a road; and any tenant that guesses a route id can read another tenant's trip.",
+    'The handler reads no header, so there is no tenant to scope by; the response builds `epoch` from `current_epoch()` instead of the record; and `degraded` is left out of the response dict.',
+    'Require `X-Tenant-Id` (401), answer 404 when `route["tenant"] != tenant`, return `route["epoch"]` with `"stale": route["epoch"] != current_epoch()`, and pass `route["geometry"]` and `route["degraded"]` through unchanged.',
   ],
-  debrief: `The interviewer is testing the read half of a routing cache: not “does it return geometry” but “can the caller tell what it is holding”. Three truths the starter breaks, and each check owns one. Ownership: the record’s \`tenant\` decides who may read it, and a foreign id answers the same 404 as an unknown one, so the read cannot be used to enumerate another tenant’s routes. Provenance: the epoch on the response is the epoch the geometry was computed in, and the current traffic epoch is used only to say \`stale\` — never to relabel old geometry as fresh. Honest degradation: \`degraded\` travels with the geometry, so a straight-line fallback estimate is never mistaken for a road route. Real platforms add a signed route token so a client can prove what it was served, per-epoch metric labels on the read path, and a reaper that deletes routes older than the retention window instead of serving them forever.`,
+  debrief: `The fix has its shape because a read is only useful if the caller can tell what it is holding. Ownership comes from the record's own \`tenant\`, and a foreign id answers the same 404 as an unknown one, so the read cannot be used to enumerate another tenant's routes. Provenance comes from the record too: the response \`epoch\` is the epoch the geometry was computed in, and the current traffic epoch is used only to say \`stale\`, not to relabel old geometry as fresh. The \`degraded\` marker travels with the geometry so a straight-line estimate is not mistaken for a road route. Production read paths add a signed route token so a client can prove what it was served, per-epoch labels on read metrics, and a reaper that deletes routes past the retention window instead of serving them forever.`,
 };

@@ -8,34 +8,29 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers \`POST /v1/files\`,
-reads \`size\` and \`mime\` from the body, and returns an upload id. It compiles, it serves the demo, and
-it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter registers \`POST /v1/files\`, reads \`size\` and \`mime\` from the
+body \`{"size": 1048576, "mime": "image/png"}\`, and returns an upload id after a bare tenant-header
+check. It serves the demo and hides four flaws.
 
-Implement the upload handshake:
+**Failure mode the checks target.** A trusted declaration lets a client declare 1 KiB, stream 4 GiB,
+and pay for neither quota nor storage. An unsniffed mime lets an executable be stored as
+\`image/png\`. An upload id not bound to its tenant is a capability for anyone who leaks it.
 
-- \`POST /v1/files\` with body \`{"size": 1048576, "mime": "image/png"}\`.
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`size\` is an integer from **1** to **5 GiB** (\`5 << 30\` bytes); anything else is **413**.
-- \`mime\` must be in the server's allowlist (\`image/png\`, \`image/jpeg\`, \`application/pdf\`,
+Requirements:
+
+- Missing \`X-Tenant-Id\` is **401**.
+- \`size\` is an integer from **1** to **5 GiB** (\`5 << 30\`); anything else is **413**.
+- \`mime\` must be in the allowlist (\`image/png\`, \`image/jpeg\`, \`application/pdf\`,
   \`text/plain\`); anything else is **415**.
-- The declared size is checked against the tenant's remaining quota before the session exists; a
-  declaration over quota is **413** and creates nothing.
-- The response is \`{"upload_id": "up_<tenant>_<uuid>", "declared_size": <bytes>}\` — the upload id is
-  scoped to the tenant that created it.
-- \`PUT /v1/uploads/{upload_id}\` streams the bytes. The server counts what actually arrives and, the
-  moment the count passes the declared size, aborts the upload (**413**) and releases the session —
-  the declared size is a contract the stream must honour, not a fact the server trusts.
-- \`POST /v1/uploads/{upload_id}/finalize\` sniffs the mime from the object's leading bytes, records the
-  **sniffed** type rather than the declared one, and requires the stored byte count to equal the
-  declared size (**409** when it does not).
-- An upload id presented by a different tenant is **403** on both the stream and the finalize path.
-
-**Failure mode the checks target.** Trusting the declared size means a client can declare 1 KiB,
-stream 4 GiB, and pay for neither the quota nor the object store. Accepting the declared mime without
-sniffing lets an executable be stored as \`image/png\`. And an upload id that is not bound to its
-tenant is a capability anyone who guesses or leaks the id can use.`,
+- The declared size is checked against the tenant's remaining quota before the session exists; over
+  quota is **413** and creates nothing.
+- The response is \`{"upload_id": "up_<tenant>_<uuid>", "declared_size": <bytes>}\`; the id is scoped
+  to its tenant.
+- \`PUT /v1/uploads/{upload_id}\` counts the bytes as they arrive and, the moment the count passes the
+  declaration, aborts with **413** and releases the session.
+- \`POST /v1/uploads/{upload_id}/finalize\` records the type **sniffed** from the leading bytes and
+  requires the stored count to equal the declaration (**409** otherwise).
+- An upload id presented by another tenant is **403** on both the stream and the finalize path.`,
   sequence: {
     participants: ['Client', 'Upload API', 'Redis', 'Object store'],
     messages: [
@@ -149,8 +144,7 @@ async def initiate(request: Request, x_tenant_id: str = Header(default="")):
     body = await request.json()
     size = body.get("size", 0)
     mime = body.get("mime", "application/octet-stream")
-    # TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
-    # session. The quota is never read and a stream may run past its declared size.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     upload_id = "up_" + uuid.uuid4().hex
     store.create(upload_id, size, mime)
     return JSONResponse({"upload_id": upload_id, "size": size}, status_code=201)
@@ -292,8 +286,7 @@ export function registerUploadApi(app: FastifyInstance): void {
     const tenant = req.headers['x-tenant-id'] as string | undefined;
     if (!tenant) return reply.code(401).send({error: 'missing X-Tenant-Id'});
     const body = req.body as {size?: number; mime?: string};
-    // TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
-    // session. The quota is never read and a stream may run past its declared size.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const uploadId = 'up_' + randomUUID();
     store.create({uploadId, size: body.size ?? 0, mime: body.mime ?? ''});
     return reply.code(201).send({upload_id: uploadId, size: body.size ?? 0});
@@ -435,8 +428,7 @@ func initiate(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
-	// session. The quota is never read and a stream may run past its declared size.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	session := Session{UploadID: "up_" + uuidString(), Size: body.Size, Mime: body.Mime}
 	store.Create(session)
 	writeJSON(rw, http.StatusCreated, map[string]any{"upload_id": session.UploadID, "size": session.Size})
@@ -645,8 +637,7 @@ object UploadApi {
             if (!tenantOpt.exists(_.nonEmpty)) {
               complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
             } else {
-              // TODO: this starter trusts the declared size, sniffs no mime and stores no tenant
-              // on the session. The quota is never read and a stream may run past its size.
+              // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
               val uploadId = "up_" + UUID.randomUUID().toString
               store.create(Session(uploadId, "", body.size, 0, body.mime))
               complete(StatusCodes.Created, """{"upload_id":""" + uploadId + """}""")
@@ -804,8 +795,7 @@ int main() {
       return;
     }
     json body = json::parse(req.body, nullptr, false);
-    // TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
-    // session. The quota is never read and a stream may run past its declared size.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto uploadId = "up_" + uuidString();
     store.create(uploadId, body.value("size", 0L), body.value("mime", std::string()));
     res.status = 201;
@@ -952,9 +942,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order: tenant, size range, mime allowlist, quota. Each one returns before the session exists, so a malformed declaration cannot reserve anything.',
-    'The declared size is a promise, not a fact. Count bytes as the stream arrives and abort the moment the count passes the declaration — otherwise the client decides how much it stores and how much quota it spends.',
-    'The finalize response records the type sniffed from the leading bytes. If the object says `image/png` but the magic bytes say `%PDF`, the sniffed type is the truth you store and index on.',
+    'A tenant declares 1 KiB, streams 4 GiB, and the object lands with no 413. Another tenant finalizes that upload with a guessed id and gets a file id back.',
+    'The starter creates the session from body values alone: no quota read, no tenant stored on it, no comparison of streamed bytes with the declaration, and finalize echoes the declared mime.',
+    'Guard in order: tenant, size range, ALLOWED_MIME, quota_remaining. Store the tenant on the session, count actual_bytes against declared_size (413 past it), and record sniff_mime() of the leading bytes at finalize.',
   ],
-  debrief: `The interviewer is testing whether you can debug an upload handshake at the trust boundary. The starter reads fine because the demo declares an honest size, sends a friendly mime, and never leaks an upload id. Three separate defects are being checked: the declared size is verified against the stream rather than trusted; the mime is sniffed rather than echoed; and the upload id is bound to its tenant so a leaked id is not a capability. Real services add a per-tenant quota reservation that is released on abort, a pre-signed URL with a short TTL so the API never proxies the bytes, and an object-store-side size check so a bypassed API cannot store more than it promised.`,
+  debrief: `The guard clauses sit in front of session creation because an upload session is a reservation: once it exists, quota and store capacity are spoken for. Checking the tenant, the size range, the allowlist and the quota before creating it means a bad declaration costs nothing. Counting bytes as they stream, rather than comparing once at finalize, is what stops a 4 GiB stream against a 1 KiB declaration from ever reaching the store. Sniffing the mime at finalize treats the declaration as a hint and the bytes as the record. Production uploaders usually hand the client a pre-signed URL with a short TTL so the API never proxies the body, and rely on the object store to enforce the size limit on its side.`,
 };

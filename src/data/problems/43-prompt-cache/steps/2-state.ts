@@ -8,37 +8,26 @@ export const cacheStateStep: Step = {
   focus: ['cache', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it writes the completion, reads
-it back, counts hits, and the demo is a cache that works. What it does under concurrency is overwrite
-a newer value with an older one, and what it does to a hot entry is keep it alive forever. Debug the
-starter as the owner of the cache, fix it, and prove both properties.
+**Starting point.** The starter is the Redis side of the cache: \`fill\` writes the completion with a
+plain \`SET\` and a caller-supplied TTL, and \`lookup\` reads it back, refreshes the value key and
+counts the hit under \`access:{version}\`. It serves the demo and hides five flaws.
 
-Implement the Redis side of the cache — the fill used by the miss path and the read used by every hit.
+**Failure mode the checks target.** The starter is a read-modify-write where a single conditional
+write is needed, and a TTL policy where the wrong key is being extended. Both are invisible with one
+writer and one reader: the clobber loses the newer answer, and the refresh makes a dead prompt version
+immortal.
 
-- **Fill with \`SET … NX\` and a TTL in one command.** The fill writes
-  \`SET {key} {payload} NX EX {ttl}\`: the first writer wins and a concurrent fill cannot replace a
-  value that is already there. The starter plain-\`SET\`s, so a slow fill that started before a newer
-  result can overwrite that newer result when it finishes.
-- **A fill that lost the race returns the winner.** When \`NX\` reports that the write did not happen,
-  the fill must \`GET\` the entry that won and return *its* completion. Returning the loser's own
-  completion would hand the caller a value the cache does not agree with.
-- **The TTL is the prompt version's lifetime.** Entries expire after \`VERSION_TTL_S = 6 * 3600\`
-  seconds — the same horizon as the version they were produced for — and that number comes from one
-  constant, never from the caller. The starter takes a \`ttl\` argument (and defaults it), so a caller can
-  pin a stale completion, and two call sites disagree about how long "hot" lasts.
-- **The value key's TTL is never refreshed on a hit.** A hit must not run \`EXPIRE\`/\`PEXPIRE\`/\`PERSIST\`
-  against the value key. A hot entry must still die when its version does; refreshing it on read is how
-  a deprecated prompt version keeps serving output forever.
-- **Hits are counted in a separate, tenant- and version-scoped counter.** The access counter key is
-  \`pc:access:{tenant}:{version}\`; a hit does \`HINCRBY counter hits 1\` and then sets **the counter's**
-  TTL (it may outlive the entry, it must not outlive the version). The starter counts into
-  \`access:{version}\`, which merges every tenant's traffic into one number and cannot answer "how many
-  hits did this tenant get on version 7".
-
-**Failure mode the checks target.** The starter is a read-modify-write where a single conditional write
-is needed, and a TTL policy where the *wrong key* is being extended. Both bugs are invisible in a demo
-with one writer and one reader, and both are permanent in production: the clobber loses the newer
-answer, and the refresh makes a dead prompt version immortal.`,
+- **Fill with \`SET {key} {payload} NX EX {ttl}\`**, one command: the first writer wins and a
+  concurrent fill cannot replace a value that is already there.
+- **A fill that lost the race returns the winner.** When \`NX\` refuses the write, \`GET\` the entry
+  that won and return *its* completion.
+- **The TTL is the prompt version's lifetime**, \`VERSION_TTL_S = 6 * 3600\`, from one constant and
+  not from a \`ttl\` argument a caller could use to pin a stale completion.
+- **The value key's TTL is not refreshed on a hit.** No \`EXPIRE\`/\`PEXPIRE\`/\`PERSIST\` against the
+  value key; a hot entry still dies with its version.
+- **Hits are counted in a tenant- and version-scoped counter**, \`pc:access:{tenant}:{version}\`: a
+  hit does \`HINCRBY counter hits 1\` and then sets **the counter's** TTL. \`access:{version}\` folds
+  every tenant into one number.`,
   sequence: {
     participants: ['Prompt Cache', 'Redis', 'Slow filler'],
     messages: [
@@ -62,9 +51,9 @@ answer, and the refresh makes a dead prompt version immortal.`,
     ],
   },
   hints: [
-    'One command decides the race: `SET key payload NX EX ttl`. `NX` means "only if absent", so the writer that arrived first keeps its value no matter how long its own call takes — and `EX` in the same call means an entry can never exist without a deadline.',
-    'The TTL belongs to the prompt version, not to the request. Derive it from one constant (`VERSION_TTL_S = 6 * 3600`) so the cache horizon moves when the version policy moves, and never accept it as an argument: a caller that can extend an entry can extend it past its template.',
-    'Count the hit somewhere else. `HINCRBY pc:access:{tenant}:{version} hits 1` keeps the statistic, and putting the `EXPIRE` on that counter — not on the value key — gives you the only two properties you need: the value dies with its version, the metric survives long enough to be read.',
+    'Under load a user occasionally gets an older completion than the one a faster request just produced, and a retired prompt version keeps serving traffic days after its template changed.',
+    'A plain `SET` lets the slowest fill overwrite the newest value, `lookup` runs `EXPIRE` on the value key so every read extends its life, and the counter key has no tenant in it.',
+    'Fill with `SET key payload NX EX VERSION_TTL_S` (constant `6 * 3600`, no `ttl` argument) and re-read on refusal; on a hit, `HINCRBY pc:access:{tenant}:{version} hits 1` and `EXPIRE` that counter only.',
   ],
   checks: [
     {
@@ -148,9 +137,7 @@ VERSION_TTL_S = 3600
 
 
 async def fill(key: str, tenant: str, version: int, completion: str, ttl: int = VERSION_TTL_S) -> str:
-    # TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
-    # newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
-    # expires; and it counts hits under a key that has no tenant in it.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = json.dumps({"tenant": tenant, "version": version, "completion": completion})
     await store.set(key, payload, ex=ttl)
     return completion
@@ -220,9 +207,7 @@ export async function fill(
   completion: string,
   ttl: number = VERSION_TTL_S,
 ): Promise<string> {
-  // TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
-  // newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
-  // expires; and it counts hits under a key that has no tenant in it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await store.set(key, JSON.stringify({tenant, version, completion}), 'EX', ttl);
   return completion;
 }
@@ -290,9 +275,7 @@ import (
 
 const VERSION_TTL_S = 3600
 
-// TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
-// newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
-// expires; and it counts hits under a key that has no tenant in it.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func fill(ctx context.Context, key, tenant string, version int, completion string, ttl time.Duration) (string, error) {
 	payload, err := json.Marshal(cacheRecord{Tenant: tenant, Version: version, Completion: completion})
 	if err != nil {
@@ -385,9 +368,7 @@ func lookup(ctx context.Context, key, tenant string, version int) (*cacheRecord,
 import redis.clients.jedis.params.SetParams
 
 object CacheStore {
-  // TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
-  // newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
-  // expires; and it counts hits under a key that has no tenant in it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   final case class CacheRecord(tenant: String, version: Int, completion: String)
 
   val VersionTtlS = 3600
@@ -443,9 +424,7 @@ object CacheStore {
 #include <optional>
 #include <string>
 
-// TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
-// newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
-// expires; and it counts hits under a key that has no tenant in it.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 constexpr int kVersionTtlS = 3600;
 
 std::string fill(sw::redis::Redis& cache, const std::string& key, const std::string& tenant, int version,
@@ -507,5 +486,5 @@ std::optional<CacheRecord> lookup(sw::redis::Redis& cache, const std::string& ke
 `,
     },
   },
-  debrief: `The interviewer is testing two instincts that separate a cache from a dictionary: a fill is a decision, not an assignment, and a TTL belongs to the data, not to the request that happens to touch it. The starter's plain \`SET\` assumes the writer that finishes last has the best answer — an assumption that only holds in a demo with one writer. \`NX\` makes the first writer win, and re-reading on a lost race keeps the caller's view and the cache's view identical. The TTL half is subtler: refreshing a value on read feels like keeping the cache warm, but it silently converts "entries expire with their prompt version" into "popular entries never expire", so a deprecated template keeps serving its output forever. Moving the refresh to a per-tenant, per-version counter keeps the hot-path statistic and gives the stats endpoint the one number it actually needs — and it is the same counter the consumer in step 4 updates.`,
+  debrief: `The fix separates two decisions the starter had fused. A fill is a decision, not an assignment: \`SET … NX EX\` makes the first writer win in one round trip, and re-reading on a lost race keeps the caller's view and the cache's view identical. A TTL belongs to the data, not to the request that touches it: the deadline comes from the version's lifetime constant, the value key is left alone on a hit, and the counter carries its own expiry so the statistic can outlive the entry. Production caches tend to add a short per-key fill lock (\`SET lock NX PX\`) so a stampede of concurrent misses makes one provider call rather than many, and some jitter the TTL so a whole version's entries do not expire in the same second.`,
 };

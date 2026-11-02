@@ -12,31 +12,27 @@ export const dependencyStep: Step = {
   focus: ['bidding', 'features', 'model'],
   task: `## Task
 
-**Starting point.** You are the bidding platform engineer on call. The bidding service's p99 is 180 ms on a
-100 ms budget, every bid is answered late, and the median response still carries a model score even
-though the feature fetch alone consumed the auction. The client below waits the full
-latency of both feature calls with no per-tier deadline, retries the identity lookup once inside the
-auction, and scores the model unconditionally.
+**Starting point.** The starter is the \`client\` module that collects features for a bid: it calls
+the identity and contextual feature services over gRPC, retries the identity lookup once on failure,
+asks the model for a score and prices the bid at \`max(floor, score + 1)\`. It compiles, it serves the
+demo, and it hides five flaws.
 
-Debug \`client\` and give each tier a slice of the auction budget, then prove the fix.
+**Failure mode the checks target.** The starter treats the auction budget as decoration. It waits
+the feature service's own latency with no per-tier slice, retries an identity lookup that cannot
+finish inside a 100 ms auction, and then asks the model for a score no matter how little time is
+left. The result is a p99 of 180 ms on a 100 ms budget, every bid late, and a median response that
+still carries a score computed from a budget that was already spent.
 
 - Two feature tiers, each with its own slice of the budget: **identity at 30 ms** and **contextual at
   50 ms**. Define both as named constants.
-- A tier may spend only \`min(remaining_ms, tier_ms)\` of the auction budget — never its full slice when
-  less is left. Express that as one helper that both calls go through.
+- A tier may spend only \`min(remaining_ms, tier_ms)\` of the auction budget. Express that as one
+  helper that both calls go through.
 - The **model score is skipped entirely** when the remaining budget cannot fit it
-  (\`remaining_ms() < MODEL_MIN_BUDGET_MS\`). A skipped model must not be replaced by a stale or a
+  (\`remaining_ms() < MODEL_MIN_BUDGET_MS\`). A skipped model is not replaced by a stale or a
   fabricated score.
 - A skipped model (or a feature tier that failed) yields a **conservative bid**: priced at the floor,
   marked \`degraded\`, with a reason the stats read can count. Define it as a named function.
-- **No tier retries**: one attempt per tier, inside that tier's slice. The starter's second identity
-  attempt starts after the first timeout and eats whatever the remaining tiers needed.
-
-**Failure mode the checks target.** The starter treats the auction budget as decoration. It waits the
-feature service's own latency, retries the identity lookup once — a retry that cannot finish inside a
-100 ms auction but is issued anyway — and then asks the model for a score no matter how little time is
-left. The result is the symptom from the briefing: bids that are always late and a score that is only
-ever computed from a budget that was already spent.`,
+- **No tier retries**: one attempt per tier, inside that tier's slice.`,
   sequence: {
     participants: ['Bidding service', 'Identity features', 'Contextual features', 'Model scorer'],
     messages: [
@@ -154,9 +150,7 @@ class BidClient:
         self.floor_cents = floor_cents
 
     def collect(self, deadline, user_hash: str, auction_id: str) -> dict:
-        # TODO: this starter gives neither tier a slice of the auction budget, retries the identity
-        # lookup once (which cannot finish inside the auction and eats the remaining tiers), and
-        # asks the model for a score even when nothing is left, so every bid is late.
+        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         for attempt in range(2):
             try:
                 identity = self.identity.fetch(user_hash, timeout=FEATURE_TIMEOUT_S)
@@ -247,9 +241,7 @@ export class BidClient {
   ) {}
 
   async collect(deadline: {remainingMs(): number}, userHash: string, auctionId: string) {
-    // TODO: this starter gives neither tier a slice of the auction budget, retries the identity
-    // lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
-    // the model for a score even when nothing is left, so every bid is late.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     let identity: Record<string, number> = {};
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -371,9 +363,7 @@ type BidClient struct {
 }
 
 func (c *BidClient) Collect(ctx context.Context, deadline *Deadline, userHash, auctionID string) map[string]any {
-	// TODO: this starter gives neither tier a slice of the auction budget, retries the identity
-	// lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
-	// the model for a score even when nothing is left, so every bid is late.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	var identity map[string]float64
 	for attempt := 0; attempt < 2; attempt++ {
 		feats, err := c.identity.Fetch(ctx, userHash, featureTimeout)
@@ -510,9 +500,7 @@ class BidClient(identity: IdentityFeatures, context: ContextFeatures, scorer: Sc
   val FeatureTimeoutS = 0.2
 
   def collect(deadline: Deadline, userHash: String, auctionId: String): Map[String, Any] = {
-    // TODO: this starter gives neither tier a slice of the auction budget, retries the identity
-    // lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
-    // the model for a score even when nothing is left, so every bid is late.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var identityFeatures = Map.empty[String, Double]
     var attempt = 0
     while (attempt < 2 && identityFeatures.isEmpty) {
@@ -613,9 +601,7 @@ class BidClient {
       : identity_(identity), context_(context), scorer_(scorer), floorCents_(floorCents) {}
 
   std::map<std::string, int> collect(const std::string& userHash, const std::string& auctionId) {
-    // TODO: this starter gives neither tier a slice of the auction budget, retries the identity
-    // lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
-    // the model for a score even when nothing is left, so every bid is late.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     std::map<std::string, double> features;
     for (int attempt = 0; attempt < 2 && features.empty(); ++attempt) {
       features = identity_.fetch(userHash, kFeatureTimeoutS);
@@ -716,23 +702,19 @@ class BidClient {
     },
   },
   hints: [
-    'Name the slices: `IDENTITY_DEADLINE_MS = 30`, `CONTEXT_DEADLINE_MS = 50`, and a helper that returns `min(remaining_ms, tier_ms)`. A tier that always gets its full slice is a tier that does not know the auction is nearly over.',
-    'Skip, do not guess: before the scoring call compare `remaining_ms() < MODEL_MIN_BUDGET_MS` and return a conservative bid at the floor, marked degraded. A score computed from an exhausted budget is a fabricated one, and it is worse than an honest low bid.',
-    'Delete the retry. One attempt per tier, inside its slice — a second identity attempt after a 30 ms timeout is issued into a budget that no longer exists, and whatever it burns is what the contextual tier and the model needed.',
+    'The bidding service’s p99 is 180 ms on a 100 ms budget, every bid is answered late, and the median response still carries a model score even though the feature fetch alone consumed the auction.',
+    'Neither feature call receives a slice of the budget, so each waits the service’s own latency; the identity retry starts after that timeout and eats what the contextual tier needed; the model is scored regardless.',
+    'Add `IDENTITY_DEADLINE_MS = 30` and `CONTEXT_DEADLINE_MS = 50` behind a `tier_slice` helper of `min(remaining_ms, tier_ms)`, delete the retry loop, and return `conservative_bid` when `remaining_ms() < MODEL_MIN_BUDGET_MS`.',
   ],
-  debrief: `The interviewer is testing whether you can turn a latency budget into a decision policy. The starter
-reads fine because the feature service is fast in the demo, so nobody notices that the auction's 100 ms
-is never consulted.
+  debrief: `The fix turns a latency budget into a decision policy. Each tier gets a named slice clamped
+to what is left, so a slow identity lookup shortens the contextual fetch instead of pushing the bid
+past the close. The model is skipped rather than guessed because a score computed from an exhausted
+budget is a fabricated one, and a conservative bid at the floor, marked \`degraded\`, wins a floor
+auction while a fabricated score wins a bad one. The retry goes because inside a 100 ms auction a
+second attempt is not resilience, it is spending someone else's slice, and the identity tier's retry
+is exactly why the contextual fetch then times out.
 
-Three defects are being checked. Tiered budgets: each feature tier gets a named slice, clamped to what
-is left, so a slow identity lookup shortens the contextual fetch instead of pushing the bid past the
-close. Graceful degradation: when the remaining budget cannot fit the model, the correct answer is a
-conservative bid at the floor marked \`degraded\`, and the stats read later counts it — an honest cheap
-bid wins a floor auction, a fabricated score wins a bad one. Retries: inside a 100 ms auction a retry
-is not resilience, it is spending someone else's slice, and the identity tier's second attempt is
-exactly why the contextual fetch then times out.
-
-Real bidders go further: they keep a per-tier budget table ordered by value, drop the cheapest tier
-first when the deadline tightens, and shadow-test a degraded path against a no-bid to learn whether a
-floor bid is worth placing at all.`,
+Production bidders keep a per-tier budget table ordered by value, drop the cheapest tier first when
+the deadline tightens, and shadow-test the degraded path against a no-bid to learn whether a floor
+bid is worth placing at all.`,
 };

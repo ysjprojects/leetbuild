@@ -8,33 +8,27 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'clock'],
   task: `## Task
 
-**Starting point.** The starter is working code: one instance fires the job,
-the window is recorded, and the demo looks correct. It breaks the moment two scheduler instances
-run, and it forgets every fire that dies. Debug it like the owner of the scheduler, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter's \`fire_window(job, schedule_id, window, owner)\` reads a
+\`last_run:{schedule_id}\` timestamp, returns \`skipped\` when it is at or past the window, otherwise
+triggers the job and writes the window back as the new last run. It serves the demo and hides 5
+flaws.
 
-Implement the fire path that decides, per window, whether **this** instance may run the job.
+**Failure mode the checks target.** A rolling deploy runs two instances, and a \`GET\` followed by
+a \`SET\` lets both read the same old value and both fire. A lease with no expiry becomes a
+permanent lock after one crash, and a fire path that records only successes turns a failing window
+into an endless retry that no history read can explain.
 
 - A window is the minute bucket of the fire time: \`window = floor(fire_time / 60) * 60\`
   (\`WINDOW_S = 60\`). Every (schedule, window) pair is fired **exactly once** by the whole fleet.
-- Acquisition must be **one atomic command**: \`SET lease:{schedule_id}:{window} <owner> NX EX
-  LEASE_TTL_S\` (or the stack's equivalent single round trip). A read of a last-run timestamp
-  followed by a write is not a lease: during a rolling deploy both instances read the same old
-  value, both decide they may fire, and the job runs twice in the same window.
+- Acquisition is **one atomic command**: \`SET lease:{schedule_id}:{window} <owner> NX EX
+  LEASE_TTL_S\` (or the stack's equivalent single round trip).
 - The lease **expires**: \`LEASE_TTL_S = 30\`, strictly shorter than \`WINDOW_S\`, so a lease
-  outlives its window only briefly and can never bleed into the next one. A lease without an
-  expiry becomes a permanent lock after one crash.
+  outlives its window only briefly and cannot bleed into the next one.
 - The instance that **loses** the race returns without touching the job. Only a winner calls
-  \`job.trigger(schedule_id, window)\`.
+  \`job.trigger(schedule_id, window)\`; nothing reads a last-run timestamp to decide.
 - **Record an outcome for the window** as soon as the fire resolves: \`record_outcome(schedule_id,
   window, "fired")\` on success and \`record_outcome(schedule_id, window, "error")\` when the fire
-  raises. The starter writes nothing on failure, so a crashed fire leaves the window with no record
-  and the next tick tries the same window again — forever.
-
-**Failure mode the checks target.** \`GET\` then \`SET\` is a check-then-act race, and a rolling
-deploy is exactly the schedule that runs two instances. A lease with no TTL is a deadlock waiting
-for one crash. And a fire path that records only successes turns a permanently failing window into
-an infinite retry loop that no history read can ever explain.`,
+  raises.`,
   sequence: {
     participants: ['Scheduler API (A)', 'Scheduler API (B)', 'Redis', 'Job service'],
     messages: [
@@ -124,9 +118,7 @@ logger = logging.getLogger("scheduler")
 
 
 def fire_window(job, schedule_id: str, window: int, owner: str) -> str:
-    # TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
-    # a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-    # crashes, so the window is retried forever. Fix both.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     last = r.get(f"last_run:{schedule_id}")
     if last is not None and int(last) >= window:
         return "skipped"
@@ -176,7 +168,7 @@ def fire_window(job, schedule_id: str, window: int, owner: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** Fire lease: flawed code that tracks the last run instead of leasing the window. */
+      starter: `/** Fire lease: tracks the last run instead of leasing the window. */
 import {Redis} from 'ioredis';
 
 const redis = new Redis({host: 'redis', port: 6379});
@@ -187,9 +179,7 @@ export async function fireWindow(
   window: number,
   owner: string,
 ): Promise<string> {
-  // TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
-  // a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-  // crashes, so the window is retried forever. Fix both.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const last = await redis.get(\`lastRun:\${scheduleId}\`);
   if (last !== null && Number(last) >= window) return 'skipped';
   await job.trigger(scheduleId, window);
@@ -257,9 +247,7 @@ var (
 )
 
 func FireWindow(job JobTrigger, scheduleID string, window int64, owner string) (string, error) {
-	// TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
-	// a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-	// crashes, so the window is retried forever. Fix both.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("lastRun:%s", scheduleID)
 	last, err := rdb.Get(ctx, key).Int64()
 	if err == nil && last >= window {
@@ -340,9 +328,7 @@ object FireWindows {
   val redis = new Jedis("redis", 6379)
 
   def fireWindow(job: JobTrigger, scheduleId: String, window: Long, owner: String): String = {
-    // TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
-    // a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-    // crashes, so the window is retried forever. Fix both.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = s"lastRun:$scheduleId"
     val last = Option(redis.get(key)).flatMap(_.toLongOption)
     if (last.exists(_ >= window)) return "skipped"
@@ -402,9 +388,7 @@ Redis redis("tcp://redis:6379");
 
 std::string fireWindow(JobTrigger& job, const std::string& scheduleId, long window,
                        const std::string& owner) {
-  // TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so a
-  // rolling deploy lets two instances fire the same window, and it records nothing when a fire
-  // crashes, so the window is retried forever. Fix both.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto key = "last_run:" + scheduleId;
   const auto last = redis.get(key);
   if (last.has_value() && std::stol(*last) >= window) return "skipped";
@@ -459,9 +443,9 @@ std::string fireWindow(JobTrigger& job, const std::string& scheduleId, long wind
     },
   },
   hints: [
-    'A lease is one command, not two. `SET key owner NX EX ttl` (or `SetNX` with a TTL, `SetParams.nx().ex(...)`) either wins or returns nil in a single round trip; a `GET` followed by a `SET` has a window in which the other instance reads the same old value and decides the same thing.',
-    'Include the fire window in the key and give the key a TTL. `lease:{schedule_id}:{window}` is what makes the next window independent, and a TTL shorter than the window means a crashed lease clears long before the window comes round again.',
-    'The loser must not touch the job, and the winner must always leave a record: return before the trigger when the lease was not won, and write `fired` or `error` for the window after it resolves. A window with no record is a window the fleet will keep retrying.',
+    'During a rolling deploy the nightly invoice job ran twice in the same minute, and a schedule whose trigger threw once has been retried on every tick since.',
+    'A read of `last_run` followed by a write is check-then-act: both instances see the old value and both proceed. Nothing expires, nothing is keyed by window, and a raised trigger leaves no record.',
+    'Take `SET lease:{schedule_id}:{window} owner NX EX LEASE_TTL_S` before the trigger, return when it is not won, then `record_outcome` with `fired` or `error` in a try/except.',
   ],
-  debrief: `The interviewer is testing the fire path for mutual exclusion. The starter passes because the demo runs one instance and never crashes. Four defects are checked: check-then-act acquisition that a rolling deploy defeats, a key that lumps every window together, a lease with no expiry that becomes a permanent lock, and a fire path that records only successes so a failing window retries forever. Real schedulers add a fencing token to the lease so a paused process cannot act on a stale grant, keep the outcome record separate from the lease so the history survives the TTL, and derive the window from a single clock source rather than each node's wall clock.`,
+  debrief: `The fix collapses the decision into one Redis command because mutual exclusion cannot be built from two round trips: whatever an instance reads is stale by the time it writes. Keying by window rather than by schedule is what makes each minute independent, and the TTL shorter than the window is what lets a crashed lease clear before the same window could be claimed again. Recording \`error\` as well as \`fired\` is the piece that stops a failing window from being retried forever and gives the history read something to show. Production schedulers also attach a fencing token to the lease so a paused process cannot act on a stale grant, keep the outcome record separate from the lease so it survives the TTL, and derive the window from one clock source rather than each node's wall clock.`,
 };

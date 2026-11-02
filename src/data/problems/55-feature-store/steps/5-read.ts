@@ -8,28 +8,22 @@ export const readStep: Step = {
   focus: ['client', 'api', 'monitor', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads two versions of stats
-and returns a mean and a drift boolean. It answers 200 for every request, including the one it should
-have shouted about. Find the flaws, fix them, and prove the fix with the checks below.
-
-Implement \`GET /v1/features/{name}/versions/{v}/stats\`:
-
-- Report the **distribution** of the version: \`mean\`, \`std\`, \`p50\`, \`p95\`.
-- Report the **null rate** and the baseline's null rate. The starter reports means only, and a mean that
-  looks stable hides the rows that stopped arriving — the single most common way a feature silently
-  degrades.
-- The baseline is **pinned to a declared version** (\`baseline_version\`), not to whatever version
-  happened to be last. The starter compares against \`v - 1\`, so the baseline walks forward with every
-  deployment and real drift is measured against a moving target.
-- Flag **\`drift\`** when the version's null rate moved more than **three standard deviations** from the
-  baseline's null rate (\`null_rate_mean + 3 × null_rate_std\`).
-- Report **freshness** and a **\`stale\`** flag: \`freshness_s\` is how long ago the newest value was
-  computed, and it is stale when it exceeds the definition's \`freshness_slo\`. A stale feature must be
-  visible in the response, not silently averaged in.
+**Starting point.** The starter serves \`GET /v1/features/{name}/versions/{v}/stats\`: it reads
+\`stats:{name}:{v}\` and \`stats:{name}:{v-1}\` from Redis and answers 200 with the two means and a
+\`drift\` flag that is true whenever the mean rose. It serves the demo and hides four flaws.
 
 **Failure mode the checks target.** A stats endpoint that reports only a mean is a dashboard that
-cannot fail; drift has to be measured against a fixed, declared baseline and staleness has to be a
-value in the response rather than something the reader is expected to infer.
+cannot fail; drift has to be measured against a declared baseline and staleness has to be a value in
+the response rather than something the reader infers.
+
+- Report the **distribution**: \`mean\`, \`std\`, \`p50\`, \`p95\`.
+- Report the **null rate** and the baseline's. The starter reports means only, and a stable mean hides
+  the rows that stopped arriving.
+- The baseline is **pinned to a declared version** (\`baseline_version\`). The starter compares against
+  \`v - 1\`, so the baseline walks forward with every deployment.
+- Flag **\`drift\`** when the null rate exceeds the baseline's \`null_rate_mean + 3 × null_rate_std\`.
+- Report **\`freshness_s\`** (age of the newest value) and **\`stale\`** (true when it exceeds the
+  definition's \`freshness_slo\`), so a stale feature is visible instead of silently averaged in.
 
 ## What to keep
 
@@ -145,9 +139,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/features/{name}/versions/{v}/stats")
 def stats(name: str, v: int) -> dict:
-    # TODO: surface the null rate, pin the baseline to a declared version instead of the previous
-    # one, flag a null rate that moved more than three standard deviations from that baseline, and
-    # report freshness so a stale feature is visible in the response.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     current = json.loads(r.get(f"stats:{name}:{v}") or "{}")
     previous = json.loads(r.get(f"stats:{name}:{v - 1}") or "{}")
     return {
@@ -217,9 +209,7 @@ const r = new Redis('redis://redis:6379');
 
 app.get('/v1/features/:name/versions/:v/stats', async (request, reply) => {
   const {name, v} = request.params as {name: string; v: string};
-  // TODO: surface the null rate, pin the baseline to a declared version instead of the previous
-  // one, flag a null rate that moved more than three standard deviations from that baseline, and
-  // report freshness so a stale feature is visible in the response.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const current = JSON.parse((await r.get(\`stats:\${name}:\${v}\`)) ?? '{}');
   const previous = JSON.parse((await r.get(\`stats:\${name}:\${Number(v) - 1}\`)) ?? '{}');
   return reply.code(200).send({
@@ -300,9 +290,7 @@ var rdb *redis.Client
 func featureStats(rw http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	version, _ := strconv.Atoi(r.PathValue("v"))
-	// TODO: surface the null rate, pin the baseline to a declared version instead of the previous
-	// one, flag a null rate that moved more than three standard deviations from that baseline, and
-	// report freshness so a stale feature is visible in the response.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	current := map[string]float64{}
 	previous := map[string]float64{}
 	_ = json.Unmarshal([]byte(rdb.Get(r.Context(), fmt.Sprintf("stats:%s:%d", name, version)).Val()), &current)
@@ -418,9 +406,7 @@ object StatsApi {
   val route: Route =
     path("v1" / "features" / Segment / "versions" / Segment / "stats") { (name, version) =>
       get {
-        // TODO: surface the null rate, pin the baseline to a declared version instead of the
-        // previous one, flag a null rate that moved more than three standard deviations from that
-        // baseline, and report freshness so a stale feature is visible in the response.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val current = jedis.get(s"stats:$name:$version")
         val previous = jedis.get(s"stats:$name:\${version.toInt - 1}")
         complete(StatusCodes.OK, s"""{"version":$version,"mean":$current,"baseline_mean":$previous}""")
@@ -495,9 +481,7 @@ int main() {
   svr.Get("/v1/features/:name/versions/:v/stats", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto name = req.path_params.at("name");
     const auto version = std::stoi(req.path_params.at("v"));
-    // TODO: surface the null rate, pin the baseline to a declared version instead of the previous
-    // one, flag a null rate that moved more than three standard deviations from that baseline, and
-    // report freshness so a stale feature is visible in the response.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto current = redis.get("stats:" + name + ":" + std::to_string(version));
     const auto previous = redis.get("stats:" + name + ":" + std::to_string(version - 1));
     res.status = 200;
@@ -574,9 +558,9 @@ int main() {
     },
   },
   hints: [
-    'A mean is the one statistic that hides a null-rate regression: rows that stopped arriving simply do not contribute. Report the distribution you have (`mean`, `std`, `p50`, `p95`) next to `null_rate`, and compare the null rate, because that is the number that moves when the pipeline breaks.',
-    'The baseline is a decision, not a coincidence: pin it to a declared `baseline_version` and compare against that version’s recorded `null_rate_mean` and `null_rate_std`. Comparing with `v - 1` means every deploy moves the baseline, and drift measured against a moving target is not drift.',
-    'Staleness is a fact about the data, not about the request: compute `freshness_s` from the newest value’s `event_ts`, compare it with the definition’s `freshness_slo`, and put `stale` in the response. A feature whose freshest value is two days old must not look like any other 200.',
+    'The dashboard shows a steady mean and drift: false while half the rows have been arriving null for two days, and the baseline changes every time a new version ships.',
+    "The handler reads only mean from the two stats records, compares against v - 1, flags drift on any increase, and reads neither the newest event_ts nor the definition's freshness_slo.",
+    'Return null_rate, std, p50 and p95; read stats:{name}:{BASELINE_VERSION}; set drift when null_rate exceeds null_rate_mean + DRIFT_SIGMA * null_rate_std; compute freshness_s from the newest event_ts and stale against freshness_slo.',
   ],
-  debrief: `The interview question behind this step is what an observability endpoint owes its reader. A stats route is a contract: its caller is deciding whether to page someone, retrain a model, or trust tonight’s backfill, so every number that changes that decision has to be in the payload. A mean alone fails that test because it is insensitive to the failure mode that matters most — rows that never arrived — while the null rate moves immediately. The baseline is the second half: drift only means something against a fixed reference, so the reference version is declared, and the threshold is a statistic rather than a vibe — three standard deviations of the baseline’s own null rate. The third half is freshness: a feature can be numerically perfect and still useless because it stopped being updated, so \`stale\` belongs in the response where the dashboard cannot miss it. Real platforms add per-entity freshness, seasonality-aware thresholds, and an alert that distinguishes a paging regression from a ticket.`,
+  debrief: `The fix puts every number that changes the reader's decision into the payload, because a stats route is a contract: its caller is deciding whether to page someone, retrain a model, or trust tonight's backfill. A mean alone fails that test because it is insensitive to the failure mode that matters most, rows that never arrived, while the null rate moves immediately. Drift only means something against a fixed reference, so the reference version is declared and the threshold is a statistic: three standard deviations of the baseline's own null rate. A feature can be numerically perfect and still useless because it stopped updating, so \`stale\` belongs where the dashboard cannot miss it. Production platforms add seasonality-aware thresholds, so a weekend dip is not paged as drift.`,
 };

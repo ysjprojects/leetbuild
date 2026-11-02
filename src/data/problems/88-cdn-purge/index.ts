@@ -17,67 +17,58 @@ import {readStep} from './steps/5-read';
 export const cdnPurgeProblem: Problem = {
   id: 'cdn-purge',
   title: 'CDN Purge',
-  tagline: 'Purge exactly what changed, prove propagation and never stampede the origin.',
+  tagline:
+    'A purge control plane that gates wildcards behind a scope and reports propagated only when every edge has confirmed.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# CDN Purge
 
-A purge service is the piece of a delivery platform that turns "this object changed" into "no edge
-serves the old one". The visible part is a \`200\` from an invalidate API; the parts that decide
-whether the platform survives a bad deploy are the blast radius a caller is allowed to ask for, the
-atomicity of the bookkeeping around it, the honesty of the failure reporting, and the status the
-on-call engineer reads at 3 a.m.
+A purge service turns "this object changed" into "no edge serves the old one". The visible part is
+a \`200\` from an invalidate API; what decides whether the platform survives a bad deploy is the
+blast radius a caller may ask for, the atomicity of the bookkeeping, and the status on-call reads
+at 3 a.m.
 
 ## The real system
 
-Production purge control planes serve many tenants against one shared CDN. They resolve a domain to
-its owner before they purge anything, because a purge is a capability: a wildcard \`/pricing*\`
-against someone else's domain is an outage they did not ask for. They cap and dedupe the patterns in
-one request, and they charge a per-domain budget so a deploy loop cannot turn a purge into a
-distributed denial of service against the origin — a wildcard purge makes every edge miss at once,
-and the origin is the only place the missing objects can come from. They hand batches to the
-provider under a deadline, retry only the failures that are worth retrying, reuse one batch id so a
-retry cannot double-purge, and keep a per-path outcome for every pattern, because "the purge failed"
-is not actionable and "this one pattern was rejected" is. They publish the *confirmed* outcome keyed
-by domain so one domain's purge history stays ordered, and they keep an outbox for the day the broker
-is down. And they never call a purge done when the provider merely accepted it: propagation is a
-different event, minutes later, on every POP.
+Fastly's purge API shapes the same problem. Purge-all is its own endpoint
+(\`POST /service/{service_id}/purge_all\`), separate from purging one URL, because wiping a service
+is a different capability from refreshing an object. Batch purges by surrogate key are capped at
+256 keys per request. A \`Fastly-Soft-Purge: 1\` header marks objects stale instead of deleting
+them, so edges revalidate with the origin rather than miss all at once; purge-all can not be soft,
+which is why it needs the stronger gate. A control plane in front of such a provider adds the
+ownership check, the per-domain budget, one batch id across retries, and propagation reported as a
+separate event from acceptance.
 
 ## What you build here
 
 One service, **purged**, with five pieces:
 
-1. \`POST /v1/purges\`: authenticated tenant, a domain the tenant owns, at most 500 deduped paths,
-   wildcards only with the elevated \`purge:wildcard\` scope (\`purge:domain\` for \`/*\`), an
-   \`Idempotency-Key\` so a replayed deploy purge returns the original purge instead of submitting
-   twice, and a \`202\` that says accepted — nothing more.
-2. A **Redis** reservation: per-path dedupe over a ten-minute window and a per-domain budget
-   bucketed by a five-minute window, both in one atomic \`EVAL\`, answering \`429\` with
-   \`Retry-After\` and \`X-Purge-Budget-Remaining\` before the provider is called.
-3. A **gRPC** provider client: a two-second deadline per attempt, at most three attempts, one
-   \`batch_id\` for the whole batch, per-path outcomes where an invalid pattern is terminal, and
-   retries that replay only the paths still pending.
-4. A **Kafka** event path: one \`cdn.purged\` event per \`(purge, path)\` keyed by domain, carrying a
+1. \`POST /v1/purges\`: a domain the tenant owns, at most 500 deduped paths, wildcards only with
+   the \`purge:wildcard\` scope (\`purge:domain\` for \`/*\`), an \`Idempotency-Key\` so a replay
+   returns the original purge, and a \`202\` that says accepted and nothing more.
+2. A **Redis** reservation: per-path dedupe over ten minutes and a per-domain budget per
+   five-minute window, in one atomic \`EVAL\`, answering \`429\` with \`Retry-After\` before the
+   provider is called.
+3. A **gRPC** provider client: a two-second deadline per attempt, three attempts, one \`batch_id\`,
+   per-path outcomes where an invalid pattern is terminal, and retries of only the pending paths.
+4. A **Kafka** event path: one \`cdn.purged\` event per \`(purge, path)\` keyed by domain, with a
    \`sha256\` path digest and the confirmed outcome, an idempotent producer, and an outbox row when
    the broker refuses the produce.
 5. \`GET /v1/purges/{id}\`: the tenant's own purge or a \`404\`, a status derived from the per-path
-   outcomes (\`accepted\`, \`propagated\`, \`partially_failed\`), the full outcome map with the failed
-   paths in it, and \`propagated_at\` only once propagation has actually confirmed.
+   outcomes (\`accepted\`, \`propagated\`, \`partially_failed\`), the full outcome map, and
+   \`propagated_at\` only once propagation has confirmed.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real delivery platform: debug
-it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path, and looks right. Your
+job in every step is to debug it against the failure modes, fix it, and prove the fix with checks
+that fail on the starter and pass on yours.
 
 ## Left out on purpose
 
 CDN account and zone management, multi-provider fan-out, per-POP propagation polling, purge cost
-attribution, log shipping from the edges, tenant onboarding for domains, and the UI that shows a
-purge timeline. The five pieces above are the ones that decide whether a purge is correct, isolated
-and honest about what it knows.`,
+attribution, edge log shipping, tenant onboarding, and the purge timeline UI.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Control plane', sub: 'deploys · on-call', x: 8, y: 50},

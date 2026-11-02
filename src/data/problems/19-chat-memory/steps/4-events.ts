@@ -8,28 +8,28 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db'],
   task: `## Task
 
-The starter is working code: a turn lands in the topic and the demo shows the
-event. Its ordering, its payload and its durability are all wrong. Find the flaws, fix them, and
-prove the fix.
+**Starting point.** The starter accepts a turn on \`POST /v1/sessions/{id}/turns\`, serializes
+\`turn_id\`, \`content\` and \`role\`, calls \`producer.send\` on \`session.turn\` with the turn id as
+the key, polls once and answers immediately. It serves the demo and hides five flaws.
 
-Implement the session-event path behind the append endpoint:
+**Failure mode the checks target.** Two turns of one session must share a partition, the payload
+must carry no turn text, an acknowledged produce must be replicated, the response must wait for
+the broker, and a broker outage must leave an outbox row instead of a lost event.
+
+Requirements:
 
 - Every accepted turn publishes a \`session.turn\` event **keyed by tenant**. Kafka orders within a
   partition, not within a topic, so the key decides which events can be reordered relative to one
-  another. The starter keys by turn id, scattering one session across partitions — a consumer then
-  sees turn 3 before turn 2.
-- The payload carries **ids and token counts**, never the message text:
+  another.
+- The payload carries **ids and token counts**, not the message text:
   \`{turn_id, session_id, role, tokens}\`. The topic is retained and replicated, so a turn's text in
-  it would outlive every buffer TTL and outlive the delete semantics of the conversation.
+  it would outlive every buffer TTL and the delete semantics of the conversation.
 - The producer uses **\`acks=all\`**, so an acknowledged produce is replicated rather than buffered
   on a single broker.
-- The handler returns only **after the broker confirms**. The starter fires the produce and answers
-  immediately, so a produce that fails after the response is a lost event nobody can replay.
+- The handler returns only **after the broker confirms**, so a produce that fails cannot hide
+  behind a response that already went out.
 - When the produce is rejected, the event is written to an **outbox** row instead, so a broker
   outage delays events rather than dropping them.
-
-**Failure mode the checks target.** Two turns of one session must share a partition, the payload
-must carry no turn text, and a broker outage must leave an outbox row instead of a lost event.
 
 ## What to keep
 
@@ -46,9 +46,9 @@ level and the failure path.`,
     ],
   },
   hints: [
-    'The message key decides the partition. `key=tenant` keeps one tenant’s turns in order; keying by turn id scatters the conversation across partitions and reorders it.',
-    'The topic is retained: publish `{turn_id, session_id, role, tokens}` and never the text. A payload with the message duplicates the store with a longer lifetime and none of its delete semantics.',
-    'Do not answer before the broker does. `acks=all` plus a wait on the delivery report (`.get()`, `await`, a delivery channel, a flush) makes the write real; on failure, insert the same payload into an `outbox` row so it can be replayed later.',
+    'Symptoms: a consumer sees turn 3 before turn 2, a compliance scan finds message text in a topic retained for 30 days, and a broker blip leaves turns that were acknowledged but no event for them.',
+    'Mechanism: the key is the turn id, so each turn picks its own partition; the payload copies `content`; the producer runs with default acks; `send` is fired and the handler returns before any delivery report.',
+    'Fix: `key=tenant`, a payload of `{turn_id, session_id, role, tokens}`, `acks=all` named as `ACKS_ALL`, `.get()` on the future before responding, and on failure `RPUSH` the same payload to an `outbox` list.',
   ],
   checks: [
     {
@@ -143,9 +143,7 @@ class Turn(BaseModel):
 
 @app.post("/v1/sessions/{id}/turns")
 def append_turn(id: str, turn: Turn) -> dict:
-    # TODO: key the event by tenant so one session keeps its partition order, publish ids and token
-    # counts instead of the turn text, configure acks=all, wait for the broker to confirm before
-    # answering, and write an outbox row when the produce fails.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = json.dumps(
         {"turn_id": turn.turn_id, "content": turn.content, "role": turn.role}
     ).encode()
@@ -199,7 +197,7 @@ def append_turn(id: str, turn: Turn, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/turns: flawed code that answers before the broker confirms. */
+      starter: `/** POST /v1/sessions/:id/turns: the starter. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -218,9 +216,7 @@ interface Turn {
 app.post('/v1/sessions/:id/turns', async (request, reply) => {
   const {id} = request.params as {id: string};
   const turn = request.body as Turn;
-  // TODO: key the event by tenant so one session keeps its partition order, publish ids and token
-  // counts instead of the turn text, configure acks=all, wait for the broker to confirm before
-  // answering, and write an outbox row when the produce fails.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   void producer.send({
     topic: 'session.turn',
     messages: [
@@ -303,9 +299,7 @@ func appendTurn(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var t turn
 	_ = json.NewDecoder(r.Body).Decode(&t)
-	// TODO: key the event by tenant so one session keeps its partition order, publish ids and token
-	// counts instead of the turn text, configure acks=all, wait for the broker to confirm before
-	// answering, and write an outbox row when the produce fails.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{"turn_id": t.TurnID, "content": t.Content, "role": t.Role})
 	producer.Input() <- &sarama.ProducerMessage{
 		Topic: "session.turn",
@@ -413,9 +407,7 @@ object EventsApi {
     path("v1" / "sessions" / Segment / "turns") { id =>
       post {
         entity(as[Turn]) { turn =>
-          // TODO: key the event by tenant so one session keeps its partition order, publish ids and
-          // token counts instead of the turn text, configure acks=all, wait for the broker to
-          // confirm before answering, and write an outbox row when the produce fails.
+          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
           val event = s"""{"turn_id":"\${turn.turn_id}","content":"\${turn.content}","role":"\${turn.role}"}"""
           producer.send(new ProducerRecord[String, String](Topic, turn.turn_id, event))
           complete(StatusCodes.Created, s"""{"session_id":"$id","turn_id":"\${turn.turn_id}"}""")
@@ -503,9 +495,7 @@ int main() {
     const auto id = req.path_params.at("id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: key the event by tenant so one session keeps its partition order, publish ids and token
-    // counts instead of the turn text, configure acks=all, wait for the broker to confirm before
-    // answering, and write an outbox row when the produce fails.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto event = json{{"turn_id", body.value("turn_id", std::string())},
                             {"content", body.value("content", std::string())},
                             {"role", body.value("role", std::string())}}
@@ -570,13 +560,13 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is what belongs in a retained, replicated log. The
-topic is not a queue you can delete from; it is an append-only record with a retention policy, so
-anything published there inherits that lifetime. Copying a turn's text in duplicates the message
-store with weaker delete semantics and a longer memory, which is why the event carries only ids and
-token counts. The key is the ordering half: Kafka orders within a partition, so keying by tenant is
-what keeps one conversation's events readable in sequence. The third half is durability: an
-acknowledged produce needs \`acks=all\`, and the response must wait for that acknowledgement. When
-the broker is down, the correct behavior is not to drop the event or to fail the turn; it is to
-park the same payload in an outbox and let a replay drain it.`,
+  debrief: `A topic is an append-only record with a retention policy, not a queue you can delete from, so
+anything published there inherits that lifetime. That is why the event carries ids and token
+counts: turn text in the log would duplicate the message store with a longer memory and weaker
+delete semantics. The key is tenant because Kafka orders within a partition, so one tenant's turns
+stay in sequence. Durability is the rest of the shape: \`acks=all\` makes an acknowledgement mean
+replication, waiting for it makes the response mean the event exists, and the outbox turns a broker
+outage into a delay instead of a gap. Production services usually write the outbox row first, in
+the same transaction as the turn, and let a relay publish from it, so the handler does not depend
+on the broker at all.`,
 };

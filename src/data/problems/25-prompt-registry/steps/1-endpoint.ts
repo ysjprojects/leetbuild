@@ -8,34 +8,24 @@ export const endpointStep: Step = {
   focus: ['client', 'registry', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route,
-parses the body and answers 201, so the demo shows a version being stored. It overwrites versions in
-place, ships undeclared placeholders, and mints a new version on every retry. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/prompts\`, the registration endpoint of the prompt registry. Body:
+**Starting point.** The starter serves \`POST /v1/prompts\` with body
 \`{"name": "support-reply", "version": 3, "template": "Hi {{name}}…", "variables": ["name"],
-"parent_version": 2}\`.
+"parent_version": 2}\`: it parses the body, calls \`store.put\` and answers 201, so the demo shows a
+version being stored. It compiles, serves the demo and hides four flaws.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-  \`Idempotency-Key\` is required — **400** when absent.
-- \`template\` is a non-empty string of at most **32 KiB** (\`1 << 15\` bytes) of UTF-8; a larger
-  one is **413**.
-- \`variables\` is the **declared** variable allowlist of the version. Every \`{{placeholder}}\`
-  found in the template must be declared **and** must exist in the registry’s
-  \`ALLOWED_VARIABLES\`; anything else is **422**. Leftover \`{{…}}\` that nobody declared ships to
-  the model as literal text, which is how prompt bugs reach production.
-- Every version carries a **content hash** (SHA-256 of the template bytes). Identical templates
-  must never mint two versions: a registration whose hash already exists for that name returns the
-  stored version with **200** and \`created: false\`.
-- A version is **immutable**. A second write of the same \`(name, version)\` with a *different*
-  template is **409**; the same \`(name, version)\` with the same template is a replay and returns
-  the **original** \`content_hash\` with **200**.
+**Failure mode the checks target.** A registry whose versions can be rewritten in place cannot back
+any eval record or rollback, and one that mints a fresh version on every client retry forks the
+history it protects. The checks look at what happens before the write.
 
-**Failure mode the checks target.** The starter's \`put\` overwrites whatever was there, so an edit
-silently rewrites history that evals were run against; it never compares the template’s placeholders
-with the declared variables, so \`{{name}}\` typos ship verbatim; and it has no key, so a client
-retry forks the version history into two versions with the same number.`,
+- The tenant comes from the \`X-Tenant-Id\` header; a missing tenant is **401**.
+  \`Idempotency-Key\` is required, **400** when absent.
+- \`template\` is a non-empty string of at most **32 KiB** (\`1 << 15\` bytes); larger is **413**.
+- Every \`{{placeholder}}\` in the template must be declared in \`variables\` **and** exist in the
+  registry's \`ALLOWED_VARIABLES\`; anything else is **422**.
+- Every version carries a **content hash** (SHA-256 of the template). A registration whose hash
+  already exists for that name returns the stored version with **200** and \`created: false\`.
+- A version is **immutable**: the same \`(name, version)\` with a different template is **409**;
+  with the same template it is a replay and returns the **original** \`content_hash\` with **200**.`,
   sequence: {
     participants: ['Client', 'Prompt Registry', 'version store'],
     messages: [
@@ -146,9 +136,7 @@ store = VersionStore()
 
 @app.post("/v1/prompts")
 def register(body: PromptRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter overwrites an existing version in place, ships the template without
-    # checking its placeholders against the variable allowlist, and mints a new version on every
-    # retry because the registration is not keyed by Idempotency-Key. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     store.put(tenant, body.name, body.version, {"name": body.name, "version": body.version})
     return JSONResponse({"name": body.name, "version": body.version, "stored": True}, status_code=201)
 `,
@@ -266,9 +254,7 @@ interface PromptBody {
 }
 
 app.post('/v1/prompts', async (request, reply) => {
-  // TODO: this starter overwrites an existing version in place, ships the template without checking
-  // its placeholders against the variable allowlist, and mints a new version on every retry
-  // because the registration is not keyed by Idempotency-Key. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as PromptBody;
   await store.put(tenant, body.name, body.version, {name: body.name, version: body.version});
@@ -393,9 +379,7 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter overwrites an existing version in place, ships the template without
-	// checking its placeholders against the variable allowlist, and mints a new version on every
-	// retry because the registration is not keyed by Idempotency-Key. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	store.Put(r.Context(), tenant, body.Name, body.Version, map[string]any{
 		"name": body.Name, "version": body.Version,
 	})
@@ -621,9 +605,7 @@ object PromptApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[PromptRequest]) { body =>
-            // TODO: this starter overwrites an existing version in place, ships the template without
-            // checking its placeholders against the variable allowlist, and mints a new version on
-            // every retry because the registration is not keyed by Idempotency-Key.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             store.put(tenant, body.name, body.version, s"""{"name":"\${body.name}","version":\${body.version}}""")
             complete(StatusCodes.Created, s"""{"name":"\${body.name}","version":\${body.version},"stored":true}""")
           }
@@ -761,9 +743,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter overwrites an existing version in place, ships the template without
-    // checking its placeholders against the variable allowlist, and mints a new version on every
-    // retry because the registration is not keyed by Idempotency-Key. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     store.put(tenant, body.value("name", std::string()), body.value("version", 0), body);
     res.status = 201;
     res.set_content(json{{"name", body.value("name", std::string())}, {"version", body.value("version", 0)}, {"stored", true}}.dump(), "application/json");
@@ -897,9 +877,9 @@ int main() {
     },
   },
   hints: [
-    'Fetch the stored version before you write anything: `store.get_version(tenant, name, version)` first, and only then decide between 200 (same hash), 409 (different hash) and 201 (nothing there). A write-then-inspect order has already destroyed the old record by the time you notice.',
-    'Extract the placeholders from the template instead of trusting `variables`: the caller declares what it thinks it uses, the template says what it really uses. Reject both a placeholder the caller never declared and a variable the registry never allowlisted.',
-    'The hash is the identity of the content: `sha256(template)`. Two versions with the same hash are the same prompt, and a replay of one registration must return the hash that was stored the first time rather than a freshly computed one under a new version number.',
+    'An operator edits version 3 and the eval that approved version 3 now describes bytes nobody can see; a client that retried once finds two versions with the same number.',
+    'The handler writes before it looks: `store.put` replaces whatever record was there, nothing compares the template placeholders with `variables`, and no key ties a retry to the first registration.',
+    'Call `store.get_version(tenant, name, version)` first and branch on the SHA-256 `content_hash`; extract placeholders with `PLACEHOLDER_RE` against `variables` and `ALLOWED_VARIABLES`; key the write by `Idempotency-Key`.',
   ],
-  debrief: `The interviewer is testing whether you can defend a registry’s core promise: a version is a name for a piece of content that never changes. Immutability is what makes every later claim possible — an eval record, a rollout percentage and a rollback all refer to a version by number, and they are only meaningful if that number still means the same bytes. The hash is the second half: it is the content identity, so a re-registration of identical text returns the stored version instead of minting a second one, and a client retry cannot fork history. The placeholder allowlist is the quiet defect: undeclared \`{{…}}\` is not a template bug you see in review, it is literal text the model receives in production. Real registries add per-name ownership, a signed manifest per version, and a retention policy that keeps a version readable for as long as any audit references it.`,
+  debrief: `The fix reads before it writes because a version number is only useful if it keeps naming the same bytes. Every later claim in the registry, an eval record, a rollout, a rollback, refers to a version by number, so the handler fetches the stored record, compares content hashes, and answers 409 for a different template and 200 for a replay. The hash is the content identity: identical text resolves to the stored version, and the \`Idempotency-Key\` keeps a retry from forking history. The placeholder allowlist matters because undeclared \`{{…}}\` is not visible as a bug anywhere; it is literal text the model receives. Production registries go further with per-name ownership, a signed manifest per version, and retention that keeps a version readable while any audit row references it.`,
 };

@@ -8,30 +8,29 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: an action is published and the item moves on. It
-puts the wrong data on a durable topic and gets the durability order backwards. Find the
-three defects, fix them, and prove the fix.
+**Starting point.** The starter's \`publish(content_id, reporter_id, action, rule, detail)\` sends
+one record to \`moderation.action\` with a default producer, keyed by the reporter id and carrying
+the action, the rule, the reporter id and the report detail, then commits the consumer offset. It
+compiles, serves the demo and hides 5 flaws.
 
-Implement the \`moderation.action\` path:
+**Failure mode the checks target.** A Kafka topic is durable, replicated and long-lived, so it is
+the last place that should hold a reporter's identity or their words. The starter fails on data
+minimisation, on ordering (the wrong key), on duplicate and dropped produces, and on the crash
+window between the commit and the persist.
+
+Requirements for the \`moderation.action\` path:
 
 - Every event is keyed by the **content id**, and the payload carries the **content id**, the
   **action**, the **rule** and the **reviewer role**. Keying by reporter scatters one item's history
-  across partitions, so two consumers can apply its actions out of order and a later restore can
-  resurrect a removal.
-- The payload must never contain the **reporter's identity** or the **verbatim report detail**.
-  The starter ships both "so downstream fraud can review", which copies a private statement about a
-  person into a retained, replicated, widely-readable topic.
+  across partitions, so two consumers can apply its actions out of order.
+- The payload must not contain the **reporter's identity** or the **verbatim report detail**. A
+  private statement about a person does not belong on a retained, widely-readable topic.
 - The producer is **idempotent** with \`acks=all\`, so a retry after a timeout does not publish the
   same action twice.
-- When the broker rejects the produce, the event goes to an **outbox** instead of being dropped —
+- When the broker rejects the produce, the event goes to an **outbox** instead of being dropped;
   the moderation decision and its audit trail must not depend on the broker being up.
-- The consumer **persists the action before it commits the offset**. The starter commits first, so a
-  crash between the two replays the event into a no-op and the removal is never recorded.
-
-**Failure mode the checks target.** A Kafka topic is durable, replicated and long-lived, so it is
-the last place that should ever hold a reporter's identity or their words. The starter fails on data
-minimisation, on ordering (the wrong key), and on the crash window between the commit and the
-persist.`,
+- The consumer **persists the action before it commits the offset**, so a crash between the two
+  replays the event instead of losing the removal.`,
   sequence: {
     participants: ['Moderation API', 'moderation.action', 'Moderation consumer', 'case store'],
     messages: [
@@ -130,8 +129,7 @@ consumer = KafkaConsumer("moderation.action", group_id="moderation-writers")
 
 
 def publish(content_id: str, reporter_id: str, action: str, rule: str, detail: str) -> None:
-    # TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
-    # payload, has no acks or idempotence, skips the outbox, and commits before it persists.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = {"action": action, "rule": rule, "reporter_id": reporter_id, "detail": detail}
     producer.send("moderation.action", key=reporter_id, value=json.dumps(payload).encode())
     consumer.commit()
@@ -194,8 +192,7 @@ export async function publish(
   rule: string,
   detail: string,
 ): Promise<void> {
-  // TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
-  // payload, has no acks or idempotence, skips the outbox, and commits before it persists.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const payload = {action, rule, reporter_id: reporterId, detail};
   await producer.send({topic: 'moderation.action', messages: [{key: reporterId, value: JSON.stringify(payload)}]});
   await consumer.commitOffsets([]);
@@ -267,8 +264,7 @@ import (
 const topic = "moderation.action"
 
 func publish(producer sarama.SyncProducer, contentID, reporterID, action, rule, detail string) error {
-	// TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
-	// payload, has no acks or idempotence, skips the outbox, and commits before it persists.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]string{
 		"action": action, "rule": rule, "reporter_id": reporterID, "detail": detail,
 	})
@@ -357,8 +353,7 @@ object ModerationEvents {
   val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
   def publish(contentId: String, reporterId: String, action: String, rule: String, detail: String): Unit = {
-    // TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
-    // payload, has no acks or idempotence, skips the outbox, and commits before it persists.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"action":"$action","rule":"$rule","reporter_id":"$reporterId","detail":"$detail"}"""
     producer.send(new ProducerRecord[String, String](Topic, reporterId, payload))
     consumer.commitSync()
@@ -415,8 +410,7 @@ const std::string kTopic = "moderation.action";
 
 void publish(rd_kafka_t* producer, const std::string& contentId, const std::string& reporterId,
              const std::string& action, const std::string& rule, const std::string& detail) {
-  // TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
-  // payload, has no acks or idempotence, skips the outbox, and commits before it persists.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto payload = "{\\"action\\":\\"" + action + "\\",\\"rule\\":\\"" + rule + "\\",\\"reporter_id\\":\\"" +
                        reporterId + "\\",\\"detail\\":\\"" + detail + "\\"}";
   rd_kafka_producev(producer, RD_KAFKA_V_TOPIC(kTopic.c_str()),
@@ -471,9 +465,9 @@ void applyAction(ActionStore& store, rd_kafka_message_t* message, rd_kafka_t* co
     },
   },
   hints: [
-    'The key is the contract: it decides the partition, and the partition decides the order two consumers see. Key by the content id so one item’s actions are applied in the order they happened, and put the content id, the action, the rule and the reviewer role in the value — nothing else.',
-    'A topic is retained, replicated and read far beyond the moderation service, so treat it as public within the company. The reporter id and the verbatim report text belong in the case store, not on `moderation.action`; if fraud needs them, they join on the case id under their own access control.',
-    'Durability is an order, not a flag: persist the action, then commit the offset. `enable_idempotence` with `acks=all` keeps a retry from duplicating the event, and an outbox row keeps the audit trail alive when the broker is the thing that failed.',
+    'Anyone with read access to the topic can see who reported whom and what they wrote, a restore sometimes resurrects a removed post, and after a broker blip some removals exist in the product but nowhere in the record.',
+    "The key is the reporter id, so one item's actions land on different partitions; the payload is built inline with `reporter_id` and `detail`; the producer uses defaults; and `consumer.commit()` runs before anything is stored.",
+    'Key with `content_key(content_id)`, build the value with `build_event(content_id, action, rule, reviewer_role)`, configure `acks="all"` and `enable_idempotence`, call `outbox.insert` on a failed send, and `store.put_action` before `consumer.commit`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a publish path that is durable and widely read. The starter reads fine because the demo runs against a healthy broker and one consumer. Three defects are being checked: data minimisation on a retained topic (no reporter identity, no free text), ordering by the right key (a reporter key loses one item’s order), and the crash window (persist before commit, or an action that happened in the product never lands in the record). Real systems add a schema registry that rejects any field outside the allowlist, an outbox drainer with its own idempotency key, and a replay tool that re-applies a content id’s history to rebuild the case file.`,
+  debrief: `The key is the contract: it decides the partition, and the partition decides the order consumers see, so one item's history must share a key. The payload is built by one function with four fields because a topic is retained and read far beyond this service; the reporter id and the detail stay in the case store, where fraud can join on the case id under its own access control. Idempotence with \`acks=all\` makes a retry safe, the outbox keeps the audit trail alive when the broker is what failed, and persist-then-commit means a crash replays an event instead of dropping it. Production pipelines also register a schema that rejects any field outside the allowlist, drain the outbox with its own idempotency key, and keep a replay tool that rebuilds a case file from a content id's history.`,
 };

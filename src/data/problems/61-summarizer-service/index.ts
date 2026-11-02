@@ -18,72 +18,55 @@ import {summarizerReadStep} from './steps/5-read';
 export const summarizerServiceProblem: Problem = {
   id: 'summarizer-service',
   title: 'Summarization Service',
-  tagline: 'Summaries with bounded inputs, versioned length rules and no hallucinated events.',
+  tagline:
+    'A summarizer whose progress record is bound to the source content hash and whose citations go stale on edit.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Summarization Service
 
-A summarization service is the piece of an AI platform that turns a long source into the short
-version somebody will actually read instead of the source. The visible part is a paragraph; the parts
-that decide whether the platform is trustworthy are the caps on what one request may carry, the rules
-that fix how short a summary is allowed to be, the state that lets a long source be summarized
-incrementally without claiming text it never read, what happens when the model call fails, what the
-event stream carries, and whether the citations in a summary still point at the text they came from.
+A summarization service turns a long source into the short version somebody reads instead of the
+source. The visible part is a paragraph; what decides whether the platform is trustworthy is the cap
+on one request, the rule that fixes a summary's length, the state that lets a long source be
+summarized incrementally, what happens when the model call fails, what the event stream carries,
+and whether the citations still point at the text they came from.
 
 ## The real system
 
-Production summarizers receive a source reference and a **length band** from the platform, and they
-enforce the request cap before any model work: a source over the cap is rejected with a pointer to
-the chunked write path instead of being pushed through whole. The band is a policy input — \`short\`,
-\`medium\` and \`long\` resolve to word budgets in a platform table — and the source text is data:
-a document that says "write one sentence" cannot choose its own length any more than it can choose
-the model. Long sources are summarized chunk by chunk, and per-source progress lives in **Redis**
-with a TTL, written **atomically**: the rolling summary and the chunks it covers move in one step,
-because a crash that leaves a summary claiming chunks it never read is a summary that invents events
-that never happened. Progress is bound to the source **content hash**, so editing a source starts a
-new summary line instead of appending to the old one.
-
-The model runs over **gRPC** with a deadline, and a failure yields a trimmed extract of the source
-labelled **extractive** — never a sentence that reads like a summary but says nothing, and never a
-retry of a refusal that will be refused again. Completion publishes one event keyed by the **source
-hash**, carrying lengths, model version and compression ratio, never the summary or the source text,
-and the summary record is persisted before the offset commits. The read endpoint returns
-**sentence-level pointers** into the source chunks, and an edit to the source marks the pointers into
-the changed chunks **stale** rather than serving a citation that no longer resolves.
+Google's Document AI enforces the request cap before any model work: online \`process\` requests are
+capped at 40 MB and 15 pages, and anything larger goes through the asynchronous \`batchProcess\`
+path, which takes files up to 1 GB and, depending on the processor, up to 500 pages. The cap is a
+request-shape rule, not a model limit, and the documented answer to a source over it is a different
+write path rather than a refusal. Summarizers that sit in front of a model apply the same shape
+downstream: the length band is a policy input from a table, chunked progress is bound to a content
+hash, a failed model call yields a labelled extract, completion events carry numbers rather than
+text, and a read returns citations that resolve into one version of the source.
 
 ## What you build here
 
 One service, **summarizerd**, with five pieces:
 
-1. \`POST /v1/summaries\`: authenticated tenant, a source capped at **1 MiB** with a \`413\` that
-   points at the chunked write path, a band resolved from the platform table and never from text
-   inside the source, and an \`Idempotency-Key\` so a replayed request returns the stored summary.
-2. A **Redis** source-progress record keyed by \`(tenant, source content hash)\` with a TTL, where
-   the rolling summary and the chunk counter are committed by one Lua script, and an edited source
-   starts a new summary line instead of extending the old one.
-3. A **gRPC** summarizer client with a **5-second** deadline, a refusal treated as terminal, and a
-   failure that returns a trimmed extract marked \`extractive\` — the output type is always labelled.
-4. A **Kafka** \`summary.done\` path keyed by source hash, carrying lengths, model version and
-   compression ratio and never any text, with an idempotent producer, an outbox row when the produce
-   fails, and the summary record persisted **before** the offset commits.
-5. \`GET /v1/summaries/{id}\`: the summary with sentence-level citations into the named source hash,
-   stale marking for citations into chunks an edit changed, and a \`404\` for another tenant's id.
+1. \`POST /v1/summaries\`: a **1 MiB** cap with a \`413\` that points at the chunked write path, a
+   band resolved from the platform table, and an \`Idempotency-Key\`.
+2. A **Redis** progress record keyed by \`(tenant, source content hash)\` with a TTL, committed by
+   one Lua script.
+3. A **gRPC** client with a **5-second** deadline, terminal refusals, and a trimmed extract marked
+   \`extractive\` on failure.
+4. A **Kafka** \`summary.done\` path keyed by source hash, carrying numbers only, with an idempotent
+   producer, an outbox, and the record persisted before the offset commits.
+5. \`GET /v1/summaries/{id}\`: sentence-level citations into the named source hash, stale marking
+   for chunks an edit changed, and a \`404\` for another tenant's id.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Debug it against the failure modes the task names,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Source ingestion and connectors, chunking strategy and overlap, prompt and model selection per band,
-fine-tuning and evaluation sets, streaming a summary to the browser, multi-language summaries,
-retention and redaction policy, and cost accounting. The five pieces above are the ones that decide
-whether a summary is correct, attributable and shippable.`,
+Source ingestion, chunking strategy and overlap, prompt and model selection per band, evaluation
+sets, streaming to the browser, multi-language summaries, retention policy and cost accounting.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · read', x: 8, y: 50},

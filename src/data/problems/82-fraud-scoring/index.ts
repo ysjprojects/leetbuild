@@ -7,17 +7,17 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Fraud scoring: the course is the debugging you owe a scoring service before it decides who gets
- * approved. Server-derived features and an account check with a transaction dedupe → one atomic
- * Redis velocity window per card and device → a model call with a 300 ms deadline and a bounded
- * rules fallback instead of a zero → account-keyed score events that carry a feature digest and
- * move the alerting counters before the offset commit → a case read that masks the account's card
- * data and scopes every lookup to the caller's tenant.
+ * Fraud scoring: the debugging you owe a scoring service before it decides who gets approved.
+ * Server-derived features and an account check with a transaction dedupe → one atomic Redis
+ * velocity window per card and device → a model call with a 300 ms deadline and a bounded rules
+ * fallback instead of a zero → account-keyed score events that carry a feature digest and move the
+ * alerting counters before the offset commit → a case read that masks the account's card data and
+ * scopes every lookup to the caller's tenant.
  */
 export const fraudScoringProblem: Problem = {
   id: 'fraud-scoring',
   title: 'Fraud Scoring',
-  tagline: 'Score transactions fast with velocity truth, fail-safe degradation and PII-safe cases.',
+  tagline: 'Score card transactions with Redis velocity windows, a rules fallback and masked case reads.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -32,18 +32,23 @@ what the review console is allowed to see.
 
 ## The real system
 
-Production scorers never take the risk signals from the request. Features are derived server-side —
-account tenure, chargeback history, device and amount bands, the velocity counters of the last hour —
-so the entity being scored cannot write its own risk. Every attempt is counted in Redis before the
-model is asked anything, because a declined attempt is exactly the signal a fraudster produces when
-they retry, and the windows are keyed by card, device and day so they reset on time instead of
-accumulating forever. The model is called over gRPC under a deadline; when it is unreachable the
-service degrades to a deterministic rules score inside a configured band and marks the verdict as a
-fallback, because an outage that scores everything zero turns an availability incident into an
-approval wave. Outcomes are published to a retained topic keyed by account, carrying a digest rather
-than the feature vector, and the alerting consumers move their counters before they commit an offset.
-And a case detail a human reviewer opens shows masked account identifiers — raw card data lives
-behind one separately audited tool, not behind a role check.
+Stripe Radar is the documented version of this shape. Its rules are \`{action} if {condition}\`
+predicates (\`Block if :amount_in_usd: > 1000.00\`) evaluated in a fixed order, request-3DS, allow,
+block, review, and the velocity attributes they read, such as \`total_charges_per_customer_hourly\`,
+are windowed counts maintained by Stripe over previous attempts, so the entity being scored cannot
+supply its own count. Some of those counters are bounded: once the cap is reached the oldest
+timestamps fall out and newer ones replace them. The decision lands in one of a small set of bands,
+and payments placed in review go to a queue where a human sees the outcome, not the raw card.
+
+This course builds the same bones in one service. Features are derived server-side so the request
+cannot carry its own risk. Every attempt is counted in Redis before the model is asked anything,
+because a declined attempt is the signal a fraud ring produces when it retries, and the windows are
+keyed by card, device and bucket so they reset on time. The model is called over gRPC under a
+deadline; when it is unreachable the service degrades to a deterministic rules score inside a
+configured band and marks the verdict as a fallback. Outcomes go to a retained topic keyed by
+account, carrying a digest rather than the feature vector, and the alerting consumer moves its
+counters before it commits an offset. A case detail shows masked identifiers; raw card data lives
+behind one separately audited tool.
 
 ## What you build here
 
@@ -57,11 +62,10 @@ One service, **scorer**, with five pieces:
    boundary and one shared rule set behind reads and alerting.
 3. A **gRPC** model client: a 300 ms deadline per attempt, at most three attempts, retries only on
    \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a terminal \`INVALID_ARGUMENT\`, and a deterministic rules
-   fallback clamped to the rules band and marked as a fallback — never a zero.
+   fallback clamped to the rules band and marked as a fallback.
 4. A **Kafka** score path: one \`fraud.scored\` event per decision keyed by account reference, an
    idempotent \`acks=all\` producer, a payload with the band, the fallback marker and a feature
-   digest and no raw features or card numbers, and a consumer that updates counters before it
-   commits the offset.
+   digest, and a consumer that updates counters before it commits the offset.
 5. \`GET /v1/cases/{id}\`: score, signals, velocity snapshot and masked card references, a **404**
    for a case that belongs to another tenant, and raw card data only through a separately audited
    tool.
@@ -69,9 +73,8 @@ One service, **scorer**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real scoring feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+it looks right. Your job in every step is to debug it against the failure modes, fix it, optimize
+what is wasteful, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

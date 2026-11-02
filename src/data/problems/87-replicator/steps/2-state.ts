@@ -8,36 +8,25 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'target'],
   task: `## Task
 
-**Starting point.** The starter is working code: it keeps a per-shard offset in
-Redis and moves it forward as changes are read. It compiles, the demo converges, and it breaks the
-one invariant that makes a replica restartable. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter walks one shard's changes in \`replicate_shard(replication_id,
+shard, changes)\`, keeps the shard's offset in a Redis key under \`PAIR_KEY\`, moves it forward with
+\`GET\` plus \`SET\`, and offers \`resume_offset\` for a restart. It compiles, the demo converges,
+and it hides 5 flaws.
 
-Implement the shard's offset bookkeeping: a function that walks one shard's changes
-(\`replicate_shard(replication_id, shard, changes)\` or the stack's equivalent), \`advance_offset\`,
-and \`resume_offset\`.
+**Failure mode the checks target.** The starter stores the offset with a one-hour TTL, so an idle
+shard restarts from zero and the target re-applies months of history; it compares offsets as
+strings, so the shard stalls at the first two-digit offset; it advances the offset before the
+target confirms; its key ignores the documented layout; and \`resume_offset\` answers 0 always.
 
-- Each shard's applied offset lives in Redis under \`offset:{replication_id}:{shard}\`, keyed by
-  **both** the replication and the shard — a key shared by the whole replication makes every shard
-  overwrite every other shard's progress.
-- The key is **durable**: no \`EX\`, no \`EXPIRE\`, no \`SETEX\`, no TTL of any kind. An offset that
-  expires during a quiet period is forgotten, so the next change read for that shard starts from
-  zero and the target re-applies months of history — the exact incident this course debugs.
-- The offset is **advanced only after the target confirms** the change was applied: apply, check the
-  confirmation, and only then move the offset. Advancing while reading is progress you have not
-  earned, and a crash between the two loses the change for good.
-- The advance is a **compare-and-set that never regresses**: confirmations arrive out of order (a
-  retried older batch, a slow apply that finished late), so compare the candidate with the stored
-  offset **as integers** and leave the stored value alone when it is not larger. String ordering is
-  the quiet bug here: \`"10" < "9"\` lexicographically, so a shard at offset 9 happily "advances" to
-  10 and then refuses 11, stalling forever.
-- \`resume_offset(replication_id, shard)\` returns the confirmed offset a restarted shard resumes
-  from, and \`0\` **only** when that shard has never confirmed anything.
-
-**Failure mode the checks target.** The starter stores the offset with a one-hour TTL, so any shard
-idle longer than that restarts from zero; it compares offsets as strings, so the shard stalls at the
-first two-digit offset; and it advances the offset while reading changes, before the target has
-confirmed anything, so a lost confirmation is never retried. Each defect is invisible in a
-minutes-long demo and turns into a replay or a stall in production.`,
+- Each shard's offset lives under \`offset:{replication_id}:{shard}\`, built by \`offset_key\`.
+- The key is **durable**: no \`EX\`, \`EXPIRE\`, \`SETEX\` or TTL of any kind.
+- The offset is **advanced only after the target confirms** the change: apply, check the
+  confirmation, then move the offset.
+- The advance is a **compare-and-set that does not regress**: confirmations arrive out of order, so
+  compare the candidate with the stored offset **as integers** (\`tonumber\` in a Lua script) and
+  leave the stored value alone when it is not larger. \`"10" < "9"\` lexicographically.
+- \`resume_offset(replication_id, shard)\` returns the confirmed offset parsed as an integer, and
+  \`0\` **only** when that shard has never confirmed anything.`,
   sequence: {
     participants: ['Replication controller', 'Target region', 'Redis'],
     messages: [
@@ -57,7 +46,7 @@ minutes-long demo and turns into a replay or a stall in production.`,
   checks: [
     {
       id: 'durable-offset',
-      title: 'The offset key never expires',
+      title: 'The offset key does not expire',
       detail:
         'The offset is written with a compare-and-set that carries **no expiry** — no `EX`, `EXPIRE` or `SETEX` anywhere. The starter stores it with a one-hour TTL, so a quiet shard forgets its offset and replays its whole history.',
       match: {
@@ -70,7 +59,7 @@ minutes-long demo and turns into a replay or a stall in production.`,
     },
     {
       id: 'monotonic',
-      title: 'Offsets compare as numbers, so a shard never rewinds',
+      title: 'Offsets compare as numbers, so a shard cannot rewind',
       detail:
         'The stored offset is parsed as a number (`tonumber`) and the candidate compared numerically, so an out-of-order confirmation of an older change cannot move it back. The starter compares the two as strings, where `"10" < "9"`.',
       match: {
@@ -136,10 +125,7 @@ OFFSET_TTL_SECONDS = 3600
 PAIR_KEY = "offset:{replication}->{shard}"
 
 
-# TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
-# stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
-# greater than "9" and the shard stalls; and it writes the offset while reading the changes, before
-# the target has confirmed anything.
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 def replicate_shard(replication_id: str, shard: int, changes: list[dict]) -> None:
     key = PAIR_KEY.format(replication=replication_id, shard=shard)
     for change in changes:
@@ -217,10 +203,7 @@ interface Change {
   payload: string;
 }
 
-// TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
-// stopped and replays its whole history from zero; it compares offsets as strings, so '10' is not
-// greater than '9' and the shard stalls; and it writes the offset while reading the changes, before
-// the target has confirmed anything.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 export async function replicateShard(replicationId: string, shard: number, changes: Change[]): Promise<void> {
   const key = pairCacheKey(replicationId, shard);
   for (const change of changes) {
@@ -313,10 +296,7 @@ type Change struct {
 	Payload  []byte \`json:"payload"\`
 }
 
-// TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
-// stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
-// greater than "9" and the shard stalls; and it writes the offset while reading the changes, before
-// the target has confirmed anything.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func replicateShard(ctx context.Context, replicationID string, shard int, changes []Change) error {
 	key := pairCacheKey(replicationID, shard)
 	for _, change := range changes {
@@ -429,10 +409,7 @@ object OffsetStore {
   private val jedis = new Jedis("redis", 6379)
   val OffsetTtlSeconds = 3600
 
-  // TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
-  // stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
-  // greater than "9" and the shard stalls; and it writes the offset while reading the changes,
-  // before the target has confirmed anything.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def replicateShard(replicationId: String, shard: Int, changes: Seq[Change]): Unit = {
     val key = pairCacheKey(replicationId, shard)
     changes.foreach { change =>
@@ -512,10 +489,7 @@ std::string pairCacheKey(const std::string& replicationId, int shard) {
   return "offset:" + replicationId + "->" + std::to_string(shard);
 }
 
-// TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
-// stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
-// greater than "9" and the shard stalls; and it writes the offset while reading the changes, before
-// the target has confirmed anything.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void replicateShard(const std::string& replicationId, int shard, const std::vector<Change>& changes) {
   const auto key = pairCacheKey(replicationId, shard);
   for (const auto& change : changes) {
@@ -592,9 +566,9 @@ int64_t resumeOffset(const std::string& replicationId, int shard) {
     },
   },
   hints: [
-    'Durability is the absence of a TTL, and it is worth a comment in the code: the offsets are the shard’s checkpoint, so anything that can delete them (an `EX`, an `EXPIRE`, a cron that clears "stale" keys) is a replay waiting to happen.',
-    'Do the compare-and-set in one round trip (a Lua `EVAL`, or a `WATCH`/`MULTI` loop): read the stored offset, parse it as a number, and write only when the candidate is strictly greater. Comparing `"10"` with `"9"` as strings is the bug that stalls a shard at the first two-digit offset.',
-    'Order the shard loop as apply → confirm → advance, and keep the key namespaced by both ids: `offset:{replication_id}:{shard}`. Then `resume_offset` is just a `GET` plus a numeric parse, with 0 reserved for "this shard never confirmed anything".',
+    'Leave a shard idle for an hour and restart the controller: it replays the shard from offset 0. Run a busy shard past offset 9: it stops advancing, and a lost confirmation is not retried.',
+    '`SET ... ex=OFFSET_TTL_SECONDS` lets the checkpoint expire, `str(offset) > current` compares digits lexicographically, the write happens before `apply_to_target` returns, and `resume_offset` ignores Redis.',
+    'Register a Lua compare-and-set (`tonumber(GET)`, write only when `candidate > current`, no expiry) under `offset_key`, call it after `confirmed = apply_to_target(...)`, and make `resume_offset` `GET` plus `int(raw)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug state handling for the two ways a checkpoint fails: it disappears, or it moves backwards. The TTL is the loud one once you say it out loud — an offset with an expiry is a shard that replays its history after any quiet period — but the string comparison is the one that survives a code review, because it works for the first nine offsets and then stops the replication entirely. The third defect, advancing the offset while reading, is the correctness one: the offset is a claim about what the target has, so it may only move after the confirmation. Real replicators store the offset in the same transaction as the applied rows where they can, keep a per-shard offset with a fencing token so two controllers cannot both advance it, and alert on the offset's age rather than its TTL.`,
+  debrief: `The fix moves the checkpoint decision into one Lua compare-and-set because both ways a checkpoint fails, disappearing and moving backwards, are decided at the write: no expiry means the key outlives any quiet period, and a numeric compare inside the script means an out-of-order confirmation cannot rewind a shard or stall it at offset 10. Ordering the loop as apply, confirm, advance makes the offset a claim about what the target holds rather than what the reader has seen, so a crash between the two re-applies a change instead of losing it. Production replicators also store the offset in the same transaction as the applied rows where the target allows it, fence the key with a controller epoch so two controllers cannot both advance one shard, and alert on the offset's age.`,
 };

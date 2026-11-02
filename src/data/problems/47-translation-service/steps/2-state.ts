@@ -8,31 +8,26 @@ export const glossaryCacheStep: Step = {
   focus: ['api', 'redis', 'glossary'],
   task: `## Task
 
-**Starting point.** The starter is working code for the cache module: it caches glossaries by
-locale pair and translation-memory hits by pair and text, and it updates glossary entries with one
-call. It compiles, the demo is fast, and it hides two production flaws. Debug it like the owner of
-the cache, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the cache module behind \`POST /v1/translations\`: it caches a
+glossary under \`glossary:{pair}\` with no expiry, caches translation-memory hits under
+\`tm:{pair}:{text}\`, and adds a term with one \`HSET\` on the live glossary entry. It compiles, the
+demo is fast, and it hides five flaws.
 
-Implement the glossary and translation-memory caches used by \`POST /v1/translations\`.
+**Failure mode the checks target.** Two tenants that share a locale pair share a cache entry, so
+tenant B's text is translated with tenant A's terminology; a term update mutates the entry a request
+in flight is reading, so one translation applies half of an update; and with no TTL and no version
+to bump, the wrong terms stay served until someone flushes Redis by hand.
 
-- Cache keys are scoped by **\`(tenant, source, target, glossary version)\`**. Two tenants that
-  share a locale pair must never share an entry: one customer's terminology must never translate
-  another customer's text.
-- Every entry has a **one-hour TTL** (\`3600\` seconds) set at write time, so a stale glossary or a
-  superseded translation memory hit expires on its own.
-- A glossary is **versioned and immutable**. Writing a term publishes a new version — bump the
-  version counter and write under the new version's key — instead of mutating the live one, so an
-  in-flight request that pinned the old version keeps reading a complete glossary.
+Requirements:
+
+- Cache keys are scoped by **\`(tenant, source, target, glossary version)\`** for glossaries, and
+  by the same tuple plus the source text for translation memory.
+- Every entry has a **one-hour TTL** (\`3600\` seconds) set at write time.
+- A glossary is **versioned and immutable**. Writing a term bumps the version counter and writes
+  under the new version's key instead of mutating the live one, so an in-flight request that pinned
+  the old version keeps reading a complete glossary.
 - A request resolves its version **once**, through the active-version pointer, and loads a
-  read-only snapshot for that version.
-- Translation-memory lookups are keyed by the same tuple plus the source text, so a hit from one
-  tenant can never be replayed for another.
-
-**Failure mode the checks target.** The starter's key is \`glossary:{pair}\`, so tenant B's request
-reads tenant A's terms; its \`HSET\` mutates the entry another request is reading, so a translation
-can apply half of an update; and with no TTL the wrong terms live forever. The version counter is the
-third one candidates miss: with an immutable versioned key, a bump makes every old entry
-unreachable in the same request that published the change.`,
+  read-only snapshot for that version.`,
   sequence: {
     participants: ['Translation API', 'Redis', 'Glossary store'],
     messages: [
@@ -139,9 +134,7 @@ def load_glossary(pair: str) -> list[dict]:
 
 
 def add_term(pair: str, source: str, target: str) -> None:
-    # TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary in
-    # place, so one tenant's terms leak into another's text and an in-flight request can read a
-    # half-updated glossary. Fix both.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     r.hset(cache_key(pair), source, target)
 
 
@@ -205,7 +198,7 @@ def tm_lookup(tenant: str, source: str, target: str, version: str, text: str) ->
 `,
     },
     typescript: {
-      starter: `/** The cache module: pair-keyed, no TTL, and it edits a live glossary. */
+      starter: `/** The cache module behind POST /v1/translations. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -225,9 +218,7 @@ async function loadGlossary(pair: string): Promise<Term[]> {
 }
 
 async function addTerm(pair: string, source: string, target: string): Promise<void> {
-  // TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary with
-  // HSET, so one tenant's terms leak into another's text and an in-flight request can read a
-  // half-updated glossary. Fix both.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await r.hset(cacheKey(pair), source, target);
 }
 
@@ -330,9 +321,7 @@ func loadGlossary(ctx context.Context, pair string) ([]Term, error) {
 }
 
 func addTerm(ctx context.Context, pair, source, target string) error {
-	// TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary with
-	// HSet, so one tenant's terms leak into another's text and an in-flight request can read a
-	// half-updated glossary. Fix both.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	return rdb.HSet(ctx, cacheKey(pair), source, target).Err()
 }
 
@@ -441,9 +430,7 @@ object GlossaryCache {
     redis.get(cacheKey(pair)).map(_.parseJson.convertTo[List[Term]]).getOrElse(Nil)
 
   def addTerm(pair: String, source: String, target: String): Unit = {
-    // TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary in
-    // place, so one tenant's terms leak into another's text and an in-flight request can read a
-    // half-updated glossary. Fix both.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     redis.hset(cacheKey(pair), source, target)
   }
 
@@ -506,9 +493,7 @@ std::vector<Term> loadGlossary(const std::string& pair) {
 }
 
 void addTerm(const std::string& pair, const std::string& source, const std::string& target) {
-  // TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary in
-  // place, so one tenant's terms leak into another's text and an in-flight request can read a
-  // half-updated glossary. Fix both.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   redis.hset(cacheKey(pair), source, target);
 }
 
@@ -566,9 +551,9 @@ std::optional<std::string> tmLookup(const std::string& tenant, const std::string
     },
   },
   hints: [
-    'Write the key builder first and read it out loud: `glossary:{tenant}:{source}:{target}:v{version}`. If the tenant is missing from that string, one customer’s terminology is served to another; if the version is missing, a bump cannot invalidate anything.',
-    'A glossary is a value, not a mutable row: `INCR glossary:version:{tenant}:{source}:{target}` publishes the new version, and the terms are written under `…:v{version}`. Readers resolve the version once per request and keep it, so a concurrent writer can never expose a half-updated glossary.',
-    'Every write goes through `SETEX`/`set(..., "EX", 3600)`. A cache without a TTL turns a bad glossary version or a wrong TM hit into a permanent bug that survives the deploy you ship to fix it.',
+    "Tenant B files a ticket: their French output uses tenant A's product names. While you look, a term edit lands and a request in flight returns a glossary with half the update applied.",
+    'The key is `glossary:{pair}`, so every tenant on `en:fr` reads one entry; `add_term` runs `HSET` on that live entry; nothing sets an expiry and there is no version to pin or bump.',
+    'Key by `(tenant, source, target, version)`, write with `SETEX … 3600`, publish edits by `INCR` on the version pointer then write under the new key; resolve that pointer once per request into a snapshot.',
   ],
-  debrief: `The interviewer is checking whether you understand that a cache key is an isolation boundary. The starter looks faster than the fix because it drops the tenant and the version from the key — exactly the two dimensions a multi-tenant localization system cannot drop. In-place mutation is the second defect: an entry that a request is reading must be treated as immutable, so a change becomes a new version and the counter is the pointer. That also gives the invalidation story for free: bumping the version makes every old entry unreachable in the same request, with no deletes to race. Real services add negative caching for unknown versions, per-tenant memory limits, and a periodic reconciler that compares the counter with the stored blobs.`,
+  debrief: `The key carries the tenant and the version because a cache key is an isolation boundary: whatever is left out of the key is shared by everyone who hits it. Versions are immutable so that a reader never observes a write in progress; the counter is the only mutable thing, and bumping it makes every old entry unreachable in the same operation that publishes the new one, with no deletes to race. The TTL is the backstop for everything the version scheme does not cover, such as a wrong TM hit. Production caches also keep a negative entry for unknown versions, cap memory per tenant, and run a reconciler that compares the pointer with the stored blobs so a failed write cannot leave a dangling version.`,
 };

@@ -8,30 +8,28 @@ export const shadowClientStep: Step = {
   focus: ['shadow', 'candidate', 'prodmodel'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the candidate and handles failures. It
-compiles and the demo returns. What it does to the production request when the candidate is slow,
-or retries without limit, is the flaw. Debug it, fix it, and prove the fix.
+**Starting point.** The starter is the client the request path uses to run a shadow beside
+production: \`observe\` loops \`CANDIDATE_RETRIES\` times over \`await self.channel.Complete(request)\`,
+swallowing every exception, and \`observe_inline\` returns that coroutine for the handler to await.
+It compiles, the demo returns, and it hides five flaws.
 
-Implement the client that the request path uses to run a shadow beside production.
+**Failure mode the checks target.** A candidate that costs production latency. The starter awaits
+the candidate inline with no deadline, so an unresponsive candidate doubles the production response
+time; it has no concurrency cap, so a burst of shadow traffic amplifies the outage; it drops nothing
+and counts nothing, so the overload is invisible; and it retries every failure, multiplying the load
+exactly when the candidate is already down.
 
-- The candidate is called over **gRPC** with a hard **300 ms deadline** per call. A candidate that
-  hangs must be abandoned at the deadline, not waited on.
-- There is a **hard concurrency cap per instance** (\`MAX_SHADOW_INFLIGHT\`). The caller tries to
-  take a slot **without blocking**; when the cap is reached the shadow is **dropped**, never queued —
-  queueing converts a candidate outage into unbounded latency and memory.
-- Every dropped shadow increments a **dropped counter** (\`shadow.dropped\`), so an overloaded
-  candidate is observable instead of silent.
-- **Retries are disabled**: exactly one attempt per shadow (\`SHADOW_MAX_ATTEMPTS = 1\`). Retrying a
-  shadow adds load proportional to the outage and can outlive the traffic window.
-- The shadow is dispatched **off the request path** (a background task, \`setImmediate\`, a
-  goroutine, a \`Future\`, a detached thread). The production response is written without waiting for
-  the candidate, so an unresponsive candidate adds **zero** latency to it.
+Requirements:
 
-**Failure mode the checks target.** The starter runs the candidate call inline on the request thread
-with **no deadline**, so an unresponsive candidate doubles production latency; it has no concurrency
-cap, so a burst of shadow traffic amplifies the outage; it has no dropped counter, so the overload is
-invisible; and it **retries** every failure, multiplying the load exactly when the candidate is
-already down.`,
+- The candidate is called over **gRPC** with a hard **300 ms deadline** per call; a candidate that
+  hangs is abandoned at the deadline.
+- A **hard concurrency cap per instance** (\`MAX_SHADOW_INFLIGHT\`). The caller tries to take a slot
+  **without blocking**; when the cap is reached the shadow is **dropped**, not queued.
+- Every dropped shadow increments a **dropped counter** (\`shadow.dropped\`).
+- **Retries are disabled**: exactly one attempt per shadow (\`SHADOW_MAX_ATTEMPTS = 1\`).
+- The shadow is dispatched **off the request path** (\`asyncio.create_task\`, \`setImmediate\`, a
+  goroutine, a \`Future\`, a detached thread), so the production response is written without
+  waiting for the candidate.`,
   sequence: {
     participants: ['Client', 'Shadow Service', 'Candidate model'],
     messages: [
@@ -124,9 +122,7 @@ class ShadowClient:
         self.channel = channel
 
     async def observe(self, config_id: str, request) -> None:
-        # TODO: the starter calls the candidate inline on the request thread, with no deadline, no
-        # concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-        # doubles production latency. Fix all four.
+        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         for _ in range(CANDIDATE_RETRIES):
             try:
                 await self.channel.Complete(request)
@@ -197,9 +193,7 @@ export class ShadowClient {
   constructor(private readonly client: CandidateStub) {}
 
   async observe(configId: string, request: unknown): Promise<void> {
-    // TODO: the starter calls the candidate inline on the request thread, with no deadline, no
-    // concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-    // doubles production latency. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for (let attempt = 0; attempt < CANDIDATE_RETRIES; attempt += 1) {
       try {
         await this.call(configId, request);
@@ -299,9 +293,7 @@ func NewShadowClient(client pb.CandidateClient) *ShadowClient {
 }
 
 func (s *ShadowClient) observe(configID string, request *pb.Request) {
-	// TODO: the starter calls the candidate inline on the request thread, with no deadline, no
-	// concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-	// doubles production latency. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < candidateRetries; attempt++ {
 		if _, err := s.client.Complete(context.Background(), request); err == nil {
 			return
@@ -376,9 +368,7 @@ func (s *ShadowClient) scheduleShadow(configID string, request *pb.Request) {
   private val candidateRetries = 3
 
   def observe(configId: String, request: Request): Unit = {
-    // TODO: the starter calls the candidate inline on the request thread, with no deadline, no
-    // concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-    // doubles production latency. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var attempt = 0
     while (attempt < candidateRetries) {
       try {
@@ -452,9 +442,7 @@ class ShadowClient {
       : stub_(Candidate::NewStub(channel)) {}
 
   void observe(const std::string& configId, const Request& request) {
-    // TODO: the starter calls the candidate inline on the request thread, with no deadline, no
-    // concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-    // doubles production latency. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for (int attempt = 0; attempt < kCandidateRetries; ++attempt) {
       grpc::ClientContext context;
       Response response;
@@ -522,9 +510,9 @@ class ShadowClient {
     },
   },
   hints: [
-    'The deadline is not optional: `timeout=0.3` (Python), a `deadline` option (Node), `context.WithTimeout` (Go), an explicit deadline (Scala), `set_deadline` (C++). Without it a hung candidate holds the production request until the transport gives up.',
-    'The cap is a semaphore you try to take, not one you wait on. Python `acquire_nowait`, Go `select` with `default:`, Scala `compareAndSet`, C++ `fetch_add` — all let you drop instead of queue, and all let you count the drop.',
-    'Dispatch, do not await. The shadow belongs in a background task (`asyncio.create_task`), a `setImmediate`, a goroutine, a `Future` or a detached thread, so the production response is written without ever observing candidate latency.',
+    'Symptom: the candidate deploy hangs and production p99 for the shadowed tenant jumps from 400 ms to tens of seconds, while the candidate sees three times its configured traffic and no dashboard explains why.',
+    'Mechanism: the handler awaits `observe`, whose `for _ in range(CANDIDATE_RETRIES)` loop calls `Complete(request)` with no `timeout=` and retries every exception; nothing bounds how many loops run at once or counts an abandoned one.',
+    'Change: `SHADOW_DEADLINE_MS = 300` as `timeout=`, `SHADOW_MAX_ATTEMPTS = 1`, `MAX_SHADOW_INFLIGHT` checked with `self.inflight >=` plus a `DROPPED_METRIC` increment, and `asyncio.create_task(client.observe(…))` instead of returning the coroutine.',
   ],
-  debrief: `The interviewer is testing one number: how much latency a candidate can add to a production request. The correct answer is zero, and it comes from four decisions, not one. First, the deadline bounds a single call so a hung candidate cannot hold the request. Second, the in-flight cap with a non-blocking acquire bounds the *number* of concurrent shadows, so a burst cannot amplify the load. Third, the drop counter makes the resulting overload visible instead of silent. Fourth, dispatching off the request path means the response is written before the candidate is even called. The retry is the subtle one: retrying a shadow looks like robustness, but it adds load proportional to the outage and can outlive the traffic window — on the shadow path, one attempt is the whole policy. Real runners add an adaptive share that shrinks when the drop rate rises.`,
+  debrief: `The fix is one number held at zero: the latency a candidate may add to a production request. The deadline bounds a single call so a hung candidate cannot hold the request. The in-flight cap with a non-blocking acquire bounds the number of concurrent shadows, so a burst cannot amplify the load, and the drop counter makes the overload visible. Dispatching off the request path means the response is written before the candidate is called. The retry is the subtle part: it looks like robustness, but it adds load proportional to the outage and can outlive the traffic window, so one attempt is the whole policy. Production shadow runners also shrink the share automatically when the drop rate rises, and cancel in-flight shadows when the config is disabled.`,
 };

@@ -8,15 +8,19 @@ export const experimentReadStep: Step = {
   focus: ['client', 'api', 'store', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the analysis state, computes a p-value
-and names a winner the moment that number is small. It looks like a report; it is a peeking
-machine. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/experiments/{id}/report\`: it checks the tenant,
+reads the per-variant counters, computes a p-value and names a winner the moment that number is
+below 0.05. It serves the demo and hides 4 flaws.
 
-Implement \`GET /v1/experiments/{id}/report\` for a signed-in tenant:
+**Failure mode the checks target.** The report calls winners it has not earned: a peek at any
+sample size mints one, a split that drifted from the frozen design stays hidden, and a lift is
+printed as one number so a two-point effect and noise look identical.
+
+Implement the report for a signed-in tenant:
 
 - **Totals from the analysis state.** Per-variant \`exposures\` (the sample) and conversions are
-  counted per \`(experiment, variant)\` in the analysis state — the Redis counters the exposure
-  consumer writes before it commits its offset — never from a total cached beside them.
+  counted per \`(experiment, variant)\` in the analysis state, the Redis counters the exposure
+  consumer writes before it commits its offset, not from a total cached beside them.
 - **Minimum sample first.** An experiment below its pinned \`min_sample\` answers **200** with
   \`{"winner": null, "status": "inconclusive", "reason": "minimum sample not reached", ...}\`,
   regardless of the p-value: a peek is refused, not an error.
@@ -25,20 +29,13 @@ Implement \`GET /v1/experiments/{id}/report\` for a signed-in tenant:
   \`{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}\` and prevents
   a winner call even when \`p < 0.05\`.
 - **Every lift carries its interval.** A lift is reported as
-  \`{"lift": 0.12, "ci_low": 0.03, "ci_high": 0.21}\` — a 95 % interval computed from the two
-  proportions — never a bare lift, and never a lift without an interval, even on a significant
-  result.
+  \`{"lift": 0.12, "ci_low": 0.03, "ci_high": 0.21}\`, a 95 % interval computed from the two
+  proportions, on every branch including a significant result.
 - **A winner only when earned.** A winner is named only when the sample is reached, no blocking
   caveat is present, and \`p_value < 0.05\`; otherwise \`winner: null\` with status
   \`inconclusive\` or \`blocked\`.
 - Missing \`X-Tenant-Id\` is **401**; an unknown experiment (or one of another tenant) is **404**.
-
-**Failure mode the checks target.** The starter decides from the p-value alone —
-\`winner: p < 0.05 ? treatment : control\` at any sample size — so every peek mints a winner. It
-never computes the sample ratio mismatch, so a split that has drifted from the frozen design is
-hidden instead of surfaced as a blocking caveat. And it reports the lift as one number, so a reader
-cannot tell a two-point effect from noise. The fix is an order: the sample guard and the SRM check
-run **before** the p-value comparison, not after it.`,
+- The sample guard and the SRM check run **before** the p-value comparison.`,
   sequence: {
     participants: ['Client', 'expd report', 'analysis state'],
     messages: [
@@ -78,7 +75,7 @@ run **before** the p-value comparison, not after it.`,
       id: 'min-sample',
       title: 'Refuses a winner below the pinned minimum sample',
       detail:
-        'Below `min_sample` the report is **200** with `status: "inconclusive"`, `winner: null` and `reason: "minimum sample not reached"` — no winner, however small the p-value. The starter names a winner at any sample size.',
+        'Below `min_sample` the report is **200** with `status: "inconclusive"`, `winner: null` and `reason: "minimum sample not reached"`, with no winner however small the p-value. The starter names a winner at any sample size.',
       match: {
         python: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /winner["']?\s*:\s*None/]},
         typescript: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /winner:\s*null/]},
@@ -91,7 +88,7 @@ run **before** the p-value comparison, not after it.`,
       id: 'srm-caveat',
       title: 'Reports a sample ratio mismatch as a blocking caveat',
       detail:
-        'A deviation of the observed variant share from the frozen split above **2 %** becomes `{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}` and prevents the winner call even when `p < 0.05`. The starter never computes SRM.',
+        'A deviation of the observed variant share from the frozen split above **2 %** becomes `{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}` and prevents the winner call even when `p < 0.05`. The starter does not compute SRM.',
       match: {
         python: {all: [/SRM_THRESHOLD/, /"kind":\s*"srm"/, /"blocking":\s*True/, /caveat/]},
         typescript: {all: [/SRM_THRESHOLD/, /kind:\s*'srm'/, /blocking:\s*true/, /caveat/]},
@@ -104,7 +101,7 @@ run **before** the p-value comparison, not after it.`,
       id: 'intervals',
       title: 'Reports every lift with a 95 % confidence interval',
       detail:
-        'A lift is always returned with `ci_low` and `ci_high` — the 95 % interval computed from the two proportions — including on a significant result. The starter reports a bare `lift`.',
+        'A lift is always returned with `ci_low` and `ci_high`, the 95 % interval computed from the two proportions, including on a significant result. The starter reports a bare `lift`.',
       match: {
         python: {all: [/ci_low/, /ci_high/, /lift/]},
         typescript: {all: [/ci_low/, /ci_high/, /lift/]},
@@ -187,8 +184,7 @@ def report(
     experiment_id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
-    # the sample ratio mismatch, and reports the lift with no confidence interval.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if tenant is None or tenant == "":
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
     experiment = store.get(tenant, experiment_id)
@@ -360,8 +356,7 @@ function computePValue(control: VariantTotals, treatment: VariantTotals): number
 
 export function routes(store: ExperimentStore): void {
   app.get('/v1/experiments/:experimentId/report', async (request, reply) => {
-    // TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
-    // the sample ratio mismatch, and reports the lift with no confidence interval.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const tenant = request.headers['x-tenant-id'];
     if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
     const {experimentId} = request.params as {experimentId: string};
@@ -547,8 +542,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func report(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
-	// the sample ratio mismatch, and reports the lift with no confidence interval.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
 		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
@@ -755,8 +749,7 @@ object ExperimentReport {
     path("v1" / "experiments" / Segment / "report") { experimentId =>
       get {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this starter declares a winner whenever p < 0.05, at any sample size, never
-          // computes the sample ratio mismatch, and reports the lift with no confidence interval.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val tenant = tenantOpt.filter(_.nonEmpty)
           if (tenant.isEmpty) {
             complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
@@ -920,8 +913,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/experiments/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
-    // the sample ratio mismatch, and reports the lift with no confidence interval.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     if (tenant.empty()) {
       res.status = 401;
@@ -1093,18 +1085,18 @@ int main() {
     },
   },
   hints: [
-    'The guards have an order: read the per-variant totals, refuse the peek below `min_sample`, run the SRM check, and only then look at the p-value. The starter runs the last one first.',
-    'The interval is not decoration: compute `ci_low` and `ci_high` from the two proportions and return all three keys on every branch — including the significant one — so nobody reads a lift without its error bar.',
-    'SRM belongs to the assignment, not the outcome: compare the observed share against the frozen split and report a deviation over **2 %** as `{"caveat": {"kind": "srm", "blocking": true, ...}}` — a caveat that survives `p < 0.05`.',
+    'A product manager refreshes the report on day two, sees `winner: treatment` with a 2 % lift, ships it, and the lift is gone a week later; nobody noticed the arms were 46/54.',
+    'The starter computes `p_value` from whatever counts exist and sets the winner from `p < 0.05` alone; it has no `min_sample` branch, no share comparison against the split, and returns `lift` with no interval.',
+    'Order the guards: `sample < min_sample` answers `inconclusive`; `abs(observed - expected) / expected > SRM_THRESHOLD` adds a blocking `caveat`; only then compare `p_value < 0.05`. Return `ci_low`/`ci_high` with every `lift`.',
   ],
-  debrief: `The interviewer is testing whether the read side can say "no" while an experiment is still
-running. The starter is a peeking machine: it computes a p-value on whatever data exists and names a
-winner, which is exactly how a 5 % false-positive rate becomes a coin flip when someone refreshes
-the dashboard every morning. It hides the sample ratio mismatch, so a split that drifted from the
-frozen design — the failure that invalidates the whole comparison — never appears, and it prints a
-lift with no interval, so a two-point move and pure noise look identical. The fix is ordering plus
-disclosure: the sample guard and the SRM check run before the p-value, the mismatch is surfaced as a
-blocking caveat carrying observed and expected, and every lift travels with its 95 % interval. Real
-platforms add sequential tests and record the design version the report was computed against, but
-the rule this step enforces is simpler: a report refuses to call a winner it has not earned.`,
+  debrief: `The fix is ordering plus disclosure. The sample guard runs first because a p-value computed on
+whatever data exists turns a 5 % false-positive rate into a coin flip for anyone who refreshes the
+dashboard every morning. The SRM check runs next because a split that drifted from the frozen design
+invalidates the comparison itself, so it has to block rather than annotate. Only then is the p-value
+consulted, and every lift travels with its 95 % interval so a reader can tell a two-point move from
+noise.
+
+Production platforms add sequential tests that make repeated looks valid, record the design version
+the report was computed against, and raise the SRM alarm on the consumer side before anyone opens a
+report.`,
 };

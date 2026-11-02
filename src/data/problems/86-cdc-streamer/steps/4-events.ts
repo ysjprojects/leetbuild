@@ -8,37 +8,28 @@ export const changeEventsStep: Step = {
   focus: ['replicator', 'kafka', 'outbox', 'sink'],
   task: `## Task
 
-**Starting point.** The starter is working code: it takes the change the
-replicator read from the log, digests nothing, json-encodes the row it just read, produces it to
-\`cdc.change\` and flushes. It compiles, it delivers the happy path, and it hides three production
-flaws. Debug it like the owner of the stream, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's publish path (\`publish_change\` / \`publishChange\` /
+\`publish\`) json-encodes the row the replicator just read, produces it to \`cdc.change\` keyed by
+table, flushes, and returns the key. It compiles, it delivers the happy path, and it hides 5 flaws.
 
-Implement the publish path every committed change goes through
-(\`publish_change\` / \`publishChange\` / \`publish\`), and return the message key it used.
+**Failure mode the checks target.** The message key is the ordering contract and the payload is
+the privacy contract. Keyed by table, concurrent changes to many rows of one table interleave and
+a consumer replaying the partition can settle a row on a state that never committed. Raw column
+values in a retained, replicated topic are a copy of the tenant's rows. And a produce result
+nobody reads is a change that can vanish with no error.
 
 - The topic is \`cdc.change\`.
-- The message key is \`row_key(table, primary_key)\` — the table plus the row's primary key, e.g.
-  \`orders:1042\` — so every change of one row lands in one partition, in commit order. A table is
-  not a row: keying by table alone serializes nothing about which change of which row came first.
-- The payload carries \`before_digest\` and \`after_digest\` — the sha256 of the canonical JSON of
-  the before and after row, computed by \`digest(...)\` — plus the change's \`lsn\`. It never carries
+- The message key is \`row_key(table, primary_key)\`, the table plus the row's primary key, e.g.
+  \`orders:1042\`, so every change of one row lands in one partition in commit order.
+- The payload carries \`before_digest\` and \`after_digest\`, the sha256 of the canonical JSON of
+  the before and after row computed by \`digest(...)\`, plus the change's \`lsn\`. It does not carry
   the raw column values.
 - The producer is idempotent with acks=all: \`enable.idempotence\` with \`"acks": "all"\`
   (confluent-kafka and kafka-clients), \`idempotent: true\` with \`acks: -1\` in KafkaJS,
   \`RequiredAcks: kafka.RequireAll\` with \`Balancer: &kafka.Hash{}\` in kafka-go, and
-  \`enable.idempotence\` with \`set("acks", "all")\` in librdkafka. A resend of the same key cannot
-  duplicate a record.
+  \`enable.idempotence\` with \`set("acks", "all")\` in librdkafka.
 - A produce the broker rejects inserts an outbox row (\`insert_outbox\` / \`insertOutbox\` /
-  \`InsertOutbox\`) inside the error branch. A relay republishes it under the same key; the change is
-  never dropped.
-
-**Failure mode the checks target.** The starter keys by table only, so concurrent modifications to many
-rows of one table interleave and a consumer replaying the partition reorders one row's history — the
-last change it applies is not the row's last state. It publishes the raw before and after column
-values, so a sink can read the change without a lookup, which turns the retained, replicated topic
-into a copy of the tenant's rows. And it ignores the produce result, so a rejected produce loses the
-change with no error anyone sees. The fix must prove per-row ordering, payloads without raw values,
-and an outbox row on rejection.`,
+  \`InsertOutbox\`) inside the error branch, so a relay can republish it under the same key.`,
   sequence: {
     participants: ['Replicator', 'cdc.change', 'Sink consumer', 'outbox'],
     messages: [
@@ -154,9 +145,7 @@ class Change(BaseModel):
 
 def publish_change(change: Change) -> str:
     """Publish one committed change to cdc.change and return the message key."""
-    # TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
-    # interleave and a consumer replays one row's history out of order; it publishes the raw
-    # before/after column values and ignores whether the broker accepted the produce.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "table": change.table,
         "primary_key": change.primary_key,
@@ -249,9 +238,7 @@ interface Change {
 }
 
 export async function publishChange(change: Change): Promise<string> {
-  // TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
-  // interleave and a consumer replays one row's history out of order; it publishes the raw
-  // before/after column values and ignores whether the broker accepted the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event = {
     table: change.table,
     primary_key: change.primaryKey,
@@ -351,9 +338,7 @@ type Change struct {
 }
 
 func publishChange(ctx context.Context, change Change) string {
-	// TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
-	// interleave and a consumer replays one row's history out of order; it publishes the raw
-	// before/after column values and ignores whether the broker accepted the produce.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"table":       change.Table,
 		"primary_key": change.PrimaryKey,
@@ -458,9 +443,7 @@ final case class Change(
 object ChangeReplicator {
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
-  // interleave and a consumer replays one row's history out of order; it publishes the raw
-  // before/after column values and ignores whether the broker accepted the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publish(change: Change): String = {
     val payload = JsObject(
       "table" -> JsString(change.table),
@@ -564,9 +547,7 @@ std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
 std::string publish(const std::string& table, const std::string& primaryKey, const std::string& op,
                     const json& before, const json& after, const std::string& lsn) {
-  // TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
-  // interleave and a consumer replays one row's history out of order; it publishes the raw
-  // before/after column values and ignores whether the broker accepted the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const json event = {
       {"table", table},
       {"primary_key", primaryKey},
@@ -663,9 +644,9 @@ std::string publish(const std::string& table, const std::string& primaryKey, con
     },
   },
   hints: [
-    'The message key is the ordering contract, and a table is not a row: the key has to be `row_key(table, primary_key)` — `key=row_key(...)`, `key: rowKey(...)`, `Key: []byte(rowKey(...))`, `ProducerRecord(topic, rowKey(...), payload)`. Two rows of one table are then free to move in parallel while one row is pinned by the hash balancer to the same partition for every change.',
-    'The payload is digests plus position, not contents: `digest(row)` is the sha256 of the canonical JSON — sorted keys, no whitespace — so `before_digest` and `after_digest` name a revision while the `lsn` says where it came from. Anything that copies a column value into the topic is the leak the third check looks for; a sink that needs contents re-reads the row.',
-    'Idempotence is producer configuration plus a stable key: `enable.idempotence` with `acks=all` (`idempotent: true` with `acks: -1` in KafkaJS, `RequiredAcks: kafka.RequireAll` with `Balancer: &kafka.Hash{}` in kafka-go, `set("acks", "all")` in librdkafka). Then wrap the produce: when the broker rejects it, `insert_outbox(key, event)` and let the relay resend it under the same key — dropping the change or failing the batch silently are the two ways it disappears.',
+    'The search index shows order 1042 as `paid` after it was refunded; a privacy request has to purge a Kafka topic; a broker outage leaves a gap in the sink with nothing in the logs.',
+    'The key is `change.table`, so two changes to one row can land in different partitions; the event holds `raw_values`; and the produce result is thrown away, so a rejection is silent.',
+    'Key with `row_key(table, primary_key)`, put `digest(before)`, `digest(after)` and `lsn` in the event, configure `enable.idempotence` with `acks=all`, and `insert_outbox(key, event)` in the `except` branch.',
   ],
-  debrief: `The interviewer is testing whether you can debug the key and the payload of a CDC topic, which is where ordering and privacy in a stream are actually decided. The starter reads fine because the demo changes one row of one table at a time. Three defects are being checked. The message key is the ordering contract: keying by table gives one partition per table but no per-row serialization once the replicator produces concurrently or retries, so a consumer can apply a row's history out of order and settle on a state that never committed — row_key(table, primary_key) is what makes the row's changes a log. The payload is the second one: shipping the raw before and after rows means the retained, replicated topic holds every column of every tenant's table, and the sink gets to skip a lookup it was never entitled to; digests plus the LSN let the sink decide whether it is behind without copying the data. The ignored produce result is the quiet third one almost every producer snippet has: a broker rejection has to land in the outbox inside the error branch, with the same key, because at-least-once delivery plus an idempotent producer and a stable key is what makes the eventual resend safe. Real pipelines add a schema registry with the digest's canonicalization versioned alongside it, tombstones for deletes, per-table compaction policy, and a relay that drains the outbox in order.`,
+  debrief: `The key and the payload are where ordering and privacy in a stream get decided. \`row_key(table, primary_key)\` makes one row's changes a log: the hash balancer pins them to one partition in commit order while other rows move in parallel. Digests plus the LSN let a sink decide whether it is behind without the topic holding every column of every tenant's table; a sink that needs contents re-reads the row. The outbox write sits inside the error branch under the same key because at-least-once plus an idempotent producer plus a stable key is what makes the eventual resend safe rather than a duplicate. Production pipelines add a schema registry that versions the digest's canonicalization, tombstones for deletes, per-table compaction policy, and a relay that drains the outbox in order.`,
 };

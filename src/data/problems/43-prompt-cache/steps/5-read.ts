@@ -8,39 +8,28 @@ export const cacheReadStep: Step = {
   focus: ['client', 'cache', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: one endpoint, one number, and a
-dashboard that looks great because it averages everybody. Its three flaws are the three ways a ratio
-lies — a global slice, a price that lives in the code, and a tenant check that does not exist. Debug
-it, fix it, and prove the fix.
-
-Implement \`GET /v1/cache/stats\` — the endpoint a rollout decision reads before it trusts a cache.
-
-- **The tenant comes from the authenticated header** and a missing tenant is **401**, exactly as on the
-  fill path: a stats endpoint that answers for whoever asks is a metrics endpoint that reports
-  somebody else’s traffic.
-- **\`?tenant=\` must match the caller.** A request for another tenant’s slice is **403**
-  \`{"error": "forbidden"}\` — not an empty result, not a 404. The starter serves any tenant’s numbers to
-  any caller, which turns the ratio into a cross-tenant traffic oracle.
-- **One slice per prompt version, for the caller’s tenant only.** Read the version set the fill path
-  maintains (\`pc:versions:{tenant}\`) and, for each version, the counters the consumer updates
-  (\`pc:access:{tenant}:{version}\` → \`hits\`, \`misses\`, \`tokens_saved\`, \`fill_latency_ms\`). The starter
-  reports a single \`global\` ratio over every tenant and version, so the tenant that pays for
-  everybody else’s misses reads exactly like the tenant the cache is actually saving.
-- **The hit ratio is \`hits / (hits + misses)\` per slice**, computed from those same counters — never
-  from hits alone, and never from a separate "total requests" number that can drift. Differences
-  between the two counters are the only honest signal a rollout has.
-- **\`fill_latency_ms\` is an average the events carry**, not the handler’s own duration. The starter
-  measures how long the stats handler took and calls it fill latency; the number that matters is how
-  long the *misses* took, which is what the event’s \`latency_ms\` records.
-- **Savings come from a versioned rate table.** \`savings_usd = tokens_saved / 1000 * RATE_TABLE[version]\`
-  with a default row for versions the table does not list yet. The starter multiplies by a hardcoded
-  \`rate = 0.002\`, so a provider price change silently rewrites history and the finance number cannot
-  be reproduced from a version.
-- The response is \`{"tenant", "versions": [{"version", "hit_ratio", "fill_latency_ms", "savings_usd"}]}\`.
+**Starting point.** The starter serves \`GET /v1/cache/stats\`: it divides two global counters into
+one ratio, prices the savings with a literal \`rate = 0.002\`, reports a fixed
+\`handler_duration_ms\`, and answers for whichever \`?tenant=\` the caller names. It serves the demo
+and hides five flaws.
 
 **Failure mode the checks target.** A ratio is only as trustworthy as its slice and its price. The
-starter’s global number hides the tenant that is subsidising everyone else, its hardcoded price makes the
-savings line unauditable, and its missing tenant check leaks all of it to anyone with a request.`,
+global number hides the tenant that is subsidising everyone else, the hardcoded price makes the
+savings line unauditable, and the missing tenant check leaks all of it to anyone with a request.
+
+- **The tenant comes from the authenticated header**; a missing tenant is **401**.
+- **\`?tenant=\` must match the caller.** Another tenant's slice is **403** \`{"error": "forbidden"}\`,
+  not an empty result.
+- **One slice per prompt version, for the caller's tenant only.** Read \`pc:versions:{tenant}\` and,
+  per version, \`pc:access:{tenant}:{version}\` (\`hits\`, \`misses\`, \`tokens_saved\`,
+  \`fill_latency_ms\`).
+- **\`hit_ratio\` is \`hits / (hits + misses)\` per slice** from those counters, 0 with no traffic.
+- **\`fill_latency_ms\` is the average the events carry**, not the handler's own duration: the number
+  that matters is how long the *misses* took.
+- **Savings come from a versioned rate table**: \`tokens_saved / 1000 * RATE_TABLE[version]\` with a
+  default row for unlisted versions, so a price change is a table change rather than a rewrite of
+  history.
+- The response is \`{"tenant", "versions": [{"version", "hit_ratio", "fill_latency_ms", "savings_usd"}]}\`.`,
   sequence: {
     participants: ['Operator', 'Prompt Cache', 'Redis'],
     messages: [
@@ -74,9 +63,9 @@ savings line unauditable, and its missing tenant check leaks all of it to anyone
     ],
   },
   hints: [
-    'Read the same keys the write path writes: `pc:versions:{tenant}` for the version set and `pc:access:{tenant}:{version}` for the counters. `hits / (hits + misses)` per slice is the only ratio a rollout can act on — a global number tells you the cache is working somewhere, which is never the question.',
-    'Slice first, then authorise: resolve the caller from the header, and if `?tenant=` names somebody else, answer 403 rather than an empty slice. "Empty" is itself information, and a metrics endpoint that reports a foreign tenant’s traffic is a leak with a friendly JSON shape.',
-    'Price the savings per version (`RATE_TABLE[version]`, with a default row) instead of in the expression: a cost is a fact about a version’s provider and model, so putting the number on the version’s row makes yesterday’s estimate reproducible when the price changes tomorrow. And take `fill_latency_ms` from the events’ `latency_ms`, not from the handler’s own clock — a fast stats endpoint says nothing about how slow the misses are.',
+    "A rollout reads a healthy 0.8 ratio while one tenant's misses are paying for everyone else's hits, any caller can read any tenant's numbers, and last quarter's savings figure cannot be recomputed.",
+    "The handler reads `global_hits` and `global_misses`, takes `requested` from `?tenant=` without comparing it to the header, hardcodes `rate`, and reports a constant `handler_duration_ms` under the cache's name.",
+    "Answer 403 when `?tenant=` differs from `x-tenant-id`; iterate `pc:versions:{tenant}`, read `pc:access:{tenant}:{version}`, compute `hits / (hits + misses)`, price with `RATE_TABLE.get(version, default)`, and report the counters' `fill_latency_ms`.",
   ],
   checks: [
     {
@@ -157,9 +146,7 @@ store = Redis.from_url("redis://cache:6379/0")
 
 @app.get("/v1/cache/stats")
 async def cache_stats(request: Request) -> JSONResponse:
-    # TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
-    # caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if
-    # it were the fill latency.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     tenant = request.headers.get("x-tenant-id")
     requested = request.query_params.get("tenant", tenant)
     hits = int(await store.get("global_hits") or 0)
@@ -231,9 +218,7 @@ export const app = Fastify();
 const store = new Redis('redis://cache:6379');
 
 app.get('/v1/cache/stats', async (request, reply) => {
-  // TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
-  // caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if
-  // it were the fill latency.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const startedAt = Date.now();
   const tenant = request.headers['x-tenant-id'] as string;
   const requested = (request.query as {tenant?: string}).tenant ?? tenant;
@@ -316,9 +301,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
-// caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if it
-// were the fill latency.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func cacheStats(r *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		startedAt := nowMillis()
@@ -436,9 +419,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 
 object CacheStats {
-  // TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
-  // caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if
-  // it were the fill latency.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   val routes: Route = get {
     path("v1" / "cache" / "stats") {
       parameter("tenant".?) { requested =>
@@ -514,9 +495,7 @@ object CacheStats {
 
 using json = nlohmann::json;
 
-// TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
-// caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if it
-// were the fill latency.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void register_cache_stats(httplib::Server& server, sw::redis::Redis& cache) {
   server.Get("/v1/cache/stats", [&cache](const httplib::Request& request, httplib::Response& response) {
     const auto started = std::chrono::steady_clock::now();
@@ -594,5 +573,5 @@ void register_cache_stats(httplib::Server& server, sw::redis::Redis& cache) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell the difference between a metric and a claim. A cache ratio decides whether a prompt version gets more traffic, which means it has to be defensible line by line: the slice must be the caller’s own tenant *and* version (otherwise one tenant’s misses are paid for by another’s hits), the price must be a row attached to the version (otherwise the savings figure cannot be recomputed after a price change), and the latency must describe the misses rather than the query that reported them. The starter is what a dashboard looks like when it is written for a demo: a single impressive number, a price typed into the expression, and no tenant check at all — which is why the last of those three is the one that turns a metrics endpoint into a disclosure.`,
+  debrief: `The fix treats the ratio as a claim that has to be defensible line by line, because a rollout acts on it. The slice is the caller's own tenant *and* version, so one tenant's misses cannot hide behind another's hits; the price is a row attached to the version, so the savings figure can be recomputed after a price change; the latency describes the misses rather than the query that reported them; and the tenant check turns a disclosure back into a metrics endpoint. Production stats endpoints usually add a time window to the slice, since lifetime totals dilute this hour's regression with last week's hits, and emit the same numbers as Prometheus series so the rollout gate can alert on a drop instead of polling.`,
 };

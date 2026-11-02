@@ -8,38 +8,28 @@ export const extractAttributesStep: Step = {
   focus: ['catalogd', 'taxonomy', 'llm'],
   task: `## Task
 
-**Starting point.** The starter is working code: it sends the title to the
-extractor, parses "key: value" lines out of the answer and returns the attributes. On clean titles
-the demo looks great. It hides five production flaws — the first of them is the one the source
-post is about. Debug it like the owner of the catalog, fix it, and prove the fix.
+**Starting point.** The starter implements \`extract_attributes(sku)\` for a job from
+\`sku.extract\`: it calls \`Extractor.Extract\` with the title and description alone (empty
+\`candidate_brands\`, empty \`schema\`, no deadline, one attempt), parses "key: value" lines out of
+\`reply.output\`, copies every value and returns the result as \`accepted\`. On clean titles the
+demo looks great. It hides 5 flaws.
 
-Implement \`extract_attributes(sku)\` for a job from \`sku.extract\`
-(\`{"sku_id", "merchant", "content_hash", "title", "description", "images"}\`), calling the
-extractor service \`Extractor.Extract(ExtractRequest) → ExtractReply\` at \`extractor:50051\`,
-where \`ExtractRequest{title, description, candidate_brands[], schema}\` and
-\`ExtractReply{output, confidence}\`:
+**Failure mode the checks target.** A model asked for free text with no candidates produces a brand
+for every title, including brands that do not exist, and the starter writes them into the catalog.
+No deadline pins a worker on a slow model; no retry turns a broker blip into a failed job; the line
+parser drops every attribute once the model rephrases. The confidence gate is the subtle one:
+without it, human reviewers do not see the SKUs that need them.
 
-- **Retrieve before the model.** Ask the taxonomy for the **20** nearest brand names
-  (\`BRAND_CANDIDATES = 20\`, \`taxonomy.nearest_brands(text, k)\`) and pass them as
-  \`candidate_brands\`. The model chooses among brands that exist; it does not invent one.
-- **Ask for structured output.** Send \`ATTRIBUTE_SCHEMA\` — a JSON schema with \`brand\`, \`size\`,
-  \`unit\`, \`organic\`, \`category\` — and parse \`reply.output\` as JSON. No line parsing.
-- **Deadline and one retry.** Every attempt carries a **5-second** deadline; at most **2** attempts,
-  and only \`UNAVAILABLE\` is retried. Any other status is raised to the caller.
-- **Validate against the taxonomy.** A brand not in the candidate list, a unit not in
-  \`ALLOWED_UNITS\` (\`ml\`, \`l\`, \`g\`, \`kg\`, \`oz\`, \`fl oz\`, \`lb\`, \`ct\`), a non-positive
-  size, or a category the taxonomy does not know is dropped to null and recorded as a problem.
-- **Gate on confidence.** When there is any problem or \`reply.confidence\` is below **0.85**
-  (\`MIN_CONFIDENCE\`), enqueue the SKU for human review with the reason and mark the result
-  \`status: "review"\`; otherwise \`status: "accepted"\`. Every result carries the
-  \`taxonomy_version\` it was produced under and \`source: "model"\`.
-
-**Failure mode the checks target.** A model asked for free text with no candidates will produce a
-brand for every title, including brands that do not exist, and the starter writes them straight into
-the catalog. The missing deadline pins a worker on a slow model; the missing retry turns a broker
-blip into a failed job; the line parser silently drops every attribute the moment the model changes
-its phrasing. The confidence gate is the quiet one: without it, the human reviewers the source post
-relies on never see the SKUs that need them.`,
+- **Retrieve before the model.** Pass the **20** nearest brand names (\`BRAND_CANDIDATES = 20\`,
+  \`taxonomy.nearest_brands\`) as \`candidate_brands\`.
+- **Structured output.** Send \`ATTRIBUTE_SCHEMA\` and parse \`reply.output\` as JSON.
+- **Deadline and retry.** A **5-second** deadline per attempt; at most **2** attempts, only on
+  \`UNAVAILABLE\`.
+- **Validate.** A brand outside the candidates, a unit outside \`ALLOWED_UNITS\` or an unknown
+  category is nulled and recorded as a problem.
+- **Gate.** Any problem or \`reply.confidence\` below **0.85** (\`MIN_CONFIDENCE\`) goes to
+  \`review.enqueue\` with \`status: "review"\`; otherwise \`"accepted"\`. Every result carries its
+  \`taxonomy_version\` and \`source: "model"\`.`,
   sequence: {
     participants: ['catalogd', 'taxonomy', 'Extractor', 'review queue'],
     messages: [
@@ -58,9 +48,9 @@ relies on never see the SKUs that need them.`,
     ],
   },
   hints: [
-    'The order inside `extract_attributes` is the fix: retrieval, then the call, then validation, then the gate. `taxonomy.nearest_brands(text, BRAND_CANDIDATES)` goes into `candidate_brands`, and `ATTRIBUTE_SCHEMA` into `schema`, before the model sees anything.',
-    'Wrap the stub call in a bounded loop: `for _ in range(MAX_ATTEMPTS)`, `timeout=DEADLINE_S` (or `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) on every attempt, and `continue` only when the status is `UNAVAILABLE`; re-raise everything else at once.',
-    'Validation is set membership: brand in the candidate set, unit in `ALLOWED_UNITS`, `taxonomy.has_category(category)`. Each miss nulls the field and appends a reason; `if problems or confidence < MIN_CONFIDENCE:` is the whole gate, and `review.enqueue` is what it calls.',
+    'The catalog shows brands no taxonomy lists, a slow extractor pins a worker for minutes, a rephrased reply yields an empty attribute set, and the review queue stays empty all day.',
+    'The request carries no candidates and no schema, so the model answers freely and the line parser cannot read it; there is no deadline, one attempt, and no check on what comes back.',
+    'Retrieve `taxonomy.nearest_brands` into `candidate_brands`, send `ATTRIBUTE_SCHEMA`, loop `MAX_ATTEMPTS` with `timeout=DEADLINE_S` retrying only `UNAVAILABLE`, validate against the taxonomy, then gate on `MIN_CONFIDENCE` with `review.enqueue`.',
   ],
   checks: [
     {
@@ -202,9 +192,7 @@ FIELDS = ("brand", "size", "unit", "organic", "category")
 
 
 def extract_attributes(sku: dict) -> dict:
-    # TODO: this starter sends the title alone and lets the model name any brand, has no deadline
-    # and no retry, parses "key: value" lines, trusts every value, and never routes anything to
-    # review. Fix all five.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     request = extractor_pb2.ExtractRequest(
         title=sku["title"],
         description=sku.get("description", ""),
@@ -361,7 +349,7 @@ def extract_attributes(sku: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Extract: flawed code that trusts free-text output from the model. */
+      starter: `/** Extract: one call to the extractor service. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -398,9 +386,7 @@ export interface SkuJob {
 }
 
 export async function extractAttributes(sku: SkuJob): Promise<Record<string, unknown>> {
-  // TODO: this starter sends the title alone and lets the model name any brand, has no deadline
-  // and no retry, parses "key: value" lines, trusts every value, and never routes anything to
-  // review. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const reply = await new Promise<ExtractReply>((resolve, reject) => {
     client.Extract(
       {title: sku.title, description: sku.description ?? '', candidate_brands: [], schema: ''},
@@ -615,9 +601,7 @@ type Result struct {
 
 var fields = []string{"brand", "size", "unit", "organic", "category"}
 
-// TODO: this starter sends the title alone and lets the model name any brand, has no deadline and
-// no retry, parses "key: value" lines, trusts every value, and never routes anything to review.
-// Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func extractAttributes(ctx context.Context, sku SkuJob) (Result, error) {
 	reply, err := extractor.Extract(ctx, &pb.ExtractRequest{
 		Title:       sku.Title,
@@ -856,9 +840,7 @@ object ExtractAttributes {
 
   val Fields = List("brand", "size", "unit", "organic", "category")
 
-  // TODO: this starter sends the title alone and lets the model name any brand, has no deadline and
-  // no retry, parses "key: value" lines, trusts every value, and never routes anything to review.
-  // Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def extractAttributes(sku: SkuJob): JsObject = {
     val reply = stub.extract(
       ExtractRequest(title = sku.title, description = sku.description.getOrElse(""), candidateBrands = Nil, schema = "")
@@ -1046,9 +1028,7 @@ std::string trim(const std::string& s) {
   return s.substr(begin, end - begin + 1);
 }
 
-// TODO: this starter sends the title alone and lets the model name any brand, has no deadline and
-// no retry, parses "key: value" lines, trusts every value, and never routes anything to review.
-// Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 json extractAttributes(const json& sku) {
   grpc::ClientContext ctx;
   ExtractRequest request;
@@ -1209,5 +1189,5 @@ json extractAttributes(const json& sku) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you know what to put around a model so that its output can be trusted by a system that cannot read it. The source post's answer, which this step reproduces, is constraint from three sides: retrieval before the call (the model picks a brand from candidates that exist in the taxonomy, the way DoorDash's brand pipeline retrieves similar brands from the knowledge graph before deciding), structure in the call (a schema, parsed as JSON — the search post's structured output mapped onto taxonomy categories), and validation after the call (nothing outside the controlled vocabulary survives). The deadline and the single retry on UNAVAILABLE are the ordinary gRPC hygiene a first client never has. The confidence gate is what makes the human reviewers useful: it is the handoff the posts describe, where SKUs the model cannot tag confidently go to a person instead of into the catalog. Real extractors add per-category attribute sets (a wine has a vintage, a beer does not), an in-house classifier in front of the model so only hard SKUs pay for an LLM call, and image inputs when the title is an abbreviation.`,
+  debrief: `The fix constrains the model from three sides so a system that cannot read its output can still trust it: retrieval before the call (the model picks a brand from candidates that exist in the taxonomy, as DoorDash's brand pipeline retrieves similar brands from the knowledge graph before deciding), structure in the call (a schema, parsed as JSON) and validation after it (nothing outside the controlled vocabulary survives). The deadline and the single retry on UNAVAILABLE are ordinary gRPC hygiene. The confidence gate is what makes human reviewers useful: SKUs the model cannot tag confidently go to a person instead of into the catalog. This step does not vary the attribute set per category, put a cheap classifier in front of the model, or read images when the title is an abbreviation.`,
 };

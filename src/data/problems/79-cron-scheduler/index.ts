@@ -16,7 +16,7 @@ import {stateStep} from './steps/state';
 export const cronSchedulerProblem: Problem = {
   id: 'cron-scheduler',
   title: 'Cron Scheduler',
-  tagline: 'One instance of a scheduled job runs, not one per node, and misfires are explicit.',
+  tagline: 'One Redis lease per fire window, and a misfire policy that decides what a scheduler pause owes.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -30,16 +30,15 @@ and the event history that makes a pause visible afterwards.
 
 ## The real system
 
-Production schedulers receive time specs from many tenants, resolve a timezone rather than trusting
-a string, and refuse a cadence the queue cannot absorb. They run as several instances, so a window
-is claimed with one atomic operation and exactly one instance fires it — during a rolling deploy
-two instances are the normal case, not the exception. They hand control to the target job over gRPC
-under a deadline, and when the scheduler was down they consult the schedule's **misfire policy**:
-skip, fire once now, or catch up at a rate the target can absorb. Above all they never treat every
-missed window as owed work, because a ten-minute pause on a minutely job is 200 executions and that
-is how a scheduler takes down the database it feeds. Every attempt, skip and misfire is published
-keyed by schedule id so one schedule's history stays ordered, and a read returns that history with
-the expectations, not just the successes.
+Quartz, the scheduler behind many Java platforms, keeps its triggers in a shared database and lets
+several instances run as a cluster (\`org.quartz.jobStore.isClustered\`): whichever node acquires a
+trigger row under the database lock fires it, and the others see it as taken. It also treats a
+missed fire as a first-class case: a trigger that passes its next fire time by more than
+\`misfireThreshold\` (60 seconds by default) is handled according to the misfire instruction on the
+trigger, and \`maxMisfiresToHandleAtATime\` bounds how many misfires one pass recovers so a long
+pause does not turn into one enormous transaction. That is the shape this course rebuilds on Redis,
+gRPC and Kafka: a time spec that resolves, one claim per window across the fleet, a policy that
+decides what a pause owes, and a history that shows the decisions, not just the successes.
 
 ## What you build here
 
@@ -62,9 +61,9 @@ One service, **cronsched**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real scheduler feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+it looks right. In every step you debug it against the failure modes the task describes, fix it,
+optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on your
+version.
 
 ## Left out on purpose
 

@@ -8,35 +8,26 @@ export const stateStep: Step = {
   focus: ['ingest', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it checks whether the content
-hash was seen, counts the tenant's assets for the minute, and lets the demo through. It hides a race,
-a leak and a wrong order of operations. Find them, fix them, and prove the fix.
-
-Implement the reservation every registration goes through: the dedupe of \`(tenant, content hash)\`
-and the per-tenant ingest quota.
-
-- A registration is reserved under two keys: the dedupe key
-  \`ingest:dedupe:{tenant}:{content_hash}\` and the minute counter
-  \`ingest:quota:{tenant}:{window}\`, where \`window\` is the UTC minute bucket
-  (\`floor(unix_seconds / 60)\`). A key without the tenant lets one tenant collide with another's
-  content hash; a quota key without the window never resets.
-- The tenant may register at most **500** assets per minute. The **501st** registration in a minute
-  is refused with **429** and \`Retry-After\` (seconds left in the window), and it must not have
-  consumed any of the tenant's budget.
-- Dedupe check, registration mark and quota increment happen in **one atomic Lua script** executed
-  with \`EVAL\`. A \`GET\` followed by a separate \`INCR\` leaves a window in which two concurrent
-  requests both observe room that only one of them has.
-- Both keys expire: the quota key with its window and the dedupe key after a day, set on the first
-  write inside the same script. Without a TTL the dedupe map grows forever and a tenant that had one
-  busy minute stays locked out.
-- A duplicate — the same content hash reserved again before its TTL — is **not** a quota rejection:
-  it returns the stored asset id (200) through the cache path and spends no quota, whatever the
-  tenant's counter says.
+**Starting point.** The starter's \`reserve(tenant, content_hash)\` answers a known hash from a
+\`GET\` on \`ingest:{content_hash}\`, reads a tenant-wide counter, increments it with a second
+command and stores the new asset id; the handler returns 201 even when the counter was full. It
+serves the demo and hides five flaws.
 
 **Failure mode the checks target.** Two concurrent registrations both pass the same check and the
-tenant goes over quota; the keys without a TTL never reset; and a refusal that already consumed a
-unit of the counter punishes the client for retrying. The subtlest one is the last: a dedupe check
-placed *after* the quota increment turns a harmless re-upload into a quota rejection.`,
+tenant goes over quota; keys without a TTL grow forever and a counter without a window locks a
+tenant out after one busy minute; a dedupe key without the tenant lets one tenant's hash answer
+another's; a refused registration gets 201 instead of 429; and a duplicate answered outside the
+script can be charged quota.
+
+- Two keys: \`ingest:dedupe:{tenant}:{content_hash}\` and the minute counter
+  \`ingest:quota:{tenant}:{window}\`, where \`window\` is \`floor(unix_seconds / 60)\`.
+- At most **500** assets per tenant per minute; the **501st** is refused with **429** and
+  \`Retry-After\` (seconds left in the window) and consumes none of the budget.
+- Dedupe check, registration mark and quota increment run in **one Lua script** via \`EVAL\`; the
+  duplicate returns *before* the counter is incremented, so a re-upload spends no quota whatever
+  the counter says.
+- Both keys expire, set on the first write inside the same script: the quota key with its window,
+  the dedupe key after a day.`,
   sequence: {
     participants: ['Ingest API', 'Redis', 'Client'],
     messages: [
@@ -57,9 +48,9 @@ placed *after* the quota increment turns a harmless re-upload into a quota rejec
     ],
   },
   hints: [
-    'All of it belongs on the Redis side of one round trip: read the dedupe key, compare the counter, increment, mark and expire inside a single `EVAL`. Two commands from the client is the race, no matter how fast the client is.',
-    'The dedupe check must come first and return early: a duplicate is a cache hit, not a request for quota. Only a hash that has never been reserved may consume a unit of the tenant’s minute.',
-    'Expire the quota key with its window (`EXPIRE` on first write, so a rejected window still cleans itself up) and the dedupe key with its retention (`86_400` seconds). A key that never expires is a leak in one case and a lockout in the other.',
+    "Two uploaders on one tenant get 503 assets through in a minute; a tenant quiet since yesterday is still refused; a re-uploaded logo comes back with another tenant's asset id.",
+    "The starter's `GET` then `INCR` are two round trips, so two requests read the same count; `ingest:{content_hash}` has no tenant, `ingest:quota:{tenant}` has no window, and no key gets an `EXPIRE`.",
+    "Put check, mark, increment and both `expire` calls in one `RESERVE_LUA` run by `.eval(`; return the duplicate before `'incr'`, cap at `QUOTA_MAX = 500`, and map a full counter to 429 with `Retry-After`.",
   ],
   checks: [
     {
@@ -118,7 +109,7 @@ placed *after* the quota increment turns a harmless re-upload into a quota rejec
       id: 'duplicate-first',
       title: 'A duplicate is answered before the quota is spent',
       detail:
-        'The script returns the stored asset for an existing dedupe key *before* it increments the counter, so a re-upload passes through the cache path even when the tenant is over quota. The starter charges first and dedupes afterwards.',
+        'The script returns the stored asset for an existing dedupe key *before* it increments the counter, so a re-upload passes through the cache path even when the tenant is over quota. The starter answers duplicates with a separate `GET` outside the reservation, so the order is not guaranteed.',
       match: {
         python: {all: [/ingest:dedupe/], order: [/duplicate/, /'incr'/]},
         typescript: {all: [/ingest:dedupe/], order: [/duplicate/, /'incr'/]},
@@ -150,9 +141,7 @@ class AssetRequest(BaseModel):
 
 
 def reserve(tenant: str, content_hash: str) -> tuple[bool, str]:
-    # TODO: this starter checks the dedupe key with one GET and increments the counter with a second
-    # command, so two concurrent registrations both observe room that only one of them has; neither
-    # key ever expires, and the dedupe key ignores the tenant.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"ingest:{content_hash}"
     existing = r.get(key)
     if existing:
@@ -261,9 +250,7 @@ interface AssetBody {
 }
 
 async function reserve(tenant: string, contentHash: string): Promise<[boolean, string]> {
-  // TODO: this starter checks the dedupe key with one GET and increments the counter with a second
-  // command, so two concurrent registrations both observe room that only one of them has; neither
-  // key ever expires, and the dedupe key ignores the tenant.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = 'ingest:' + contentHash;
   const existing = await r.get(key);
   if (existing !== null) return [true, existing];
@@ -388,9 +375,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func reserve(ctx context.Context, tenant, contentHash string) (bool, string, error) {
-	// TODO: this starter checks the dedupe key with one GET and increments the counter with a second
-	// command, so two concurrent registrations both observe room that only one of them has; neither
-	// key ever expires, and the dedupe key ignores the tenant.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := "ingest:" + contentHash
 	if existing, err := rdb.Get(ctx, key).Result(); err == nil {
 		return true, existing, nil
@@ -569,9 +554,7 @@ object IngestState {
   private val jedis = new Jedis("redis", 6379)
 
   def reserve(tenant: String, contentHash: String): (Boolean, String) = {
-    // TODO: this starter checks the dedupe key with one GET and increments the counter with a second
-    // command, so two concurrent registrations both observe room that only one of them has; neither
-    // key ever expires, and the dedupe key ignores the tenant.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = s"ingest:$contentHash"
     val existing = jedis.get(key)
     if (existing != null) {
@@ -711,9 +694,7 @@ constexpr long long kQuotaLimit = 500;
 auto redis = sw::redis::Redis("tcp://redis:6379");
 
 bool reserve(const std::string& tenant, const std::string& contentHash, std::string& assetId) {
-  // TODO: this starter checks the dedupe key with one GET and increments the counter with a second
-  // command, so two concurrent registrations both observe room that only one of them has; neither
-  // key ever expires, and the dedupe key ignores the tenant.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string key = "ingest:" + contentHash;
   if (const auto existing = redis.get(key)) {
     assetId = *existing;
@@ -844,16 +825,13 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can see the check-then-act shape in a cache path. The starter
-reads like a cache-aside implementation and it passes every sequential test; under concurrency the
-two commands are two decisions, and the tenant can spend a unit of quota twice. Moving them into one
-Lua script makes the read, the compare and both writes one decision, which is the only way a
-distributed counter is correct.
-
-The second-order bug is the order inside that script: charge first, dedupe second, and a client that
-re-uploads a file it already uploaded gets a 429 — a cache hit reported as a quota error. Expiry is
-the third: the dedupe key is a memory leak without a TTL, and the quota key without the minute bucket
-turns a burst into a permanent lockout. Real systems add a small Retry-After skew, a
-X-RateLimit-Remaining header, and an operator-visible counter for refusals, and they keep the
-reservation in the same request as the metadata write so a refused asset leaves no partial row.`,
+  debrief: `The starter reads like cache-aside and passes every sequential test; under concurrency its two
+commands are two decisions, and a tenant can spend one unit of quota twice. Moving the read, the
+compare and both writes into one Lua script makes them a single decision, which is what a
+distributed counter needs. The order inside the script matters as much as its atomicity: charge
+first and dedupe second, and a client re-uploading a file it already owns gets a 429, a cache hit
+reported as a quota error. Expiry set on the first write keeps the dedupe map bounded and lets a
+busy minute end. Production services also expose \`X-RateLimit-Remaining\` and a refusal counter
+for operators, and run the reservation in the same request as the metadata write so a refused
+asset leaves no partial row.`,
 };

@@ -8,28 +8,24 @@ export const monitorReportStep: Step = {
   focus: ['client', 'monitor', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: the endpoint returns a distance, the demo looks
-right, and the number is meaningless. It hides three flaws. Debug it, fix it, and prove the fix.
-
-Implement \`GET /v1/monitors/{monitor_id}/report\`:
-
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the monitor is resolved **scoped by
-  tenant** — \`store.report(tenant, monitor_id)\`. A foreign or unknown monitor id is **404**, never
-  another tenant's drift.
-- The report always carries the **sample counts** on both sides (\`sample_count\`,
-  \`baseline_sample_count\`), the current window boundaries and the **baseline window**. A distance
-  without counts cannot be judged; the starter hides them.
-- The state is **explicit**: fewer than \`MIN_SAMPLES = 200\` samples on either side reports
-  \`state: "insufficient_data"\` rather than an alert. The starter calls a distance computed from a single
-  batch of 20 samples significant.
-- \`threshold_crossed\` is true only when the samples are sufficient **and** \`distance >= threshold\`;
-  otherwise it is false, and the state says why.
-- The response carries numbers about the distribution, never feature values.
+**Starting point.** The starter serves \`GET /v1/monitors/{monitor_id}/report\`: it resolves the
+monitor by id alone, reads the latest evaluation and answers with the distance and a hardcoded
+\`"significant": true\`. It serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** A number without its counts is an opinion: on 20 samples a
 distance of 0.4 is noise, and a monitor that reports it as a crossing trains everyone to ignore it. A
-report that resolves the monitor by id alone also leaks one tenant's drift to another. Both flaws pass
-every demo, because demos ask for their own monitor and never look at the sample count.`,
+report that resolves the monitor by id alone also leaks one tenant's drift to another. Both pass
+every demo, because demos ask for their own monitor and do not look at the sample count.
+
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the monitor is resolved **scoped by
+  tenant** with \`store.report(tenant, monitor_id)\`. A foreign or unknown monitor id is **404**.
+- The report always carries the **sample counts** on both sides (\`sample_count\`,
+  \`baseline_sample_count\`), the current window boundaries and the **baseline window**.
+- The state is **explicit**: fewer than \`MIN_SAMPLES = 200\` samples on either side reports
+  \`state: "insufficient_data"\` rather than an alert.
+- \`threshold_crossed\` is true only when the samples are sufficient **and** \`distance >= threshold\`;
+  otherwise it is false, and the state says why.
+- The response carries numbers about the distribution, not feature values.`,
   sequence: {
     participants: ['Client', 'Drift Monitor', 'report store', 'Redis'],
     messages: [
@@ -63,7 +59,7 @@ every demo, because demos ask for their own monitor and never look at the sample
       id: 'tenant-scope',
       title: 'Resolves the monitor inside the tenant',
       detail:
-        'The lookup is `store.report(tenant, monitor_id)` and a missing or foreign monitor is **404** — not another tenant’s drift and not a 403. The starter resolves by monitor id alone, so any caller can read any monitor.',
+        'The lookup is `store.report(tenant, monitor_id)` and a missing or foreign monitor is **404**, not another tenant’s drift and not a 403. The starter resolves by monitor id alone, so any caller can read any monitor.',
       match: {
         python: {all: [/store\.report\(tenant, monitor_id\)/, /status_code\s*=\s*404/]},
         typescript: {all: [/store\.report\(tenant, monitorId\)/, /code\(\s*404\s*\)/]},
@@ -102,7 +98,7 @@ every demo, because demos ask for their own monitor and never look at the sample
       id: 'threshold-crossed',
       title: 'Reports a crossing only for a sufficient, over-threshold window',
       detail:
-        '`threshold_crossed` is computed as `sufficient and distance >= threshold`, never hardcoded. The starter returns `"significant": true` for whatever it found.',
+        '`threshold_crossed` is computed as `sufficient and distance >= threshold`, not hardcoded. The starter returns `"significant": true` for whatever it found.',
       match: {
         python: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
         typescript: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
@@ -137,9 +133,7 @@ def monitor_report(
     monitor_id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
-    # reports a distance computed from a single 20-sample batch as significant; and it hides the
-    # sample counts. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     latest = store.resolve(monitor_id)
     if latest is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -218,9 +212,7 @@ import {store} from './store';
 export const app = Fastify();
 
 app.get('/v1/monitors/:monitor_id/report', async (request, reply) => {
-  // TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
-  // reports a distance computed from a single 20-sample batch as significant; and it hides the
-  // sample counts. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {monitor_id: monitorId} = request.params as {monitor_id: string};
   const latest = await store.resolve(monitorId);
   if (latest === null) return reply.code(404).send({error: 'not found'});
@@ -302,9 +294,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func monitorReport(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
-	// reports a distance computed from a single 20-sample batch as significant; and it hides the
-	// sample counts. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	monitorID := r.PathValue("monitor_id")
 	latest, err := store.Resolve(r.Context(), monitorID)
 	if err != nil {
@@ -423,9 +413,7 @@ object ReportApi {
   val route: Route =
     path("v1" / "monitors" / Segment / "report") { monitorId =>
       get {
-        // TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
-        // reports a distance computed from a single 20-sample batch as significant; and it hides the
-        // sample counts. Fix all three.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         store.resolve(monitorId) match {
           case None =>
             complete(StatusCodes.NotFound, """{"error":"not found"}""")
@@ -540,9 +528,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/monitors/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
-    // reports a distance computed from a single 20-sample batch as significant; and it hides the
-    // sample counts. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto monitorId = req.matches[1].str();
     const auto latest = store.resolve(monitorId);
     if (!latest) {
@@ -635,16 +621,17 @@ int main() {
     },
   },
   hints: [
-    'Authorize with the same lookup you read with: `store.report(tenant, monitor_id)` returns nothing when the monitor belongs to someone else, and that nothing is a **404**. Resolving by monitor id alone and then comparing owners in the handler is the bug the starter ships.',
-    'Ship the counts with the number. `sample_count`, `baseline_sample_count` and `baseline_window` are what let a reader decide whether a distance of 0.4 is drift or noise — a report without them is an opinion.',
-    'Make the state explicit rather than implied: `sufficient = sample_count >= MIN_SAMPLES and baseline_sample_count >= MIN_SAMPLES`, `state = "ok" / "insufficient_data"`, and `threshold_crossed = sufficient and distance >= threshold`. Never return a crossing the samples cannot support.',
+    'Symptom: a dashboard shows "significant" on a monitor five minutes after registration, and a tenant pastes another workspace’s monitor id into the URL and gets a report back.',
+    'Mechanism: `store.resolve(monitor_id)` ignores the tenant, the response is built from the distance alone, and the flag is a literal `true`, so nothing in the handler ever looks at how many samples were behind the number.',
+    'Change: `store.report(tenant, monitor_id)` with 404 on none; return `sample_count`, `baseline_sample_count`, `baseline_window`; `sufficient = both >= MIN_SAMPLES`, `state = "ok" / "insufficient_data"`, `threshold_crossed = sufficient and distance >= threshold`.',
   ],
-  debrief: `The last step is the one that decides whether the monitor is trusted. Three habits are being tested:
-scope every read to the tenant that owns the object, so a monitor id from another workspace is a 404
-rather than a leak; report the counts alongside the distance, because significance is a property of the
-sample, not of the number; and model the third state explicitly — drift monitors have "no drift", "drift"
-and "not enough data yet", and collapsing the third into either of the others is how a monitor earns a
-reputation for crying wolf. Real platforms add confidence intervals or p-values per distance measure,
-per-feature breakdowns, a report cache keyed by (monitor, window), and a retention policy that keeps the
-baseline window readable for as long as the comparison is offered.`,
+  debrief: `Authorization and lookup are the same call because a tenant-scoped read cannot leak: \`store.report\`
+returns nothing for a foreign monitor, and nothing is a 404, which tells an attacker less than a 403
+would. The counts travel with the distance because significance is a property of the sample, not of
+the number. Modelling "not enough data yet" as its own state, instead of folding it into "no drift"
+or "drift", is what keeps the monitor from crying wolf during the first windows after registration,
+and deriving \`threshold_crossed\` from that state keeps the flag and the explanation consistent.
+Production reports add confidence intervals or p-values per distance measure, per-feature
+breakdowns, a report cache keyed by (monitor, window) and a retention policy that keeps the baseline
+window readable for as long as the comparison is offered.`,
 };

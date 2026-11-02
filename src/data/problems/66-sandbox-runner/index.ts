@@ -7,75 +7,66 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Sandbox runner: the course is not "run code in a container", it is the debugging you owe an
- * execution path before it runs model-authored code on a host. Declarative submissions with
- * default-deny capabilities → Redis leases that carry the hard wall-clock limit → a container call
- * with a deadline and an isolation check → job events keyed by job, carrying digests instead of
- * bodies → a read endpoint that returns the used profile, resource usage and a verified output.
+ * Sandbox runner: the debugging an execution path needs before it runs model-authored code on a
+ * host. Declarative submissions with default-deny capabilities → Redis leases that carry the hard
+ * wall-clock limit → a container call with a deadline and an isolation check → job events keyed by
+ * job, carrying digests instead of bodies → a read endpoint that returns the used profile, resource
+ * usage and a verified output.
  */
 export const sandboxRunnerProblem: Problem = {
   id: 'sandbox-runner',
   title: 'Sandbox Runner',
-  tagline: 'Execute model-authored code in isolation with hard limits and reproducible logs.',
+  tagline: 'Run model-authored code under a Redis lease, an isolation rank check and digest-only job events.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Sandbox Runner
 
-A sandbox runner is the piece of an AI platform that takes code a model wrote and runs it somewhere
-it cannot do damage: a container with a wall-clock limit, a declared capability set, a named
-isolation profile, and a result an operator can audit later. The visible part is "the job finished";
-the parts that decide whether the platform survives are the submission contract, the lease that owns
-the clock, the isolation check before the code runs, the event stream nobody can mine for tenant
-data, and a read path that proves what actually ran.
+A sandbox runner takes code a model wrote and runs it where it cannot do damage: a container with a
+wall-clock limit, a declared capability set, a named isolation profile, and a result an operator can
+audit later. The parts that decide whether the platform survives are the submission contract, the
+lease that owns the clock, the isolation check before the code runs, the event stream, and the read
+path that proves what ran.
 
 ## The real system
 
-Production runners receive programs from many tenants, at sizes a human did not write. They cap them,
-they make the caller *declare* what the job needs, and they grant capabilities from a profile table
-rather than from the request. They give every job a lease with a hard maximum runtime so a runaway
-program ends on schedule even if the runner restarts. They call a container service under a deadline
-and check that the isolation they got is the isolation they asked for, because a silently downgraded
-profile is a job running on the host. They publish lifecycle events keyed by job so the history stays
-ordered, carrying digests rather than the code and output bodies, with an outbox for the produce that
-fails. And they never serve a result they cannot attribute: the used profile, the resource usage and
-a digest-verified output, scoped to the tenant that submitted it.
+gVisor's \`runsc\` runs a container's syscalls through its own user-space kernel, and its
+\`--network=none\` runtime flag removes external networking while keeping a loopback inside the
+sandbox; a profile table that maps "no network" to that flag is the kind of grant this course
+models. E2B's cloud sandboxes take a timeout at creation, extend it through \`setTimeout\` while
+running, and kill the sandbox when it expires, so the lifetime lives on the platform rather than in
+the client.
 
 ## What you build here
 
 One service, **sandboxd**, with five pieces:
 
-1. \`POST /v1/sandbox/jobs\`: an authenticated tenant, code capped at 256 KiB, a declared entry
-   point, a profile from an allowlist, a **default-deny capability** check against that profile, and
-   an \`Idempotency-Key\` so a replayed submit returns the original job id instead of running the
-   body again.
+1. \`POST /v1/sandbox/jobs\`: an authenticated tenant, code capped at 256 KiB, a profile from an
+   allowlist, a **default-deny capability** check against that profile, and an \`Idempotency-Key\`
+   so a replayed submit returns the original job id.
 2. A **Redis** lease per job: \`lease:{job_id}\` written with the hard maximum runtime as its TTL,
-   read back on every check, enforced with a kill at the deadline, discarding any result written
-   after the lease lapsed, and recovered from Redis when the runner restarts.
+   read back on every check, a kill at the deadline, late results discarded, and jobs recovered
+   after a restart.
 3. A **gRPC** container client: a 30-second deadline per attempt, at most two attempts, an image
    rejection treated as terminal, a start timeout that fails the job instead of weakening the
-   profile, and a rank check that refuses a container reporting a weaker isolation than requested.
-4. A **Kafka** lifecycle stream: \`sandbox.job\` keyed by job id, one event per stage with profile,
-   exit status, resource usage and the digests of code and output — never the bodies — an idempotent
-   producer with \`acks=all\`, and an outbox row when the broker rejects the produce.
-5. \`GET /v1/sandbox/jobs/{id}\`: the result with provenance — exit status, usage, the **profile
-   actually used**, and a digest-verified download for the output; a foreign job is **404** and an
-   unfinished job is **409**.
+   profile, and a rank check on the isolation the container reports.
+4. A **Kafka** lifecycle stream: \`sandbox.job\` keyed by job id, one event per stage carrying
+   profile, exit status, usage and the digests of code and output, an idempotent producer with
+   \`acks=all\`, and an outbox row when the produce fails.
+5. \`GET /v1/sandbox/jobs/{id}\`: exit status, usage, the **profile actually used**, and a
+   digest-verified download; a foreign job is **404**, an unfinished job **409**.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real AI platform feature: debug
-it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. In each step you debug it, fix it, optimize what
+is wasteful, and prove the fix with checks that fail on the starter and pass on yours.
 
 ## Left out on purpose
 
-Container runtime internals (namespaces, seccomp profiles, image building), the scheduler that places
-jobs on nodes, GPU passthrough, artifact storage backends, billing for execution time, the job
-queue's own delivery guarantees, and any UI. The five pieces above are the ones that decide whether
-the sandbox is correct, isolated and auditable.`,
+Container runtime internals (namespaces, seccomp profiles, image building), the scheduler that
+places jobs on nodes, GPU passthrough, artifact storage backends, billing, the job queue's own
+delivery guarantees, and any UI.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · read', x: 6, y: 50},

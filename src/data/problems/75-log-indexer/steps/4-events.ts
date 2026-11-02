@@ -8,30 +8,26 @@ export const eventsStep: Step = {
   focus: ['redis', 'writer', 'shard', 'kafka'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds an event, produces it
-to \`log.indexed\` and commits the batch. It compiles, the topic fills up, and it hides three
-production flaws — one of them lets a pipeline that is dropping logs look complete. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`publish_batch\` builds a \`log.indexed\` event with the batch id,
+tenant, indexed count and index snapshot, produces it keyed by the batch's index name, flushes, then
+calls \`commit_batch\`. It compiles, the topic fills up, and it hides four flaws; one of them lets a
+pipeline that is dropping logs look complete.
 
-Implement \`publish_batch\` for one drained batch of records:
-
-- Publish **only after the shard has committed** the batch: call \`commit_batch(batch_id)\` first, then
-  produce. Announcing a batch the index does not hold makes the completeness number a lie.
-- The message **key is the service id**, so one service's \`log.indexed\` stream lands on one partition
-  and stays ordered. Keying by the index shard interleaves every service that shares the shard.
-- The event carries \`batch_id\`, \`indexed_count\`, **\`shed_count\`**, **\`rejected_count\`** and the
-  \`index_snapshot\`. A consumer must be able to see that 400 records were shed and 12 were rejected
-  at ingest; omitting those counts makes a dropping pipeline look complete.
+- Publish **only after the shard has committed**: \`commit_batch(batch_id)\` first, then produce.
+- The message **key is the service id**, so one service's stream stays on one partition, in order.
+- The event carries \`batch_id\`, \`indexed_count\`, **\`shed_count\`**, **\`rejected_count\`** and
+  \`index_snapshot\`, so a consumer can see what ingest shed and rejected.
 - The producer is **idempotent with \`acks=all\`** (\`RequiredAcks=RequireAll\` with a hash balancer in
-  kafka-go), so a retried produce cannot duplicate the event.
+  kafka-go).
 - When the broker **rejects the produce**, write an **outbox** row (\`insert_outbox\`) that a relay
-  republishes; never drop the event and never fail the write silently.
-- The payload carries tenant and service ids — never the log message text.
+  republishes.
+- The payload carries tenant and service ids, never the log message text.
 
-**Failure mode the checks target.** The starter keys by the index shard, so a service's events scatter
-across partitions and a consumer cannot reconstruct order; it publishes before the shard commits, so
-a crash between the produce and the commit leaves the ledger announcing a batch that was never
-indexed; and it drops the shed and rejected counts, so the same ledger reports 100 % while the ingest
-path quietly discarded a fifth of the traffic.`,
+**Failure mode the checks target.** Keyed by the index shard, a service's events scatter across
+partitions and lose order; produced before the commit, a crash in between leaves the ledger
+announcing a batch that was not indexed; with the broker's answer ignored, a rejected produce
+vanishes; and without the shed and rejected counts, the ledger reports 100 % while the ingest path
+discarded a fifth of the traffic.`,
   sequence: {
     participants: ['Buffered writer', 'Index shard', 'log.indexed'],
     messages: [
@@ -136,9 +132,7 @@ store = OutboxStore()
 
 
 def publish_batch(tenant: str, service: str, batch: dict, commit_batch) -> dict:
-    # TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
-    # shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
-    # three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     event = {
         "batch_id": batch["batch_id"],
         "tenant": tenant,
@@ -226,9 +220,7 @@ export async function publishBatch(
   batch: CommittedBatch,
   commitBatch: (batchId: string) => Promise<void>,
 ): Promise<Record<string, unknown>> {
-  // TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
-  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
-  // three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const event = {
     batch_id: batch.batch_id,
     tenant,
@@ -324,9 +316,7 @@ var store = &OutboxStore{}
 
 // PublishBatch ships one log.indexed event for a drained batch.
 func PublishBatch(ctx context.Context, tenant, service string, batch CommittedBatch, commitBatch func(context.Context, string) error) (map[string]any, error) {
-	// TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
-	// shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
-	// three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"batch_id":       batch.BatchID,
 		"tenant":         tenant,
@@ -420,9 +410,7 @@ object Events {
       indexSnapshot: Map[String, String]
   )
 
-  // TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
-  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
-  // three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   def publishBatch(tenant: String, service: String, batch: CommittedBatch, commitBatch: String => Unit): Map[String, Any] = {
     val event = Map(
       "batch_id" -> batch.batchId,
@@ -518,9 +506,7 @@ json publishBatch(
     const std::string& service,
     const json& batch,
     const std::function<void(const std::string&)>& commitBatch) {
-  // TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
-  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
-  // three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const json event = {
       {"batch_id", batch["batch_id"]},
       {"tenant", tenant},
@@ -591,9 +577,9 @@ json publishBatch(
     },
   },
   hints: [
-    "The key is an ordering contract, not a label: key by the index shard and every service that shares it is interleaved in one partition, so a consumer cannot reconstruct one service's stream. Key by the service id and each service gets its own ordered stream.",
-    'The produce order matters more than the retry policy here. Commit the shard batch first, then produce: an event that arrives before the index holds the data is a promise the ledger cannot keep, and a crash between the two leaves the completeness page claiming records that were never written.',
-    'A broker is not a database. Check the produce result and, when it fails, insert an outbox row that a relay republishes with the same batch id; and put `shed_count` and `rejected_count` in the event so the consumer can see the records the ingest path never accepted.',
+    'The completeness page reads 100 % while a fifth of the traffic was shed; a consumer sees `checkout` batches out of order; after a writer crash the ledger lists a batch the index does not hold.',
+    '`produce` is keyed by `batch["index"]`, so services sharing a shard share a partition; it runs before `commit_batch`; the event omits shed and rejected counts; the broker result is unchecked.',
+    'Call `commit_batch` first, then `producer.produce(TOPIC, key=service, ...)` with `shed_count` and `rejected_count` in the event; wrap the produce in `except KafkaException` and call `store.insert_outbox(tenant, service, event)` there.',
   ],
-  debrief: `The interviewer is checking the three things a Kafka snippet gets wrong. First, the key is a partition contract: keyed by service, one service's ingestion stream is ordered; keyed by the shard, every service on that shard interleaves, which is why the starter's consumers saw counts jump around. Second, publish-after-commit is what makes the event a statement of fact rather than an intention, and it is the difference between a ledger that lags and a ledger that lies. Third, completeness is only honest when the event carries everything: shedding is a policy decision, so the shed and rejected counts belong in the same event as the indexed count. The producer configuration is the fourth, quieter point — idempotence with acks=all is what makes a retried produce safe. Real platforms add schema-registry validation, per-tenant topic quotas, a relay that republishes outbox rows, and dead-letter events for the batches a human has to re-map.`,
+  debrief: `The key is a partition contract rather than a label, which is why the fix keys by service: Kafka orders within a partition only, so the key decides whose stream stays in sequence. Commit-then-produce makes the event a statement of fact instead of an intention; the ledger may lag the index, but it cannot run ahead of it. The shed and rejected counts travel in the same event as the indexed count because a consumer reading two sources at two times will reconcile them wrong. The outbox exists because a broker rejection is an ordinary outcome, not an exception to swallow. Production platforms go further: schema-registry validation on the event, per-tenant topic quotas, a relay that drains outbox rows, and dead-letter events for batches a human has to re-map.`,
 };

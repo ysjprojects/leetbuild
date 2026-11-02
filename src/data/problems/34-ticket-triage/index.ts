@@ -7,16 +7,16 @@ import {triageEventsStep} from './steps/4-events';
 import {triageReadStep} from './steps/5-read';
 
 /**
- * Ticket triage: the course is not "call a classifier from an endpoint", it is the debugging you
- * owe a triage service before it routes a customer's tickets. Server-side routing and an
- * idempotency key → an atomic Redis dedupe claim plus per-queue admission → a classifier call with
- * a deadline and a rule-based fallback → a tenant-keyed `triage.decided` event with an outbox and a
- * commit after the routing record → a queue summary computed from routing records.
+ * Ticket triage: the debugging you owe a triage service before it routes a customer's tickets.
+ * Server-side routing and an idempotency key → an atomic Redis dedupe claim plus per-queue
+ * admission → a classifier call with a deadline and a rule-based fallback → a tenant-keyed
+ * `triage.decided` event with an outbox and a commit after the routing record → a queue summary
+ * computed from routing records.
  */
 export const ticketTriageProblem: Problem = {
   id: 'ticket-triage',
   title: 'Ticket Triage',
-  tagline: 'Classify, prioritize and route inbound tickets without letting the caller route itself.',
+  tagline: 'Classify, prioritize and route inbound tickets while the server, not the caller, picks the queue.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -31,25 +31,26 @@ manager reads during an outage.
 
 ## The real system
 
-Production triage services receive tickets from many tenants, cap the text they will look at,
-extract what they can cheaply, and classify the rest. They never let the caller pick a priority or a
-queue: a customer who can self-assign \`critical\` will, and the human queue behind it fills with
-noise. Triage is idempotent — the same webhook retried five times must produce one routing — and
+Zendesk's intelligent triage classifies a new ticket from its subject and first public comment
+into topic, sentiment and language, each paired with a confidence field, and admins build routing
+and prioritization workflows on those fields rather than on anything the requester typed into a
+priority box. The same shape appears in any triage service built in-house: the caller describes
+the problem and the server decides where it goes, because a customer who can self-assign
+\`critical\` will. Triage is idempotent, so a webhook retried five times produces one routing, and
 admission is capped per queue per minute so a classifier spike cannot funnel every ticket into one
-place. Classification runs over the network under a deadline, and when the classifier refuses or
-times out, a deterministic keyword ruleset keeps routing with the fallback reason recorded, instead of
-paralysing everything into a catch-all. Routing decisions are published keyed by ticket so each
-tenant's stream stays ordered, the payload carries ids and scores rather than ticket text, and the
-consumer records the routing before it commits its offset. Finally, the summary endpoint aggregates
-routing records, not cached counters, so a broken classifier shows up as a fallback share instead of
-looking like extra demand.
+place. Classification runs over the network under a deadline; when the classifier refuses or times
+out, a deterministic keyword ruleset keeps routing and records why it took over. Routing decisions
+are published keyed by tenant so each tenant's stream stays ordered, the payload carries ids and
+scores rather than ticket text, and the consumer records the routing before it commits its offset.
+The summary endpoint aggregates routing records, not cached counters, so a broken classifier shows
+up as a fallback share instead of looking like extra demand.
 
 ## What you build here
 
 One service, **triage-api**, with five pieces:
 
 1. \`POST /v1/tickets/triage\`: authenticated tenant, ticket text capped at 32 KiB, and a routing
-   decision — queue, priority and extracted fields — chosen server-side. \`priority\` and \`queue\`
+   decision (queue, priority and extracted fields) chosen server-side. \`priority\` and \`queue\`
    in the body are accepted and ignored, and an \`Idempotency-Key\` keyed by the ticket hash returns
    the stored routing on a replay.
 2. A **Redis** state layer: one atomic script claims the dedupe key per \`(tenant, ticket hash)\` and
@@ -59,17 +60,17 @@ One service, **triage-api**, with five pieces:
    versioned keyword ruleset as fallback with the fallback reason recorded, and a failure memory
    measured in seconds so a recovered classifier is used again within a minute.
 4. A **Kafka** routing path: \`triage.decided\` keyed by tenant, carrying the ticket id, queue,
-   priority and confidence — never the ticket text — with an outbox row when the broker rejects the
+   priority and confidence but not the ticket text, with an outbox row when the broker rejects the
    produce, and a consumer that records the routing before it commits its offset.
 5. \`GET /v1/queues/{id}/summary\`: depth, median wait and fallback share computed from routing
    records, and a 404 for a queue that belongs to another tenant.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
-failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is to debug it against the failure modes, name the subtle
+one, fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and
+pass on your version.
 
 ## Left out on purpose
 

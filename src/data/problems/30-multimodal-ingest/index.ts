@@ -25,77 +25,54 @@ export const multimodalIngestProblem: Problem = {
   minutes: 70,
   statement: `# Multimodal Ingest
 
-A multimodal ingest service is the piece of an AI platform that turns an uploaded image and its
-caption into exactly one searchable document: metadata registered before the bytes arrive, a content
-hash that collapses re-uploads, a vision model that captions what the caller did not, an indexer
-that writes text and image vectors together, and an event stream that tells the rest of the platform
-what became searchable. The visible part is a search result with a thumbnail; the parts that decide
-whether the platform can be trusted are the trust boundary at upload, the atomic dedupe and quota,
-the failure policy around the vision model, the key and payload of the events, and the signed,
-tenant-scoped read.
+A multimodal ingest service turns an uploaded image and its caption into exactly one searchable
+document: metadata registered before the bytes arrive, a content hash that collapses re-uploads, a
+vision model that captions what the caller did not, and an event that tells the platform what became
+searchable. The parts that decide whether the platform can be trusted are the trust boundary at
+upload, the atomic dedupe and quota, the failure policy around the vision model, the payload of the
+events, and the tenant-scoped read.
 
 ## The real system
 
-Production ingest never lets the bytes and the metadata arrive together. The client registers the
-asset first — mime type, byte size, optional caption, content hash — and receives a signed URL to
-PUT the bytes to object storage, so a 20 MiB upload never occupies an API worker. The mime type
-comes from an allowlist rather than the request, because "image/svg+xml" and a polyglot PDF are the
-same field. The content hash is the idempotency key: two uploads of the same bytes under the same
-tenant are one asset with one set of embeddings, whatever the client retries.
+Immich, the open-source photo server, runs this pipeline for every library it hosts: a separate
+machine-learning service embeds each uploaded asset with a CLIP model, the vectors land in Postgres
+through the VectorChord extension, and "Smart Search" indexing runs as a background job queue, so
+switching models means re-queueing every asset rather than blocking uploads.
 
-Dedupe and quota live in one atomic reservation. Checking "have I seen this hash" with one command
-and incrementing the tenant's minute counter with another leaves a window where two concurrent
-requests both observe room that only one of them has; the reservation has to happen inside a single
-Lua script, and both keys have to expire or the dedupe map grows forever and a tenant that had one
-busy minute stays locked out.
-
-Captions are optional and expensive. When the request has none, the service asks a vision model over
-gRPC under a deadline. A timeout is not an error the user sees: the asset is indexed with text-only
-embeddings and flagged as degraded, so search still works and the backfill can find it later. A
-content-policy rejection is different — the asset must fail with a reason, because indexing it
-text-only would hide the rejection. And nothing that failed may ever be replaced by placeholder
-text: a caption of "an image" is worse than no caption, because it matches every query.
-
-Events carry facts, not addresses. The indexed event is keyed by asset id so every event about one
-asset stays ordered, carries the checksum and the embedding ids instead of a URL, and is published
-only after the index write confirms — otherwise a consumer reacts to an asset it cannot read yet.
-Rejections leave an outbox row so the broker's bad day is not the index's bad day.
-
-Reads are signed and scoped. The read endpoint answers with metadata, the caption and its character
-offsets, and a signed URL that expires in 15 minutes and covers the tenant, so an id leaked to
-another tenant is a 404 and a URL leaked to a proxy stops working.
+The shape generalizes. The client registers the asset first and receives a signed URL to PUT the
+bytes to object storage, so a 20 MiB upload does not occupy an API worker, and the content hash is
+the idempotency key. Dedupe and quota live in one atomic reservation with expiring keys. A vision
+timeout degrades the asset to text-only indexing with a visible flag, a content-policy rejection
+fails it with a reason, and no placeholder caption enters the index. Events are keyed by asset id,
+carry checksums and embedding ids rather than URLs, and follow the index write. Reads hand out a
+15-minute signed URL bound to the tenant; a foreign id is a 404.
 
 ## What you build here
 
 One service, **ingestd**, with five pieces:
 
-1. \`POST /v1/assets\`: authenticated tenant, mime allowlist, 20 MiB byte cap, 4 KiB caption cap, and
-   a required \`Idempotency-Key\` carrying the content hash — a re-registration returns the original
-   asset id instead of a duplicate.
-2. A **Redis** reservation: one Lua \`EVAL\` that checks the \`(tenant, content hash)\` dedupe key,
-   refuses the **501st** asset of a tenant's minute with \`Retry-After\`, and expires both keys on
-   first write; a duplicate passes through the cache path without spending quota.
-3. A **gRPC** vision client: a 3-second deadline per caption call, a content-policy rejection that
-   fails the asset, and a timeout that degrades to text-only embeddings with \`caption: null\` — never
-   placeholder text.
-4. A **Kafka** \`asset.indexed\` event: keyed by asset id, carrying checksums and embedding ids and no
-   object URL, published only after the index write confirms, with an outbox row on rejection.
-5. \`GET /v1/assets/{id}\`: tenant-scoped (foreign id → **404**) with a signed URL that expires in 15
-   minutes; the API never proxies the original bytes.
+1. \`POST /v1/assets\`: tenant, mime allowlist, 20 MiB byte cap, 4 KiB caption cap, and a required
+   \`Idempotency-Key\` carrying the content hash; a re-registration returns the original asset id.
+2. A **Redis** reservation: one Lua \`EVAL\` for the \`(tenant, content hash)\` dedupe key and the
+   minute counter, **429** with \`Retry-After\` on the 501st asset, both keys expiring on first write.
+3. A **gRPC** vision client: a 3-second deadline, a content-policy rejection that fails the asset,
+   and a timeout that degrades to text-only embeddings with \`caption: null\`.
+4. A **Kafka** \`asset.indexed\` event: keyed by asset id, carrying checksums and embedding ids and
+   no object URL, published after the index write confirms, with an outbox row on rejection.
+5. \`GET /v1/assets/{id}\`: tenant-scoped (foreign id is **404**) with a 15-minute signed URL; the
+   API does not proxy the bytes.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
-failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path and looks
+right. In every step you debug it against the failure modes, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Object storage internals and multipart uploads, EXIF stripping and image resizing, the vector store's
-own schema, caption quality evaluation, caption backfill scheduling, per-tenant mime overrides,
-virus scanning, and cross-region replication. The five pieces above are the ones that decide whether
-the ingest is correct, isolated and shippable.`,
+own schema, caption quality evaluation, caption backfill scheduling, per-tenant mime overrides, virus
+scanning, and cross-region replication.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'register · upload · read', x: 8, y: 50},

@@ -8,37 +8,27 @@ export const eventsStep: Step = {
   focus: ['collector', 'kafka', 'rollup', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: the trace finished, so the starter
-publishes one event per span with everything the span had, and the consumer updates the rollup. It
-passes a demo where one trace is published and read back by hand. It keys the topic by trace id,
-pushes span tags (user identifiers live there) into a retained topic, and commits the offset before
-its counters are updated.
+**Starting point.** The starter implements the completion path in two halves:
+\`publish_completed(trace)\` produces one \`trace.completed\` event per span, keyed by trace id and
+carrying everything the span had, through a default producer; the consumer loop commits the offset,
+then updates the Redis rollup counters. It passes a demo where one trace is published and read back
+by hand, and hides four flaws.
 
-Implement the completion path in two halves — \`publish_completed(trace)\` and the consumer loop.
+**Failure mode the checks target.** All of them look like "the rollup is a bit off": a key that does
+not match the thing you order by, a payload that copies identifiers into a topic you cannot
+un-publish, a producer whose broker retry can double-count, and an offset commit that claims work
+the counters have not done.
 
-- The topic is \`trace.completed\` (\`TRACE_COMPLETED_TOPIC\`). One event is published **per service**
-  in the finished trace, **keyed by the service id**, with \`span_count\`, \`p50_ms\` and \`p95_ms\`
-  computed from that service's spans and the \`trace_id\`. The key is an ordering contract: with
-  \`key = service\`, every event for one service lands in the same partition in order, which is what
-  makes a latency stream for that service meaningful. The starter keys by trace id, so the same
-  service's events are spread across partitions and the rollup sees an arbitrary order.
-- The payload carries **counts and percentiles only**: no span tags, no attributes, no user
-  identifiers, no raw payloads. The topic is retained and replicated, so anything written there
-  outlives the request, the tenant and the retention policy the span itself was subject to. The
-  starter publishes \`tags\` and \`user_id\` verbatim.
-- The producer is configured for idempotent delivery with \`acks=all\` (Go: \`RequiredAcks:
-  RequireAll\` with a hash balancer; C++/Scala/Python: \`enable.idempotence\` + \`acks=all\`; KafkaJS:
-  \`idempotent: true\` and \`acks: -1\`), so a broker retry cannot duplicate an event that the rollup
-  will then count twice.
-- The consumer updates the Redis rollup counters (\`rollup:{service}\`: \`traces\`, \`spans\`) **before**
-  it commits the offset, and runs with auto-commit off. Counters first means a crash between the two
-  costs at most one update; the starter commits first, so a crash after the commit loses the update
-  permanently — the offset says the event was processed and no counter ever saw it.
-
-**Failure mode the checks target.** Three failures that all look like "the rollup is a bit off":
-a key that does not match the thing you order by, a payload that copies identifiers into a topic you
-cannot un-publish, and an offset commit that claims work the counters never did. The third one is the
-one that never recovers, because the event is gone and the offset has moved past it.`,
+- The topic is \`trace.completed\` (\`TRACE_COMPLETED_TOPIC\`). One event is published **per
+  service** in the finished trace, **keyed by the service id**, with \`span_count\`, \`p50_ms\` and
+  \`p95_ms\` from that service's spans plus the \`trace_id\`.
+- The payload carries **counts and percentiles only**: no span tags, attributes, user identifiers
+  or raw payloads. The topic is retained and replicated.
+- The producer is idempotent with \`acks=all\` (Go: \`RequiredAcks: RequireAll\` with a hash
+  balancer; C++/Scala/Python: \`enable.idempotence\` + \`acks=all\`; KafkaJS: \`idempotent: true\`
+  and \`acks: -1\`).
+- The consumer updates \`rollup:{service}\` (\`traces\`, \`spans\`) **before** it commits the
+  offset, with auto-commit off.`,
   sequence: {
     participants: ['Trace Collector', 'Kafka', 'Latency rollup', 'Redis'],
     messages: [
@@ -57,9 +47,9 @@ one that never recovers, because the event is gone and the offset has moved past
     ],
   },
   hints: [
-    "Pick the key by asking what has to stay in order: the rollup reads the latencies of one service as a stream, so the key is the service id. Keying by trace id scatters a service's events over partitions, and the consumer has no ordering guarantee left.",
-    'The topic is not a debugging aid you can clean up later: whatever you publish is retained and replicated. Send the count and the percentiles that the rollup needs (p50/p95) and leave span tags, attributes and user identifiers in the span store, where they have an owner and a retention policy.',
-    'Two more habits the checks look for: an idempotent producer with acks=all so a broker retry cannot double-count, and counters updated before the offset commit so a crash can lose an update but never silently skip one.',
+    'The checkout latency chart shows p95 jumping backwards in time, a privacy audit finds user ids in a topic another team mirrors, and after a rollup restart some traces are counted zero times.',
+    'Keying by trace id scatters one service across partitions; the event copies the span verbatim, tags and `user_id` included; the default producer can resend on a broker retry; and `commit` runs before `hincrby`.',
+    'In `publish_completed`, group spans by service and call `producer.produce(..., key=service)` with only `span_count`/`p50_ms`/`p95_ms`; set `enable.idempotence` and `acks=all`; in the consumer, `hincrby` the rollup before `commit`.',
   ],
   checks: [
     {
@@ -142,9 +132,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 def publish_completed(trace: dict) -> list[dict]:
     """Publish the trace so the rollup can see everything that happened in it."""
-    # TODO: key by the service id instead of the trace id, keep span tags and user identifiers out
-    # of the event, configure the producer for idempotent delivery with acks=all, and update the
-    # rollup counters before committing the offset.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     published = []
     for span in trace["spans"]:
         event = {
@@ -255,9 +243,7 @@ interface Span {
 }
 
 export async function publishCompleted(traceId: string, spans: Span[]): Promise<void> {
-  // TODO: key by the service id instead of the trace id, keep span tags and user identifiers out
-  // of the event, configure the producer for idempotent delivery with acks=all, and update the
-  // rollup counters before committing the offset.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (const span of spans) {
     const event = {
       trace_id: traceId,
@@ -391,9 +377,7 @@ type Span struct {
 }
 
 func publishCompleted(ctx context.Context, traceID string, spans []Span) error {
-	// TODO: key by the service id instead of the trace id, keep span tags and user identifiers out
-	// of the event, configure the producer for idempotent delivery with acks=all, and update the
-	// rollup counters before committing the offset.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	for _, span := range spans {
 		event := map[string]any{
 			"trace_id":    traceID,
@@ -541,9 +525,7 @@ object TraceEvents {
   val jedis = new Jedis("redis", 6379)
 
   def publishCompleted(traceId: String, spans: Seq[Map[String, Any]]): Unit = {
-    // TODO: key by the service id instead of the trace id, keep span tags and user identifiers out
-    // of the event, configure the producer for idempotent delivery with acks=all, and update the
-    // rollup counters before committing the offset.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     spans.foreach { span =>
       val event = Map(
         "trace_id" -> traceId,
@@ -655,9 +637,7 @@ const std::string kTraceCompletedTopic = "trace.completed";
 std::unique_ptr<RdKafka::Producer> producer;
 
 void publishCompleted(const std::string& traceId, const std::vector<json>& spans) {
-  // TODO: key by the service id instead of the trace id, keep span tags and user identifiers out
-  // of the event, configure the producer for idempotent delivery with acks=all, and update the
-  // rollup counters before committing the offset.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (const auto& span : spans) {
     const json event = {
         {"trace_id", traceId},
@@ -770,5 +750,5 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is testing the three contracts of a completion topic. The **key** is an ordering contract: a consumer can only rely on order inside a partition, so the key must be the thing whose history you read as a sequence — here the service whose latency stream the rollup maintains. The **payload** is a retention contract: a topic is replicated, retained and read by other teams, so span tags, attributes and user identifiers must not travel through it; counts and percentiles answer the rollup's question without copying anyone's data. The **offset** is a progress contract: state first, then commit, because the commit is a promise that the work is done, and a crash between the two must cost one update rather than silently dropping the event. Real platforms add a schema registry and compatibility checks, per-service partitioning keys that match the consumer's aggregation window, and a dead-letter topic for events their schema cannot read — but every one of those builds on the key, the payload and the order of those two writes.`,
+  debrief: `The fix takes its shape from the three contracts of a completion topic. The key is an ordering contract: a consumer can only rely on order inside a partition, so the key must be the thing whose history is read as a sequence, here the service whose latency stream the rollup maintains. The payload is a retention contract: a topic is replicated, retained and read by other teams, so span tags and user identifiers must not travel through it. The offset is a progress contract: counters first, then commit, because the commit is a promise that the work is done. Production platforms put a schema registry with compatibility checks in front of the topic and route unparseable events to a dead-letter topic, both resting on the same contracts.`,
 };

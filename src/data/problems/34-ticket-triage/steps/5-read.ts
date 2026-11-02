@@ -8,31 +8,24 @@ export const triageReadStep: Step = {
   focus: ['client', 'summary', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it returns a depth for any queue id handed to it,
-so the dashboard renders. It hides three flaws, one of them the reason an outage went unnoticed.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter registers \`GET /v1/queues/{queue_id}/summary\`, reads the tenant
+header, and answers \`{"queue_id", "depth"}\` from \`store.depth_counter(queue_id)\` for any queue
+id it is handed. It serves the demo and hides four flaws.
 
-Implement \`GET /v1/queues/{id}/summary\` for a signed-in tenant:
+**Failure mode the checks target.** A cached counter is a second source of truth that drifts from
+the records it summarizes; a summary without the fallback share hides the single most important
+failure of a triage service; a mean wait is moved by one stuck ticket; and an unscoped read
+endpoint leaks one tenant's queue depth and wait times to another.
 
-- **Computed from routing records.** Depth, median wait and the fallback share are **derived from the
-  routing records**, not from a cached counter. The starter reads a depth counter that is only
-  incremented on accepted routings, so every rejected dedupe hit and every fallback booking makes the
-  number drift low — exactly when a manager is looking at it.
-- **Depth** is the number of routing records in the queue for this tenant. **Median wait** is the
-  median of the records' wait times (0 when the queue is empty), not a mean that one stuck ticket
-  can move.
+- **Computed from routing records.** Depth, median wait and the fallback share are derived from the
+  routing records, not from a cached counter.
+- **Depth** is the number of routing records in the queue for this tenant. **Median wait**
+  (\`median_wait_s\`) is the median of the records' wait times, 0 when the queue is empty.
 - **Fallback share is mandatory.** The response reports the share of tickets the rules routed
-  (\`fallback_share\`) and the raw count (\`fallback_count\`). Without it a classifier outage looks
-  like extra demand and nobody can see that the model stopped answering.
-- **Tenant scope.** The queue must belong to the caller’s tenant: an unknown queue id, or one owned
-  by another tenant, is **404** — never a summary of somebody else’s tickets. The starter serves any
-  queue to any caller.
-- Missing tenant is **401**.
-
-**Failure mode the checks target.** A cached counter is a second source of truth that drifts from the
-records it summarizes; a summary without the fallback share hides the single most important failure
-mode of a triage service; and an unscoped read endpoint leaks one tenant's queue depth and wait times
-to another.`,
+  (\`fallback_share\`) and the raw count (\`fallback_count\`).
+- **Tenant scope.** The queue must belong to the caller's tenant: an unknown queue id, or one owned
+  by another tenant, is **404**.
+- Missing tenant is **401**.`,
   sequence: {
     participants: ['Manager', 'Queue summary', 'routing records'],
     messages: [
@@ -139,8 +132,7 @@ store = QueueStore()
 
 @app.get("/v1/queues/{queue_id}/summary")
 def summary(queue_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter reads a cached depth counter that misses rejected dedupe hits, omits the
-    # fallback share entirely, and serves any queue id to any caller.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     return JSONResponse({"queue_id": queue_id, "depth": store.depth_counter(queue_id)}, status_code=200)
 `,
       solution: `from fastapi import FastAPI, Header, HTTPException
@@ -209,8 +201,7 @@ interface QueueStore {
 
 export function routes(store: QueueStore): void {
   app.get('/v1/queues/:queueId/summary', async (request, reply) => {
-    // TODO: this starter reads a cached depth counter that misses rejected dedupe hits, omits the
-    // fallback share entirely, and serves any queue id to any caller.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const {queueId} = request.params as {queueId: string};
     return reply.code(200).send({queue_id: queueId, depth: await store.depthCounter(queueId)});
   });
@@ -287,8 +278,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func summary(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reads a cached depth counter that misses rejected dedupe hits, omits the
-	// fallback share entirely, and serves any queue id to any caller.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	queueID := r.PathValue("id")
 	writeJSON(rw, http.StatusOK, map[string]any{"queue_id": queueID, "depth": store.DepthCounter(r.Context(), queueID)})
 }
@@ -421,8 +411,7 @@ object QueueSummary {
     path("v1" / "queues" / Segment / "summary") { queueId =>
       get {
         headerValueByName("X-Tenant-Id") { _ =>
-          // TODO: this starter reads a cached depth counter that misses rejected dedupe hits, omits
-          // the fallback share entirely, and serves any queue id to any caller.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           complete(StatusCodes.OK, s"""{"queue_id":"$queueId","depth":\${store.depthCounter(queueId)}}""")
         }
       }
@@ -516,8 +505,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/queues/([^/]+)/summary)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reads a cached depth counter that misses rejected dedupe hits, omits the
-    // fallback share entirely, and serves any queue id to any caller.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string queueId = req.matches[1];
     res.status = 200;
     res.set_content(json{{"queue_id", queueId}, {"depth", store.depthCounter(queueId)}}.dump(), "application/json");
@@ -603,9 +591,9 @@ int main() {
     },
   },
   hints: [
-    'The routing record is the source of truth: one row per ticket with its queue, tenant, wait time and the reason it was routed the way it was. Depth is a `len()`/`size()` over those rows; a counter kept beside them is a cache you must now keep honest.',
-    'Sort, then take the middle: a median of the wait times refuses to be moved by the one ticket that sat for three days, which is what a manager needs when a queue looks bad. Report it with the fallback share so a rule-routed ticket is visible in the same view.',
-    'The queue id is a tenant-scoped resource, so resolve its owner first and compare before you count anything: `queue_tenant(queue_id) != tenant` → 404 for both "no such queue" and "not yours", which also stops the endpoint being used to probe other tenants’ queue names.',
+    'During a classifier outage the dashboard shows a normal depth and no sign that rules are routing; a manager from tenant B can read `/v1/queues/billing/summary` for tenant A by guessing the name.',
+    'The handler is one line: `depth_counter` is a counter beside the records rather than a count of them, no wait or fallback figure is derived, and `tenant` is read but compared with nothing.',
+    'Resolve `queue_tenant(queue_id)` and 404 on mismatch, then load `routing_records(queue_id, tenant)`: `depth = len(records)`, `median_wait_s` from `sorted` waits, `fallback_count`/`fallback_share` from `fallback_reason`.',
   ],
-  debrief: `The interviewer is testing whether an operational read endpoint can be trusted during an incident. The starter is a one-liner and it is wrong three times over: it reports a cached depth counter, which necessarily disagrees with the routing records after any rejection or fallback, and it does so precisely when a manager is deciding whether to add agents. It omits the fallback share, which is the number that would have shown the classifier was down rather than busy. And it resolves any queue id, so a tenant can read another tenant's ticket volume and wait times by guessing "billing". The fix is to compute every figure from the routing records in one pass and to scope the queue to the caller's tenant, answering 404 for both a missing queue and a foreign one so the endpoint cannot be used to enumerate queues. Real platforms add a time window to the summary, a per-queue SLO breach count, and a cached aggregate that is invalidated by the routing events rather than by a timer.`,
+  debrief: `Every figure comes from the routing records in one pass because a counter kept beside them is a cache with no invalidation: it disagrees with the records after any rejection or fallback, which is exactly when a manager is deciding whether to add agents. The median rather than the mean keeps one three-day ticket from making a healthy queue look broken, and the fallback share is the number that distinguishes a classifier outage from a busy day. Scoping the queue to the caller's tenant and answering 404 for both a missing and a foreign queue keeps the endpoint from being used to enumerate other tenants' queue names. Production platforms add a time window to the summary, a per-queue SLO breach count, and a cached aggregate invalidated by the routing events rather than by a timer.`,
 };

@@ -8,32 +8,31 @@ export const citationStateStep: Step = {
   focus: ['api', 'redis', 'docstore'],
   task: `## Task
 
-**Starting point.** The starter is working code: a span resolves and the second request is fast, so
-the demo looks cached. The key is wrong in two ways and the entry never expires. Find the flaws, fix
-them, and prove the fix.
+**Starting point.** The starter serves
+\`GET /v1/spans?document_id=doc-7&version=3&start=412&end=447\`: it looks the span up in Redis,
+resolves it from the document store on a miss, writes the entry back and deletes keys when a document
+is updated. It compiles, it serves the demo, and it hides four flaws.
 
-Implement the span cache used by every resolution, exposed as
-\`GET /v1/spans?document_id=doc-7&version=3&start=412&end=447\`:
+**Failure mode the checks target.** A cache hit is a claim about one specific thing, and the key is
+that claim spelled out. A key that leaves out part of the span's identity, or spells the same span
+two ways, answers requests with text they did not ask for or caches the same text under several
+keys. Both stay invisible on a document that is never edited or re-read with padded offsets, which
+is exactly what a real corpus does constantly.
 
 - The cache key names the **immutable version**: \`span:{document_id}:{version}:{start}:{end}\`.
-  A key without the version serves one version's text for another version's request — after a
-  document update every cached span is silently wrong.
-- Offsets in the key are **normalized integers** (\`10\`, never the raw query string \`010\`): string
-  offsets make two requests for the same span different keys, and one span of one version end up
+  A key without the version serves one version's text for another version's request; after a
+  document update every cached span is wrong.
+- Offsets in the key are **normalized integers** (\`10\`, not the raw query string \`010\`): string
+  offsets make two requests for the same span different keys, and one span of one version ends up
   cached several times.
 - The entry gets a **long TTL** on write (\`SPAN_TTL_S\`, seven days) because an immutable version
   cannot change: the TTL is the only eviction a span cache needs.
-- A cached payload carries **its version** and a hit whose version is not the requested one is never
-  served — the version in the key is the contract, the version in the payload is the proof.
+- A cached payload carries **its version** and a hit whose version is not the requested one is
+  refused: the version in the key is the contract, the version in the payload is the proof.
 - A write to a document invalidates **nothing**: no \`DEL\` on update, no key sweep. Nothing about an
   immutable version can go stale.
 - A missing \`X-Tenant-Id\` is **401** and \`version < 1\`, \`start < 0\` or \`end <= start\` is
-  **400**; an unknown version is **404**.
-
-**Failure mode the checks target.** The starter’s key is \`span:{document_id}:{start}:{end}\` with the
-raw query strings, written without a TTL and deleted whenever a document is updated. Each mistake is
-invisible on a document that is never edited and never re-read with padded offsets — the two things
-a real corpus does constantly.`,
+  **400**; an unknown version is **404**.`,
   sequence: {
     participants: ['Client', 'Citation API', 'Redis', 'document store'],
     messages: [
@@ -47,9 +46,9 @@ a real corpus does constantly.`,
     ],
   },
   hints: [
-    'The key is the identity of the thing you cache. A cached span is the text at a range of one immutable version, so all three parts — document, version, range — belong in the key. Anything less and two different spans share one entry.',
-    'Normalize before you key: the query arrives as strings, so cast the offsets to integers once, at the edge, and build the key from the numbers. `010` and `10` are the same offset, and a cache that treats them as different loses its hits.',
-    'Immutability is what buys the TTL: because a version never changes, `SETEX`/`SET … EX`/`Expire` is the whole eviction story, and the `DEL` in the update path is dead weight that can only race with a reader. Keep the version inside the payload too, so a hand-written or migrated key can never serve the wrong version.',
+    'After a document is updated, span requests for the old version come back with the new text, the hit rate is far below what the traffic predicts, and Redis memory only ever grows.',
+    'The starter keys by document id and the raw offset strings, so the version is not part of the identity and `010` and `10` are two entries; it writes with no expiry and leans on `DEL` instead.',
+    'Build `span_key(document_id, version, int(start), int(end))`, write with `SETEX`/`SET … EX SPAN_TTL_S`, keep the version in the payload and refuse a hit whose version differs, and remove the `DEL` path.',
   ],
   checks: [
     {
@@ -143,9 +142,7 @@ def get_span(
     end: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: the starter keys the cache by document id and the raw offset strings instead of the
-    # immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
-    # Key by (document_id, version, start, end) with numeric offsets and a long TTL.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     raw = r.get(cache_key(document_id, start, end))
     if raw is not None:
         return JSONResponse({"text": raw, "cached": True}, status_code=200)
@@ -222,7 +219,7 @@ def get_span(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/spans: flawed code that caches by document id and string offsets. */
+      starter: `/** GET /v1/spans: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -237,9 +234,7 @@ function cacheKey(documentId: string, start: string, end: string): string {
 }
 
 app.get('/v1/spans', async (request, reply) => {
-  // TODO: the starter keys the cache by document id and the raw offset strings instead of the
-  // immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
-  // Key by (document_id, version, start, end) with numeric offsets and a long TTL.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const query = request.query as {document_id: string; version: string; start: string; end: string};
   const cached = await r.get(cacheKey(query.document_id, query.start, query.end));
   if (cached !== null) return reply.code(200).send({text: cached, cached: true});
@@ -369,9 +364,7 @@ func getSpan(rw http.ResponseWriter, r *http.Request) {
 	version := query.Get("version")
 	start := query.Get("start")
 	end := query.Get("end")
-	// TODO: the starter keys the cache by document id and the raw offset strings instead of the
-	// immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
-	// Key by (document_id, version, start, end) with numeric offsets and a long TTL.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	if raw, err := rdb.Get(r.Context(), cacheKey(documentID, start, end)).Result(); err == nil {
 		writeJSON(rw, http.StatusOK, map[string]any{"text": raw, "cached": true})
 		return
@@ -522,9 +515,7 @@ object SpanApi {
     path("v1" / "spans") {
       get {
         parameters("document_id", "version", "start", "end") { (documentId, version, start, end) =>
-          // TODO: the starter keys the cache by document id and the raw offset strings instead of the
-          // immutable version, writes the entry with no TTL, and deletes keys when a document is
-          // updated. Key by (document_id, version, start, end) with numeric offsets and a long TTL.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           Option(jedis.get(cacheKey(documentId, start, end))) match {
             case Some(text) =>
               complete(StatusCodes.OK, s"""{"text":"$text","cached":true}""")
@@ -651,9 +642,7 @@ int main() {
     const auto documentId = req.get_param_value("document_id");
     const auto start = req.get_param_value("start");
     const auto end = req.get_param_value("end");
-    // TODO: the starter keys the cache by document id and the raw offset strings instead of the
-    // immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
-    // Key by (document_id, version, start, end) with numeric offsets and a long TTL.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     if (const auto raw = redis.get(cacheKey(documentId, start, end))) {
       res.status = 200;
       res.set_content(json{{"text", *raw}, {"cached", true}}.dump(), "application/json");
@@ -774,5 +763,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question is what a cache key has to contain. A cache hit is a claim about a specific thing, so the key has to name that thing completely: the document, the version and the exact offset range. Leaving the version out is the subtle bug, because it passes every test written against one document revision and fails the moment the document is updated — the entry then answers one version with another version's text. The offset strings are the second trap: a query string is not an offset, and keying \`010\` beside \`10\` quietly destroys the hit rate. The TTL is the third: immutability is what lets the entry be long-lived, and it also means the \`DEL\` on update is dead weight that can race with a reader mid-request. Real span caches add a payload version stamp (a key can outlive a refactor), a size cap per document, and a background warmer for the versions a corpus reads most.`,
+  debrief: `The fix has its shape because a cache key is the complete identity of the thing it caches. A span is the text at a range of one immutable version, so the key names the document, the version and the normalized integer range; anything less lets two spans share one entry or one span occupy several. Immutability buys the rest: an entry that cannot go stale carries a long TTL, the \`DEL\` on update is dead weight that can only race with a reader, and the version stamp in the payload lets a migrated key be refused instead of trusted. Production span caches go further than this step did, with a per-document size cap so one huge version cannot evict everything else and a warmer for the versions a corpus reads most.`,
 };

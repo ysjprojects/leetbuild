@@ -8,33 +8,32 @@ export const completionTelemetryStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: the editor reports what it
-showed and what the developer kept, the events reach Kafka, and a consumer moves counters, so the
-acceptance dashboard shows numbers. Four production contracts are broken. Find them, fix them,
-and prove the fix.
+**Starting point.** The starter serves \`POST /v1/telemetry\`, where the editor reports what it
+showed and what the developer kept, produces one Kafka record per report, and runs a consumer in
+group \`acceptance\` that moves \`HINCRBY acceptance:{language}\` counters in Redis, so the
+acceptance dashboard shows numbers. It serves the demo and hides four flaws.
 
-\`POST /v1/telemetry\` with body
-\`{"event": "shown" | "accepted", "request_id": "…", "language": "python", "candidate_len": 142, "latency_ms": 210}\`
-is how the editor reports the outcome of a completion, and the consumer turns those events into
-the acceptance rate — the number GitHub's A/B tests were run on.
+**Failure mode the checks target.** Keying by request id scatters one session's events across
+partitions; an unconfigured producer can duplicate an acceptance on retry; the completion text
+in the event is a data leak with a long tail; and commit-before-process makes the acceptance
+rate silently wrong after every consumer restart.
+
+The body is
+\`{"event": "shown" | "accepted", "request_id": "…", "language": "python", "candidate_len": 142, "latency_ms": 210}\`,
+and the consumer turns those events into the acceptance rate, the number GitHub's A/B tests were
+run on.
 
 - Publish one event per report to \`completion.shown\` or \`completion.accepted\` with the
   **session** as the message key, so one developer's shown/accepted pairs stay on one partition
   and in order. The event carries \`request_id\`, \`session\`, \`language\`, \`candidate_len\` and
   \`latency_ms\`. An \`event\` outside \`ALLOWED_EVENTS\` is **400**.
-- **Never** put the completion text, the prefix or the suffix in the event or in a log line. The
-  topic is retained and replicated; code written there outlives the session, the file and the
-  retention policy that the request path has.
+- The completion text, the prefix and the suffix stay out of the event and out of every log line.
+  The topic is retained and replicated; code written there outlives the session, the file and
+  the retention policy that the request path has.
 - The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
   \`all\` plus hashed, stable keys), so a retried produce cannot count one acceptance twice.
-- The consumer (group \`acceptance\`) updates \`HINCRBY acceptance:{language} shown|accepted\` in
-  Redis and **only then** commits the offset. Commit first and one crash loses the counter
-  update forever.
-
-**Failure mode the checks target.** Keying by request id scatters one session's events across
-partitions; an unconfigured producer can duplicate an acceptance on retry; the completion text
-in the event is a data leak with a long tail; and commit-before-process makes the acceptance
-rate silently wrong after every consumer restart.`,
+- The consumer updates \`HINCRBY acceptance:{language} shown|accepted\` in Redis and **only
+  then** commits the offset. Commit first and one crash loses the counter update.`,
   sequence: {
     participants: ['Editor', 'completiond', 'completion.accepted', 'Acceptance consumer', 'Redis'],
     messages: [
@@ -54,9 +53,9 @@ rate silently wrong after every consumer restart.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=session` (or `Key: []byte(session)`, `key: session`, `ProducerRecord(topic, session, …)`). Keyed by the request id, a session’s shown and accepted events land on different partitions.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or kafka-go’s `RequireAll` with a hash balancer. Validate `event` against `ALLOWED_EVENTS` before producing.',
-    'Replace the `text` field with `candidate_len` everywhere — the request model, the event, the log line. In the consumer, `HINCRBY` first and commit second, with auto-commit off: a crash between the two then replays the record instead of losing it.',
+    'An accepted event is counted before its shown event on a restarted consumer, a broker retry bumps acceptance twice, the dashboard drops after every deploy, and a Kafka topic now holds customer source code.',
+    'The record key is the request id, the producer has default acks and no idempotence, the body carries a `text` field that is logged and copied into the event, and the consumer commits before `HINCRBY`.',
+    'Key by `session`, validate `event` against `ALLOWED_EVENTS`, set `enable.idempotence` with `acks=all` (or the stack’s equivalent), replace `text` with `candidate_len`, and commit only after the Redis update.',
   ],
   checks: [
     {
@@ -139,9 +138,7 @@ class TelemetryRequest(BaseModel):
 
 @app.post("/v1/telemetry", status_code=202)
 def telemetry(body: TelemetryRequest, session: str = Header(alias="X-Session-Id")) -> dict:
-    # TODO: key by session instead of the request id and validate the event name, configure the
-    # idempotent producer with acks=all, keep the completion text out of the event and the logs,
-    # and make the consumer update counters before it commits. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     logger.info("telemetry session=%s event=%s text=%r", session, body.event, body.text)
     event = {
         "request_id": body.request_id,
@@ -233,7 +230,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** Completion telemetry: flawed code that keys by request id and ships the code. */
+      starter: `/** Completion telemetry: the starter. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -253,9 +250,7 @@ interface TelemetryBody {
 }
 
 app.post('/v1/telemetry', async (request, reply) => {
-  // TODO: key by session instead of the request id and validate the event name, configure the
-  // idempotent producer with acks=all, keep the completion text out of the event and the logs,
-  // and make the consumer update counters before it commits. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const session = request.headers['x-session-id'] as string;
   const body = request.body as TelemetryBody;
   request.log.info({session, event: body.event, text: body.text}, 'telemetry');
@@ -377,9 +372,7 @@ func telemetry(rw http.ResponseWriter, r *http.Request) {
 	session := r.Header.Get("X-Session-Id")
 	body := TelemetryRequest{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: key by session instead of the request id and validate the event name, configure
-	// acks=all / hashed keys, keep the completion text out of the event and the logs, and make
-	// the consumer update counters before it commits. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	log.Printf("telemetry session=%s event=%s text=%q", session, body.Event, body.Text)
 	event := map[string]any{
 		"request_id": body.RequestID,
@@ -518,9 +511,7 @@ object Telemetry {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key by session instead of the request id and validate the event name, configure the
-  // idempotent producer with acks=all, keep the completion text out of the event and the logs,
-  // and make the consumer update counters before it commits. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def publish(session: String, event: String, requestId: String, language: String, text: String): Unit = {
     log.info(s"telemetry session=$session event=$event text=$text")
     val payload = Map(
@@ -619,9 +610,7 @@ using json = nlohmann::json;
 std::unique_ptr<RdKafka::Producer> producer;
 std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
 
-// TODO: key by session instead of the request id and validate the event name, configure the
-// idempotent producer with acks=all, keep the completion text out of the event and the logs, and
-// make the consumer update counters before it commits. Fix all four.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 void publish(
     const std::string& session,
     const std::string& event,
@@ -734,5 +723,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you treat a telemetry topic as a product surface with the same rules as the request path. The acceptance rate is the number GitHub's post reports every improvement against — neighboring tabs +5 %, FIM +10 % — so it has to be right: the session key keeps a developer's shown/accepted pairs ordered on one partition, the idempotent producer with acks=all keeps a retry from counting an acceptance twice, and counters-before-commit keeps a consumer crash from losing one. The leak is the quiet flaw: the starter copies the accepted completion into an event that is retained and replicated, which is source code leaving the editor for a system nobody scoped for it; the event needs the length, not the text. Real pipelines add a schema registry so a \`text\` field cannot be added back by accident, a dead-letter topic for unparseable events, and a windowed aggregation instead of unbounded hash counters.`,
+  debrief: `The telemetry topic gets the same rules as the request path because the acceptance rate is the number every improvement is judged against (GitHub's post reports neighboring tabs at +5 % and FIM at +10 % on it). The session key keeps one developer's shown/accepted pairs in order on one partition; the idempotent producer with acks=all keeps a broker retry from counting an acceptance twice; counters-before-commit means a crash replays a record instead of dropping it, and HINCRBY on a replay is the acceptable error. The length replaces the text because a retained, replicated topic is a system nobody scoped for source code. Production pipelines put a schema registry in front of the topic so a \`text\` field cannot return by accident, route unparseable events to a dead-letter topic, and aggregate into time windows instead of unbounded hash counters.`,
 };

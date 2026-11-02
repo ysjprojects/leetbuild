@@ -8,34 +8,27 @@ export const eventsStep: Step = {
   focus: ['matchmaker', 'kafka', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a "found" event when a match forms and
-a "joined" event when a player joins. It compiles, the analytics topic fills up, and it hides three
-flaws — one of which makes a whole class of failures invisible. Debug it, fix it, and prove the fix.
+**Starting point.** The starter is the matchmaker's lifecycle publisher. \`publish(bucket,
+payload)\` sends to \`match.event\` keyed by the skill bucket; \`publish_found\`, \`publish_joined\`
+and \`publish_started\` build payloads with the match id, kind, player ids and server id and call
+it. It compiles, the topic fills up, and it hides 4 flaws.
 
-Implement the lifecycle publisher for the matchmaker:
+**Failure mode the checks target.** With one matchmaker in a demo everything looks ordered; with
+two matches consumed in parallel the events of one match land on different partitions and
+interleave. "started" goes out the moment the roster is decided, so every consumer that treats it
+as "the game is underway" is wrong about a player who is still connecting. Matches that fail to
+allocate or whose roster dissolves reach no topic at all, so the failures the platform most needs
+to explain are the ones it cannot see. And a produce the broker rejects raises out of the publisher
+and the event is gone.
 
-- Publish **\`match.found\`**, **\`match.joined\`**, **\`match.started\`** and **\`match.abandoned\`** on
-  the topic **\`match.event\`**, keyed by **match id**. The key decides the partition, so keying by
-  match id is what keeps one match's lifecycle in order; the starter keys by skill bucket, so a match's
-  events are spread across partitions and can be consumed out of order.
-- Every event carries the **player ids** and the **server id** it is about (the server id is absent
-  until the match is allocated, the reason is present only on an abandoned match).
-- **\`match.started\` may only be published after every join is confirmed.** Gate the publish on
-  \`all_joins_confirmed(match_id)\`; if any participant is still pending, refuse and do not publish.
-  The starter publishes "started" the moment the count is decided, so consumers see a game start while
-  a player is still connecting.
-- **Abandoned matches are published with a reason.** A match that fails to allocate, or whose roster
-  dissolves, must not vanish: publish \`match.abandoned\` with the players and the reason. The starter
-  only has happy-path publishers, so every failure is invisible to the consumers that reconcile
-  matches against games.
-- When the broker **rejects** the produce, write an **outbox** row so the event can be replayed
-  instead of dropped. The starter lets the exception escape and the event is lost.
-
-**Failure mode the checks target.** The key is the subtle one: everything works in a demo with one
-matchmaker, and only shows up when two matches are consumed in parallel and the events of one match
-interleave. The second is "started before joins", which corrupts every consumer that treats the
-event as "the game is underway". The third is the omitted abandoned events: the failures that the
-platform most needs to explain are exactly the ones that never reach the topic.`,
+- Publish \`match.found\`, \`match.joined\`, \`match.started\` and \`match.abandoned\` on
+  \`match.event\`, keyed by **match id**.
+- Every event carries the **player ids** and the **server id** it is about; the server id is
+  absent until allocation, the reason is present only on an abandoned match.
+- \`match.started\` is gated on \`all_joins_confirmed(match_id)\`; with a pending participant,
+  refuse and do not publish.
+- Publish \`match.abandoned\` with the players and a \`reason\`.
+- When the broker rejects the produce, write an **outbox** row so the event can be replayed.`,
   sequence: {
     participants: ['Matchmaker', 'match.event', 'match store'],
     messages: [
@@ -123,7 +116,7 @@ platform most needs to explain are exactly the ones that never reach the topic.`
   ],
   code: {
     python: {
-      starter: `"""Match events: flawed code that keys by bucket and hides failures."""
+      starter: `"""Match events: publish the match lifecycle."""
 import json
 
 from kafka import KafkaProducer
@@ -135,11 +128,7 @@ producer = KafkaProducer(bootstrap_servers=["kafka:9092"])
 
 
 def publish(bucket: int, payload: dict) -> None:
-    # TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
-    # partitions; it publishes "started" before every join is confirmed; it never publishes an
-    # abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
-    # gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
-    # on a rejected produce.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     producer.send(TOPIC, key=str(bucket).encode("utf-8"), value=json.dumps(payload).encode("utf-8"))
 
 
@@ -200,7 +189,7 @@ def publish_abandoned(match_id: str, player_ids: list[str], reason: str) -> None
 `,
     },
     typescript: {
-      starter: `/** Match events: flawed code that keys by bucket and hides failures. */
+      starter: `/** Match events: publish the match lifecycle. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'matchmakerd', brokers: ['kafka:9092']});
@@ -217,11 +206,7 @@ interface MatchEvent {
 }
 
 export async function publish(bucket: number, event: MatchEvent): Promise<void> {
-  // TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
-  // partitions; it publishes "started" before every join is confirmed; it never publishes an
-  // abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
-  // gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
-  // on a rejected produce.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   await producer.send({topic: TOPIC, messages: [{key: String(bucket), value: JSON.stringify(event)}]});
 }
 
@@ -295,11 +280,7 @@ type MatchEvent struct {
 }
 
 func publish(ctx context.Context, bucket int, event MatchEvent) error {
-	// TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
-	// partitions; it publishes "started" before every join is confirmed; it never publishes an
-	// abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
-	// gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
-	// on a rejected produce.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(event)
 	return writer.WriteMessages(ctx, kafka.Message{
 		Key:   []byte(strconv.Itoa(bucket)),
@@ -383,11 +364,7 @@ object MatchEvents {
   val producer: KafkaProducer[String, String] = new KafkaProducer[String, String](producerProps)
 
   def publish(bucket: Int, payload: String): Unit = {
-    // TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
-    // partitions; it publishes "started" before every join is confirmed; it never publishes an
-    // abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
-    // gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
-    // on a rejected produce.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     producer.send(new ProducerRecord[String, String](Topic, bucket.toString, payload))
   }
 
@@ -457,11 +434,7 @@ object MatchEvents {
 const std::string kMatchEventTopic = "match.event";
 
 void publish(RdKafka::Producer* producer, const std::string& bucket, const std::string& payload) {
-  // TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
-  // partitions; it publishes "started" before every join is confirmed; it never publishes an
-  // abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
-  // gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row on
-  // a rejected produce.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   producer->produce(kMatchEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                     const_cast<char*>(payload.data()), payload.size(), bucket.c_str(), bucket.size(), 0, nullptr);
 }
@@ -511,9 +484,9 @@ void publishAbandoned(RdKafka::Producer* producer, const std::string& match_id,
     },
   },
   hints: [
-    'One topic, one key: `match.event` for the topic and `match_id` for the key. The key is not decoration — it is what puts every event of one match on one partition so consumers see found, joined, started in the order they happened. Buckets and player ids are the wrong keys for the same reason.',
-    '`started` is a claim about the world, so it needs a precondition: read `all_joins_confirmed(match_id)` and refuse when a participant is still pending. Refusing is better than publishing a lie that every downstream consumer will act on.',
-    'Failures are events too. Give the abandoned path the same publisher as the happy path — same topic, same key — and carry the `reason`. And wrap the produce: a broker rejection writes an outbox row so the event is replayed later instead of disappearing with the process.',
+    'The reconciliation consumer logs "started before found" for some matches, counts games that no server ever ran, and shows players in-game while their client is still on the loading screen.',
+    'The partition is chosen by the key, and the key is the bucket, so one match spreads over partitions. The started publisher has no precondition, nothing publishes failures, and a rejected produce raises out of `publish`.',
+    'Key by `match_id`; check `all_joins_confirmed(match_id)` before `"started"`; add `publish_abandoned` with `reason`; wrap the produce so a `KafkaError` writes an `outbox` row instead of escaping.',
   ],
-  debrief: `The interviewer is testing whether you understand that an event stream is an interface, not a log sink. Three contracts are being checked. Ordering: the key selects the partition, and keying by match id is the only way one match's lifecycle stays ordered for a consumer — key by bucket or by player and the events of a single match interleave with another's. Truth: "started" is a claim that the game is underway, so it may only be published after every join is confirmed; publishing it when the roster is *decided* means every consumer of that event is now wrong about a player who is still connecting. Completeness: the abandoned path must publish too, because the failures are the events the platform most needs — a match that silently vanishes cannot be reconciled against the games that ran. The outbox is the durability contract: a produce that the broker rejects is a fact that must survive the process that observed it. Real matchmakers add a per-match sequence number in the payload so consumers can detect gaps and reordering, a compacted "latest state" topic alongside the event stream, and a consumer that verifies the roster in the match read before it trusts a started event.`,
+  debrief: `An event stream is an interface, not a log sink, and the fix follows three contracts. Ordering: the key selects the partition, so keying by match id is what keeps one match's lifecycle ordered for a consumer. Truth: "started" claims the game is underway, so it waits for every join; refusing to publish is better than publishing something every consumer acts on. Completeness: the abandoned path publishes through the same topic and key, because a match that vanishes cannot be reconciled against the games that ran. The outbox makes a rejected produce a fact that outlives the process that saw it. Production matchmakers add a per-match sequence number so consumers detect gaps, and a compacted latest-state topic alongside the stream for consumers that only need the current position.`,
 };

@@ -17,71 +17,58 @@ import {stateStep} from './steps/state';
 export const fineTuneOrchestratorProblem: Problem = {
   id: 'fine-tune-orchestrator',
   title: 'Fine-tune Orchestrator',
-  tagline: 'Fine-tuning jobs with reproducible configs, budget gates and rollback-safe promotion.',
+  tagline: 'Fine-tune jobs with Redis budget reservations and an eval gate before promotion.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Fine-tune Orchestrator
 
-A fine-tune orchestrator is the piece of an AI platform that turns "train this base model on this
-dataset" into a long-running job: it decides whether the recipe is reproducible, whether the team can
-afford it, which worker may advance it, what happens when the trainer goes quiet for a minute, and
-whether the finished artifact is allowed anywhere near production. The visible part is a job id; the
-parts that decide whether the platform is safe are the validation funnel, the reservation, the
-failure policy and the promotion gate.
+A fine-tune orchestrator turns "train this base model on this dataset" into a long-running job: it
+decides whether the recipe is reproducible, whether the team can afford it, what happens when the
+trainer goes quiet, and whether the artifact is allowed near production.
 
 ## The real system
 
-Production orchestrators are budgeted state machines, not shell scripts with a timer. A submission is
-validated against the registry — a base model version and a dataset version, both hashed — and its
-hyperparameters must be a subset of what the base model's recipe defines, because "the same config" is
-only meaningful if the knobs are the same. The job's compute budget is reserved from the team pool in
-one atomic Redis script at submission, so ten submissions cannot all start and oversubscribe the
-cluster, and the release on completion returns only the unused remainder and is idempotent against a
-redelivered callback. The trainer is driven over gRPC under a 60-second heartbeat deadline; a missed
-heartbeat asks for a checkpoint before anything restarts, a trainer that cannot checkpoint is failed
-explicitly rather than restarted blind, and repeated failures stop the job instead of looping. Every
-transition publishes a job-keyed event that carries the config hash, the dataset version and the
-checkpoint ids — never the hyperparameter block, never a sample of the loss log — and the job record is
-committed before the event is produced. The read path returns status, spent budget, checkpoint lineage
-and the eval gate result, refuses to serve another team's job, and reports a run whose eval did not
-pass as trained but not promotable.
+Production orchestrators are state machines. The Kubeflow Training Operator's
+\`PyTorchJob\` carries a \`runPolicy.backoffLimit\` (retries before the job is marked failed) and a
+replica \`restartPolicy: ExitCode\`, where exit codes 1 to 127 are permanent and not restarted while
+128 to 255 are retryable: the failure policy is data on the job, not a loop in a client. A
+submission is validated against a registry of hashed model and dataset versions. The compute budget
+is reserved from the team pool in one atomic Redis script at submission, and the release returns
+only the unused remainder, once. A missed trainer heartbeat asks for a checkpoint before anything
+restarts. Every transition publishes a job-keyed event carrying hashes and checkpoint ids rather than
+the hyperparameter block, produced after the job record commits. The read path reports a run whose
+eval did not pass as trained but not promotable.
 
 ## What you build here
 
-One service, **finetuned**, with five pieces:
+One service, **finetuned**, in five pieces:
 
-1. \`POST /v1/finetune/jobs\`: an authenticated team, a base model version and a dataset version that
-   must both exist in the registry, a hyperparameter block that must be a subset of the base model's
-   supported set and is canonicalised into a \`config_hash\`, a positive compute budget, and an
-   \`Idempotency-Key\` so a retry returns the original job.
-2. A **Redis** queue with reservations: \`submit\` takes the budget out of \`pool:{team}\` in one
-   atomic script before it queues the job, \`start\` refuses a job whose reservation is gone,
-   \`complete\` returns only \`reserved - spent\` and only once, and \`cancel\` frees the whole
-   reservation.
-3. A **gRPC** trainer client: a 60-second heartbeat deadline, a checkpoint request before any restart,
-   a restart that names the checkpoint it resumed from, an explicit failure when the trainer cannot
-   checkpoint, and a stop after repeated heartbeat failures.
+1. \`POST /v1/finetune/jobs\`: registered base model and dataset versions, hyperparameters
+   restricted to the base model's supported set and hashed into a \`config_hash\`, a positive
+   compute budget, and an \`Idempotency-Key\`.
+2. A **Redis** queue: \`submit\` reserves from \`pool:{team}\` in one atomic script before queuing,
+   \`start\` refuses a job whose reservation is gone, \`complete\` returns \`reserved - spent\`
+   once, and \`cancel\` frees the whole reservation.
+3. A **gRPC** trainer client: a 60-second heartbeat deadline, a checkpoint before any restart, a
+   restart that names its checkpoint, an explicit failure when the trainer cannot checkpoint, and a
+   stop after repeated failures.
 4. A **Kafka** event path: \`finetune.job\` keyed by job id, a payload of \`config_hash\`,
-   \`dataset_version\`, \`checkpoint_ids\` and \`status\`, an idempotent \`acks=all\` producer, and a
-   produce that happens after the job record commits.
+   \`dataset_version\`, \`checkpoint_ids\` and \`status\`, an idempotent \`acks=all\` producer, a
+   produce after commit.
 5. \`GET /v1/finetune/jobs/{id}\`: team-scoped, with the eval gate, a \`promotable\` flag that needs
-   both exit code zero and a passing eval, a reconciled budget and the checkpoint lineage.
+   exit code zero and a passing eval, a reconciled budget and the checkpoint lineage.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and looks right. In every step you debug it against
+the failure modes, fix it, and prove the fix with checks that fail on the starter and pass on yours.
 
 ## Left out on purpose
 
-Registry write paths, dataset hashing pipelines, checkpoint storage and retention, GPU scheduling and
-placement, hyperparameter search, multi-region training, the eval service's own golden sets, and cost
-accounting. The five pieces above are the ones that decide whether a fine-tune is reproducible,
-isolated and safe to promote.`,
+Registry write paths, dataset hashing, checkpoint storage, GPU scheduling, hyperparameter search,
+multi-region training, the eval service's golden sets, and cost accounting.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · read', x: 8, y: 50},

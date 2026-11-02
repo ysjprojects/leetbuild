@@ -8,32 +8,26 @@ export const triageDependencyStep: Step = {
   focus: ['triage', 'classifier', 'rules'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the classifier and returns whatever it
-says, so the happy path works. It hides three flaws in the failure path. Find them, fix them, and
-prove the fix.
+**Starting point.** The starter's \`classify\` loops over \`stub.Classify\` with the hour-long
+\`CACHE_TTL_S\` as its timeout, catches every \`RpcError\`, and answers from a single
+\`catch_all\` queue for the rest of the hour after a failure. It serves the demo and hides five
+flaws.
 
-Implement the classifier client every triage call uses:
+**Failure mode the checks target.** Failing every ticket into one catch-all queue erases the
+difference between "billing outage" and "delivery delay", and no \`fallback_reason\` means the
+outage is invisible in the data. Retrying a refusal turns a deterministic error into a retry storm.
+A failure cache measured in hours keeps the service on rules long after the classifier is healthy.
 
-- **Deadline.** Every \`Classify\` call runs with a **1-second** deadline. A call that overruns is a
-  \`DEADLINE_EXCEEDED\`, not something to wait on.
+- **Deadline.** Every \`Classify\` call runs with a **1-second** deadline.
 - **Bounded retries.** At most **3 attempts**, and only for \`UNAVAILABLE\` and
-  \`DEADLINE_EXCEEDED\`. A **refusal** (\`INVALID_ARGUMENT\`) is never retried: the classifier has
-  spoken, and hammering it until the deadline is how one bad request becomes an outage.
-- **Rule-based fallback.** When the classifier times out, is unavailable, or refuses, classify
-  deterministically from a versioned keyword ruleset (\`ruleset v3\`): the keywords pick the queue and
-  the priority, and the decision records **why** it fell back (\`fallback_reason\`) and **which**
-  ruleset decided (\`ruleset_version\`). The fallback must be a real routing, not a single catch-all
-  queue that swallows every ticket during an outage.
-- **Short failure memory.** After \`5\` consecutive retryable failures the client stops calling the
-  classifier for **30 seconds**, then probes it again. A recovered classifier must be used again
-  within a minute — the starter caches the failure for every ticket of the hour, which is how an
-  outage hides.
-
-**Failure mode the checks target.** Failing all tickets into one catch-all queue erases the
-difference between "billing outage" and "delivery delay", and no \`fallback_reason\` means the outage
-is invisible in the data. Retrying a refusal turns a deterministic error into a retry storm. A
-failure cache measured in hours means the service keeps using rules long after the classifier is
-healthy again.`,
+  \`DEADLINE_EXCEEDED\`. A refusal (\`INVALID_ARGUMENT\`) is not retried.
+- **Rule-based fallback.** On timeout, unavailability or refusal, classify deterministically from
+  a versioned keyword ruleset (\`ruleset v3\`): the keywords pick queue and priority, and the
+  decision records \`fallback_reason\` and \`ruleset_version\`. An unmatched ticket lands in the
+  real \`general\` queue, not a catch-all.
+- **Short failure memory.** After \`5\` consecutive retryable failures the client skips the
+  classifier for **30 seconds**, then probes it again, so a recovered classifier is used again
+  within a minute.`,
   sequence: {
     participants: ['triage-api', 'Classifier', 'Rule engine'],
     messages: [
@@ -107,7 +101,7 @@ healthy again.`,
       id: 'fallback-recorded',
       title: 'Records the ruleset version and reason, with no catch-all queue',
       detail:
-        'The decision names the `ruleset_version` and the `fallback_reason`, and an unmatched ticket lands in the real `general` queue — never in a single catch-all queue that hides the outage.',
+        'The decision names the `ruleset_version` and the `fallback_reason`, and an unmatched ticket lands in the real `general` queue, not in a single catch-all queue that hides the outage.',
       match: {
         python: {all: [/ruleset_version/, /fallback_reason/, /GENERAL_QUEUE/], none: [/catch_all/]},
         typescript: {all: [/ruleset_version/, /fallback_reason/, /GENERAL_QUEUE/], none: [/catch_all/]},
@@ -157,8 +151,7 @@ class Decision:
 
 
 def classify(text: str) -> Decision:
-    # TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
-    # deadline, and caches the failure for every ticket of the hour.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     global _failed_at
     while True:
         try:
@@ -303,8 +296,7 @@ export interface Decision {
 }
 
 export async function classify(text: string): Promise<Decision> {
-  // TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
-  // deadline, and caches the failure for every ticket of the hour.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const reply = await new Promise<ClassifyReply>((resolve, reject) => {
@@ -476,8 +468,7 @@ type Decision struct {
 
 // Classify asks the classifier for a routing decision.
 func Classify(ctx context.Context, text string) (Decision, error) {
-	// TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
-	// deadline, and caches the failure for every ticket of the hour.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
 		ctx, cancel := context.WithTimeout(ctx, cacheTTL)
 		reply, err := stub.Classify(ctx, &pb.ClassifyRequest{Text: text})
@@ -652,8 +643,7 @@ object Classifier {
   private var failedAt = 0L
 
   def classify(text: String): Decision = {
-    // TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
-    // deadline, and caches the failure for every ticket of the hour.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var done = false
     var result = Decision(CatchAllQueue, "normal", 0.0)
     while (!done) {
@@ -774,8 +764,7 @@ auto stub = classifier::Classifier::NewStub(channel);
 long long failedAt = 0;
 
 json classify(const std::string& text) {
-  // TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
-  // deadline, and caches the failure for every ticket of the hour.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kCacheTtlSeconds));
@@ -901,9 +890,9 @@ json classify(const std::string& text) {
     },
   },
   hints: [
-    'Keep the classifier call thin: build the request, attach `deadline: now + 1s`, and translate the reply into the same `Decision` shape the rules fallback returns. When both paths return the same type, the caller never learns where the answer came from — except through `fallback_reason`.',
-    'Classify the status: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt (bounded to three), everything else is an answer. `INVALID_ARGUMENT` means the classifier understood the request and refused it; retrying it cannot help and only delays the fallback.',
-    'The breaker is a clock, not a flag: after five consecutive retryable failures, remember *when* it opened, skip the call for 30 seconds, then let one probe through. `time.monotonic()`/`Date.now()`/`System.nanoTime()` is what makes "used again within a minute" testable.',
+    'Stop the classifier for ten seconds: every ticket lands in `catch_all` with no reason recorded, and they keep landing there an hour after it is back. A refused request hangs the caller.',
+    'The loop has no attempt cap and treats every `RpcError` alike, `timeout=CACHE_TTL_S` is 3600 seconds, and `_failed_at` gates the fallback for the same 3600 seconds.',
+    'Add `CLASSIFY_DEADLINE_S = 1.0`, `MAX_ATTEMPTS`, a `RETRYABLE` tuple, `FALLBACK_RULES` with `rule_queue` filling `fallback_reason`/`ruleset_version`, `GENERAL_QUEUE`, and `BREAKER_COOLDOWN_S = 30` keyed on `time.monotonic()`.',
   ],
-  debrief: `The interviewer is testing the failure path of a dependency call, which is where most code is weakest. The starter looks defensive — it has a \`try\`, it has a cache — and it is wrong in three ways. It funnels every failure into one catch-all queue, so an outage looks like a surge of undifferentiated tickets and no dashboards can separate billing from delivery; nothing in the decision records that rules, not the model, chose the queue. It retries every error including a refusal, which is a retry storm pointed at a service that already said no. And its failure memory is measured in hours: once the classifier fails, every ticket for the rest of the hour is routed by rules, long after the classifier recovered. The fix is a deadline, a bounded retry over retryable codes only, a versioned rules fallback that records its reason and ruleset version, and a breaker whose cooldown is short enough to probe recovery.`,
+  debrief: `The fix separates the three questions the starter blurred together. How long to wait is the deadline, one second, because triage is on the request path. Whether to try again depends on the status: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may clear, a refusal will not, so only the first two earn up to three attempts. What to answer when the model cannot is the keyword ruleset, which routes to real queues and stamps the decision with its reason and version so dashboards can show the outage as a fallback share instead of a surge. The breaker is a clock rather than a flag: thirty seconds, then one probe. Production clients add per-status metrics, a half-open state that lets a single probe through at a time, and a ruleset loaded from config so v4 ships without a deploy.`,
 };

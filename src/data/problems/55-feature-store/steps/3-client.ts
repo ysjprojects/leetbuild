@@ -8,35 +8,28 @@ export const dependencyStep: Step = {
   focus: ['worker', 'offline', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it fans out over the partitions,
-calls the warehouse and collects rows. It works on an idle cluster and it produces a training set full
-of fake zeros exactly when the warehouse is busy. Find the flaws, fix them, and prove the fix with the
-checks below.
-
-Implement the backfill job that materializes one feature version from the offline store:
-
-- The offline store is called once **per partition** over gRPC:
-  \`Scan(feature, version, partition, cutoff_ms)\`.
-- Every call carries a **60-second deadline**. The starter has no deadline at all, so one slow partition
-  pins a worker until the warehouse decides to answer.
-- At most **4 partitions** are in flight. The starter launches every partition at once; a backfill that
-  opens 200 concurrent scans is a self-inflicted outage for the warehouse and for everyone else using it.
-- A partition that ends in \`DEADLINE_EXCEEDED\` is reported **missing**, never zero-filled. The starter
-  turns every timeout into rows of \`0.0\`, which is how an infrastructure failure becomes
-  plausible-looking training data — a zero the model happily learns from.
-- \`PERMISSION_DENIED\` **stops the backfill once**. The starter retries the rejection partition by
-  partition, so a bad credential becomes a hot loop against a store that has already said no.
-- The scan request carries the **training cutoff** so the offline read is the same point-in-time
-  question the online store answers, and the summary distinguishes \`written\` from \`missing\`.
+**Starting point.** The starter's \`backfill\` fans out one \`Scan\` RPC per partition with
+\`asyncio.gather\`, retries every error in a loop, turns a timeout into a row of \`0.0\` and returns the
+collected rows. It compiles and hides five flaws.
 
 **Failure mode the checks target.** Honesty about infrastructure: a timed-out partition must appear in
 the result as missing, not as invented values, and a permission error must end the job instead of
 being retried forever.
 
+- The offline store is called once **per partition**: \`Scan(feature, version, partition, cutoff_ms)\`.
+- Every call carries a **60-second deadline**. The starter has none, so one slow partition pins a
+  worker.
+- At most **4 partitions** are in flight. The starter launches every partition at once.
+- A \`DEADLINE_EXCEEDED\` partition is reported **missing**, not zero-filled. The starter turns every
+  timeout into rows of \`0.0\`, a zero the model learns from.
+- \`PERMISSION_DENIED\` **stops the backfill once**. The starter retries it partition by partition.
+- The request carries the **training cutoff** (\`cutoff_ms\`) and the summary distinguishes
+  \`written\` from \`missing\`. The starter drops the cutoff it was given.
+
 ## What to keep
 
-The per-partition call, the shape of the request and the collection of the summary are fine. The fix is
-the concurrency gate, the deadline, and the two error policies.`,
+The per-partition call and the request shape are fine. The fix is the concurrency gate, the deadline,
+the cutoff and the two error policies.`,
   sequence: {
     participants: ['Backfill job', 'Offline store', 'Online store'],
     messages: [
@@ -138,9 +131,7 @@ warehouse = warehouse_pb2_grpc.OfflineStoreStub(channel)
 
 
 async def backfill(name: str, version: int, cutoff_ms: int, partitions: list[int]) -> dict:
-    # TODO: bound the partitions in flight to 4 with a 60-second deadline each, report a timed-out
-    # partition as missing instead of zero-filling it, and let a permission rejection stop the
-    # backfill instead of being retried partition by partition.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     async def one(partition: int) -> list[dict]:
         while True:
             try:
@@ -229,9 +220,7 @@ export async function backfill(
   cutoff: number,
   partitions: number[],
 ): Promise<{rows: Row[]}> {
-  // TODO: bound the partitions in flight to 4 with a 60-second deadline each, report a timed-out
-  // partition as missing instead of zero-filling it, and let a permission rejection stop the
-  // backfill instead of being retried partition by partition.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const scanned = await Promise.all(
     partitions.map(async partition => {
       try {
@@ -322,9 +311,7 @@ import (
 )
 
 func backfill(ctx context.Context, client pb.OfflineStoreClient, name string, partitions []int) map[string]any {
-	// TODO: bound the partitions in flight to 4 with a 60-second deadline each, report a timed-out
-	// partition as missing instead of zero-filling it, and let a permission rejection stop the
-	// backfill instead of being retried partition by partition.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	results := make(chan []float64, len(partitions))
 	for _, partition := range partitions {
 		go func(partition int) {
@@ -452,9 +439,7 @@ object BackfillRunner {
       name: String,
       version: Int,
       partitions: List[Int]): List[Double] = {
-    // TODO: bound the partitions in flight to 4 with a 60-second deadline each, report a timed-out
-    // partition as missing instead of zero-filling it, and let a permission rejection stop the
-    // backfill instead of being retried partition by partition.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     implicit val ec: ExecutionContext = ExecutionContext.global
     Await
       .result(
@@ -528,9 +513,7 @@ object BackfillRunner {
 #include <vector>
 
 int run_backfill(Warehouse::Stub& warehouse, const std::string& name, const std::vector<int>& partitions) {
-  // TODO: bound the partitions in flight to 4 with a 60-second deadline each, report a timed-out
-  // partition as missing instead of zero-filling it, and let a permission rejection stop the
-  // backfill instead of being retried partition by partition.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   std::vector<double> rows;
   std::mutex mutex;
   std::vector<std::thread> workers;
@@ -621,9 +604,9 @@ int run_backfill(
     },
   },
   hints: [
-    'A backfill is a client of a shared warehouse: four partitions in flight (`asyncio.Semaphore`, a fixed worker pool, a buffered channel, a counting semaphore) is the difference between a batch job and a denial-of-service attack. The deadline belongs on every call, not on the job: 60 seconds per partition, so a slow one fails alone.',
-    'A timeout is information, not a value. `DEADLINE_EXCEEDED` belongs in a `missing` list that the caller can retry later; turning it into `0.0` rows is how an infrastructure failure becomes plausible-looking training data that nobody can explain.',
-    'A permission rejection is a property of the credential, not of the partition: the first `PERMISSION_DENIED` ends the job with one abort. Retrying it per partition hammers a store that has already answered, and the answer will not change until the job does.',
+    'On a busy warehouse the job opens 200 scans at once, hangs on the slowest one, and the training set it writes is full of 0.0 rows with no record of which partitions timed out.',
+    'gather launches every partition with no semaphore and no timeout; the except branch returns a fake row on DEADLINE_EXCEEDED and loops on everything else, so PERMISSION_DENIED is retried forever and cutoff_ms is dropped.',
+    'Gate each call with Semaphore(MAX_CONCURRENCY), pass timeout=PARTITION_DEADLINE_S and cutoff_ms=cutoff_ms, append a timed-out partition to missing, raise BackfillAborted on PERMISSION_DENIED, and return written and missing.',
   ],
-  debrief: `The interview question behind this step is honest failure propagation from a dependency. A warehouse is shared, rate-limited and occasionally slow, so a backfill has three obligations the starter ignores. Bounded concurrency protects the dependency and the job's own memory; a per-call deadline turns "slow" into a decision the job can make instead of a hang; and the two error policies are deliberately different — a timeout is transient, so the partition is reported missing and can be retried by whoever owns the schedule, while a permission rejection is terminal, so the job stops once instead of burning the warehouse with retries that cannot succeed. The subtle part is what \`missing\` prevents: a zero-fill looks like data, it passes every schema check, and it quietly teaches a model that the feature is zero in exactly the situations where the pipeline was broken.`,
+  debrief: `The fix treats the warehouse as a shared, rate-limited dependency with its own failure vocabulary. Bounded concurrency protects the dependency and the job's own memory; a per-call deadline turns "slow" into a decision the job can make instead of a hang; and the two error policies differ on purpose. A timeout is transient, so the partition is reported missing and can be retried by whoever owns the schedule, while a permission rejection is terminal, so the job stops once instead of burning the warehouse with retries that cannot succeed. A zero-fill looks like data, passes every schema check, and teaches a model that the feature is zero exactly where the pipeline was broken. Production backfills also checkpoint finished partitions, so a restarted job resumes instead of rescanning.`,
 };

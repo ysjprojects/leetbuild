@@ -8,34 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'scorer', 'accounts', 'model'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route,
-parses the body and returns a band, so the demo ends green. It trusts the caller three times — the
-risk signals come from the request body, the account is never looked up, and the transaction id is
-never checked against the scores already taken. Debug it like the service owner, fix it, and prove
-the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/scores\` with body
+\`{"transaction_id": "tx-…", "account_ref": "acct-…"}\`: it parses the body, reads
+\`body.features["declared_risk"]\`, calls the model, writes the result with \`scores.put\` and returns a
+band. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/scores\` with body \`{"transaction_id": "tx-…", "account_ref": "acct-…"}\`.
+**Failure mode the checks target.** Caller-supplied features let the entity being scored write its
+own risk: a probe account declares itself low-risk and gets approved. The same handler scores accounts
+that do not exist and scores every retry again, which inflates the velocity counters the next step
+builds on and bills a model call each time.
 
 - \`account_ref\` must resolve in the server's own account store (\`accounts.get(account_ref)\`). An
-  unknown account is **404** (\`UNKNOWN_ACCOUNT\`) and it must be refused **before** any feature
-  derivation or model work: a scoring call for an account nobody has is a probe, and it costs a
-  model round trip.
-- **Features are derived server-side** by \`derive_features(account, transaction_id)\` and carry a
-  pinned \`FEATURE_VERSION\`, so a decision can be replayed later. Extra fields in the request body
-  are ignored — a caller that sends \`features\` or \`declared_risk\` must not be able to move its own
-  risk, in either direction.
+  unknown account is **404** (\`UNKNOWN_ACCOUNT\`), refused before any feature derivation or model
+  work.
+- Features are derived server-side by \`derive_features(account, transaction_id)\` and carry a pinned
+  \`FEATURE_VERSION\`, so a decision can be replayed later. Anything the caller sends under
+  \`features\` or \`declared_risk\` is ignored.
 - \`transaction_id\` is the dedupe key: \`scores.get(transaction_id)\` answers a replay with the
-  **stored** decision, and only a first sighting is scored and written with
+  stored decision; only a first sighting is scored and written with
   \`scores.put(transaction_id, result)\`.
-- The stored decision carries the score, the band, the feature version and the fallback marker, and
-  the log line carries ids and the band — never the feature vector, which describes a person.
-
-**Failure mode the checks target.** Caller-supplied features are the fraud equivalent of letting a
-suspect write the police report: the starter scores \`body.features["declared_risk"]\`, so a probe
-account declares itself low-risk and gets approved. Without the account lookup the same starter scores
-accounts that do not exist, and without the dedupe it scores every retry again, which inflates the
-velocity counters the next step builds on and bills a model call each time. The order matters as
-much as the guards: the account lookup has to happen before the model call.`,
+- The stored decision carries the score, the band, the feature version and the fallback marker. The
+  log line carries ids and the band, not the feature vector, which describes a person.`,
   sequence: {
     participants: ['Merchant client', 'Fraud Scorer', 'Accounts', 'Fraud model'],
     messages: [
@@ -98,7 +91,7 @@ much as the guards: the account lookup has to happen before the model call.`,
       id: 'replay-dedupe',
       title: 'A replayed transaction id returns the stored score',
       detail:
-        'The decision is read back with `scores.get(transaction_id)` before any model work and written with `scores.put(transaction_id, result)` only for a first sighting. The starter stores nothing back and scores every retry as a new decision.',
+        'The decision is read back with `scores.get(transaction_id)` before any model work and written with `scores.put(transaction_id, result)` only for a first sighting. The starter writes every decision but reads none back, so each retry is scored as a new decision.',
       match: {
         python: {all: [/scores\.get\(/, /scores\.put\(/]},
         typescript: {all: [/scores\.get\(/, /scores\.put\(/]},
@@ -164,8 +157,7 @@ model = ModelClient()
 
 @app.post("/v1/scores")
 def score(body: ScoreRequest) -> JSONResponse:
-    # TODO: this starter builds the score from body.features, never looks the account up, and
-    # re-scores a replayed transaction id. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     declared = body.features
     declared_risk = float(declared.get("declared_risk", 0.0))
     scored = model.score(declared)
@@ -324,8 +316,7 @@ function bandFor(score: number): string {
 }
 
 app.post('/v1/scores', async (request, reply) => {
-  // TODO: this starter builds the score from body.features, never looks the account up, and
-  // re-scores a replayed transaction id. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const body = request.body as ScoreBody;
   const declared = body.features ?? {};
   await model.score(declared);
@@ -490,8 +481,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func score(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter builds the score from body.Features, never looks the account up, and
-	// re-scores a replayed transaction id. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	var body ScoreRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -688,8 +678,7 @@ object Api {
   def bandFor(score: Double): String =
     if (score <= 0.3) "approve" else if (score <= 0.7) "review" else "decline"
 
-  // TODO: this starter builds the score from request.features, never looks the account up, and
-  // re-scores a replayed transaction id. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   def score(request: ScoreRequest): JsObject = {
     val declared = request.features.getOrElse("declared_risk", 0.0)
     model.score(request.features)
@@ -850,8 +839,7 @@ int main() {
       res.set_content("{\\"error\\":\\"invalid json\\"}", "application/json");
       return;
     }
-    // TODO: this starter builds the score from body.value("features"), never looks the account up,
-    // and re-scores a replayed transaction id. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const json declared = body.value("features", json::object());
     const double declared_risk = declared.value("declared_risk", 0.0);
     const json scored = model.score(declared);
@@ -970,10 +958,10 @@ int main() {
     },
   },
   hints: [
-    'Write the guards in cost order: shape of the body, the account, the transaction id. The account read and the scores read both happen before the model call, so a probe account or a replay never costs a model round trip.',
-    'The fix is not "drop the features field from the response": the request model itself must stop accepting opinions. Declare the body as `transaction_id` and `account_ref` only, and derive the vector with `derive_features(account, transaction_id)` — the caller names a transaction, not a risk.',
-    'Dedupe by `transaction_id` before scoring: read `scores.get(transaction_id)` and answer a hit with the stored decision. The stored decision also carries `feature_version`, which is what lets you re-score or defend the decision six months later.',
+    'Send the same body twice with `declared_risk: 0` and an account that does not exist: both calls return `approve`, the second one costs a second model round trip.',
+    'The handler reads `body.features`, so the caller sets the input, and nothing consults `accounts` or reads `scores` before `model.score` runs.',
+    'Drop `features` from the request model; `accounts.get` (404 on miss), then `scores.get` (return a hit), then `derive_features(account, transaction_id)` with `FEATURE_VERSION`, then the model, then `scores.put`.',
   ],
-  debrief: `The interviewer is testing the trust boundary of a scoring API, and the starter fails it in the way these services actually fail in production: it reads the risk signals from the caller. A probe account sends \`declared_risk: 0\`, the starter approves it, and the velocity counters that should have flagged the burst keep counting silently because the request never touches the account store. Three guards are being checked here: the account lookup (with its own 404 and its position before the model call), the server-derived feature vector with a pinned version, and the transaction dedupe key. Real scorers add a hashed transaction fingerprint so PII never enters the dedupe store, sign the decision so it can be replayed, and keep the model version inside the decision record so a disputed approval can be explained.
+  debrief: `The guards sit in cost order because each one makes the next unnecessary: an unknown account costs one store read, a replay costs one more, and only a first sighting for a real account pays for feature derivation and a model round trip. Deriving the vector server-side at a pinned \`FEATURE_VERSION\` is what makes the stored decision replayable: six months later the same account history and the same version reproduce the same score, which is what a disputed approval needs. Production scorers go further than this step: they hash the transaction fingerprint so the dedupe store holds no PII, record the model version next to the feature version in the decision, and sign the decision record so a replay can be checked against the original.
 `,
 };

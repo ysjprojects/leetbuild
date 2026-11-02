@@ -8,30 +8,28 @@ export const stateStep: Step = {
   focus: ['api', 'state', 'worker'],
   task: `## Task
 
-**Starting point.** The starter is working code: a tenant with room left gets a
-token and the happy path works. Two failures hide under it — an admission race and a leak — and
-neither shows up in a serial demo. Find them, fix them, and prove the fix.
+**Starting point.** The starter's \`admit(tenant)\` reads \`gpu:tokens:{tenant}\` with \`GET\`,
+returns false when the counter is empty, otherwise sends \`DECR\` and returns true; the route already
+answers **429** with \`Retry-After\` when admission fails. It serves the demo and hides four flaws.
 
-Implement the per-tenant **GPU admission pool** that decides how many inferences may run at once.
+**Failure mode the checks target.** A read followed by a decrement is correct in a serial test and
+over-admits the moment two requests arrive together, and because the guard runs on the client the
+counter can also go negative. No TTL is set and no release exists, so every crashed worker removes one
+slot from the tenant's pool until Redis restarts.
+
+Requirements for the per-tenant **GPU admission pool**:
 
 - Each tenant holds \`GPU_TOKENS_PER_TENANT = 10\` concurrent inference tokens in Redis:
   \`gpu:tokens:{tenant}\` counts the tokens still available and \`gpu:holders:{tenant}\` is the hash of
   the tickets currently holding one.
-- Admission is **one atomic Lua \`EVAL\`**: read the counter, reject when it is empty, decrement when
-  it is not, and record the ticket in the same call. A client-side \`GET\` followed by \`DECR\` lets a
-  burst read the same room twice and over-admits past the GPU's capacity.
-- The TTL (\`TOKEN_TTL_S\`) is set **at first write, inside the script** (\`SET key value EX ttl\`).
-  Tokens heat the pool back up on their own: a worker that dies holding a token never releases it,
-  and without an expiry the pool leaks until someone restarts Redis.
-- Admission returns a **lock id**; release runs through \`RELEASE_LUA\`, which decrements only when the
+- Admission is **one atomic Lua \`EVAL\`** (\`ADMIT_LUA\`): read the counter, return a rejection
+  tuple when it is empty, decrement when it is not, and record the ticket in the same call.
+- The TTL (\`TOKEN_TTL_S\`) is set **at first write, inside the script** (\`SET key value EX ttl\`),
+  so a token held by a dead worker expires back into the pool on its own.
+- Admission returns a **lock id**; release runs through \`RELEASE_LUA\`, which increments only when the
   caller still holds that ticket (\`HDEL\` returns 1). A late release from a retried worker must not
   hand out a token that already expired and went to someone else.
-- When the pool is empty answer **429** with \`Retry-After\` (seconds) and **do not queue** the request:
-  the caller backs off instead of the service growing an unbounded work queue.
-
-**Failure mode the checks target.** A check-then-decrement pair is correct in a serial test and
-over-admits the moment two requests arrive together; a token with no TTL and no owner-checked release
-leaks one slot per crashed worker until the pool is permanently empty.`,
+- When the pool is empty answer **429** with \`Retry-After\` (seconds) and **do not queue** the request.`,
   sequence: {
     participants: ['Vision API', 'Redis', 'Inference worker'],
     messages: [
@@ -61,7 +59,7 @@ leaks one slot per crashed worker until the pool is permanently empty.`,
       id: 'ttl',
       title: 'Sets the token TTL at first write',
       detail:
-        'The script creates the counter with `SET … EX TOKEN_TTL_S`, so the tokens a crashed worker never released expire back into the pool. The starter never sets an expiry, so one crashed worker removes a slot until Redis restarts.',
+        'The script creates the counter with `SET … EX TOKEN_TTL_S`, so tokens a crashed worker did not release expire back into the pool. The starter sets no expiry, so one crashed worker removes a slot until Redis restarts.',
       match: {
         python: {all: [/TOKEN_TTL_S/, /'EX'/]},
         typescript: {all: [/TOKEN_TTL_S/, /'EX'/]},
@@ -74,7 +72,7 @@ leaks one slot per crashed worker until the pool is permanently empty.`,
       id: 'release',
       title: 'Releases only for the worker holding the ticket',
       detail:
-        'Release runs through a second script that removes the ticket with `HDEL` and increments the counter only when the caller still held it. The starter never releases at all, and an unguarded `INCR` would hand a token to whoever replays a stale lock id.',
+        'Release runs through a second script that removes the ticket with `HDEL` and increments the counter only when the caller still held it. The starter has no release at all, and an unguarded `INCR` would hand a token to whoever replays a stale lock id.',
       match: {
         python: {all: [/RELEASE_LUA/, /HDEL/, /lock_id/]},
         typescript: {all: [/RELEASE_LUA/, /HDEL/, /lockId/]},
@@ -130,9 +128,7 @@ class InferenceRequest(BaseModel):
 
 
 def admit(tenant: str) -> bool:
-    # TODO: this starter reads the counter and decrements it in two round trips, so a burst
-    # over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-    # restarts. Move both into scripts. Fix all of it.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     left = int(r.get(f"gpu:tokens:{tenant}") or GPU_TOKENS_PER_TENANT)
     if left <= 0:
         return False
@@ -242,9 +238,7 @@ const redis = new Redis({host: 'redis', port: 6379});
 const GPU_TOKENS_PER_TENANT = 10;
 
 async function admit(tenant: string): Promise<boolean> {
-  // TODO: this starter reads the counter and decrements it in two round trips, so a burst
-  // over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-  // restarts. Move both into scripts. Fix all of it.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const raw = await redis.get(\`gpu:tokens:\${tenant}\`);
   const left = raw === null ? GPU_TOKENS_PER_TENANT : Number(raw);
   if (left <= 0) return false;
@@ -361,9 +355,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func admit(ctx context.Context, tenant string) bool {
-	// TODO: this starter reads the counter and decrements it in two round trips, so a burst
-	// over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-	// restarts. Move both into scripts. Fix all of it.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	key := "gpu:tokens:" + tenant
 	left, err := rdb.Get(ctx, key).Int()
 	if err == redis.Nil {
@@ -489,9 +481,7 @@ object Admission {
   val GpuTokensPerTenant = 10
   val jedis = new JedisPooled("redis", 6379)
 
-  // TODO: this starter reads the counter and decrements it in two round trips, so a burst
-  // over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-  // restarts. Move both into scripts. Fix all of it.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def admit(tenant: String): Boolean = {
     val key = s"gpu:tokens:$tenant"
     val left = Option(jedis.get(key)).map(_.toLong).getOrElse(GpuTokensPerTenant.toLong)
@@ -631,9 +621,7 @@ sw::redis::Redis redis("tcp://redis:6379");
 
 constexpr int kGpuTokensPerTenant = 10;
 
-// TODO: this starter reads the counter and decrements it in two round trips, so a burst over-admits,
-// and it never releases a token when a worker dies — the pool leaks until Redis restarts. Move both
-// into scripts. Fix all of it.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 bool admit(const std::string& tenant) {
   const auto key = "gpu:tokens:" + tenant;
   const auto raw = redis.get(key);
@@ -754,16 +742,16 @@ int main() {
     },
   },
   hints: [
-    'Every decision the pool makes has to happen on the Redis side, in one script: read the counter, refuse when it is empty, decrement, and record the ticket. Sending `GET` and then `DECR` leaves a window in which a second request sees the same room and both are admitted.',
-    "The TTL is what makes a crash self-healing. Set it with the first write (`SET key capacity EX TOKEN_TTL_S`) rather than in a follow-up `EXPIRE` that a failed request can skip — and never refresh it on release, or a busy tenant's counter would never expire.",
-    'Release is not a bare `INCR`: it must prove the caller still holds the ticket (`HDEL` on the holder hash, increment only when it removed something). Otherwise a retried worker that already lost its ticket to the TTL hands the pool an eleventh token.',
+    'Fire 20 concurrent requests at one tenant: more than 10 are admitted and `gpu:tokens:acme` ends below zero. Kill a worker mid-inference and the counter stays one lower for good.',
+    '`GET` and `DECR` are two round trips, so every request that reads between them sees the same room, and the guard runs client-side so nothing stops the decrement in Redis. No expiry, no release.',
+    'Move admission into `ADMIT_LUA` run by one `eval` (`SET … EX TOKEN_TTL_S` on first write, `return {0, …}` when `left <= 0`, else `DECR` and `HSET`), and add `RELEASE_LUA`: `HDEL` the `lock_id`, then `INCR`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a quota that looks right in a serial test. Two
-defects are being checked and both are invisible to a demo: a check-then-decrement windows (two
-requests read the same free slot), and a token that is never returned when a worker dies. The fix is
-the same shape as every well-built limiter — one atomic server-side decision, an expiry so a crash is
-self-healing, and an owner-checked release so a stale ticket cannot inflate the pool. The interview
-follow-up is usually about the number: 10 tokens per tenant is a fair-share policy, and the real
-systems add a global cap, a queue *inside* the worker for admitted-but-not-started work, and a metric
-on how long a ticket is held, because a pool that is never full is often a pool that is too big.`,
+  debrief: `The limiter has the shape every well-built one has: a single server-side decision, an
+expiry set with the first write so a crash heals itself, and an owner-checked release so a stale
+ticket cannot inflate the pool. The TTL belongs inside the script rather than in a follow-up
+\`EXPIRE\` that a failed request can skip, and release must not refresh it, or a busy tenant's counter
+would live forever. The number is policy: 10 tokens per tenant is fair share, not capacity.
+Production pools put a global cap above the per-tenant one, keep a short queue inside the worker for
+admitted-but-not-started work, and measure how long tickets are held, because a pool that is never
+full is usually a pool that is too big.`,
 };

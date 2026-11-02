@@ -8,16 +8,14 @@ export const eventsStep: Step = {
   focus: ['gateway', 'kafka', 'transcripts', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a turn event and the consumer moves the transcript along, so the demo shows turns arriving. Three contracts are broken. Find them, fix them, and prove the fix.
+**Starting point.** The starter takes a finished turn on \`POST /v1/voice/turns\`, publishes a \`voice.turn\` event, and the consumer stores the turn and commits, so the demo shows turns arriving. It serves the demo and hides five flaws.
 
-\`voice.turn\` is how the gateway reports each finished turn; a consumer groups those events into the stored transcript.
+**Failure mode the checks target.** A user-keyed event scatters one session's turns across partitions and loses order; raw speech in a retained topic is a data leak with a long tail; an unconfigured producer duplicates on retry; a bare counter without timings cannot be placed in time; and commit-before-process trades correctness for code that merely looks exactly-once.
 
-- Publish **one** \`voice.turn\` event per turn with the **session id** as the message key, so one transcript assembles in order. Keyed by the user, two concurrent sessions of that user interleave and the transcript cannot be reconstructed.
-- The payload carries ids only: \`session_id\`, \`tenant\`, \`turn_index\`, \`started_at\`, \`ended_at\` (the timings) and \`transcript_ref\` — a reference to the stored, redacted transcript. **Never** the raw speech (\`transcript_text\`) and **never** audio (\`audio_bytes\`): the topic is retained for days and replicated, so content written there outlives every retention policy the call has.
+- Publish **one** \`voice.turn\` event per turn with the **session id** as the message key, so one transcript assembles in order.
+- The payload carries ids only: \`session_id\`, \`tenant\`, \`turn_index\`, \`started_at\`, \`ended_at\` (the timings) and \`transcript_ref\`, a reference to the stored, redacted transcript. No raw speech (\`transcript_text\`) and no audio (\`audio_bytes\`): the topic is retained for days and replicated, so content written there outlives every retention policy the call has.
 - The producer is **idempotent with \`acks=all\`**, so a retried produce cannot duplicate a record.
-- The consumer writes the transcript row (\`insert_turn\`) and **only then** commits the offset. Commit first and one crash loses the turn forever, because the offset already moved past the unprocessed record.
-
-**Failure mode the checks target.** A user-keyed event scatters one session's turns across partitions and loses order; the retained raw speech is a data leak with a long tail; an unconfigured producer duplicates on retry; and commit-before-process trades correctness for code that merely looks exactly-once.`,
+- The consumer writes the transcript row (\`insert_turn\`) and **only then** commits the offset.`,
   sequence: {
     participants: ['Voice Gateway', 'voice.turn', 'Transcript consumer', 'Transcript store'],
     messages: [
@@ -35,16 +33,15 @@ export const eventsStep: Step = {
     ],
   },
   hints: [
-    'The message key is the partition key: `key=session_id`, `key: session_id`, `Key: []byte(sessionId)`, `ProducerRecord("voice.turn", sessionId, …)`. Keyed by the user id, two concurrent calls from one user interleave and the transcript loses order.',
-    'Idempotence is producer configuration plus a stable key: `enable.idempotence=true` with `acks=all`, KafkaJS `idempotent: true` with `acks: -1`, `RequiredAcks: kafka.RequireAll` with a hash balancer. It needs the same message key on every retry.',
-    '`insert_turn` first, `commit` second — a crash between them then replays the record instead of losing it. The event carries `transcript_ref`, never the text.',
+    'Support pulls a transcript and the turns of two calls from the same user are shuffled together; a compliance scan then finds verbatim speech and audio blobs sitting in the topic a week later.',
+    'The producer keys on the user id, so concurrent sessions share partitions; the event body copies `transcript_text` and `audio_bytes`; the producer has default acks; the consumer commits before `insert_turn`.',
+    'Key by `session_id`, send `turn_index`, `started_at`, `ended_at` and `transcript_ref` only, enable idempotence with `acks=all` (KafkaJS `idempotent: true`, `acks: -1`), and call `insert_turn` before the commit.',
   ],
   checks: [
     {
       id: 'session-key',
       title: 'Keyed by session id so a transcript assembles in order',
-      detail:
-        'The message key is the session id. The starter keys by user id, so two concurrent sessions of one user interleave and neither transcript can be reconstructed.',
+      detail: "The message key is the session id, so one call's turns land on one partition and assemble in order.",
       match: {
         python: {all: [/key=session_id/]},
         typescript: {all: [/key:\s*sessionId\b/]},
@@ -56,8 +53,7 @@ export const eventsStep: Step = {
     {
       id: 'no-raw-speech',
       title: 'References the redacted transcript, never raw speech',
-      detail:
-        'The event carries `transcript_ref` and no `transcript_text` or `audio_bytes` anywhere in the file. The starter copies the raw text and the audio blob into a retained, replicated topic.',
+      detail: 'The event carries `transcript_ref` and no `transcript_text` or `audio_bytes` anywhere in the file.',
       match: {
         python: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
         typescript: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
@@ -70,7 +66,7 @@ export const eventsStep: Step = {
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` + `acks`, KafkaJS `idempotent: true` + `acks: -1`, `RequiredAcks: kafka.RequireAll` with a hash balancer. A retry of a produce must not duplicate the record.',
+        'The producer is configured for idempotence and `acks=all`: `enable.idempotence` + `acks`, KafkaJS `idempotent: true` + `acks: -1`, `RequiredAcks: kafka.RequireAll` with a hash balancer.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -83,7 +79,7 @@ export const eventsStep: Step = {
       id: 'persist-before-commit',
       title: 'Persists the transcript before committing the offset',
       detail:
-        'The consumer runs `insert_turn` before committing the offset; committing first makes a crash lose the turn forever. The starter commits first.',
+        'The consumer runs `insert_turn` before committing the offset; committing first makes a crash lose the turn.',
       match: {
         python: {order: [/insert_turn\(/, /consumer\.commit\(/]},
         typescript: {order: [/insert_turn\(/, /commitOffsets\(/]},
@@ -96,7 +92,7 @@ export const eventsStep: Step = {
       id: 'turn-payload',
       title: 'Carries the turn index, timings and the transcript ref',
       detail:
-        'The event carries `turn_index`, the timings (`started_at`, `ended_at`) and `transcript_ref`. The starter publishes a bare counter and the raw text, so a consumer cannot place the turn in time.',
+        'The event carries `turn_index`, the timings (`started_at`, `ended_at`) and `transcript_ref`, so a consumer can place the turn in time.',
       match: {
         python: {all: [/turn_index/, /transcript_ref/]},
         typescript: {all: [/turn_index/, /transcript_ref/]},
@@ -133,9 +129,7 @@ class TurnRequest(BaseModel):
 
 @app.post("/v1/voice/turns")
 def post_turn(body: TurnRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: key the event by session_id instead of the user id, send a transcript_ref instead of the
-    # raw transcript_text and the audio_bytes, configure the producer with enable.idempotence and
-    # acks=all, carry turn_index and the timings, and insert the turn before committing the offset.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     logger.info("turn session=%s user=%s text=%r", body.session_id, body.user_id, body.transcript_text)
     event = {
         "session_id": body.session_id,
@@ -265,9 +259,7 @@ interface TurnBody {
 }
 
 app.post('/v1/voice/turns', async (request, reply) => {
-  // TODO: key the event by session id instead of the user id, send a transcript_ref instead of the
-  // raw transcript_text and audio_bytes, produce idempotently with acks: -1, carry turn_index and
-  // the timings, and insert the transcript row before committing the offset.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as TurnBody;
   request.log.info({session_id: body.session_id, text: body.transcript_text}, 'turn finished');
@@ -409,10 +401,7 @@ func postTurn(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "bad request", http.StatusBadRequest)
 		return
 	}
-	// TODO: key the event by session_id instead of the user id, send a transcript_ref instead of
-	// the raw transcript_text and audio_bytes, set RequiredAcks: kafka.RequireAll with a hash
-	// balancer, carry turn_index and the timings, and insert the turn before the offset is
-	// committed.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	log.Printf("turn session=%s user=%s text=%q", body.SessionID, body.UserID, body.TranscriptText)
 	event := map[string]any{
 		"session_id":  body.SessionID,
@@ -565,9 +554,7 @@ object VoiceEvents {
   props.put("bootstrap.servers", "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: key the event by sessionId instead of the userId, send a transcript_ref instead of the
-  // raw transcript_text and the audio_bytes, configure enable.idempotence with "acks" -> "all",
-  // carry turn_index and the timings, and insert the turn before committing the offset.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publish(
       tenant: String,
       sessionId: String,
@@ -713,9 +700,7 @@ struct TranscriptStore {
 
 TranscriptStore store;
 
-// TODO: key the event by sessionId instead of the userId, send a transcript_ref instead of the raw
-// transcript_text and the audio_bytes, set enable.idempotence with acks=all, carry turn_index and
-// the timings, and insert the turn before the offset is committed.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void post_turn(const std::string& tenant, const std::string& sessionId, const std::string& userId, int turn, const std::string& startedAt, const std::string& endedAt, const std::string& transcriptText, const std::string& audioBytes) {
   std::cerr << "turn session=" << sessionId << " user=" << userId << " text=" << transcriptText << "\\n";
   const json event = {{"session_id", sessionId}, {"tenant", tenant}, {"turn", turn}, {"started_at", startedAt}, {"ended_at", endedAt}, {"transcript_text", transcriptText}, {"audio_bytes", audioBytes}};
@@ -797,5 +782,5 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you can debug a Kafka path against the two contracts a topic never renegotiates. The partition key is the unit of ordering: Kafka only orders records within a partition, so keying every turn by the session id keeps one call's turns on one partition and lets the consumer assemble them in \`turn_index\` order, while keying by the user interleaves two concurrent calls and makes either transcript impossible to reconstruct. Retention is the second contract: a retained, replicated topic keeps whatever you write into it long after the request, the tenant and the policy that produced it are gone, so the event carries the ids, the timings and a \`transcript_ref\` into storage that redacts and expires on its own schedule — never the raw speech, never the audio. The third is the consumer's transactional boundary: \`insert_turn\` before the offset commit, with an idempotent producer configured \`acks=all\` on the other side, turns a crash into a replay instead of a lost turn. Real platforms add a schema registry that refuses any field outside the allowlist, per-session partition quotas, and a dead-letter topic for records the transcript store cannot apply.`,
+  debrief: `The fix follows the two contracts a topic does not renegotiate. The partition key is the unit of ordering: Kafka orders records only within a partition, so keying every turn by the session id keeps one call's turns together and lets the consumer assemble them in \`turn_index\` order, while a user key interleaves two concurrent calls. Retention is the second: a replicated topic keeps whatever you write into it long after the request, the tenant and the policy that produced it are gone, so the event carries ids, timings and a \`transcript_ref\` into storage that redacts and expires on its own schedule. \`insert_turn\` before the commit, with an idempotent \`acks=all\` producer on the other side, turns a crash into a replay instead of a lost turn. Production pipelines also enforce the payload shape with a schema registry and route rows the transcript store cannot apply to a dead-letter topic.`,
 };

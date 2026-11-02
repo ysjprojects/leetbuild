@@ -56,85 +56,53 @@ export const catalogEnrichmentProblem: Problem = {
   statement: `# Catalog Enrichment
 
 A grocery merchant onboards with forty thousand SKUs. Half of the titles look like
-"DOVE SLK GLW BW 500ML", a third have no brand field, and the organic ones are organic only if you
-read the packaging. Shoppers will search for "organic oat milk 1 l" tomorrow. The enrichment
-service is what turns that feed into attributes a search index, a ranker and a substitution model
-can use — and it is the service where a model that confidently invents a brand does real damage.
+"DOVE SLK GLW BW 500ML" and a third have no brand field. Shoppers will search for "organic oat
+milk 1 l" tomorrow. The enrichment service turns that feed into attributes a search index, a ranker
+and a substitution model can use, and it is where a model that invents a brand does real damage.
 
 ## The real system
 
-DoorDash's **retail catalog** is a centralised dataset for every product sold by its non-restaurant
-merchants: each SKU is a list of attributes — brand, size, unit of measure, dietary tags, category.
-Raw merchant data arrives in every format and quality, so the catalog team standardises and enriches
-it. Historically that was manual work by contract operators, slow and expensive enough that a second
-person had to audit the first. The replacement is a pipeline of LLM-powered extractors: a brand
-pipeline that passes SKUs the in-house classifier cannot tag confidently to a model and then checks
-the extracted brand against similar brands retrieved from the knowledge graph; an organic tagger
-that goes from exact string matching to model reasoning over titles and packaging text; and a
-generalised attribute extractor bootstrapped from a small set of human "golden" annotations,
-expanded with retrieval-augmented model annotations and fine-tuned from both. The attributes feed
-personalised ranking, search retrieval and substitutions — so a wrong attribute surfaces as a wrong
-item in a cart.
+DoorDash's **retail catalog** holds every product sold by its non-restaurant merchants as a list of
+attributes: brand, size, unit of measure, dietary tags, category. Contract operators used to enrich
+it by hand; now LLM extractors do. The brand pipeline sends SKUs the in-house classifier cannot tag
+confidently to a model, then checks the extracted brand against similar brands retrieved from the
+knowledge graph before admitting it; the generalised extractor starts from human "golden"
+annotations and is fine-tuned on model annotations. The attributes feed ranking, search and
+substitutions, so a wrong attribute is a wrong item in a cart.
 
 ## From the source
 
-*Building DoorDash's product knowledge graph with large language models* describes the catalog,
-the attribute-extraction problem as token classification ("Dove Silk Glow Body Wash 500 ml" →
-brand, size, unit), and the cold-start problem that LLMs solved. It gives this course its three
-mechanisms: **retrieval before the model** (the brand pipeline retrieves similar brands and example
-item names from the knowledge graph, and the generalised extractor retrieves the nearest golden
-annotations by embedding similarity because relevant examples reduce hallucination), **confidence
-as a routing signal** (only SKUs the classifier cannot tag confidently go to the model, and new
-brands enter the taxonomy through a duplicate check rather than directly), and **labels as the
-product** (model annotations that would have taken months to collect by hand were generated in a
-week and used to fine-tune the next model). *How DoorDash leverages LLMs for better search
-retrieval* adds the shape of the model call: ask for structured output mapped onto taxonomy
-categories, hand the model a curated candidate list retrieved by approximate nearest neighbour
-(100 taxonomy concepts per query in that post) so it can only choose concepts that exist, post-process
-anything outside the controlled vocabulary, and audit every batch by hand. *Unleashing the power of
-large language models at DoorDash* confirms the golden → silver → fine-tune loop. The numbers in
-this course that are not in the posts — 20 candidate brands per SKU, the 0.85 confidence threshold,
-the 5-second deadline, the 50 000-per-merchant daily budget, the 15-minute review lease — are
-operating choices made here, in the spirit of the posts.
+The knowledge-graph post gives this course its three mechanisms: **retrieval before the model**,
+**confidence as a routing signal** and **labels as the product**. The search post adds the shape
+of the call: structured output against a curated candidate list. The numbers here (20 candidate
+brands, the 0.85 threshold, the 5-second deadline, the daily budget, the 15-minute lease) are
+operating choices made for this course.
 
 ## What you build here
 
 One service, **catalogd**, with five pieces:
 
-1. A **Kafka** intake: consume \`sku.upserted\` (key = merchant) in group \`catalog-enrichment\`,
-   validate each record (title ≤ 4 KiB, description ≤ 16 KiB, at most 8 image refs, malformed
-   records to \`sku.upserted.dlq\`), skip SKUs whose content hash has not changed, enqueue an
-   extraction job on \`sku.extract\` keyed by merchant, and commit the offset only after the enqueue.
-2. A **gRPC** extraction call: retrieve the 20 nearest brand names from the taxonomy *before* the
-   model, ask \`Extractor.Extract\` for structured output against a schema under a 5-second
-   deadline with one retry on \`UNAVAILABLE\`, validate brand, unit and category against the
-   taxonomy, and send anything unresolved or below confidence 0.85 to the review queue.
-3. A **Redis** layer: an extraction cache keyed by \`extract:{taxonomy_version}:{content_hash}\`
-   with a 7-day TTL, a per-merchant daily budget of 50 000 extractions reserved by one atomic Lua
-   \`EVAL\` before the model call, and review-claim leases taken with \`SET NX EX 900\`.
-4. \`POST /v1/skus/{sku_id}/review\`: a reviewer accepts or corrects the proposed attributes;
-   **403** unless the caller holds a reviewer role, **409** unless the caller holds the SKU's lease,
-   \`Idempotency-Key\` required, and every decision stored as a versioned labelled example for the
-   next model.
-5. A **Kafka** publish path: one \`sku.enriched\` event per attribute version (source \`model\` or
-   \`human\`) through an idempotent producer with \`acks=all\` and an outbox on failure; a consumer
-   in group \`catalog-index\` that updates the catalog and the search index before it commits, and
-   never lets a model result overwrite a human correction.
+1. A **Kafka** intake: consume \`sku.upserted\` in group \`catalog-enrichment\`, validate,
+   dead-letter, skip unchanged content hashes, enqueue on \`sku.extract\` keyed by merchant, commit
+   after the enqueue.
+2. A **gRPC** extraction call: 20 candidate brands before the model, a schema, a 5-second deadline
+   with one retry on \`UNAVAILABLE\`, validation against the taxonomy, review below confidence 0.85.
+3. A **Redis** layer: a cache keyed by taxonomy version and content hash, an atomic daily budget per
+   merchant, review leases with \`SET NX EX 900\`.
+4. \`POST /v1/skus/{sku_id}/review\`: role, lease and \`Idempotency-Key\` enforced, every decision
+   stored as a versioned label.
+5. A **Kafka** publish path: \`sku.enriched\` through an idempotent producer with an outbox, applied
+   to the catalog and the search index before the commit, human attributes kept over model ones.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real AI feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. In each step you debug it against the failure
+modes, fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-The embedding model and the ANN index behind the taxonomy, the fine-tuning job that consumes the
-labels, image OCR and multimodal extraction, entity resolution across merchants, the duplicate-brand
-check that admits new brands to the taxonomy, and the ranking and substitution models downstream.
-The five pieces above are the ones that decide whether a model-enriched catalog can be trusted by
-the systems that read it.`,
+The embedding model and ANN index behind the taxonomy, the fine-tuning job, image OCR, entity
+resolution across merchants, the duplicate-brand check, and the ranking and substitution models.`,
   diagram: {
     nodes: [
       {id: 'feed', kind: 'client', label: 'Merchant feed', sub: 'SKU upserts', x: 6, y: 30},

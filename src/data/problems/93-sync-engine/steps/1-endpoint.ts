@@ -8,33 +8,29 @@ export const pushEndpointStep: Step = {
   focus: ['device', 'sync', 'revisions'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the push route,
-parses the body and returns an applied count. It compiles, it syncs the demo laptop, and it hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter registers \`POST /v1/sync/push\` with body
+\`{"device_id": "…", "base_revision": 412, "changes": [{"doc_id": "…", "content_hash": "…", "body": "…"}]}\`,
+reads the device from \`X-Device-Id\`, hands every change to \`store.apply_all\` and returns the
+applied count with the new revision. It compiles, it syncs the demo laptop, and it hides four flaws.
 
-Implement \`POST /v1/sync/push\` with body
-\`{"device_id": "…", "base_revision": 412, "changes": [{"doc_id": "…", "content_hash": "…", "body": "…"}]}\`.
+**Failure mode the checks target.** A laptop that was offline for a month pushes against a base the
+server never issued, and the starter applies its changes over newer edits from another device with
+nobody told. One push with a million changes holds a worker for minutes. A truncated or corrupted
+change reaches storage as if it were the device's edit.
+
+Requirements:
 
 - The device is authenticated by the \`X-Device-Id\` header; a missing device is **401**.
 - \`changes\` is a non-empty list of at most **500** entries (\`MAX_CHANGES\`); a longer list is
   **413** before a single change is applied.
-- Every change names its document (\`doc_id\`) and its content hash, and the hash must be 64
-  lowercase hex characters — a malformed hash is **400**, and it is rejected in the validation pass,
-  before any apply runs.
-- \`base_revision\` must be a revision the server actually issued (\`store.issued(base_revision)\`).
-  When it is not — the laptop that was offline for a month — the push is stale: answer **409** with
-  the per-document \`conflicts\` list and apply nothing, because the device's edits are real but its
-  base is not the head it thinks it is. A stale base must never overwrite a newer document.
+- Every change names its document (\`doc_id\`) and its content hash; the hash must be 64 lowercase
+  hex characters, and a malformed hash is **400** in the validation pass, before any apply runs.
+- \`base_revision\` must be a revision the server issued (\`store.issued(base_revision)\`). When it is
+  not, the push is stale: answer **409** with the per-document \`conflicts\` list and apply nothing. A
+  stale base must not overwrite a newer document.
 - When the base is current, apply the batch (\`store.apply_batch\`), record the revision
   (\`store.record_revision\`) and answer with \`applied\`, the \`conflicts\` the apply produced, and the
-  newly issued \`revision\`.
-
-**Failure mode the checks target.** The starter applies every change blindly, so a device that was
-offline overwrites a month of edits from another device and nobody is told. It accepts a change list
-of unbounded size, so one push can hold a worker for minutes while it applies a million documents.
-And it never looks at a content hash, so a truncated or corrupted change reaches storage as if it
-were the device's edit.`,
+  newly issued \`revision\`.`,
   sequence: {
     participants: ['Device', 'Sync Engine', 'revisions'],
     messages: [
@@ -156,8 +152,7 @@ store = RevisionStore()
 
 @app.post("/v1/sync/push")
 def push(body: PushRequest, device: str = Header(alias="X-Device-Id")) -> JSONResponse:
-    # TODO: this starter ignores base_revision and applies every change blindly, accepts a change
-    # list of unbounded size, and never validates a change's content hash. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     outcome = store.apply_all(device, [change.model_dump() for change in body.changes])
     return JSONResponse({"applied": outcome["applied"], "revision": outcome["revision"]}, status_code=200)
 `,
@@ -256,8 +251,7 @@ interface PushBody {
 }
 
 app.post('/v1/sync/push', async (request, reply) => {
-  // TODO: this starter ignores base_revision and applies every change blindly, accepts a change
-  // list of unbounded size, and never validates a change's content hash. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const device = request.headers['x-device-id'] as string;
   const body = request.body as PushBody;
   const outcome = await store.applyAll(device, body.changes);
@@ -362,8 +356,7 @@ func push(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter ignores base_revision and applies every change blindly, accepts a change
-	// list of unbounded size, and never validates a change's content hash. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	outcome, _ := store.ApplyAll(r.Context(), device, body.Changes)
 	log.Printf("push device=%s changes=%d", device, len(body.Changes))
 	writeJSON(rw, http.StatusOK, map[string]any{"applied": outcome["applied"], "revision": outcome["revision"]})
@@ -511,8 +504,7 @@ object SyncApi {
       post {
         headerValueByName("X-Device-Id") { device =>
           entity(as[PushRequest]) { body =>
-            // TODO: this starter ignores base_revision and applies every change blindly, accepts a
-            // change list of unbounded size, and never validates a change's content hash.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val outcome = store.applyAll(device, body.changes)
             system.log.info(s"push device=$device changes=\${body.changes.size}")
             complete(StatusCodes.OK, s"""{"applied":\${outcome.applied},"revision":\${outcome.revision}}""")
@@ -616,8 +608,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter ignores base_revision and applies every change blindly, accepts a change
-    // list of unbounded size, and never validates a change's content hash. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto outcome = store.applyAll(device, body.value("changes", json::array()));
     std::cerr << "push device=" << device << " changes=" << body.value("changes", json::array()).size() << "\\n";
     res.status = 200;
@@ -710,9 +701,11 @@ int main() {
     },
   },
   hints: [
-    'Validate in cost order and return early: device, empty list, cap, hash shape. Every one of those is a cheap rejection that runs before `apply_batch`, so a malformed or oversized push never touches a document.',
-    'The base revision is the whole point of the endpoint. `store.issued(base_revision)` answers whether the server really handed that revision to a device; when it did not, the device has been away and its base is behind the head. The answer is 409, not a warning in the log line — the client has to see which documents conflicted so it can fetch and merge them.',
-    "The conflict list is per document, built from the changes in this push: `[change.doc_id for change in body.changes]`. An empty `applied` list and a populated `conflicts` list is the honest answer for a stale base — the device's work is kept, nothing is overwritten, and the client knows exactly what to re-merge.",
+    'A laptop that was offline for a month pushes, gets a cheerful 200, and a colleague opens the document to find a month of their edits gone. Nobody saw a conflict.',
+    'The handler never reads `base_revision`; `store.apply_all` writes whatever arrives on top of head. Nothing in the path asks whether the base is a revision the server issued, how long the list is, or what the hash looks like.',
+    'Validate first (device 401, empty list, `MAX_CHANGES` 413, `HASH_RE` 400), then `store.issued(base_revision)`; when false, answer 409 with `conflicts = [c.doc_id ...]`. Otherwise `apply_batch` and `record_revision`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a sync protocol. The starter passes the demo because it pushes from one device with a fresh base and never sends a large batch. Three defects are being checked. The base revision: applying a change without proving the base is a revision the server issued is how a returning laptop destroys a month of another device's edits — the fix is not to reject the device, but to surface per-document conflicts. The cap: a change list is attacker-controlled and unbounded, so the limit belongs in validation, before any write. The hash: the content hash is the device's claim about what it is uploading, and a malformed one means the change is not what the client thinks it is, so it is 400 in the same validation pass. Real sync layers add a snapshot path for devices whose base is so far behind that conflict-per-document is useless, a per-device rate limit, and a server-side revision per document rather than per batch.`,
+  debrief: `The fix has the shape of a funnel: cheap rejections first, in cost order, so an oversized list or a malformed hash is refused before any document is read, and the one expensive question (is this base a revision the server issued?) comes last. A stale base is answered with per-document conflicts rather than a refusal, because the device's edits are real and the client needs the list to know what to fetch and merge. The starter passed the demo because one device with a fresh base cannot produce a conflict.
+
+Production push endpoints go further: they check the base per document rather than per batch, so one stale document does not block the rest, dedupe by an idempotency key so a retried push does not double-apply, and verify the content hash against the body instead of only its shape.`,
 };

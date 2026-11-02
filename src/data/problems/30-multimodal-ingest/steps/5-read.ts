@@ -8,31 +8,25 @@ export const readStep: Step = {
   focus: ['client', 'ingest', 'objects', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks the asset up, returns it
-and the demo gallery renders. It hides a missing tenant check, a permanent URL and an API that proxies
-the original bytes. Find them, fix them, and prove the fix.
-
-Implement \`GET /v1/assets/{id}\` — the read side of ingest.
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when missing), and the asset
-  must belong to it: a foreign or unknown asset id is **404**, exactly like an id that does not exist.
-  Never 403 — a 403 confirms that the id is real.
-- The response carries the asset metadata: \`asset_id\`, \`mime\`, \`checksum\`, the \`caption\` and its
-  \`caption_offsets\`, and \`degraded\` when the caption never arrived.
-- The response also carries a **signed URL** to the object store and its \`expires_at\`. The signature
-  covers \`checksum | tenant | expires_at\`, so a URL handed to the wrong tenant or used after its
-  expiry is rejected by the store.
-- The signed URL expires in **15 minutes** (\`900\` seconds). A permanent URL is a read credential for
-  the lifetime of the object; nothing in the API may hand one out.
-- The API **never proxies the bytes**: when a signed URL will do, streaming the object through the
-  service turns one read into two network hops, blocks a worker, and loses the tenant scope the
-  signature carried.
+**Starting point.** The starter serves \`GET /v1/assets/{id}\`: it looks the asset up by id alone with
+\`store.get_by_id\` and streams the object through the API with a \`FileResponse\`. It serves the
+demo gallery and hides four flaws.
 
 **Failure mode the checks target.** The missing tenant check is an IDOR: any authenticated caller who
-learns an asset id reads another tenant's image and caption. The permanent URL is the same problem with
-a longer tail — it leaks through logs, screenshots and error reports and never stops working. The proxy
-is the quiet one: it looks like a convenience, and it removes the only place where access is actually
-enforced.`,
+learns an asset id reads another tenant's image and caption. The permanent address leaks through
+logs and screenshots and keeps working. The proxy looks like a convenience and removes the only
+place where access is enforced. A signature over the path alone expires nothing and scopes nothing.
+
+- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when missing) and the asset
+  must belong to it: a foreign or unknown asset id is **404**, like an id that does not exist. Not
+  403, which confirms that the id is real.
+- The response carries \`asset_id\`, \`mime\`, \`checksum\`, the \`caption\` and its
+  \`caption_offsets\`, and \`degraded\` when the caption did not arrive.
+- It also carries a **signed URL** and its \`expires_at\`. The signature is an HMAC over
+  \`checksum | tenant | expires_at\`, so a URL handed to the wrong tenant or used after its expiry
+  is rejected by the store.
+- The signed URL expires in **15 minutes** (\`SIGNED_URL_TTL_S = 900\`).
+- The API does **not proxy the bytes**: the client fetches from object storage with the signed URL.`,
   sequence: {
     participants: ['Client', 'Ingest API', 'assets DB', 'Object store'],
     messages: [
@@ -45,9 +39,9 @@ enforced.`,
     ],
   },
   hints: [
-    'Look the asset up under the authenticated tenant — `store.get(tenant, asset_id)` — and map "not mine" and "does not exist" to the same 404. A separate 403 tells an attacker which ids are real.',
-    'Sign the tuple the store will re-derive: `checksum | tenant | expires_at`. If the tenant is not in the message, a URL minted for one tenant works for another; if the expiry is not, it never stops working.',
-    'Fifteen minutes is the whole point of the signed URL: short enough that a leaked link is stale before it is useful, long enough for a browser to load the image. Return it in the body and let the client fetch the bytes directly — never relay them through the API.',
+    "Support pastes an asset id from one customer's ticket into another customer's session and the image loads; the URL in the ticket still works a month later.",
+    "The starter's `store.get_by_id(asset_id)` has no tenant in the lookup, and `FileResponse` streams whatever it finds; no clock and no tenant are bound to the access it grants.",
+    'Read `X-Tenant-Id`, `store.get(tenant, asset_id)` or 404; set `expires_at = now + SIGNED_URL_TTL_S`, `signature = hmac.new(key, checksum|tenant|expires_at)`; return `signed_url` in the body, no `FileResponse`.',
   ],
   checks: [
     {
@@ -127,8 +121,7 @@ app = FastAPI()
 
 @app.get("/v1/assets/{asset_id}")
 def read_asset(asset_id: str) -> FileResponse:
-    # TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
-    # original bytes through the API instead of a signed URL that expires.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     asset = store.get_by_id(asset_id)
     return FileResponse("/objects/" + asset["object_key"])
 `,
@@ -194,8 +187,7 @@ import {store} from './asset_store';
 export const app = Fastify();
 
 app.get('/v1/assets/:assetId', async (request, reply) => {
-  // TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
-  // original bytes through the API instead of a signed URL that expires.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {assetId} = request.params as {assetId: string};
   const asset = await store.getById(assetId);
   return reply.code(200).header('Content-Type', asset.mime).send(createReadStream(asset.object_path));
@@ -253,8 +245,7 @@ import (
 )
 
 func readAsset(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
-	// original bytes through the API instead of a signed URL that expires.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	asset, err := store.GetByID(r.Context(), r.PathValue("assetID"))
 	if err != nil || asset == nil {
 		rw.WriteHeader(http.StatusInternalServerError)
@@ -364,8 +355,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "assets" / Segment) { assetId =>
       get {
-        // TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams
-        // the original bytes through the API instead of a signed URL that expires.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         getFromFile(s"/objects/$assetId.png")
       }
     }
@@ -439,8 +429,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/assets/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
-    // original bytes through the API instead of a signed URL that expires.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string assetId = req.matches[1];
     res.status = 200;
     res.set_header("Location", "https://objects.internal/" + assetId + ".png");
@@ -511,16 +500,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you know where access is enforced. The starter enforces it nowhere: any
-authenticated caller with an id reads any tenant's asset, and because the response is a permanent URL,
-the leak outlives the request. Both bugs are the same bug — the read path treats possession of an id as
-authorization — and the fix is to scope the lookup by tenant and to mint a credential that is bound to
-the tenant and to a clock.
-
-Proxying the bytes is the third bug and the one that is easiest to defend by accident ("the client
-should not need to know the bucket"). What the proxy actually does is move the authorization decision
-into a service that has no reason to make it, double the egress, and take a worker out of the pool for
-the duration of a slow download. Real systems sign with a per-tenant key, shorten the TTL for
-thumbnails and lengthen it for large downloads, log every signature with the tenant so a leak has an
-owner, and rotate the signing key on a schedule that the object store accepts both of.`,
+  debrief: `The starter treats possession of an id as authorization, and the fix has two halves because the
+leak has two: scope the lookup by tenant so the API itself refuses, and mint a credential bound to
+the tenant and to a clock so the object store refuses too. Signing \`checksum | tenant | expires_at\`
+together makes both bindings hold; drop either field and the URL moves between tenants or outlives
+its purpose. Proxying the bytes is the easiest flaw to defend ("the client should not need to know
+the bucket"), and what it does is move the access decision into a service with no reason to make
+it and park a worker for a slow download. Production read paths sign with a per-tenant key and log
+every signature with its tenant, so a leaked URL has an owner.`,
 };

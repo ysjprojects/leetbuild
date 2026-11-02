@@ -8,43 +8,19 @@ export const stateStep: Step = {
   focus: ['purge', 'redis', 'tenant'],
   task: `## Task
 
-**Starting point.** The starter dedupes with \`EXISTS\` and marks paths afterwards, keeps the
-budget counter under a key that never expires, and answers a bare \`429\`. It works in a demo
-where requests arrive one at a time. Debug it like the engineer who owns the Redis keyspace, fix
-it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/purges\` and runs \`reserve(tenant, domain, paths)\` before the provider call: it dedupes with a client-side \`EXISTS\`, marks paths afterwards with a \`SET\` that has no TTL, charges \`purge:budget:{domain}\` with a client-side \`INCRBY\`, and answers a bare \`429\`. It works when requests arrive one at a time, and it hides five flaws.
 
-Every purge goes through \`reserve(tenant, domain, paths)\`, which runs **one** Lua script
-(\`RESERVE_LUA\`) with \`EVAL\`:
+**Failure mode the checks target.** A double-submitted deploy purges twice, because the check and the write are separate commands. The dedupe keys and the budget key are immortal, so a path purged once can not be purged again and after 1000 paths every purge for the domain is refused. The bare \`429\` tells the client to retry now.
 
-- **Per-path dedupe.** For each path, the key \`purge:seen:{tenant}:{domain}:{path}\` is set with
-  \`SET … NX EX DEDUPE_TTL_S\`, where \`DEDUPE_TTL_S\` is **600** (a ten-minute window). A path whose
-  key already exists is a duplicate: it is reported back and is **not** purged again.
-- **Per-domain budget.** \`purge:budget:{domain}:{window}\` counts the paths charged in this
-  window, where \`window = now // WINDOW_S\` and \`WINDOW_S\` is **300**. The counter is incremented
-  by the number of **new** paths inside the same script, and gets \`EXPIRE WINDOW_S\` on first write
-  so it is born with the window and dies with it. \`BUDGET_MAX\` is **1000** paths per window.
-- **One script, one atomic step.** A read-then-write pair from the application (\`EXISTS\`/number,
-  then \`SET\`, then a client-side \`INCRBY\`) has a window between the halves: two purges from the
-  same double-submitted deploy both see the path as new and both charge the budget. The write has
-  to be inside the script, next to the check.
-- **The reply is positional**: allowed, remaining, TTL, how many paths are new, the new paths, then
-  the duplicates.
+\`reserve\` must run **one** Lua script (\`RESERVE_LUA\`) through \`EVAL\`:
 
-The handler reserves **before** it calls the provider:
+- **Per-path dedupe.** \`purge:seen:{tenant}:{domain}:{path}\` is set with \`SET … NX EX DEDUPE_TTL_S\` (**600**). A path whose key exists is a duplicate: reported back, not purged again.
+- **Per-domain budget.** \`purge:budget:{domain}:{window}\` (\`budget_key\`, \`window = now // WINDOW_S\`, \`WINDOW_S\` = **300**) is incremented by the number of **new** paths inside the script and gets \`EXPIRE WINDOW_S\` on first write; \`BUDGET_MAX\` is **1000**.
+- **The reply is positional**: allowed, remaining, TTL, new count, new paths, duplicates.
 
-- Budget exhausted → **429** with \`Retry-After\` (the remaining TTL of the window key, at least 1)
-  and \`X-Purge-Budget-Remaining: 0\`, and the provider is never called.
-- Otherwise the provider receives only the **new** paths, so a duplicate purge submits an empty
-  batch instead of hammering the CDN again.
+The handler reserves **before** the provider call: budget exhausted is **429** with \`Retry-After\` (the window key's remaining TTL, at least 1) and \`X-Purge-Budget-Remaining: 0\`; otherwise the provider receives only the **new** paths.
 
-:::widget token-bucket {"rate": 3, "burst": 1000}
-
-**Failure mode the checks target.** The starter checks dedupe with a client-side \`EXISTS\`, then
-writes later — a double-submitted deploy purges twice and burns budget for work it did not need.
-Its budget key is \`purge:budget:{domain}\` with no window bucket and no TTL, so the counter only
-ever grows: after 1000 paths in the domain's lifetime, every purge is rejected forever, and no
-operator sees why. And the bare \`429\` leaves the client to retry immediately, which is how a
-budget rejects a deploy into a retry storm.`,
+:::widget token-bucket {"rate": 3, "burst": 1000}`,
   sequence: {
     participants: ['Purge API', 'Redis', 'CDN provider'],
     messages: [
@@ -182,11 +158,7 @@ def dedupe_key(tenant: str, domain: str, path: str) -> str:
 
 
 def reserve(tenant: str, domain: str, paths: list[str]) -> dict:
-    # TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
-    # double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-    # counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
-    # that checks and writes together, a bucketed budget key that expires with its window, and a
-    # 429 that tells the client when to come back.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     seen = [path for path in paths if r.exists(dedupe_key(tenant, domain, path))]
     fresh = [path for path in paths if path not in seen]
     for path in fresh:
@@ -352,11 +324,7 @@ function dedupeKey(tenant: string, domain: string, path: string): string {
 }
 
 app.post('/v1/purges', async (request, reply) => {
-  // TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
-  // double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-  // counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
-  // that checks and writes together, a bucketed budget key that expires with its window, and a
-  // 429 that tells the client when to come back.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as PurgeBody;
   const seen: string[] = [];
@@ -541,11 +509,7 @@ type Reservation struct {
 }
 
 func reserve(ctx context.Context, tenant, domain string, paths []string) (*Reservation, error) {
-	// TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
-	// double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-	// counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
-	// that checks and writes together, a bucketed budget key that expires with its window, and a
-	// 429 that tells the client when to come back.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	reservation := &Reservation{}
 	for _, path := range paths {
 		exists, err := rdb.Exists(ctx, dedupeKey(tenant, domain, path)).Result()
@@ -818,11 +782,7 @@ object PurgeState {
   def dedupeKey(tenant: String, domain: String, path: String): String =
     s"purge:seen:$tenant:$domain:$path"
 
-  // TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
-  // double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-  // counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
-  // that checks and writes together, a bucketed budget key that expires with its window, and a
-  // 429 that tells the client when to come back.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def reserve(tenant: String, domain: String, paths: List[String]): Reservation = {
     val duplicates = paths.filter(path => jedis.exists(dedupeKey(tenant, domain, path)))
     val fresh = paths.filterNot(duplicates.contains)
@@ -980,11 +940,7 @@ struct Reservation {
   std::vector<std::string> duplicates;
 };
 
-// TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
-// double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-// counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL that
-// checks and writes together, a bucketed budget key that expires with its window, and a 429 that
-// tells the client when to come back.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 Reservation reserve(const std::string& tenant, const std::string& domain, const std::vector<std::string>& paths) {
   Reservation reservation;
   for (const auto& path : paths) {
@@ -1148,9 +1104,11 @@ int main() {
     },
   },
   hints: [
-    'One script, one atomic step: pass the budget key first and one dedupe key per path, then the TTL, the budget and the window TTL as arguments, and read the per-path paths from `ARGV[4..]`. Redis runs the whole script without interleaving another command, which is what makes "check then write" safe here.',
-    'Bucket the budget by the clock, not by the deploy: `window = now // WINDOW_S` in the key, plus `EXPIRE WINDOW_S` when the script creates the key, so the counter dies with its window instead of living until someone deletes it.',
-    'Reserve before the provider call and hand it only the new paths. When the reservation is refused, answer 429 with `Retry-After` from the window key’s TTL and `X-Purge-Budget-Remaining`, and leave the dedupe keys untouched so the paths stay purgeable once the window rolls over.',
+    'A deploy pipeline submits the same purge twice and the CDN receives both; a week later every purge for the domain is refused with a bare 429 that nobody can explain.',
+    '`reserve` asks `EXISTS`, then `SET`s with no TTL, then `INCRBY`s the budget from the client; two requests can pass the check before either writes, and `purge:budget:{domain}` has no window and no `EXPIRE`.',
+    'Put the check, `SET … NX EX DEDUPE_TTL_S` and the charge inside `RESERVE_LUA` via `r.eval`; key the budget with `budget_key(domain, window)` plus `EXPIRE WINDOW_S`; on refusal answer 429 with `Retry-After` and `X-Purge-Budget-Remaining`.',
   ],
-  debrief: `The interviewer is asking about atomicity under concurrency and about key lifetimes. A read-then-write dedupe passes every serial test and fails exactly when it matters: a deploy pipeline that submits the same purge twice, or two replicas receiving the same request. One Lua script turns check-and-write into a single step, and it also lets the budget be charged by the same decision that deduped the paths. The window bucket is the second half: a counter keyed by domain alone is immortal, so the domain slowly spends a budget that never refills, and the resulting 429s look like a bug in the CDN rather than a missing TTL. The 429 itself is a contract — \`Retry-After\` tells a well-behaved client when the window reopens, and \`X-Purge-Budget-Remaining\` lets a deploy pipeline see how close it is. Real platforms add a per-tenant budget on top of the per-domain one, a soft limit that lets wildcards through with a warning, and a metric on every dedupe hit so a stuck pipeline is visible.`,
+  debrief: `The fix has its shape because a reservation is one decision, and a decision made in two halves is not one. Moving the dedupe check, the \`SET NX EX\` and the budget charge into a single \`EVAL\` lets Redis answer "these paths are new and the domain can afford them" with no other command landing in between, which is what a double-submitted deploy or two replicas would otherwise break. Keying the budget by \`window\` and expiring it with \`WINDOW_S\` gives the counter the same lifetime as the promise it enforces; \`Retry-After\` turns the 429 into a schedule instead of a retry storm.
+
+Production systems load scripts once with \`EVALSHA\`, tune budgets per tenant tier, and put an exhausted window on a dashboard before deploys start being refused.`,
 };

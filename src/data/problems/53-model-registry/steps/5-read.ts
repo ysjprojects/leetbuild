@@ -8,35 +8,24 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'redis', 'eval', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: a version comes back and the
-demo shows the lineage. It hides the two fields that decide a serving decision and it serves any
-tenant's model. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/models/{name}/versions/{v}\`: it loads the version
+record, answers from a Redis cache keyed \`mread:{name}:{v}\`, builds
+\`{name, version, stage, lineage_tag}\`, adds \`eval_record\` only when the record's \`passed\`
+flag is set, and caches the body for \`CACHE_TTL_S = 3600\`. It reads no tenant header and no
+pool pointer. It compiles and hides four flaws.
 
-Implement the read endpoint consumers resolve their serving decision through:
+**Failure mode the checks target.** A consumer that reads a version after a promotion and still
+sees the old serving state for most of an hour, and one that cannot distinguish a gate that failed
+from a gate that was never evaluated.
 
-- \`GET /v1/models/{name}/versions/{v}\`. The tenant comes from the authenticated
-  \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The response carries the version, its \`lineage_tag\`, its \`artifact_digest\`, its
-  \`pools\` (each with the \`active:{pool}\` pointer it currently resolves to) and the
-  \`eval_record\` that opened its gate: \`{eval_id, score, threshold, passed}\`.
-- The \`eval_record\` is **always** attached, including when the score is **below** threshold. The
-  starter attaches it only when \`passed\` is true, so a consumer cannot tell a gate that was never
-  opened from one that was opened and failed.
-- A **private model is 404 for a foreign tenant** — the registry is per-tenant and a foreign name
-  must be indistinguishable from a missing one. The starter serves any tenant’s private metadata.
-- The read is served through a cache keyed on the **active pointer**, with a **short TTL**
-  (\`READ_TTL_S = 5\`): a promotion changes the pointer, so the next read misses the stale entry and
-  the new version is visible within seconds. The starter caches per version for an hour, so a
-  promotion is invisible to consumers for most of an hour.
-
-**Failure mode the checks target.** A read after a promotion must return the new active version, a
-foreign tenant must get 404 rather than another tenant's model, and the eval record must be present
-even when its score failed — the failures are exactly the records a reviewer needs.
-
-## What to keep
-
-The response shape and the pointer reads are fine. The fix is authorization, the always-present eval
-record, and a cache key that follows the promotion.`,
+- The tenant comes from \`X-Tenant-Id\`; missing is **401**. \`assert_visible\` compares the
+  record's owner with the request tenant and answers **404** for a foreign private model.
+- The response carries the version, \`lineage_tag\`, \`artifact_digest\`, \`pools\` (each with the
+  \`active:{pool}\` pointer it resolves to) and \`eval_record = {eval_id, score, threshold, passed}\`,
+  attached unconditionally, including when the score was below \`threshold\`.
+- The cache key includes the active pointer (\`mread:{tenant}:{name}:{v}:{pointer}\`) and the
+  entry expires after \`READ_TTL_S = 5\`, so a promotion is visible within seconds.
+- The response shape otherwise stays as it is.`,
   sequence: {
     participants: ['Client', 'Model Registry', 'Redis', 'Eval store'],
     messages: [
@@ -143,10 +132,7 @@ models = ModelStore()
 
 @app.get("/v1/models/{name}/versions/{v}")
 def read_version(name: str, v: str) -> dict:
-    # TODO: the starter omits the eval record when its score was below threshold, serves any tenant's
-    # private model, and caches per version for an hour. Attach the eval record unconditionally,
-    # answer 404 for a foreign tenant, and key the cache on the active:{pool} pointer with a short
-    # READ_TTL_S so a promotion is visible within seconds.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     record = models.get(name, v) or {}
     cached = r.get(f"mread:{name}:{v}")
     if cached is not None:
@@ -230,7 +216,7 @@ def read_version(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/models/{name}/versions/{v}: flawed code that caches for an hour. */
+      starter: `/** GET /v1/models/{name}/versions/{v}: reads a version through a cache. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -242,10 +228,7 @@ const r = new Redis('redis://redis:6379');
 const CACHE_TTL_S = 3600;
 
 app.get('/v1/models/:name/versions/:v', async (request, reply) => {
-  // TODO: the starter omits the eval record when its score was below threshold, serves any tenant's
-  // private model, and caches per version for an hour. Attach the eval record unconditionally,
-  // answer 404 for a foreign tenant, and key the cache on the active:{pool} pointer with a short
-  // READ_TTL_S so a promotion is visible within seconds.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {name, v} = request.params as {name: string; v: string};
   const cached = await r.get(\`mread:\${name}:\${v}\`);
   if (cached !== null) return reply.code(200).send(JSON.parse(cached));
@@ -352,10 +335,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readVersion(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the starter omits the eval record when its score was below threshold, serves any tenant's
-	// private model, and caches per version for an hour. Attach the eval record unconditionally,
-	// answer 404 for a foreign tenant, and key the cache on the active:{pool} pointer with a short
-	// readTTLS so a promotion is visible within seconds.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	name := r.PathValue("name")
 	version := r.PathValue("v")
 	record, _ := models.Get(r.Context(), name, version)
@@ -494,10 +474,7 @@ object VersionRead {
   val route: Route =
     path("v1" / "models" / Segment / "versions" / Segment) { (name, version) =>
       get {
-        // TODO: the starter omits the eval record when its score was below threshold, serves any
-        // tenant's private model, and caches per version for an hour. Attach the eval record
-        // unconditionally, answer 404 for a foreign tenant, and key the cache on the
-        // active:{pool} pointer with a short ReadTtlS so a promotion is visible within seconds.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val key = s"mread:$name:$version"
         Option(jedis.get(key)) match {
           case Some(cached) =>
@@ -604,10 +581,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/models/([^/]+)/versions/([^/]+)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the starter omits the eval record when its score was below threshold, serves any
-    // tenant's private model, and caches per version for an hour. Attach the eval record
-    // unconditionally, answer 404 for a foreign tenant, and key the cache on the active:{pool}
-    // pointer with a short kReadTtlS so a promotion is visible within seconds.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto name = req.matches[1].str();
     const auto version = req.matches[2].str();
     const auto cache_key = "mread:" + name + ":" + version;
@@ -718,9 +692,9 @@ int main() {
     },
   },
   hints: [
-    'Attach the eval record unconditionally — a score below threshold is the record a reviewer most needs. The starter’s `if passed` gate is what turns a failed eval into a missing one, and a consumer cannot tell a gate that never opened from one that opened and failed.',
-    'Authorize the read exactly like the write: compare `record.owner_tenant` with the request tenant before a single key is read, and answer `404` so a foreign model is indistinguishable from a missing one.',
-    'Put the active pointer in the cache key and keep the TTL short. `mread:{tenant}:{name}:{v}:{pointer}` changes the moment a promotion swaps `active:{pool}`, so the next read misses the stale entry and the new version is visible within `READ_TTL_S` seconds — not within an hour.',
+    'A team promoted v4 at 09:02 and the deploy dashboard, which polls this endpoint, kept showing v3 as serving until 09:58. A failed eval on v5 showed no eval record at all.',
+    'The cache key is `mread:{name}:{v}` with a 3600 s TTL, so nothing about a promotion changes the key or expires the entry; the `if record.get("passed")` branch drops failed evals.',
+    'Key the cache `mread:{tenant}:{name}:{v}:{pointer}` from `active:{pool}` with `READ_TTL_S = 5`; attach `eval_record` with `score`, `threshold`, `passed` unconditionally; add `assert_visible` returning 404 for a foreign tenant.',
   ],
-  debrief: `The interview question behind this step is whether the read path tells the truth. Two fields decide a serving decision and the starter hides both: the eval record disappears whenever it failed, and the active pointer is missing entirely, so a consumer cannot see which version a pool is actually serving. The cache is the subtle one: an hourly TTL keyed per version makes a promotion invisible for most of an hour, which is long enough for a fleet to look healthy while half of it serves the old bytes. Keying the cache on the pointer and a five-second TTL makes the promotion visible within seconds. Real registries add an immutable view per version, a signed lineage document, and a read that returns the promotion history so a consumer can reconstruct why a version is serving.`,
+  debrief: `The pointer goes into the cache key because a promotion changes the pointer and nothing else about the version, so the key is the cheapest signal that the cached body is stale; the five-second TTL covers the gap for readers that cached before the swap. The eval record is attached regardless of outcome because a failed score is the record an auditor asks for first, and a missing field cannot be told apart from a gate that was skipped. Tenant scoping answers 404 rather than 403 so a foreign tenant cannot enumerate model names. Production registries also serve the promotion history of a version, with who promoted it and which eval opened each gate, and expose an ETag on this read so a poller can short-circuit unchanged responses.`,
 };

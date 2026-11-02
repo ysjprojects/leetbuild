@@ -8,31 +8,28 @@ export const driftEventsStep: Step = {
   focus: ['monitor', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: every evaluation produces a \`drift.evaluated\`
-event and the topic looks healthy in the console. It hides three flaws, and the first one is the
-reason an audit cannot answer "when did this monitor last fire?". Debug it, fix it, and prove the
-fix.
+**Starting point.** The starter's \`publish_evaluation\` builds an event with the monitor id, metric,
+distance and threshold, keys it by model version, and produces it to \`drift.evaluated\` on every
+evaluation with a default producer, ignoring the result. It serves the demo and hides 5 flaws.
+
+**Failure mode the checks target.** A history is only auditable if it is ordered, complete and
+affordable. Keying by the wrong entity destroys order; publishing every tick destroys the topic and
+buries the crossing that mattered; and a produce error that is ignored destroys completeness exactly
+when the broker is already sick, the moment you most need the record.
 
 Every evaluation can publish to \`drift.evaluated\`:
 
 - **Keyed by monitor id.** The key decides the partition, so all events for one monitor keep their
-  order relative to each other. The starter keys by model version, so two monitors watching the same
-  version interleave and one monitor's history is split across partitions.
+  order relative to each other.
 - **Routine evaluations are summarized, not published one by one.** Only a threshold crossing (or a
   state change) publishes an event; no-drift ticks are counted and rolled into one summary every
-  \`SUMMARY_EVERY = 60\` evaluations, because a topic that carries every tick at full volume is
-  unaffordable and useless for audit.
+  \`SUMMARY_EVERY = 60\` evaluations.
 - The event carries the **metric, threshold, distance and both window boundaries**.
 - The producer is **idempotent with \`acks=all\`**, so a retried produce cannot duplicate or reorder the
   history.
 - A rejected produce writes an **outbox row** (\`insert_outbox\`) instead of dropping the event, so a
   broker outage cannot erase an alert from history.
-- The consumer updates the monitor's Redis counters **before** it commits the offset.
-
-**Failure mode the checks target.** A history is only auditable if it is ordered, complete and
-affordable. Keying by the wrong entity destroys order; publishing every tick destroys the topic and
-buries the crossing that mattered; and a produce error that is ignored destroys completeness exactly
-when the broker is already sick — the moment you most need the record.`,
+- The consumer updates the monitor's Redis counters **before** it commits the offset.`,
   sequence: {
     participants: ['Drift Monitor', 'Kafka drift.evaluated', 'History consumer', 'outbox'],
     messages: [
@@ -103,7 +100,7 @@ when the broker is already sick — the moment you most need the record.`,
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true` + `acks: -1`, or required acks `all` with a hash balancer. A produce retry must not duplicate or reorder a monitor’s history.',
+        'The producer is configured for idempotence and `acks=all`: `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true` + `acks: -1`, or required acks `all` with a hash balancer. A produce retry must not duplicate or reorder a monitor’s history.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -139,9 +136,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_evaluation(monitor: dict, window: int, distance: float, over_threshold: bool) -> None:
-    # TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
-    # full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-    # rejected produce. Fix all five.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "monitor_id": monitor["monitor_id"],
         "metric": monitor["metric"],
@@ -230,9 +225,7 @@ export async function publishEvaluation(
   distance: number,
   overThreshold: boolean,
 ): Promise<void> {
-  // TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
-  // full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-  // rejected produce. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event = {
     monitor_id: monitor.monitor_id,
     metric: monitor.metric,
@@ -329,9 +322,7 @@ type Monitor struct {
 }
 
 func publishEvaluation(ctx context.Context, monitor Monitor, window int64, distance float64, overThreshold bool) error {
-	// TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
-	// full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-	// rejected produce. Fix all five.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"monitor_id": monitor.MonitorID,
 		"metric":     monitor.Metric,
@@ -451,9 +442,7 @@ object DriftEvents {
   val producer = new KafkaProducer[String, String](props)
 
   def publishEvaluation(monitor: Monitor, window: Long, distance: Double, overThreshold: Boolean): Unit = {
-    // TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
-    // full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-    // rejected produce. Fix all five.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload =
       "{\\"monitor_id\\":\\"" + monitor.monitorId + "\\",\\"metric\\":\\"" + monitor.metric +
         "\\",\\"distance\\":" + distance + ",\\"threshold\\":" + monitor.threshold + "}"
@@ -552,9 +541,7 @@ struct Monitor {
 RdKafka::Producer* producer = nullptr;
 
 void publishEvaluation(const Monitor& monitor, long window, double distance, bool overThreshold) {
-  // TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
-  // full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-  // rejected produce. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string payload = "{\\"monitor_id\\":\\"" + monitor.monitor_id() + "\\",\\"metric\\":\\"" +
                               monitor.metric() + "\\",\\"distance\\":" + std::to_string(distance) +
                               ",\\"threshold\\":" + std::to_string(monitor.threshold()) + "}";
@@ -624,17 +611,17 @@ bool publishEvaluation(const Monitor& monitor, long window, double distance, boo
     },
   },
   hints: [
-    'The key is the partition selector, so it must name the entity whose order matters: the monitor. `key=monitor_id` keeps one monitor’s crossings, summaries and reports in order; keying by model version interleaves every monitor watching that version.',
-    'A topic that carries every tick is a bill and a haystack. Publish on a crossing, count the quiet ticks in Redis and publish one summary every `SUMMARY_EVERY` evaluations — then the one event that mattered is still findable.',
-    'Configure the producer once: `enable.idempotence` with `acks=all` (or `idempotent: true`, `acks: -1`). Then wrap the produce so a broker rejection calls `insert_outbox` instead of vanishing; the outbox row is what lets a replay restore the missing history.',
+    'Symptom: an auditor asks "when did monitor X last fire?" and gets events out of order, buried under thousands of no-drift ticks, with a gap exactly where last month’s broker outage was.',
+    'Mechanism: the record key is the model version, so one monitor is spread across partitions; `publish_evaluation` produces on every call with a default producer and discards the broker’s answer.',
+    'Change: key by `monitor_id`; publish only when `crossed`, counting quiet ticks toward `SUMMARY_EVERY`; add `window_start`/`window_end`; configure `enable.idempotence` with `acks=all`; call `insert_outbox` in the error branch.',
   ],
-  debrief: `This step is about the audit trail behind the alert. Three habits are being tested: choose the
-partition key from the question you will ask later ("show me this monitor's history"), not from the
-record's shape; publish the signal and summarize the noise, so volume does not bury the crossing; and
-treat a produce error as data loss that must be recorded, not logged. Idempotence plus \`acks=all\` is what
-lets a retry be safe, and the outbox is what closes the gap when the broker is unreachable. The consumer
-side follows the same habit as any exactly-once-adjacent pipeline: update the Redis counters first, then
-commit the offset, so a crash replays rather than loses. Real systems add a compacted topic for the
-latest state per monitor, schema registry enforcement so no producer smuggles feature values in, and a
-replay tool that drains the outbox in order.`,
+  debrief: `The partition key comes from the question the history has to answer later ("show me this monitor")
+rather than from the record's shape, because Kafka only orders within a partition. Publishing the
+crossing and summarizing the quiet ticks keeps the topic small enough that the one event that
+mattered is still findable. Idempotence plus \`acks=all\` makes a producer retry safe, and the
+outbox row is what turns a broker rejection from silent loss into a replayable record. The consumer
+follows the same ordering: counters first, offset commit second, so a crash replays instead of
+losing. Production pipelines add a compacted topic for the latest state per monitor, schema
+registry enforcement so no producer smuggles feature values into events, and a replay tool that
+drains the outbox in order, none of which this step covers.`,
 };

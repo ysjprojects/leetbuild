@@ -16,41 +16,40 @@ import {lagReadStep} from './steps/5-read';
 export const cdcStreamerProblem: Problem = {
   id: 'cdc-streamer',
   title: 'CDC Streamer',
-  tagline: 'Change data capture that never skips a change and keeps per-row order.',
+  tagline: 'A WAL tailer with a durable LSN cursor, same-batch retries and per-row Kafka keys.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# CDC Streamer
 
 A change data capture streamer reads a database's write-ahead log and delivers every committed
-change to the sinks that care about it — a warehouse, a search index, a cache. The visible part is a
-subscription endpoint and a lag number; the parts that decide whether the platform can be trusted
+change to the sinks that care about it: a warehouse, a search index, a cache. The visible part is a
+subscription endpoint and a lag number. The parts that decide whether the platform can be trusted
 are the authorization of a subscription, the durability of the confirmed position in the log, the
-retry rule that never lets a batch disappear, the message key that keeps one row's history in order,
-and the lag an operator can actually act on.
+retry rule for a failed batch, the message key that keeps one row's history in order, and the lag
+an operator can act on.
 
 ## The real system
 
-Production CDC pipelines hold a logical replication slot against the source database, read the log
-in batches under a deadline, and track a confirmed log sequence number (LSN) per (subscription,
-table). A confirmed LSN is a promise: everything up to it has been durably applied downstream, so a
-restart resumes exactly there — it re-delivers nothing below it and drops nothing above it. The slot
-retains log segments until the consumer confirms, which is why a stalled or lost slot is a page and
-not a metric: the database will discard the segments the stream still needs, and the distance
-between the confirmed LSN and the slot's restart LSN is the data about to be lost.
+Debezium's PostgreSQL connector holds a logical replication slot, records the WAL position of every
+event it emits, and on restart resumes from the LSN stored in its Kafka offsets topic rather than
+from the server's head. When that recorded position is no longer available on the server, the
+\`snapshot.mode=when_needed\` setting takes a fresh snapshot instead of silently continuing from
+wherever the log now starts. The slot retains WAL segments until the consumer confirms them, which is
+why a stalled or lost slot is a page and not a metric: the distance between the confirmed LSN and the
+slot's restart LSN is the data about to be lost.
 
 Under pressure the tempting move is to skip. A batch fails, the tailer jumps past it to keep the lag
-chart flat, the cursor moves, and the tenant's changes are gone with no error anyone ever sees. Real
-pipelines do the opposite: a failed batch is retried from its first LSN with the same batch id until
-it succeeds or the subscription halts loudly, and back-pressure is applied at the sink — the slow
-consumer — instead of being absorbed by dropping work. Exactly-once delivery to a non-transactional
-sink is impossible; at-least-once plus an idempotent, ordered apply is what is actually shipped.
+chart flat, the cursor moves, and the tenant's changes are gone with no error anyone sees. A failed
+batch is instead retried from its first LSN with the same batch id until it succeeds or the
+subscription halts, and back-pressure lands on the slow sink rather than on dropped work.
+Exactly-once delivery to a non-transactional sink is not available; at-least-once plus an idempotent,
+ordered apply is what ships.
 
-Ordering is a keying decision. Keying a change topic by table scatters the changes of a single row
-across partitions, so consumers replay one row's history out of order; keying by (table, primary
-key) puts every change of one row in one partition, in commit order, and lets a consumer apply them
-sequentially. The payload itself carries digests, not raw column values: a stream that copies
-column contents into a replicated, retained topic turns every PII fix into a data-removal project.
+Ordering is a keying decision. Keying a change topic by table scatters one row's changes across
+partitions; keying by (table, primary key) puts every change of one row in one partition in commit
+order. The payload carries digests, not raw column values, because a retained topic that copies
+column contents turns every PII fix into a data-removal project.
 
 ## What you build here
 
@@ -58,33 +57,30 @@ One service, **cdcd**, with five pieces:
 
 1. \`POST /v1/subscriptions\`: an authenticated tenant, a table on that tenant's approved list
    (**403** otherwise), a filter parsed to structured predicates over non-sensitive columns, a sink
-   reference, and an \`Idempotency-Key\` so a replay returns the existing subscription instead of
-   creating a second stream.
+   reference, and an \`Idempotency-Key\` so a replay returns the existing subscription.
 2. A **Redis** LSN cursor per (subscription, table): written without expiry, advanced only after the
-   downstream confirmation, monotonic, and used as the resume point of a restart.
+   downstream confirmation, monotonic, and the resume point of a restart.
 3. A **gRPC** slot reader: a five-second deadline per read, a failed batch retried from its first LSN
    with the same batch id until it succeeds or the subscription halts, a lost slot surfaced as a
-   page-worthy state, and back-pressure at the sink instead of skipped batches.
+   page-worthy state, and back-pressure at the sink.
 4. A **Kafka** change path: \`cdc.change\` keyed by (table, primary key), before and after digests
    plus the LSN in the payload, an idempotent producer, and an outbox row when the broker rejects the
    produce.
 5. \`GET /v1/subscriptions/{id}/lag\`: the confirmed LSN, the source head LSN, lag in changes and in
-   seconds derived from LSN arithmetic, whether the slot is still active, a critical state beyond the
+   seconds from LSN arithmetic, whether the slot is still active, a critical state beyond the
    retention window, and **404** for a subscription that belongs to someone else.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real data platform: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter in this course compiles and serves the happy path. Your job in each step is to debug
+it against the failure modes, fix it, and prove the fix with checks that fail on the starter and
+pass on your version.
 
 ## Left out on purpose
 
 Slot creation and WAL configuration, schema change handling, sink-specific upsert dialects,
-multi-region slots, snapshot/backfill orchestration, throughput tuning, and the sink connectors
-themselves. The five pieces above are the ones that decide whether the stream is correct, ordered
-and operable.`,
+multi-region slots, snapshot and backfill orchestration, throughput tuning, and the sink connectors
+themselves. The five pieces above decide whether the stream is correct, ordered and operable.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Tenant app', sub: 'subscribe · read lag', x: 8, y: 50},

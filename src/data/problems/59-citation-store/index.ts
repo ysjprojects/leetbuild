@@ -16,7 +16,7 @@ import {readCitationsStep} from './steps/5-read';
 export const citationStoreProblem: Problem = {
   id: 'citation-store',
   title: 'Citation Store',
-  tagline: 'Citations that point at exact spans and stay valid as documents are versioned.',
+  tagline: 'Citations that point at exact spans in a named document version and stay valid after an edit.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -31,18 +31,22 @@ whether the recorded history of a document's citations survives an edit.
 
 ## The real system
 
-Production stores validate the span before they keep it: they take a document id, a version, a
-start and an end offset and the quoted text, and they refuse the record when the quote is not
-exactly the bytes at those offsets in that version. Offsets are resolved against an immutable
-version — never "the document" — because a later edit re-points everything that was stored against a
-bare document id. Resolved span text is cached under a key that names the version, with a long TTL,
-since an immutable version cannot change. When the document store cannot serve a version, the
-service bounds the call with a deadline, treats a missing version as terminal, and marks a citation
-it cannot re-anchor as **broken** with a reason rather than dropping it. Verification results are
-published keyed by document, so a document's citation history stays ordered, and a broken citation
-is published like any other so regressions are visible instead of hidden. The read side returns the
-span, its version, its status and the full offset range for the owning tenant only, and an answer's
-status is the worst status among its citations.
+The Claude Messages API's citations feature returns, for each cited passage of a plain-text
+document, a \`char_location\` block with the \`cited_text\`, the \`document_index\` and the
+\`start_char_index\` / \`end_char_index\` the quote was extracted from; the quoted text is taken
+directly from the source rather than generated, which is what makes an offset pair worth storing.
+A store that keeps such citations has to defend that guarantee over time. It validates the span
+before it keeps it: document id, version, start and end offset and the quoted text, refusing the
+record when the quote is not exactly the bytes at those offsets in that version. Offsets are
+resolved against an immutable version rather than "the document", because a later edit re-points
+everything stored against a bare document id. Resolved span text is cached under a key that names
+the version, with a long TTL, since an immutable version cannot change. When the document store
+cannot serve a version, the service bounds the call with a deadline, treats a missing version as
+terminal, and marks a citation it cannot re-anchor as **broken** with a reason rather than dropping
+it. Verification results are published keyed by document, so a document's citation history stays
+ordered, and a broken citation is published like any other so regressions are visible. The read
+side returns the span, its version, its status and the full offset range for the owning tenant
+only, and an answer's status is the worst status among its citations.
 
 ## What you build here
 
@@ -53,7 +57,7 @@ One service, **citations**, with five pieces:
    mismatch answering **422** with both the stored and the supplied text, and an
    \`Idempotency-Key\` so recording the same citation twice cannot diverge.
 2. A **Redis** span cache keyed by \`span:{document_id}:{version}:{start}:{end}\` with numeric,
-   normalized offsets and a long TTL, because an immutable version never changes and nothing needs
+   normalized offsets and a long TTL, because an immutable version cannot change and nothing needs
    invalidating.
 3. A **gRPC** document fetch: a 1-second deadline per attempt, terminal \`NOT_FOUND\` for a version
    that does not exist, a bounded retry for the retryable codes only, and a citation whose span
@@ -62,14 +66,14 @@ One service, **citations**, with five pieces:
    idempotent \`acks=all\` producer, verification before the publish, and an outbox row when the
    broker rejects the produce.
 5. \`GET /v1/citations/{id}\`: the span, its document version, its verification status and the full
-   offset range for the owning tenant — **404** for a foreign citation — plus an answer's citation
+   offset range for the owning tenant, **404** for a foreign citation, plus an answer's citation
    list that reports the worst status, \`degraded\` when any citation is broken.
 
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+the failure modes, find the subtle one, fix it, optimize what is wasteful, and prove the fix with
 checks that fail on the starter and pass on your version.
 
 ## Left out on purpose

@@ -8,33 +8,27 @@ export const dependencyStep: Step = {
   focus: ['hub', 'vendor', 'oauth'],
   task: `## Task
 
-**Starting point.** The starter is working code: while the vendor is healthy every page arrives
-and the sync advances. Every failure path is wrong. Find them, fix them, and prove the fix.
+**Starting point.** The starter's \`fetch_page(connector)\` calls the vendor's \`FetchPage\` RPC
+with the connector id and cursor and returns the records; on any exception it loops and calls
+again, with no deadline, no delay and no attempt limit. It compiles, serves the demo while the
+vendor is healthy and hides 4 flaws.
 
-Implement \`fetch_page(connector)\`, the vendor call a sync worker makes for one page:
-
-- Each attempt carries a **2 s** deadline. A call without one lets one slow vendor pin a worker for
-  the whole sync.
-- A **429** (\`RESOURCE_EXHAUSTED\`) is retried after **exponential backoff with jitter**:
-  \`BACKOFF_BASE_MS = 250\`, doubling per attempt, capped at \`BACKOFF_MAX_MS = 8_000\`, with full
-  jitter, and the vendor's own \`retry-after\` trailing metadata honoured when it sends one. At most
-  \`MAX_ATTEMPTS = 5\` attempts. The starter re-sends 429s in a tight loop with no delay, which is how
-  a polite client becomes the reason the vendor rate-limits you harder.
-- A **401** (\`UNAUTHENTICATED\`) is permanent: it is attempted **once**, then the connector is
-  **disabled with a visible reason** (\`store.disable(connector_id, reason)\`) so a human can see why
-  it stopped and re-enable it after fixing the token. Retrying a 401 burns the rate limit and still
-  fails forever.
-- A **circuit breaker** opens after **5 consecutive 5xx** replies (\`UNAVAILABLE\`/\`INTERNAL\`)
-  and stays open for \`BREAKER_COOLDOWN_S = 30\`; while it is open, \`allow()\` must short-circuit
-  the call so five failures do not become thousands of requests against a vendor that is already
-  down. A success resets the counter — the count is *consecutive*.
-- Anything else — \`INVALID_ARGUMENT\`, \`PERMISSION_DENIED\` — is returned to the caller at once
-  instead of being retried.
-
-**Failure mode the checks target.** The starter's blanket retry turns a vendor deploy into a hot loop
-and a bad token into an infinite one; with no backoff the retries amplify exactly when the vendor is
+**Failure mode the checks target.** The blanket retry turns a vendor deploy into a hot loop and a
+bad token into an infinite one; with no backoff the retries amplify exactly when the vendor is
 asking you to slow down; and with no breaker a single broken vendor costs every worker its
-throughput. Each of these is invisible in a demo where the vendor is healthy.`,
+throughput. Each of these is invisible in a demo where the vendor answers.
+
+- Each attempt carries a **2 s** deadline, so one slow vendor cannot pin a worker for a whole sync.
+- A **429** (\`RESOURCE_EXHAUSTED\`) is retried after exponential backoff with full jitter:
+  \`BACKOFF_BASE_MS = 250\`, doubling per attempt, capped at \`BACKOFF_MAX_MS = 8_000\`, honouring
+  the vendor's \`retry-after\` trailing metadata when present. At most \`MAX_ATTEMPTS = 5\`.
+- A **401** (\`UNAUTHENTICATED\`) is permanent: attempted once, then the connector is disabled with
+  a visible reason via \`store.disable(connector_id, reason)\` so a human can fix the token and
+  re-enable it.
+- A circuit breaker opens after **5 consecutive 5xx** replies (\`UNAVAILABLE\`/\`INTERNAL\`) and
+  stays open for \`BREAKER_COOLDOWN_S = 30\`; \`allow()\` is checked before the call so an open
+  breaker skips the vendor. A success resets the counter.
+- Anything else (\`INVALID_ARGUMENT\`, \`PERMISSION_DENIED\`) returns to the caller at once.`,
   sequence: {
     participants: ['Sync worker', 'Vendor gRPC', 'Connector store'],
     messages: [
@@ -139,9 +133,7 @@ store = ConnectorStore()
 
 
 def fetch_page(connector: dict) -> bytes:
-    # TODO: this starter retries every status forever with no delay, including the 401 that can never
-    # succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
-    # disable for 401s, and a breaker after five consecutive 5xx.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = vendor.FetchPage(
@@ -284,9 +276,7 @@ const {vendor} = grpc.loadPackageDefinition(protoLoader.loadSync('vendor.proto')
 const client = new vendor.Vendor('vendor:9000', grpc.credentials.createInsecure());
 
 export async function fetchPage(connector: Connector): Promise<Buffer> {
-  // TODO: this starter retries every status forever with no delay, including the 401 that can never
-  // succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
-  // disable for 401s, and a breaker after five consecutive 5xx.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const {promise, resolve, reject} = Promise.withResolvers<Buffer>();
@@ -434,9 +424,7 @@ func (s *ConnectorStore) Disable(ctx context.Context, connectorID, reason string
 var store = &ConnectorStore{}
 
 func fetchPage(ctx context.Context, connector Connector) ([]byte, error) {
-	// TODO: this starter retries every status forever with no delay, including the 401 that can never
-	// succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
-	// disable for 401s, and a breaker after five consecutive 5xx.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := vendor.FetchPage(ctx, &pb.FetchPageRequest{
 			ConnectorId: connector.ID,
@@ -599,9 +587,7 @@ object VendorClient {
   )
 
   def fetchPage(connector: Connector): Array[Byte] = {
-    // TODO: this starter retries every status forever with no delay, including the 401 that can never
-    // succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
-    // disable for 401s, and a breaker after five consecutive 5xx.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     while (true) {
       try {
         val reply = vendor.fetchPage(
@@ -732,9 +718,7 @@ struct ConnectorStore {
 ConnectorStore store;
 
 std::string fetchPage(const Connector& connector) {
-  // TODO: this starter retries every status forever with no delay, including the 401 that can never
-  // succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
-  // disable for 401s, and a breaker after five consecutive 5xx.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     FetchPageRequest request;
@@ -857,9 +841,9 @@ std::string fetchPage(const Connector& connector) {
     },
   },
   hints: [
-    'Separate the statuses before you write the loop: retryable is `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `DEADLINE_EXCEEDED`, permanent is `UNAUTHENTICATED` / `INVALID_ARGUMENT` / `PERMISSION_DENIED`. A permanent code returns on the first attempt — there is no third try that succeeds with a bad token.',
-    'Backoff belongs between attempts, not in front of the first one: `min(BACKOFF_MAX_MS, BACKOFF_BASE_MS · 2^attempt)` with jitter, and if the vendor sent `retry-after` in the trailing metadata, that value overrides your own schedule. Sleeping zero is the starter.',
-    'The breaker counts *consecutive* 5xx replies: `record(failed)` resets the counter on success and opens after `BREAKER_FAILURES`, and `allow()` is checked before the call so an open breaker returns without touching the vendor. A 401 is not a breaker event — it is a connector that must be disabled once.',
+    'Symptoms: a connector with a revoked token pins a worker at 100% CPU and floods the vendor with 401s; during a vendor outage every worker is stuck inside `fetch_page`.',
+    'The `while True` loop treats every exception alike and sleeps zero: 429, 401 and 503 all re-send immediately, so the client is the load the vendor is shedding and a bad token retries forever.',
+    'Loop `for attempt in range(MAX_ATTEMPTS)` with `timeout=DEADLINE_S`. 401: `store.disable(id, reason)`, return. 429: `time.sleep(min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2**attempt))` with `random.uniform` jitter. Gate on `breaker.allow()`.',
   ],
-  debrief: `The interview question is failure policy against a dependency you do not control. The starter passes every serial test with a healthy vendor and fails exactly when the vendor is having its worst day: an unbounded retry with no delay turns your client into the load that keeps the vendor down, retrying a 401 burns rate limit for a result that can never change, and with no breaker every worker independently rediscovers that the vendor is out. The fixes are the four contracts every outbound call needs — a deadline, bounded attempts over a status whitelist, a backoff policy that honours the server's own instructions, and a breaker so the dependency gets room to recover. Real hubs also include the connector's own rate limit as a client-side token bucket, a per-connector concurrency cap so one big connector cannot starve the rest, and an alarm on the breaker opening so a vendorship problem reaches a human.`,
+  debrief: `The fix classifies before it loops: a status is retryable, permanent or a breaker event, and the loop shape follows from that. Bounded attempts over a retryable set mean the worst case is five calls; backoff with jitter spreads the retries of many workers so they do not re-synchronize on the vendor; honouring \`retry-after\` lets the vendor set the schedule it can tolerate; and the breaker is checked before the call because the point is to make no call at all while the vendor recovers. Disabling on 401 with a reason turns an infinite loop into an operator task. Production hubs also keep a client-side token bucket for the vendor's quota, scope the breaker per vendor host rather than per process, and record attempt counts and breaker transitions as metrics the health endpoint can read.`,
 };

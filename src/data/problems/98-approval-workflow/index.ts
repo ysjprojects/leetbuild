@@ -17,7 +17,7 @@ import {readStep} from './steps/5-read';
 export const approvalWorkflowProblem: Problem = {
   id: 'approval-workflow',
   title: 'Approval Workflow',
-  tagline: 'Chained approvals with eligibility checks, atomic states and no self-approval.',
+  tagline: 'Approver chains pinned from policy, Redis compare-and-swap decisions, a gRPC eligibility gate.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,16 +31,17 @@ decision, and the trail that survives.
 
 ## The real system
 
-Production approval services resolve approvers from policy, never from the request: the requester
-names a chain, the chain names the approvers, and the version of that chain is pinned on the request
-so an in-flight approval is not silently re-routed by an edit to the policy. Every decision is a
-compare-and-swap against the current step, because two approvers clicking at the same moment must
-not move a chain two steps, and the state of a request that waits three weeks for finance must not
-live under an hour of cache expiry. Before a decision counts, the service asks an eligibility
-service whether this approver may still act — a bounded call under a deadline that denies when the
-answer cannot be verified, because an outage must not approve spend. And every step change becomes
-an event keyed by the request, carrying ids and enums rather than the text a human wrote, published
-only after the state that it describes is durable.
+Temporal's documented approval pattern runs an approval as a durable workflow that blocks on a
+Signal (\`workflow.wait_condition\` with a timeout in Python, \`Workflow.await\` in Java) until an
+approver submits a decision carrying their identity, the outcome and a comment, and a multi-level
+chain iterates through its approval levels waiting for one Signal per level. That is the same
+shape as this course, with the durability outsourced to the workflow engine. Here you build the
+pieces by hand: a chain resolved from a pinned policy version so an edit to the policy cannot
+re-route an in-flight request; one compare-and-swap per decision, because two approvers clicking
+at the same moment must not move a chain two steps; state with no cache-style expiry, because a
+request can wait three weeks for finance; an eligibility call under a deadline that denies when
+the answer cannot be verified; and an event per step change, keyed by the request, carrying ids
+and enums, published after the state it describes is durable.
 
 ## What you build here
 
@@ -66,9 +67,8 @@ One service, **approvals**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+it looks right. In every step you debug it against the failure modes, fix it, optimize what is
+wasteful, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

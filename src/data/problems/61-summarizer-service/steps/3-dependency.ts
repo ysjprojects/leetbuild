@@ -8,35 +8,28 @@ export const summarizerClientStep: Step = {
   focus: ['api', 'model', 'extract'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the summarizer, loops until it gets
-something back, and returns *something* on failure. It compiles, it serves the happy path, and it
-hides four production flaws. Debug it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter's \`summarize_with_model(stub, content, band)\` calls the model's
+\`Summarize\` RPC in a \`while True\` loop, returns \`{"kind": "abstractive", "summary": reply.text}\`
+on success, and on failure returns the first 400 characters of the source, or the sentence
+\`summary unavailable\`, under the same label. It compiles, it serves the happy path, and it hides
+five flaws.
 
-Call the summary model over gRPC. The call is allowed to fail, but the answer it returns must never
-pretend the model spoke when it did not.
+**Failure mode the checks target.** The call has no deadline, so one hung provider holds the request
+until the caller times out. Every failure is retried, including a refusal, and the loop has no upper
+bound. The fallback is a slice of the source with no trimming rule, labelled \`abstractive\`, or a
+placeholder sentence that a reader takes for content.
 
-- Every attempt carries a **5-second deadline** (\`DEADLINE_S\`) applied to the call itself
-  (\`timeout\`/\`deadline\`, a per-attempt context or a client-context deadline) — never a wall-clock
-  check after the fact, which leaves the call running while you look at your watch.
-- A **refusal is terminal**. The provider declines a source with the \`REFUSED\` detail (and other
-  non-retryable statuses are in \`TERMINAL_CODES\`); retrying a refusal spends the deadline to be
-  refused again. Only \`RETRYABLE_CODES\` (\`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`) may be retried, at
-  most \`MAX_ATTEMPTS = 3\`.
-- When the call fails, return a **trimmed extract of the source** — \`trim_extract(source)\` bounded by
-  \`EXTRACT_CHARS = 1200\` — marked \`OUTPUT_EXTRACTIVE\`. A trimmed extract is honest: it is the
-  source's own words. A sentence like \`summary unavailable\` dressed up as a summary is not, because
-  a caller (and a board deck) reads it as content.
-- **Label the output type always**: every result carries \`kind\`, either \`OUTPUT_ABSTRACTIVE\` (the
-  model wrote it) or \`OUTPUT_EXTRACTIVE\` (it is the source's text). A fallback labelled abstractive
-  makes an extractive answer look generated, which is exactly the confusion the label exists to
-  prevent.
+Requirements:
 
-**Failure mode the checks target.** The starter has no deadline and retries in an unbounded \`while\`
-loop, treating a refusal as a transient hiccup and hammering the model until the caller gives up. On
-failure it returns the first 400 characters of the source labelled \`abstractive\` — or the literal
-sentence \`summary unavailable\` — so a caller cannot tell a generated summary from a truncated source
-or from nothing at all.`,
+- Every attempt carries a **5-second deadline** (\`DEADLINE_S\`) on the call itself: a per-attempt
+  \`timeout\`/\`deadline\` or a context deadline, not a wall-clock check after the fact.
+- A refusal is terminal: the \`REFUSED\` detail and the statuses in \`TERMINAL_CODES\` end the call.
+  Only \`RETRYABLE_CODES\` (\`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`) may be retried, at most
+  \`MAX_ATTEMPTS = 3\`.
+- On failure return \`trim_extract(source)\` bounded by \`EXTRACT_CHARS = 1200\`, marked
+  \`OUTPUT_EXTRACTIVE\`: the source's own words, cut to a known size.
+- Every result carries \`kind\`, either \`OUTPUT_ABSTRACTIVE\` (the model wrote it) or
+  \`OUTPUT_EXTRACTIVE\` (it is the source's text). No result is a placeholder sentence.`,
   sequence: {
     participants: ['Summarizer', 'Summary model', 'Extractive fallback', 'Reader'],
     messages: [
@@ -137,9 +130,7 @@ class SummaryModel:
 
 
 def summarize_with_model(stub: SummaryModel, content: str, band: str) -> dict:
-    # TODO: this starter calls the model with no deadline and retries every failure — refusals
-    # included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-    # the sentence "summary unavailable") as if it were a summary. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = stub.Summarize(SummaryRequest(content=content, band=band))
@@ -221,7 +212,7 @@ def summarize_with_model(stub: SummaryModel, content: str, band: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Summarize over gRPC: flawed code that loops until something comes back. */
+      starter: `/** Summarize over gRPC: the starter loops until something comes back. */
 import * as grpc from '@grpc/grpc-js';
 
 import type {SummaryModelClient} from './client_pb';
@@ -236,9 +227,7 @@ export async function summarizeWithModel(
   content: string,
   band: string,
 ): Promise<SummaryResult> {
-  // TODO: this starter calls the model with no deadline and retries every failure — refusals
-  // included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-  // the sentence "summary unavailable") as if it were a summary. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const reply = await client.summarize({content, band});
@@ -330,9 +319,7 @@ type Result struct {
 
 // summarizeWithModel asks the model for a summary. The starter loops until it gets one.
 func summarizeWithModel(ctx context.Context, client pb.SummaryModelClient, content, band string) Result {
-	// TODO: this starter calls the model with no deadline and retries every failure — refusals
-	// included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-	// the sentence "summary unavailable") as if it were a summary. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := client.Summarize(ctx, &pb.SummarizeRequest{Content: content, Band: band})
 		if err == nil {
@@ -438,9 +425,7 @@ object SummaryClient {
 
   /** Ask the model for a summary. The starter loops until it gets one. */
   def summarizeWithModel(stub: SummaryModelGrpc.SummaryModelStub, content: String, band: String): Result = {
-    // TODO: this starter calls the model with no deadline and retries every failure — refusals
-    // included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-    // the sentence "summary unavailable") as if it were a summary. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var result: Option[Result] = None
     while (result.isEmpty) {
       try {
@@ -534,9 +519,7 @@ struct Result {
 
 // summarize_with_model asks the model for a summary. The starter loops until it gets one.
 Result summarize_with_model(std::shared_ptr<SummaryModel::Stub> stub, const std::string& content, const std::string& band) {
-  // TODO: this starter calls the model with no deadline and retries every failure — refusals
-  // included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-  // the sentence "summary unavailable") as if it were a summary. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext context;
     SummarizeRequest request;
@@ -624,20 +607,16 @@ Result summarize_with_model(const std::shared_ptr<SummaryModel::Stub>& stub, con
     },
   },
   hints: [
-    'Put a deadline on the call, not around it: a per-attempt timeout means a hung provider costs five seconds, while a wall-clock check leaves the call running and the connection occupied.',
-    'A refusal is an answer, not a failure. Classify the status before you loop — `REFUSED`/terminal codes stop immediately, only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are worth another attempt, and three attempts is the whole budget.',
-    'The fallback must be honest in two ways: the text is a trimmed extract of the source (so nothing is invented), and `kind` says `extractive`. Never label an extract `abstractive`, and never return a placeholder sentence as a summary.',
+    'The provider refuses a document and the request pins a worker until the gateway times out. When the model is down, callers receive the first 400 characters of the source as a "summary".',
+    '`stub.Summarize` is called with no `timeout`, and `continue` runs on `reply.refused` and on any `RpcError` whose detail says refused, so the loop has no exit. The fallback reuses `kind: "abstractive"`.',
+    'Pass `timeout=DEADLINE_S`; loop `for attempt in range(MAX_ATTEMPTS)` and `break` unless `err.code()` is in `RETRYABLE_CODES`. Return `trim_extract(content)` with `kind: OUTPUT_EXTRACTIVE`.',
   ],
-  debrief: `The interview question behind this step is what a service owes its caller when the model does not
-answer. Three answers are wrong in the same way: retrying a refusal (the provider already decided),
-retrying forever (the request has a caller with a timeout), and returning a sentence that reads like
-a summary but is not one. The right answer has two halves — a bounded failure policy and an output
-contract. The deadline is the first half: five seconds per attempt, so a hung provider is a slow
-response rather than a stuck worker. The classification is the second: terminal failures are
-terminal, and only the two codes that mean "try again" get retried. The fallback is where the honesty
-lives: the source's own words, trimmed to a known size, labelled extractive, so a reader knows the
-model did not write that paragraph and a metrics dashboard can count how often it happens. Real
-systems add per-provider breakers, a token-budget check before the call, extractive fallbacks ranked
-by sentence salience, and a label on the summary record itself so a stored summary can never be
-mistaken for a generated one.`,
+  debrief: `The fix has two halves: a bounded failure policy and an output contract. The deadline goes on the
+call rather than around it so a hung provider costs five seconds and frees the connection; a
+wall-clock check after the fact leaves the call running. Status classification happens before the
+retry decision because a refusal is an answer, and only the two codes that mean "try again" earn
+another attempt out of a budget of three. The fallback is the source's own words trimmed to a known
+size and labelled extractive, so a reader knows the model did not write that paragraph and a
+dashboard can count how often it happens. Production clients add per-provider circuit breakers and
+extractive fallbacks ranked by sentence salience instead of a prefix.`,
 };

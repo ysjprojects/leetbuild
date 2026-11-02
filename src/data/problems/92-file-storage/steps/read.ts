@@ -8,29 +8,28 @@ export const readStep: Step = {
   focus: ['client', 'reader', 'redis', 'audit'],
   task: `## Task
 
-**Starting point.** The starter is working code for the download endpoint: it
-registers the route and returns a URL for the file. It compiles, the demo downloads work, and it hides
-three production flaws. Debug it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/files/{id}\`, reads the \`X-Tenant-Id\` header
+without checking it, and returns a plain CDN URL built from the file id. It serves the demo and hides
+four flaws.
 
-Implement \`GET /v1/files/{id}\`:
+**Failure mode the checks target.** A permanent public URL is a capability with no end: a browser
+history or a proxy log keeps access forever. Serving any file id to any caller turns a guessable id
+into a data leak. A download path with no audit is the one access you cannot reconstruct after an
+incident.
 
-- The tenant comes from \`X-Tenant-Id\` and the person asking from \`X-User-Id\`; a missing tenant is
+Requirements for \`GET /v1/files/{id}\`:
+
+- The tenant comes from \`X-Tenant-Id\` and the requester from \`X-User-Id\`; a missing tenant is
   **401**.
-- The file is looked up by id and the request is authorized against the file's owning tenant. A file
-  that does not exist, **or exists but belongs to another tenant**, is **404** — never **403**, so the
-  endpoint does not confirm that an id exists.
+- The file is looked up by id and authorized against its owning tenant. A file that does not exist,
+  **or belongs to another tenant**, is **404** rather than **403**, so the endpoint does not confirm
+  that an id exists.
 - The response is a **signed URL** to the CDN: the signature covers the path, the expiry and the tenant,
-  so the CDN can verify it without calling back and a signature minted for one tenant cannot be
-  replayed by another.
-- The URL **expires in 10 minutes** (\`600\` seconds). After that the CDN rejects it; the client asks the
-  API for a fresh one.
-- Every issuance appends an audit record — \`download_issued\`, the file id, the tenant and the
-  **requesting user** — to the audit stream, before the URL is returned.
-
-**Failure mode the checks target.** A permanent public URL is a capability with no end: anyone who sees
-it, including a browser history or a proxy log, keeps access forever. Serving any file id to any caller
-turns a guessable id into a data leak. And a download path with no audit is the one access you cannot
-reconstruct after an incident, when the question is exactly who read which object and when.`,
+  so the CDN verifies it without calling back and a link minted for one tenant cannot be replayed by
+  another.
+- The URL **expires in 10 minutes** (\`600\` seconds); after that the client asks for a fresh one.
+- Every issuance appends an audit record (\`download_issued\`, file id, tenant and **requesting user**)
+  before the URL is returned.`,
   sequence: {
     participants: ['Client', 'Download API', 'File index', 'Audit topic'],
     messages: [
@@ -120,8 +119,7 @@ CDN_BASE = "https://cdn.example.com"
 
 @app.get("/v1/files/{file_id}")
 async def download(file_id: str, x_tenant_id: str = Header(default="")):
-    # TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
-    # audits nothing.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     return JSONResponse({"url": CDN_BASE + "/" + file_id}, status_code=200)
 `,
       solution: `import hashlib
@@ -172,8 +170,7 @@ const CDN_BASE = 'https://cdn.example.com';
 
 export function registerDownloadApi(app: FastifyInstance): void {
   app.get('/v1/files/:fileId', async (req, reply) => {
-    // TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
-    // audits nothing.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     return reply.code(200).send({url: CDN_BASE + '/' + (req.params as {fileId: string}).fileId});
   });
 }
@@ -216,8 +213,7 @@ import (
 )
 
 func download(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
-	// audits nothing.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	writeJSON(rw, http.StatusOK, map[string]string{"url": "https://cdn.example.com/" + r.PathValue("fileId")})
 }
 
@@ -294,8 +290,7 @@ object DownloadApi {
   val route: Route =
     path("v1" / "files" / Segment) { fileId =>
       get {
-        // TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
-        // audits nothing.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         complete(StatusCodes.OK, PublicUrl("https://cdn.example.com/" + fileId))
       }
     }
@@ -367,8 +362,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/files/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
-    // audits nothing.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     res.status = 200;
     res.set_content(json{{"url", kCdnBase + "/" + req.matches[1]}}.dump(), "application/json");
   });
@@ -437,9 +431,9 @@ int main() {
     },
   },
   hints: [
-    'The signature is the whole point: sign the path, the expiry and the tenant together so the CDN can verify the link without calling the API, and so a link minted for one tenant cannot be replayed by another.',
-    'Ten minutes is a budget, not a constant to admire: long enough for the browser to follow the redirect and start the transfer, short enough that a leaked link dies before it is useful. Return `expires_in` so the client knows when to ask again.',
-    'Answer 404 for another tenant’s file, never 403. A 403 tells the caller the id exists and belongs to someone else; a 404 tells them nothing, and the audit record is where the attempt shows up instead.',
+    "A link copied from a support ticket six months ago still downloads the file. A tenant pastes another tenant's file id and gets a working URL. The audit stream shows none of it.",
+    'The starter concatenates CDN_BASE and the file id and returns it. No lookup, no tenant comparison, no signature, no expiry, no audit append: the id alone is the credential.',
+    'Look the record up, answer 404 when record["tenant"] differs, set expires = now + SIGNED_URL_TTL_S, HMAC path, expiry and tenant with SIGNING_KEY, and audit.append a download_issued record before returning.',
   ],
-  debrief: `The interviewer is testing whether you can debug an access path, not just a storage path. The starter's "public URL" is the single most common shortcut and the most expensive: it turns a one-time read into a permanent capability. The fix has three parts — sign the URL so the CDN can verify it, give it a short expiry so a leak is bounded, and bind it to the tenant so the signature cannot be replayed. The audit record is the part candidates skip: it is what turns "someone read the object" into "this user read this object at this time". Real systems add per-object rate limits, a CDN-side check that the file's tenant still matches, and a key rotation that invalidates links older than the rotation window.`,
+  debrief: `A signed URL moves authorization out of the request path: the API decides once, the CDN verifies the signature offline, and the decision carries its own expiry. Signing the tenant into the URL is what stops a link minted for one tenant from being replayed by another, and answering 404 for a foreign id means the endpoint leaks nothing about which ids exist. The audit record is appended before the URL leaves because an issuance that fails to audit should fail to issue. Production download paths rotate the signing key on a schedule, which invalidates every link older than the rotation window, and let the CDN re-check the file's tenant on fetch so a moved or deleted object is not served from a still-valid link.`,
 };

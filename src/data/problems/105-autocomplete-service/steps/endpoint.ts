@@ -8,12 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads \`prefix\` from the
-query string, asks the index for matches and returns them. It compiles, it serves the demo — a
-three-letter prefix from one tenant — and it hides three production flaws. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
-
-Implement \`GET /v1/autocomplete?prefix=…\` for the typeahead box.
+**Starting point.** The starter registers \`GET /v1/autocomplete\`, reads \`prefix\` from the query
+string, lowercases it, asks the index for matches and returns every one of them. It compiles, it
+serves the demo (a three-letter ASCII prefix from one tenant), and it hides 4 flaws.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`prefix\` is normalized before it is used: case is folded and accents are folded to their base
@@ -29,10 +26,10 @@ Implement \`GET /v1/autocomplete?prefix=…\` for the typeahead box.
 - The response shape is \`{"prefix": <normalized>, "suggestions": [...]}\`.
 
 **Failure mode the checks target.** Matching on the unbounded raw prefix lets one request walk the
-whole index — \`prefix=\` empty returns thousands of terms — and it turns a case or accent difference
-into a second entry. Lowercasing without Unicode folding is the subtle one: \`Café\` and \`cafe\`
-survive as two suggestions because \`str.lower()\` never touches the accent, so the list "works" in
-English and duplicates the moment the catalog is not.`,
+whole index: \`prefix=\` empty returns thousands of terms, and a control character rides straight
+into the cache key and the log line. Lowercasing without Unicode folding is the subtle part:
+\`Café\` and \`cafe\` survive as two suggestions because \`str.lower()\` never touches the accent, so
+the list works in English and duplicates the moment the catalog is not.`,
   sequence: {
     participants: ['Client', 'Autocomplete API', 'Suggestion index'],
     messages: [
@@ -87,7 +84,7 @@ English and duplicates the moment the catalog is not.`,
       id: 'suggestion-cap',
       title: 'Returns at most 10 suggestions',
       detail:
-        'The endpoint owns the contract: it folds, dedupes by the normalized term, and returns at most 10. The starter returns every match in the index — thousands for a short prefix.',
+        'The endpoint owns the contract: it folds, dedupes by the normalized term, and returns at most 10. The starter returns every match in the index, thousands for a short prefix.',
       match: {
         python: {all: [/MAX_SUGGESTIONS/, /\[:MAX_SUGGESTIONS\]/]},
         typescript: {all: [/MAX_SUGGESTIONS/, /slice\(\s*0\s*,\s*MAX_SUGGESTIONS\s*\)/]},
@@ -128,9 +125,7 @@ index = SuggestionIndex()
 
 @app.get("/v1/autocomplete")
 def autocomplete(prefix: str = "", x_tenant_id: str = Header(default="")):
-    # TODO: this starter matches on the raw prefix with no bounds, returns every match in the
-    # index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-    # and "cafe" both appear as separate suggestions. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     return {"prefix": prefix.lower(), "suggestions": index.matching(x_tenant_id, prefix.lower())}
 `,
       solution: `import unicodedata
@@ -202,9 +197,7 @@ const index: SuggestionIndex = {
 };
 
 app.get('/v1/autocomplete', async (request, reply) => {
-  // TODO: this starter matches on the raw prefix with no bounds, returns every match in the
-  // index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-  // and "cafe" both appear as separate suggestions. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const prefix = String((request.query as Record<string, unknown>).prefix ?? '');
   return {prefix: prefix.toLowerCase(), suggestions: await index.matching(tenant, prefix.toLowerCase())};
@@ -276,9 +269,7 @@ type SuggestionIndex interface {
 func autocomplete(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	prefix := r.URL.Query().Get("prefix")
-	// TODO: this starter matches on the raw prefix with no bounds, returns every match in the
-	// index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-	// and "cafe" both appear as separate suggestions. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	terms, _ := index.Matching(tenant, strings.ToLower(prefix))
 	rw.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(rw).Encode(map[string]any{"prefix": strings.ToLower(prefix), "suggestions": terms})
@@ -413,9 +404,7 @@ object Api {
       get {
         parameter("prefix".?) { prefixOpt =>
           headerValueByName("X-Tenant-Id") { tenant =>
-            // TODO: this starter matches on the raw prefix with no bounds, returns every match in
-            // the index (thousands for a short prefix), and lowercases without Unicode folding,
-            // so "Café" and "cafe" both appear as separate suggestions. Fix all three.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val prefix = prefixOpt.getOrElse("").toLowerCase
             complete(StatusCodes.OK, s"""{"prefix":"$prefix","suggestions":[]}""")
           }
@@ -518,9 +507,7 @@ int main() {
   svr.Get("/v1/autocomplete", [](const httplib::Request& req, httplib::Response& res) {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto prefix = req.get_param_value("prefix");
-    // TODO: this starter matches on the raw prefix with no bounds, returns every match in the
-    // index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-    // and "cafe" both appear as separate suggestions. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto terms = matching(tenant, prefix);
     res.status = 200;
     res.set_content(json{{"prefix", prefix}, {"suggestions", terms}}.dump(), "application/json");
@@ -651,9 +638,9 @@ int main() {
     },
   },
   hints: [
-    'Normalize before you bound. The prefix arrives as user text, so fold case and accents first and then check the 1..64 limit on the folded string — an oversized raw prefix that folds to 64 characters is still fine, a folded prefix over 64 is not.',
-    'Reject control characters explicitly, before the index: a newline or a NUL in a prefix corrupts cache keys and log lines. The cost order is normalize, reject control characters, bound the length, then look up.',
-    'The index returns everything that matches; the endpoint owns the ten-suggestion contract. Fold each term, keep the first spelling you see per normalized key, and slice the ranked list to ten after dedupe — never truncate the raw list first.',
+    'Send prefix= with nothing after it, or type "Café": the first returns the whole index, the second lists the same term twice.',
+    'The handler passes the raw prefix straight to the index: no length check, no control-character check, and lower() leaves accents in place.',
+    'Fold case and accents (NFKD, strip combining marks), reject control characters, enforce 1..64 on the folded string, dedupe by the folded term, then slice to 10.',
   ],
-  debrief: `The interviewer is testing whether you can debug a typeahead handler at the trust boundary. The starter reads fine because the demo sends a short ASCII prefix from one tenant. Three defects are being checked. Unbounded matching turns the endpoint into a bulk export: an empty prefix returns the whole index, and a 64-character cap makes a scrape expensive instead of free. Control characters are the second: they never belong in a cache key or a log line, so they are rejected before the lookup. The subtle one is Unicode folding: \`lower()\` is not normalization, so \`Café\` and \`cafe\` survive as two suggestions and the "duplicate" bug only appears once the catalog is not English. Real endpoints keep the ranking server-side, return a stable list per normalized prefix so the client can cache it, and hash the prefix in analytics rather than sending it raw.`,
+  debrief: `The fix is an ordering: normalize, reject, bound, look up, dedupe, cap. Normalizing first means the length limit and the dedupe key both see the same string the cache and the index will see, so an oversized raw prefix that folds to 64 characters still passes and a 65-character folded one does not. Rejecting control characters before the lookup keeps them out of every cache key and log line downstream. The cap is applied after dedupe because truncating the raw list first lets two spellings of one term crowd out a ninth and tenth suggestion. Production typeaheads go further: the ranking stays server-side and stable between keystrokes, the folding table is shared with the indexer so both sides agree on what one term is, and the length bound is enforced in the client too so the request is not sent at all.`,
 };

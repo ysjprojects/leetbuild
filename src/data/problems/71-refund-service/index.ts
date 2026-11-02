@@ -7,76 +7,67 @@ import {refundEventsStep} from './steps/4-events';
 import {refundReadStep} from './steps/5-read';
 
 /**
- * Refund service: the course is not "call the PSP from an endpoint", it is the debugging you owe a
- * money path before it refunds twice. Validated, idempotent endpoint → one atomic Redis ledger per
- * payment with a lifetime cap → a PSP call with a deadline and a stable idempotency key that
- * records unknowns as pending → payment-keyed refund events with an outbox and
- * confirm-before-publish → a read endpoint that reconstructs the balance from the durable records
- * and reconciles the cache.
+ * Refund service: the debugging you owe a money path before it refunds twice. Validated,
+ * idempotent endpoint → one atomic Redis ledger per payment with a lifetime cap → a PSP call with
+ * a deadline and a stable idempotency key that records unknowns as pending → payment-keyed refund
+ * events with an outbox and confirm-before-publish → a read endpoint that reconstructs the balance
+ * from the durable records and reconciles the cache.
  */
 export const refundServiceProblem: Problem = {
   id: 'refund-service',
   title: 'Refund Service',
-  tagline: 'Refunds capped by the original payment, executed once, and visible immediately.',
+  tagline: 'Refunds capped by the original payment, with a retry that pays once.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Refund Service
 
-A refund service is the piece of a payment platform that gives money back. The visible part is one
-number in a support tool; the parts that decide whether the platform is safe are the cap that makes
-a refund impossible to exceed, the key that makes a retry the same refund, the state machine that
-survives a provider timeout, and the read path finance reconciles against.
+A refund service is the piece of a payment platform that gives money back. The parts that decide
+whether it is safe are the cap a refund cannot exceed, the key that makes a retry the same refund,
+the state that survives a provider timeout, and the read path finance reconciles against.
 
 ## The real system
 
-Refunds are money movement, and money movement is not idempotent by default. A production service
-therefore treats every refund as one *intent* with a lifetime: the amount may never exceed what the
-customer actually paid, the claim against that cap is atomic so two concurrent partial refunds
-cannot both pass the same remaining balance, and the provider call carries the refund id as its
-idempotency key so a retry after a timeout cannot pay twice. A timeout is not a failure — it is an
-*unknown*, and the honest local state is \`PENDING\` until the provider is asked what happened.
-Those unknowns are reconciled before anything is shown to a customer, the durable refund records —
-not a cache — remain the ledger of record, and the events that describe the lifecycle are keyed so a
-single payment's history stays ordered.
+Stripe's Refunds API is the shape this service copies. A charge may be refunded several times, but
+the refunded total cannot exceed the original charge amount; every refund is its own object whose
+status moves through \`pending\`, \`succeeded\`, \`failed\` or \`canceled\`, and a
+\`refund.updated\` event later carries the acquirer reference number support hands to a customer
+who cannot find the credit. The merchant side follows the same rules: the claim against the cap is
+atomic, the provider call carries the refund id as its idempotency key so a retry cannot pay twice,
+a timeout leaves the refund \`PENDING\` until the provider is asked, and the durable refund records,
+not a cache, remain the ledger of record.
 
 ## What you build here
 
 One service, **refundd**, with five pieces:
 
-1. \`POST /v1/refunds\`: authenticated tenant, validated amount (integer, at least 1) and reason
-   code, a payment that must belong to the caller (**404** otherwise), an amount above the remaining
-   refundable balance refused with **422**, and an \`Idempotency-Key\` so a retry returns the first
-   refund instead of paying twice.
-2. A **Redis** ledger: one key per payment (\`refunded:{payment_id}\`), a **lifetime** cap with no
-   TTL, and one atomic Lua \`EVAL\` that reads, refuses above the payment total and adds otherwise —
-   rebuildable at any moment from the durable refund records.
-3. A **gRPC** PSP client: a **5-second** deadline per attempt, at most three attempts, the refund id
-   as the idempotency key on every attempt, \`PENDING\` plus reconciliation for unknown outcomes, and
-   a terminal rejection that releases exactly the reservation it took.
-4. A **Kafka** refund event path: one \`refund.event\` per confirmed refund keyed by the **payment**
-   id, amounts, reason codes and PSP references in the payload, an idempotent producer with
-   \`acks=all\`, and an outbox row when the broker rejects the produce — with nothing published
-   before the provider confirms.
-5. \`GET /v1/payments/{id}/refunds\`: the refunded total and remaining balance reconstructed from the
-   durable records, matched against the Redis ledger with the drift reported, pending refunds
-   reconciled with the PSP and called out with their references, and a foreign payment id answered
-   with **404**.
+1. \`POST /v1/refunds\`: authenticated tenant, validated amount and reason code, a foreign payment
+   answered **404**, an amount above the remaining balance refused with **422**, and an
+   \`Idempotency-Key\` so a retry returns the first refund.
+2. A **Redis** ledger: one key per payment (\`refunded:{payment_id}\`), no TTL, one atomic Lua
+   \`EVAL\` that reads, refuses above the payment total and adds otherwise, and a rebuild from the
+   durable refund records.
+3. A **gRPC** PSP client: a 5-second deadline, at most three attempts, the refund id as the
+   idempotency key on every attempt, \`PENDING\` plus reconciliation for unknown outcomes, and a
+   terminal rejection that releases only its reservation.
+4. A **Kafka** event path: one \`refund.event\` per confirmed refund keyed by the payment id with
+   amount, reason code and PSP reference, an idempotent producer with \`acks=all\`, and an outbox
+   row when the broker rejects the produce.
+5. \`GET /v1/payments/{id}/refunds\`: the total reconstructed from the durable records, the Redis
+   drift reported, pending refunds reconciled with the PSP, and a foreign payment id answered
+   **404**.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real payments feature: debug
-it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version. In a refund service the failures
-are especially quiet: a double refund looks like a happy customer until finance closes the month.
+Every starter in this course is working code with flaws: it compiles, serves the happy path and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
+checks that fail on the starter and pass on your version. A double refund looks like a happy
+customer until finance closes the month.
 
 ## Left out on purpose
 
-PSP account onboarding, bank settlement timelines, chargeback and dispute handling, partial
-refund fees, tax adjustments, currency conversion, refund approval workflows, customer
-notifications and the accounting export. The five pieces above are the ones that decide whether the
-refund path is correct, isolated and shippable.`,
+PSP onboarding, settlement timelines, chargebacks and disputes, refund fees, tax adjustments,
+currency conversion, approval workflows, customer notifications and the accounting export.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Merchant client', sub: 'refund · retry', x: 8, y: 40},

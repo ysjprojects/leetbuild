@@ -8,38 +8,27 @@ export const summarizerStateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it keeps a per-source record in Redis, folds each
-chunk's summary into it and bumps a counter. It works for one document that is written once, by one
-writer, that never fails. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter serves \`POST /v1/sources/{source_id}/chunks\` with body
+\`{"chunk_index": n, "chunk_summary": "…"}\`: it \`HSET\`s the chunk summary into a Redis hash under
+\`progress_key(tenant, source_id)\`, \`HINCRBY\`s a counter and returns the record. It compiles, it
+serves the demo, and it hides five flaws.
 
-A long source is summarized chunk by chunk. Implement the per-source progress record:
+**Failure mode the checks target.** The summary and the counter are two commands, so a crash between
+them leaves a summary claiming chunks it has not read: the invented quarter. The key carries no
+content hash, so an edited source extends the previous version's summary. There is no TTL, no
+version in the reply, and the counter counts deliveries, so a redelivered chunk double-counts.
 
-- Key it by \`progress_key(tenant, source_hash)\` → \`summary:progress:{tenant}:{source_hash}\`, where
-  \`source_hash\` is a **content hash** of the source (a hex digest of its bytes), not the source id.
-  The hash *is* the version: editing a source produces a new hash, a new key and a **new summary
-  line**, and the old record is left untouched instead of being extended.
-- Commit one chunk with \`apply_chunk(tenant, source_hash, chunk_index, chunk_summary)\`. The rolling
-  summary, the version it belongs to and the covered-chunk counter (\`chunks_done\`) must move in a
-  **single** atomic step — one registered Lua script (\`COMMIT_LUA\`) — never as separate writes. A
-  crash between "write the summary" and "bump the counter" is exactly how a summary ends up claiming
-  chunks it never read, and a summary that claims coverage it never had invents events that never
-  happened.
-- Set the TTL inside that same script: \`TTL_S = 3600\`, refreshed when the key has no expiry, so
-  progress expires with the source's window instead of living forever.
-- Re-applying a chunk must be idempotent: the script compares the incoming \`chunk_index\` with the
-  stored counter and returns the record unchanged when that chunk is already covered, so a retried
-  chunk cannot push the counter past the chunks that were actually summarized.
-- The returned record reports only completed work: \`chunks_done\`, the rolling \`summary\`, the
-  \`summary_version\` it covers, and \`line\` — \`NEW_LINE\` when this chunk opened a summary line for
-  this hash, the continuation otherwise.
+Requirements:
 
-**Failure mode the checks target.** The starter writes the summary with \`HSET\` and bumps the counter
-with a second command, so a crash (or a timeout between the two) leaves a summary that claims
-chunks it never read — the invented quarter. It keys progress by \`source_id\` with no content hash,
-so an edited source resumes the old line and appends new text to a summary of the previous version.
-It sets no TTL, so progress for deleted sources never expires. And it increments the counter by one
-instead of storing the chunk index it covered, so a redelivered chunk silently double-counts.`,
+- Key the record by \`progress_key(tenant, source_hash)\` → \`summary:progress:{tenant}:{source_hash}\`,
+  where \`source_hash\` is a hex digest of the source bytes. A new hash opens a new summary line.
+- \`apply_chunk(tenant, source_hash, chunk_index, chunk_summary)\` commits the rolling summary, its
+  \`summary_version\` and \`chunks_done\` in one registered Lua script (\`COMMIT_LUA\`).
+- The script sets \`TTL_S = 3600\` with \`EXPIRE\` when the key has no expiry.
+- The script compares \`chunk_index\` with the stored counter (\`idx <= done\`) and returns the record
+  unchanged when the chunk is already covered.
+- The reply carries \`chunks_done\`, \`summary\`, \`summary_version\` and \`line\`: \`NEW_LINE\` when
+  this chunk opened the line for its hash, the continuation otherwise.`,
   sequence: {
     participants: ['Chunk writer', 'Summarizer', 'Redis'],
     messages: [
@@ -148,9 +137,7 @@ def progress_key(tenant: str, source_id: str) -> str:
 
 @app.post("/v1/sources/{source_id}/chunks")
 def apply_chunk(source_id: str, body: ChunkBody, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter writes the rolling summary and then bumps the counter as two separate
-    # commands, keys progress by source id with no content hash, never sets a TTL, and increments
-    # the counter instead of storing the chunk it covered. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = progress_key(tenant, source_id)
     r.hset(key, mapping={"summary": body.chunk_summary, "summary_version": str(body.chunk_index)})
     r.hincrby(key, "chunks_done", 1)
@@ -270,9 +257,7 @@ export async function applyChunk(
   chunkIndex: number,
   chunkSummary: string,
 ): Promise<{chunks_done: number; summary: string}> {
-  // TODO: this starter writes the rolling summary and then bumps the counter as two separate
-  // commands, keys progress by source id with no content hash, never sets a TTL, and increments
-  // the counter instead of storing the chunk it covered. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = progressKey(tenant, sourceId);
   await r.hset(key, {summary: chunkSummary, summary_version: String(chunkIndex)});
   await r.hincrby(key, 'chunks_done', 1);
@@ -376,9 +361,7 @@ func progressKey(tenant, sourceID string) string {
 // applyChunk folds one chunk into the rolling summary. The starter does it in two
 // steps and keys by source id.
 func applyChunk(ctx context.Context, rdb *redis.Client, tenant, sourceID string, body ChunkBody) (map[string]any, error) {
-	// TODO: this starter writes the rolling summary and then bumps the counter as two separate
-	// commands, keys progress by source id with no content hash, never sets a TTL, and increments
-	// the counter instead of storing the chunk it covered. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := progressKey(tenant, sourceID)
 	if err := rdb.HSet(ctx, key, "summary", body.ChunkSummary, "summary_version", body.ChunkIndex).Err(); err != nil {
 		return nil, err
@@ -492,9 +475,7 @@ object SourceProgress {
 
   /** Fold one chunk into the rolling summary. The starter does it in two steps. */
   def applyChunk(tenant: String, sourceId: String, chunkIndex: Int, chunkSummary: String): Map[String, String] = {
-    // TODO: this starter writes the rolling summary and then bumps the counter as two separate
-    // commands, keys progress by source id with no content hash, never sets a TTL, and increments
-    // the counter instead of storing the chunk it covered. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = progressKey(tenant, sourceId)
     Redis.hset(key, "summary", chunkSummary)
     Redis.hset(key, "summary_version", chunkIndex.toString)
@@ -579,9 +560,7 @@ static std::string progress_key(const std::string& tenant, const std::string& so
 /** Fold one chunk into the rolling summary. The starter does it in two steps. */
 std::string apply_chunk(Redis& redis, const std::string& tenant, const std::string& source_id, int chunk_index,
                         const std::string& chunk_summary) {
-  // TODO: this starter writes the rolling summary and then bumps the counter as two separate
-  // commands, keys progress by source id with no content hash, never sets a TTL, and increments
-  // the counter instead of storing the chunk it covered. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto key = progress_key(tenant, source_id);
   redis.hset(key, "summary", chunk_summary);
   redis.hset(key, "summary_version", std::to_string(chunk_index));
@@ -654,19 +633,16 @@ Progress apply_chunk(Redis& redis, const std::string& tenant, const std::string&
     },
   },
   hints: [
-    'The counter and the summary are one fact, not two: "the summary covers chunks 0..n". Write them with one registered Lua script and commit them together, because the crash you cannot reproduce is the one that leaves a summary claiming chunks it never read.',
-    'Bind progress to the source **content** hash, not the source id — the hash is the version. A new hash means a new key, a new summary line, and the old record left alone for whoever is still reading the old version.',
-    'Make the commit idempotent: compare the incoming chunk index with `chunks_done` and return the stored record unchanged when the chunk is already covered, so a redelivery counts a chunk once.',
+    'A worker dies mid-request and the reopened record says `chunks_done: 7` over a summary that covers six. After an author edits the document, new chunks land on the old summary.',
+    '`hset` and `hincrby` are two round trips with no transaction between them, and `progress_key` takes `source_id`, so one key outlives every edit. `HINCRBY` counts calls, not chunk indexes.',
+    'Register `COMMIT_LUA` that checks `idx <= done`, `HSET`s summary, version and `chunks_done`, and `EXPIRE`s with `TTL_S`. Key by `source_hash`; return `line` as `NEW_LINE` when the key was empty.',
   ],
-  debrief: `The interview question behind this step is atomicity of a derived fact: a rolling summary *is* the
-claim "I have read these chunks", so the text and the counter have to be written as one thing. Two
-writes pass every serial test and fail exactly when a worker dies between them, and the failure is
-silent — the summary looks complete and mentions text it never read, which is how a board summary
-invents a quarter. Binding progress to the source content hash is the second half: without it an
-edited source resumes the previous summary and appends new text onto a summary of a document that no
-longer exists, and the fix is to make the version part of the key. A TTL keeps progress from
-outliving the source, and index-based idempotence makes retries — which every chunk writer has —
-harmless. Real systems add a per-chunk digest so a re-summarized chunk replaces its own contribution,
-a compaction pass that folds long lines into a stored version, and a lock so two workers cannot
-interleave writes to one source.`,
+  debrief: `A rolling summary is the claim "I have read these chunks", so the text and the counter are one
+fact and get one write. Two commands pass every serial test and fail only when a worker dies between
+them, silently: the summary looks complete and mentions text it did not read. The
+Lua script fixes it because Redis runs a script without interleaving, and the idempotence check lives
+inside it for the same reason. The content hash in the key makes the version part of the identity,
+so an edit opens a new line and leaves the old one alone; the TTL sits in the script so no key can
+exist without an expiry. Production systems add a per-chunk digest so a re-summarized chunk replaces
+its own contribution.`,
 };

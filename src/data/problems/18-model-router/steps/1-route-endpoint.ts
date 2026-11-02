@@ -8,11 +8,15 @@ export const routeEndpointStep: Step = {
   focus: ['client', 'router', 'db', 'provider'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns a routing decision. It compiles, it serves the demo, and it hides four
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/route\` with body
+\`{"prompt": "…", "max_tokens": 256, "policy": "auto"}\`, reads \`X-Tenant-Id\`, computes the
+estimate and returns \`{"model": <policy>, "estimated_tokens": …}\`. It compiles, it serves the demo,
+and it hides four flaws.
 
-Implement \`POST /v1/route\` with body \`{"prompt": "…", "max_tokens": 256, "policy": "auto"}\`.
+**Failure mode the checks target.** Returning \`policy\` as the model name lets a caller name any
+model the provider serves; the missing caps turn one huge prompt into an unbounded bill; an un-keyed
+endpoint double-routes every client retry; and the prompt in the log line ships tenant content into a
+pipeline that outlives the request and the retention policy.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`prompt\` is a non-empty string of at most **256 KiB** (\`1 << 18\` bytes) of UTF-8; a larger
@@ -20,18 +24,12 @@ Implement \`POST /v1/route\` with body \`{"prompt": "…", "max_tokens": 256, "p
 - \`max_tokens\` is an integer from **1** to **4096** (**400** otherwise) and defaults to 256.
 - \`policy\` is one of \`auto\`, \`small\`, \`large\` (**400** otherwise). The model is chosen
   server-side: \`auto\` routes to the small model when the estimate is at most **2048** tokens and
-  to the large model above that; \`small\` and \`large\` pin the choice. Never echo a caller-supplied
-  string as the model name — the caller picks a policy, the router picks the model.
+  to the large model above that; \`small\` and \`large\` pin the choice. The caller picks a policy,
+  the router picks the model.
 - The estimate is \`len(prompt) // 4 + max_tokens\`.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same
   \`(tenant, key)\` returns the stored decision instead of routing again.
-- Log the decision with tenant, model and estimate — never the prompt text.
-
-**Failure mode the checks target.** Trusting \`policy\` as a model name lets a caller name any model
-the provider serves; the missing caps turn one huge prompt into an unbounded bill; an un-keyed route
-endpoint double-routes every client retry. The prompt in the log line is the quiet one: it ships
-tenant content into the log pipeline on every request, where it outlives the request, the tenant and
-the retention policy.`,
+- Log the decision with tenant, model and estimate, not the prompt text.`,
   sequence: {
     participants: ['Client', 'Model Router', 'policy store'],
     messages: [
@@ -75,7 +73,7 @@ the retention policy.`,
       id: 'tenant-policy',
       title: 'Authenticates the tenant and picks the model server-side',
       detail:
-        'The tenant is required — **401** when absent — and `policy` is checked against `auto`/`small`/`large`; the model is derived from the policy and the estimate (auto → small at ≤ 2048 tokens, large above). The starter returns the caller’s `policy` string as the model name.',
+        'The tenant is required (**401** when absent) and `policy` is checked against `auto`/`small`/`large`; the model is derived from the policy and the estimate (auto: small at ≤ 2048 tokens, large above). The starter returns the caller’s `policy` string as the model name.',
       match: {
         python: {all: [/ALLOWED_POLICIES/, /status_code\s*=\s*401/, /SMALL_MODEL/, /AUTO_SMALL_MAX_TOKENS/]},
         typescript: {all: [/ALLOWED_POLICIES/, /code\(\s*401\s*\)/, /SMALL_MODEL/, /AUTO_SMALL_MAX_TOKENS/]},
@@ -99,7 +97,7 @@ the retention policy.`,
     },
     {
       id: 'no-prompt-log',
-      title: 'Logs the decision, never the prompt',
+      title: 'Logs the decision without the prompt',
       detail:
         'The routing decision is logged with tenant, model and estimate; the prompt text never reaches a log line. The starter logs `prompt` on every request.',
       match: {
@@ -144,8 +142,7 @@ store = RouteStore()
 
 @app.post("/v1/route")
 def route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter treats the caller's policy as the model name, checks neither the prompt
-    # size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     estimate = len(body.prompt) // 4 + body.max_tokens
     logger.info("route tenant=%s prompt=%r", tenant, body.prompt)
     return JSONResponse({"model": body.policy, "estimated_tokens": estimate}, status_code=200)
@@ -231,7 +228,7 @@ def route(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/route: flawed code that echoes the caller's policy. */
+      starter: `/** POST /v1/route. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -243,8 +240,7 @@ interface RouteBody {
 }
 
 app.post('/v1/route', async (request, reply) => {
-  // TODO: this starter returns the caller's policy as the model name, checks neither the prompt
-  // size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RouteBody;
   const estimate = Math.floor(body.prompt.length / 4) + (body.max_tokens ?? 256);
@@ -353,8 +349,7 @@ func route(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter returns the caller's policy as the model name, checks neither the prompt
-	// size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	estimate := len([]byte(body.Prompt))/4 + body.MaxTokens
 	log.Printf("route tenant=%s prompt=%q", tenant, body.Prompt)
 	writeJSON(rw, http.StatusOK, map[string]any{"model": body.Policy, "estimated_tokens": estimate})
@@ -520,8 +515,7 @@ object RouteApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RouteRequest]) { body =>
-            // TODO: this starter returns the caller's policy as the model name, checks neither the
-            // prompt size nor max_tokens, ignores Idempotency-Key, and logs the prompt.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val estimate = body.prompt.getBytes("UTF-8").length / 4 + body.max_tokens
             system.log.info(s"route tenant=$tenant prompt=\${body.prompt}")
             complete(StatusCodes.OK, s"""{"model":"\${body.policy}","estimated_tokens":$estimate}""")
@@ -642,8 +636,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter returns the caller's policy as the model name, checks neither the prompt
-    // size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto prompt = body.value("prompt", std::string());
     const int maxTokens = body.value("max_tokens", 256);
     const int estimate = static_cast<int>(prompt.size()) / 4 + maxTokens;
@@ -758,9 +751,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant, Idempotency-Key, prompt shape, byte length, max_tokens range, policy whitelist. Every one of them returns before any provider work, so the endpoint can never spend money on a malformed request.',
-    'The idempotency lookup is keyed by `(tenant, key)` and happens before routing; a hit returns the stored decision with 200. Storing the decision — not just the request hash — is what lets a replay answer without re-estimating or re-routing.',
-    'The log line is a contract: tenant, model, policy, estimate. The prompt belongs to the caller; if you need it for debugging, hash it or keep only its length. `logger.info(..., body.prompt)` leaks tenant content into every log sink.',
+    'Send the same request twice with one `Idempotency-Key`, or send `policy: "gpt-giant"`: both route again and the response echoes the policy string as the model, and the log line shows the whole prompt.',
+    'The handler reads only the body and the tenant header: no `Idempotency-Key`, no `store` lookup, no size or range check, and the response is built straight from `body.policy`, so every request is routed fresh and unbounded.',
+    'Guard in cost order (tenant 401, key 400, bytes 413, max_tokens 400, policy 400), then `store.get`; on a miss pick `SMALL_MODEL`/`LARGE_MODEL` from policy and estimate, `store.put`, and log tenant, model, estimate only.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one tenant and never retries. Four separate defects are being checked: authentication (the tenant is never optional), input caps (cheap rejections before expensive work), server-side policy resolution (the caller names a policy, never a model), and idempotency keyed by tenant so a retry cannot double-route. The log line is the fourth one that candidates miss in interviews: the prompt has to be assumed sensitive, so it may never be logged verbatim. Real routers add per-tenant policy overrides from config, request-scoped trace ids, and a hashed prompt fingerprint for dedupe and debugging.`,
+  debrief: `The fix is a funnel: every guard runs before any work that costs money, in the order of how cheap it is to decide, and the idempotency lookup sits between validation and routing so a replay is answered from the store without a second estimate. The model is derived from the policy and the estimate because the policy is the only thing a caller is entitled to choose; the provider's model catalogue is the router's business. The log line carries ids and numbers only, since a prompt written to a log sink outlives the request and the tenant's retention terms. Production routers also attach a request-scoped trace id, store a hashed prompt fingerprint for dedupe and debugging, and read per-tenant policy overrides from config instead of a hard-coded threshold.`,
 };

@@ -8,36 +8,28 @@ export const agentChainStep: Step = {
   focus: ['api', 'agents', 'workspaces'],
   task: `## Task
 
-**Starting point.** The starter is working code: with small tables and a
-healthy agent service it returns SQL, so the demo passes. It hides four production flaws: no
-deadline on any call, an unbounded retry of every error, no column pruning, and model output
-trusted as JSON. Find them, fix them, and prove the fix.
+**Starting point.** The starter is the agent client the service uses after the user ACKs the
+tables: \`plan(question)\` (intent, then tables) and \`generate(question, workspace, tables)\`
+(schemas, then generation). Every RPC goes through one \`call\` helper that loops until it gets an
+answer; the schemas go to \`Generate\` as fetched and its text field is indexed as JSON. With small
+tables and a healthy agent service it returns SQL, so the demo passes. It compiles and hides 5
+flaws.
 
-Implement the agent client the service uses after the user ACKs the tables — \`plan(question)\`
-(intent, then tables) and \`generate(question, workspace, tables)\` (schemas, pruning, generation):
+**Failure mode the checks target.** Retrying forever spins a worker against a provider that will
+not answer differently; with no deadline a slow generation holds the request open; with no pruning
+two wide tables fail intermittently on token size; and indexing into \`json.loads(text)["sql"]\`
+turns one malformed answer into a 500.
 
-- Every call carries a deadline: **10 s** for the classifiers (\`Intent\`, \`PickTables\`,
-  \`PruneColumns\`; \`AGENT_DEADLINE_S = 10\`) and **30 s** for \`Generate\`
-  (\`GENERATE_DEADLINE_S = 30\`). A call without one lets a stuck model pin a worker for as long
-  as the provider feels like.
-- At most **2 attempts** per call (\`MAX_ATTEMPTS = 2\`) and only \`UNAVAILABLE\` is retried;
-  \`INVALID_ARGUMENT\`, \`RESOURCE_EXHAUSTED\` and everything else return to the caller at once.
-- Before \`Generate\`, estimate the schema size as \`characters / 4\` tokens
-  (\`estimate_tokens\`). When it exceeds \`SCHEMA_TOKEN_BUDGET = 24000\`, call the **column prune
-  agent** with the question and the schemas, and generate from the pruned schemas it returns. The
-  source's wide tables cost 40–60K tokens each and broke the 32K-token model they started with;
-  pruning is what made large tables generate at all, and it cut the cost and latency of every
-  call since.
-- The model's answer is a text field holding JSON \`{"sql": "…", "explanation": "…"}\`. Parse it in
-  \`parse_output\`: invalid JSON, a missing or non-string \`sql\` or \`explanation\`, or an empty
-  \`sql\` is a \`GenerationError\`, not a crash in the handler.
+Requirements:
 
-**Failure mode the checks target.** The starter retries forever on any error, so a permanent
-\`INVALID_ARGUMENT\` spins the worker against a provider that will never answer differently; with
-no deadline a slow generation holds the request open indefinitely; with no pruning the request
-that includes two wide tables fails intermittently on token size, which is exactly the bug that
-appeared when more users arrived; and indexing straight into \`json.loads(text)["sql"]\` turns one
-malformed model answer into a 500 with a stack trace.`,
+- Every call carries a deadline: \`AGENT_DEADLINE_S = 10\` for \`Intent\`, \`PickTables\` and
+  \`PruneColumns\`; \`GENERATE_DEADLINE_S = 30\` for \`Generate\`.
+- At most \`MAX_ATTEMPTS = 2\` per call and only \`UNAVAILABLE\` is retried; every other status
+  returns to the caller at once.
+- Before \`Generate\`, \`estimate_tokens\` is \`characters / 4\`. Over \`SCHEMA_TOKEN_BUDGET = 24000\`,
+  call the **column prune agent** with the question and schemas and generate from what it returns.
+- The model's text field holds JSON \`{"sql": "…", "explanation": "…"}\`. \`parse_output\` raises
+  \`GenerationError\` on invalid JSON, a missing or non-string field, or an empty \`sql\`.`,
   sequence: {
     participants: ['querygen', 'Agents', 'Catalog'],
     messages: [
@@ -59,9 +51,9 @@ malformed model answer into a 500 with a stack trace.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). Put the retry in one helper that takes the call as a closure: `for attempt in range(MAX_ATTEMPTS)`, catch the RPC error, compare its code to `UNAVAILABLE`, and re-raise anything else immediately.',
-    'Pruning is a size decision made before generation: sum the schema characters, divide by four, compare to `SCHEMA_TOKEN_BUDGET`. Only when the estimate is over budget does the prune agent run, and what it returns replaces the schemas you pass to `Generate`.',
-    '`parse_output` is defensive by construction: parse inside a try, check the result is an object, check `sql` and `explanation` are strings, check `sql` is not blank, and raise `GenerationError` with a reason for anything else. The handler maps that one error type to a 502; everything else is a bug.',
+    'Symptoms: two wide tables fail on token size now and then, a bad argument pins a worker in a retry loop, a slow generation holds the connection open, one odd model answer is a 500.',
+    '`call` takes no deadline and loops `while True` with a catch-all except; nothing measures the schemas before `Generate`; the handler does `json.loads(text)["sql"]` and trusts the shape.',
+    'Pass `timeout=` per call (10 s / 30 s), loop `range(MAX_ATTEMPTS)` re-raising all but `UNAVAILABLE`, prune when `estimate_tokens` exceeds `SCHEMA_TOKEN_BUDGET` and generate from the pruned schemas, validate in `parse_output` raising `GenerationError`.',
   ],
   checks: [
     {
@@ -186,9 +178,7 @@ agents = agents_pb2_grpc.AgentsStub(grpc.insecure_channel("agents:9000"))
 
 
 def call(fn):
-    # TODO: add per-call deadlines (10 s classifiers, 30 s Generate), bound the attempts to 2 and
-    # retry only UNAVAILABLE, prune columns when the schemas exceed the token budget, and parse the
-    # model output defensively instead of indexing into it.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             return fn()
@@ -296,7 +286,7 @@ def generate(question: str, workspace: str, tables: list[str]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Agent chain: flawed code that retries everything forever and trusts the output. */
+      starter: `/** Agent chain: the starter. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -327,9 +317,7 @@ function unary<R>(start: (callback: Callback<R>) => void): Promise<R> {
 }
 
 async function withRetry<R>(call: () => Promise<R>): Promise<R> {
-  // TODO: add per-call deadlines (10 s classifiers, 30 s Generate), bound the attempts to 2 and
-  // retry only UNAVAILABLE, prune columns when the schemas exceed the token budget, and parse the
-  // model output defensively instead of indexing into it.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       return await call();
@@ -491,9 +479,7 @@ type Generated struct {
 	Explanation string \`json:"explanation"\`
 }
 
-// TODO: add per-call deadlines (10 s classifiers, 30 s Generate), bound the attempts to 2 and
-// retry only UNAVAILABLE, prune columns when the schemas exceed the token budget, and parse the
-// model output defensively instead of indexing into it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func withRetry[R any](ctx context.Context, call func(ctx context.Context) (R, error)) R {
 	for {
 		reply, err := call(ctx)
@@ -644,9 +630,7 @@ final case class Generated(sql: String, explanation: String)
 object AgentChain {
   val agents = AgentsGrpc.blockingStub(ManagedChannelBuilder.forAddress("agents", 9000).usePlaintext().build())
 
-  // TODO: add per-call deadlines (10 s classifiers, 30 s Generate), bound the attempts to 2 and
-  // retry only UNAVAILABLE, prune columns when the schemas exceed the token budget, and parse the
-  // model output defensively instead of indexing into it.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def withRetry[R](call: () => R): R = {
     var result: Option[R] = None
     while (true) {
@@ -780,9 +764,7 @@ struct Generated {
 
 std::vector<std::string> schemasFor(const std::vector<std::string>& tables);
 
-// TODO: add per-call deadlines (10 s classifiers, 30 s Generate), bound the attempts to 2 and
-// retry only UNAVAILABLE, prune columns when the schemas exceed the token budget, and parse the
-// model output defensively instead of indexing into it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 template <typename Call>
 void withRetry(Call call) {
   while (true) {
@@ -935,5 +917,5 @@ Generated generate(
 `,
     },
   },
-  debrief: `The interviewer is asking one question in four forms: what is the worst case of each model call? A deadline bounds one attempt; the attempt cap and the retryable set bound the call — and the set is tiny on purpose, because an \`INVALID_ARGUMENT\` from a classifier will be an \`INVALID_ARGUMENT\` on the next try too. The token estimate bounds the input: QueryGPT's wide tables are the concrete reason the column prune agent exists, and the source is explicit that pruning fixed the intermittent token failures and lowered the cost and latency of every generation. The parser bounds the output: a model that is asked for JSON returns JSON most of the time, and a service that assumes "most" is "always" ships a 500 on the remainder. Real services add a validation agent that checks the generated tables and columns exist and asks the model to repair them, a prompt enhancer in front of the intent agent, and jittered backoff between the two attempts.`,
+  debrief: `Each fix bounds one dimension of a model call. A deadline bounds one attempt; the attempt cap and the retryable set bound the whole call, and the set is tiny on purpose, because an \`INVALID_ARGUMENT\` from a classifier will be an \`INVALID_ARGUMENT\` on the next try too. The token estimate bounds the input: QueryGPT's wide tables are why the column prune agent exists, and the source says pruning fixed the intermittent token failures and lowered the cost and latency of every generation. The parser bounds the output: a model asked for JSON returns JSON most of the time, and a service that assumes "most" is "always" ships a 500 on the remainder. Production systems add a validation agent that repairs unknown tables and columns, a prompt enhancer before the intent agent, and jittered backoff between attempts.`,
 };

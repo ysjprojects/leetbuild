@@ -8,37 +8,24 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: batches arrive, the window
-counters move, and the dashboard shows series totals. It hides a crash that leaves half a batch
-applied, an expiry that lags its window by hours, and a redelivery that counts twice. Debug it, fix
-it, and prove the fix with the checks below.
+**Starting point.** The starter implements \`merge_batch(tenant, batch)\`, the call the API makes
+once a batch of \`(series, delta)\` samples is accepted: it computes the window from
+\`recorded_at\`, builds one \`metrics:{tenant}:{series}:{window_start}\` key per series and
+increments each counter from the client. It serves the demo and hides 4 flaws.
 
-Implement \`merge_batch(tenant, batch)\`, the call the API makes once a batch of per-series deltas has
-been accepted:
+**Failure mode the checks target.** One \`INCRBY\` per sample is a partial batch waiting for a crash,
+and rollups cannot tell a half-applied window from a real one. A TTL set by a sweeper hours later is
+not a window boundary. A merge without a batch id doubles the series when the broker redelivers.
 
-- A batch carries its \`batch_id\`, the time it was \`recorded_at\`, and its \`(series, delta)\`
-  samples. Every delta belongs to the window that contains the batch time:
-  \`window_start = floor(recorded_at / WINDOW_SECONDS) * WINDOW_SECONDS\`, with **\`WINDOW_SECONDS =
-  60\`**.
-- Each counter lives in its own key, \`metrics:{tenant}:{series}:{window_start}\`, built by
-  \`window_key\` from the tenant, the series and the boundary — a key that drops the series mixes
-  unrelated counters, and a key that drops the boundary never rolls over.
-- The **whole batch merges in one atomic Lua \`EVAL\`**: every delta is incremented server-side in a
-  single script, so a crash leaves the batch applied or absent, never half of it. The starter sends
-  one \`INCRBY\` per sample from the client, and a crash between two of them leaves a partial batch
-  that downstream rollups cannot distinguish from real data.
-- The window key **expires exactly at its boundary**: the script sets \`EXPIRE\` to
+- \`window_start = floor(recorded_at / WINDOW_SECONDS) * WINDOW_SECONDS\`, with **\`WINDOW_SECONDS =
+  60\`**; \`window_key\` builds the key from the tenant, the series and the boundary.
+- The **whole batch merges in one atomic Lua \`EVAL\`**, so a crash leaves the batch applied or
+  absent. No client-side \`INCRBY\` per sample remains.
+- The window key **expires at its boundary**: the script sets \`EXPIRE\` to
   \`window_start + WINDOW_SECONDS - now\` on the first write (\`TTL\` < 0 means the key just opened).
-  The starter never expires at write time — a cleanup job sweeps hours later — so a closed window
-  stays readable next to live ones.
-- A **redelivered batch is a no-op**: claim the batch id with \`SET NX\` (\`nx=True\`, \`'NX'\`,
-  \`SetNX\`, \`nx()\`, \`UpdateType::NOT_EXIST\`) on \`metrics:batch:{batch_id}\`, with a \`WINDOW_TTL\`
-  lifetime, before merging, and skip the merge when the claim is refused. The starter keeps no batch
-  id, so an at-least-once redelivery adds the same samples twice.
-
-**Failure mode the checks target.** One \`INCRBY\` per sample is a partial batch waiting for a crash;
-a TTL set by a sweeper that runs hours later is not a window boundary; and a merge without a batch
-id silently doubles the series when the broker redelivers.`,
+- A **redelivered batch is a no-op**: claim \`metrics:batch:{batch_id}\` with \`SET NX\` (\`nx=True\`,
+  \`'NX'\`, \`SetNX\`, \`nx()\`, \`UpdateType::NOT_EXIST\`) and a \`WINDOW_TTL\` lifetime before merging,
+  and skip the merge when the claim is refused.`,
   sequence: {
     participants: ['Metrics API', 'Redis', 'Rollup worker'],
     messages: [
@@ -55,9 +42,9 @@ id silently doubles the series when the broker redelivers.`,
     ],
   },
   hints: [
-    'The whole batch belongs in one script: pass every counter key as `KEYS` and every delta as `ARGV`, and let Lua run the `INCRBY` loop next to the expiry in a single `EVAL`. One client-side `INCRBY` per sample means a crash between two of them leaves half the batch applied, and nothing downstream can tell which half.',
-    'The deadline comes from the boundary, not from the write: compute `window_start + WINDOW_SECONDS - now` and pass it into the script, which sets `EXPIRE` only while `TTL` is negative (the key just opened). A cleanup job that sweeps hours later leaves a closed window sitting next to live ones, so a rollup reads yesterday as today.',
-    "A redelivered batch must be a no-op: claim `metrics:batch:{batch_id}` with `SET NX` (`nx=True`, `'NX'`, `SetNX`, `nx()`, `UpdateType::NOT_EXIST`) and a `WINDOW_TTL` lifetime before merging — a refused claim means the batch was already applied, so return without touching a counter.",
+    'After a worker restart mid-batch, a series total is off by a few samples with no error logged; a broker redelivery later makes the same window count twice.',
+    'Each sample is a separate client-side `INCRBY`, so a crash between two calls leaves a partial window, and nothing records which batch ids were already applied.',
+    'Claim `metrics:batch:{batch_id}` with `SET NX` first, then run one `EVAL` (`MERGE_LUA`) that loops `INCRBY` over `KEYS`/`ARGV` and sets `EXPIRE` to `window_start + WINDOW_SECONDS - now` when `TTL` < 0.',
   ],
   checks: [
     {
@@ -164,9 +151,7 @@ def window_key(tenant: str, series: str, start: int) -> str:
 
 
 def merge_batch(tenant: str, batch: Batch) -> dict:
-    # TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
-    # partial merge; it never expires a window at write time (only a sweeper that runs hours later
-    # does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     start = window_start(batch.recorded_at)
     applied = 0
     for sample in batch.samples:
@@ -278,9 +263,7 @@ export function windowKey(tenant: string, series: string, start: number): string
 }
 
 export async function mergeBatch(tenant: string, batch: Batch): Promise<{applied: number; window_start: number}> {
-  // TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
-  // partial merge; it never expires a window at write time (only a sweeper that runs hours later
-  // does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const start = windowStart(batch.recordedAt);
   let applied = 0;
   for (const sample of batch.samples) {
@@ -401,9 +384,7 @@ func windowKey(tenant, series string, start int64) string {
 }
 
 func mergeBatch(ctx context.Context, tenant string, batch Batch) (int, error) {
-	// TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
-	// partial merge; it never expires a window at write time (only a sweeper that runs hours later
-	// does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	start := windowStart(batch.RecordedAt)
 	for _, sample := range batch.Samples {
 		if err := rdb.IncrBy(ctx, windowKey(tenant, sample.Series, start), sample.Delta).Err(); err != nil {
@@ -528,9 +509,7 @@ object MetricsStore {
   def windowKey(tenant: String, series: String, start: Long): String = s"metrics:$tenant:$series:$start"
 
   def mergeBatch(tenant: String, batch: Batch): Map[String, Long] = {
-    // TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
-    // partial merge; it never expires a window at write time (only a sweeper that runs hours later
-    // does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val start = windowStart(batch.recordedAt)
     batch.samples.foreach { sample =>
       jedis.incrBy(windowKey(tenant, sample.series, start), sample.delta)
@@ -638,9 +617,7 @@ std::string window_key(const std::string& tenant, const std::string& series, lon
 }
 
 int merge_batch(const std::string& tenant, const Batch& batch) {
-  // TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
-  // partial merge; it never expires a window at write time (only a sweeper that runs hours later
-  // does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const auto start = window_start(batch.recorded_at);
   for (const auto& sample : batch.samples) {
     redis.incrby(window_key(tenant, sample.series, start), sample.delta);
@@ -733,5 +710,5 @@ int merge_batch(const std::string& tenant, const Batch& batch) {
 `,
     },
   },
-  debrief: `The lesson is that an aggregation window is an atomic unit of work. A batch that lands half-applied is worse than one that never landed: downstream rollups cannot tell a partial window from a real one, so the numbers are quietly wrong and there is no error to find. One Lua \`EVAL\` per batch makes every merge all-or-nothing, and the same script opens the window's expiry, so the key dies at its boundary instead of whenever a sweeper notices — a deadline that belongs to the window, not to the write. Dedupe by batch id closes the other half: brokers deliver at least once, so the merge must be idempotent per batch, and \`SET NX\` on \`metrics:batch:{batch_id}\` before any counter moves turns a redelivery into a no-op. Real pipelines go one step further and make the claim part of the same transaction as the merge — the guard is the script's first step — so a crash between the two cannot swallow a batch; they also keep longer-lived window archives for rollups that run after expiry, and hash-tag keys so every counter of one tenant-window lands on the same Redis cluster slot.`,
+  debrief: `An aggregation window is an atomic unit of work, so the fix moves every counter increment into one Lua \`EVAL\`: a crash leaves the batch applied or absent, and the same script opens the expiry so the key dies at its boundary rather than when a sweeper notices. The batch-id claim is the other half. Brokers deliver at least once, so the merge has to be idempotent per batch, and \`SET NX\` before any counter moves turns a redelivery into a no-op. Production pipelines put the claim inside the same script as the merge, so a crash between the two cannot swallow a batch; they keep longer-lived window archives for rollups that run after expiry; and they hash-tag keys so one tenant-window lands on a single cluster slot.`,
 };

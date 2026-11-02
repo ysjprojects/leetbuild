@@ -8,52 +8,31 @@ export const assignmentStateStep: Step = {
   focus: ['service', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: one annotator clicks next
-item, the queue hands out an item, the demo looks healthy, and every flaw in it is invisible until a
-second annotator or a closed tab shows up. It marks work *assigned* instead of *leasing* it, claims
-with three separate Redis commands, has no way back for work nobody finished, and reports depth from
-a counter it maintains itself. Debug it like the queue owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter is the Redis assignment pool behind \`claim\`: it walks
+\`SMEMBERS pool:{task_id}\`, skips ids in \`taken:{task_id}\`, marks the first free one with
+\`SADD\`/\`SREM\` and \`HSET assign:{task_id}:{item_id} annotator assigned_at\`, keeps a \`renew\`
+stub returning false, and reports depth from a counter it \`INCR\`s itself. It serves the demo and
+hides 5 flaws.
 
-Implement the Redis assignment pool behind \`claim\`:
+**Failure mode the checks target.** One annotator clicking next item looks healthy. A second
+annotator or a closed tab shows the rest: a flag with no deadline leaves circulation for good, a
+client-side read-check-write hands one item to two annotators, and a counter-based depth drifts
+from the pool after the first partial failure.
 
-- Four keys per task: \`pool:{task_id}\` (sorted set of item ids, score = queue order),
-  \`lease:{task_id}\` (sorted set, score = the lease deadline in unix milliseconds),
-  \`assign:{task_id}:{item_id}\` (hash with \`annotator\` and \`leased_until_ms\`) and
-  \`items:{task_id}\` (hash of item id → \`available\` | \`leased\`). Every key is per task: one pool
-  shared by two tasks hands an annotator another task's questions.
-- \`LEASE_TTL_S = 900\` — an assignment is a **lease that expires after 15 minutes of inactivity**,
-  never a flag: the deadline is written into the lease score *and* the assignment hash, and an
-  expired lease returns the item to the pool. The starter writes \`HSET … assigned_at=<timestamp>\`
-  with no expiry at all, so an annotator who closes the tab strands their item forever.
-- \`claim(task_id, annotator)\` is **one atomic Lua \`EVAL\`** (\`CLAIM_LUA\`): reclaim expired
-  leases, \`ZPOPMIN\` the next item out of the pool, \`ZADD\` the lease with score
-  \`now_ms + 900_000\`, write the assignment record and return the item id — an empty pool returns
-  nil, which the route answers **204**. The starter claims with \`SISMEMBER\` then \`SADD\` then
-  \`SREM\` from the client, so two concurrent annotators both see the item free and receive the same
-  one.
-- \`renew(task_id, item_id, annotator)\` extends the lease **for the holder only**: the script reads
-  \`HGET assign:{task_id}:{item_id} annotator\` inside the same atomic step, refuses a caller the
-  record does not name (\`false\` → **409**) and leaves the lease exactly as it was. \`release\` (the
-  annotator hands the item back early) obeys the same holder rule. The starter has no renew or release
-  path at all.
-- \`reclaim_expired(task_id)\` puts **every** lease whose deadline has passed back into
-  \`pool:{task_id}\`, deletes its assignment record and flips the item state back to \`available\`.
-  It runs inside the claim script — so a claim rescues abandoned work — and is exposed for the
-  sweeper that visits idle tasks.
-- \`queue_depth(task_id)\` returns \`{"available": ZCARD pool, "leased": ZCARD lease, "total": HLEN
-  items}\` read in one atomic step, so \`available + leased == total\` cannot drift. The starter
-  answers from an \`INCR\`ed counter, which disagrees with the pool the first time a claim fails
-  after the counter was bumped.
-
-**Failure mode the checks target.** Every flaw here is one flaw: the starter treats an assignment as
-an event instead of a lease with a deadline. A flag with no expiry is work that disappears — the
-item is in neither the pool nor any claimable state, and the queue silently shrinks with every
-closed tab until someone reconciles the hashes by hand. A client-side read-check-write never
-collides in a demo and always collides under real traffic, handing one item to two annotators who
-answer the same question twice. And a depth read from a counter agrees with the pool only until the
-first partial failure — depth is the number the dashboard uses to decide whether the queue needs
-another annotator.
+- Four keys per task: \`pool:{task_id}\` (sorted set, score = queue order), \`lease:{task_id}\`
+  (sorted set, score = deadline in unix ms), \`assign:{task_id}:{item_id}\` (hash with
+  \`annotator\`, \`leased_until_ms\`), \`items:{task_id}\` (item id → \`available\` | \`leased\`).
+- \`LEASE_TTL_S = 900\`: the deadline goes into the lease score *and* the assignment hash; an
+  expired lease returns the item to the pool.
+- \`claim(task_id, annotator)\` is one atomic Lua \`EVAL\` (\`CLAIM_LUA\`): reclaim expired leases,
+  \`ZPOPMIN\` the next item, \`ZADD\` the lease at \`now_ms + 900_000\`, write the record, return the
+  id; an empty pool returns nil (**204**).
+- \`renew\` and \`release\` act for the holder only: \`HGET assign:… annotator\` inside the script,
+  anyone else gets \`false\` (**409**).
+- \`reclaim_expired(task_id)\` returns every expired lease to the pool, deletes its record and flips
+  the item to \`available\`; the claim script and the sweeper both call it.
+- \`queue_depth(task_id)\` is \`{"available": ZCARD pool, "leased": ZCARD lease, "total": HLEN
+  items}\` in one atomic read.
 `,
   sequence: {
     participants: ['Annotator', 'Service', 'Redis', 'Sweeper'],
@@ -256,11 +235,7 @@ import redis
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# TODO: this starter marks an item assigned with HSET ... assigned_at=<unix seconds> and never
-# expires it, so an annotator who closes the tab strands the item forever. It claims with SISMEMBER,
-# SADD and SREM from the client, so two concurrent annotators both see the item free and open the
-# same one. It has no reclaim path for work nobody renewed, and it reports queue depth from an
-# INCR'd counter that drifts away from the pool the first time a claim fails halfway.
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
 
 def pool_key(task_id: str) -> str:
@@ -293,8 +268,7 @@ def claim(task_id: str, annotator: str) -> str | None:
 
 def renew(task_id: str, item_id: str, annotator: str) -> bool:
     """Keep the item for a while longer."""
-    # TODO: nothing here expires, so there is no lease to renew: a second annotator just overwrites
-    # the assignment instead of being refused.
+    # TODO: not implemented.
     return False
 
 
@@ -471,11 +445,7 @@ def queue_depth(task_id: str) -> dict:
 
 export const redis = new Redis({host: 'redis', port: 6379});
 
-// TODO: this starter marks an item assigned with HSET ... assigned_at=<unix seconds> and never
-// expires it, so an annotator who closes the tab strands the item forever. It claims with
-// sismember, sadd and srem from the client, so two concurrent annotators both see the item free and
-// open the same one. It has no reclaim path for work nobody renewed, and it reports queue depth
-// from an INCR'd counter that drifts away from the pool the first time a claim fails halfway.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
 const poolKey = (taskId: string): string => \`pool:\${taskId}\`;
 const takenKey = (taskId: string): string => \`taken:\${taskId}\`;
@@ -496,8 +466,7 @@ export async function claim(taskId: string, annotator: string): Promise<string |
 
 /** Keeps the item for a while longer. */
 export async function renew(taskId: string, itemId: string, annotator: string): Promise<boolean> {
-  // TODO: nothing here expires, so there is no lease to renew: a second annotator just overwrites
-  // the assignment instead of being refused.
+  // TODO: not implemented.
   return false;
 }
 
@@ -687,11 +656,7 @@ import (
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// TODO: this starter marks an item assigned with HSET ... assigned_at=<unix seconds> and never
-// expires it, so an annotator who closes the tab strands the item forever. It claims with SIsMember
-// then SAdd then SRem from the client, so two concurrent annotators both see the item free and open
-// the same one. It has no reclaim path for work nobody renewed, and it reports queue depth from an
-// INCR'd counter that drifts away from the pool the first time a claim fails halfway.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
 func poolKey(taskID string) string { return "pool:" + taskID }
 func takenKey(taskID string) string { return "taken:" + taskID }
@@ -729,8 +694,7 @@ func claim(ctx context.Context, taskID, annotator string) (string, error) {
 
 // renew keeps the item for a while longer.
 func renew(ctx context.Context, taskID, itemID, annotator string) (bool, error) {
-	// TODO: nothing here expires, so there is no lease to renew: a second annotator just overwrites
-	// the assignment instead of being refused.
+	// TODO: not implemented.
 	return false, nil
 }
 
@@ -912,11 +876,7 @@ import scala.jdk.CollectionConverters._
 object Assignments {
   private val jedis = new JedisPooled("redis", 6379)
 
-  // TODO: this starter marks an item assigned with HSET ... assigned_at=<unix seconds> and never
-  // expires it, so an annotator who closes the tab strands the item forever. It claims with
-  // sismember, sadd and srem from the client, so two concurrent annotators both see the item free
-  // and open the same one. It has no reclaim path for work nobody renewed, and it reports queue
-  // depth from an INCR'd counter that drifts away from the pool the first time a claim fails.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
   private def poolKey(taskId: String): String = s"pool:$taskId"
   private def takenKey(taskId: String): String = s"taken:$taskId"
@@ -940,8 +900,7 @@ object Assignments {
 
   /** Keeps the item for a while longer. */
   def renew(taskId: String, itemId: String, annotator: String): Boolean = {
-    // TODO: nothing here expires, so there is no lease to renew: a second annotator just overwrites
-    // the assignment instead of being refused.
+    // TODO: not implemented.
     false
   }
 
@@ -1108,11 +1067,7 @@ object Assignments {
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-// TODO: this starter marks an item assigned with HSET ... assigned_at=<unix seconds> and never
-// expires it, so an annotator who closes the tab strands the item forever. It claims with
-// sismember, sadd and srem from the client, so two concurrent annotators both see the item free
-// and open the same one. It has no reclaim path for work nobody renewed, and it reports queue
-// depth from an INCR'd counter that drifts away from the pool the first time a claim fails.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 
 std::string pool_key(const std::string& task_id) { return "pool:" + task_id; }
 std::string taken_key(const std::string& task_id) { return "taken:" + task_id; }
@@ -1149,8 +1104,7 @@ std::optional<std::string> claim(const std::string& task_id, const std::string& 
 
 // Keeps the item for a while longer.
 bool renew(const std::string& task_id, const std::string& item_id, const std::string& annotator) {
-  // TODO: nothing here expires, so there is no lease to renew: a second annotator just overwrites
-  // the assignment instead of being refused.
+  // TODO: not implemented.
   (void)task_id;
   (void)item_id;
   (void)annotator;
@@ -1319,9 +1273,9 @@ QueueDepth queue_depth(const std::string& task_id) {
     },
   },
   hints: [
-    'The whole claim is one script: `ZRANGEBYSCORE lease:{task} -inf now_ms` → `ZREM` + `DEL assign` + `ZADD pool` + `HSET items available`, then `ZPOPMIN pool` for the item, then `ZADD lease now+ttl` and `HSET assign annotator leased_until_ms`. Reading the pool in the host language and writing it back leaves a window in which two annotators both see the item as free.',
-    'Renew is a holder check, not a write: `HGET assign:{task}:{item} annotator` inside the same script, compare it against the caller, and only then move `leased_until_ms` and the lease score. A renew that writes first and checks afterwards hands a second annotator a lease over someone else’s item — and an expired or reclaimed item has no assignment record left to match.',
-    'Depth is derived, never stored: `ZCARD` of the pool plus `ZCARD` of the lease set equals `HLEN` of the item hash, and the reclaim path is what keeps them equal after an abandoned tab. Read the three counts in one round trip, so a claim landing between two reads cannot make the answer disagree with itself.',
+    'The dashboard says 40 items are available while the form shows "queue empty"; two annotators on one task both got item 17; an annotator who closed the tab an hour ago still holds items.',
+    'Assignment is a flag: `assigned_at` has no deadline and nothing sweeps it. The free check and the mark are separate commands, so two claims both pass `SISMEMBER`. Depth is a counter, not the pool.',
+    'Move claim into one Lua script: reclaim leases past `now_ms`, `ZPOPMIN pool`, `ZADD lease now_ms+TTL`, `HSET assign annotator leased_until_ms`. Renew and release check `HGET annotator` first. Depth is `ZCARD`+`ZCARD`+`HLEN` in one read.',
   ],
-  debrief: `The interview question is what happens to work nobody finished. A queue where assignment is a flag is a queue that leaks items: nothing in it will ever move an item out of "assigned", so every closed tab and every crashed annotator removes a question from circulation, and the only repair is someone reconciling hashes by hand. A lease with a deadline and a reclaim path makes abandonment a normal event instead of a silent loss — the sweeper returns it, and every claim reclaims on its way in, so the pool heals under load. Atomicity is the second half: the check-then-write the starter uses is correct in a demo and wrong exactly when traffic arrives, because the gap between \`SISMEMBER\` and \`SADD\` is where the second annotator reads. One Lua script makes reclaim, pop, lease and record a single step. The holder check in \`renew\` is the third: a lease is a promise to one annotator, and a renew that does not verify the record lets a colliding caller take over someone else's item. Production adds the belt-and-braces parts this course leaves out: \`{task_id}\` hash tags so every key of a task lands in one Redis Cluster slot, a sweeper that also flags tasks whose leases keep expiring, and metrics on reclaims per hour, which is the honest signal that your queue is short on annotators.`,
+  debrief: `A lease with a deadline and a reclaim path makes abandonment a normal event instead of a silent loss: the sweeper returns the item, and every claim reclaims on its way in, so the pool heals under load. The claim lives in one Lua script because the gap between \`SISMEMBER\` and \`SADD\` is exactly where a second annotator reads; Redis runs the script without interleaving, so check and write cannot be split. The holder check in renew and release is the same idea at a different window. Depth is derived from the keys rather than stored beside them, so it cannot drift. Production queues add \`{task_id}\` hash tags so a task's keys share one Redis Cluster slot, a renew heartbeat from the form, and a reclaims-per-hour metric.`,
 };

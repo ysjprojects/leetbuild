@@ -8,38 +8,28 @@ export const readStep: Step = {
   focus: ['client', 'hub', 'shadow'],
   task: `## Task
 
-**Starting point.** The starter is working code: the route answers, the demo device shows its state
-and the dashboard renders a document, so nothing looks wrong. It hides three flaws. It merges the
-two sides of the shadow into one document, so the divergence the shadow exists to expose
-disappears; it reports the newer version as if it were both versions; and it serves any device to
-any caller. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`GET /v1/devices/{device_id}/shadow\` calls
+\`shadows.read(device_id)\`, merges the two documents as \`{**reported, **desired}\`, takes
+\`max(desired_version, reported_version)\` as one \`version\`, logs it, and answers
+\`{device_id, version, document}\` to any caller. It compiles and hides four flaws.
 
-Implement \`GET /v1/devices/{device_id}/shadow\`.
+**Failure mode the checks target.** A device still running last week's configuration reads as
+converged, because the desired values overwrite the reported ones in the merge. One version on both
+sides hides which side is stale, so support cannot tell whether to wait or escalate. Any tenant can
+read any device's shadow by guessing an id.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The device is looked up in the register and its **owner** compared with the tenant: a device the
-  caller does not own answers **404**, exactly like one that does not exist, so a foreign device id
-  cannot be distinguished by guessing ids.
-- The shadow lives in the Redis hash \`shadow:{device_id}\`: the \`desired\` document written by
-  operators, the \`reported\` document written by the device, and the independent
-  \`desired_version\` / \`reported_version\` counters. Read it through the shadow store
-  (\`shadows.read(device_id)\`) — never serve a document you merged yourself.
-- The response carries **both documents**, verbatim, under \`desired\` and \`reported\`, and **both
-  versions** as \`desired_version\` and \`reported_version\`. Never report one version on both sides:
-  a device reporting version 3 while the operator is on version 7 is exactly the case the endpoint
-  exists to expose.
-- The response carries \`divergence\`: every top-level field of \`desired\` whose value the
-  \`reported\` document does not match, sorted. An empty list means the device is converged; a
-  non-empty one names precisely what the device has not applied yet.
-- Log tenant, device and versions — never the documents: a shadow document is operator
-  configuration, and it outlives the request in every log sink it reaches.
+Requirements:
 
-**Failure mode the checks target.** Merging the documents destroys the one thing the shadow exists to
-show: the desired value overwrites the reported one, so a device still running last week's
-configuration reads as converged and the operator's change looks applied before the device ever
-acknowledged it. Reporting one version for both hides which side is stale, so nobody can tell
-whether to wait or escalate. And answering without an ownership check lets any tenant read any
-device's shadow by guessing an id.`,
+- The tenant comes from \`X-Tenant-Id\`; missing is \`401\`.
+- \`assert_tenant_owns(tenant, devices.get(device_id))\` compares the register row's owner with the
+  tenant before the shadow is read; a foreign or unknown device is \`404\` either way.
+- The response carries \`"desired"\` and \`"reported"\` untouched, plus
+  \`"desired_version": shadow["desired_version"]\` and
+  \`"reported_version": shadow["reported_version"]\` exactly as the store holds them.
+- \`"divergence": divergent_fields(desired, reported)\`: the sorted top-level fields of \`desired\`
+  where \`reported.get(field) != desired[field]\`. Empty means converged.
+- Log tenant, device and the two versions, not the documents; a shadow document is operator
+  configuration and outlives the request in every log sink.`,
   sequence: {
     participants: ['Operator', 'IoT Hub', 'Shadow'],
     messages: [
@@ -52,9 +42,9 @@ device's shadow by guessing an id.`,
     ],
   },
   hints: [
-    'Read once through the store: `shadows.read(device_id)` already holds both documents and both version counters, and the response carries those four fields untouched. The moment you fold `reported` into `desired` — or into a single `document` — you have thrown away the answer the endpoint was built to give.',
-    'Divergence is computed, not implied: for every field of `desired` where `reported` does not hold the same value, put the field name into a sorted `divergence` list. An empty list means converged. Never substitute the newer version for both counters — the pair is what tells support which side is stale.',
-    'Authorize before you read: look the device up in the register and compare its owner with the `X-Tenant-Id` tenant, answering **404** — not 403 — for a device the caller does not own, so a foreign device id is indistinguishable from one that never existed.',
+    'Support sees a thermostat as converged on the dashboard while the device on site still runs the old schedule, and a customer reports reading a device id that belongs to another tenant.',
+    '`{**reported, **desired}` lets every desired value overwrite the reported one, and `max(...)` of the two counters discards whichever side is behind; no owner is compared before the read.',
+    'Return `desired`, `reported`, `desired_version`, `reported_version` from `shadows.read` untouched, plus `divergence: divergent_fields(desired, reported)`. Add `assert_tenant_owns` against `devices.get(device_id)` with `404` before the read.',
   ],
   checks: [
     {
@@ -170,9 +160,7 @@ shadows = ShadowStore()
 
 @app.get("/v1/devices/{device_id}/shadow")
 def read_shadow(device_id: str) -> JSONResponse:
-    # TODO: this starter merges the desired and reported documents so divergence cannot be seen,
-    # reports the newer version as if it were both versions, and serves any device to any caller.
-    # Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     shadow = shadows.read(device_id)
     merged = {**shadow["reported"], **shadow["desired"]}
     version = max(shadow["desired_version"], shadow["reported_version"])
@@ -252,7 +240,7 @@ def read_shadow(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/devices/:id/shadow: flawed code that merges the shadow. */
+      starter: `/** GET /v1/devices/:id/shadow: serves a device shadow to its tenant. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -274,9 +262,7 @@ const shadows = new ShadowStore();
 
 app.get('/v1/devices/:deviceId/shadow', async (request, reply) => {
   const {deviceId} = request.params as {deviceId: string};
-  // TODO: this starter merges the desired and reported documents so divergence cannot be seen,
-  // reports the newer version as if it were both versions, and serves any device to any caller.
-  // Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const shadow = await shadows.read(deviceId);
   const merged = {...shadow.reported, ...shadow.desired};
   const version = Math.max(shadow.desired_version, shadow.reported_version);
@@ -376,9 +362,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readShadow(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter merges the desired and reported documents so divergence cannot be seen,
-	// reports the newer version as if it were both versions, and serves any device to any caller.
-	// Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	deviceID := r.PathValue("device_id")
 	shadow, err := shadows.Read(r.Context(), deviceID)
 	if err != nil {
@@ -557,9 +541,7 @@ object ShadowReadApi {
   val route: Route =
     path("v1" / "devices" / Segment / "shadow") { deviceId =>
       get {
-        // TODO: this starter merges the desired and reported documents so divergence cannot be seen,
-        // reports the newer version as if it were both versions, and serves any device to any
-        // caller. Fix all three.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val shadow = shadows.read(deviceId)
         val merged = JsObject(shadow.reported ++ shadow.desired)
         val version = math.max(shadow.desired_version, shadow.reported_version)
@@ -682,9 +664,7 @@ int main() {
 
   svr.Get(R"(/v1/devices/([^/]+)/shadow)", [](const httplib::Request& req, httplib::Response& res) {
     const auto deviceId = req.matches[1].str();
-    // TODO: this starter merges the desired and reported documents so divergence cannot be seen,
-    // reports the newer version as if it were both versions, and serves any device to any caller.
-    // Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto shadow = shadows.read(deviceId);
     json merged = shadow.reported;
     merged.update(shadow.desired);
@@ -786,5 +766,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a read endpoint whose whole purpose is to surface disagreement. A device shadow is two documents with independent versions — the operator's desired configuration and what the device last reported — and merging them destroys the only thing the endpoint exists to show: the merged document reads as converged while the device is still running an older configuration, and the operator's change looks applied before the device ever acknowledged it. Reporting one version for both hides which side is stale: the pair is what tells support whether to wait or to escalate. The divergence list is the part that makes it actionable, and it has to be computed from the two documents rather than inferred from the versions, because a device can report a newer version while still missing one field. The ownership check is the security half of the same fix — a device id is guessable, so the answer for someone else's device is 404, not 403 and not 200. Real hubs return deeper field paths, expose a reconciliation target for the next desired write, and alert when a divergence ages past an SLA.`,
+  debrief: `The response keeps the shadow's four fields separate because disagreement is the data: a
+merged document can only show the desired value, and a single \`max\` version cannot say which side is
+behind. \`divergence\` is computed by comparing the documents field by field rather than inferred from
+the counters, because a device can report a newer version and still be missing one field. The
+ownership check runs before the read and answers \`404\` rather than \`403\` so a guessed id reveals
+nothing about whether the device exists. This step stops at top-level fields and a point-in-time
+read. A production shadow read also walks nested paths in the divergence, and the hub alerts when a
+device's divergence has aged past its reconciliation budget instead of waiting for someone to look.`,
 };

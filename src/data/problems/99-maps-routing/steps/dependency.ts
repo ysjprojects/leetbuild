@@ -8,32 +8,27 @@ export const dependencyStep: Step = {
   focus: ['api', 'engine', 'fallback'],
   task: `## Task
 
-**Starting point.** The starter is working code for the routing-engine client: when the engine is
-healthy and answers with geometry for the traffic epoch the caller asked about, the demo passes.
-Every failure path is wrong. Find them, fix them, and prove the fix.
+**Starting point.** The starter is the API service's engine client,
+\`compute_route(origin, destination, waypoints, epoch)\`: it calls the engine's \`ComputeRoute\` RPC
+in a \`while True\` loop, retries any error, and on a timeout serves whatever a \`last_known\` cache
+happens to hold. When the engine is healthy the demo passes. It hides five flaws.
 
-Implement \`compute_route(origin, destination, waypoints, epoch)\` for the API service's engine
-client:
+**Failure mode the checks target.** Every failure path is wrong, and each is invisible while the
+engine is up. The call has no deadline, so one stuck solver pins the request worker. The loop
+retries a \`NO_ROUTE\` answer until the request deadline, because "there must be some route". And
+the \`last_known\` cache is keyed by nothing, so a route computed for an old traffic epoch is
+presented as the current one the moment the engine goes quiet.
 
-- The gRPC call to the engine carries a **1.5 s deadline** on every attempt. A call without one lets
-  one stuck solver pin the request worker indefinitely.
+- Every attempt carries a **1.5 s deadline** on the gRPC call.
 - At most **3 attempts**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retryable; every
-  other status is returned to the caller immediately. The starter retries a \`NO_ROUTE\` answer
-  because "there must be some route".
+  other status is returned to the caller immediately.
 - When the attempts are exhausted, return a **straight-line distance estimate** between origin and
-  destination, marked \`degraded = true\`. It is honest about what it is; a road route cached at
-  another traffic epoch is not.
-- The returned route's \`epoch\` must be the **caller's epoch**. Serving geometry computed for an
-  older traffic state — from a cache or from a retry that raced an epoch bump — presents stale
-  geometry as current, which is exactly the bug navigation users hit.
+  destination, marked \`degraded = true\`. A road route cached at another traffic epoch is not a
+  substitute.
+- The returned route's \`epoch\` is the **caller's epoch**. Geometry the engine computed for a
+  different epoch (a retry that raced an epoch bump) is not served as current.
 - \`NO_ROUTE\` is **terminal**: there is no road, so a retry cannot invent one, and the fallback must
-  not turn "unroutable" into "here is a rough guess".
-
-**Failure mode the checks target.** The starter keeps a \`last_known\` cache keyed by nothing in
-particular and serves whatever it happens to hold when the engine times out, so a route computed
-for an old epoch is presented as the current one; it loops \`while True\` on every error, so a
-\`NO_ROUTE\` burns the solver until the request deadline; and it never sets a deadline on the call.
-Each of those is invisible while the engine is up and loud the moment it is not.`,
+  not turn "unroutable" into "here is a rough guess".`,
   sequence: {
     participants: ['Route Handler', 'Routing Engine', 'Fallback'],
     messages: [
@@ -66,9 +61,9 @@ Each of those is invisible while the engine is up and loud the moment it is not.
     ],
   },
   hints: [
-    'The deadline belongs to the call, not to the process: `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. The starter retries with `while True`, which has no exit for a `NO_ROUTE` or a `PERMISSION_DENIED`; bound the attempts with a constant and a `for` loop.',
-    '`NO_ROUTE` is data, not an error: return it before the retry branch. Retrying it asks the solver to invent a road that does not exist, and the fallback estimate would turn "unroutable" into a plausible-looking lie.',
-    'The degraded answer is constructed, not looked up: build the response with `degraded = true`, the straight-line distance and the caller’s `epoch`. If you keep a cache at all, key it by epoch and refuse a hit whose epoch differs — the geometry you return must describe the traffic state the caller asked about.',
+    'The engine pod restarts and every route request hangs for the full request timeout; the ones that do return show rush-hour geometry at midnight, and an unroutable island pair comes back as a straight line.',
+    'The call has no deadline, the `while True` loop treats `NO_ROUTE` like `UNAVAILABLE`, and the timeout path reads `last_known`, which stores a route under no epoch and returns it under any.',
+    'Use `timeout=DEADLINE_S` on `ComputeRoute`, `for attempt in range(MAX_ATTEMPTS)` with a `RETRYABLE` set, return `NO_ROUTE` at once, reject `response.epoch != epoch`, and build the fallback from `straight_line(…)` with `degraded=True, epoch=epoch`.',
   ],
   checks: [
     {
@@ -171,9 +166,7 @@ last_known = {}
 
 
 def compute_route(origin, destination, waypoints, epoch):
-    # TODO: put a 1.5 s deadline on the call, return a marked straight-line estimate when the
-    # engine is unreachable, treat NO_ROUTE as terminal, and never serve geometry from another
-    # traffic epoch.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     global last_known
     while True:
         try:
@@ -281,9 +274,7 @@ export async function computeRoute(
   waypoints: LatLng[],
   epoch: number,
 ): Promise<RouteResponse> {
-  // TODO: put a 1.5 s deadline on the call, return a marked straight-line estimate when the
-  // engine is unreachable, treat NO_ROUTE as terminal, and never serve geometry from another
-  // traffic epoch.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const response = await new Promise<RouteResponse>((resolve, reject) => {
@@ -390,8 +381,7 @@ import (
 
 var lastKnown = map[uint64]*pb.RouteResponse{}
 
-// TODO: put a 1.5 s deadline on the call, return a marked straight-line estimate when the engine
-// is unreachable, treat NO_ROUTE as terminal, and never serve geometry from another traffic epoch.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func computeRoute(
 	ctx context.Context,
 	client pb.RoutingClient,
@@ -490,8 +480,7 @@ object RouteClient {
 
   var lastKnown = Map.empty[Long, RouteResponse]
 
-  // TODO: put a 1.5 s deadline on the call, return a marked straight-line estimate when the engine
-  // is unreachable, treat NO_ROUTE as terminal, and never serve geometry from another traffic epoch.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def computeRoute(origin: LatLng, destination: LatLng, waypoints: Seq[LatLng], epoch: Long): RouteResponse = {
     var done = false
     var answer: RouteResponse = null
@@ -580,8 +569,7 @@ std::map<long, RouteResponse> last_known;
 
 }  // namespace
 
-// TODO: put a 1.5 s deadline on the call, return a marked straight-line estimate when the engine
-// is unreachable, treat NO_ROUTE as terminal, and never serve geometry from another traffic epoch.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 RouteResponse ComputeRoute(
     Routing::Stub* stub,
     const LatLng& origin,
@@ -668,5 +656,5 @@ RouteResponse ComputeRoute(
 `,
     },
   },
-  debrief: `The interviewer is probing one question under many names: what does the client owe the caller when the engine is not there? A deadline bounds one attempt, a bounded attempt count bounds the call, the retryable set decides which failures are worth another try, and NO_ROUTE is an answer rather than a failure. The fallback is the honesty answer: a straight-line estimate marked \`degraded = true\` tells the caller what it is, while a cached route from another epoch tells them a story about traffic that is no longer true. The starter looks fine because a healthy engine never enters any of these paths. Real clients add jittered backoff between attempts, a breaker per engine endpoint, coverage checks before the call, and a response field that distinguishes "no road exists" from "we could not ask".`,
+  debrief: `The fix has this shape because each piece bounds a different thing: the deadline bounds one attempt, the attempt count bounds the call, the retryable set decides which failures deserve another try, and \`NO_ROUTE\` is an answer rather than a failure. What the shape protects is the meaning of the response. A straight-line estimate marked \`degraded = true\` tells the caller exactly what it is; a cached road route from another epoch tells a story about traffic that is no longer true, and the \`epoch\` comparison is what keeps that story out of the response. The starter passed only because a healthy engine never enters any of these paths. Production clients add jittered backoff between attempts, a circuit breaker per engine endpoint, and a response field that separates "no road exists" from "we could not ask".`,
 };

@@ -7,78 +7,65 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Permission service: the course is not "store some roles in a table", it is the debugging you owe
- * an authorization layer before it guards anything. A grant that cannot exceed its assigner → a
- * version-bumped cache a revocation cannot survive → a policy-engine call that denies when it
- * cannot verify → subject-keyed events with an outbox that can rebuild the cache → a read that
- * explains every permission instead of returning a blob.
+ * Permission service: the debugging an authorization layer needs before it guards anything. A
+ * grant that cannot exceed its assigner → a version-bumped cache a revocation cannot survive → a
+ * policy-engine call that denies when it cannot verify → subject-keyed events with an outbox that
+ * can rebuild the cache → a read that explains every permission instead of returning a blob.
  */
 export const permissionServiceProblem: Problem = {
   id: 'permission-service',
   title: 'Permission Service',
-  tagline: 'Grants that cannot escalate, revoke immediately and explain themselves.',
+  tagline: 'Grants bounded by what the assigner holds, and a permission cache a revocation can reach.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Permission Service
 
-A permission service answers one question for every other service in the platform — *may this subject
-do this thing, here?* — and two more that decide whether anyone can trust the answer: *who granted it,
-and from what?* The visible part is a boolean; the parts that decide whether the platform is safe are
-the grant check, the cache invalidation, the failure policy at the policy engine, and the event stream
-that makes a revocation replayable.
+A permission service answers one question for every other service, *may this subject do this
+thing, here?*, and two more that decide whether the answer can be trusted: *who granted it, and
+from what?* The boolean is the visible part; the grant check, the cache invalidation, the failure
+policy at the policy engine and the event stream are what make it safe.
 
 ## The real system
 
-Production authorization services never let an admin be the unit of trust. They let a subject hand out
-**only what it already holds**, at a scope no wider than where it holds it, from a **catalog** that is
-the only source of valid roles and scopes — so a wildcard is a validation error, not a super-grant. They
-cache effective permissions per \`(subject, scope)\` because every request asks, and they invalidate that
-cache with a **version counter** rather than a delete, because a read racing the delete repopulates the
-stale set and a revoked contractor keeps access until TTL. They consult a policy engine under a
-**deadline** and **deny when they cannot verify**: an outage must not become broad access, and a policy
-rejection is terminal while a transport failure is not. And they publish **one event per grant change,
-keyed by subject**, so a subject's history stays ordered, with the row written in the same transaction
-as the grant and relayed after the commit — which is also how the cache version is rebuilt. Finally,
-the read path explains itself: every permission comes with the roles and grants that produce it, the
-list is the same computation the live check uses, and a caller cannot read a stranger's permissions.
+The freshness problem two of these steps turn on is what Google's Zanzibar paper calls the "new
+enemy problem": a cached check answering from before a revocation. SpiceDB, the open-source
+Zanzibar implementation, exposes the fix in its v1 API: \`CheckPermission\` and every write return a
+**ZedToken**, an opaque datastore revision, and a caller sends
+\`Consistency { at_least_as_fresh: ZedToken }\` to force a check onto data no older than that
+revision, or \`minimize_latency\` to accept whatever is cached. Storing the token beside the protected
+resource gives read-after-write consistency without bypassing the cache, which is the role
+\`grant_version\` plays here. The rest follows the same discipline: a subject hands out only what it
+holds, from a catalog that is the only source of valid roles and scopes; the policy engine is called
+under a deadline and the service denies when it cannot verify; one subject-keyed event per grant
+change commits with the grant; and the read path names the grants behind every permission.
 
 ## What you build here
 
 One service, **permz**, with five pieces:
 
-1. \`POST /v1/roles/assignments\`: an authenticated assigner, a role and scope validated against the
-   role catalog, an **escalation guard** that refuses any grant exceeding the assigner's own holdings
-   (**403** naming the missing permission, **422** for a role or scope outside the catalog), and an
-   \`Idempotency-Key\` so a replayed assignment grants once.
-2. A **Redis** effective-permission cache keyed by \`(subject, scope)\`, stamped with the global
-   \`grant_version\`, and invalidated by **bumping that counter** on every assignment change — a read
-   holding an old entry recomputes instead of serving it, and concurrent misses collapse behind a
-   lock.
-3. A **gRPC** policy-engine client: a 400 ms deadline, at most two attempts, retries only on
-   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a **deny** on timeout with a retriable \`503\`, a **terminal**
-   \`403\` on a rejection, and cached allows used only while their version still matches.
-4. A **Kafka** \`permission.event\` stream: one event per grant change keyed by **subject**, carrying
-   the role ids, scopes and the grant version, written to the **outbox** in the same transaction as the
-   grant and published **after** the commit, plus a consumer that can rebuild the version counter by
-   replaying the stream.
-5. \`GET /v1/users/{id}/permissions\`: each permission returned with its **derivation** (the roles and
-   grants that produce it), from the version-stamped cache, matched **bit-for-bit** by the live check
-   endpoint — and a foreign subject's permissions are **403** without the audit permission.
+1. \`POST /v1/roles/assignments\`: catalog validation (**422**), an **escalation guard** that refuses
+   any grant exceeding the assigner's holdings (**403**), and an \`Idempotency-Key\`.
+2. A **Redis** effective-permission cache per \`(subject, scope)\`, stamped with \`grant_version\`
+   and invalidated by **bumping that counter**, misses collapsed behind a lock.
+3. A **gRPC** policy-engine client: 400 ms deadline, two attempts, retries only on
+   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, \`503\` on timeout, terminal \`403\` on rejection, cached
+   allows used only while their version matches.
+4. A **Kafka** \`permission.event\` stream keyed by **subject**, carrying the grant version, written
+   to the **outbox** in the grant's transaction, published after commit, and replayable into the
+   version counter.
+5. \`GET /v1/users/{id}/permissions\`: each permission with its **derivation**, from the
+   version-stamped cache, matched by the live check, **403** for a foreign subject.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real authorization feature:
-debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles, serves the happy path, and looks right. Debug it against the failure modes,
+fix it, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Identity and session management, group nesting and transitive membership, policy authoring and
-simulation, SCIM/SSO provisioning, the audit log store, key management for signed grants, and
-per-region replication. The five pieces above are the ones that decide whether the service is correct,
-isolated and shippable.`,
+Identity and sessions, group nesting, policy authoring, SCIM/SSO provisioning, the audit log store,
+key management for signed grants, and per-region replication.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'console · SDK', x: 8, y: 50},

@@ -16,7 +16,7 @@ import {stateStep} from './steps/state';
 export const fileStorageProblem: Problem = {
   id: 'file-storage',
   title: 'File Storage',
-  tagline: 'Uploads that respect quota, resume cleanly and never expose permanent links.',
+  tagline: 'Quota-reserved uploads and signed download links that expire in ten minutes.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -30,16 +30,14 @@ performs and the link it signs.
 
 ## The real system
 
-Production storage services never trust the size a client declares. They reserve quota atomically so two
-uploads cannot both spend the last gigabyte, count the bytes that actually arrive, and abort a stream
-that runs past its declaration. They keep an upload's session and its reservation in one atomic unit
-with an expiry, so an abandoned multi-gigabyte upload stops pinning the tenant's headroom. They write
-chunks to the object store under a deadline, retry only the chunk that failed, and let the store dedupe
-an identical chunk by its hash. They mark a file complete only after the store confirms the commit, so
-an interrupted upload never appears in a listing. They publish one event per file keyed by the file id,
-carrying digests and sniffed types but never the original filename. And they answer a download with a
-signed URL that expires, is bound to the requesting tenant, and leaves an audit record naming the
-person who asked.
+Amazon S3 is the reference shape. Its multipart upload splits an object into parts that are retried
+individually and assembled by a final \`CompleteMultipartUpload\`, and uploads can carry a SHA-256
+checksum so the store can verify each part. Reads are granted with presigned URLs: a bearer link
+signed with the caller's credentials that carries its own expiry, up to seven days from the SDK and
+between one minute and twelve hours from the console, and a bucket policy can reject any signature
+older than a chosen age with the \`s3:signatureAge\` condition. The service you debug here is the
+layer a platform builds on top of such a store: the quota it reserves, the bytes it counts, the events
+it publishes and the links it signs for its own tenants.
 
 ## What you build here
 
@@ -47,7 +45,7 @@ One service, **stored**, with five pieces:
 
 1. \`POST /v1/files\`: an authenticated tenant, a declared size within 5 GiB and a mime in the allowlist,
    a quota check, and a tenant-scoped upload id. The declared size is verified against the actual
-   stream — a stream past its declaration aborts mid-upload — and the finalize path records the type
+   stream (a stream past its declaration aborts mid-upload) and the finalize path records the type
    sniffed from the bytes rather than the one the caller claimed.
 2. A **Redis** state layer: the session and the tenant's reservation move in one atomic script, the
    chunk ack and the byte accounting move in another, the session key expires after 24 hours, and a
@@ -56,16 +54,16 @@ One service, **stored**, with five pieces:
    carries its SHA-256 so the store dedupes it, and completion waits for the store's \`CommitMultipart\`
    before the local index marks the file committed.
 4. A **Kafka** event path: one \`file.event\` per upload, finalize and delete, keyed by file id so a file's
-   lifecycle stays ordered, with the digest, the sniffed type and the size — and no original filename.
+   lifecycle stays ordered, with the digest, the sniffed type and the size and no original filename.
 5. \`GET /v1/files/{id}\`: the file's tenant is checked against the caller (a foreign id is \`404\`), the
    response is a signed URL that expires in 10 minutes, and the issuance is audited with the requester.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter in this course compiles, serves the happy path, and looks right. Your job in every step
+is the job you will have on a real feature: debug it against the failure modes, name the subtle one,
+fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
+your version.
 
 ## Left out on purpose
 

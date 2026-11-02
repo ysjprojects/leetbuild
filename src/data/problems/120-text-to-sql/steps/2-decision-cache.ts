@@ -8,35 +8,29 @@ export const decisionCacheStep: Step = {
   focus: ['api', 'redis', 'agents'],
   task: `## Task
 
-**Starting point.** The starter is working code: a repeated question comes
-back from the cache, a user under budget gets through, and the pending ACK is stored, so the demo
-passes. It hides four production flaws: a cache key that collides and never expires, a budget that
-races and never resets, a budget charged after the agents ran, and a pending ACK that lives forever.
-Find them, fix them, and prove the fix.
-
-Implement the Redis side of \`POST /v1/queries\`:
-
-- The table agent's decision is cached under \`decision:{workspace}:{qhash}\`, where \`qhash\` is
-  the SHA-256 of the **normalised** question (trimmed, lower-cased, whitespace collapsed). The key
-  includes the workspace because the same words mean different tables in Mobility and in Ads, and
-  the hash because "Trips in Seattle" and "trips in seattle" are one decision. Entries expire after
-  **24 hours** (\`DECISION_TTL_S = 86400\`): workspaces are re-curated, and a cached decision must
-  not outlive the table list it was made from.
-- Each user may create **50 queries per hour** (\`QUERY_BUDGET = 50\`, \`WINDOW_S = 3600\`). The key
-  is \`budget:{user}:{window}\` with \`window = floor(unix_seconds / 3600)\`; one atomic Lua
-  \`EVAL\` reads the counter, rejects when it is at the limit, increments it and sets \`EXPIRE\` on
-  the first write. Over budget is **429** with \`Retry-After\` (the key's TTL).
-- Reserve the budget **before** the first agent call; a rejected request must never have paid for
-  an intent call.
-- The proposed tables wait for the user's ACK under \`pending:{query_id}\` with
-  \`PENDING_TTL_S = 600\`: an ACK that does not arrive within ten minutes expires with the query.
+**Starting point.** The starter wires Redis into \`POST /v1/queries\`: \`decide\` caches the table
+agent's answer under \`decision:{question}\`, \`charge\` reads and increments \`budget:{user}\` after
+the agents have run, and the handler writes \`pending:{query_id}\` for the ACK. A repeated question
+comes back from the cache and a user under budget gets through, so the demo passes. It compiles
+and hides 5 flaws.
 
 **Failure mode the checks target.** A key built from the raw question misses on every
 capitalisation and collides across workspaces; a key without a TTL serves yesterday's table list
-after the workspace was re-curated; a read-then-set budget lets two concurrent requests both pass;
-a window-less budget key never resets, so one busy hour locks the user out for good; charging
-after the agents means the rejected request already cost two model calls; and pending ACKs that
-never expire grow Redis by one entry per abandoned question.`,
+after re-curation; a read-then-set budget lets two concurrent requests both pass and a window-less
+key never resets; charging after the agents means a rejected request already paid for two model
+calls; and pending ACKs without expiry grow Redis by one entry per abandoned question.
+
+Requirements:
+
+- Cache the decision under \`decision:{workspace}:{qhash}\`, \`qhash\` the SHA-256 of the
+  **normalised** question (trimmed, lower-cased, whitespace collapsed), with
+  \`DECISION_TTL_S = 86400\`.
+- **50 queries per user per hour** (\`QUERY_BUDGET\`, \`WINDOW_S = 3600\`) on
+  \`budget:{user}:{window}\`, \`window = floor(unix_seconds / 3600)\`: one Lua \`EVAL\` reads, rejects
+  at the limit, increments and sets \`EXPIRE\` on the first write. Over budget is **429** with
+  \`Retry-After\` from the key's TTL.
+- Reserve the budget **before** the first agent call.
+- Store the proposed tables under \`pending:{query_id}\` with \`PENDING_TTL_S = 600\`.`,
   sequence: {
     participants: ['querygen', 'Redis', 'Agents'],
     messages: [
@@ -50,9 +44,9 @@ never expire grow Redis by one entry per abandoned question.`,
     ],
   },
   hints: [
-    'Normalise before hashing: `strip`, lower-case, collapse runs of whitespace to one space, then SHA-256. The key is `decision:{workspace}:{qhash}`; the workspace is part of the identity of a decision, not metadata about it.',
-    'The budget script does all of it on the server: `GET` the counter, compare against `ARGV[1]`, `INCR`, and `EXPIRE` with `ARGV[2]` when the increment returned 1. Return `{ok, TTL}` so the 429 can carry a real `Retry-After`. Call it before the intent agent — the reservation is the first thing the handler does after validation.',
-    'Every `SET` in this file carries an expiry: `ex=DECISION_TTL_S` on the decision, `ex=PENDING_TTL_S` on the pending ACK. A key you write without a TTL is a key you have promised to delete yourself.',
+    'Symptoms: "Trips in Seattle" misses the cache that "trips in seattle" filled, an Ads user gets Mobility tables, two parallel requests both pass at 50, and a busy hour locks a user out for good.',
+    'The key drops the workspace and hashes nothing; no `SET` carries an expiry; the budget is a client-side GET then SET on a key with no window, run after two agent calls already cost money.',
+    'Key by `decision:{workspace}:{sha256(normalised)}` with `ex=DECISION_TTL_S`; one Lua `EVAL` on `budget:{user}:{window}` returning `{ok, ttl}`, called before `Intent`, 429 with `Retry-After`; `pending:` with `ex=PENDING_TTL_S`.',
   ],
   checks: [
     {
@@ -162,8 +156,7 @@ class QueryRequest(BaseModel):
 
 
 def charge(user: str) -> bool:
-    # TODO: replace the read-then-set budget with one atomic EVAL on a windowed key with EXPIRE,
-    # and reserve before the agents run instead of charging after they did.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"budget:{user}"
     used = int(r.get(key) or 0)
     if used >= BUDGET:
@@ -173,7 +166,6 @@ def charge(user: str) -> bool:
 
 
 def decide(question: str, workspace: str) -> dict:
-    # TODO: key by workspace and the hash of the normalised question, and give the entry a TTL.
     cached = r.get(f"decision:{question}")
     if cached is not None:
         return json.loads(cached)
@@ -192,7 +184,6 @@ def create_query(body: QueryRequest, user: str = Header(alias="X-User-Id")) -> d
     if not charge(user):
         raise HTTPException(status_code=429, detail="query budget exhausted", headers={"Retry-After": "3600"})
     query_id = str(uuid.uuid4())
-    # TODO: the pending ACK never expires.
     r.set(f"pending:{query_id}", json.dumps({"user": user, **decision}))
     return {"query_id": query_id, "status": "pending_ack", **decision}
 `,
@@ -284,7 +275,7 @@ def create_query(body: QueryRequest, user: str = Header(alias="X-User-Id")) -> d
 `,
     },
     typescript: {
-      starter: `/** POST /v1/queries: flawed code that caches by raw question and charges after the agents. */
+      starter: `/** POST /v1/queries: the starter's Redis side. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -308,8 +299,7 @@ interface Decision {
 }
 
 async function charge(user: string): Promise<boolean> {
-  // TODO: replace the read-then-set budget with one atomic EVAL on a windowed key with EXPIRE,
-  // and reserve before the agents run instead of charging after they did.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = \`budget:\${user}\`;
   const used = Number((await r.get(key)) ?? 0);
   if (used >= BUDGET) return false;
@@ -318,7 +308,6 @@ async function charge(user: string): Promise<boolean> {
 }
 
 async function decide(question: string, workspace: string): Promise<Decision> {
-  // TODO: key by workspace and the hash of the normalised question, and give the entry a TTL.
   const cached = await r.get(\`decision:\${question}\`);
   if (cached !== null) return JSON.parse(cached) as Decision;
   const picked = await agents.PickTables({question, workspace});
@@ -336,7 +325,6 @@ app.post('/v1/queries', async (request, reply) => {
     return reply.code(429).header('Retry-After', '3600').send({error: 'query budget exhausted'});
   }
   const queryId = randomUUID();
-  // TODO: the pending ACK never expires.
   await r.set(\`pending:\${queryId}\`, JSON.stringify({user, ...decision}));
   return reply.code(202).send({query_id: queryId, status: 'pending_ack', ...decision});
 });
@@ -457,8 +445,7 @@ type Decision struct {
 }
 
 func charge(ctx context.Context, user string) bool {
-	// TODO: replace the read-then-set budget with one atomic EVAL on a windowed key with EXPIRE,
-	// and reserve before the agents run instead of charging after they did.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := "budget:" + user
 	used, _ := rdb.Get(ctx, key).Int()
 	if used >= budget {
@@ -469,7 +456,6 @@ func charge(ctx context.Context, user string) bool {
 }
 
 func decide(ctx context.Context, question, workspace string) (Decision, error) {
-	// TODO: key by workspace and the hash of the normalised question, and give the entry a TTL.
 	key := "decision:" + question
 	if cached, err := rdb.Get(ctx, key).Result(); err == nil {
 		var decision Decision
@@ -510,7 +496,6 @@ func createQuery(rw http.ResponseWriter, r *http.Request) {
 	}
 	queryID := uuid.NewString()
 	pending, _ := json.Marshal(map[string]any{"user": user, "workspace": workspace, "tables_proposed": decision.TablesProposed})
-	// TODO: the pending ACK never expires.
 	rdb.Set(r.Context(), "pending:"+queryID, pending, 0)
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusAccepted)
@@ -677,8 +662,7 @@ object DecisionsApi {
   val jedis = new Jedis("redis", 6379)
   val agents = AgentsGrpc.blockingStub(ManagedChannelBuilder.forAddress("agents", 9000).usePlaintext().build())
 
-  // TODO: replace the read-then-set budget with one atomic EVAL on a windowed key with EXPIRE,
-  // and reserve before the agents run instead of charging after they did.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def charge(user: String): Boolean = {
     val key = s"budget:$user"
     val used = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
@@ -689,7 +673,6 @@ object DecisionsApi {
     }
   }
 
-  // TODO: key by workspace and the hash of the normalised question, and give the entry a TTL.
   def decide(question: String, workspace: String): Decision = {
     val key = s"decision:$question"
     Option(jedis.get(key)).map(_.parseJson.convertTo[Decision]).getOrElse {
@@ -717,7 +700,6 @@ object DecisionsApi {
               )
             } else {
               val queryId = UUID.randomUUID().toString
-              // TODO: the pending ACK never expires.
               jedis.set(s"pending:$queryId", JsObject(decision.toJson.asJsObject.fields + ("user" -> JsString(user))).compactPrint)
               complete(StatusCodes.Accepted, s"""{"query_id":"$queryId","status":"pending_ack","workspace":"$workspace"}""")
             }
@@ -863,8 +845,7 @@ std::unique_ptr<Agents::Stub> agents;
 std::string uuidString();
 
 bool charge(sw::redis::Redis& redis, const std::string& user) {
-  // TODO: replace the read-then-set budget with one atomic EVAL on a windowed key with EXPIRE,
-  // and reserve before the agents run instead of charging after they did.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto key = "budget:" + user;
   const auto raw = redis.get(key);
   const long long used = raw ? std::stoll(*raw) : 0;
@@ -874,7 +855,6 @@ bool charge(sw::redis::Redis& redis, const std::string& user) {
 }
 
 json decide(sw::redis::Redis& redis, const std::string& question, const std::string& workspace) {
-  // TODO: key by workspace and the hash of the normalised question, and give the entry a TTL.
   const auto key = "decision:" + question;
   if (const auto cached = redis.get(key)) return json::parse(*cached);
   grpc::ClientContext ctx;
@@ -917,7 +897,6 @@ int main() {
     }
     const auto queryId = uuidString();
     decision["user"] = user;
-    // TODO: the pending ACK never expires.
     redis.set("pending:" + queryId, decision.dump());
     decision["query_id"] = queryId;
     decision["status"] = "pending_ack";
@@ -1065,5 +1044,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing three Redis habits at once. Identity: a cache key names *what* was decided — the workspace and the normalised question — not the bytes that happened to arrive, so the same question cached once serves every user who asks it that hour and never leaks a Mobility table list into an Ads question. Lifetime: every key in this file has a TTL, because the decision is only as good as the curation it was made from and a pending ACK that nobody answers is garbage by definition. Atomicity and order: a budget is a reservation made in one server-side script before the money is spent, not a count taken after the agents already ran; a read-then-write budget passes every serial test and fails under exactly the load it exists for. Real services add a cache version stamped from the workspace's curation revision so a re-curation invalidates in one step, a per-workspace budget beside the per-user one, and a refund when the chain fails before generation.`,
+  debrief: `The fix changes what each key means rather than adding code around it. Identity: a cache key names what was decided, the workspace and the normalised question, not the bytes that arrived, so one cached decision serves everyone who asks that hour and a Mobility table list cannot answer an Ads question. Lifetime: every key has a TTL, because a decision is only as good as the curation it came from and an unanswered pending ACK is garbage by definition. Atomicity and order: the budget is a reservation made in one server-side script before money is spent; a read-then-write budget passes every serial test and fails under exactly the load it exists for. Production systems also stamp the key with the workspace's curation revision, keep a per-workspace budget beside the per-user one, and refund when the chain fails before generation.`,
 };

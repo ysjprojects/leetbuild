@@ -8,34 +8,26 @@ export const checkpointsStep: Step = {
   focus: ['lead', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it records the plan, stores
-each subagent's result as it lands and counts tool calls against the budget. In a demo on one
-process it looks exactly like a checkpoint store. It hides three production flaws: the state lives
-in process memory, the tool counter races, and the tool is called before the budget is charged.
-Debug it, fix it, and prove the fix.
-
-Implement the lead agent's checkpoint store:
-
-- The job record lives in Redis under \`research:{job_id}\` — a hash with \`status\`, the
-  serialised \`plan\` and the \`budget\` — written with \`HSET\` when the job starts.
-- Each subagent result is checkpointed as it arrives: \`HSET research:{job_id}:results {task_id}
-  {findings}\`. The source's lesson is that agents are stateful and errors compound, so a lead that
-  crashes must resume from where it was, not restart from the beginning.
-- Both keys expire **24 hours** after their last write (\`CHECKPOINT_TTL_S = 86400\`): a finished
-  or abandoned job must not live in Redis forever.
-- \`resume(job_id)\` reads the job record and the results with \`HGETALL\` and returns the plan's
-  **pending** tasks (those without a result) together with the results already in hand. A restarted
-  lead calls it before fanning out, so completed subagents are never re-run.
-- Tool calls are reserved against \`budget.max_tool_calls\` by **one atomic Lua script** on
-  \`research:{job_id}:tools\` — \`INCRBY\`, compare, roll back when over, set the expiry on first
-  write — and the reservation happens **before** the tool is called. A subagent that is over budget
-  gets a \`BudgetExceeded\` error and the tool is never touched.
+**Starting point.** The starter is the lead agent's checkpoint store: \`start_job\` records the
+plan and budget, \`save_result\` stores each subagent's findings, \`pending_tasks\` filters the plan,
+and \`tool_call\` runs the tool and then counts it, all in a process-local \`JOBS\` dictionary. On
+one process it looks right. It compiles and hides five flaws.
 
 **Failure mode the checks target.** A process-local dictionary is lost on every crash, deploy and
-scale-out, so the lead restarts from zero and pays for every subagent twice — the source calls
-restarts expensive and frustrating for exactly this reason; a counter that is incremented in memory
-by concurrent subagents overshoots the budget; and charging after the call means the budget is a
-report, not a limit.`,
+scale-out, so the lead restarts from zero and pays for every subagent twice; a counter incremented
+in memory by concurrent subagents overshoots the budget; charging after the call makes the budget a
+report, not a limit.
+
+- The job record lives in Redis under \`research:{job_id}\`, a hash with \`status\`, the
+  serialised \`plan\` and the \`budget\`, written with \`HSET\` at start.
+- Each subagent result is checkpointed as it arrives: \`HSET research:{job_id}:results {task_id}
+  {findings}\`.
+- Both keys expire **24 hours** after their last write (\`CHECKPOINT_TTL_S = 86400\`).
+- \`resume(job_id)\` reads both hashes with \`HGETALL\` and returns the plan's **pending** tasks
+  with the results in hand; a restarted lead calls it before fanning out.
+- Tool calls are reserved against \`budget.max_tool_calls\` by **one atomic Lua script** on
+  \`research:{job_id}:tools\` (\`INCRBY\`, compare, roll back when over, expiry on first write),
+  **before** the tool is called; over budget raises \`BudgetExceeded\` and the tool is not touched.`,
   sequence: {
     participants: ['Lead agent', 'Redis', 'Tools'],
     messages: [
@@ -56,9 +48,9 @@ report, not a limit.`,
     ],
   },
   hints: [
-    'Replace the dictionary with hashes: `HSET research:{job_id}` for the record, `HSET research:{job_id}:results task_id findings` for each result, and an `EXPIRE` of 86 400 s after each write. Everything the lead needs to continue must be readable by a process that did not start the job.',
-    '`resume` is two `HGETALL`s and a filter: parse the plan from the record, read the results hash, and return the tasks whose id is not a field of it. The lead calls it before the fan-out and only runs what comes back.',
-    'The budget is a Lua script, not an `if`: `INCRBY` the counter, compare the result against `ARGV[1]`, `DECRBY` and return 0 when it went over, `EXPIRE` when the TTL is unset. Call `reserve_tool_call` first and `call_tool` only when it returned a positive count.',
+    'After a deploy mid-job the lead reports every task as pending and re-runs subagents it already paid for, and a `fact` job with a budget of 10 tool calls shows 14 in the bill.',
+    'Everything lives in the `JOBS` dictionary of one process, `tool_call` runs `call_tool` and only then does `+= 1`, and that increment from concurrent subagents is a read-compare-write race with no expiry anywhere.',
+    'Write `HSET research:{job_id}` and `research:{job_id}:results` with `EXPIRE` 86 400 s, make `resume` two `HGETALL`s plus a filter, and run `RESERVE_LUA` (`INCRBY`, compare, `DECRBY`) via `reserve_tool_call` before `call_tool`.',
   ],
   checks: [
     {
@@ -136,8 +128,7 @@ class BudgetExceeded(Exception):
     """The job has used every tool call its effort level allows."""
 
 
-# TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
-# in-memory increment, and charges the budget after the tool has already run. Fix all three.
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 JOBS: dict[str, dict] = {}
 
 
@@ -255,8 +246,7 @@ interface JobState {
 
 export class BudgetExceeded extends Error {}
 
-// TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
-// in-memory increment, and charges the budget after the tool has already run. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 const JOBS = new Map<string, JobState>();
 
 export function startJob(jobId: string, plan: Task[], budget: Budget): void {
@@ -389,8 +379,7 @@ type jobState struct {
 
 var ErrBudgetExceeded = errors.New("tool-call budget exceeded")
 
-// TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
-// in-memory increment, and charges the budget after the tool has already run. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 var (
 	jobs   = map[string]*jobState{}
 	jobsMu sync.Mutex
@@ -569,8 +558,7 @@ object Checkpoints {
     var toolCalls: Int = 0
   }
 
-  // TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
-  // in-memory increment, and charges the budget after the tool has already run. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   private val jobs = mutable.Map.empty[String, JobState]
 
   def startJob(jobId: String, plan: List[Task], budget: Budget): Unit =
@@ -694,8 +682,7 @@ struct JobState {
   int tool_calls = 0;
 };
 
-// TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
-// in-memory increment, and charges the budget after the tool has already run. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::map<std::string, JobState> jobs;
 std::mutex jobsMutex;
 
@@ -832,5 +819,5 @@ std::string toolCall(const std::string& jobId, const std::string& name, const st
 `,
     },
   },
-  debrief: `The interview question behind this step is durability for a long-running, stateful process. The source is explicit: agents run for a long time, maintain state across many tool calls, and when something fails you cannot restart from the beginning — restarts are expensive and users notice — so the system resumes from where the agent was. A dictionary in the worker's memory is the opposite of that: every crash, deploy and scale-out event empties it, and the lead pays for every subagent again. Hashes keyed by job id with a TTL make the state survive the process and die with the job. The tool counter is the second half: subagents run concurrently, so a budget that is read, compared and incremented in three steps is a race, and one that is charged after the call is a report. One Lua script that increments, compares and rolls back is both atomic and a limit. Real systems also checkpoint the lead's own plan and partial synthesis, version the checkpoint schema so a resumed job can be read by newer code, and hold a lease on the job so two workers never resume the same one.`,
+  debrief: `The fix protects durability for a long-running, stateful process: when something fails the system resumes from where the agent was, because a restart repeats every subagent's spend and the user notices the delay. A dictionary in the worker's memory is the opposite of that; hashes keyed by job id with a TTL survive the process and die with the job. The tool counter is the second half: subagents run concurrently, so a budget read, compared and incremented in three steps is a race, and one charged after the call is a report. One Lua script that increments, compares and rolls back is atomic and a limit. Production systems also checkpoint the lead's own plan, version the checkpoint schema, and hold a lease so two workers cannot resume the same job.`,
 };

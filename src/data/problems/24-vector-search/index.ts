@@ -17,43 +17,41 @@ import {readStep} from './steps/5-read';
 export const vectorSearchProblem: Problem = {
   id: 'vector-search',
   title: 'Vector Search Service',
-  tagline: 'Tenant-filtered nearest-neighbor search with scatter-gather limits and honest results.',
+  tagline: 'Tenant-filtered nearest-neighbor search with a scoped cache, shard quorum and labeled results.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Vector Search Service
 
-A vector search service answers one question — which stored vectors are closest to this one,
-inside this tenant's corpus — and all of the difficulty is in the qualifiers. The visible part is a
-ranked list of ids. The parts that decide whether the service is safe are the tenant that gets
-scoped onto the query, the cap that stops one caller from asking for the whole index, the fan-out
-that must answer from a quorum of shards inside a deadline, the events that describe a search
-without retaining it, and the provenance stamped on every result.
+A vector search service answers one question, which stored vectors are closest to this one inside
+this tenant's corpus, and all of the difficulty is in the qualifiers. The visible part is a ranked
+list of ids. The parts that decide whether the service is safe are the tenant that gets scoped onto
+the query, the cap that stops one caller from asking for the whole index, the fan-out that must
+answer from a quorum of shards inside a deadline, the events that describe a search without
+retaining it, and the provenance stamped on every result.
 
 ## The real system
 
-Production search services receive a query from an authenticated tenant and resolve everything else
-themselves: the tenants that may be searched, the index version that is live, the number of
-neighbors that may be returned. They cache aggressively because identical lookups are the common
-case, but the cache key is a security boundary — it carries the tenant and the index version, so a
-popular query by one tenant can never populate an entry that another tenant reads. They fan a query
-out to index shards over gRPC with a deadline per shard, require a quorum of answers before they
-call a result a result, and report a partial answer as partial instead of pretending a slow shard
-returned nothing. They publish search events keyed by tenant for ordering, and those events carry a
-fingerprint, latency and version — never the query text, because a query is tenant content and a
-topic is retained and replicated. And when they serve neighbors from a cached snapshot, they label
-the response with the version that produced it, not with whatever version is live now.
+Pinecone stores records inside namespaces within an index, and every upsert and query targets
+exactly one namespace; its documented multitenancy pattern is one namespace per tenant, so a query
+cannot cross tenants because the namespace is part of the request the server resolves, not a filter
+the caller may omit. An index also fixes the vector dimension at creation, which is why a
+wrong-width query is rejected before it touches storage. The service you debug here applies the
+same shape to a self-hosted design: tenant and index version resolved on the server, a cache key
+that carries both, a scatter-gather over gRPC shards with a per-shard deadline and a quorum, search
+events keyed by tenant that carry a fingerprint rather than the query, and a neighbors read labeled
+with the version that produced its results.
 
 ## What you build here
 
 One service, **searchd**, with five pieces:
 
 1. \`POST /v1/search\`: the authenticated tenant filter, a query vector checked against the active
-   index's dimension, \`k\` capped at 100, and a server-resolved index version — the caller picks
+   index's dimension, \`k\` capped at 100, and a server-resolved index version; the caller picks
    none of the three.
 2. A **Redis** result cache: keyed by \`(tenant, index version, query digest, k)\`, written with a
-   60-second TTL, never invalidated by hand and never shared across tenants.
+   60-second TTL, expired rather than invalidated by hand, and not shared across tenants.
 3. A **gRPC** shard client: a 400 ms deadline per shard, bounded retries inside a small retry
    budget, a quorum of shard replies before answering, and an explicit partial answer instead of a
    silently incomplete list.

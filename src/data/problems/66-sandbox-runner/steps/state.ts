@@ -8,30 +8,25 @@ export const stateStep: Step = {
   focus: ['runner', 'redis', 'container'],
   task: `## Task
 
-The starter is working code: the happy-path job runs to completion and its
-result appears, so the demo works. Its clock lives in the wrong place. Find the flaws, fix them, and
-prove the fix.
+**Starting point.** The starter’s \`run_job\` records \`time.monotonic()\` in a process-local
+\`jobs\` dict, calls \`containers.Start(job_id)\`, reads output chunks until the stream ends or
+\`DEFAULT_TIMEOUT_S\` of local clock has elapsed, then \`finish\` calls \`store.put_result\`
+unconditionally. It compiles and hides five flaws.
 
-Implement the runner’s job loop, where the **lease in Redis is the authority** for how long a job may
-run:
+**Failure mode the checks target.** The clock lives in the runner process. A restart forgets every
+running job, the loop exits at the timeout without killing the container, and a result that arrives
+after the deadline is published as the job’s result.
 
-- Every job holds a lease key \`lease:{job_id}\` set with the job’s **hard maximum runtime** as its
-  TTL (\`MAX_RUNTIME_S\`, from the requested profile). A job may never outlive its lease — the
-  wall-clock limit is a property of the lease, not of a timer in the runner.
-- The remaining budget is read **from Redis** on every check (\`TTL lease:{job_id}\`). A runner that
-  tracks elapsed time in process memory forgets every job on restart, and the container then runs
-  until the node dies.
-- When the lease lapses (**TTL ≤ 0**) the runner **kills** the container and reports no result.
-- A result may only be written while the lease is still held: \`finish\` re-reads the lease and
-  **discards** a late write instead of publishing it as the job’s result.
-- On start-up the runner **recovers** its jobs from Redis (\`recover_leases\`): it scans the
-  \`lease:\` keys, kills the ones whose lease has already lapsed, and resumes the rest. Recovery is
-  how a restart stops being a leak.
+Make the lease in Redis the authority for how long a job may run:
 
-**Failure mode the checks target.** In-process runtime tracking makes the lease unenforceable across
-a restart; a kill that only happens in the runner’s own timer never happens at all; and a result
-written after the deadline turns a killed job into a successful one in the job history. Each is
-invisible until the process is restarted or a job misbehaves.`,
+- Every job holds \`lease:{job_id}\` (\`LEASE_PREFIX\`), set atomically with the hard maximum
+  runtime as its TTL (\`MAX_RUNTIME_S\`, \`ex=MAX_RUNTIME_S\`).
+- The remaining budget is read from Redis on every check (\`lease_ttl(job_id)\`, which wraps
+  \`TTL\`); no monotonic arithmetic in the runner decides the deadline.
+- When the TTL reaches zero the runner calls \`containers.Kill(job_id)\` and reports no result.
+- \`finish\` re-reads the lease before \`store.put_result\` and discards a late write.
+- On start-up \`recover_leases\` scans the \`lease:\` keys with \`scan_iter\`, kills the jobs whose
+  lease already lapsed and resumes the rest.`,
   sequence: {
     participants: ['Runner', 'Redis', 'Container service'],
     messages: [
@@ -45,9 +40,9 @@ invisible until the process is restarted or a job misbehaves.`,
     ],
   },
   hints: [
-    'The lease is an ordinary Redis key whose TTL *is* the hard limit: `SET lease:{job_id} <runner> NX EX MAX_RUNTIME_S`. Nothing in the runner may compute a deadline of its own — read `TTL` instead, so a restarted process sees exactly what the previous one saw.',
-    'Enforce the kill where the lease says so: `if ttl <= 0: kill(job)` before reading another chunk of output, and again before writing the result. A container that keeps writing after its lease is gone must be killed, and its output must never reach the result store.',
-    'Recovery is the restart half: `recover_leases()` scans `lease:*`, kills the jobs whose TTL already lapsed, and returns the live ones. Without it, a runner restart leaves every container orphaned on the node with nobody holding the clock.',
+    'Restart the runner while a job is running: the container keeps going on the node, nothing kills it at 300 s, and when it eventually exits its result still lands in the store.',
+    'The deadline is `time.monotonic() - started` against a constant in a process-local dict, so it dies with the process; the loop only stops reading, it does not kill, and `finish` writes whatever arrives.',
+    '`r.set(LEASE_PREFIX + job_id, runner, nx=True, ex=MAX_RUNTIME_S)`; check `lease_ttl(job_id)` each tick and before `put_result`, `containers.Kill` at zero; `recover_leases` via `scan_iter("lease:*")`.',
   ],
   checks: [
     {
@@ -141,9 +136,7 @@ store = ResultStore()
 
 
 def run_job(job_id: str) -> None:
-    # TODO: hold a Redis lease with the hard runtime as its TTL, read the remaining budget from
-    # Redis instead of a local clock, kill the container at the deadline, discard a result written
-    # after the lease lapsed, and recover the jobs of a restarted runner.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     started = time.monotonic()
     jobs[job_id] = {"started": started}
     stream = containers.Start(job_id)
@@ -224,7 +217,7 @@ def finish(job_id: str, result: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** The runner loop: flawed code whose clock lives in the process. */
+      starter: `/** The runner loop: starts a container, reads its output, stores the result. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -239,9 +232,7 @@ interface JobResult {
 }
 
 async function runJob(jobId: string): Promise<void> {
-  // TODO: hold a Redis lease with the hard runtime as its TTL, read the remaining budget from
-  // Redis instead of a local clock, kill the container at the deadline, discard a result written
-  // after the lease lapsed, and recover the jobs of a restarted runner.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const startedAt = Date.now();
   jobs[jobId] = {startedAt};
   const stream = await containers.Start(jobId);
@@ -335,9 +326,7 @@ const defaultTimeoutSeconds = 300
 var jobs = map[string]time.Time{}
 
 func runJob(ctx context.Context, jobID string) {
-	// TODO: hold a Redis lease with the hard runtime as its TTL, read the remaining budget from
-	// Redis instead of a local clock, kill the container at the deadline, discard a result written
-	// after the lease lapsed, and recover the jobs of a restarted runner.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	started := time.Now()
 	jobs[jobID] = started
 	stream, _ := containers.Start(ctx, jobID)
@@ -446,9 +435,7 @@ object Runner {
   val DefaultTimeoutMillis = 300000L
   val jobs = new ConcurrentHashMap[String, java.lang.Long]()
 
-  // TODO: hold a Redis lease with the hard runtime as its TTL, read the remaining budget from
-  // Redis instead of a local clock, kill the container at the deadline, discard a result written
-  // after the lease lapsed, and recover the jobs of a restarted runner.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def runJob(jobId: String): Unit = {
     val started = System.nanoTime()
     jobs.put(jobId, started)
@@ -540,9 +527,7 @@ void finish(const std::string& jobId, const nlohmann::json& result) {
 }
 
 void runJob(const std::string& jobId) {
-  // TODO: hold a Redis lease with the hard runtime as its TTL, read the remaining budget from
-  // Redis instead of a local clock, kill the container at the deadline, discard a result written
-  // after the lease lapsed, and recover the jobs of a restarted runner.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto started = std::chrono::steady_clock::now();
   jobs[jobId] = started;
   auto stream = containers->Start(jobId);
@@ -620,15 +605,11 @@ void runJob(const std::string& jobId) {
 `,
     },
   },
-  debrief: `The interview question is "where does the authority for a deadline live?" A runner that
-times its jobs with a local clock is correct exactly until the process restarts, and then every
-orchestrator decision it made is gone: the containers keep going because nobody owns the clock any
-more. Moving the deadline into a Redis key with a TTL fixes both halves at once — the lock that
-makes one runner own a job and the hard limit that ends it are the same object, and any process can
-read it without a coordinator. Enforcing the kill is the second half: the lease says when, but
-somebody has to actually call \`Kill\`, and it has to happen before the result is written, or a job
-that ran past its deadline reappears in the job history as a success. Recovery is the third: on
-start-up the runner asks Redis what exists, kills what already expired, and adopts the rest. Real
-platforms add lease renewal with a heartbeat for long jobs, a per-node container reaper that
-survives a runner crash, and audit rows that record the deadline each job was given.`,
+  debrief: `A runner that times its jobs with a local clock is correct until the process restarts; then the
+containers keep going because nobody owns the clock. A Redis key with a TTL is both the lock that
+makes one runner own a job and the hard limit that ends it, readable by any process. The lease only
+says when, so the kill still has to be called, and before the result is written, or a job that
+overran reappears in the history as a success. Recovery closes the loop: on start-up the runner
+asks Redis what exists, kills what expired, and adopts the rest. Production runners renew the lease
+with a heartbeat for long jobs and run a per-node reaper that outlives a runner crash.`,
 };

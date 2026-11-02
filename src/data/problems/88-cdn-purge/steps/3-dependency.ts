@@ -8,40 +8,18 @@ export const dependencyStep: Step = {
   focus: ['purge', 'cdn', 'edges'],
   task: `## Task
 
-**Starting point.** The starter calls the provider’s \`BatchPurge\` RPC and loops until something
-comes back. It compiles, it works against a healthy provider, and it hides three flaws that only
-appear when the provider is unhappy. Debug it like the owner of the client library, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter's \`submit_batch(purge_id, domain, paths)\` calls the provider's \`BatchPurge\` RPC in a loop with no deadline, mints a fresh \`batch_id\` per attempt, skips to the next attempt on any \`RpcError\`, and returns \`succeeded\` as soon as one path is accepted. It works against a healthy provider and hides five flaws.
 
-Implement \`submit_batch(purge_id, domain, paths)\` against \`PurgeService.BatchPurge\`:
+**Failure mode the checks target.** A rejected pattern is retried until someone kills the pod, a hung connection holds the request forever, a retry after a timeout purges the same paths under a new id, a partial purge looks complete, and the per-path results an operator needs are thrown away.
 
-- \`BatchPurgeRequest\` carries \`batch_id\`, \`domain\`, the \`patterns\` still being attempted and the
-  \`attempt\` number. \`BatchPurgeReply\` carries one \`results\` entry per pattern, each with
-  \`path\` and \`status\`.
-- **Per-path outcomes are the product.** Every path ends in one of \`accepted\`,
-  \`invalid_pattern\` or \`failed\`, and the result carries the full \`outcomes\` map so an operator
-  can see which paths survived. A return value of "ok" is not an answer: the caller needs to know
-  which patterns the CDN refused.
-- **Terminal outcomes stop their paths.** \`invalid_pattern\` is terminal — a malformed pattern
-  stays malformed, so retrying it forever is a hot loop against the provider. The same holds when
-  the RPC itself fails with \`INVALID_ARGUMENT\` or \`FAILED_PRECONDITION\`: every path in that batch
-  is finished, and no attempt is made again.
-- **Retryable outcomes are bounded.** Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` (the \`RETRYABLE\`
-  set) are worth another attempt, at most \`MAX_ATTEMPTS\` = 3 attempts in total, each under a
-  **two-second deadline** (\`DEADLINE_S\` in Python, \`DEADLINE_MS\`/\`DeadlineMs\` elsewhere) so a
-  wedged connection cannot hold the request forever.
-- **Retries replay only what is pending, under the same batch id.** The paths that did not reach a
-  terminal outcome are the \`pending\` set for the next attempt, and the \`batch_id\` is minted once
-  for the whole batch: the provider dedupes on it, so a retry can never purge the same path twice.
-- The batch \`succeeded\` only when **every** path reached \`accepted\` — one accepted path out of
-  thirty is a partial failure, and the caller has to see it as one.
+- \`BatchPurgeRequest\` carries \`batch_id\`, \`domain\`, the \`patterns\` still being attempted and the \`attempt\` number; \`BatchPurgeReply\` carries one \`results\` entry per pattern.
+- Every path ends in \`accepted\`, \`invalid_pattern\` or \`failed\`, and the result carries the full \`outcomes\` map.
+- \`invalid_pattern\` is terminal, and so is an RPC failing with \`INVALID_ARGUMENT\` or \`FAILED_PRECONDITION\`.
+- Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` (the \`RETRYABLE\` set) earn another attempt, at most \`MAX_ATTEMPTS\` = 3 in total, each under a **two-second deadline** (\`DEADLINE_S\`; \`DEADLINE_MS\`/\`DeadlineMs\` elsewhere).
+- Retries replay only the \`pending\` paths under the same \`batch_id\`, minted once so the provider can dedupe on it.
+- The batch \`succeeded\` only when **every** path reached \`accepted\`.
 
-:::widget deadline-retry {"base": 100, "deadline": 2000, "attempts": 3}
-
-**Failure mode the checks target.** The starter \`while True:\`s on every error, so a rejected
-pattern is retried until someone kills the pod; it marks the batch \`succeeded\` as soon as one path
-comes back accepted, so a partial purge looks complete; and it throws away the per-path results, so
-the operator who has to purge those thirty paths by hand never learns which ones they are.`,
+:::widget deadline-retry {"base": 100, "deadline": 2000, "attempts": 3}`,
   sequence: {
     participants: ['Purge API', 'provider client', 'CDN provider'],
     messages: [
@@ -155,11 +133,7 @@ cdn = cdn_pb2_grpc.PurgeServiceStub(channel)
 
 
 def submit_batch(purge_id: str, domain: str, paths: list[str]) -> dict:
-    # TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
-    # marks the whole batch successful as soon as one path is accepted, and throws away the
-    # per-path outcomes. Fix all four: one batch id for the batch, a terminal set that stops
-    # invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried
-    # under a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     while True:
         request = cdn_pb2.BatchPurgeRequest(batch_id=str(uuid.uuid4()), domain=domain, patterns=paths)
         try:
@@ -265,11 +239,7 @@ const cdnProvider = new cdn.PurgeService('cdn-provider:9000', grpc.credentials.c
 const purge = promisify(cdnProvider.Purge.bind(cdnProvider));
 
 export async function submitBatch(purgeId: string, domain: string, paths: string[]): Promise<unknown> {
-  // TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
-  // marks the whole batch successful as soon as one path is accepted, and throws away the per-path
-  // outcomes. Fix all four: one batch id for the batch, a terminal set that stops
-  // invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried under
-  // a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (;;) {
     const reply = (await purge({
       batch_id: randomUUID(),
@@ -391,11 +361,7 @@ import (
 )
 
 func submitBatch(ctx context.Context, client pb.PurgeServiceClient, purgeID, domain string, paths []string) (*BatchResult, error) {
-	// TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
-	// marks the whole batch successful as soon as one path is accepted, and throws away the
-	// per-path outcomes. Fix all four: one batch id for the batch, a terminal set that stops
-	// invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried
-	// under a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	for {
 		batchID := purgeID + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
 		reply, err := client.Purge(ctx, &pb.BatchPurgeRequest{BatchId: batchID, Domain: domain, Patterns: paths})
@@ -548,11 +514,7 @@ object PurgeClient {
   val stub = PurgeServiceGrpc
     .blockingStub(ManagedChannelBuilder.forAddress("cdn-provider", 9000).usePlaintext().build())
 
-  // TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
-  // marks the whole batch successful as soon as one path is accepted, and throws away the per-path
-  // outcomes. Fix all four: one batch id for the batch, a terminal set that stops
-  // invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried under
-  // a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def submitBatch(purgeId: String, domain: String, paths: List[String]): Map[String, String] = {
     var outcome = Map.empty[String, String]
     var done = false
@@ -656,11 +618,7 @@ object PurgeClient {
 
 std::string uuidString();
 
-// TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
-// marks the whole batch successful as soon as one path is accepted, and throws away the per-path
-// outcomes. Fix all four: one batch id for the batch, a terminal set that stops invalid_pattern
-// and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried under a 2 s deadline and
-// a bounded attempt count, and a per-path outcome map in the result.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::vector<std::string> submitBatch(
     PurgeService::Stub* client,
     const std::string& purgeId,
@@ -787,9 +745,11 @@ BatchResult submitBatch(
     },
   },
   hints: [
-    'Model the batch as a map from path to outcome and drive the loop from it: `unfinished(outcomes)` is both the work list for the next attempt and the condition that ends the loop. A path leaves that set exactly once, when it reaches a terminal outcome.',
-    'Split failures in two. A per-path `invalid_pattern` or a batch-level `INVALID_ARGUMENT`/`FAILED_PRECONDITION` is terminal for those paths; only `UNAVAILABLE` and `DEADLINE_EXCEEDED` earn another attempt, and the attempt count is bounded so even a fully broken provider costs three calls, not three thousand.',
-    'Mint the `batch_id` once, before the loop, and put it on every attempt: the provider dedupes on it, so a retry after a timeout is a no-op rather than a second purge of paths that already propagated. Send only the pending paths so a retry also costs less than the first attempt.',
+    'One malformed pattern pins a worker in a hot loop against the provider until the pod is killed; a batch with one accepted path out of thirty reports success and nobody learns which twenty-nine failed.',
+    '`submit_batch` loops `while True`, mints a fresh `batch_id` on each attempt, calls the RPC with no timeout, `continue`s on every `RpcError`, and returns as soon as any result is `accepted`.',
+    'Mint `batch_id` once, keep an `outcomes` map driven by `unfinished`, call with `timeout=DEADLINE_S` at most `MAX_ATTEMPTS` times, retry only `RETRYABLE` codes with the `pending` paths, and set `succeeded` only when all are accepted.',
   ],
-  debrief: `The interviewer is probing one question under many names: what is the worst case of this call? A deadline bounds one attempt, a bounded attempt count bounds the call, and the retryable set decides which failures are even worth another attempt — a rejected pattern is a fact, not a transient error, and retrying it turns a client bug into a provider incident. The per-path outcome map is what makes the failure actionable: an operator who has to fix thirty patterns needs to know which ones the CDN refused and which ones never made it. Reusing the batch id is the correctness half: purge is not idempotent by itself, so the client has to give the provider something to dedupe on. Real clients add jittered backoff between attempts, a breaker per provider endpoint, and a partial-success response that the API layer can surface as \`partially_failed\` instead of a bare 500.`,
+  debrief: `The fix has its shape because every piece bounds one dimension of the worst case. The deadline bounds an attempt, \`MAX_ATTEMPTS\` bounds the call, and the \`RETRYABLE\` set bounds which failures are worth repeating: a rejected pattern is a fact, and retrying a fact turns a client bug into a provider incident. The \`outcomes\` map makes a partial failure actionable, because an operator with thirty paths to fix needs to know which ones the CDN refused. One reused \`batch_id\` is the correctness half: a purge is not idempotent on its own, so the client hands the provider something to dedupe on.
+
+Production clients space attempts with jittered backoff, put a breaker per provider endpoint, and persist the outcome map so the status read in step 5 answers from it.`,
 };

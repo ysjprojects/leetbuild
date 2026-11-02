@@ -17,7 +17,7 @@ import {readStep} from './steps/5-read';
 export const resumableUploadProblem: Problem = {
   id: 'resumable-upload',
   title: 'Resumable Upload',
-  tagline: 'Large uploads that resume from the exact missing part, verified per part.',
+  tagline: 'Multi-gigabyte uploads that resume from the exact missing part number.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,15 +31,16 @@ resume read.
 
 ## The real system
 
-Production upload services initiate a session with a declared total size, part size and content type,
-then bound the manifest by dividing the total by the minimum part size so a 1-byte part cannot create a
-million rows. Each part is registered in one atomic script that rejects duplicates and out-of-range
-numbers and expires abandoned sessions after 24 hours. Parts are written to the object store over gRPC
-under a deadline, and the store echoes the checksum it computed; the manifest marks a part stored only
-when the echoed checksum matches. Completion publishes an event keyed by the upload id so an upload's
-history stays ordered, and only after the object commits, with an outbox row when the broker rejects.
-And the status read returns stored, missing and corrupt parts — an exact work list — scoped to the
-tenant that owns the upload, so a client resumes from the gaps rather than restarting.
+The tus resumable upload protocol makes resume a two-step dance: the client sends a \`HEAD\` to the
+upload URL and the server answers with an \`Upload-Offset\` header saying how many bytes it has, and
+the client continues with a \`PATCH\` from that offset. Its creation extension declares
+\`Upload-Length\` up front so the server can bound the session before any bytes arrive. Part-based
+services such as S3 multipart upload follow the same shape with numbered parts instead of a byte
+offset: initiate with a declared size, register each part with the checksum the store computed, and
+list the parts on resume. The service in this course does the part-based version: one atomic
+manifest write per part, a checksum compared against the store's echo before a part is called
+stored, completion published only after the object commits, and a status read that returns the
+missing and corrupt part numbers scoped to the owning tenant.
 
 ## What you build here
 
@@ -63,8 +64,8 @@ One service, **uploadd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,40 +8,30 @@ export const runGuardStep: Step = {
   focus: ['analyst', 'api', 'warehouse'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks the query up and
-hands its SQL to the warehouse. With well-behaved model output the demo passes. It hides four
-production flaws: anything the model wrote is executed, against any table, without a partition
-filter, with no row cap and no timeout. Debug it like the owner of the warehouse, fix it, and prove
-the fix.
+**Starting point.** The starter registers \`POST /v1/queries/{id}/run\`, looks the record up (404
+when unknown), hands \`record["sql"]\` to \`warehouse.execute\` as written and returns the rows
+with \`row_count\`. With well-behaved model output the demo passes. It compiles and hides 4 flaws.
 
-Implement \`POST /v1/queries/{id}/run\`. The record for \`{id}\` holds \`sql\`, \`user\`,
-\`workspace\` and \`tables_acked\` (the list the user confirmed or edited). **401** without
-\`X-User-Id\`, **404** for an unknown id, **403** when the record belongs to another user. Before
-the warehouse sees a byte, the guard checks:
+**Failure mode the checks target.** Executing model output verbatim lets the model decide what the
+warehouse runs: a hallucinated table is a failed query, a missing partition filter is a full scan,
+a missing \`LIMIT\` streams a billion rows into a browser tab, and a slow join holds a warehouse
+slot until someone notices.
 
-- **One SELECT.** \`is_single_select\`: the statement starts with \`SELECT\` or \`WITH\` and contains
-  no second statement (no \`;\` inside). Anything else is **422** — the generator is asked for a
-  query, and "a query" is never an \`INSERT\`, a \`DROP\` or two statements.
+Requirements. The record holds \`sql\`, \`user\`, \`workspace\` and \`tables_acked\`. **401** without
+\`X-User-Id\`, **404** for an unknown id, **403** for another user's record. Before the warehouse
+sees a byte:
+
+- **One SELECT.** \`is_single_select\`: the statement starts with \`SELECT\` or \`WITH\` with no
+  second statement (no \`;\` inside); anything else is **422**.
 - **ACKed tables only.** \`referenced_tables\` collects every \`FROM\`/\`JOIN\` target; a table
-  outside \`tables_acked\` is **422**. The source names tables that do not exist as the
-  hallucination it still fights; the ACKed list is the one set of names the service can vouch for.
-- **A partition filter.** Warehouse tables are partitioned by \`datestr\`
-  (\`PARTITION_COLUMN\`); a \`WHERE\` without it is **422**, because the source's own evaluation
-  shows generated queries failing for exactly this reason, and the ones that do not fail scan
-  every partition.
-- **A row cap.** \`with_limit\` appends \`LIMIT 1000\` (\`MAX_ROWS\`) when the query has none and
-  lowers a larger one. **A statement timeout** of **60 s** (\`STATEMENT_TIMEOUT_S\`) is passed to
-  the warehouse call.
+  outside \`tables_acked\` is **422**.
+- **A partition filter.** Tables are partitioned by \`datestr\` (\`PARTITION_COLUMN\`); a \`WHERE\`
+  without it is **422**.
+- **A row cap and a timeout.** \`with_limit\` appends \`LIMIT 1000\` (\`MAX_ROWS\`) or lowers a
+  larger one; \`STATEMENT_TIMEOUT_S = 60\` is passed to the warehouse call.
 
-The response reports \`row_count\` and \`has_output\` — the signal the source tracks separately from
-"ran successfully", because a hallucinated filter like \`status = 'Finished'\` runs fine and
-returns nothing.
-
-**Failure mode the checks target.** Executing model output verbatim means the model, not the
-service, decides what the warehouse runs: one hallucinated table name is a failed query, one
-missing partition filter is a full-table scan, one missing \`LIMIT\` streams a billion rows into a
-browser tab, and one slow join holds a warehouse slot until someone notices. The starter gets all of
-these wrong by doing nothing at all.`,
+The response reports \`row_count\` and \`has_output\`, which the source tracks apart from "ran
+successfully": a hallucinated filter like \`status = 'Finished'\` runs fine and returns nothing.`,
   sequence: {
     participants: ['Analyst', 'querygen', 'query store', 'Warehouse'],
     messages: [
@@ -55,9 +45,9 @@ these wrong by doing nothing at all.`,
     ],
   },
   hints: [
-    'The guard is four pure functions over the SQL string and one lookup: `is_single_select`, `referenced_tables`, `has_partition_filter`, `with_limit`. Write them first, test them in your head on `SELECT … ; DROP TABLE …`, then wire the handler to answer 422 at the first one that fails.',
-    'Table references are the identifiers after `FROM` and `JOIN` (case-insensitive, dotted names allowed). Lower-case both sides and take the set difference against `tables_acked`; the difference is the 422 message, so the user sees which name the model invented.',
-    'The partition check is a `WHERE` followed somewhere by `datestr`; the limit is a regex on a trailing `LIMIT n`: append when absent, replace when larger than `MAX_ROWS`. Pass `timeout_s=STATEMENT_TIMEOUT_S` to the warehouse call — the limit bounds the rows, the timeout bounds the time.',
+    'Symptoms: a stack trace for a table the model invented, a query with no date filter scanning a year of partitions, a million rows in a browser tab, a slow join holding a warehouse slot for hours.',
+    'The handler has one lookup and one `execute`: nothing inspects the SQL string between the store and the warehouse, no `LIMIT` is added, and `execute` is called without a timeout.',
+    'Four pure functions (`is_single_select`, `referenced_tables` lower-cased against `tables_acked`, `has_partition_filter` on `datestr`, `with_limit` to `MAX_ROWS`), 422 at the first failure, then `execute(sql, timeout_s=STATEMENT_TIMEOUT_S)` and report `has_output`.',
   ],
   checks: [
     {
@@ -172,8 +162,7 @@ app = FastAPI()
 
 @app.post("/v1/queries/{query_id}/run")
 def run_query(query_id: str, user: str = Header(alias="X-User-Id")) -> dict:
-    # TODO: the generated SQL is executed as-is: no single-SELECT check, no check that the tables
-    # are the ACKed ones, no partition filter required, no LIMIT, no statement timeout.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     record = store.get_query(query_id)
     if record is None:
         raise HTTPException(status_code=404, detail="unknown query")
@@ -252,7 +241,7 @@ def run_query(query_id: str, user: str | None = Header(default=None, alias="X-Us
 `,
     },
     typescript: {
-      starter: `/** POST /v1/queries/:id/run: flawed code that executes the generated SQL as-is. */
+      starter: `/** POST /v1/queries/:id/run: the starter. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -261,8 +250,7 @@ import {warehouse} from './warehouse';
 export const app = Fastify();
 
 app.post('/v1/queries/:id/run', async (request, reply) => {
-  // TODO: the generated SQL is executed as-is: no single-SELECT check, no check that the tables
-  // are the ACKed ones, no partition filter required, no LIMIT, no statement timeout.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const user = request.headers['x-user-id'] as string;
   const {id} = request.params as {id: string};
   const record = await store.getQuery(id);
@@ -357,8 +345,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func runQuery(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the generated SQL is executed as-is: no single-SELECT check, no check that the tables
-	// are the ACKed ones, no partition filter required, no LIMIT, no statement timeout.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	user := r.Header.Get("X-User-Id")
 	id := r.PathValue("id")
 	record, err := store.GetQuery(r.Context(), id)
@@ -527,8 +514,7 @@ object RunApi {
     path("v1" / "queries" / Segment / "run") { queryId =>
       post {
         headerValueByName("X-User-Id") { user =>
-          // TODO: the generated SQL is executed as-is: no single-SELECT check, no check that the
-          // tables are the ACKed ones, no partition filter required, no LIMIT, no statement timeout.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           store.getQuery(queryId) match {
             case None =>
               complete(StatusCodes.NotFound, """{"error":"unknown query"}""")
@@ -654,8 +640,7 @@ int main() {
   httplib::SSLServer svr("cert.pem", "key.pem");
 
   svr.Post(R"(/v1/queries/([^/]+)/run)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the generated SQL is executed as-is: no single-SELECT check, no check that the tables
-    // are the ACKed ones, no partition filter required, no LIMIT, no statement timeout.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto user = req.get_header_value("X-User-Id");
     const auto queryId = req.matches[1].str();
     const auto record = store.getQuery(queryId);
@@ -803,5 +788,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat model output as input. Generated SQL is a string from an untrusted source that happens to look like code, and the run endpoint is the boundary where it becomes real work on a shared warehouse. Four separate guards are being checked, each cheap and each closing a specific hole: statement shape (one SELECT, so the generator can never be talked into a write), table provenance (the ACKed list is the only set of names the service vouches for — the source's hallucinated tables cannot pass it), partition hygiene (the source's own evaluation dashboard shows queries failing for a missing partition filter; the ones that do not fail are worse), and bounds (\`LIMIT\` for rows, a timeout for time). \`has_output\` in the response is the fifth lesson, lifted from the evaluation section: a query that runs and returns nothing is the signature of a hallucinated filter value, and a service that only tracks "ran OK" cannot see it. Real services add a proper SQL parser instead of regexes, a dry-run \`EXPLAIN\` with a cost ceiling, per-user warehouse queues, and a validation agent that repairs unknown columns before the user ever sees the query.`,
+  debrief: `Generated SQL is a string from an untrusted source that happens to look like code, and the run endpoint is where it becomes real work on a shared warehouse. Each guard is cheap and closes one hole: statement shape (one SELECT, so the generator cannot be talked into a write), table provenance (the ACKed list is the only set of names the service vouches for, so hallucinated tables cannot pass), partition hygiene (the source's dashboard shows queries failing for a missing partition filter; the ones that do not fail are worse), and bounds (\`LIMIT\` for rows, a timeout for time). \`has_output\` comes from the evaluation section: a query that runs and returns nothing is the signature of a hallucinated filter value. Production systems add a real SQL parser instead of regexes, a dry-run \`EXPLAIN\` with a cost ceiling, per-user warehouse queues, and a validation agent that repairs unknown columns.`,
 };

@@ -8,33 +8,32 @@ export const eventsStep: Step = {
   focus: ['search', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event on the
-happy path and the analytics job lights up, so the demo shows numbers moving. Four contracts are
-broken. Find them, fix them, and prove the fix with the checks below.
+**Starting point.** The starter publishes one event per search on \`search.query\`:
+\`publish_search_event\` serializes \`{"query", "latency_ms"}\`, produces it with
+\`key=event.request_id\` on a default-configured producer, and logs the query. The consumer in
+group \`search-analytics\` polls, commits the offset, then runs \`HINCRBY searchstats:{tenant}\`.
+The analytics job lights up and the demo shows numbers moving. It compiles and hides five flaws.
 
-Every search publishes one event on \`search.query\`, and a consumer turns those events into
-per-tenant counters.
+**Failure mode the checks target.** A request-id key destroys per-tenant ordering; the retained
+query text is a data leak with a long tail; an unconfigured producer duplicates on retry; a failed
+produce silently loses the event; and commit-before-process trades correctness for code that merely
+looks exactly-once.
 
 - The message **key is the tenant** (\`key=event.tenant\`, \`key: event.tenant\`, \`Key: []byte(tenant)\`,
   \`ProducerRecord(Topic, event.tenant, payload)\`). Partitioning by tenant keeps each tenant's
-  events in order; the starter keys by \`request_id\`, so one tenant's events scatter across partitions.
-- The payload carries **\`request_id\`, \`latency_ms\`, \`k\`, \`index_version\` and a \`fingerprint\`** —
-  a stable digest of the query vector. It never carries the query text or the vector: a query is
+  events in order.
+- The payload carries **\`request_id\`, \`latency_ms\`, \`k\`, \`index_version\` and a \`fingerprint\`**,
+  a stable digest of the query vector. It does not carry the query text or the vector: a query is
   tenant content, and the topic is retained for days and replicated, so anything written there
   outlives every retention policy the request path has.
-- The producer is **idempotent with \`acks=all\`** — \`enable.idempotence\` plus \`acks\`,
+- The producer is **idempotent with \`acks=all\`**: \`enable.idempotence\` plus \`acks\`,
   KafkaJS's \`idempotent: true\` with \`acks: -1\`, Go's \`RequiredAcks: kafka.RequireAll\` with a hash
   balancer, or the Java client's two properties. A produce retry must not duplicate a record.
 - When the broker rejects the produce, write the event to the **outbox** (\`outbox.insert(...)\`)
   instead of dropping it, and let a relay republish it when the broker recovers.
 - The consumer updates the counters (\`HINCRBY searchstats:{tenant}:{version} …\`) and **only then**
-  commits the offset. Commit first and a crash loses the counter update forever, because the offset
-  has already moved past the record.
-
-**Failure mode the checks target.** A request-id key destroys per-tenant ordering; the retained
-query text is a data leak with a long tail; an unconfigured producer duplicates on retry; a failed
-produce silently loses the event; and commit-before-process trades correctness for code that merely
-looks exactly-once.`,
+  commits the offset. Commit first and a crash loses the counter update, because the offset has
+  already moved past the record.`,
   sequence: {
     participants: ['Search API', 'search.query', 'Analytics consumer', 'Redis'],
     messages: [
@@ -48,9 +47,9 @@ looks exactly-once.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=event.tenant` (or `Key: []byte(event.Tenant)`, `key: event.tenant`, `new ProducerRecord(Topic, event.tenant, payload)`). Keyed by the request id, one tenant’s events land in different partitions and their order is gone — which is exactly the signal the quality counters are built on.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all` (or `acks=-1` with `idempotent: true` in KafkaJS, `RequiredAcks: kafka.RequireAll` with a hash balancer in Kafka Go). It requires a stable key on every retry, which is the same fix as the tenant key.',
-    'The outbox is the durability half: wrap the produce, and on rejection `outbox.insert(tenant, payload)` so a relay can republish. In the consumer, run the `HINCRBY` first and commit second — a crash between the two then replays the record instead of losing the counter update.',
+    "A tenant's dashboard shows searches out of order and occasionally double-counted, a broker blip makes events vanish, and a compliance scan finds raw query text in a topic retained for a week.",
+    'The key is `event.request_id`, so one tenant spreads over partitions; the producer dict has no `enable.idempotence`/`acks`; `produce` ignores rejection; the consumer calls `commit` before `hincrby`.',
+    'Key with `key=event.tenant`, replace `query` in the payload with a `fingerprint` plus `k`/`index_version`, set `enable.idempotence` and `acks=all`, `outbox.insert` in `except KafkaException`, and move `commit` after `hincrby`.',
   ],
   checks: [
     {
@@ -151,9 +150,7 @@ class SearchEvent(BaseModel):
 
 
 def publish_search_event(event: SearchEvent) -> None:
-    # TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
-    # into a retained topic, configures no idempotence and no acks, and drops the event when the
-    # broker rejects the produce. Fix all four before this topic ships.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = json.dumps({"query": event.query, "latency_ms": event.latency_ms})
     producer.produce(TOPIC, key=event.request_id, value=payload)
     logger.info("search event tenant=%s query=%s", event.tenant, event.query)
@@ -265,9 +262,7 @@ export interface SearchEvent {
 }
 
 export async function publishSearchEvent(event: SearchEvent): Promise<void> {
-  // TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
-  // into a retained topic, configures no idempotence and no acks, and drops the event when the
-  // broker rejects the produce. Fix all four before this topic ships.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: TOPIC,
     messages: [{key: event.request_id, value: JSON.stringify({query: event.query, latency_ms: event.latency_ms})}],
@@ -384,9 +379,7 @@ type SearchEvent struct {
 }
 
 func publishSearchEvent(ctx context.Context, event SearchEvent) error {
-	// TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
-	// into a retained topic, configures no idempotence and no acks, and drops the event when the
-	// broker rejects the produce. Fix all four before this topic ships.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{"query": event.Query, "latency_ms": event.LatencyMs})
 	message := kafka.Message{Key: []byte(event.RequestID), Value: payload}
 	return writer.WriteMessages(ctx, message)
@@ -517,9 +510,7 @@ object SearchEvents {
   val cache = new Jedis("redis", 6379)
 
   def publish(event: SearchEvent): Unit = {
-    // TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
-    // into a retained topic, configures no idempotence and no acks, and drops the event when the
-    // broker rejects the produce. Fix all four before this topic ships.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"query":"\${event.query}","latency_ms":\${event.latencyMs}}"""
     producer.send(new ProducerRecord[String, String](Topic, event.requestId, payload))
     System.out.println(s"search event \${event.tenant} \${event.query}")
@@ -637,9 +628,7 @@ std::unique_ptr<RdKafka::Producer> searchProducer() {
 }
 
 void publishSearchEvent(const SearchEvent& event) {
-  // TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
-  // into a retained topic, configures no idempotence and no acks, and drops the event when the
-  // broker rejects the produce. Fix all four before this topic ships.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string payload = json{{"query", event.query}, {"latency_ms", event.latencyMs}}.dump();
   const std::string key = event.requestId;
   auto producer = searchProducer();
@@ -751,17 +740,14 @@ void consumeSearchEvents() {
     },
   },
   debrief: `The event is where a search service decides what it is willing to remember. The starter is
-built around the analytics use case — publish the query so the dashboard can show it — and that is
-precisely the mistake: the topic is retained and replicated, so the query text outlives the request,
-the session and the retention policy of whatever pipeline wrote it. The fix is a fingerprint:
-enough to group identical queries and spot a bad ranking cohort, useless as content. The other three
-defects are ordering, duplication and loss. Keying by request id scatters one tenant's events, which
-breaks the per-tenant counter ordering the consumer relies on (key by tenant). A default producer can
-duplicate on retry, so idempotence plus \`acks=all\` is configuration, not a comment (and it needs a
-stable key, which the tenant key already provides). And a rejected produce that is not written to the
-outbox is an event lost silently, which is worse than a failed request because nobody is waiting for
-the error. Real platforms add a topic schema registry that refuses a payload field called \`query\`,
-retention and compaction policies per topic, and a consumer that commits only after the counter
-mutation — the same ordering rule as any other at-least-once pipeline.
+built around the analytics use case, publish the query so the dashboard can show it, and that is
+the mistake: the topic is retained and replicated, so the query text outlives the request, the
+session and every retention policy upstream. A fingerprint is enough to group identical queries and
+spot a bad ranking cohort, and useless as content. The tenant key does double duty: it keeps one
+tenant's events in order and gives the idempotent producer the stable key it needs to dedupe a
+retry. The outbox and the commit-after-update rule are the two halves of at-least-once: nothing is
+dropped on the way in, nothing is skipped on the way out. Production platforms add a schema
+registry that refuses a payload field called \`query\` and per-topic retention and compaction
+policies.
 `,
 };

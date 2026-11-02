@@ -8,34 +8,31 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it counts an applicant’s
-attempts, opens their case and answers the caller. It compiles, it serves the demo, and it hides the
-two flaws that make KYC state unsafe under a burst. Debug it like the service owner, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter is the Redis state layer behind \`POST /v1/verifications\` and the
+status read that follows it: it counts an applicant's attempts in \`kyc:attempts:{tenant}:{applicant}\`,
+opens their case under one key and answers the caller. It compiles, it serves the demo, and it
+hides five flaws.
 
-Implement the Redis state layer behind \`POST /v1/verifications\` and the status read that follows it:
+**Failure mode the checks target.** A burst of submissions from one applicant all pass the cap
+together, a refused client retries immediately because it was told nothing about when to come back,
+and two applicants, even from different tenants, end up looking at the same case.
 
-- **One atomic script per decision.** A reservation script moves the attempt bucket
-  \`kyc:attempts:{tenant}:{applicant}\` — read, compare against the cap, \`INCR\`, and \`EXPIRE\` in the
-  same \`EVAL\` (redis-py \`register_script\`, ioredis \`defineCommand\`, go-redis \`NewScript\`, Jedis
-  \`eval\`, redis-plus-plus \`eval\`) — and a second script opens the case create-if-absent. A
-  client-side read followed by a write leaves a window where a whole burst reads the same count and
-  every submission passes the cap.
+Requirements:
+
+- **One atomic script per decision.** A reservation script moves the attempt bucket: read, compare
+  against the cap, \`INCR\` and \`EXPIRE\` in the same \`EVAL\` (redis-py \`register_script\`, ioredis
+  \`defineCommand\`, go-redis \`NewScript\`, Jedis \`eval\`, redis-plus-plus \`eval\`), and a second
+  script opens the case create-if-absent.
 - **The cap is 4.** The fifth attempt is refused \`429 Too Many Requests\` with \`Retry-After\` set to
-  the seconds left in the bucket, taken from the script’s \`TTL\` and never from a constant. A refused
+  the seconds left in the bucket, taken from the script's \`TTL\`, not from a constant. A refused
   attempt must not open a case.
-- **The case key is scoped by tenant and applicant:** \`kyc:case:{tenant}:{applicant}\`. A shared key
-  hands the second applicant the first one’s case, and a second submission of the same applicant must
-  find the case that already exists instead of starting a parallel review.
+- **The case key is scoped by tenant and applicant:** \`kyc:case:{tenant}:{applicant}\`. A second
+  submission of the same applicant must find the case that already exists instead of starting a
+  parallel review.
 - **Both keys expire:** the attempt bucket with its attempt window, the case with its own lifetime,
   set inside the script that creates it.
-- \`GET /v1/applicants/{id}/status\` reads the same case key, scoped by the caller’s tenant, and
-  answers \`404\` when that applicant has no case.
-
-**Failure mode the checks target.** The starter reads the attempt count and writes it back in two round
-trips, so a burst slips past the cap; it keys the active case \`kyc:case:active\`, so two applicants
-collide on one case; and its refusal carries no \`Retry-After\`, so a refused client retries
-immediately.`,
+- \`GET /v1/applicants/{id}/status\` reads the same case key, scoped by the caller's tenant, and
+  answers \`404\` when that applicant has no case.`,
   sequence: {
     participants: ['KYC API', 'Redis'],
     messages: [
@@ -52,9 +49,9 @@ immediately.`,
     ],
   },
   hints: [
-    'One script per decision: the bucket must move server-side. Read the counter, compare it against the cap, `INCR` and set `EXPIRE` inside the same script (`register_script`/`defineCommand`/`NewScript`/`EVAL`). A `GET` followed by `incr` from the client lets a whole burst read the same count and pass the cap together.',
-    'Scope the case to the tenant **and** the applicant: `kyc:case:{tenant}:{applicant}`. Inside the same script, create it only when it is absent (`SET ... NX`) and give it its lifetime there, so two concurrent submissions of one applicant converge on a single case instead of two parallel reviews.',
-    'The script’s return value is the contract: whether the attempt was allowed, how many are left, and the bucket’s remaining `TTL`. Feed that `TTL` into `Retry-After` on the 429 — a refused client that is handed nothing to wait for retries immediately.',
+    'Under a load test, one applicant gets eight cases opened against a cap of four, refused clients hammer the endpoint in a tight loop, and a tenant reads a status that belongs to someone else.',
+    'The reservation is a client-side `GET` then `incr`, so a burst reads the same count; the refusal carries no wait; and the case lives at `kyc:case:active`, one key for everyone.',
+    'Move read, compare, `INCR`, `EXPIRE` into one script that returns allowed, remaining and `TTL`; feed the `TTL` into `Retry-After`. Open the case with `SET ... NX` at `kyc:case:{tenant}:{applicant}`.',
   ],
   checks: [
     {
@@ -125,7 +122,7 @@ immediately.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/verifications: flawed code of the KYC attempt and case state."""
+      starter: `"""POST /v1/verifications: the starter for the KYC attempt and case state."""
 import json
 
 import redis
@@ -160,9 +157,7 @@ def case_key(tenant: str, applicant: str) -> str:
 
 
 def reserve_attempt(tenant: str, applicant: str) -> tuple[bool, int, int]:
-    # TODO: the count is read and written in two round trips, so a burst of submissions of one
-    # applicant passes the cap together. Move the whole reservation into one script that INCRs and
-    # EXPIREs the bucket, and return the key's remaining window.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = attempts_key(tenant, applicant)
     used = int(r.get(key) or 0)
     if used >= MAX_ATTEMPTS:
@@ -173,9 +168,6 @@ def reserve_attempt(tenant: str, applicant: str) -> tuple[bool, int, int]:
 
 
 def open_case(tenant: str, applicant: str) -> tuple[bool, dict]:
-    # TODO: the case key carries no applicant, so two applicants collide on one case and a second
-    # submission replaces the first one's case. Scope the key to kyc:case:{tenant}:{applicant} and
-    # open it create-if-absent with SET ... NX inside the script that gives it its lifetime.
     key = case_key(tenant, applicant)
     record = {"applicant": applicant, "status": "pending"}
     if r.exists(key):
@@ -305,7 +297,7 @@ def case_status(applicant_id: str, tenant: str = Header(alias="X-Tenant-Id")) ->
 `,
     },
     typescript: {
-      starter: `/** POST /v1/verifications: flawed code of the KYC attempt and case state. */
+      starter: `/** POST /v1/verifications: the starter for the KYC attempt and case state. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -333,9 +325,7 @@ const attemptsKey = (tenant: string, applicant: string): string => \`kyc:attempt
 const caseKey = (_tenant: string, _applicant: string): string => 'kyc:case:active';
 
 async function reserveAttempt(tenant: string, applicant: string): Promise<[boolean, number, number]> {
-  // TODO: the count is read and written in two round trips, so a burst of submissions of one
-  // applicant passes the cap together. Move the whole reservation into one defineCommand script
-  // that INCRs and EXPIREs the bucket and returns the window it has left.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = attemptsKey(tenant, applicant);
   const used = Number((await r.get(key)) ?? 0);
   if (used >= MAX_ATTEMPTS) return [false, 0, ATTEMPT_WINDOW_S];
@@ -345,9 +335,6 @@ async function reserveAttempt(tenant: string, applicant: string): Promise<[boole
 }
 
 async function openCase(tenant: string, applicant: string): Promise<[boolean, Record<string, string>]> {
-  // TODO: the case key carries no applicant, so two applicants collide on one case and a second
-  // submission replaces the first one's case. Scope the key to kyc:case:{tenant}:{applicant} and
-  // open it create-if-absent with SET ... NX inside the script that gives it its lifetime.
   const key = caseKey(tenant, applicant);
   const record = {applicant, status: 'pending'};
   if (await r.exists(key)) {
@@ -484,7 +471,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// POST /v1/verifications: flawed code of the KYC attempt and case state.
+      starter: `// POST /v1/verifications: the starter for the KYC attempt and case state.
 package main
 
 import (
@@ -525,9 +512,7 @@ func caseKey(_, _ string) string {
 }
 
 func reserveAttempt(ctx context.Context, tenant, applicant string) (bool, int64, int64, error) {
-	// TODO: the count is read and written in two round trips, so a burst of submissions of one
-	// applicant passes the cap together. Move the whole reservation into one redis.NewScript that
-	// INCRs and EXPIREs the bucket and returns the window it has left.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := attemptsKey(tenant, applicant)
 	used, err := rdb.Get(ctx, key).Int64()
 	if err != nil && err != redis.Nil {
@@ -545,9 +530,6 @@ func reserveAttempt(ctx context.Context, tenant, applicant string) (bool, int64,
 }
 
 func openCase(ctx context.Context, tenant, applicant string) (bool, map[string]any, error) {
-	// TODO: the case key carries no applicant, so two applicants collide on one case and a second
-	// submission replaces the first one's case. Scope the key to kyc:case:{tenant}:{applicant} and
-	// open it create-if-absent with SET ... NX inside the script that gives it its lifetime.
 	record := map[string]any{"applicant": applicant, "status": "pending"}
 	key := caseKey(tenant, applicant)
 	exists, err := rdb.Exists(ctx, key).Result()
@@ -778,7 +760,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `// POST /v1/verifications: flawed code of the KYC attempt and case state.
+      starter: `// POST /v1/verifications: the starter for the KYC attempt and case state.
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
@@ -807,9 +789,7 @@ object KycStateApi {
   def caseKey(tenant: String, applicant: String): String = "kyc:case:active"
 
   def reserveAttempt(tenant: String, applicant: String): (Boolean, Long, Long) = {
-    // TODO: the count is read and written in two round trips, so a burst of submissions of one
-    // applicant passes the cap together. Move the whole reservation into one jedis.eval script that
-    // INCRs and EXPIREs the bucket and returns the window it has left.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = attemptsKey(tenant, applicant)
     val used = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
     if (used >= MaxAttempts) {
@@ -822,9 +802,6 @@ object KycStateApi {
   }
 
   def openCase(tenant: String, applicant: String): (Boolean, String) = {
-    // TODO: the case key carries no applicant, so two applicants collide on one case and a second
-    // submission replaces the first one's case. Scope the key to kyc:case:{tenant}:{applicant} and
-    // open it create-if-absent with SET ... NX inside the script that gives it its lifetime.
     val key = caseKey(tenant, applicant)
     val record = s"""{"applicant":"$applicant","status":"pending"}"""
     if (jedis.exists(key)) {
@@ -1011,7 +988,7 @@ object KycStateApi {
 `,
     },
     cpp: {
-      starter: `// POST /v1/verifications: flawed code of the KYC attempt and case state.
+      starter: `// POST /v1/verifications: the starter for the KYC attempt and case state.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
@@ -1038,9 +1015,7 @@ std::vector<long long> reserveAttempt(
     sw::redis::Redis& redis,
     const std::string& tenant,
     const std::string& applicant) {
-  // TODO: the count is read and written in two round trips, so a burst of submissions of one
-  // applicant passes the cap together. Move the whole reservation into one Lua script that INCRs and
-  // EXPIREs the bucket and returns the window it has left.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto key = attemptsKey(tenant, applicant);
   const auto raw = redis.get(key);
   const long long used = raw ? std::stoll(*raw) : 0;
@@ -1056,9 +1031,6 @@ std::pair<bool, std::string> openCase(
     sw::redis::Redis& redis,
     const std::string& tenant,
     const std::string& applicant) {
-  // TODO: the case key carries no applicant, so two applicants collide on one case and a second
-  // submission replaces the first one's case. Scope the key to kyc:case:{tenant}:{applicant} and
-  // open it create-if-absent with SET ... NX inside the script that gives it its lifetime.
   const json record = {{"applicant", applicant}, {"status", "pending"}};
   const auto key = caseKey(tenant, applicant);
   if (redis.exists(key)) {
@@ -1238,5 +1210,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is state that moves in one step and is scoped to the entity it belongs to. A read-then-write attempt counter passes every serial test and fails exactly under a burst, which is when an attempt cap has to hold: two submissions both read three attempts used and both write four. One script per decision makes read, compare, increment and expiry a single step, and the same script returns the bucket’s \`TTL\`, which is what a refusal owes its client in \`Retry-After\`. The case key carries the tenant and the applicant because a case belongs to exactly that pair: the starter’s shared \`kyc:case:active\` key answers the second applicant with the first one’s case and lets one tenant read another tenant’s applicant. \`SET ... NX\` inside the script makes opening a case create-if-absent, so a duplicate submission finds the case that already exists instead of racing a second review into being. Real services keep the case record in the key with a lifetime that matches the review window, keep the attempt bucket short-lived, and write both to an audit trail, because every counter they move is evidence a regulator may ask for.`,
+  debrief: `State that decides something has to move in one step and live under the entity it belongs to. A read-then-write counter passes every serial test and fails exactly under a burst, which is when a cap has to hold: two submissions both read three used and both write four. One script per decision makes read, compare, increment and expiry a single step, and the same script returns the bucket's \`TTL\`, which is what a refusal owes its client in \`Retry-After\`. The case key carries tenant and applicant because a case belongs to exactly that pair, and \`SET ... NX\` inside the script makes opening it create-if-absent, so a duplicate submission finds the existing case rather than racing a second review into being. What this step did not do: match the case lifetime to the review window, and write every counter move to an audit trail a regulator can ask for.`,
 };

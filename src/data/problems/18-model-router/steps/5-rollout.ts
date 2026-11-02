@@ -8,27 +8,26 @@ export const rolloutStep: Step = {
   focus: ['router', 'db', 'eval'],
   task: `## Task
 
-The starter is working code: it takes the rollout request and applies it, so
-the demo shows the canary percentage change. It trusts the caller, skips the gate that is the whole
-point of a rollout, and cannot roll back. Fix it and prove the fix.
+**Starting point.** The starter registers \`POST /v1/policies/{policy}/rollout\` with body
+\`{"version": 3, "percentage": 25, "rollback": false}\`, writes the version and percentage to the
+store with \`set_active\` and echoes the body back. It compiles, it serves the demo, and it hides
+four flaws.
 
-Implement \`POST /v1/policies/{policy}/rollout\` with body
-\`{"version": 3, "percentage": 25, "rollback": false}\`.
+**Failure mode the checks target.** Trusting the request body means any service with network access
+can point 100% of a tenant's traffic at an unvalidated version; without the eval gate a regression
+ships because the demo looked better; a rollout without pins has no safe undo; and an echoed body
+tells the operator nothing about what actually applies. Every one of those is invisible until the
+day it matters.
 
 - The policy name matches \`^[a-z0-9][a-z0-9_-]{1,31}$\`, \`version\` is an integer \`>= 1\`, and
   \`percentage\` is an integer from **0** to **100**; otherwise **400**. A missing tenant is **401**.
 - **Raising** the canary above the currently active percentage requires an **eval pass** for the
   target version: the latest eval record must exist, be \`passed\`, and score at least **0.85**.
-  Otherwise **409** and no traffic change. Lowering traffic never needs a gate.
+  Otherwise **409** and no traffic change. Lowering traffic needs no gate.
 - A rollback (\`rollback: true\`) pins the **calling tenant** to the version it is currently being
   served (key \`pin:{tenant}:{policy}\`) before traffic drops to 0, so no tenant flips mid-session.
-- The response is the caller’s **active assignment** — its pinned version if there is one, else the
-  policy’s canary. The starter echoes the request body instead.
-
-**Failure mode the checks target.** Trusting the request body means any service with network access
-can point 100% of a tenant’s traffic at an unvalidated version; without the eval gate a regression
-ships because “the demo looked better”; and a rollout without pins or rollback has no undo. Every
-one of those is invisible until the day it matters.`,
+- The response is the caller's **active assignment**: its pinned version if there is one, else the
+  policy's canary.`,
   sequence: {
     participants: ['Operator', 'Model Router', 'policy store', 'Eval service'],
     messages: [
@@ -42,9 +41,9 @@ one of those is invisible until the day it matters.`,
     ],
   },
   hints: [
-    'Validate before touching the store: policy name against the regex, `version >= 1`, and `percentage` inside 0..100, each with a 400. A rollout endpoint is a control plane — it deserves at least the validation a data-plane endpoint gets.',
-    'The gate only applies when traffic **increases** (or on the canary move): fetch the eval record for the target version and refuse with 409 when it is missing, not passed, or below the score floor. Compare against the currently active percentage, not the request.',
-    'A rollback pins first, then drops traffic: `pin:{tenant}:{policy}` holds the version the tenant was served, and the response returns the caller’s assignment — its pin if present, otherwise the policy’s canary — so the operator sees what actually applies.',
+    'Post `{"version": 99, "percentage": 100}` for a version nobody evaluated: the store accepts it and every tenant moves at once. Post `rollback: true` and nothing different happens; the response is your own body.',
+    'The handler calls `store.set_active` with whatever arrived, has no regex, range or eval lookup in front of it, reads `body.rollback` nowhere, and builds the response from the request instead of the store.',
+    'Check `POLICY_RE`, `version < 1` and the 0..100 range (400); when the percentage rises, call `evals.latest` and refuse below `MIN_EVAL_SCORE` (409); on rollback `store.pin` `pin:{tenant}:{policy}` first; return `store.assignment`.',
   ],
   checks: [
     {
@@ -139,7 +138,7 @@ one of those is invisible until the day it matters.`,
       id: 'assignment',
       title: 'Answers with the caller’s active assignment',
       detail:
-        'The response is the caller’s active assignment — its pinned version if present, else the policy’s canary. The starter echoes the request body.',
+        'The response is the caller’s active assignment: its pinned version if present, else the policy’s canary. The starter echoes the request body.',
       match: {
         python: {all: [/store\.assignment\(/, /"assignment"/]},
         typescript: {all: [/store\.assignment\(/, /assignment:/]},
@@ -175,9 +174,7 @@ store = RolloutStore()
 
 @app.post("/v1/policies/{policy}/rollout")
 def rollout(policy: str, body: RolloutRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: validate the policy name, version and percentage; require an eval pass before
-    # increasing traffic; pin each tenant's version during a rollback; and answer with the
-    # caller's active assignment instead of echoing the request body.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     store.set_active(policy, body.version, body.percentage)
     return JSONResponse(
         {"policy": policy, "version": body.version, "percentage": body.percentage},
@@ -262,7 +259,7 @@ def rollout(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/policies/:policy/rollout: flawed code that trusts the request body. */
+      starter: `/** POST /v1/policies/:policy/rollout. */
 import Fastify from 'fastify';
 
 import {store} from './rollout_store';
@@ -276,9 +273,7 @@ interface RolloutBody {
 }
 
 app.post('/v1/policies/:policy/rollout', async (request, reply) => {
-  // TODO: validate the policy name, version and percentage; require an eval pass before
-  // increasing traffic; pin each tenant's version during a rollback; and answer with the
-  // caller's active assignment instead of echoing the request body.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {policy} = request.params as {policy: string};
   const body = request.body as RolloutBody;
   await store.setActive(policy, body.version, body.percentage);
@@ -371,9 +366,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func rollout(rw http.ResponseWriter, r *http.Request) {
-	// TODO: validate the policy name, version and percentage; require an eval pass before
-	// increasing traffic; pin each tenant's version during a rollback; and answer with the
-	// caller's active assignment instead of echoing the request body.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	var body RolloutRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -550,9 +543,7 @@ object RolloutApi {
     path("v1" / "policies" / Segment / "rollout") { policy =>
       post {
         entity(as[RolloutRequest]) { body =>
-          // TODO: validate the policy name, version and percentage; require an eval pass before
-          // increasing traffic; pin each tenant's version during a rollback; and answer with the
-          // caller's active assignment instead of echoing the request body.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           store.setActive(policy, body.version, body.percentage)
           complete(StatusCodes.OK, s"""{"policy":"$policy","version":\${body.version},"percentage":\${body.percentage}}""")
         }
@@ -652,9 +643,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post(R"(/v1/policies/([a-z0-9_-]+)/rollout)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: validate the policy name, version and percentage; require an eval pass before
-    // increasing traffic; pin each tenant's version during a rollback; and answer with the
-    // caller's active assignment instead of echoing the request body.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
     const auto policy = req.matches[1].str();
@@ -769,5 +758,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is asking whether you can debug a control-plane endpoint like a data-plane one. Three contracts are being checked. Validation: a rollout endpoint that trusts its body lets anything on the network move a tenant’s traffic. The eval gate: raising exposure must be earned by a passing eval for the exact target version — the gate is the difference between shipping a prompt and gambling a tenant’s experience. Pins and rollback: a percentage is a fleet-wide knob, and without a per-tenant pin a rollback flips a tenant mid-session between two model versions. The response shape matters too: an operator needs the assignment that actually applies to the caller, not a restatement of the request. Real platforms add eval windows (minimum sample sizes before a pass counts), staged percentages with automatic promotion, and an audit log of who changed which policy when.`,
+  debrief: `The fix gives a control-plane endpoint the same discipline as a data-plane one. Validation comes first because a rollout endpoint that trusts its body lets anything on the network move a tenant's traffic. The eval gate runs before the store write and only when exposure rises: raising traffic has to be earned by a passing eval for the exact target version, and lowering it must stay cheap so an operator in trouble is not blocked by a missing eval. The pin is written before traffic drops because a percentage is a fleet-wide knob, and without a per-tenant pin a rollback flips a tenant mid-session between two model versions. The response reports the assignment that applies to the caller, since that is what an operator needs to see. Production platforms add minimum sample sizes before an eval counts, staged percentages with automatic promotion, and an audit log of who changed which policy when.`,
 };

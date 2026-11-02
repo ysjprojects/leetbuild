@@ -48,30 +48,26 @@ export const clientStep: Step = {
   },
   task: `## Task
 
-**Starting point.** You are the AI platform engineer on call. After a model rollout, a week of feedback
-that belonged to the previous model showed up under the new one, because the attribution client fell
-back to whatever model was active when the lookup was slow. A second bug hid in the same file: a failed
-lookup was cached for a day, so one slow request poisoned attribution for every request that followed.
+**Starting point.** \`client\` exposes \`attribute(tenant, request_id)\`. It calls the gRPC stub
+\`GetAttribution\` with a one-second \`TIMEOUT_SECONDS\`, and on \`grpc.RpcError\` records the request
+id in \`_failure_cache\` for \`CACHE_FAILURE_TTL\` (a day) and returns \`ACTIVE_MODEL\` as the
+attribution. It serves the demo and hides five flaws.
 
-Debug \`client\` and make a failed lookup honest instead of convenient.
+**Failure mode the checks target.** After a model rollout, a week of feedback that belonged to the
+previous model shows up under the new one, because a slow lookup is answered with whatever model is
+active, and one failed lookup is remembered for a day.
 
-- The lookup carries a \`200\` ms deadline. Express it as \`DEADLINE_MS = 200\` and pass it to the stub
-  (\`timeout=\`, \`deadline:\`, \`withDeadlineAfter\`, \`set_deadline\` — whatever the stack calls it).
-- When the lookup fails or times out, the rating is stored as \`unattributed\`. It must never be attributed
-  to the currently active model, because that is how a rollout silently rewrites history.
-- Failures are not cached. Only a successful reply may be cached, with a short TTL; a miss must be
-  retried on the next request instead of being remembered for a day.
-- A late attribution may \`backfill\` a stored rating's model, prompt and route — but it must not change
-  the rating itself.
-
-**Failure mode the checks target.** A timeout answered with "the active model" is a misattribution that
-survives every audit, and a cached failure turns one slow lookup into a day of wrong attribution. The
-checks below require the deadline, the honest \`unattributed\` fallback, a failure-free cache, and a
-backfill that only moves attribution fields.`,
+- The lookup carries \`DEADLINE_MS = 200\`, passed as \`timeout=DEADLINE_MS / 1000\`.
+- On failure or timeout, return \`fallback_attribution()\` with \`model_version\` set to the constant
+  \`UNATTRIBUTED\`. Remove \`ACTIVE_MODEL\` and anything that attributes to the active model.
+- Cache only successful replies, keyed by request id, with \`CACHE_TTL_SECONDS = 300\`; drop the
+  failure cache so a miss is retried on the next request.
+- Add \`backfill(record, attribution)\` that updates \`model_version\`, \`prompt_version\` and \`route\`
+  on a stored row and leaves \`rating\` untouched.`,
   hints: [
-    'Set `DEADLINE_MS = 200` and hand it to the gRPC call. In Python the timeout is in seconds, so `timeout=DEADLINE_MS / 1000`; in Node it is `deadline: Date.now() + DEADLINE_MS`.',
-    'On failure, return a fallback whose `model_version` is the literal `unattributed` — never the active model. Make the fallback a named function (`fallback_attribution`) so the check can see the honest default.',
-    'Cache only successful replies, keyed by request id with a short TTL (`CACHE_TTL_SECONDS = 300`). Keep a separate `backfill(record, attribution)` that writes `model_version`, `prompt_version` and `route` and leaves `rating` untouched.',
+    'The day after a rollout, the new model carries a week of thumbs-downs that were left on answers it did not serve, and the ratio stays wrong until the next morning.',
+    'A `grpc.RpcError` is answered with `_active_model_attribution()`, and the request id goes into `_failure_cache` for 24 hours, so every later call for that id takes the same shortcut without asking the registry.',
+    'Set `DEADLINE_MS = 200` (`timeout=DEADLINE_MS / 1000`), return `fallback_attribution()` with `UNATTRIBUTED`, cache only successes with `CACHE_TTL_SECONDS = 300`. The checks cover `backfill`.',
   ],
   checks: [
     {
@@ -192,8 +188,7 @@ def _active_model_attribution() -> Attribution:
 
 
 def attribute(tenant: str, request_id: str) -> Attribution:
-    # TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
-    # falls back to whatever model is active, so a rollout rewrites last week's feedback.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if request_id in _failure_cache and time.time() - _failure_cache[request_id] < CACHE_FAILURE_TTL:
         return _active_model_attribution()
     try:
@@ -317,8 +312,7 @@ export async function attribute(
   tenant: string,
   requestId: string,
 ): Promise<Attribution> {
-  // TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
-  // falls back to whatever model is active, so a rollout rewrites last week's feedback.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const cached = failureCache.get(requestId);
   if (cached !== undefined && Date.now() / 1000 - cached < CACHE_FAILURE_TTL) {
     return {model_version: ACTIVE_MODEL, prompt_version: 'current', route: 'default'};
@@ -427,8 +421,7 @@ type Attribution struct {
 var failureCache = map[string]time.Time{}
 
 func attribute(ctx context.Context, client pb.AttributionClient, tenant, requestID string) Attribution {
-	// TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
-	// falls back to whatever model is active, so a rollout rewrites last week's feedback.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	if seenAt, ok := failureCache[requestID]; ok && time.Since(seenAt) < time.Duration(cacheFailureTtl)*time.Second {
 		return Attribution{ModelVersion: activeModel, PromptVersion: "current", Route: "default"}
 	}
@@ -518,8 +511,7 @@ object AttributionLookup {
   private var failureCache: Map[String, Long] = Map.empty
 
   def attribute(tenant: String, requestId: String): Future[Attribution] = {
-    // TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
-    // falls back to whatever model is active, so a rollout rewrites last week's feedback.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val now = System.currentTimeMillis()
     failureCache.get(requestId) match {
       case Some(seenAt) if now - seenAt < CacheFailureTtl * 1000L =>
@@ -611,8 +603,7 @@ struct Attribution {
 };
 
 Attribution attribute(const std::string& tenant, const std::string& requestId) {
-  // TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
-  // falls back to whatever model is active, so a rollout rewrites last week's feedback.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kTimeoutSeconds));
   GetAttributionRequest request;
@@ -676,13 +667,14 @@ void backfill(FeedbackRecord& record, const Attribution& attribution) {
 `,
     },
   },
-  debrief: `Attribution is the difference between "users disliked *this* answer" and "users disliked
+  debrief: `Attribution is the difference between "users disliked this answer" and "users disliked
 something, somewhere". A timeout must not be answered with the model that happens to be active, because
-the whole point of pinning feedback to a request id is that the answer stops moving when a rollout
-happens. Caching the failure for a day is the second half of the same bug: one slow lookup would pin a
-whole day of ratings to the wrong model.
+the point of pinning feedback to a request id is that the answer stops moving when a rollout happens.
+Caching the failure for a day is the second half of the same bug: one slow lookup pins a whole day of
+ratings to the wrong model. An explicit \`unattributed\` bucket makes the gap measurable instead of
+invisible.
 
-Real systems keep the deadline short because the write path is user-facing, record an explicit
-\`unattributed\` bucket so the gap is measurable, and let a background worker backfill attribution when
-the registry recovers — always as a metadata update, never as a change to the rating.`,
+Production collectors keep the deadline short because the write path is user-facing, alert when the
+\`unattributed\` share rises, and run a background worker that backfills attribution once the registry
+recovers, as a metadata update that leaves the stored rating alone.`,
 };

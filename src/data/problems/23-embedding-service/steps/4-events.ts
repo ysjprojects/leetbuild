@@ -8,26 +8,23 @@ export const eventsStep: Step = {
   focus: ['api', 'outbox', 'topic', 'indexer'],
   task: `## Task
 
-**Starting point.** The starter is working code: once the vectors are stored it
-publishes one \`embed.ready\` per chunk. The demo's single document arrives in order. It hides three
-failures that only show up when documents are large or the broker is down. Find them and fix them.
+**Starting point.** The starter implements \`publish_ready(document_id, content_hashes)\`: for each
+chunk it produces one \`embed.ready\` record keyed by the content hash with the producer's default
+acks, then writes the chunk to the cache, and flushes at the end. The demo's single document arrives
+in order. It compiles and hides 5 flaws.
 
-Implement \`publish_ready(document_id, content_hashes)\` and \`event_key(document_id)\`:
+**Failure mode the checks target.** A large document whose chunks the indexer applies out of order,
+a crash that leaves an event for vectors that were not stored, and a broker outage that turns into a
+document nobody indexes.
 
-- Publish **\`embed.ready\`** keyed by the **document id**, not the content hash. Keyed by document id
-  every chunk of one document lands on one partition, so the indexer updates a document's chunks in
-  order; keyed by content hash the chunks of one document scatter across partitions.
-- Publish **only after the cache write commits**. The starter publishes first, so a crash between the
-  two leaves an indexed document whose vectors were never written.
+Requirements for \`publish_ready\` and \`event_key(document_id)\`:
+
+- Publish **\`embed.ready\`** keyed by the **document id**, not the content hash, so every chunk of
+  one document lands on one partition and the indexer applies them in order.
+- Publish **only after the cache write commits**.
 - Set **\`acks=all\`** so the produce is durable across replicas.
-- When the produce is **rejected** — a full local queue or an unavailable broker — write an **outbox**
-  row with the topic, the document key and the payload, so a relay can publish it later instead of
-  the document being left unindexed.
-
-**Failure mode the checks target.** Ordering dies first: keying by content hash scatters a document's
-chunks, so the indexer applies them out of order. Durability dies second: publishing before the cache
-write commits lets a crash produce an event for a document that was never stored. And the missing
-outbox turns one broker outage into a document that is never indexed.`,
+- When the produce is **rejected** (a full local queue or an unavailable broker), write an **outbox**
+  row with the topic, the document key and the payload, so a relay can publish it later.`,
   sequence: {
     participants: ['Embedding API', 'Vector cache', 'Kafka', 'Outbox', 'Indexer'],
     messages: [
@@ -40,9 +37,9 @@ outbox turns one broker outage into a document that is never indexed.`,
     ],
   },
   hints: [
-    "Key the event by `document_id`, not by the content hash: Kafka only preserves order within a partition, and one document's chunks must share one.",
-    'Write the cache first and publish second — the event must never exist before the vectors it announces.',
-    '`acks=all` makes the produce durable; on a rejected produce, record an outbox row so a relay can publish it later.',
+    'Large documents come back from the indexer with chunks in the wrong order; after a broker outage, a batch of documents is embedded, cached, and still missing from the index.',
+    'Kafka orders within a partition only, and the content hash spreads one document across many. The produce runs before the cache write, with acks=1 and no path for a rejected record.',
+    'Return `document_id` from `event_key`, call `store.put` before `producer.produce`, set `acks=all` on the producer, and on a rejected produce insert an outbox row with topic, key and payload.',
   ],
   checks: [
     {
@@ -113,7 +110,7 @@ outbox turns one broker outage into a document that is never indexed.`,
   ],
   code: {
     python: {
-      starter: `"""Draft: embed.ready — keyed by content hash, published before the cache write commits."""
+      starter: `"""embed.ready: one record per stored chunk, so the indexer learns when a document's vectors exist."""
 import json
 
 from confluent_kafka import Producer
@@ -122,9 +119,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})  # acks defaults to 1
 
 
 def publish_ready(document_id: str, content_hashes: list[str]) -> None:
-    # TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
-    # after the cache write commits (the starter publishes first) and record an outbox row when the
-    # produce is rejected.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for content_hash in content_hashes:
         producer.produce(topic="embed.ready", key=content_hash, value=json.dumps({"document_id": document_id}))
         store.put(content_hash, "ready")
@@ -163,16 +158,14 @@ def publish_ready(document_id: str, content_hashes: list[str]) -> None:
 `,
     },
     typescript: {
-      starter: `/** Draft: embed.ready — keyed by content hash, published before the cache write commits. */
+      starter: `/** embed.ready: one record per stored chunk, so the indexer learns when a document's vectors exist. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({brokers: ['kafka:9092']});
 const producer = kafka.producer();
 
 export async function publishReady(documentId: string, contentHashes: string[]): Promise<void> {
-  // TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
-  // after the cache write commits (the starter publishes first) and record an outbox row when the
-  // produce is rejected.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (const contentHash of contentHashes) {
     await producer.send({
       topic: 'embed.ready',
@@ -214,7 +207,7 @@ export async function publishReady(documentId: string, contentHashes: string[]):
 `,
     },
     go: {
-      starter: `// Draft: embed.ready — keyed by content hash, published before the cache write commits.
+      starter: `// embed.ready: one record per stored chunk, so the indexer learns when a document's vectors exist.
 package main
 
 import (
@@ -227,9 +220,7 @@ import (
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
 func publishReady(ctx context.Context, documentID string, contentHashes []string) error {
-	// TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
-	// after the cache write commits (the starter publishes first) and record an outbox row when the
-	// produce is rejected.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for _, contentHash := range contentHashes {
 		payload, _ := json.Marshal(map[string]any{"document_id": documentID})
 		_ = writer.WriteMessages(ctx, kafka.Message{Topic: "embed.ready", Key: []byte(contentHash), Value: payload})
@@ -280,7 +271,7 @@ func publishReady(ctx context.Context, documentID string, contentHashes []string
 `,
     },
     scala: {
-      starter: `// Draft: embed.ready — keyed by content hash, published before the cache write commits.
+      starter: `// embed.ready: one record per stored chunk, so the indexer learns when a document's vectors exist.
 import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
@@ -292,9 +283,7 @@ object EventPublisher {
   val producer = new KafkaProducer[String, String](props)
 
   def publishReady(documentId: String, contentHashes: List[String]): Unit = {
-    // TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
-    // after the cache write commits (the starter publishes first) and record an outbox row when the
-    // produce is rejected.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     contentHashes.foreach { contentHash =>
       producer.send(new ProducerRecord[String, String]("embed.ready", contentHash, s"""{"document_id":"$documentId"}"""))
       store.put(contentHash, "ready")
@@ -337,7 +326,7 @@ object EventPublisher {
 `,
     },
     cpp: {
-      starter: `// Draft: embed.ready — keyed by content hash, published before the cache write commits.
+      starter: `// embed.ready: one record per stored chunk, so the indexer learns when a document's vectors exist.
 #include <librdkafka/rdkafkacpp.h>
 
 #include <string>
@@ -347,9 +336,7 @@ int publish_ready(
     RdKafka::Producer* producer,
     const std::string& document_id,
     const std::vector<std::string>& content_hashes) {
-  // TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
-  // after the cache write commits (the starter publishes first) and record an outbox row when the
-  // produce is rejected.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (const auto& content_hash : content_hashes) {
     RdKafka::ErrorCode err = producer->produce(
         "embed.ready", RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
@@ -406,8 +393,13 @@ int publish_ready(
 `,
     },
   },
-  debrief: `Kafka orders within a partition, not across them — so the key is the ordering contract: key by
-document and a document's chunks apply in order. Publish after the cache write commits, or the event
-can announce vectors that were never stored. \`acks=all\` makes the produce durable, and the outbox row
-turns a rejected produce into a document a relay can finish instead of a document that is never indexed.`,
+  debrief: `The key is the ordering contract because Kafka orders within a partition and nowhere else: key by
+document and every chunk of that document rides one partition in the order it was produced. The
+cache write goes first because an event is a promise that the vectors exist; produced before the
+write, a crash makes it a lie the indexer acts on. \`acks=all\` makes the broker's acknowledgement
+mean replicated, and the outbox row keeps a rejected produce from becoming a document nobody indexes.
+
+This step's outbox has no relay and the producer is not idempotent. A production pipeline drains the
+outbox with a relay, enables \`enable.idempotence\` so a retried produce cannot duplicate, and lets
+the indexer tolerate a repeated event for a document it already holds.`,
 };

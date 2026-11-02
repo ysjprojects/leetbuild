@@ -8,27 +8,26 @@ export const detectorClientStep: Step = {
   focus: ['redactor', 'detector', 'regex'],
   task: `## Task
 
-**Starting point.** The starter is working code: the model answers, the demo
-redacts, and when the model is down the service still answers — with a warning header. That last
-part is the bug: the fallback returns what it was given. Debug it, fix it, and prove the fix.
+**Starting point.** The starter calls the NER model over gRPC in a retry loop with no deadline,
+and when every attempt fails it answers with a \`x-detector-degraded\` header and a substring scan
+that is skipped above 10 KiB. It serves the demo, because the demo model always answers, and hides
+5 flaws.
 
-Detection runs over **gRPC**. The model is the primary path; the fallback must be a **deterministic
-regex pass over the declared entity types**, never a pass-through.
+**Failure mode the checks target.** A fallback that returns the input is not a fallback, it is the
+outage. An unbounded retry loop without a deadline turns a slow dependency into a self-inflicted
+denial of service. The fix is a *bounded* retry with a *deterministic* fallback, so the service
+degrades in detection quality instead of degrading in safety.
+
+Detection runs over **gRPC**. The model is the primary path; the fallback is a **deterministic
+regex pass over the declared entity types**.
 
 - Every attempt carries a **600 ms** deadline, so one slow model cannot pin a worker.
 - At most **two attempts** per request, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retryable. The starter retries a timeout four times while the model is down: that is an amplifier,
-  not a retry policy — the outage gets four times the load exactly when it can least take it.
-- On failure — including a deadline — redact with the regex pass and return the spans marked
-  \`degraded: true\` and \`source: "regex"\`. Degraded must mean "redacted by a weaker detector", not
+  retryable.
+- On failure, including a deadline, redact with the regex pass and return the spans marked
+  \`degraded: true\` and \`source: "regex"\`. Degraded means "redacted by a weaker detector", not
   "returned unchanged".
-- The regex pass runs for **every** text size. The starter skips it above 10 KiB \`(10 * 1024)\`, so the
-  large documents — the ones most likely to contain a leak — are exactly the ones left unredacted.
-
-**Failure mode the checks target.** A fallback that returns the input is not a fallback, it is the
-outage. And an unbounded retry loop under a deadline turns a slow dependency into a self-inflicted
-denial of service. Notice the two failure modes are in tension: the fix is a *bounded* retry with a
-*deterministic* fallback, so the service degrades in detection quality instead of degrading in safety.`,
+- The regex pass runs for **every** text size; no \`(10 * 1024)\` guard around it.`,
   sequence: {
     participants: ['Redactor', 'Detector', 'Regex fallback'],
     messages: [
@@ -141,9 +140,7 @@ def regex_pass(text: str, entities: list[str]) -> list[Span]:
 
 
 def detect(tenant: str, text: str, entities: list[str], stub) -> tuple[list[Span], dict[str, str]]:
-    # TODO: a timeout falls back to the input with a warning header, the loop retries a timeout
-    # four times while the model is down, and the regex pass is skipped for texts over 10 KiB.
-    # Redact via regex on any failure, cap the attempts at two, and drop the size gate.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for _ in range(MAX_RETRIES + 1):
         try:
             reply = stub.Detect(DetectRequest(text=text, entities=entities))
@@ -250,9 +247,7 @@ export async function detect(
   entities: string[],
   client: DetectorClient,
 ): Promise<{spans: Span[]; headers: Record<string, string>}> {
-  // TODO: a timeout falls back to the input with a warning header, the loop retries a timeout
-  // four times while the model is down, and the regex pass is skipped for texts over 10 KiB.
-  // Redact via regex on any failure, cap the attempts at two, and drop the size gate.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
     try {
       const reply = await new Promise<DetectReply>((resolve, reject) =>
@@ -364,9 +359,7 @@ func regexPass(text string, entities []string) []Span {
 }
 
 func detect(ctx context.Context, tenant, text string, entities []string, client DetectorClient) ([]Span, map[string]string) {
-	// TODO: a timeout falls back to the input with a warning header, the loop retries a timeout
-	// four times while the model is down, and the regex pass is skipped for texts over 10 KiB.
-	// Redact via regex on any failure, cap the attempts at two, and drop the size gate.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		reply, err := client.Detect(ctx, &DetectRequest{Text: text, Entities: entities})
 		if err == nil {
@@ -472,9 +465,7 @@ object DetectorClient {
     }
   }
 
-  // TODO: a timeout falls back to the input with a warning header, the loop retries a timeout
-  // four times while the model is down, and the regex pass is skipped for texts over 10 KiB.
-  // Redact via regex on any failure, cap the attempts at two, and drop the size gate.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def detect(tenant: String, text: String, entities: List[String], stub: DetectorStub): (List[Span], Map[String, String]) = {
     var attempt = 0
     while (attempt <= MaxRetries) {
@@ -563,9 +554,7 @@ std::vector<Span> regex_pass(const std::string& text, const std::vector<std::str
   return spans;
 }
 
-// TODO: a timeout falls back to the input with a warning header, the loop retries a timeout
-// four times while the model is down, and the regex pass is skipped for texts over 10 KiB.
-// Redact via regex on any failure, cap the attempts at two, and drop the size gate.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::pair<std::vector<Span>, std::string> detect(const std::string& tenant, const std::string& text, const std::vector<std::string>& entities, Detector::Stub& stub) {
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
     grpc::ClientContext context;
@@ -652,9 +641,9 @@ std::string detection_result(const std::string& tenant, const std::string& text,
     },
   },
   hints: [
-    'Bounded retries under one budget: `for attempt in range(MAX_ATTEMPTS)` with the deadline set per attempt, and `if error.code() not in RETRYABLE: break`. Retrying an unretryable code is a bug; retrying a retryable one more than once while the dependency is down is an outage amplifier.',
-    'The fallback table is data: `ENTITY_PATTERNS = {"EMAIL": re.compile(…), "PHONE": …}` and a loop that runs every declared type over the whole text. Deterministic means the same input yields the same spans — a property the model path cannot offer, which is exactly why the response must say `source: "regex"`.',
-    'There is no size guard. The starter’s `len(text) > 10 * 1024: return []` skips redaction for the largest documents; if the regex pass is too slow for a 256 KiB text, make the pass cheaper, not the coverage smaller.',
+    'While the model is down, p99 latency climbs past a minute, the model receives five times the traffic, and large documents come back with an `x-detector-degraded` header and zero spans.',
+    'Each `stub.Detect` call has no deadline, the loop runs `MAX_RETRIES + 1` times on any exception, and the fallback is a substring scan that returns `[]` above `10 * 1024` characters.',
+    'Set `timeout=0.6` per attempt, loop `MAX_ATTEMPTS = 2` and break unless `e.code()` is in `RETRYABLE`; on failure scan compiled `ENTITY_PATTERNS` over the whole text and return `source: "regex"`, `degraded: true`.',
   ],
-  debrief: `The interviewer is testing failure policy for a model dependency: a deadline, a bounded retry, and a fallback that is genuinely safer than the primary path’s absence. The starter fails on all three counts — four retries with no deadline amplifies a model outage, and the "fallback" returns the caller's text behind a warning header, which is not a degraded mode but an exfiltration mode. The interesting sentence is the one about size: gating the regex pass at 10 KiB means the redactor’s coverage silently drops on exactly the documents that matter most, and nothing in the response says so. In production you would also cap concurrent model calls, keep the regex table versioned beside the pattern version reported in step 2, and alert on the degraded rate rather than the error rate.`,
+  debrief: `The fix pairs a bounded retry with a deterministic fallback because the two failure modes pull in opposite directions: retrying longer keeps the model path alive but amplifies the outage, while giving up sooner is only safe if what comes next still redacts. A 600 ms deadline and two attempts on exactly \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\` bound the cost of a down model; a compiled regex table over the declared entity types bounds the cost of giving up. The size gate had to go because the largest documents are the likeliest to carry a leak, and \`source: "regex"\` lets a caller tell degraded from healthy. Production clients also cap concurrent model calls with a circuit breaker, version the regex table beside the pattern version, and alert on the degraded rate.`,
 };

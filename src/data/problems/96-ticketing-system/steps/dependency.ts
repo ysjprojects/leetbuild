@@ -8,37 +8,30 @@ export const dependencyStep: Step = {
   focus: ['api', 'crm', 'worker', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: an agent posts a note, the starter pushes it to
-the CRM, the demo answers 201, and nothing looks wrong. It hides four production flaws. Debug it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is \`ticketd\`'s CRM client: \`post_note\` appends the note, calls
+\`sync_note\`, and answers **201** once the CRM has taken it; \`sync_note\` builds a \`SyncNoteRequest\`
+from the ticket id and body and loops on any \`RpcError\` until the call succeeds. It serves the demo
+and hides 5 flaws.
 
-Implement \`ticketd\`'s CRM client: the request path that accepts a note, and the worker pass that
-syncs notes to the CRM over gRPC.
+**Failure mode the checks target.** An inline sync means one CRM outage blocks every agent's post.
+A request without a key means each retry creates a new CRM note, duplicating the agent's reply in
+the customer's record. Retrying \`INVALID_ARGUMENT\` spins forever, and a call with no deadline can
+hang the worker. All of it is invisible while the CRM is healthy and fast.
 
-- **Never on the request path.** The handler commits the note and its outbox row in one transaction
-  (\`store.commit_note\`, \`commitNote\` in TypeScript and Scala, \`CommitNote\` in Go) and answers
-  **201**; a separate drain (\`drain_outbox\` / \`drainOutbox\`) reads the pending rows and makes the
-  RPC. A CRM outage is a pending row, never a failed request — the ticket UI never waits on the CRM.
-- **A 3-second deadline per attempt.** The \`SyncNote\` call carries one (\`DEADLINE_S = 3\`,
-  \`DEADLINE_MS = 3000\`, \`context.WithTimeout(ctx, deadlineS*time.Second)\`,
-  \`withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)\`, \`set_deadline\`). Without it a CRM that accepts
-  the connection and then says nothing pins the sync worker.
-- **The note id is the idempotency key.** Every attempt sends the note id and
-  \`idempotency_key = note.id\`, so a retry **updates one CRM record** instead of creating a second
-  note. Omitting the key — or minting a fresh one per attempt — makes each retry a new note and
-  duplicates an agent's reply in the customer's record.
-- **Bounded retries, retryable statuses only.** \`MAX_ATTEMPTS = 3\`, and only \`UNAVAILABLE\` and
-  \`DEADLINE_EXCEEDED\` are worth another attempt; the **same key** goes out on every attempt.
-- **A schema rejection is quarantined.** \`INVALID_ARGUMENT\` means the CRM refused the note's shape:
-  call \`store.quarantine(note.id, reason)\` with the status and **stop retrying**. Any other
-  permanent status is quarantined too; a note whose retryable attempts are exhausted stays pending
-  for the next pass (\`return False\` / \`return false\`).
+Requirements:
 
-**Failure mode the checks target.** The starter syncs inline before it answers, so one CRM outage
-blocks every agent's post; it sends no key, so its endless retries create a new CRM note each time —
-the agent's reply duplicates in the customer's record; it treats \`INVALID_ARGUMENT\` like every other
-error and retries it forever; and with no deadline the call can hang the worker indefinitely. All
-four are invisible in a demo where the CRM is healthy and fast.`,
+- **Off the request path.** Commit the note and its outbox row together (\`store.commit_note\`,
+  \`commitNote\`, \`CommitNote\`), answer **201**; a separate \`drain_outbox\` / \`drainOutbox\` makes
+  the RPC.
+- **A 3-second deadline per attempt** on \`SyncNote\` (\`DEADLINE_S = 3\`, \`DEADLINE_MS = 3000\`,
+  \`context.WithTimeout(ctx, deadlineS*time.Second)\`, \`withDeadlineAfter(DeadlineS,
+  TimeUnit.SECONDS)\`, \`set_deadline\`).
+- **The note id is the idempotency key.** Every attempt sends \`idempotency_key = note.id\`; no key
+  is minted per attempt.
+- **Bounded retries.** \`MAX_ATTEMPTS = 3\`; only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` earn another.
+- **A schema rejection is quarantined.** On \`INVALID_ARGUMENT\` (or any permanent status) call
+  \`store.quarantine(note.id, reason)\` and stop; exhausted retries leave the row pending
+  (\`return False\` / \`return false\`).`,
   sequence: {
     participants: ['Ticket API', 'Ticket store', 'Event worker', 'CRM'],
     messages: [
@@ -72,9 +65,9 @@ four are invisible in a demo where the CRM is healthy and fast.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)`, `set_deadline`) — wrapping the call changes nothing. And the idempotency key is the note id, built once and replayed on every attempt: the starter sends neither a note id nor a key, so the CRM cannot see two attempts as one record.',
-    'Keep the CRM off the request path: commit the note and its outbox row together (`store.commit_note` / `store.commitNote`), answer 201, and let the worker drain the pending rows. The starter calls the CRM inside the handler, so a CRM outage is a failed agent request — the outbox row is what turns that failure into a pending row instead.',
-    'Split the statuses instead of catching everything: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt under a `MAX_ATTEMPTS = 3` cap; `INVALID_ARGUMENT` is the CRM refusing the note, so it must be quarantined with a reason (`store.quarantine(note.id, …)`) instead of retried. The starter’s `while` loop has no exit for it.',
+    'With the CRM down, every agent’s note post fails; with it flapping, the customer’s CRM record shows the same agent reply three times; with one malformed note, the worker spins at full CPU.',
+    'The handler calls `sync_note` before answering, the request carries no note id or key so the CRM cannot match attempts, the `while True` catches every `RpcError` alike, and the call has no deadline.',
+    'Commit note plus outbox row in `store.commit_note`, answer 201, drain in `drain_outbox`; call `SyncNote(..., idempotency_key=note.id, timeout=DEADLINE_S)` for `range(MAX_ATTEMPTS)`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, `store.quarantine` on `INVALID_ARGUMENT`.',
   ],
   checks: [
     {
@@ -216,10 +209,7 @@ crm = crm_pb2_grpc.CrmStub(grpc.insecure_channel("crm:9000"))
 def post_note(note, store) -> int:
     """POST /v1/tickets/{id}/notes — the starter answers only after the CRM has taken the note."""
     store.append_note(note)
-    # TODO: never call the CRM from the request path (a CRM outage blocks the agent), put a 3 s
-    # deadline on the call, send the note id as the idempotency key so a retry updates one CRM
-    # record, cap the attempts at 3 on UNAVAILABLE / DEADLINE_EXCEEDED only, and quarantine the
-    # note with a reason when the CRM rejects its schema with INVALID_ARGUMENT.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     sync_note(note)
     return 201
 
@@ -329,10 +319,7 @@ const crmClient = new crm.Crm('crm:9000', grpc.credentials.createInsecure());
 
 export async function postNote(note: Note, store: TicketStore): Promise<number> {
   await store.appendNote(note);
-  // TODO: never call the CRM from the request path (a CRM outage blocks the agent), put a 3 s
-  // deadline on the call, send the note id as the idempotency key so a retry updates one CRM
-  // record, cap the attempts at 3 on UNAVAILABLE / DEADLINE_EXCEEDED only, and quarantine the
-  // note with a reason when the CRM rejects its schema with INVALID_ARGUMENT.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await syncNote(note);
   return 201;
 }
@@ -447,10 +434,7 @@ func postNote(ctx context.Context, note Note, store TicketStore) int {
 	if err := store.AppendNote(ctx, note); err != nil {
 		return 500
 	}
-	// TODO: never call the CRM from the request path (a CRM outage blocks the agent), put a 3 s
-	// deadline on the call, send the note id as the idempotency key so a retry updates one CRM
-	// record, cap the attempts at 3 on codes.Unavailable / codes.DeadlineExceeded only, and
-	// quarantine the note with a reason when the CRM rejects its schema with codes.InvalidArgument.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	syncNote(ctx, note)
 	return 201
 }
@@ -562,10 +546,7 @@ object Client {
   // postNote answers the agent only after the CRM has taken the note.
   def postNote(note: Note, store: TicketStore): Int = {
     store.appendNote(note)
-    // TODO: never call the CRM from the request path (a CRM outage blocks the agent), put a 3 s
-    // deadline on the call, send the note id as the idempotency key so a retry updates one CRM
-    // record, cap the attempts at 3 on UNAVAILABLE / DEADLINE_EXCEEDED only, and quarantine the
-    // note with a reason when the CRM rejects its schema with INVALID_ARGUMENT.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     syncNote(note)
     201
   }
@@ -651,10 +632,7 @@ int postNote(const Note& note, TicketStore& store) {
 }
 
 bool sync_note(const Note& note, Crm::Stub* crm) {
-  // TODO: never call the CRM from the request path (a CRM outage blocks the agent), put a 3 s
-  // deadline on the call, send the note id as the idempotency key so a retry updates one CRM
-  // record, cap the attempts at 3 on UNAVAILABLE / DEADLINE_EXCEEDED only, and quarantine the
-  // note with a reason when the CRM rejects its schema with INVALID_ARGUMENT.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     SyncNoteRequest request;
@@ -728,5 +706,7 @@ void drain_outbox(TicketStore& store, Crm::Stub* crm) {
 `,
     },
   },
-  debrief: `The interviewer is asking one question in four costumes: what does a retry mean here? An idempotency key is what turns “send it again” into “make sure it happened once”, and the note id is the only honest key — it is the identity of the thing being created, so the CRM can update the record it already made instead of appending a second copy of the agent's reply. A deadline is what stops one silent dependency from pinning the worker. The retryable set is what separates “the CRM was briefly away” from “the CRM will never accept this note”, and the quarantine is where the second category goes: parked with a reason a human can act on, instead of burning the worker forever. The outbox is the shape that makes all of it safe: the note commits in the same transaction as its pending-sync row, the request returns, and the worker owns the RPC — so a CRM outage degrades the sync, never the ticket page. What candidates miss is that these are one decision, not four: without the outbox the retry policy is a UI timeout, without the key a retry is a duplicate write, and without the quarantine a schema bug becomes an infinite loop. Real clients add exponential backoff with jitter, a per-note attempt counter so a poison note is parked after a few passes, reconciliation that compares the CRM's note ids with the store's, and an alert on quarantine depth.`,
+  debrief: `The fix takes its shape from one question asked four ways: what does a retry mean here? The note id is the natural idempotency key because it is the identity of the thing being created, so the CRM can update the record it already made instead of appending a second copy of the agent's reply. The deadline stops one silent dependency from pinning the worker. The retryable set separates "the CRM was briefly away" from "the CRM will never accept this note", and quarantine is where the second category goes, parked with a reason a human can act on. The outbox makes all of it safe: the note commits with its pending-sync row, the request returns, and the worker owns the RPC, so a CRM outage degrades the sync rather than the ticket page.
+
+Production clients add exponential backoff with jitter, a per-note attempt counter so a poison note is parked after a few passes, and reconciliation of CRM note ids against the store.`,
 };

@@ -8,15 +8,12 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for signup: the happy path claims the address,
-inserts the row and answers **201**, and a second signup with the same email gets **409**, so the
-demo looks correct. The claim path is what is wrong with it: the email handle is checked with
-\`EXISTS\` and then written with a separate \`SET\`, the phone handle is never claimed at all — two
-accounts can share one phone — and an aborted signup never gives its keys back, so the address
-stays reserved for an account that does not exist. Debug it like the owner of the identity
-service, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/signup\`: it lowercases the email, checks
+\`handle:email:{email}\` with \`EXISTS\`, writes the key with a separate \`SET\`, inserts the row and
+answers **201**; a second signup with the same email gets **409**. It compiles, it serves the demo
+and hides 5 flaws.
 
-Implement the handle claims behind \`POST /v1/signup\`:
+Requirements for the handle claims:
 
 - Email and phone uniqueness are enforced by **atomic set-if-absent keys in one Redis namespace**:
   the key is \`handle:{kind}:{value}\` — \`kind\` is \`email\` or \`phone\`, \`value\` is the
@@ -69,9 +66,9 @@ its real owner for the whole TTL.`,
     ],
   },
   hints: [
-    '`SET key value NX EX ttl` is one command that both checks and claims: the reply is truthy when it created the key and falsy when the key already existed, and that single value is the whole "is this handle free?" decision. `EXISTS` then `SET` is two round trips, and between them another signup sees the same handle as free.',
-    'An account owns two handles, email and phone, and a phone number is as much an identity as an address: two accounts sharing one number is a fraud path, not a cosmetic bug. Claim both through the same helper, and when the second claim is refused release the first key before answering 409 — a refused signup must not leave a handle claimed behind it.',
-    'A claim is a reservation, not a record: when the row cannot be written there is no account, and the address must not stay reserved. `DEL` every key the signup claimed from its failure path — all of them, not just the one you happened to be looking at — or the real owner of that address is refused for the whole `HANDLE_TTL_S`.',
+    'Two people who signed up at the same second both got `alice@x.com`; two accounts share one phone; and a signup whose insert failed left the address refused to its owner for a week.',
+    '`EXISTS` then `SET` is two round trips with a window between them, the phone is never claimed, the key is spelled inline rather than built from one helper, and the failure path deletes nothing.',
+    'Add `handle_key` over `HANDLE_KEY_PREFIX`, claim email and phone with `SET … NX EX HANDLE_TTL_S` before the insert, answer 409 on a refused claim, and `release_claims` every key when `create_account` fails.',
   ],
   checks: [
     {
@@ -188,10 +185,7 @@ def create_account(email: str, phone: str, password: str) -> dict:
 
 @app.post("/v1/signup", status_code=201)
 def signup(body: SignupRequest) -> dict:
-    # TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
-    # handle with one atomic SET NX instead of EXISTS-then-SET, or two concurrent signups both pass
-    # the check and both insert. And when create_account fails, release every key the signup
-    # claimed: the starter reserves the address for a whole week for an account that does not exist.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     email = body.email.strip().lower()
     phone = body.phone.strip()
     key = f"handle:email:{email}"
@@ -331,10 +325,7 @@ function createAccount(email: string, phone: string, password: string): {id: str
 }
 
 app.post('/v1/signup', async (request, reply) => {
-  // TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
-  // handle with one atomic SET NX instead of EXISTS-then-SET, or two concurrent signups both pass
-  // the check and both insert. And when createAccount fails, release every key the signup claimed:
-  // the starter reserves the address for a whole week for an account that does not exist.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const body = request.body as SignupBody;
   const email = body.email.trim().toLowerCase();
   const phone = body.phone.trim();
@@ -505,10 +496,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func signup(rw http.ResponseWriter, r *http.Request) {
-	// TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
-	// handle with one atomic SetNX instead of Exists-then-Set, or two concurrent signups both pass
-	// the check and both insert. And when createAccount fails, release every key the signup
-	// claimed: the starter reserves the address for a whole week for an account that does not exist.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	body := struct {
 		Email    string \`json:"email"\`
 		Phone    string \`json:"phone"\`
@@ -737,11 +725,7 @@ object SignupApi {
     path("v1" / "signup") {
       post {
         entity(as[SignupRequest]) { body =>
-          // TODO: claim the phone handle too — two accounts can share one phone today. Claim the
-          // email handle with one atomic SET NX instead of exists-then-set, or two concurrent
-          // signups both pass the check and both insert. And when createAccount throws, release
-          // every key the signup claimed: the starter reserves the address for a whole week for an
-          // account that does not exist.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val email = body.email.trim.toLowerCase
           val phone = body.phone.trim
           val key = s"handle:email:$email"
@@ -990,10 +974,7 @@ int main() {
 
   httplib::Server svr;
   svr.Post("/v1/signup", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
-    // handle with one atomic SET NX instead of EXISTS-then-SET, or two concurrent signups both pass
-    // the check and both insert. And when createAccount fails, release every key the signup
-    // claimed: the starter reserves the address for a whole week for an account that does not exist.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
     const auto email = lower(trim(body.value("email", std::string())));
@@ -1174,5 +1155,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is what a claim is worth and how it is given back. \`SET NX EX\` is the whole trick: one round trip both asks "is this handle free?" and makes it not free, so a thousand concurrent signups for one address produce exactly one account — the read-then-write starter passes every serial test and fails exactly when two people sign up at the same moment. The namespace matters as much as the atomicity: every handle of an account gets its own key under \`HANDLE_KEY_PREFIX\`, so the phone is protected exactly like the email, and the TTL keeps a claim nobody ever confirmed from pinning an address forever. Releasing on abort is the half demos never test: a claim is a reservation made on behalf of an account that does not exist yet, and once the account cannot be created the reservation has to go back — otherwise the address belongs to a ghost and its real owner is refused for a week. Real identity services take this further: handles are normalized (lowercased, plus-addresses folded) before they are claimed so aliases collapse to one identity; the claim stores the user id rather than the handle, so a taken address can be traced to the account that holds it; email and phone carry separate TTLs; and the account table keeps \`UNIQUE (email, phone)\` as the last line of defence for the day a bug in the claim path ships — this step's store only constrains the email, which is exactly why the phone claim cannot be left out.`,
+  debrief: `The fix is one atomic command because a claim has to be the check: \`SET NX EX\` both asks "is this handle free?" and makes it not free in a single round trip, so a thousand concurrent signups for one address produce exactly one account, where the read-then-write starter passes every serial test and fails the moment two people sign up together. One \`handle_key\` helper under \`HANDLE_KEY_PREFIX\` is what makes the phone protected exactly like the email, and the TTL keeps a claim nobody confirmed from pinning an address forever. Releasing on abort follows from what a claim is: a reservation for an account that does not exist yet, which has to go back when the insert fails.
+
+Production identity services normalize handles before claiming them so aliases collapse, store the user id in the claim so a taken address traces to its account, give email and phone separate TTLs, and keep \`UNIQUE (email, phone)\` in the table as the last line of defence for the day a claim-path bug ships.`,
 };

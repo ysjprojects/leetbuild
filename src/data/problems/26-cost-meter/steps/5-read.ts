@@ -8,34 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'meter', 'redis', 'limiter'],
   task: `## Task
 
-The starter is working code: a spend number comes back and the dashboard shows
-it. It authorizes nothing, it reads a table that trails reality, and it rounds every request away.
-Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/tenants/{tenant}/spend\`, the read engineering and
+finance both quote: it takes the tenant from the path, sums the analytics table's rows with each row
+rounded to four decimals, and returns \`spend_usd\` with a literal \`"v1"\` as the statement version.
+It compiles, serves the demo and hides five flaws.
 
-Implement \`GET /v1/tenants/{tenant}/spend\`, the read engineering and finance both quote:
+**Failure mode the checks target.** Any caller can read any tenant's ledger. The number trails the
+limiter by minutes, so the dashboard and the 429 disagree by exactly the traffic that matters, and
+nothing says how much budget is left. A thousand requests that each cost 0.00004 bill as a thousand
+zeroes. The statement version is a literal nobody can trace to a rate table.
 
-- The caller is authenticated by \`X-Tenant-Id\` and may only read **its own** tenant: a request for
-  another tenant's spend is **403**. The starter serves whatever tenant the path names, so any caller
-  can read any ledger.
-- The number is reconstructed from the **same Redis counters the limiter enforces** —
-  \`meter:{tenant}:{bucket}\`, the current window's \`input_tokens\` and \`output_tokens\`. The starter
-  sums an analytics table that trails by minutes, so the spend it shows and the budget the platform
-  blocks on can differ by exactly the traffic that matters.
-- The response carries the window, the tokens, \`spend_micros\`, \`spend_usd\`, the tenant's
-  \`budget_micros\`, the \`remaining_micros\`, and the \`statement_version\` the numbers were priced
-  under. The version comes from server config (\`STATEMENT_VERSION\`), not from the request and not
-  from a literal typed into the handler.
-- Costs stay **integer micro-dollars** all the way to the statement, and rounding to cents happens
-  **once, on the total**: \`round(spend_micros / MICROS_PER_USD, 2)\`. The starter rounds each row to
-  four decimals, so a thousand requests that each cost 0.00004 bill as a thousand zeroes.
-- A tenant that is over budget reports \`remaining_micros = 0\` rather than a negative remainder —
-  the limiter is already refusing requests, and the read should say the same thing.
-
-**Failure mode the checks target.** Every one of these is a reconciliation bug rather than a display
-bug: an unauthorized read, a number that disagrees with the limit that was enforced, a rate applied
-after per-request rounding, and a statement version nobody can trace. The rounding flaw is the
-subtle one — it looks like tidiness, and on a high-volume tenant it makes a real invoice round to
-zero.`,
+- The caller is authenticated by \`X-Tenant-Id\` and may only read its own tenant; another tenant's
+  spend is **403**.
+- The number is reconstructed from the Redis counters the limiter enforces,
+  \`meter:{tenant}:{bucket}\`: the current window's \`input_tokens\` and \`output_tokens\`.
+- The response carries the window, the tokens, \`spend_micros\`, \`spend_usd\`, \`budget_micros\`
+  (\`BUDGET_MICROS\`), \`remaining_micros\`, and \`statement_version\` from server config
+  (\`STATEMENT_VERSION\`), not from the request or a literal.
+- Costs stay integer micro-dollars to the statement; rounding to cents happens once, on the total:
+  \`round(spend_micros / MICROS_PER_USD, 2)\`.
+- A tenant over budget reports \`remaining_micros = 0\`, not a negative remainder.`,
   sequence: {
     participants: ['Client', 'Cost Meter', 'Redis', 'Budget limiter'],
     messages: [
@@ -128,9 +120,7 @@ analytics = AnalyticsTable()
 
 @app.get("/v1/tenants/{tenant}/spend")
 def read_spend(tenant: str) -> dict:
-    # TODO: authorize the caller against the tenant, read the current window from the meter
-    # counters instead of the analytics table, compare against the enforced budget, stamp the
-    # statement version from config, and round once at statement level instead of per request.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     total = 0.0
     for row in analytics.spend_rows(tenant):
         total += round(row["cost_usd"], 4)
@@ -199,9 +189,7 @@ interface SpendRow {
 }
 
 app.get('/v1/tenants/:tenant/spend', async (request, reply) => {
-  // TODO: authorize the caller against the tenant, read the current window from the meter
-  // counters instead of the analytics table, compare against the enforced budget, stamp the
-  // statement version from config, and round once at statement level instead of per request.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const {tenant} = request.params as {tenant: string};
   let total = 0;
   for (const row of (await analyticsRows(tenant)) as SpendRow[]) {
@@ -283,9 +271,7 @@ func analyticsRows(tenant string) []SpendRow {
 }
 
 func readSpend(rw http.ResponseWriter, r *http.Request) {
-	// TODO: authorize the caller against the tenant, read the current window from the meter
-	// counters instead of the analytics table, compare against the enforced budget, stamp the
-	// statement version from config, and round once at statement level instead of per request.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	tenant := r.PathValue("tenant")
 	total := 0.0
 	for _, row := range analyticsRows(tenant) {
@@ -385,9 +371,7 @@ object SpendRead {
   val analytics = AnalyticsTable.open()
 
   def readSpend(tenant: String): JsObject = {
-    // TODO: authorize the caller against the tenant, read the current window from the meter
-    // counters instead of the analytics table, compare against the enforced budget, stamp the
-    // statement version from config, and round once at statement level instead of per request.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     var total = 0.0
     for (row <- analytics.spendRows(tenant)) {
       total += Math.round(row("cost_usd").convertTo[Double] * 10000) / 10000
@@ -468,9 +452,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/tenants/([^/]+)/spend)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: authorize the caller against the tenant, read the current window from the meter
-    // counters instead of the analytics table, compare against the enforced budget, stamp the
-    // statement version from config, and round once at statement level instead of per request.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.matches[1];
     double total = 0.0;
     for (const auto& row : analytics.spendRows(tenant)) {
@@ -564,9 +546,9 @@ int main() {
     },
   },
   hints: [
-    'Authorize the read like the write: take the caller from `X-Tenant-Id`, compare it with the tenant in the path, and answer `403` on a mismatch. An unguessable id is not an access-control mechanism, and spend data is exactly what a competitor would like to read.',
-    'Read `meter:{tenant}:{bucket}` — the same key the limiter checks — so the dashboard and the 429 come from one number. A warehouse copy that trails by minutes is fine for a weekly report and wrong for a spend page someone is watching during an incident.',
-    'Keep money integral: micro-dollars per request, one rounding to cents on the statement total, and `statement_version` on every response. Rounding inside the loop is the bug that makes a busy tenant’s invoice look like zero.',
+    'A busy tenant with thousands of small completions sees a spend page that reads 0.00 while the limiter has already started returning 429s.',
+    '`round(row["cost_usd"], 4)` runs inside the loop, so sub-cent rows vanish before they are summed; the loop also reads the analytics table, which lags the counters the limiter checks.',
+    'Compare `X-Tenant-Id` with the path tenant (403 on mismatch), `hmget` `meter:{tenant}:{bucket}`, compute `spend_micros` as integers, subtract from `BUDGET_MICROS`, round once, stamp `STATEMENT_VERSION`.',
   ],
-  debrief: `The interviewer is testing the read side of a money system, where the interesting question is never "does it return a number" but "is it the same number the rest of the platform acted on". Four properties are checked: authorization (a ledger read is a permissioned read), one source of truth (the limiter’s own counters, not a trailing copy), a versioned statement (so an old invoice can be re-derived), and integral money with a single statement-level rounding (so small requests still add up). The rounding flaw is the one that gets shipped: it reads like defensive tidiness, and it silently zeroes exactly the workloads that keep a platform busy. Real meters add a per-model breakdown you can drill into, a period-level counter that outlives the window, and a reconciliation report that compares these counters against the provider's own usage export.`,
+  debrief: `The read side of a money system is judged by one question: is this the same number the rest of the platform acted on. That is why the handler reads the limiter's own counters instead of a trailing copy, why it reports the budget the limiter compares against, and why money stays in integer micro-dollars until a single rounding on the statement total. Per-row rounding reads like tidiness and silently zeroes exactly the workloads that keep a platform busy. The authorization check and the configured statement version make the number safe to show and possible to re-derive later. Production meters add a per-model breakdown behind the same read, and a period-level counter that outlives the hourly window so the monthly statement does not depend on keys that have already expired.`,
 };

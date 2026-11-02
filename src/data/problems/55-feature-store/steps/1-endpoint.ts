@@ -8,35 +8,28 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it parses the body, stores the
-definition and returns it. It compiles, it serves the demo, and it hides three production flaws.
-Debug it like the platform owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter accepts \`POST /v1/features/definitions\` with body
+\`{"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}\`,
+stores it under \`name:version\` and echoes it back with 200. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/features/definitions\` with body
-\`{"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}\`.
+**Failure mode the checks target.** A definition that can be written over is one training and serving
+can disagree about; a dangling \`computation_ref\` and a \`null\` freshness SLO only surface once a
+model has been trained on them.
 
-- A definition is keyed by **(name, version)**. Registering an existing pair is **409**, and the
-  stored definition is returned untouched. The starter writes over the record, so a second registration
-  silently changes the code both training and serving resolve to.
+- A definition is keyed by **(name, version)**. Registering an existing pair is **409** and the stored
+  record stays untouched. The starter writes over it.
 - \`dtype\` is one of \`int64\`, \`float64\`, \`string\`, \`bool\` (**400** otherwise).
-- \`computation_ref\` is a pointer into the platform's compute registry, not free text: it is resolved
-  at registration time and a reference that names nothing is **422**. The starter accepts any string, so
-  the failure surfaces later, in a training job that has already read half a warehouse.
-- \`freshness_slo\` is the number of seconds within which a value must be recomputed. It is **required**
-  and must be positive (**400** when missing or \`null\`). The starter defaults it to \`null\`, and nothing
-  downstream can alert on a definition that never declared how stale is too stale.
-- The response is the definition **as stored** — name, version, dtype, computation_ref, freshness_slo
-  and the creation time — returned with **201**, not a restatement of the request body, so both
-  training and serving read the same record.
-
-**Failure mode the checks target.** A definition that can be mutated in place is a definition training
-and serving can disagree about; a dangling \`computation_ref\` and a \`null\` freshness SLO are failures
-that only surface much later, when a model has already been trained on them.
+- \`computation_ref\` is resolved against the compute registry at registration; a reference that names
+  nothing is **422**. The starter accepts any string.
+- \`freshness_slo\` (seconds) is **required** and positive (**400** when missing or \`null\`). The
+  starter has no such field and stores \`freshness\` as \`null\`.
+- The response is the definition **as stored**, including the creation time, with **201**, not a
+  restatement of the request body.
 
 ## What to keep
 
-The route, the request model and the store are fine. The fix is the key, the resolution step and the
-explicit SLO: validate everything before the write, and never overwrite a stored version.`,
+The route, the request model and the store are fine. The fix is the key check, the resolution step and
+the explicit SLO: validate everything before the write, and never overwrite a stored version.`,
   sequence: {
     participants: ['Client', 'Feature API', 'Definition registry'],
     messages: [
@@ -150,9 +143,7 @@ class Definition(BaseModel):
 
 @app.post("/v1/features/definitions")
 def register(body: Definition) -> JSONResponse:
-    # TODO: reject a re-registration of the same (name, version) with 409 instead of overwriting the
-    # stored record, resolve computation_ref against the compute registry with 422 when it is
-    # dangling, and require an explicit freshness SLO instead of storing freshness=None.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     record = {**body.model_dump(), "created_at": 0}
     DEFINITIONS[f"{body.name}:{body.version}"] = record
     return JSONResponse(record, status_code=200)
@@ -219,9 +210,7 @@ interface Definition {
 
 app.post('/v1/features/definitions', async (request, reply) => {
   const body = request.body as Definition;
-  // TODO: reject a re-registration of the same (name, version) with 409 instead of overwriting the
-  // stored record, resolve computation_ref against the compute registry with 422 when it is
-  // dangling, and require an explicit freshness SLO instead of storing whatever the caller sent.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const record = {...body, created_at: Math.floor(Date.now() / 1000)};
   DEFINITIONS.set(\`\${body.name}:\${body.version}\`, record);
   return reply.code(200).send(record);
@@ -290,9 +279,7 @@ var definitions = map[string]map[string]any{}
 func registerDefinition(rw http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: reject a re-registration of the same (name, version) with 409 instead of overwriting the
-	// stored record, resolve computation_ref against the compute registry with 422 when it is
-	// dangling, and require an explicit freshness SLO instead of storing whatever the caller sent.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	body["created_at"] = time.Now().Unix()
 	definitions[fmt.Sprintf("%v:%v", body["name"], body["version"])] = body
 	rw.WriteHeader(http.StatusOK)
@@ -395,9 +382,7 @@ object DefineApi {
     path("v1" / "features" / "definitions") {
       post {
         entity(as[Definition]) { body =>
-          // TODO: reject a re-registration of the same (name, version) with 409 instead of
-          // overwriting the stored record, resolve computation_ref against the compute registry
-          // with 422 when it is dangling, and require an explicit freshness SLO.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           definitions(s"\${body.name}:\${body.version}") = body
           complete(StatusCodes.OK, body)
         }
@@ -477,9 +462,7 @@ int main() {
   svr.Post("/v1/features/definitions", [](const httplib::Request& req, httplib::Response& res) {
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: reject a re-registration of the same (name, version) with 409 instead of overwriting the
-    // stored record, resolve computation_ref against the compute registry with 422 when it is
-    // dangling, and require an explicit freshness SLO.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     definitions[body.value("name", std::string()) + ":" + std::to_string(body.value("version", 0))] = body;
     res.status = 200;
     res.set_content(body.dump(), "application/json");
@@ -547,9 +530,9 @@ int main() {
     },
   },
   hints: [
-    'Uniqueness is per (name, version): build the store key from both fields and look it up before you write. A map keyed by name alone is what lets a second registration quietly move the definition both training and serving resolve to, and returning 409 without touching the stored record is the whole point.',
-    'A computation reference is a pointer into the platform registry, not free text. Resolve it before storing and answer 422 when it names nothing — failing at registration is cheap; failing after a training job has scanned a warehouse is not.',
-    '`freshness_slo` is the contract that makes staleness alertable: an old client may omit it, but it can never be stored as `null`. Validate it, store an explicit value, and answer 201 with the record you actually stored rather than a restatement of the request.',
+    'Register the same name and version twice: the second call answers 200 and the stored definition quietly changes. A typo in computation_ref is accepted, and freshness comes back null.',
+    'The handler writes to DEFINITIONS before checking anything: no lookup of the existing key, no registry of known computation refs, and the model declares an optional freshness instead of a required freshness_slo.',
+    'Check the key first and answer 409; keep a COMPUTATION_REFS tuple and answer 422 on a miss; require a positive freshness_slo (400 otherwise); build the record explicitly and answer 201 with it.',
   ],
-  debrief: `The interview question behind this step is what a feature registry is actually for. A definition is the shared contract between training and serving, so an identifier that can be mutated in place is not a version — it is a rename that silently changes what a model was trained on. The 409 keeps every version of a feature addressable and immutable. The dangling \`computation_ref\` is the second failure: a pointer resolved at registration time cannot break a training run that started an hour later. The third is the freshness SLO, the only field that lets a consumer decide whether a value is usable; a \`null\` default turns a stale value into an unremarkable one, and the alert that should have fired never has a threshold to fire on. Real registries add ownership, deprecation windows, a schema history and a diff of the compute function between versions.`,
+  debrief: `The fix validates everything before the single write because a registry is the shared contract between training and serving: an identifier that can be mutated in place is not a version, it is a rename that silently changes what a model was trained on. The 409 keeps every version addressable and immutable. Resolving \`computation_ref\` at registration moves the failure from a training job an hour later to the request that caused it. The freshness SLO is the one field that lets a consumer decide whether a value is usable; a \`null\` default turns a stale value into an unremarkable one. Production registries also record an owner per feature and a deprecation window, so a version can be retired without breaking the models still pinned to it.`,
 };

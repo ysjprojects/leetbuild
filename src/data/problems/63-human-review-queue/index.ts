@@ -17,7 +17,8 @@ import {readStep} from './steps/5-read';
 export const humanReviewQueueProblem: Problem = {
   id: 'human-review-queue',
   title: 'Human Review Queue',
-  tagline: 'Route low-confidence model output to humans with SLA-aware leases and clean handoffs.',
+  tagline:
+    'Route low-confidence model output to reviewers with leased assignments, monotonic SLA clocks and a narrow auto-resolve.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -25,29 +26,26 @@ export const humanReviewQueueProblem: Problem = {
   statement: `# Human Review Queue
 
 A human review queue is the piece of an AI platform that takes the output the model is not trusted to
-ship — a low-confidence completion, a guardrail block, a user report — and routes it to a person
-with a deadline. The visible part is a task in a reviewer's console; the parts that decide whether
-the platform is safe are the dedupe at the door, the lease that returns a stranded item, the clock
-that decides when an item has breached its SLA, the narrow class the queue may clear without a human,
-and the event trail a reviewer's decision leaves behind months later.
+ship, such as a low-confidence completion, a guardrail block or a user report, and routes it to a
+person with a deadline. The visible part is a task in a reviewer's console; the parts that decide
+whether the platform is safe are the dedupe at the door, the lease that returns a stranded item, the
+clock that decides when an item has breached its SLA, the narrow class the queue may clear without a
+human, and the event trail a reviewer's decision leaves behind months later.
 
 ## The real system
 
-Production review queues receive escalations from many sources and many tenants. They do not trust a
-caller's priority: priority is derived from the platform's rules — a guardrail block outranks a user
-report, a safety category outranks a style complaint. They dedupe by \`(source type, source id)\` so
-the same blocked completion is reviewed once, not five times because five workers noticed it. They
-store a reference to the payload in a retention-managed store instead of copying model output and user
-text into the queue row. They assign each item with a lease so a reviewer who crashes or abandons a
-tab cannot strand work forever, and they compute the SLA deadline from a monotonic clock, not from a
-wall clock that drifts minutes per day between regions. When an item breaches its SLA it re-enters
-the queue at the front, visibly marked as breached, not silently reordered. A reviewer's resolution
-may clear only a limited class — spam duplicates and known-safe false positives — by calling the
-enforcement service over gRPC with a one-second deadline; a timeout escalates to a human, it never
-resolves. Every lifecycle change publishes a \`review.event\` keyed by source id so one item's events
-stay ordered, carrying priority, SLA state and outcome category, and never the reviewer's name or the
-payload text. Finally the operator read returns depth per priority, the age of the oldest item, the
-breach count and the assignment distribution — and only for the caller's tenant.
+Amazon Augmented AI (A2I) is the documented shape of this service. A flow definition says which
+conditions start a human loop (for Rekognition image moderation, an inference confidence interval),
+which work team receives the task, how many workers see each task, and two time limits:
+\`TaskAvailabilityLifetimeInSeconds\`, after which an unclaimed task expires, and
+\`TaskTimeLimitInSeconds\`, after which a worker's hold on it ends. The output lands in an S3 path the
+customer owns, not inside the queue. Review queues in moderation platforms add what A2I leaves to the
+caller: priority derived from the platform's rules rather than the caller's say-so, dedupe by
+\`(source type, source id)\` so a blocked completion is reviewed once no matter how many workers saw
+it, a payload reference instead of a copy of user text, SLA deadlines from a monotonic clock, a
+breached item re-entering at the front and visibly marked, an auto-resolve limited to a named safe
+class with an enforcement call that escalates on timeout, and lifecycle events keyed by source id
+that carry an opaque reviewer reference.
 
 ## What you build here
 
@@ -61,12 +59,12 @@ One service, **reviewd**, with five pieces:
    breached when it comes back.
 3. A **gRPC** enforcement client: a one-second deadline, an auto-resolve only for the safe class and
    only with a recorded grant, a timeout that escalates to a human, and a policy rejection that is
-   terminal — never retried.
+   terminal rather than retried.
 4. A **Kafka** \`review.event\` path: one event per lifecycle change keyed by source id, an idempotent
    producer with \`acks=all\`, the reviewer referenced by an opaque id for audit only, no payload text,
-   and publish-after-commit so an event cannot describe a state the item store never reached.
+   and publish-after-commit so an event cannot describe a state the item store did not reach.
 5. \`GET /v1/review/queues/{p}\`: depth per priority reconciled with the item store, the age of the
-   oldest item always reported, the SLA breach count and the assignment state distribution — **403**
+   oldest item always reported, the SLA breach count and the assignment state distribution, **403**
    for another tenant's queue.
 
 ## The debugging habit

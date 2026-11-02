@@ -8,31 +8,28 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event on the happy path and the
-payload names the user, so the demo shows telemetry flowing. Three production contracts are
-broken. Find them, fix them, and prove the fix.
-
-The publisher is what the map service calls once a route is computed, and it feeds
-\`route.computed\`, the topic every region's telemetry pipeline reads from.
-
-- Key the record by **map region**, not by the user: \`route.computed\` is partitioned so one
-  region's routes arrive in order. Keyed by the user id, one region's events scatter across
-  partitions and the ordering guarantee is gone.
-- The event may carry the geography only as a **coordinate-cell hash**: round each endpoint to a
-  ~1 km cell (two decimal places) and hash the cell into \`route_cell\`. Exact endpoints must not
-  appear in the payload or in any log line — the topic is retained and replicated, and an
-  origin/destination pair is where someone lives.
-- The event carries what downstream needs to trust it: \`latency_ms\`, \`distance_m\` and the
-  traffic \`epoch\` of the route it describes.
-- When the broker rejects the produce, write the event to the **outbox** —
-  \`store.insert_outbox(region, event)\` / \`store.insertOutbox(region, event)\` /
-  \`store.InsertOutbox(ctx, region, event)\` — instead of dropping it; a relay republishes outbox
-  rows when the broker recovers.
+**Starting point.** The starter is \`publish_route(route)\`, the publisher the map service calls
+once a route is computed. It produces one \`route.computed\` record keyed by the user id, with the
+exact origin and destination and \`latency_ms\` in the payload, logs the endpoints, and ignores the
+produce result. The demo shows telemetry flowing. It hides five flaws.
 
 **Failure mode the checks target.** Keyed by the user, one region's telemetry loses its ordering;
-a payload that names the exact endpoints of a trip is a location history with days of retention;
-without \`epoch\` and \`distance_m\` a consumer cannot tell which traffic state, or how long a route,
-it is counting; and a rejected produce with no outbox row loses the event with no way back.`,
+a payload that names the exact endpoints of a trip is a location history with days of retention,
+and the log line is a second copy; without \`epoch\` and \`distance_m\` a consumer cannot tell which
+traffic state, or how long a route, it is counting; and a rejected produce with no outbox row
+loses the event with no way back.
+
+- Key the record by **map region**, not by the user: \`route.computed\` is partitioned so one
+  region's routes arrive in order.
+- The event may carry the geography only as a **coordinate-cell hash**: round each endpoint to a
+  ~1 km cell (two decimal places) and hash the cell into \`route_cell\`. Exact endpoints must not
+  appear in the payload or in any log line.
+- The event carries what downstream needs to trust it: \`latency_ms\`, \`distance_m\` and the
+  traffic \`epoch\` of the route it describes.
+- When the broker rejects the produce, write the event to the **outbox**
+  (\`store.insert_outbox(region, event)\` / \`store.insertOutbox(region, event)\` /
+  \`store.InsertOutbox(ctx, region, event)\`) instead of dropping it; a relay republishes outbox
+  rows when the broker recovers.`,
   sequence: {
     participants: ['Route service', 'route.computed', 'Telemetry consumer', 'Route store', 'Outbox relay'],
     messages: [
@@ -59,9 +56,9 @@ it is counting; and a rejected produce with no outbox row loses the event with n
     ],
   },
   hints: [
-    'The message key is the partition key: `key=route["region"]` (or `Key: []byte(route.Region)`, `ProducerRecord("route.computed", route.region, …)`). Keyed by the user id, one region’s events land in different partitions and their order is no longer guaranteed.',
-    'Coarsen before you hash: round each coordinate to two decimals (~1 km) — `round(lat, 2)`, `Math.round(lat * 100) / 100`, `math.Round(lat*100) / 100`, `math.round(lat * 100) / 100`, `std::round(lat * 100) / 100` — then hash the cell and publish `route_cell`. The raw `origin`/`destination` never reach the payload or a log line.',
-    'The outbox is the durability half: wrap the produce and, when the broker rejects it, write a row — `store.insert_outbox(region, event)`, `store.insertOutbox`, `store.InsertOutbox` — that a relay republishes. Keep `epoch` and `distance_m` in the payload next to `latency_ms`: without them the consumer cannot tell a rush-hour route from a midnight one.',
+    'The region dashboard shows routes out of order, a privacy audit finds home addresses in a topic with seven days of retention, and the count of routes during a broker outage is simply missing.',
+    'The record key is the user id, so one region spreads across partitions; the payload and the log line carry `origin`/`destination` verbatim; `epoch` and `distance_m` are dropped; the produce result is never checked.',
+    'Produce with `key=route["region"]`, replace the endpoints with `"route_cell": cell_hash(origin, destination)` (round to two decimals, then hash), add `"epoch"` and `"distance_m"`, log ids only, and on `KafkaException` call `store.insert_outbox(region, event)`.',
   ],
   checks: [
     {
@@ -193,9 +190,7 @@ class OutboxStore:
 store = OutboxStore()
 
 
-# TODO: key by the map region and not the user, publish the coarse coordinate-cell hash instead of
-# the exact endpoints, carry the epoch and the distance, and write an outbox row when the broker
-# rejects the produce.
+# TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 def publish_route(route: dict) -> None:
     logger.info("route id=%s user=%s origin=%s destination=%s", route["id"], route["user_id"], route["origin"], route["destination"])
     payload = {
@@ -276,9 +271,7 @@ export interface ComputedRoute {
   degraded: boolean;
 }
 
-// TODO: key by route.region instead of route.user_id, publish the coarse coordinate-cell hash
-// instead of the exact endpoints, carry the epoch and the distance, and write an outbox row when
-// the broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 export async function publishRoute(route: ComputedRoute): Promise<void> {
   const event = {
     id: route.id,
@@ -374,9 +367,7 @@ type ComputedRoute struct {
 	Degraded    bool       \`json:"degraded"\`
 }
 
-// TODO: key by route.Region instead of route.UserID, publish the coarse coordinate-cell hash
-// instead of the exact endpoints, carry the epoch and the distance, and write an outbox row when
-// the broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func publishRoute(ctx context.Context, route ComputedRoute) {
 	log.Printf("route id=%s user=%s origin=%v destination=%v", route.ID, route.UserID, route.Origin, route.Destination)
 	event := map[string]any{
@@ -468,9 +459,7 @@ object Events {
       epoch: Long,
       degraded: Boolean)
 
-  // TODO: key by route.region instead of route.userId, publish the coarse coordinate-cell hash
-  // instead of the exact endpoints, carry the epoch and the distance, and write an outbox row when
-  // the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publishRoute(route: ComputedRoute): Unit = {
     log.info(s"route id=\${route.id} user=\${route.userId} origin=\${route.origin} destination=\${route.destination}")
     val payload = Map(
@@ -565,9 +554,7 @@ struct Route {
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: key by route.region instead of route.user_id, publish the coarse coordinate-cell hash
-// instead of the exact endpoints, carry the epoch and the distance, and write an outbox row when
-// the broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publishRoute(const Route& route) {
   std::cerr << "route id=" << route.id << " user=" << route.user_id << " origin=" << route.origin.first << ","
             << route.origin.second << " destination=" << route.destination.first << "," << route.destination.second
@@ -661,5 +648,5 @@ void publishRoute(const Route& route) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partitioned by region, each region’s telemetry arrives in order; keyed by user, it does not. Second, a topic is retained and replicated, so anything written there — exact endpoints included — outlives the request: the payload carries a coarse cell hash and the logs carry ids, not positions. Third, a broker is not a database: a rejected produce becomes an outbox row that a relay republishes, and the event carries the epoch so consumers never mix traffic states. Real platforms add a schema registry and per-topic retention, compact telemetry to roll-ups, and run PII scanners over the pipeline.`,
+  debrief: `The fix has its shape because a topic is three contracts at once. The message key is an ordering contract: partitioned by region, each region's telemetry arrives in order, and keyed by user it does not. Retention is a storage contract: anything written to a replicated topic outlives the request, so the payload carries a coarse cell hash and the logs carry ids, not positions. And a broker is not a database: a rejected produce becomes an outbox row that a relay republishes, while \`epoch\` and \`distance_m\` ride along so consumers can tell which traffic state they are counting. Production platforms register the event schema so a field like \`origin\` cannot be added back silently, set per-topic retention for telemetry, and run PII scanners over the pipeline to catch what review misses.`,
 };

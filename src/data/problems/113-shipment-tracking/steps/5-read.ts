@@ -8,36 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'ops', 'api', 'redis', 'projection'],
   task: `## Task
 
-**Starting point.** The starter is working code: the tracking page fetches a
-shipment and renders a status and an ETA, so the demo looks finished. It serves any shipment to any
-caller, it hands internal flags and the carrier's error payload to customers, and it trusts a stored
-\`status\` field that is written when the label is created. Debug it, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter serves \`GET /v1/shipments/{shipment_id}\`: it loads the shipment by
+id with no tenant, returns the stored \`status\` field (defaulting to \`delivered\` when absent),
+\`estimated_delivery\`, the internal \`reconciliation\` flag and the carrier's \`carrier_error\`
+payload to every caller. It serves the demo and hides four flaws.
 
-Implement \`GET /v1/shipments/{shipment_id}\`, the read the tracking page and the operations console
-both call:
+**Failure mode the checks target.** Any customer can read any shipment id. A shipment whose only
+scan is the label reports delivered. Carrier error payloads and the platform's own disagreements
+with the carrier appear in the customer API, and nothing is exposed to the operations console that
+needs them.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing). A shipment that does not exist **or
-  belongs to another tenant** is **404** — never 403: a customer must not be able to probe which
-  shipment ids exist.
-- The customer view is \`{"shipment_id", "status", "timeline", "estimated_delivery", "delivered"}\`:
-  the derived status, the scans in chronological order at **city granularity**, and the ETA.
-- \`status\` is derived from the **scans** by \`status_from_scans()\`, not read from the stored
-  status field: \`delivered\` requires a **delivered scan**. A shipment whose label was just created
-  is \`label\`, however the stored field was initialized — and if the scans and the stored field
-  disagree, the scans win.
-- Operations, presenting \`X-Ops-Token\` equal to \`OPS_TOKEN\`, get the same view **plus**
-  \`poll_health\`, \`reconciliation\` and \`carrier_error\` — the fields \`operations_view()\` adds.
-  Customers' responses come from \`customer_view()\`, which has no access to them: internal
-  reconciliation flags and carrier error payloads are never customer-visible.
-- Log the read with the shipment id and whether it is the operations view; never the token.
-
-**Failure mode the checks target.** Three silent leaks. Without the tenant check, any customer can
-read any shipment id, and 403-versus-404 differences tell them which ids are real. Deriving
-\`delivered\` from a stored field means a shipment can report delivered before any carrier has
-scanned it. And returning carrier error payloads and reconciliation flags to customers exposes
-internal carrier integrations and the platform's own disagreements with them — the same fields that
-make the console useful make the customer API a liability.`,
+- The tenant comes from \`X-Tenant-Id\` (**401** when missing). \`load_shipment(shipment_id, tenant)\`
+  answers **404** when the shipment is missing or its \`tenant_id\` is another tenant's, the same
+  refusal in both cases so ids cannot be probed.
+- The customer view, built by \`customer_view()\`, is \`{"shipment_id", "status", "timeline",
+  "estimated_delivery", "delivered"}\`: scans in chronological order at city granularity.
+- \`status\` comes from \`status_from_scans()\`: \`DELIVERED\` requires a delivered scan, a fresh label
+  reads \`label\`, and the scans win over the stored field.
+- A caller presenting \`X-Ops-Token\` equal to \`OPS_TOKEN\` gets \`operations_view()\`, which adds
+  \`poll_health\`, \`reconciliation\` and \`carrier_error\`. \`customer_view()\` has no access to them.
+- Log the shipment id and whether it is the operations view, not the token.`,
   sequence: {
     participants: ['Customer', 'Operations console', 'Shipment API', 'Redis'],
     messages: [
@@ -57,9 +47,9 @@ make the console useful make the customer API a liability.`,
     ],
   },
   hints: [
-    'Scope the read at the loader: `load_shipment(shipment_id, tenant)` returns 404 when the shipment is missing **or** its `tenant_id` is someone else’s. Answering 403 for the other tenant’s shipment confirms the id exists, so the refusal must be the same shape as "no such shipment".',
-    'The stored status field is a cache of the scans, and the scans are the truth: `status_from_scans()` walks the shipment’s scans in order and returns the furthest one, so a shipment with no scans is `label` and `delivered` requires an actual delivered scan. A field written at label creation can say anything.',
-    'Build two payloads from one read: `customer_view(shipment)` returns the timeline, the derived status and the ETA, and `operations_view(shipment, view)` adds `poll_health`, `reconciliation` and `carrier_error` for a caller presenting `X-Ops-Token`. Keeping the customer builder free of those fields is what makes the leak impossible rather than unlikely.',
+    'A customer support ticket includes a UPS error payload copied from the tracking page, and a parcel shows delivered an hour after the label printed.',
+    'One payload serves every caller, built from fields the loader happens to return, and the status is a cached field written at label creation rather than a fact derived from scans.',
+    'Load through `load_shipment(shipment_id, tenant)` with 404 on `tenant_id` mismatch, derive status with `status_from_scans()`, and split `customer_view()` from `operations_view()` behind `X-Ops-Token` equal to `OPS_TOKEN`.',
   ],
   checks: [
     {
@@ -150,10 +140,7 @@ store = ShipmentRead()
 
 @app.get("/v1/shipments/{shipment_id}")
 def read_shipment(shipment_id: str) -> JSONResponse:
-    # TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag and
-    # the carrier's error payload to customers, and reports the stored status as delivered when only
-    # a label was created. Scope the read to the tenant with a 404, derive the status from the scans,
-    # and keep poll health, the reconciliation flag and carrier errors in the operations view.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     shipment = store.get(shipment_id) or {}
     return JSONResponse(
         {
@@ -258,7 +245,7 @@ def read_shipment(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/shipments/:shipmentId: flawed code that leaks the internals. */
+      starter: `/** GET /v1/shipments/:shipmentId: read a shipment for the tracking page. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -280,10 +267,7 @@ class ShipmentRead {
 const store = new ShipmentRead();
 
 app.get('/v1/shipments/:shipmentId', async (request, reply) => {
-  // TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag and
-  // the carrier's error payload to customers, and reports the stored status as delivered when only
-  // a label was created. Scope the read to the tenant with a 404, derive the status from the scans,
-  // and keep poll health, the reconciliation flag and carrier errors in the operations view.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {shipmentId} = request.params as {shipmentId: string};
   const shipment = (await store.get(shipmentId)) ?? {};
   return reply.code(200).send({
@@ -430,10 +414,7 @@ func (s *shipmentRead) Get(ctx context.Context, shipmentID string) (*StoredShipm
 var store = &shipmentRead{}
 
 func readShipment(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag and
-	// the carrier's error payload to customers, and reports the stored status as delivered when only
-	// a label was created. Scope the read to the tenant with a 404, derive the status from the scans,
-	// and keep poll health, the reconciliation flag and carrier errors in the operations view.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	shipmentID := r.PathValue("id")
 	shipment, _ := store.Get(r.Context(), shipmentID)
 	if shipment == nil {
@@ -618,11 +599,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "shipments" / Segment) { shipmentId =>
       get {
-        // TODO: this starter serves any shipment to any caller, hands the internal reconciliation
-        // flag and the carrier's error payload to customers, and reports the stored status as
-        // delivered when only a label was created. Scope the read to the tenant with a 404, derive
-        // the status from the scans, and keep poll health, the reconciliation flag and carrier
-        // errors in the operations view.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val shipment = get(shipmentId).getOrElse(StoredShipment(shipmentId, "delivered", "", "", ""))
         complete(
           StatusCodes.OK,
@@ -755,11 +732,7 @@ int main() {
 
   svr.Get(R"(/v1/shipments/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
     const auto shipmentId = req.matches[1].str();
-    // TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag
-    // and the carrier's error payload to customers, and reports the stored status as delivered when
-    // only a label was created. Scope the read to the tenant with a 404, derive the status from the
-    // scans, and keep poll health, the reconciliation flag and carrier errors in the operations
-    // view.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto shipment = store.get(shipmentId);
     const json body = {
         {"shipment_id", shipmentId},
@@ -885,5 +858,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question is what a read owes each of its callers. The customer needs a truthful status and a coarse timeline — which is why the status must be derived from the scans rather than from a field that was initialized optimistically, and why the location is a city. The operations console needs the parts of the truth the customer must not see: whether the carrier feed is stale, whether the timeline disagrees with the carriers, and what the carrier's API said when it failed. Two builders over one load make that boundary explicit; one shared payload makes it a leak waiting for a field to be added. And the 404-versus-403 difference is the same boundary applied to ids: an API that distinguishes "not yours" from "not found" is an enumeration oracle. Real platforms add per-tenant shipment search indexes, signed tracking links for recipients who are not the buyer, and a separate internal service for the operations fields.`,
+  debrief: `The read owes each caller a different slice of the same record, and the fix makes that boundary structural. Two builders over one load mean a field added to the operations view cannot reach a customer by accident, where one shared payload is a leak waiting for the next field. Deriving the status from the scans rather than a field set at label creation is what makes "delivered" mean a carrier scanned it. The 404-for-foreign-tenant rule is the same boundary applied to ids: an API that distinguishes "not yours" from "not found" is an enumeration oracle. Production platforms also issue signed tracking links so a recipient who is not the buyer can read one shipment without a tenant credential, and serve the operations fields from an internal service.`,
 };

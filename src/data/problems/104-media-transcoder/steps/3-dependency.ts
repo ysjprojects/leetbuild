@@ -8,33 +8,24 @@ export const dependencyStep: Step = {
   focus: ['api', 'worker', 'source'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the worker, catches the error and tries
-again until it works. That is exactly what turns one corrupt segment into a job that never
-finishes. Debug it, fix it, and prove the fix with the checks below.
-
-Implement the worker client that encodes one segment at a time:
-
-- The deadline is **scaled to the segment's length**:
-  \`DEADLINE_BASE_MS = 2000\` plus \`DEADLINE_PER_SECOND_MS = 500\` per second of segment, applied
-  per attempt (\`timeout\`, \`deadline: Date.now() + …\`, \`context.WithTimeout\`,
-  \`withDeadlineAfter\`, \`set_deadline\`). A fixed ceiling is wrong in both directions: it cuts a
-  long segment short and gives a tiny segment a worker's whole budget to hang in.
-- Each segment gets at most **two attempts** (\`MAX_ATTEMPTS = 2\`) in a bounded loop. The starter
-  retries every error forever, so one bad segment consumes the job.
-- Failures are **classified**: \`INVALID_ARGUMENT\` is corrupt input at that index and is
-  **terminal** — the job fails with the segment index and no further attempt is made.
-  \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are worker loss and are **retryable**; anything else is
-  terminal. \`is_retryable\`/\`isRetryable\` is the one place that decides.
-- Attempts stay **inside the segment**: a worker that dies is replaced for that segment only, never
-  by re-encoding the whole file. There is no whole-file call in this client.
-- When a segment finally fails, the raised error carries the **segment index** so the job row and
-  the event can name the offending segment.
+**Starting point.** The starter is the worker client: for each segment it calls \`EncodeSegment\`
+with a fixed 30 s timeout inside \`while True\`, logs and retries on any \`RpcError\`, and still
+carries a whole-file \`encode_file\` helper. It serves the demo and hides five flaws.
 
 **Failure mode the checks target.** Retrying every error forever is the corrupt-input runaway: the
-job loops for hours and consumes the whole job's budget re-encoding a segment that can never
-succeed. Re-encoding the entire file when one worker dies re-does an hour of work and, with the
-claim tracker, still cannot fill the missing segment. A fixed 30-second ceiling is the quiet third
-one: it starves long segments and lets short ones hang.`,
+job loops for hours on a segment that can never succeed. Re-encoding the whole file when one worker
+dies redoes an hour of work and, with the claim tracker, still cannot fill the hole. The fixed
+ceiling starves long segments and lets short ones hang, and the bare exception cannot say which
+segment broke.
+
+- The deadline is **scaled to the segment's length**: \`DEADLINE_BASE_MS = 2000\` plus
+  \`DEADLINE_PER_SECOND_MS = 500\` per second, applied per attempt (\`timeout\`, \`deadline\`,
+  \`context.WithTimeout\`, \`withDeadlineAfter\`, \`set_deadline\`).
+- Each segment gets at most **two attempts** (\`MAX_ATTEMPTS = 2\`) in a bounded loop.
+- Failures are **classified** in one place, \`is_retryable\`/\`isRetryable\`: \`UNAVAILABLE\` and
+  \`DEADLINE_EXCEEDED\` are retryable; \`INVALID_ARGUMENT\` and anything else are terminal.
+- Attempts stay **inside the segment**; there is no whole-file call in this client.
+- When a segment finally fails, the raised error carries the **segment index**.`,
   sequence: {
     participants: ['Transcoder API', 'Worker client', 'Transcode worker', 'Source store'],
     messages: [
@@ -143,9 +134,7 @@ logger = logging.getLogger("transcoder")
 
 
 def encode_job(stub, job_id: str, segments, source_uri: str) -> None:
-    # TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
-    # input apart from worker loss, re-encodes the whole file when a worker dies, and raises
-    # without the segment index. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     for segment_index, _segment_seconds in enumerate(segments):
         request = workers_pb2.EncodeRequest(job_id=job_id, segment_index=segment_index, source_uri=source_uri)
         while True:
@@ -231,9 +220,7 @@ export interface WorkerStub {
 }
 
 export async function encodeJob(worker: WorkerStub, jobId: string, segments: number[], sourceUri: string): Promise<void> {
-  // TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
-  // input apart from worker loss, re-encodes the whole file when a worker dies, and raises
-  // without the segment index. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (const [segmentIndex] of segments.entries()) {
     const request = EncodeRequest.create({jobId, segmentIndex, sourceUri});
     while (true) {
@@ -352,9 +339,7 @@ import (
 )
 
 func encodeJob(ctx context.Context, worker WorkerClient, jobID string, segments []float64, sourceURI string) error {
-	// TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
-	// input apart from worker loss, re-encodes the whole file when a worker dies, and returns an
-	// error without the segment index. Fix all four.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	for segmentIndex := range segments {
 		request := &EncodeRequest{JobId: jobID, SegmentIndex: int32(segmentIndex), SourceUri: sourceURI}
 		for {
@@ -457,9 +442,7 @@ import scala.concurrent.duration._
 
 object WorkerClient {
 
-  // TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
-  // input apart from worker loss, re-encodes the whole file when a worker dies, and throws
-  // without the segment index. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def encodeJob(stub: WorkerGrpc.WorkerBlockingStub, jobId: String, segments: Seq[Double], sourceUri: String): Unit = {
     segments.zipWithIndex.foreach { case (_, segmentIndex) =>
       val request = EncodeRequest(jobId = jobId, segmentIndex = segmentIndex, sourceUri = sourceUri)
@@ -549,9 +532,7 @@ object WorkerClient {
 
 void encodeJob(transcode::Worker::Stub& worker, const std::string& job_id, const std::vector<double>& segments,
                const std::string& source_uri) {
-  // TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
-  // input apart from worker loss, re-encodes the whole file when a worker dies, and throws
-  // without the segment index. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (int segment_index = 0; segment_index < static_cast<int>(segments.size()); ++segment_index) {
     transcode::EncodeRequest request;
     request.set_job_id(job_id);
@@ -647,9 +628,9 @@ void encodeJob(transcode::Worker::Stub& worker, const std::string& job_id, const
     },
   },
   hints: [
-    'Write the classification first, because it decides the loop: `is_retryable` is true only for `UNAVAILABLE` and `DEADLINE_EXCEEDED`. `INVALID_ARGUMENT` means the bytes at that index are corrupt — no number of retries will fix them, so the job must fail and name the index.',
-    'Scale the deadline per segment: `deadline = DEADLINE_BASE_MS + DEADLINE_PER_SECOND_MS × segment_seconds`. A fixed ceiling cuts long segments off mid-encode and gives small ones far more budget than they need to hang.',
-    'Bounded attempts are what keep a corrupt segment from consuming the job: `for attempt in range(MAX_ATTEMPTS)` with a terminal raise after the last one. Retries stay inside the segment loop — a worker that dies is replaced for that index, and the rest of the file keeps its finished work.',
+    'One job has been "encoding" for six hours on a 90-minute file; the worker log is the same line thousands of times, and nobody can tell the operator which segment is stuck.',
+    '`while True` around a 30 s call retries `INVALID_ARGUMENT` the same as a dead worker, so corrupt bytes loop forever; the raise at the end carries no index, and `encode_file` restarts the whole source.',
+    'Add `is_retryable` (only `UNAVAILABLE`, `DEADLINE_EXCEEDED`), loop `for attempt in range(MAX_ATTEMPTS)`, set `timeout` from base plus per-second, raise `SegmentFailure(segment_index, reason)`, and delete `encode_file`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an RPC client against the two failure kinds a media pipeline actually sees. The starter is right on the happy path: the call, the retry, the log line. Four defects are being checked: the classification (corrupt input is terminal, worker loss is retryable — retrying corrupt bytes forever is what makes a job loop for hours and burn its budget), bounded attempts (two per segment, not infinity), the deadline scaled to segment length rather than one fixed ceiling, and segment-scoped failure (the error carries the index, and no attempt re-encodes the file). The scope point matters twice over: an encoder is the expensive part of the pipeline, and with the claim tracker from the previous step a whole-file retry cannot even fix the missing segment because the finished ones are skipped. Real clients add jittered backoff between attempts, a per-worker circuit breaker, and a resumable range fetch so attempt two starts from the last good byte offset.`,
+  debrief: `The fix starts with classification because everything else follows from it: once \`is_retryable\` says that only worker loss is worth a second try, a bounded loop of two attempts is enough, and corrupt input exits on the first. The deadline scales with segment length because the encoder's cost does; one ceiling is wrong for both a 2-second tail and a 6-minute chapter. Keeping retries inside the segment matters twice: the encoder is the expensive part of the pipeline, and with the claim tracker a whole-file retry cannot even fill the hole, since finished indices are skipped. The index on the failure lets the job row and the event name the segment. What this step did not do: a production client puts jittered backoff between the two attempts so a rebooting worker pool is not hit twice in one second.`,
 };

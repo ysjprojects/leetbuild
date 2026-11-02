@@ -8,36 +8,27 @@ export const extractionCacheStep: Step = {
   focus: ['catalogd', 'redis', 'llm'],
   task: `## Task
 
-**Starting point.** The starter is working code: it caches extraction results,
-counts a merchant's extractions against a daily budget, and lets a reviewer claim a SKU. In a demo
-with one worker and one reviewer it all works. It hides five production flaws. Debug it like the
-engineer paying the model bill, fix it, and prove the fix with the checks below.
+**Starting point.** The starter implements \`enrich(sku)\` in front of \`extract_attributes\`: it
+looks up \`extract:{sku_id}\` in Redis, calls the model on a miss, writes the result back without a
+TTL, then reads and increments \`budget:{merchant}:{day}\` from the client; \`claim_review\` takes
+the lease with a plain \`SET\` and \`release_review\` deletes it. With one worker and one reviewer
+it all works. It hides 5 flaws.
 
-Implement the Redis layer in front of \`extract_attributes\` from the previous step:
+**Failure mode the checks target.** A cache keyed by id pays for every duplicate product and serves
+stale attributes after a title change; a key without a TTL grows until Redis evicts something you
+wanted; a read-then-increment budget passes every serial test and overspends under load; counting
+after the call pays for refused work; a non-exclusive, unexpiring lease is a lock in name only.
 
-- **Cache key** \`extract:{taxonomy_version}:{content_hash}\` — the hash from the intake job, and
-  the taxonomy version the result is valid under. Two merchants selling the same product share the
-  entry; a taxonomy release invalidates every entry at once; an updated title never hits a stale
-  one. The starter keys by SKU id, so the second merchant pays again and a changed title is served
-  the old attributes.
+- **Cache key** \`extract:{taxonomy_version}:{content_hash}\`: merchants selling the same product
+  share the entry and a taxonomy release invalidates every entry at once.
 - **Cache TTL** of **7 days** (\`CACHE_TTL_S = 604800\`), set with the write.
-- **Daily budget**: at most **50 000** extractions per merchant per UTC day
-  (\`DAILY_BUDGET = 50_000\`), keyed \`budget:{merchant}:{day}\`, reserved by **one atomic Lua
-  \`EVAL\`** that reads, checks, increments and sets the key's expiry on first write
-  (\`BUDGET_TTL_S = 172800\`). A client-side read followed by an increment lets concurrent workers
-  overspend.
-- **Reserve before the model call** — a cache miss reserves budget, then extracts, then caches. The
-  starter calls the model and counts afterwards, so an over-budget merchant is still billed.
+- **Daily budget**: at most **50 000** extractions per merchant per UTC day (\`DAILY_BUDGET\`),
+  keyed \`budget:{merchant}:{day}\`, reserved by **one atomic Lua \`EVAL\`** that reads, checks,
+  increments and sets expiry on first write (\`BUDGET_TTL_S = 172800\`).
+- **Reserve before the model call**, on a cache miss only.
 - **Review leases**: \`claim_review(sku_id, reviewer)\` takes \`review:lease:{sku_id}\` with
-  \`SET NX EX 900\` (\`LEASE_TTL_S = 900\`) and reports whether the claim won;
-  \`release_review\` deletes the lease only when this reviewer still holds it. The starter's plain
-  \`SET\` lets two reviewers edit the same SKU and never expires.
-
-**Failure mode the checks target.** A cache keyed by id costs money on every duplicate product and
-serves stale attributes after a title change; a key without a TTL grows until Redis evicts something
-you wanted; a read-then-increment budget passes every serial test and overspends exactly under
-load; counting after the call pays for refused work; and an unexpiring, non-exclusive lease is a
-lock in name only.`,
+  \`SET NX EX 900\` (\`LEASE_TTL_S = 900\`); \`release_review\` deletes it only when this reviewer
+  still holds it.`,
   sequence: {
     participants: ['catalogd', 'Redis', 'Extractor'],
     messages: [
@@ -52,9 +43,9 @@ lock in name only.`,
     ],
   },
   hints: [
-    'The cache key has two parts and neither is the SKU id: `taxonomy.version()` and `sku["content_hash"]` from the intake job. Write it with `ex=CACHE_TTL_S` (or `EX`, a `time.Duration`, `setex`, `std::chrono::seconds`), and look it up before anything that costs money.',
-    'Move the budget into Redis: a Lua script that does `GET`, compares with the limit, `INCRBY`s and calls `EXPIRE` when the key is new, returning `{ok, remaining}`. Call it from `reserve_budget` and call `reserve_budget` before `extract_attributes` — on a cache miss only.',
-    'A lease is `SET key reviewer NX EX 900`: `NX` makes it exclusive, `EX` makes it expire when the reviewer walks away. Releasing it is a compare-and-delete script (`GET == ARGV[1]` then `DEL`), so a reviewer whose lease expired cannot delete the next reviewer’s.',
+    'Two merchants with the same product pay twice, a changed title comes back with the old attributes, a merchant blows past its budget on a busy night, and two reviewers edit one SKU at once.',
+    'The cache key is the SKU id with no expiry; the budget is read then incremented from the client after the model call; the lease is a plain `SET` with no `NX` and no `EX`.',
+    'Key by `taxonomy.version()` and `content_hash` with `ex=CACHE_TTL_S`; move the budget into a Lua `EVAL` called from `reserve_budget` before `extract_attributes`; claim with `nx=True, ex=LEASE_TTL_S` and release via `RELEASE_LUA`.',
   ],
   checks: [
     {
@@ -192,8 +183,7 @@ class BudgetExhausted(Exception):
 
 
 def enrich(sku: dict) -> dict:
-    # TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
-    # model call, and takes a review lease with a plain SET. Fix all five.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"extract:{sku['sku_id']}"
     cached = r.get(key)
     if cached is not None:
@@ -300,7 +290,7 @@ def release_review(sku_id: str, reviewer: str) -> bool:
 `,
     },
     typescript: {
-      starter: `/** Extraction cache and budget: flawed code that keys by id and counts after the call. */
+      starter: `/** Extraction cache, budget and review leases in Redis. */
 import {Redis} from 'ioredis';
 
 import {extractAttributes, type ExtractionResult, type SkuJob} from './extract_attributes';
@@ -312,8 +302,7 @@ const DAILY_BUDGET = 50_000;
 export class BudgetExhausted extends Error {}
 
 export async function enrich(sku: SkuJob): Promise<ExtractionResult> {
-  // TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
-  // model call, and takes a review lease with a plain SET. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = \`extract:\${sku.sku_id}\`;
   const cached = await r.get(key);
   if (cached !== null) return JSON.parse(cached) as ExtractionResult;
@@ -425,8 +414,7 @@ var rdb *redis.Client
 
 var ErrBudgetExhausted = errors.New("merchant has no extractions left today")
 
-// TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
-// model call, and takes a review lease with a plain SET. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func enrich(ctx context.Context, sku SkuJob) (Result, error) {
 	key := "extract:" + sku.SkuID
 	if cached, err := rdb.Get(ctx, key).Result(); err == nil {
@@ -587,8 +575,7 @@ object ExtractionCache {
 
   final class BudgetExhausted(merchant: String) extends RuntimeException(s"$merchant has no extractions left today")
 
-  // TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
-  // model call, and takes a review lease with a plain SET. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def enrich(sku: SkuJob): JsObject = {
     val key = s"extract:\${sku.sku_id}"
     Option(jedis.get(key)) match {
@@ -723,8 +710,7 @@ std::string today() {
   return buf;
 }
 
-// TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
-// model call, and takes a review lease with a plain SET. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 json enrich(const json& sku) {
   const auto skuId = sku["sku_id"].get<std::string>();
   const auto merchant = sku["merchant"].get<std::string>();
@@ -850,5 +836,5 @@ bool releaseReview(const std::string& skuId, const std::string& reviewer) {
 `,
     },
   },
-  debrief: `The interview question behind this step is "what does the model call cost, and who pays when the code is wrong?" The cache key is the content-specific answer: keyed by content hash the cache dedupes the same product across merchants and never serves a stale title; keyed by taxonomy version it empties itself the moment the brand list changes, which the source post says happens continuously as new brands are ingested. The TTL bounds the memory the cache can take. The budget is the atomicity answer: one Lua script makes read, check, increment and expiry a single step, so concurrent workers cannot both see room for one more, and reserving before the call means a refused merchant is never billed. The lease is the human-review answer: \`NX\` makes a claim exclusive, \`EX\` makes an abandoned claim expire, and compare-and-delete stops a reviewer whose lease lapsed from releasing someone else's. Real systems add a negative cache for SKUs the model could not parse, per-merchant budgets configured rather than constant, and a budget refund when the call fails before the model ran.`,
+  debrief: `The question behind this step is what the model call costs and who pays when the code is wrong. Keyed by content hash, the cache dedupes the same product across merchants and cannot serve a stale title; keyed by taxonomy version, it empties itself when the brand list changes; the TTL bounds its memory. One Lua script makes read, check, increment and expiry a single step, so concurrent workers cannot both see room for one more, and reserving before the call means a refused merchant is not billed. For the lease, \`NX\` makes a claim exclusive, \`EX\` expires an abandoned one, and compare-and-delete keeps a lapsed reviewer from releasing someone else's. This step does not cache failed parses, configure budgets per merchant, or refund a reservation when the call fails early.`,
 };

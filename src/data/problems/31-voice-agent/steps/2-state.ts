@@ -8,29 +8,26 @@ export const sessionStateStep: Step = {
   focus: ['gateway', 'redis', 'tts'],
   task: `## Task
 
-**Starting point.** The starter is working code: on the happy path it records
-the speaker and the playback offset and the call sounds right. It hides a race and a TTL bug. Find
-them, fix them, and prove the fix.
-
-Implement the Redis turn state for one session, key \`voice:state:{session_id}\`.
-
-- The hash holds \`current_speaker\` (\`agent\` or \`user\`), \`turn_index\`, and \`tts_offset\` — the token
-  the speech stream has already delivered.
-- The key expires **30 seconds** after the last audio frame and **every audio frame refreshes it**
-  (the \`EXPIRE\` happens in the same write that updates the state). A pause longer than the TTL must
-  end a dead session, but a long answer must never expire mid-playback.
-- **Barge-in is one atomic transition**: a single Lua script run with \`EVAL\` that flips
-  \`current_speaker\` to \`user\`, advances \`turn_index\`, and leaves \`tts_offset\` at the token already
-  delivered, so the agent's stream is truncated exactly there. Two separate commands leave a window
-  where the barge-in lands between them and the agent keeps talking over the user.
-- \`barge_in(session_id, delivered_tokens)\` returns the \`truncated_offset\` the gateway must stop the
-  stream at.
-- Read the whole state in one round trip (\`HMGET\`): never act on a half-updated view.
+**Starting point.** The starter keeps one session's turn state under \`voice:state:{session_id}\`:
+\`save_turn\` writes the speaker and the playback offset, and the call sounds right on the happy
+path. It compiles and hides five flaws.
 
 **Failure mode the checks target.** Writing the speaker change and the offset as two commands makes
 barge-in non-atomic: an audio frame can land between them and the agent speaks over the user. A
 state with no TTL leaks sessions forever, and a state whose TTL is set once dies mid-playback during
-a long answer, so both halves of the TTL contract matter.`,
+a long answer, so both halves of the TTL contract matter.
+
+- The hash holds \`current_speaker\` (\`agent\` or \`user\`), \`turn_index\`, and \`tts_offset\`, the token
+  the speech stream has already delivered.
+- The key expires **30 seconds** after the last audio frame and **every audio frame refreshes it**
+  (the \`EXPIRE\` happens in the same write that updates the state). A pause longer than the TTL
+  ends a dead session; a long answer keeps its own alive.
+- **Barge-in is one atomic transition**: a single Lua script run with \`EVAL\` that flips
+  \`current_speaker\` to \`user\`, advances \`turn_index\`, and leaves \`tts_offset\` at the token already
+  delivered, so the agent's stream is truncated exactly there.
+- \`barge_in(session_id, delivered_tokens)\` returns the \`truncated_offset\` the gateway must stop the
+  stream at.
+- Read the whole state in one round trip (\`HMGET\`), not a half-updated view.`,
   sequence: {
     participants: ['Voice Gateway', 'Redis', 'TTS'],
     messages: [
@@ -48,16 +45,16 @@ a long answer, so both halves of the TTL contract matter.`,
     ],
   },
   hints: [
-    'one Lua script does the whole transition server-side: set `current_speaker`, bump `turn_index`, keep `tts_offset`; `EVAL` is one round trip and cannot interleave.',
-    'the TTL belongs in the same script that writes the state, checked with `TTL` and set with `EXPIRE` when the key was just created — that is what makes an idle session end and a long answer survive.',
-    'the truncated offset is the return value of the script, not a second read: the caller must learn where to stop the stream from the same atomic transition that changed the speaker.',
+    'A caller says "stop" and the agent keeps finishing its sentence for another second; the next morning Redis is full of hashes for calls that ended days ago.',
+    'Two separate `HSET`s leave a gap an audio frame can land in, and the second write re-asserts the old speaker; the key never gets an `EXPIRE`, and field-at-a-time `HGET`s read a torn state.',
+    'Move the transition into one Lua script run with `EVAL` that sets `current_speaker`, bumps `turn_index`, keeps `tts_offset` and `EXPIRE`s for `STATE_TTL_S`, returning the offset; read with `HMGET`.',
   ],
   checks: [
     {
       id: 'atomic-barge-in',
       title: 'Barge-in is one atomic transition',
       detail:
-        'The speaker change, the turn index and the truncation of `tts_offset` happen inside one Lua script executed with `EVAL`. The starter issues two separate writes, so a frame can land between them and the agent speaks over the user.',
+        'The speaker change, the turn index and the truncation of `tts_offset` happen inside one Lua script executed with `EVAL`, not as separate writes.',
       match: {
         python: {all: [/BARGE_IN_LUA/, /\.eval\(/]},
         typescript: {all: [/BARGE_IN_LUA/, /\.eval\(/]},
@@ -69,8 +66,7 @@ a long answer, so both halves of the TTL contract matter.`,
     {
       id: 'ttl-refresh',
       title: 'Turn state expires after 30 idle seconds and is refreshed',
-      detail:
-        'The state key gets a 30-second TTL and every frame refreshes it: `EXPIRE` runs inside the write. The starter never expires the key, so a dead session keeps a Redis hash forever.',
+      detail: 'The state key gets a 30-second TTL and every frame refreshes it: `EXPIRE` runs inside the write.',
       match: {
         python: {all: [/STATE_TTL_S/, /EXPIRE/]},
         typescript: {all: [/STATE_TTL_S/, /EXPIRE/]},
@@ -83,7 +79,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'fields',
       title: 'Keeps speaker, turn index and TTS offset together',
       detail:
-        'The hash carries `current_speaker`, `turn_index` and `tts_offset`, so a reader can tell who is speaking and where playback stopped. The starter stores only the speaker and an offset, so the turn index is re-derived and the two fields drift apart.',
+        'The hash carries `current_speaker`, `turn_index` and `tts_offset`, so a reader can tell who is speaking and where playback stopped.',
       match: {
         python: {all: [/current_speaker/, /turn_index/, /tts_offset/]},
         typescript: {all: [/current_speaker/, /turn_index/, /tts_offset/]},
@@ -96,7 +92,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'truncate',
       title: 'Truncates the TTS stream at the delivered token',
       detail:
-        '`barge_in(session_id, delivered_tokens)` returns the `truncated_offset` (python `truncated_offset`, other languages `truncatedOffset`) that the gateway stops the stream at. The starter keeps playing the sentence the user just interrupted.',
+        '`barge_in(session_id, delivered_tokens)` returns the `truncated_offset` (python `truncated_offset`, other languages `truncatedOffset`) that the gateway stops the stream at.',
       match: {
         python: {all: [/barge_in\(/, /truncated_offset/]},
         typescript: {all: [/bargeIn\(/, /truncatedOffset/]},
@@ -109,7 +105,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'read-atomic',
       title: 'Reads the whole turn state in one round trip',
       detail:
-        'Speaker, turn index and offset are read with one `HMGET`, so the gateway never renders a state that is half updated. The starter reads the fields one at a time with `HGET`.',
+        'Speaker, turn index and offset are read with one `HMGET`, so the gateway never renders a state that is half updated.',
       match: {
         python: {all: [/[Hh][Mm][Gg][Ee][Tt]\(/]},
         typescript: {all: [/[Hh][Mm][Gg][Ee][Tt]\(/]},
@@ -141,9 +137,7 @@ class Interrupt(BaseModel):
 
 
 def save_turn(session_id: str, speaker: str, offset: int) -> None:
-    # TODO: the speaker and the offset go out as two separate HSETs, so an audio frame can land
-    # between them and the agent keeps talking over the user; nothing expires the key either, so a
-    # dead session keeps its hash in Redis forever.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"voice:state:{session_id}"
     r.hset(key, "speaker", speaker)
     r.hset(key, "offset", offset)
@@ -280,9 +274,7 @@ export function stateKey(sessionId: string): string {
 }
 
 export async function saveTurn(sessionId: string, speaker: string, offset: number): Promise<void> {
-  // TODO: the speaker and the offset go out as two separate HSETs, so an audio frame can land
-  // between them and the agent keeps talking over the user; nothing expires the key either, so a
-  // dead session keeps its hash in Redis forever.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await redis.hset(stateKey(sessionId), 'speaker', speaker);
   await redis.hset(stateKey(sessionId), 'offset', String(offset));
 }
@@ -448,9 +440,7 @@ func stateKey(sessionID string) string {
 }
 
 func saveTurn(ctx context.Context, sessionID, speaker string, offset int64) error {
-	// TODO: the speaker and the offset go out as two separate HSETs, so an audio frame can land
-	// between them and the agent keeps talking over the user; nothing expires the key either, so
-	// a dead session keeps its hash in Redis forever.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	if err := rdb.HSet(ctx, stateKey(sessionID), "speaker", speaker).Err(); err != nil {
 		return err
 	}
@@ -673,9 +663,7 @@ object SessionState {
   def stateKey(sessionId: String): String = s"voice:state:$sessionId"
 
   def saveTurn(sessionId: String, speaker: String, offset: Long): Unit = {
-    // TODO: the speaker and the offset go out as two separate HSETs, so an audio frame can land
-    // between them and the agent keeps talking over the user; nothing expires the key either, so
-    // a dead session keeps its hash in Redis forever.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     jedis.hset(stateKey(sessionId), "speaker", speaker)
     jedis.hset(stateKey(sessionId), "offset", offset.toString)
   }
@@ -855,9 +843,7 @@ std::string state_key(const std::string& session_id) {
   return "voice:state:" + session_id;
 }
 
-// TODO: the speaker and the offset go out as two separate HSETs, so an audio frame can land
-// between them and the agent keeps talking over the user; nothing expires the key either, so a
-// dead session keeps its hash in Redis forever.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void save_turn(const std::string& session_id, const std::string& speaker, long long offset) {
   redis.hset(state_key(session_id), "speaker", speaker);
   redis.hset(state_key(session_id), "offset", std::to_string(offset));
@@ -1001,5 +987,5 @@ int main() {
 `,
     },
   },
-  debrief: `Barge-in is a state machine, not two writes, because the interruption and the truncation are the same fact: the speaker may never change without the offset moving with it, and an audio frame must never land between the two — that is why the whole transition lives in one Lua script and the caller learns where to stop the stream from that script's return value rather than a second read. The TTL is refreshed by every audio frame because the key's existence is the session's liveness: a caller who stops sending audio lets the state die within 30 seconds, while a caller in the middle of a two-minute answer keeps renewing the lease and is never cut off mid-playback. Both halves matter — a state with no TTL leaks sessions forever, and a state whose TTL is set once expires under a long answer. A real voice platform adds per-session sharding so one hot call cannot share a Redis slot with everyone else's, a monotonic sequence number so a replayed or reordered frame is rejected instead of rewinding the state, and a small replay buffer for the frames a reconnecting client missed while the gateway held its state.`,
+  debrief: `Barge-in is a state machine, not two writes, because the interruption and the truncation are the same fact: the speaker cannot change without the offset moving with it. That is why the whole transition lives in one Lua script and the caller learns where to stop the stream from the script's return value rather than a second read. The TTL is refreshed by every audio frame because the key's existence is the session's liveness: a caller who goes silent lets the state die within 30 seconds, while a caller in the middle of a two-minute answer keeps renewing the lease. Production voice platforms also put a monotonic sequence number on frames so a replayed or reordered frame cannot rewind the state, and keep a small replay buffer for the frames a reconnecting client missed.`,
 };

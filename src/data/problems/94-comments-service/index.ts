@@ -10,14 +10,14 @@ import {readStep} from './steps/5-read';
  * Comments service: the course is not "write a CRUD endpoint", it is the debugging you owe a
  * comment service before real threads scroll through it. Validated, idempotent replies → Redis
  * counters committed atomically with the write → a moderation and notification fan-out with a
- * deadline, one token per attempt and no cross-cancellation → comment events keyed by thread,
- * published after the commit, never carrying bodies → a keyset-paginated read that yields every
- * comment exactly once while the thread keeps moving.
+ * deadline and one token per comment → comment events keyed by thread, published after the commit,
+ * without bodies → a keyset-paginated read that yields every comment exactly once while the thread
+ * keeps moving.
  */
 export const commentsServiceProblem: Problem = {
   id: 'comments-service',
   title: 'Comments Service',
-  tagline: 'Threaded comments with stable pagination and moderation that never duplicates.',
+  tagline: 'Threaded comments with idempotent replies, atomic counters and cursor pagination.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -32,18 +32,19 @@ pagination has to keep its promise while other people keep writing.
 
 ## The real system
 
-Production comment services accept writes from a validated endpoint, and every write carries an
-idempotency key because clients, queues and proxies all retry. The reply tree is enforced, not
-assumed: a parent from another thread is a client bug that the service refuses, not a comment it
-grafts. Bodies are stored escaped and rendered from a safe subset, because between the write and the
-read there is always another client. Per-thread counters live where the read path can afford to look
-— a cache — but they are updated in the same atomic step as the comment, otherwise a crash between
-the two leaves the UI showing fewer comments than exist. Moderation and notification leave the
-process over gRPC under a deadline, each attempt carrying the comment id as its idempotency token, so
-a retry pings an author once and a moderation timeout becomes an asynchronous review flag rather than
-a failed post. Read models are fed by events keyed by thread, so one thread's stream stays ordered,
-and published only after the comment is durable. The read path paginates by cursor, never by offset,
-because "skip the first 20" means something different after 20 more people comment.
+Disqus, which hosts comment threads for millions of sites, paginates its public API with cursors:
+\`posts/list\` returns a \`cursor\` object with an opaque \`next\` token and a \`hasNext\` flag, and
+most endpoints give no \`total\` at all, because a count is a different question from a position.
+That is the read side of this course. The rest is what any comment service has to settle: writes
+carry an idempotency key because clients, queues and proxies all retry; the reply tree is enforced,
+so a parent from another thread is a client bug the service refuses; bodies are stored escaped and
+rendered from a safe subset, because between the write and the read there is always another client.
+Per-thread counters live in a cache where the read path can afford to look, but they are updated in
+the same atomic step as the comment, otherwise a crash between the two leaves the UI showing fewer
+comments than exist. Moderation and notification leave the process over gRPC under a deadline, each
+attempt carrying the comment id as its idempotency token, so a retry pings an author once and a
+moderation timeout becomes an asynchronous review flag rather than a failed post. Read models are
+fed by events keyed by thread, published only after the comment is durable.
 
 ## What you build here
 
@@ -57,9 +58,9 @@ One service, **commentsd**, with five pieces:
    and a recount from the durable store that has to match the counter.
 3. The **gRPC** fan-out: moderation and author notification under a 500 ms deadline, each carrying
    the comment id as its idempotency token, a moderation timeout flagged for asynchronous review
-   instead of blocking the API, and a notification failure that can never cancel moderation.
+   instead of blocking the API, and a notification failure that cannot cancel moderation.
 4. The **Kafka** event path: \`comment.event\` keyed by thread id, published after the commit,
-   carrying comment id, parent id and edit revision, and never the body.
+   carrying comment id, parent id and edit revision, and no body.
 5. \`GET /v1/threads/{id}/comments\`: cursor pagination on \`(created_at, id)\`, top-level comments
    with their reply counts, tombstones for deleted comments, and a page that is stable while new
    comments arrive.

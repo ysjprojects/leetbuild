@@ -8,31 +8,24 @@ export const redactionStateStep: Step = {
   focus: ['redactor', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it caches patterns, it counts
-characters, and the demo tenant never hits a limit and never shares a pattern id with anyone else.
-It hides two multi-tenant bugs and one ordering bug. Debug it, fix it, and prove the fix.
+**Starting point.** The starter resolves each tenant's custom patterns through a Redis cache
+keyed by pattern id, calls the detector, then \`INCRBY\`s a per-tenant character counter. It serves
+the demo, because the demo tenant is alone and under any limit, and hides 5 flaws.
 
-Custom patterns are per-tenant rules — a regex body plus an id — and detection costs money, so the
-redactor keeps both a pattern cache and a per-tenant budget in Redis.
+**Failure mode the checks target.** A cache key without the tenant makes one tenant's custom rule
+authoritative for everyone who uses the same pattern id, and because it is a detection rule the
+failure is silent: spans stop appearing. The budget is a read-then-write race made worse by
+charging after the expensive call.
 
 - **Pattern cache.** The key is \`patterns:{tenant}:{pattern_id}:{version}\`, where \`version\` is a
-  stable hash of the regex body. A miss compiles and stores the body with a **3600-second** TTL; a hit
-  returns the cached body. Keying by pattern id alone means one tenant's rule silently replaces
-  another tenant's, and a changed body must land under a new version instead of shadowing the old one.
-- **Budget.** Each tenant may redact **2 000 000 characters per hour**. The key is
-  \`budget:{tenant}:{window}\` with \`window = floor(unix_seconds / 3600)\` — a tenant-less key shares
-  one budget across every tenant, a window-less key never resets.
-- **Reserve atomically and before the detector.** One **Lua \`EVAL\`** must read the used count, reject
-  when the request does not fit, increment on success and set \`EXPIRE\` on first write. The starter does
-  a client-side check, calls the detector, and only then \`INCRBY\`s — so an over-budget request has
-  already been paid for and two concurrent requests can both pass.
+  stable hash of the regex body. A miss stores the body with a **3600-second** TTL; a hit returns
+  it. A changed body lands under a new version instead of shadowing the old one.
+- **Budget.** Each tenant may redact **2 000 000 characters per hour** under
+  \`budget:{tenant}:{window}\` with \`window = floor(unix_seconds / 3600)\`.
+- **Reserve atomically and before the detector.** One **Lua \`EVAL\`** reads the used count, rejects
+  when the request does not fit, increments on success and sets \`EXPIRE\` on first write.
 - An exhausted tenant is **429** with \`Retry-After\` (the key's TTL in seconds) and
-  \`X-RateLimit-Remaining\`, and the detector is never called.
-
-**Failure mode the checks target.** Tenancy is the quiet one: a cache key without the tenant makes
-one tenant's custom rule authoritative for everyone who uses the same pattern id, which is a silent
-correctness *and* data-boundary bug. The budget bug is the classic read-then-write race, made worse
-by charging after the expensive call.`,
+  \`X-RateLimit-Remaining\` built from the script result, and the detector is not called.`,
   sequence: {
     participants: ['Redactor', 'Redis', 'Detector'],
     messages: [
@@ -133,9 +126,7 @@ def pattern_version(regex: str) -> int:
 
 
 def cached_patterns(tenant: str, patterns: dict[str, str]) -> list[tuple[str, str]]:
-    # TODO: the cache key forgets the tenant and the version, so tenants overwrite each other's
-    # custom rules; the budget is a plain INCRBY after the detector ran, so over-budget work is
-    # already paid for. Scope the key and reserve before the detector.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     resolved = []
     for pattern_id, regex in patterns.items():
         key = f"pattern:{pattern_id}"
@@ -246,9 +237,7 @@ function patternVersion(regex: string): number {
 }
 
 function cachedPatterns(tenant: string, patterns: Record<string, string>): Array<[string, string]> {
-  // TODO: the cache key forgets the tenant and the version, so tenants overwrite each other's
-  // custom rules; the budget is a plain incrby after the detector ran, so over-budget work is
-  // already paid for. Scope the key and reserve before the detector.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const resolved: Array<[string, string]> = [];
   for (const [patternId, regex] of Object.entries(patterns)) {
     void conn.get(\`pattern:\${patternId}\`).then(async cached => {
@@ -355,9 +344,7 @@ func patternVersion(regex string) int {
 }
 
 func cachedPatterns(ctx context.Context, tenant string, patterns map[string]string) []ResolvedPattern {
-	// TODO: the cache key forgets the tenant and the version, so tenants overwrite each other's
-	// custom rules; the budget is a plain IncrBy after the detector ran, so over-budget work is
-	// already paid for. Scope the key and reserve before the detector.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	resolved := make([]ResolvedPattern, 0, len(patterns))
 	for id, regex := range patterns {
 		key := fmt.Sprintf("pattern:%s", id)
@@ -524,9 +511,7 @@ object RedactionState {
   def patternVersion(regex: String): Int =
     java.security.MessageDigest.getInstance("SHA-256").digest(regex.getBytes(StandardCharsets.UTF_8)).take(4).foldLeft(0)((acc, b) => (acc << 8) | (b & 0xff))
 
-  // TODO: the cache key forgets the tenant and the version, so tenants overwrite each other's
-  // custom rules; the budget is a plain incrBy after the detector ran, so over-budget work is
-  // already paid for. Scope the key and reserve before the detector.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def cachedPatterns(tenant: String, patterns: Map[String, String]): List[ResolvedPattern] =
     patterns.map { case (id, regex) =>
       val key = s"pattern:$id"
@@ -641,9 +626,7 @@ struct ResolvedPattern {
   std::string regex;
 };
 
-// TODO: the cache key forgets the tenant and the version, so tenants overwrite each other's
-// custom rules; the budget is a plain incr on "budget:" + tenant after the detector ran, so
-// over-budget work is already paid for. Scope the key and reserve before the detector.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::vector<ResolvedPattern> cached_patterns(const std::string& tenant, const std::unordered_map<std::string, std::string>& patterns) {
   std::vector<ResolvedPattern> resolved;
   for (const auto& [id, regex] : patterns) {
@@ -769,9 +752,9 @@ void budget_exceeded(httplib::Response& res, long long retry_after) {
     },
   },
   hints: [
-    'Tenancy belongs in every key. `patterns:{tenant}:{pattern_id}:{version}` is not just tidier than `pattern:{pattern_id}` — with the short key, the second tenant to register `http-url` silently rewrites the first tenant’s rule for everyone sharing that id.',
-    'The version is a hash of the regex body, so editing a rule lands under a new key and the old body can still serve in-flight requests until its TTL ends. Cache-aside both ways: `GET`, and on `nil` `SET … EX 3600`.',
-    'The reservation is one script: `HGET` the used count, compare against the cap, `HINCRBY` on success, `EXPIRE` when the window key was just created. Run it *before* the detector — the cost you are metering is the detector call you are about to make.',
+    "After a second tenant registers a rule with the id `http-url`, the first tenant's documents stop producing spans for it, and one busy tenant can run the detector all day without ever seeing a 429.",
+    'The cache key is `pattern:{pattern_id}` with no tenant or version, so the last writer wins; the counter is `budget:{tenant}` with no window, no cap and no refusal path, incremented after the detector ran.',
+    'Key patterns as `patterns:{tenant}:{pattern_id}:{version}` with `SET … EX 3600`; before `detect`, run one `EVAL` that `HGET`s, compares to the cap, `HINCRBY`s and `EXPIRE`s `budget:{tenant}:{window}`, answering 429 on rejection.',
   ],
-  debrief: `The interviewer is testing two production reflexes at once: tenant isolation in every key, and metering before spending. The starter looks reasonable because a single tenant with unique pattern ids works perfectly. The first bug is the classic shared-cache leak: a key without the tenant lets one tenant's rule become authoritative for another, and because the rule is a *detection* rule, the failure is silent — spans simply stop appearing. The second bug is a read-then-write race compounded by ordering: the check is client-side, so concurrent requests both see room, and the charge happens after the detector, so refused work is already paid for. Real systems add a version to the key so a rule edit is a new cache entry, a window bucket so budgets reset, and a 429 that tells the client *when* to come back via the key's TTL.`,
+  debrief: `The fix has its shape because every flaw here is about where a decision is made. Tenant and version in the key move the isolation decision into Redis addressing, so a rule edit is a new entry and another tenant's rule cannot be found at all. The Lua script moves the budget decision into one Redis round trip, so two concurrent requests cannot both observe room, and running it before the detector means a refusal costs nothing. The 429 carries the key's TTL as \`Retry-After\` so the client knows when the window turns over. Production meters also reconcile the reservation after the call (refund on detector failure), keep a per-tenant cap in configuration instead of a constant, and alert on budget keys that grow without a matching expiry.`,
 };

@@ -17,7 +17,8 @@ import {readStep} from './steps/5-read';
 export const modelAuditProblem: Problem = {
   id: 'model-audit',
   title: 'Model Audit Trail',
-  tagline: 'An append-only record of every decision, verifiable later without keeping the inputs.',
+  tagline:
+    'An append-only record of each model decision: digests, a per-tenant hash chain, and a verify endpoint that recomputes it.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -32,26 +33,22 @@ when the signer was down, and whether the verify endpoint actually recomputes an
 
 ## The real system
 
-Production audit trails are append-only by construction: there is no update route and no delete
-route, because a record you can edit is not evidence. They store a digest of the inputs and of the
-decision rather than the inputs themselves, so replay is impossible and the trail is not a second
-copy of tenant content. Each tenant's records form a hash chain whose head advances with the append
-in a single atomic step, so a crash cannot leave an entry the verifier cannot place, and positions
-are dense and unique because they come from the head rather than from a count of rows. Every append
-secures a signed receipt under a short deadline; when the signer cannot answer, the record is marked
-unsigned and queued for signing instead of being silently committed as if it were verified. Chain
-advances publish a content-free event keyed by tenant, carrying ids and digests only, and a rejected
-produce leaves an outbox row so a mirror can always resync from the ledger. And the verify endpoint
-walks the chain from a record to the head it names, recomputing every hash, reporting the first
-divergence at its exact position, scoped to the tenant that owns the chain.
+immudb is an open source database built for exactly this shape: every transaction lands in
+append-only logs with a monotonically increasing transaction id, a Merkle tree is maintained over
+them, and the client SDKs offer verified reads that check a cryptographic inclusion proof against a
+state the client keeps locally, so a tampered or truncated history is detected on the client side
+rather than trusted from the server. The same ideas drive this course at a smaller scale: a digest
+instead of the content, a per-tenant hash chain whose head advances in one atomic step, a signed
+receipt or an explicit unsigned state, a content-free event with an outbox, and a verifier that
+recomputes every hash and reports the first position that disagrees.
 
 ## What you build here
 
 One service, **auditd**, with five pieces:
 
 1. \`POST /v1/audit/decisions\`: authenticated tenant, a model version, a policy id, an input digest
-   and a decision digest, server-set monotonic timestamps, and **no** update or delete route — an
-   update attempt is answered **405** by design.
+   and a decision digest, server-set monotonic timestamps, and no update or delete route; an update
+   attempt is answered **405** by design.
 2. A **Redis** hash chain per tenant: one Lua \`EVAL\` appends the entry and advances the head
    together, positions are dense and unique, the head key has no TTL, and verification reports the
    first position whose recomputed hash disagrees.
@@ -68,8 +65,8 @@ One service, **auditd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 

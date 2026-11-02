@@ -12,34 +12,29 @@ export const readStep: Step = {
   focus: ['exchange', 'bidding', 'redis', 'consumer'],
   task: `## Task
 
-**Starting point.** You are the bidding platform engineer on call. The dashboard says a bidder has a 94% win
-rate and is "healthy", yet the bidder won almost nothing last week: the rate is computed against the
-auctions it won and lost, and the bids that timed out were never counted at all. On top of that, any
-advertiser can read any other advertiser's numbers by editing the id in the URL.
+**Starting point.** The starter registers \`GET /v1/bidders/{id}/stats?window=day\`, loads the
+bidder's counters for the window, and returns a win rate computed as wins over wins plus losses
+together with the bid count. It compiles, it serves the demo, and it hides four flaws.
 
-Debug \`read\` and make the stats tell the truth.
-
-Implement \`GET /v1/bidders/{id}/stats?window=day\`.
+**Failure mode the checks target.** The dashboard says a bidder has a 94% win rate and is "healthy",
+yet the bidder won almost nothing last week. The starter omits timeouts and degradation entirely, so
+bids that missed the deadline and bids that were only conservative are invisible. Its win rate
+divides by wins plus losses, which flatters exactly that bidder: the more auctions it timed out on,
+the better its reported rate. It also treats the path parameter as an identifier rather than an
+authorization decision, so any advertiser can read any other advertiser's numbers by editing the URL.
 
 - The caller comes from the authenticated \`X-Bidder-Id\` header (**401** when missing) and may read
-  **only its own** stats: a foreign bidder id is **403**. The starter serves anyone.
+  **only its own** stats: a foreign bidder id is **403**.
 - \`window\` is one of \`hour\` or \`day\` (**400** otherwise) and defaults to \`day\`; it selects the
   counter bucket, not the response shape.
 - \`win_rate\` is wins against **every auction the bidder saw** (\`auctions_seen\`, which includes
-  no-bids and timeouts), never against wins plus losses. Define it as a named \`win_rate\` /
-  \`winRate\` and let it answer \`0\` for a bidder that has seen nothing.
-- \`bid_rate\` is bids over auctions seen, and **\`timeout_rate\`** is the share of auctions that ran out
-  of budget — a slow bidder must look slow. The response must carry both.
-- **\`degraded_share\`** is first-class too: the share of placed bids that were marked degraded, so
-  tiered degradation is visible next to the money.
+  no-bids and timeouts). Define it as a named \`win_rate\` / \`winRate\` that answers \`0\` for a bidder
+  that has seen nothing.
+- \`bid_rate\` is bids over auctions seen, and **\`timeout_rate\`** is the share of auctions that ran
+  out of budget. The response carries both.
+- **\`degraded_share\`** is first-class too: the share of placed bids that were marked degraded.
 - Report **spend versus cap** for the same window: \`spend_cents\` from the counters and \`cap_cents\`
-  from the spend ledger, so an operator can see how close the bidder is to its daily limit.
-
-**Failure mode the checks target.** The starter omits timeouts and degradation entirely, so the two
-symptoms that matter most — bids that never made the deadline and bids that are only conservative —
-are invisible. Its win rate divides by wins plus losses, which flatters exactly the bidder in the
-briefing: the more auctions it timed out on, the better its reported rate. And it treats the path
-parameter as an identifier rather than an authorization decision.`,
+  from the spend ledger.`,
   sequence: {
     participants: ['Advertiser console', 'Stats endpoint', 'Redis counters', 'Spend ledger'],
     messages: [
@@ -97,7 +92,7 @@ parameter as an identifier rather than an authorization decision.`,
       id: 'win-rate-denominator',
       title: 'Win rate is against every auction seen',
       detail:
-        'A named `win_rate` / `winRate` divides wins by `auctions_seen` — including the auctions lost to a timeout or a no-bid — and returns 0 for a bidder that has seen nothing. The starter divides by wins plus losses, which flatters a bidder that mostly times out.',
+        'A named `win_rate` / `winRate` divides wins by `auctions_seen`, including the auctions lost to a timeout or a no-bid, and returns 0 for a bidder that has seen nothing. The starter divides by wins plus losses, which flatters a bidder that mostly times out.',
       match: {
         python: {all: [/def win_rate\(/, /auctions_seen/], none: [/"wins"\]\s*\+\s*counters\["losses"\]/]},
         typescript: {all: [/function winRate\(/, /auctions_seen/], none: [/counters\.wins\s*\+\s*counters\.losses/]},
@@ -156,9 +151,7 @@ stats_store = StatsStore()
 
 @app.get("/v1/bidders/{bidder_id}/stats")
 def stats(bidder_id: str, window: str = Query(default="day")) -> JSONResponse:
-    # TODO: this starter omits the timeout and degradation shares, computes the win rate against wins
-    # and losses only (so a bidder whose bids never land looks perfect), and serves any bidder's
-    # stats to any caller. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     counters = stats_store.counters(bidder_id, window)
     wins = counters.get("wins", 0)
     losses = counters.get("losses", 0)
@@ -252,9 +245,7 @@ interface StatsStore {
 const statsStore = {} as StatsStore;
 
 app.get('/v1/bidders/:bidderId/stats', async (request, reply) => {
-  // TODO: this starter omits the timeout and degradation shares, computes the win rate against wins
-  // and losses only (so a bidder whose bids never land looks perfect), and serves any bidder's
-  // stats to any caller. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {bidderId} = request.params as {bidderId: string};
   const window = (request.query as {window?: string}).window ?? 'day';
   const counters = await statsStore.counters(bidderId, window);
@@ -351,9 +342,7 @@ func stats(rw http.ResponseWriter, r *http.Request) {
 	if window == "" {
 		window = "day"
 	}
-	// TODO: this starter omits the timeout and degradation shares, computes the win rate against
-	// wins and losses only (so a bidder whose bids never land looks perfect), and serves any
-	// bidder's stats to any caller. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	counters := statsStore.Counters(bidderID, window)
 	writeJSON(rw, http.StatusOK, map[string]any{
 		"bidder_id": bidderID,
@@ -481,9 +470,7 @@ object ReadApi {
       get {
         parameters("window".?) { windowOpt =>
           val window = windowOpt.getOrElse("day")
-          // TODO: this starter omits the timeout and degradation shares, computes the win rate
-          // against wins and losses only (so a bidder whose bids never land looks perfect), and
-          // serves any bidder's stats to any caller. Fix all three.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val counters = statsStore.counters(bidderId, window)
           val wins = counters.getOrElse("wins", 0)
           val losses = counters.getOrElse("losses", 0)
@@ -589,9 +576,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/bidders/([A-Za-z0-9_-]+)/stats)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter omits the timeout and degradation shares, computes the win rate against
-    // wins and losses only (so a bidder whose bids never land looks perfect), and serves any
-    // bidder's stats to any caller. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string bidderId = req.matches[1];
     const std::string window = req.has_param("window") ? req.get_param_value("window") : "day";
     const auto counters = statsStore.counters(bidderId, window);
@@ -689,23 +674,19 @@ int main() {
     },
   },
   hints: [
-    'Authorize before you read: the `X-Bidder-Id` header must equal the id in the path (403 when it does not, 401 when the header is missing). A stats endpoint keyed only by a path parameter is an information leak, not a read.',
-    'Fix the denominator first: `win_rate = wins / auctions_seen`, where `auctions_seen` counts every auction the bidder received a request for — the ones it lost on price, the ones it lost to a timeout and the ones it never answered. Dividing by wins plus losses makes a slow bidder look perfect.',
-    'Report latency and degradation next to the money: `timeout_rate` over auctions seen, `degraded_share` over bids placed, and `spend_cents` beside `cap_cents` for the same `window`. Those four numbers are what tell an operator whether the bidder is slow, timid or simply out of budget.',
+    'The dashboard reports a 94% win rate for a bidder that won almost nothing last week, and an advertiser noticed it could open another advertiser’s stats by changing the id in the URL.',
+    'The win rate divides by wins plus losses, so auctions lost to a timeout vanish from the denominator; no timeout or degraded counter is ever read; the path id is used without comparing it to the caller.',
+    'Compare `X-Bidder-Id` to the path id (403 on mismatch), define `win_rate` as wins over `auctions_seen`, and add `timeout_rate`, `degraded_share`, `spend_cents` and `cap_cents` for the requested `window`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read path for honesty. Reads are boring to
-write and easy to get subtly wrong, and the wrong read makes every later decision wrong: the polling
-loop, the on-call runbook, the cap increase.
+  debrief: `The denominator is the whole fix: a win rate over resolved auctions hides the auctions the
+bidder timed out on, which is precisely the failure mode the rest of this course fixes, so the read
+must count \`auctions_seen\`. \`timeout_rate\` and \`degraded_share\` sit next to it because they are the
+two signals that separate "not competitive on price" from "never answered in time" and "only bidding
+conservatively". The path parameter identifies which stats to read and the header decides whether
+the caller may, so a foreign bidder is 403. Spend versus cap closes the loop, because a bidder at 95%
+of its daily cap is the next incident.
 
-Three defects are being checked. The denominator: a win rate over resolved auctions hides the auctions
-the bidder timed out on, which is precisely the failure mode the rest of this course fixes, so the
-read must count \`auctions_seen\`. The missing rates: \`timeout_rate\` and \`degraded_share\` are the two
-signals that separate "not competitive on price" from "never answered in time" and "only bidding
-conservatively". Authorization: the path parameter identifies which stats to read, and the header
-decides whether the caller may; a foreign bidder is 403. Spend versus cap closes the loop, because a
-bidder at 95% of its daily cap is the next incident.
-
-Real platforms also expose per-window percentiles of the stage timings, a loss-reason breakdown, and a
-reconciliation delta between spend and wins, so an operator can tell a configuration mistake from a
-market that simply was not there.`,
+Production platforms also expose per-window percentiles of the stage timings, a loss-reason breakdown
+and a reconciliation delta between spend and wins, so an operator can tell a configuration mistake
+from a market that simply was not there.`,
 };

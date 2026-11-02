@@ -8,36 +8,26 @@ export const classifierTiersStep: Step = {
   focus: ['guard', 'classifier', 'judge'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the classifier and
-the judge and returns a verdict, so the demo refuses the obvious queries. It hides four production
-flaws, and one of them is a legal exposure, not a bug. Debug it, fix it, and prove the fix.
+**Starting point.** The starter's \`decide(text, policy)\` calls \`Classifier.Classify\` and then
+\`Judge.Judge\` on every request, blocks when \`score >= THRESHOLD\` (0.5) or the judge says
+non-compliant, and returns an allowed decision from a bare \`except Exception\`. It compiles and
+hides five flaws.
 
-Implement \`decide(text, policy)\` — the decision every guard request runs — as three tiers in the
-order the Zillow post deploys them:
+**Failure mode the checks target.** When the classifier is overloaded every steering query passes,
+silently, because the error path allows. The single 0.5 cut trades recall for precision, the opposite
+of what Fair Housing exposure requires. The judge runs on every request, so the fast tier buys
+nothing and the LLM bill scales with traffic. And there is no deterministic layer for the phrases
+that must be caught every time.
 
-- **Stop list first.** The policy carries \`stop_phrases\` (the post's "worst offending terms", e.g.
-  "do not accept section 8"); a case-insensitive lexical hit blocks immediately with tier
-  \`stoplist\` and reason \`stop_phrase:{phrase}\`. No classifier call is made.
-- **Classifier second.** \`Classifier.Classify(text, policy_version)\` returns \`score\`, the
-  probability of non-compliance, and a \`label\`. Each call carries a **250 ms** deadline — the post
-  requires fast inference because the decision sits inside the conversation's latency.
-- **Two thresholds, set for recall.** Block at \`score >= 0.35\` (\`BLOCK_THRESHOLD\`); allow below
-  \`0.15\` (\`REVIEW_LOW\`). The post is explicit that recall matters most: a missed violation is a
-  Fair Housing exposure, a refused compliant query is a product cost. One threshold at 0.5 optimises
-  the wrong thing.
-- **Judge only for the band.** Scores in \`[0.15, 0.35)\` go to \`Judge.Judge(text,
-  policy_version)\` — an LLM with the fair-housing instructions — under a **2 s** deadline. The judge
-  is slow and expensive; it must never see traffic the classifier already decided.
-- **Fail closed.** A gRPC error or deadline at any tier returns \`allowed = false\` with reason
-  \`guard_unavailable\` (\`FAIL_CLOSED_REASON\`). A guard that is down must not look like a guard
-  that approved.
-
-**Failure mode the checks target.** The starter catches every exception and allows: when the
-classifier is overloaded, every steering query passes, silently. Its single 0.5 threshold trades
-recall for precision — the opposite of what the domain requires. It calls the judge on every
-request, so the fast tier buys nothing and the LLM bill scales with traffic. And it has no stop
-list, so the one deterministic layer the post insists on — the phrases that must be caught 100% of
-the time — does not exist.`,
+- Scan \`policy.stop_phrases\` first (case-insensitive); a hit blocks with tier \`stoplist\` and
+  reason \`stop_phrase:{phrase}\` without any RPC.
+- \`Classify(text, policy_version)\` runs under \`DEADLINE_S = 0.25\` (\`timeout=DEADLINE_S\`).
+- Block at \`score >= BLOCK_THRESHOLD\` (\`0.35\`); allow below \`REVIEW_LOW\` (\`0.15\`). Remove
+  the single \`THRESHOLD = 0.5\`.
+- Only scores in \`[REVIEW_LOW, BLOCK_THRESHOLD)\` go to \`Judge(text, policy_version)\`, under a
+  **2 s** deadline.
+- A gRPC error or deadline at any tier returns \`allowed = false\` with \`FAIL_CLOSED_REASON\`
+  (\`guard_unavailable\`). Catch the RPC error class, not \`Exception\`.`,
   sequence: {
     participants: ['fhguard', 'Classifier', 'Judge'],
     messages: [
@@ -51,9 +41,9 @@ the time — does not exist.`,
     ],
   },
   hints: [
-    'Order is the design: a lexical scan over `policy.stop_phrases` costs microseconds and returns before any RPC. Make it the first statement of `decide`, and give it its own tier name so the audit can tell a stop-list block from a classifier block.',
-    'The deadline is an argument on the call (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). Two constants, not one: compare the score against `BLOCK_THRESHOLD` first, then `REVIEW_LOW`; only what is left is the band the judge sees.',
-    'Catch the RPC error class, not `Exception`, and return a blocked decision carrying `FAIL_CLOSED_REASON`. The caller (next steps) turns that into the predefined fallback message, so the user sees a polite refusal, not an outage — and never an unguarded answer.',
+    'During a classifier brown-out the guard reports zero blocks and the assistant answers "are there any section 8 tenants nearby?" in full; latency per turn also climbs with the judge on every request.',
+    'The `except Exception` branch builds an allowed decision with score 0.0, so a timeout and an approval are indistinguishable downstream; the judge call sits inside the same block for every score.',
+    'Catch `grpc.RpcError` and return blocked with `FAIL_CLOSED_REASON`; add `timeout=DEADLINE_S` to `Classify`; the stop list, the two thresholds and the judge band are covered by the other checks.',
   ],
   checks: [
     {
@@ -181,9 +171,7 @@ class Decision:
 
 
 def decide(text: str, policy: Policy) -> Decision:
-    # TODO: add the stop-list tier, put a 250 ms deadline on Classify, split the single 0.5
-    # threshold into block-at-0.35 / allow-below-0.15 with the judge only for the band under 2 s,
-    # and fail closed instead of allowing on error.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     try:
         reply = classifier.Classify(guard_pb2.ClassifyRequest(text=text, policy_version=policy.version))
         verdict = judge.Judge(guard_pb2.JudgeRequest(text=text, policy_version=policy.version))
@@ -261,7 +249,7 @@ def decide(text: str, policy: Policy) -> Decision:
 `,
     },
     typescript: {
-      starter: `/** Guard tiers: flawed code with one threshold that allows on error. */
+      starter: `/** Guard tiers: classifier and judge behind one decide(). */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -308,9 +296,7 @@ export interface Decision {
 }
 
 export async function decide(text: string, policy: Policy): Promise<Decision> {
-  // TODO: add the stop-list tier, put a 250 ms deadline on Classify, split the single 0.5
-  // threshold into block-at-0.35 / allow-below-0.15 with the judge only for the band under 2 s,
-  // and fail closed instead of allowing on error.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   try {
     const reply = await new Promise<ClassifyReply>((resolve, reject) =>
       classifier.Classify({text, policy_version: policy.version}, (err, res) => (err ? reject(err) : resolve(res))),
@@ -449,9 +435,7 @@ type Decision struct {
 	Reasons []string
 }
 
-// TODO: add the stop-list tier, put a 250 ms deadline on Classify, split the single 0.5 threshold
-// into block-at-0.35 / allow-below-0.15 with the judge only for the band under 2 s, and fail closed
-// instead of allowing on error.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func decide(ctx context.Context, classifier pb.ClassifierClient, judge pb.JudgeClient, text string, policy Policy) Decision {
 	reply, err := classifier.Classify(ctx, &pb.ClassifyRequest{Text: text, PolicyVersion: policy.Version})
 	if err != nil {
@@ -552,9 +536,7 @@ object ClassifyTiers {
     ClassifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("classifier", 9000).usePlaintext().build())
   val judge = JudgeGrpc.blockingStub(ManagedChannelBuilder.forAddress("judge", 9000).usePlaintext().build())
 
-  // TODO: add the stop-list tier, put a 250 ms deadline on classify, split the single 0.5 threshold
-  // into block-at-0.35 / allow-below-0.15 with the judge only for the band under 2 s, and fail
-  // closed instead of allowing on error.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def decide(text: String, policy: Policy): Decision = {
     try {
       val reply = classifier.classify(ClassifyRequest(text = text, policyVersion = policy.version))
@@ -651,9 +633,7 @@ struct Decision {
   std::vector<std::string> reasons;
 };
 
-// TODO: add the stop-list tier, put a 250 ms deadline on Classify, split the single 0.5 threshold
-// into block-at-0.35 / allow-below-0.15 with the judge only for the band under 2 s, and fail closed
-// instead of allowing on error.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 Decision decide(Classifier::Stub* classifier, Judge::Stub* judge, const std::string& text, const Policy& policy) {
   grpc::ClientContext ctx;
   ClassifyRequest request;
@@ -740,5 +720,5 @@ Decision decide(Classifier::Stub* classifier, Judge::Stub* judge, const std::str
 `,
     },
   },
-  debrief: `The interviewer is probing whether you understand that a guardrail's failure policy is a legal decision, not an availability one. The starter looks fine because a healthy classifier never enters the error path, and 0.5 "feels" neutral. Four separate defects are being checked: the deterministic stop-list tier (the post's "right action 100% of the time" for the worst phrases, and the one layer that works when every model is down); the per-call deadline on a tier that sits inside conversation latency; two thresholds that encode the post's precision/recall argument in code — block early, allow only when confident, and send the band to a slower reader; and fail-closed, because an outage that returns \`allowed\` is indistinguishable from approval in the audit. The judge gating is the cost half: the fast tier only pays for itself if the LLM never sees traffic it already decided. Real systems add a breaker around the judge so a long outage degrades to "band → blocked" without 2 s of waiting per request, per-tier latency histograms, and a shadow-scoring path that feeds sampled decisions to human review — the feedback loop the post describes.`,
+  debrief: `The tiers are ordered by cost and certainty. A lexical scan over the stop phrases costs microseconds and still works when every model is down, so it runs first and gets its own tier name for the audit. The two thresholds encode the recall argument in code: block early at 0.35, allow only below 0.15, and send the band to the slower judge, which is the only way the fast tier pays for itself. Fail-closed matters because an outage that returns \`allowed\` is indistinguishable from an approval in the audit trail. Production guards wrap the judge in a circuit breaker so a long outage degrades to a blocked band without a 2 s wait per request, record per-tier latency histograms, and shadow-score a sample of decisions for human review.`,
 };

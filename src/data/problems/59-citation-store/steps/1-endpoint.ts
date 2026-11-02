@@ -8,31 +8,28 @@ export const citationEndpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, takes
-the body and stores a citation. It compiles, it serves the demo, and it hides three production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/citations\` with body
+\`{"document_id": "doc-7", "version": 3, "start": 412, "end": 447, "quote": "…"}\`, slices the
+document's latest text at the caller's offsets and stores the result under the tenant. It compiles,
+it serves the demo, and it hides four flaws.
 
-Implement \`POST /v1/citations\` with body
-\`{"document_id": "doc-7", "version": 3, "start": 412, "end": 447, "quote": "…"}\`.
+**Failure mode the checks target.** A citation is a claim that these bytes, at these offsets, in
+this version, say this. A handler that forwards the caller's offsets without comparing them to the
+document, resolves them against whatever the document says today, or records a client retry as a
+second citation produces records that look fine until a reviewer clicks one after an edit.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`document_id\` is a non-empty string, \`version\` an integer **>= 1**, \`start\` an integer
   **>= 0**, \`end > start\`, and \`quote\` a non-empty string of at most **16 KiB**; anything else is
   **400**.
 - The quote must equal the bytes at \`[start, end)\` of the document's **named version**. On a
-  mismatch answer **422** with both texts — \`{"stored": …, "supplied": …}\`, the text that is
-  actually at those offsets and the text the caller sent — so the caller can see how the span
+  mismatch answer **422** with both texts, \`{"stored": …, "supplied": …}\`: the text that is
+  actually at those offsets and the text the caller sent, so the caller can see how the span
   drifted.
-- Offsets always resolve against the immutable **version** in the request, never the document's
-  latest text: a document update must not change what an already-recorded citation points at.
+- Offsets resolve against the immutable **version** in the request, not the document's latest
+  text, and the stored record keeps that version.
 - \`Idempotency-Key\` is required (**400** when missing). A replay of \`(tenant, key)\` returns the
-  stored record instead of recording a second one.
-
-**Failure mode the checks target.** Storing the caller's offsets without comparing them to the
-document bytes turns the store into a claim nobody verified; resolving them against the document
-instead of the version means an edit silently re-points every old citation at new text; and keying
-the record by document id alone makes two different versions of the same document indistinguishable.
-Every one of those is silent until a reviewer clicks the citation.`,
+  stored record instead of recording a second one.`,
   sequence: {
     participants: ['Client', 'Citation API', 'document store', 'citation store'],
     messages: [
@@ -52,9 +49,9 @@ Every one of those is silent until a reviewer clicks the citation.`,
     ],
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant, Idempotency-Key, span shape, quote size. Every one of them returns before the document store is touched, so a malformed citation never costs a fetch.',
-    'The comparison is three values, not two: the document text for the **requested version**, the slice `text[start:end]`, and the caller’s quote. Slice the requested version — slicing `latest(document_id)` is exactly the bug, because the same offsets land on different text after an edit.',
-    'A mismatch is not a 400: the request was well formed, the span simply does not resolve. Answer 422 with both texts (`stored` and `supplied`) — the caller needs the actual bytes to re-anchor, and the stored value is what your record will hold.',
+    'After a document edit, every citation recorded against it highlights the wrong sentence; a client that retried a timeout owns two citation ids for one quote; a request with no tenant still gets 200.',
+    'The starter slices `documents.latest(document_id)`, keeps no version in the record, trusts the quote without reading the bytes, and keys storage by document id, so edits and retries both rewrite what was recorded.',
+    'Guard tenant, Idempotency-Key, span shape and quote size first. Fetch `(document_id, version)`, compare `text[start:end]` to the quote, answer 422 with `stored` and `supplied`, then `store.get`/`store.put` under `(tenant, key)`.',
   ],
   checks: [
     {
@@ -170,10 +167,7 @@ store = CitationStore()
 def record(
     body: CitationRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
 ) -> JSONResponse:
-    # TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
-    # it, and keys by document id alone, so citations to old versions silently point at the newest
-    # text. Validate the span, resolve it against (document_id, version), and key the record by
-    # (tenant, Idempotency-Key).
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     text = documents.latest(body.document_id)
     citation = {
         "document_id": body.document_id,
@@ -267,7 +261,7 @@ def record(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/citations: flawed code that trusts the caller's offsets. */
+      starter: `/** POST /v1/citations: the starter. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -285,10 +279,7 @@ interface CitationBody {
 }
 
 app.post('/v1/citations', async (request, reply) => {
-  // TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
-  // it, and keys by document id alone, so citations to old versions silently point at the newest
-  // text. Validate the span, resolve it against (document_id, version), and key the record by
-  // (tenant, Idempotency-Key).
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as CitationBody;
   const text = documents.getLatest(body.document_id);
@@ -419,10 +410,7 @@ func record(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
-	// it, and keys by document id alone, so citations to old versions silently point at the newest
-	// text. Validate the span, resolve it against (document_id, version), and key the record by
-	// (tenant, Idempotency-Key).
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	text, _ := documents.Latest(body.DocumentID)
 	citation := map[string]any{
 		"document_id": body.DocumentID,
@@ -597,10 +585,7 @@ object CitationApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[CitationRequest]) { body =>
-            // TODO: the starter stores whatever offsets the caller sends, accepts the quote without
-            // checking it, and keys by document id alone, so citations to old versions silently
-            // point at the newest text. Validate the span, resolve it against (document_id,
-            // version), and key the record by (tenant, Idempotency-Key).
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val text = documents.latest(body.document_id)
             val citation = Citation(
               java.util.UUID.randomUUID().toString,
@@ -737,10 +722,7 @@ int main() {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
-    // it, and keys by document id alone, so citations to old versions silently point at the newest
-    // text. Validate the span, resolve it against (document_id, version), and key the record by
-    // (tenant, Idempotency-Key).
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto documentId = body.value("document_id", std::string());
     const auto start = body.value("start", 0);
     const auto end = body.value("end", 0);
@@ -869,5 +851,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler whose bug is in the data model, not the syntax. The starter reads fine because the demo cites a document that was never edited. Three defects are being checked. First, an unverified span: offsets and a quote only mean something together, so the handler must slice the version text and compare — a 422 with both texts is what lets a caller re-anchor. Second, the resolution key: \`(document_id, version)\` is the identity of the text an offset points into; resolving the document's latest version and storing no version at all means every later edit rewrites history. Third, idempotency: the record is keyed by \`(tenant, Idempotency-Key)\` so a client retry returns the same citation instead of a second one with a fresh id. Real stores add byte-offset normalization for encodings, a quote fingerprint for cheap re-anchoring, and a compaction job that re-verifies citations when a document's text is rewritten.`,
+  debrief: `The fix has its shape because a citation's identity is \`(document_id, version, start, end)\` and nothing less. The guard clauses run first and in cost order so a malformed request is refused before the document store is paid for. The handler then fetches the named version, slices it and compares, because offsets and a quote only mean something together; the 422 carries both texts so the caller can re-anchor instead of guessing. The record keeps the version so a later edit cannot re-point it, and it is stored under \`(tenant, Idempotency-Key)\` so a client retry returns the same citation id. Production stores go further than this step did: they normalize offsets across encodings and re-verify stored citations in a background job whenever a document's text is rewritten.`,
 };

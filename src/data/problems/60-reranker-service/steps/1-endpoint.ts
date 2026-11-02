@@ -8,28 +8,26 @@ export const rerankEndpointStep: Step = {
   focus: ['client', 'api', 'reranker'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the body and returns
-a scored list. It compiles, it serves the demo, and it hides four production flaws. Debug it like
-the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/rerank\`, reads the tenant from \`X-Tenant-Id\`,
+parses a body of \`{"query": "…", "candidates": [{"passage_id": "…", "text": "…"}]}\`, scores each
+candidate against the query and returns \`{"results": [...]}\` in input order. It compiles, serves
+the demo and hides 4 flaws.
 
-Implement \`POST /v1/rerank\` with body \`{"query": "…", "candidates": [{"passage_id": "…", "text": "…"}]}\`.
+**Failure mode the checks target.** A request with thousands of candidates or a huge query goes
+straight to the model, so one caller sets the bill; a long passage is clipped before scoring and the
+response does not say so, so the score describes text the model did not see; equal scores come
+back in whatever order the client sent them, so the same request can produce two different lists.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+Requirements:
+
+- A missing tenant is **401**.
 - \`query\` is a non-empty string of at most **2 KiB** (\`2 * 1024\` bytes) of UTF-8; a larger query
   is **413**.
-- \`candidates\` holds at most **200** entries (**400** above that), so one request can never push an
-  unbounded amount of text through the model.
-- Each \`text\` is at most **4 KiB**. A longer passage is clipped for scoring, and the result for that
-  passage carries \`truncated: true\` so a score of clipped text is never presented as a score of the
-  full passage.
-- Results are ordered by score descending and broken by \`passage_id\` ascending, so equal scores
-  always come out in the same order.
-- Log the decision with tenant and candidate count — never the query or passage text.
-
-**Failure mode the checks target.** The starter scores every candidate it is handed, clips long
-passages silently, and returns input order. Unbounded candidates let one request set the budget;
-silent clipping makes a score describe text the model never saw; input order makes ties
-irreproducible for a client that wants to cache or diff the list.`,
+- \`candidates\` holds at most **200** entries; more is **400**, rejected before any scoring work.
+- Each \`text\` is at most **4 KiB**. A longer passage is clipped for scoring and its result carries
+  \`truncated: true\`.
+- Results are ordered by score descending, ties broken by \`passage_id\` ascending.
+- Log the decision with tenant and candidate count, not the query or passage text.`,
   sequence: {
     participants: ['Client', 'Rerank API', 'Reranker model'],
     messages: [
@@ -136,8 +134,7 @@ def score_passage(query: str, text: str) -> float:
 
 @app.post("/v1/rerank")
 def rerank(body: RerankRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter scores every candidate it is handed, clips long passages without
-    # reporting it, and returns input order. Check the caps, the clipping and the ordering.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     results = []
     for candidate in body.candidates:
         clipped = candidate.text[:4096]
@@ -225,8 +222,7 @@ function scorePassage(query: string, text: string): number {
 }
 
 app.post('/v1/rerank', async (request, reply) => {
-  // TODO: this starter scores every candidate it is handed, clips long passages without
-  // reporting it, and returns input order. Check the caps, the clipping and the ordering.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RerankBody;
   const results = body.candidates.map(candidate => ({
@@ -316,8 +312,7 @@ func scorePassage(query, text string) float64 {
 }
 
 func rerank(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter scores every candidate it is handed, clips long passages without
-	// reporting it, and returns input order. Check the caps, the clipping and the ordering.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	var body RerankBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -458,8 +453,7 @@ object RerankApi extends DefaultJsonProtocol {
       path("v1" / "rerank") {
         post {
           entity(as[String]) { raw =>
-            // TODO: this starter scores every candidate it is handed, clips long passages without
-            // reporting it, and returns input order. Check the caps, the clipping and the ordering.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val body = raw.parseJson.convertTo[RerankBody]
             val results = body.candidates.map { candidate =>
               JsObject(
@@ -556,8 +550,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/rerank", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter scores every candidate it is handed, clips long passages without
-    // reporting it, and returns input order. Check the caps, the clipping and the ordering.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -650,16 +643,15 @@ int main() {
     },
   },
   hints: [
-    'Write the caps first, in cost order: tenant, query bytes, candidate count. Every one returns before the model call, so a malformed request can never spend money.',
-    'The truncation flag is part of the response contract, not a log line. Return `truncated` per passage and let the caller decide whether a clipped comparison is acceptable.',
-    'Scores tie constantly with a small model. Sort by `(-score, passage_id)` so the same input always produces the same order and a client can cache or diff the list.',
+    'One tenant posts 5,000 candidates and the model queue backs up for everyone; another client complains that the same request returns its tied passages in a different order each time.',
+    'The handler loops straight into `score_passage` with no check on query bytes or candidate count, slices text to 4096 without recording it, and never sorts the results.',
+    'Reject over-cap query (413) and candidates (400) before scoring, return `truncated` per clipped passage, and sort by `(-score, passage_id)` before building the response.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler on top of an expensive dependency.
-The starter reads fine because the demo sends a short query and short passages from one
-caller. Four defects are being checked: the candidate cap (a cheap rejection before any model work),
-the query cap, per-passage truncation reported as data rather than hidden, and a deterministic order
-under ties. The trust boundary matters here because the model call — not the handler — is what costs
-money, so every cap has to run before it. Real rerankers add a token budget instead of a byte budget,
-per-tenant candidate caps, and a passage fingerprint so a clipped passage can be re-fetched on
-demand.`,
+  debrief: `The caps sit before the model call because the model, not the handler, is where the money goes:
+a rejected request costs a parse and nothing else. Truncation is returned as data rather than
+logged because only the caller knows whether a score of the first 4 KiB is good enough for its use.
+The tie-break is a sort key, not a stable-sort assumption, because the input order is the
+retriever's and changes between runs. A production endpoint would budget in model tokens rather
+than bytes, cap candidates per tenant rather than globally, and return a passage fingerprint so a
+clipped passage can be re-fetched at full length when the caller needs it.`,
 };

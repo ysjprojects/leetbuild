@@ -8,34 +8,27 @@ export const guardrailsStep: Step = {
   focus: ['workflow', 'guardrails', 'human'],
   task: `## Task
 
-**Starting point.** The starter is working code for the gate between the
-reasoning loop's result and the customer: it asks the Guardrail Framework whether the model's answer
-is relevant and returns it. When the guardrail service is healthy and the answer is fine,
-the demo passes. It hides four production flaws. Debug it like the owner of the guardrails, fix
-it, and prove the fix.
-
-Implement \`gate(turn, draft, context)\`, run once per turn after the loop produces a result and
-before anything reaches the customer:
-
-- The configured guardrails are \`GUARDRAILS = ("relevance", "groundedness", "pii")\`: is the
-  answer about the question, is it grounded in the assembled context (the hallucination check),
-  does it leak personal data. Every one of them runs on every turn; a product cannot ship with the
-  groundedness guardrail quietly skipped.
-- They run **in parallel** — \`Check\` on \`guardrails:9200\` once per guardrail, started together
-  — under **one 2 s deadline** (\`GUARDRAIL_DEADLINE_S\`). Three sequential 2 s checks would
-  triple the tail latency of every turn.
-- A guardrail that times out or fails with any status is a failed verdict (\`ERROR\`), not a pass.
-  The gate **fails closed**: an unverified answer is an unverified answer.
-- Any verdict other than \`PASS\` **blocks the answer** and hands the conversation to a human
-  agent: \`handoff.escalate(conversation, turn_id, verdicts)\`; the turn's status is \`escalated\`
-  and the model's answer is never returned. Only when every verdict is \`PASS\` is the status
-  \`answered\`.
-- The verdicts are returned with the turn either way, so step 5 can record them.
+**Starting point.** The starter is \`gate\`, which takes the turn, the model's answer and the
+context and sits between the reasoning loop and the customer: it sends one \`relevance\` \`Check\`
+to the Guardrail Framework (\`guardrails:9200\`), logs a warning on \`FAIL\`, and returns the
+answer. It serves the demo and hides 5 flaws.
 
 **Failure mode the checks target.** The starter runs one guardrail, waits for it with no deadline,
-treats an exception as "nothing to see", and on an explicit \`FAIL\` logs a warning and returns the
-answer anyway. In production the guardrail service's slow day becomes the assistant's slow day,
-and its outage becomes the day every hallucinated refund policy reached a guest.`,
+treats an exception as nothing to see, and on an explicit \`FAIL\` returns the answer anyway. The
+guardrail service's slow day becomes the assistant's slow day, and its outage becomes the day a
+hallucinated refund policy reaches a guest.
+
+The gate runs once per turn, before anything reaches the customer:
+
+- \`GUARDRAILS = ("relevance", "groundedness", "pii")\`: is the answer about the question, is it
+  grounded in the assembled context, does it leak personal data. Every one runs on every turn.
+- They run **in parallel**, one \`Check\` per guardrail started together, under **one 2 s
+  deadline** (\`GUARDRAIL_DEADLINE_S\`).
+- A guardrail that times out or fails with any status is a failed verdict (\`ERROR\`), not a pass.
+- Any verdict other than \`PASS\` **blocks the answer**: \`handoff.escalate(conversation,
+  turn_id, verdicts)\`, status \`escalated\`, no answer returned. Only when every verdict is
+  \`PASS\` is the status \`answered\`.
+- The verdicts are returned with the turn either way, so step 5 can record them.`,
   sequence: {
     participants: ['CoT workflow', 'Guardrail Framework', 'Human agent'],
     messages: [
@@ -53,9 +46,9 @@ and its outage becomes the day every hallucinated refund policy reached a guest.
     ],
   },
   hints: [
-    'Make the guardrail list data, not code: a tuple of names and one loop that builds a `CheckRequest` per name. Start all the calls before waiting on any of them — `.future()` on the stub, `Promise.all`, goroutines with a `WaitGroup`, `Future.sequence`, `std::async` — and give each the same 2 s deadline.',
-    'Collect verdicts into a map keyed by guardrail name. An RPC error — including `DEADLINE_EXCEEDED` — writes `"ERROR"` into the map instead of being swallowed; the decision afterwards is simply "is every value `PASS`?".',
-    'When any verdict is not `PASS`, call `handoff.escalate(conversation, turn_id, verdicts)` and return `{status: "escalated", verdicts}` without the answer. The log line in the starter is where the answer leaks: a warning is not a block.',
+    'A guest receives an answer quoting another guest’s email; a guardrail outage makes every turn hang, and once the service is back a flagged answer still reaches the chat with only a warning logged.',
+    'The starter calls `Check` for `relevance` only, with no deadline, catches `RpcError` with `pass`, and after a `FAIL` falls through to `return {"status": "answered", ...}`; the groundedness and pii guardrails are never asked.',
+    'Loop over `GUARDRAILS`, start every `Check.future(..., timeout=GUARDRAIL_DEADLINE_S)` before waiting, write `"ERROR"` on `RpcError`, then if any verdict is not `PASS` call `handoff.escalate` and return `{"status": "escalated", "verdicts": verdicts}`.',
   ],
   checks: [
     {
@@ -150,8 +143,7 @@ handoff = Handoff()
 
 
 def gate(turn: dict, draft: str, context: dict) -> dict:
-    # TODO: run relevance, groundedness and pii in parallel under one 2 s deadline, treat a
-    # timeout as a failed verdict, and escalate instead of returning a failed answer.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     verdicts: dict[str, str] = {}
     try:
         request = apv2_pb2.CheckRequest(
@@ -216,7 +208,7 @@ def gate(turn: dict, draft: str, context: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Guardrail gate: flawed code that checks relevance and returns the answer regardless. */
+      starter: `/** Guardrail gate: checks the model's answer with the Guardrail Framework before it is returned. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -251,8 +243,7 @@ export interface Gated {
 }
 
 export async function gate(turn: Turn, draft: string, context: unknown): Promise<Gated> {
-  // TODO: run relevance, groundedness and pii in parallel under one 2 s deadline, treat a
-  // timeout as a failed verdict, and escalate instead of returning a failed answer.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const verdicts: Record<string, string> = {};
   try {
     const reply = await new Promise<CheckReply>((resolve, reject) => {
@@ -369,8 +360,7 @@ type Gated struct {
 	Verdicts map[string]string
 }
 
-// TODO: run relevance, groundedness and pii in parallel under one 2 s deadline, treat a
-// timeout as a failed verdict, and escalate instead of returning a failed answer.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func Gate(ctx context.Context, turn Turn, draft string, assembled *Assembled) Gated {
 	contextJSON, _ := json.Marshal(assembled)
 	verdicts := map[string]string{}
@@ -480,8 +470,7 @@ object GuardrailGate {
   private val log = Logger.getLogger("guardrails")
   val stub = GuardrailsGrpc.blockingStub(ManagedChannelBuilder.forAddress("guardrails", 9200).usePlaintext().build())
 
-  // TODO: run relevance, groundedness and pii in parallel under one 2 s deadline, treat a
-  // timeout as a failed verdict, and escalate instead of returning a failed answer.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def gate(turn: Turn, draft: String, context: JsObject): Gated = {
     var verdicts = Map.empty[String, String]
     try {
@@ -565,8 +554,7 @@ struct Handoff {
 Handoff handoff;
 std::unique_ptr<apv2::Guardrails::Stub> guardrails;
 
-// TODO: run relevance, groundedness and pii in parallel under one 2 s deadline, treat a
-// timeout as a failed verdict, and escalate instead of returning a failed answer.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 json gate(const std::string& conversation, const std::string& turnId, const std::string& draft, const json& context) {
   std::map<std::string, std::string> verdicts;
   grpc::ClientContext ctx;
@@ -648,5 +636,5 @@ json gate(const std::string& conversation, const std::string& turnId, const std:
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat a safety check as a gate or as telemetry. The starter treats it as telemetry: one check, a warning, the answer goes out. The post's framework is a gate — reusable guardrails that engineers from different teams write once, executed in parallel against the model's output, LLM-backed where the question is semantic (content moderation, groundedness) and rule-backed where it is structural (a tool call with an invalid listing setup). Four properties make it a gate: every configured guardrail runs, they run together under one deadline so the gate costs one check's latency rather than three, a check that could not run is a check that failed, and a failed check ends in a human, not in a hedge. The fail-closed rule is the one candidates argue about, and the argument is the interview: a guardrail outage that passes everything is indistinguishable from no guardrail at all. Real frameworks add a severity per guardrail (block vs annotate), regeneration once before escalation, tool guardrails that run before \`Invoke\` rather than after the result, and a verdict stream — step 5 — so the gate's own precision can be measured.`,
+  debrief: `The fix turns a safety check from telemetry into a gate. The starter's shape (one check, a warning, the answer goes out) lets the guardrail observe but not stop anything. Making the guardrail list data lets teams add guardrails without touching the gate, which is the post's reusable-guardrail idea; starting all checks together makes the gate cost one check's latency instead of three; and recording \`ERROR\` on a timeout keeps an outage from passing everything, since a guardrail that passes when it cannot run is indistinguishable from no guardrail. Escalation ends a blocked turn in a human rather than a hedge. Production frameworks also assign a severity per guardrail (block versus annotate), regenerate once before escalating, and run tool guardrails before \`Invoke\` rather than after the result.`,
 };

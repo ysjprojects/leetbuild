@@ -16,70 +16,58 @@ import {readStep} from './steps/5-read';
 export const secretsRotationProblem: Problem = {
   id: 'secrets-rotation',
   title: 'Secrets Rotation',
-  tagline: 'Secrets that rotate with an overlap window and are revoked exactly once.',
+  tagline: 'Secret versions that rotate with an overlap window and retire only after consumers verify.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Secrets Rotation
 
-A secrets rotation service is the piece of a platform that decides how a new version of a secret is
-created, when it becomes current, how the fleet moves from the old version to the new one, and when
-the old one may be destroyed. The visible part is a version id in a response; the parts that decide
-whether the platform survives rotation day are the write-once boundary, the overlap window, the
-verification gate in front of retirement, the ordering of the lifecycle log, and a read path that
-cannot grow a material flag by accident.
+A secrets rotation service decides how a new version of a secret is created, when it becomes
+current, how the fleet moves from the old version to the new one, and when the old one may be
+destroyed. The parts that decide whether the platform survives rotation day are the write-once
+boundary, the overlap window, the verification gate in front of retirement, the ordering of the
+lifecycle log, and a read path that cannot grow a material flag by accident.
 
 ## The real system
 
-Production secret stores write material once and never read it back through the API: callers get
-version ids and fingerprints, and anything that needs the bytes asks the vault with its own
-credentials. Rotation is a sequence, not an update — activate, announce, verify, retire, revoke —
-and every step of that sequence exists because the previous one is not instantaneous. While a fleet
-redeploys, two versions are legitimately alive: the new one for the consumers that moved, the old
-one for the consumers that have not. Retirement is gated on proof, not on hope: every registered
-consumer must demonstrate that it can read the new version before the old one is destroyed. The
-lifecycle is published as ordered events keyed by the secret, carrying ids and fingerprints rather
-than material, because the topic is retained and replicated far longer than the version lives. And
-the read path that operators use to see all of this is metadata-only under every flag, for every
-role.
+AWS Secrets Manager models rotation as versions with staging labels. \`PutSecretValue\` creates a
+new version and, unless told otherwise, moves the \`AWSCURRENT\` label onto it while the previous
+version keeps \`AWSPREVIOUS\`; a rotation in progress holds \`AWSPENDING\` until the new credential
+is tested, and \`UpdateSecretVersionStage\` is the explicit call that moves a label. Each label sits
+on only one version at a time, the same invariant as a single active pointer. This course builds
+the same shape: material written once and read through the vault, activation and retirement as
+separate steps, two versions alive while a fleet redeploys, and a metadata-only read path.
 
 ## What you build here
 
 One service, **secretd**, with five pieces:
 
 1. \`POST /v1/secrets\`: validated name, a material cap, a rotation interval with health derived
-   from it, and a response that carries a version id and a fingerprint — never the material, in no
-   response and in no log line.
+   from it, and a response carrying a version id and a fingerprint, not the material.
 2. A **Redis** active-version pointer: one atomic \`EVAL\` that moves \`secret:{name}:active\` to the
-   new version while the previous one stays valid under \`secret:{name}:overlap\` for a bounded
-   overlap of at least one deploy cycle. The pointer never expires; revocation is an explicit step
-   in \`secret:{name}:revoked\`.
+   new version while the previous one stays valid under \`secret:{name}:overlap\` for at least one
+   deploy cycle. The pointer has no TTL; revocation is explicit in \`secret:{name}:revoked\`.
 3. A **gRPC** verification gate: one \`CanReadVersion\` call per registered consumer with a 2-second
-   deadline, a report per consumer, and a retirement that only proceeds when every consumer has
-   verified — an unresponsive consumer blocks retirement and raises an alert instead of being
-   counted as agreement.
+   deadline, and a retirement that proceeds only when every consumer has verified. An unresponsive
+   consumer blocks retirement and raises an alert.
 4. A **Kafka** lifecycle path: \`created\`, \`activated\`, \`retired\` and \`revoked\` events on
-   \`secret.event\`, keyed by secret name so each secret's history stays ordered, carrying ids and
-   fingerprints, published after the pointer swap.
-5. \`GET /v1/secrets/{name}/versions\`: a metadata-only read — version ids, fingerprints, activation
-   windows and consumer acceptance — behind the \`secrets\` scope, with a closed query allowlist so
-   no flag can ever surface material.
+   \`secret.event\`, keyed by secret name, carrying ids and fingerprints, published after the swap.
+5. \`GET /v1/secrets/{name}/versions\`: a metadata-only read behind the \`secrets\` scope, with a
+   closed query allowlist so no flag can surface material.
 
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real rotation path: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version. The mock scenario in this course is
-the incident that produced it: a rotation that retired the old version before consumers verified,
-and an audit line that carried the new material in plaintext.
+it looks right. In every step, debug it against the failure modes, fix it, optimize what is
+wasteful, and prove the fix with checks that fail on the starter and pass on your version. The mock
+scenario is the incident behind this course: a rotation that dropped the old version the instant
+the new one activated, and a checkout fleet that could not decrypt until it redeployed.
 
 ## Left out on purpose
 
-Key wrapping and HSMs, envelope encryption of the material at rest, per-region replication and
-failover, audit export to a SIEM, secret import from other vaults, dynamic database credentials, and
-operator UIs. The five pieces above are the ones that decide whether a rotation is correct, ordered
-and safe to run on a Tuesday.`,
+Key wrapping and HSMs, envelope encryption at rest, per-region replication, audit export to a SIEM,
+secret import from other vaults, dynamic database credentials, and operator UIs. The five pieces
+above decide whether a rotation is correct, ordered and safe to run on a Tuesday.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Secret consumers', sub: 'fetch · decrypt', x: 6, y: 22},

@@ -2,40 +2,35 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Model calls with a rules fallback, never a zero',
+  title: 'Model calls with a rules fallback instead of a zero',
   concept: 'grpc',
   file: 'client',
   focus: ['scorer', 'model', 'rules'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the model is healthy the
-scoring service answers, so the demo passes. Every failure path is wrong, and two of them are the
-kind of bug that only shows up during an incident — when nobody is watching the code. Find them, fix
-them, and prove the fix with the checks below.
+**Starting point.** The starter is \`score_transaction(features)\`, the scorer's model layer: a
+\`for _ in range(3)\` loop that calls \`stub.Score\` with no deadline, \`continue\`s on any
+\`grpc.RpcError\`, returns the model's score and band on success, and after the loop returns
+\`{"score": 0.0, "band": "approve", "fallback": False}\`. It serves the demo while the model is
+healthy and hides five flaws.
 
-Implement \`score_transaction(features)\`, the fraud scorer's model layer.
+**Failure mode the checks target.** A model outage is scored as a fleet of perfectly safe
+transactions, because the exhausted path returns risk zero. A malformed feature vector costs three
+identical round trips for three identical rejections, and a stuck model holds a payment request open
+until the client gives up.
 
-- Every attempt carries a **300 ms** deadline (\`DEADLINE_MS\`, a call timeout / \`context.WithTimeout\`
-  / \`withDeadlineAfter\` / \`set_deadline\`). A call without one lets one stuck model hold a payment
-  request open until the client gives up.
-- At most **\`MAX_ATTEMPTS\` (3)** attempts, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retryable: \`RETRYABLE_CODES\` holds them, \`TERMINAL_CODES\` holds the ones that must not be retried.
-  An \`INVALID_ARGUMENT\` — a malformed feature vector — is **terminal**: retrying it three times buys
-  the same rejection three times and triples the latency of a request that was never going to work.
-- When the attempts are exhausted, do **not** return zero risk. Score the transaction with
-  \`rules_score(features)\` — a deterministic function over the feature vector — clamp it with
-  \`clamp_rules_score\` to \`RULES_MAX_SCORE\`, and return a verdict marked \`fallback: true\` with
-  \`model_version\` set to the rules version. A zero-risk verdict during an outage is an approval
-  wave: the model being down must degrade the decision, never lower the risk.
-- The rules band is the ceiling for degraded decisions: at \`RULES_MAX_SCORE\` a fallback verdict can
-  at best land in the review band, so the approval rate during an outage can never exceed the band
-  someone signed off on.
-
-**Failure mode the checks target.** The starter has no deadline, catches every error, retries three
-times whatever the status is, and after the loop returns \`{"score": 0.0, "band": "approve"}\` — which
-means a model outage is scored as a fleet of perfectly safe transactions. The malformed-request retry
-is the quieter half: three identical round trips for a vector that will be rejected identically every
-time, with a reviewer later reading a latency spike that never had a cause.`,
+- Every attempt carries a **300 ms** deadline (\`DEADLINE_MS\`: a call timeout, \`context.WithTimeout\`,
+  \`withDeadlineAfter\` or \`set_deadline\`).
+- At most \`MAX_ATTEMPTS\` (3) attempts; only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retryable.
+  \`RETRYABLE_CODES\` holds them, \`TERMINAL_CODES\` holds the ones that must not be retried, and
+  \`INVALID_ARGUMENT\` is terminal.
+- When the attempts are exhausted, score the transaction with \`rules_score(features)\`, a
+  deterministic function over the feature vector, clamp it with \`clamp_rules_score\` to
+  \`RULES_MAX_SCORE\`, and return a verdict marked \`fallback: true\` with \`model_version\` set to the
+  rules version.
+- The rules band is the ceiling for degraded decisions: at \`RULES_MAX_SCORE\` a fallback verdict
+  lands at best in the review band, so the approval rate during an outage stays inside the band
+  someone signed off on.`,
   sequence: {
     participants: ['Fraud Scorer', 'Fraud model', 'Rules engine'],
     messages: [
@@ -54,7 +49,7 @@ time, with a reviewer later reading a latency spike that never had a cause.`,
       id: 'deadline',
       title: 'Every attempt carries a 300 ms deadline',
       detail:
-        'The call is made with a 300 ms deadline — a call timeout, a `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + DEADLINE_MS`. Without it one stuck model holds a payment request open indefinitely.',
+        'The call is made with a 300 ms deadline: a call timeout, a `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + DEADLINE_MS`. The starter passes none, so one stuck model holds a payment request open indefinitely.',
       match: {
         python: {all: [/DEADLINE_MS\s*=\s*300/, /timeout=DEADLINE_MS/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*300/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -91,9 +86,9 @@ time, with a reviewer later reading a latency spike that never had a cause.`,
     },
     {
       id: 'rules-fallback',
-      title: 'A failure returns a rules verdict marked as a fallback, never a zero',
+      title: 'A failure returns a rules verdict marked as a fallback, not a zero',
       detail:
-        'The exhausted path returns `rules_score(features)` with `fallback: true` and the rules model version. The starter returns `{"score": 0.0, "band": "approve"}` — during a model outage that approves everything, which is how an availability incident becomes a fraud incident.',
+        'The exhausted path returns `rules_score(features)` with `fallback: true` and the rules model version. The starter returns `{"score": 0.0, "band": "approve"}`, which approves everything during a model outage and turns an availability incident into a fraud incident.',
       match: {
         python: {all: [/def rules_score\(/, /["']fallback["']:\s*True/], none: [/["']score["']\s*:\s*0(\.0)?\s*[,}]/]},
         typescript: {all: [/function rulesScore\(/, /fallback:\s*true/], none: [/score:\s*0(\.0)?\s*[,}]/]},
@@ -109,7 +104,7 @@ time, with a reviewer later reading a latency spike that never had a cause.`,
       id: 'rules-band',
       title: 'The fallback score is clamped to the rules band',
       detail:
-        'The rules score is clamped by `clamp_rules_score`/`clampRulesScore` to `RULES_MAX_SCORE`, so a degraded verdict can never reach the approve band and the outage approval rate stays inside the configured rules band.',
+        'The rules score is clamped by `clamp_rules_score`/`clampRulesScore` to `RULES_MAX_SCORE`, so a degraded verdict cannot reach the approve band and the outage approval rate stays inside the configured rules band. The starter has no rules path at all.',
       match: {
         python: {all: [/RULES_MAX_SCORE/, /clamp_rules_score\(/]},
         typescript: {all: [/RULES_MAX_SCORE/, /clampRulesScore\(/]},
@@ -139,9 +134,7 @@ def band_for(score: float) -> str:
 
 
 def score_transaction(stub, features: dict) -> dict:
-    # TODO: the starter has no deadline, retries every status three times - including a malformed
-    # feature vector - and maps an unreachable model to risk zero, which approves the outage.
-    # Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for _ in range(3):
         try:
             response = stub.Score(ScoreRequest(features=features))
@@ -265,9 +258,7 @@ function bandFor(score: number): string {
 }
 
 export async function scoreTransaction(features: Record<string, unknown>): Promise<Verdict> {
-  // TODO: the starter has no deadline, retries every status three times - including a malformed
-  // feature vector - and maps an unreachable model to risk zero, which approves the outage.
-  // Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const response = await client.score({features});
@@ -412,9 +403,7 @@ func bandFor(score float64) string {
 }
 
 func scoreTransaction(ctx context.Context, client ModelClient, features FeatureVector) (Verdict, error) {
-	// TODO: the starter has no deadline, retries every status three times - including a malformed
-	// feature vector - and maps an unreachable model to risk zero, which approves the outage.
-	// Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 3; attempt++ {
 		response, err := client.Score(ctx, &pb.ScoreRequest{FeatureVersion: features.Version, TxRef: features.TxRef})
 		if err != nil {
@@ -589,9 +578,7 @@ object ModelClient {
   def bandFor(score: Double): String =
     if (score <= 0.30) "approve" else if (score <= 0.70) "review" else "decline"
 
-  // TODO: the starter has no deadline, retries every status three times - including a malformed
-  // feature vector - and maps an unreachable model to risk zero, which approves the outage.
-  // Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def scoreTransaction(model: ModelStub, features: Map[String, Any]): Verdict = {
     var attempt = 0
     while (attempt < 3) {
@@ -698,9 +685,7 @@ static std::string bandFor(double score) {
 }
 
 static json scoreTransaction(Model::Stub* stub, const json& features) {
-  // TODO: the starter has no deadline, retries every status three times - including a malformed
-  // feature vector - and maps an unreachable model to risk zero, which approves the outage.
-  // Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (int attempt = 0; attempt < 3; ++attempt) {
     grpc::ClientContext ctx;
     ScoreReply reply;
@@ -806,9 +791,9 @@ static json scoreTransaction(Model::Stub* stub, const json& features) {
     },
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), not a wrapper around it. Bound the loop with `MAX_ATTEMPTS`; the starter’s `for _ in range(3)` is bounded but blind — it retries a rejection exactly like a blip.',
-    'Retryability is a property of the status: capture the error, compare its code against `RETRYABLE_CODES`, and treat `TERMINAL_CODES` (starting with `INVALID_ARGUMENT`) as final. The terminal case should raise, not fall back: a malformed vector is a bug in the caller, and hiding it behind a rules verdict hides the bug.',
-    'The fallback is where the outage is decided. `rules_score(features)` must be deterministic over the feature vector, clamped by `clamp_rules_score` to `RULES_MAX_SCORE`, and returned with `fallback: true` plus the rules version. A `0.0` here is not `no risk`, it is `no model` written as the lowest possible risk.',
+    'Stop the model container and watch the approval rate climb to 100%; send a malformed vector and watch one request take three full round trips before it fails.',
+    '`except grpc.RpcError: continue` treats every status as transient, `stub.Score` has no `timeout=`, and the line after the loop writes the outage as `score: 0.0`, the lowest possible risk.',
+    'Add `timeout=DEADLINE_MS`, loop to `MAX_ATTEMPTS`, retry only codes in `RETRYABLE_CODES` and raise on `TERMINAL_CODES`; after the loop return `clamp_rules_score(rules_score(features))` with `fallback: True` and the rules version.',
   ],
-  debrief: `The interviewer is testing how the scorer behaves when the model does not. Three defects are checked: the missing deadline (a stuck model is an unbounded request), the blanket retry (a permanent rejection is retried like a transient one), and the zero verdict (an outage that scores everything safe). The fallback is the interesting half of the step: a degraded verdict has to be inside a band someone approved, marked so downstream alerting can see it, and versioned so a disputed decision can be replayed. Real implementations add a circuit breaker in front of the attempts, jittered backoff, and a metric for the fallback rate — if the fallback rate is not zero and unknown, nobody knows what fraction of yesterday's approvals came from the rules.`,
+  debrief: `The retry predicate is keyed on the gRPC status because the status is the only thing that distinguishes a blip from a bug: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may pass on the next attempt, \`INVALID_ARGUMENT\` will not, so retrying it only triples the latency of a request that was always going to fail. The fallback has its shape for the same reason the deadline exists: the scorer must answer in bounded time even when the model cannot, and the answer must be inside a band someone approved, marked so alerting can see it, and versioned so a disputed decision can be replayed. Production clients put a circuit breaker in front of the attempts, jitter the backoff, and graph the fallback rate, because without that number nobody knows what fraction of yesterday's approvals came from the rules.`,
 };

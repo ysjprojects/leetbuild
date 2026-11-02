@@ -17,33 +17,34 @@ import {pullReadStep} from './steps/5-read';
 export const syncEngineProblem: Problem = {
   id: 'sync-engine',
   title: 'Sync Engine',
-  tagline: 'Bidirectional sync that detects conflicts honestly and resumes from a watermark.',
+  tagline: 'Bidirectional document sync with base revisions, per-device cursors and a resumable watermark.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Sync Engine
 
 A sync engine is the piece of a product that lets a laptop, a phone and a web tab edit the same
-documents — including offline — and still converge. The visible part is a document that looks up to
+documents, including offline, and still converge. The visible part is a document that looks up to
 date; the parts that decide whether a user loses work are the base revision a change is applied
 against, the cursor that records what a device already received, the merge policy for two edits of
 one document, and the durability of the stream every device reads from.
 
 ## The real system
 
-Production sync layers are optimistic: a client sends its base revision plus the changes it made,
-and the server accepts those changes only if the base is a revision it issued. A device that has
-been offline for a month is normal traffic, not an error — its base is stale, and the honest
-answers are a per-document conflict or a merge, never a silent overwrite. Each device carries a
-cursor that the server advances atomically with the batch it represents, so a crash cannot leave a
-device that will never be sent its own lost changes, and a server watermark that only ever moves
-forward lets a device tell "there is nothing new" from "you stopped mid-stream". Two edits of one
-document are merged three-way — base, local, remote — over a bounded gRPC call with a deadline, and
-a merge that cannot be performed is a conflict that retains both revisions instead of a winner
-picked by upload time. Every applied change publishes a \`sync.change\` event keyed by document id
-so a document's revision stream stays ordered, after the apply has committed, with an outbox row
-when the broker rejects the produce. A device that has been idle for a week asks for what it missed:
-deltas after its cursor, capped, with the watermark that covers exactly the entries returned.
+Dropbox's HTTP API shows the shape a pull side settles into: \`files/list_folder\` returns a page of
+entries plus an opaque \`cursor\` and a \`has_more\` flag, and \`files/list_folder/continue\` takes
+that cursor and resumes exactly where the previous page stopped, so a client that was away for a
+month pages through what it missed instead of relisting everything. The push side of a sync layer
+is optimistic in the same spirit: a client sends its base revision plus the changes it made, and the
+server accepts those changes only if the base is a revision it issued. A stale base is normal
+traffic, not an error, and the answer is a per-document conflict or a merge rather than a silent
+overwrite. Each device carries a cursor that the server advances atomically with the batch it
+represents, so a crash cannot leave a device that will never be sent its own lost changes, and a
+server watermark that only moves forward lets a device tell "there is nothing new" from "you
+stopped mid-stream". Two edits of one document are merged three-way (base, local, remote) over a
+bounded gRPC call with a deadline, and a merge that cannot be performed is a conflict that retains
+both revisions. Every applied change publishes a \`sync.change\` event keyed by document id, after
+the apply has committed, with an outbox row when the broker rejects the produce.
 
 ## What you build here
 
@@ -67,11 +68,10 @@ One service, **syncd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with a flaw. It compiles, it syncs the demo document,
+Every starter in this course is working code with flaws. It compiles, it syncs the demo document,
 and it looks right. Your job in every step is the job you will have on a real sync feature: debug
-the starter against the failure modes a returning laptop produces, name the subtle one, fix it,
-optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on your
-version.
+the starter against the failure modes a returning laptop produces, fix it, optimize what is
+wasteful, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

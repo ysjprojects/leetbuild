@@ -8,29 +8,26 @@ export const stateStep: Step = {
   focus: ['redis', 'worker', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: a worker pops a shard from the
-work set and starts work, so the happy path moves shards through the batch. It hides a lost shard, a
-race and a lie in the counters. Debug it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter implements \`claim\` and \`heartbeat\` over Redis: \`claim\` pops a shard
+from \`batch:{batch_id}:shards\` with \`SPOP\`, increments \`done\` in \`batch:{batch_id}:counts\`, then
+writes a 30-second lease; \`heartbeat\` rewrites the lease with a plain \`SET\`. It moves shards through
+the demo and hides 5 flaws.
 
-Implement the shard queue the worker pool runs on, over Redis. Work set
-\`batch:{batch_id}:shards\`, lease \`batch:{batch_id}:shard:{shard_id}:lease\`, lease index
-\`batch:{batch_id}:leases\`, counters \`batch:{batch_id}:counts\`.
+**Failure mode the checks target.** A queue that loses shards: a crash between pop and completion
+removes the shard from the work set with nothing to bring it back, two workers can hold one shard,
+and the progress counter disagrees with the work set.
+
+Keys: work set \`batch:{batch_id}:shards\`, lease \`batch:{batch_id}:shard:{shard_id}:lease\`, lease
+index \`batch:{batch_id}:leases\`, counters \`batch:{batch_id}:counts\`.
 
 - **Claim atomically.** Pop a shard, then take its lease with \`SET … NX EX 30\` (or the stack's
   equivalent). If the lease is refused the shard was already taken: put it back and claim nothing.
-  The starter pops with \`SPOP\` and processes with no lease, so a worker crash loses the shard.
-- **Heartbeat only your own lease.** Renewing must compare the stored owner — a Lua script that
-  returns \`0\` unless \`GET lease == worker_id\` and then \`EXPIRE\`s it. The starter's heartbeat is a
-  plain \`SET\`, so two workers can believe they own the same shard.
+- **Heartbeat only your own lease.** Renewing compares the stored owner: a Lua script that returns
+  \`0\` unless \`GET lease == worker_id\` and then \`EXPIRE\`s it.
 - **Reclaim a crash.** The lease index is a sorted set keyed by deadline; a reaper returns every
   shard whose lease expired back to the work set and clears its lease, so another worker retries it.
 - **Counters update on completion only, atomically.** \`HINCRBY batch:{batch_id}:counts done 1\`
-  after the shard finishes (and \`failed\` when it does not) — never on claim, or a crashed worker
-  leaves a shard counted as done forever.
-
-**Failure mode the checks target.** A popped shard without a lease is a shard that vanishes when its
-worker dies; a heartbeat that overwrites the lease hands one shard to two workers; counting on claim
-makes the progress counter disagree with the work set.`,
+  after the shard finishes (and \`failed\` when it does not), not on claim.`,
   sequence: {
     participants: ['Worker pool', 'work set', 'batch · outbox'],
     messages: [
@@ -42,9 +39,9 @@ makes the progress counter disagree with the work set.`,
     ],
   },
   hints: [
-    'The pop and the lease are two steps, so the lease is where the race is resolved: `SET lease worker NX EX 30`. When it is refused, `SADD` the shard back — the worker that already holds it owns the work.',
-    'A heartbeat is not a write, it is a compare-and-renew. Run a Lua script that returns 0 unless `GET lease` equals the caller, then `EXPIRE`. A plain `SET` lets a second worker overwrite the owner and both process the shard.',
-    'Crash recovery needs a deadline, not a flag: keep `batch:{batch_id}:leases` as a sorted set scored by expiry, and have a reaper move every expired member back to the work set and delete its lease.',
+    'Kill a worker mid-shard and the batch finishes with one shard missing from the outputs while the counter says every shard is done.',
+    'The pop removes the shard from the only place that tracks it, the counter is bumped before any work, and a plain `SET` heartbeat lets a second worker overwrite the owner and run the same shard.',
+    'After `SPOP`, `SET lease worker nx=True ex=30` and `SADD` the shard back if refused; heartbeat via a Lua compare-then-`EXPIRE`; a reaper over the `leases` sorted set; `hincrby` only after `run_shard`.',
   ],
   checks: [
     {
@@ -121,8 +118,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def claim(batch_id: str, worker_id: str) -> str | None:
-    # TODO: this starter pops the shard with no lease and counts it before the work is done; its
-    # heartbeat overwrites the lease so two workers can believe they own the shard.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     shard_id = r.spop(f"batch:{batch_id}:shards")
     if shard_id is None:
         return None
@@ -192,14 +188,13 @@ def run_shard(batch_id: str, shard_id: str) -> None:
 `,
     },
     typescript: {
-      starter: `/** Shard claims: flawed code that pops without a lease. */
+      starter: `/** Shard claims over Redis. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
 
 export async function claim(batchID: string, workerID: string): Promise<string | null> {
-  // TODO: this starter pops the shard with no lease and counts it before the work is done; its
-  // heartbeat overwrites the lease so two workers can believe they own the shard.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const shardID = await r.spop('batch:' + batchID + ':shards');
   if (shardID === null) return null;
   await r.hincrby('batch:' + batchID + ':counts', 'done', 1);
@@ -274,8 +269,7 @@ import (
 )
 
 func Claim(ctx context.Context, rdb *redis.Client, batchID, workerID string) (string, error) {
-	// TODO: this starter pops the shard with no lease and counts it before the work is done; its
-	// heartbeat overwrites the lease so two workers can believe they own the shard.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	shardID, err := rdb.SPop(ctx, "batch:"+batchID+":shards").Result()
 	if err != nil {
 		return "", err
@@ -373,8 +367,7 @@ func RunShard(ctx context.Context, rdb *redis.Client, batchID, shardID string) {
 
 object ShardQueue {
   def claim(jedis: Jedis, batchId: String, workerId: String): Option[String] = {
-    // TODO: this starter pops the shard with no lease and counts it before the work is done; its
-    // heartbeat overwrites the lease so two workers can believe they own the shard.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     Option(jedis.spop(s"batch:$batchId:shards")).map { shardId =>
       jedis.hincrBy(s"batch:$batchId:counts", "done", 1)
       jedis.set(s"batch:$batchId:shard:$shardId:lease", workerId)
@@ -449,8 +442,7 @@ object ShardQueue {
 using namespace sw::redis;
 
 std::string claim(Redis& redis, const std::string& batchId, const std::string& workerId) {
-  // TODO: this starter pops the shard with no lease and counts it before the work is done; its
-  // heartbeat overwrites the lease so two workers can believe they own the shard.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   auto shardId = redis.spop("batch:" + batchId + ":shards");
   if (!shardId) return "";
   redis.hincrby("batch:" + batchId + ":counts", "done", 1);
@@ -524,12 +516,14 @@ void run_shard(Redis& redis, const std::string& batchId, const std::string& shar
 `,
     },
   },
-  debrief: `The interviewer is testing one property: can this queue lose a shard? The starter can, three ways.
-It pops without a lease, so a crash between pop and completion removes the shard from the work set
-forever; its heartbeat is a plain write, so a second worker can claim ownership of a shard already
-being processed; and it counts a shard as done before the work happens, so the counter says finished
-while the work set is missing an entry. The fix is the standard leased-work pattern — atomic
-\`SET NX EX\`, a compare-and-renew heartbeat, a sorted-set deadline index with a reaper, and counters
-incremented only when the shard is actually terminal. Real systems add a per-worker visibility
-timeout, a bounded redelivery count, and a poison-shard quarantine after repeated failures.`,
+  debrief: `The shape of the fix follows from one question: at every instant, where is the shard recorded? In
+the work set, or under a lease with an owner and a deadline. \`SET NX EX\` makes the handoff between
+those two states atomic; the compare-and-renew heartbeat keeps the owner from changing underneath a
+running worker; the sorted-set deadline index gives the reaper a cheap range query instead of a scan;
+and incrementing counters only on completion keeps the counts a function of real work rather than of
+claims. Each piece closes one gap through which a shard could fall.
+
+What this step did not do: cap how many times a shard can be reclaimed, so a record that crashes every
+worker ends up quarantined instead of retried forever, and size the lease against the actual shard
+runtime rather than a fixed 30 seconds.`,
 };

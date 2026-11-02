@@ -8,36 +8,27 @@ export const endpointStep: Step = {
   focus: ['sdk', 'collector', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the ingest route,
-decodes the body, hands the span to the assembler and answers \`202\`. It serves the demo because the
-demo's SDK sends a 32-character trace id, a parent that is never itself, and a duration that happens
-to be small. Three of those assumptions are wrong in production and one of them silently changes the
-meaning of every number the trace shows.
+**Starting point.** The starter serves \`POST /v1/spans\` with body
+\`{"trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7", "parent_span_id": "00f067aa0ba902b6", "service": "checkout", "start_ms": 1712345678901, "duration_ms": 412}\`:
+it reads the tenant header, decodes the body, hands the span to \`store.insert_span\` and answers
+\`202\`. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/spans\` with body
-\`{"trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7", "parent_span_id": "00f067aa0ba902b6", "service": "checkout", "start_ms": 1712345678901, "duration_ms": 412}\`.
+**Failure mode the checks target.** None of the flaws crash anything. A trace id one character
+short is a Redis key nobody will query, a self-parenting span leaves a trace with no root, and a
+duration read in the wrong unit makes a 412-second checkout look like 412 ms on a dashboard.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`trace_id\` is exactly **32 lowercase hex** characters and \`span_id\` is exactly **16 lowercase
-  hex** characters; \`parent_span_id\` is optional (absent or \`""\` for a root) but must match the span
-  id shape when present. A malformed id is **422**, never a stored span.
-- A span whose \`parent_span_id\` equals its own \`span_id\` is **422**. An accepted self-parent is a
-  cycle: the assembler never resolves a root for that trace and every read of it waits forever.
-- \`duration_ms\` is an integer from **0** to **1 800 000**; negative or larger values are **422**.
-  The unit is part of the contract: the body carries \`duration_ms\`, the response reports
-  \`"duration_unit": "ms"\`, and a body that sends \`duration\` or \`duration_s\` (seconds, as the
-  demo's SDK emits) is **422** rather than silently stored as a millisecond value.
-- \`service\` is a non-empty string of at most **64** characters and \`start_ms\` is a non-negative
-  epoch millisecond.
-- The span reaches the assembler (\`store.insert_span\`) **only after** every guard has passed, and the
-  response is \`202\` with the trace id, span id, service, \`duration_ms\`, \`duration_unit\` and
-  \`duplicate\` — the flag the dedupe key produces, so a retrying exporter is visible in the response.
-
-**Failure mode the checks target.** Every one of these defects is invisible until it matters. A
-32-hex id with a missing character is just another string to Redis, so the span lands under a key
-nobody will ever read; a self-parent hides one broken SDK behind a trace that never assembles; and a
-starter that reads \`duration\` as milliseconds turns a 412-second checkout into a 412-millisecond one,
-which is exactly the number an incident review will believe.`,
+- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
+- \`trace_id\` is exactly **32 lowercase hex** characters and \`span_id\` exactly **16**;
+  \`parent_span_id\` is optional (absent or \`""\` for a root) but must match the span id shape.
+  A malformed id is **422**.
+- A span whose \`parent_span_id\` equals its own \`span_id\` is **422**.
+- \`duration_ms\` is an integer from **0** to **1 800 000**; out-of-range values are **422**. The
+  response reports \`"duration_unit": "ms"\`, and a body that sends \`duration\` or \`duration_s\` is
+  **422** rather than stored as milliseconds.
+- \`service\` is non-empty, at most **64** characters; \`start_ms\` is a non-negative epoch
+  millisecond.
+- The span reaches \`store.insert_span\` only after every guard has passed; the \`202\` body carries
+  the ids, service, \`duration_ms\`, \`duration_unit\` and the \`duplicate\` flag.`,
   sequence: {
     participants: ['Traces SDK', 'Trace Collector', 'Redis'],
     messages: [
@@ -60,9 +51,9 @@ which is exactly the number an incident review will believe.`,
     ],
   },
   hints: [
-    'Compile the two id shapes once and match them in the handler: `^[0-9a-f]{32}$` for a trace and `^[0-9a-f]{16}$` for a span. Reject with 422 **before** the store call — an id that never matched any other span is the cheapest thing in the system to detect and the most expensive one to discover during an incident.',
-    'A parent that names its own span is a cycle, not a typo. Compare `parent_span_id` with `span_id` after the shape check and answer 422; `Some(id) == Some(id)` style comparisons on an optional field are fine, just keep the empty/absent parent as a root.',
-    'The unit belongs to the field name. Accept `duration_ms`, bound it, echo `duration_unit`, and make any other duration field — `duration`, `duration_s`, whatever the SDK invented — a 422. Whichever way you enforce that (a strict model, a field whitelist, a decoder that rejects unknown fields), the point is that a seconds value can never be read as milliseconds.',
+    'Search the UI for a trace the demo SDK just sent and nothing comes back; another trace spins forever waiting for its root; a checkout you timed at 7 minutes shows 412 ms.',
+    'The handler stores whatever the body says. No regex checks the id lengths, nothing compares `parent_span_id` to `span_id`, and `duration` is read as if it were milliseconds.',
+    'In `ingest`, match `TRACE_ID_RE`/`SPAN_ID_RE`, reject `parent_span_id == span_id`, bound `duration_ms` by `MAX_DURATION_MS`, forbid extra fields and echo `DURATION_UNIT`, all with 422 before `store.insert_span`.',
   ],
   checks: [
     {
@@ -159,9 +150,7 @@ store = SpanStore()
 
 @app.post("/v1/spans")
 def ingest(body: SpanIn, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
-    # whose parent is itself, and reads the SDK's duration (seconds) as if it were milliseconds.
-    # Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     span = {
         "trace_id": body.trace_id,
         "span_id": body.span_id,
@@ -277,9 +266,7 @@ interface SpanBody {
 }
 
 app.post('/v1/spans', async (request, reply) => {
-  // TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
-  // whose parent is itself, and reads the SDK's \`duration\` (seconds) as if it were milliseconds.
-  // Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as SpanBody;
   const durationMs = Math.round(body.duration);
@@ -417,9 +404,7 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
-	// whose parent is itself, and reads the SDK's duration (seconds) as if it were milliseconds.
-	// Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	span := map[string]any{
 		"trace_id":       body.TraceID,
 		"span_id":        body.SpanID,
@@ -603,9 +588,7 @@ object Api {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[SpanIn]) { body =>
-            // TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a
-            // span whose parent is itself, and reads the SDK's duration (seconds) as if it were
-            // milliseconds. Validate the ids, reject a self-parent, name the unit, then store.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val span = Map[String, Any](
               "trace_id" -> body.trace_id,
               "span_id" -> body.span_id,
@@ -744,9 +727,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
-    // whose parent is itself, and reads the SDK's duration (seconds) as if it were milliseconds.
-    // Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const double duration = body.value("duration", 0.0);
     const json span = {
         {"trace_id", body.value("trace_id", std::string())},
@@ -881,5 +862,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug an ingest handler at the trust boundary, and the tell is that every defect is a *shape* problem rather than a crash. Ids are the join key of the whole system: a trace id that is the wrong length does not fail anywhere, it simply produces a trace that no query will ever find, which is worse than an error because it looks like data loss during an incident. The self-parent is the cycle case that turns an assembly algorithm into an infinite expectation: the trace waits for a root that cannot exist. The unit is the quietest one and the most dangerous: a span whose duration is read in the wrong unit makes a slow path look fast, and a latency dashboard is exactly the artefact an on-call engineer trusts to decide whether to roll back. Real collectors add clock-skew correction between the SDK's \`start_ms\` and the collector's receipt, parse the W3C \`traceparent\` header, cap per-tenant ingest rates, and decide sampling at the edge — but all of that assumes the ids and units survived the door.`,
+  debrief: `The fix lives at the trust boundary because ids and units are the join keys of the whole system. A trace id of the wrong length does not fail anywhere; it produces a trace that no query will find, which looks like data loss during an incident. A self-parent turns assembly into an infinite expectation, and a duration read in the wrong unit makes a slow path look fast on the dashboard that decides a rollback. Rejecting all of that before \`insert_span\` keeps every stored span readable and comparable. Production collectors go further: they correct clock skew between the SDK's \`start_ms\` and the collector's receipt, parse the W3C \`traceparent\` header, and cap per-tenant ingest rates. All of that assumes the ids and units survived the door.`,
 };

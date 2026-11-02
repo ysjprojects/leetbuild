@@ -8,36 +8,28 @@ export const readStep: Step = {
   focus: ['requester', 'agent', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: a ticket page renders a
-timeline, so the demo looks finished. It hands every note — internal ones included — to whoever
-asks, it treats a requester and an agent identically, and it pages with \`limit\`/\`offset\`, so the
-other half of the timeline shifts under a reader as notes arrive. Debug it, fix it, and prove the
-fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/tickets/{ticket_id}\` with \`limit\` and \`offset\`:
+it calls \`store.page(ticket_id, limit, offset)\` and returns \`{"ticket_id", "notes"}\` to whoever
+asks, reading no role header and issuing no cursor. The ticket page renders a timeline, so the demo
+looks finished. It serves the demo and hides 4 flaws.
 
-Implement \`GET /v1/tickets/{ticket_id}\`, the read the requester's ticket page and the agent console
-both call:
+**Failure mode the checks target.** Returning every note to everyone breaks the promise that
+internal notes stay internal, and it fails the first time a customer opens the page rather than at
+deploy. An \`offset\` page over a busy timeline makes notes repeat or vanish without telling the
+reader. No cursor forces clients to invent offsets, and filtering before deriving the cursor makes
+a requester ask for the same page forever.
 
-- The caller's role comes from \`X-Actor-Role\` (\`requester\` | \`agent\`); a missing or unknown role is
-  **401**. \`limit\` defaults to 50 and must be **1–100** — anything outside that is **400**.
-- The response is \`{"ticket_id", "notes", "next_cursor"}\`: the ticket's timeline page, ordered by the
-  notes' monotonic \`seq\`, plus the opaque cursor for the following page (\`null\` when this page is the
-  last one). A \`cursor\` that is not one the server issued is **400**, before the store is touched.
-- Visibility applies to the page, not to the URL: an entry whose \`visibility\` is \`internal\` is for
-  agents. A requester must **never** receive one; an agent receives the internal notes as well, so the
-  agent console sees the whole timeline.
-- Pagination is keyset, not \`offset\`. The store is provided and reads one keyset page:
-  \`page(ticket_id, after_seq, limit)\` returns up to \`limit\` entries with \`seq > after_seq\`
-  ascending by \`seq\`, each \`{seq, visibility, author, body}\` — and \`next_cursor\` encodes the \`seq\`
-  of the last entry **fetched**. Two readers paging the same busy ticket must not see a note twice or
-  miss one because fifteen notes arrived in between.
+Requirements:
 
-**Failure mode the checks target.** A read that returns every note to everyone is a one-line breach
-of the promise the support product makes to its customers — internal notes are ours — and it does not
-fail loudly when it ships; it fails the first time a customer opens the page. An \`offset\` page over
-an append-only, busy timeline is a wrong-results bug that looks like a UI glitch: notes repeat, notes
-vanish, and the reader is never told. A response with no cursor is what forces clients to invent
-offsets in the first place, and filtering the page before deriving the cursor makes a requester ask
-for the same page forever.`,
+- The role comes from \`X-Actor-Role\` (\`requester\` | \`agent\`); missing or unknown is **401**.
+  \`limit\` defaults to 50 and must be **1–100** (**400** otherwise).
+- The response is \`{"ticket_id", "notes", "next_cursor"}\`: a page ordered by \`seq\`, plus the
+  opaque cursor for the next page (\`null\` on the last). A \`cursor\` the server did not issue is
+  **400**, before the store is touched.
+- An entry whose \`visibility\` is \`internal\` is dropped for a requester and kept for an agent.
+- Pagination is keyset: \`store.page(ticket_id, after_seq, limit)\` returns up to \`limit\` entries
+  with \`seq > after_seq\`, each \`{seq, visibility, author, body}\`; \`next_cursor\` encodes the
+  \`seq\` of the last entry **fetched**, not the last one shown.`,
   sequence: {
     participants: ['Requester', 'Agent', 'Ticket API', 'Ticket store'],
     messages: [
@@ -63,9 +55,9 @@ for the same page forever.`,
     ],
   },
   hints: [
-    'The role is an input like any other: `X-Actor-Role` must be `requester` or `agent` (401 otherwise), and it decides one thing — whether `visibility == "internal"` entries belong in the page. Filter the entries you fetched; there is no second read that knows the caller.',
-    'A cursor is a position in the timeline, not a count of rows: `next_cursor` encodes the `seq` of the last entry you fetched, and the next request reads `seq > after_seq`. Encoding the last **visible** entry instead stalls a requester on a page of internal notes — the position never advances past them.',
-    'Pagination and visibility have to compose: the store reads a keyset page of the raw timeline (`limit` entries, ascending by `seq`), the response carries the cursor of the last raw entry even when that entry was filtered out, and a page shorter than `limit` means the timeline is exhausted, so `next_cursor` is `null`.',
+    'A customer opens their ticket and reads the agents’ internal notes about them; on a busy ticket, scrolling shows the same note twice and skips another.',
+    'The handler reads no `X-Actor-Role`, so every caller gets the raw page; `store.page(ticket_id, limit, offset)` is a row count over a timeline that grows while the reader pages, so later offsets shift.',
+    'Read the role (401 if invalid), set `include_internal = role == "agent"`, drop `visibility == "internal"` entries otherwise; replace `offset` with a `cursor` over `seq`, `store.page(ticket_id, after_seq, limit)`, and `next_cursor` from the last entry fetched.',
   ],
   checks: [
     {
@@ -168,10 +160,7 @@ store = TicketTimeline()
 
 @app.get("/v1/tickets/{ticket_id}")
 def read_ticket(ticket_id: str, limit: int = Query(50), offset: int = Query(0)) -> JSONResponse:
-    # TODO: this starter hands every note — internal ones included — to every caller, treats a
-    # requester and an agent alike, and pages with limit/offset, so notes appended while a reader
-    # is paging push the rest of the timeline forward. Read the role from X-Actor-Role, drop
-    # internal notes for requesters, keep them for agents, and page by a cursor over the notes' seq.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     notes = store.page(ticket_id, limit, offset)
     return JSONResponse({"ticket_id": ticket_id, "notes": notes}, status_code=200)
 `,
@@ -253,10 +242,7 @@ class TicketTimeline {
 const store = new TicketTimeline();
 
 app.get('/v1/tickets/:ticketId', async (request, reply) => {
-  // TODO: this starter hands every note — internal ones included — to every caller, treats a
-  // requester and an agent alike, and pages with limit/offset, so notes appended while a reader
-  // is paging push the rest of the timeline forward. Read the role from X-Actor-Role, drop
-  // internal notes for requesters, keep them for agents, and page by a cursor over the notes' seq.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {ticketId} = request.params as {ticketId: string};
   const query = request.query as {limit?: string; offset?: string};
   const limit = Number(query.limit ?? 50);
@@ -355,10 +341,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readTicket(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter hands every note — internal ones included — to every caller, treats a
-	// requester and an agent alike, and pages with limit/offset, so notes appended while a reader
-	// is paging push the rest of the timeline forward. Read the role from X-Actor-Role, drop
-	// internal notes for requesters, keep them for agents, and page by a cursor over the notes' seq.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	ticketID := r.PathValue("id")
 	limit := 50
 	if raw := r.URL.Query().Get("limit"); raw != "" {
@@ -524,10 +507,7 @@ object ReadApi {
     path("v1" / "tickets" / Segment) { ticketId =>
       get {
         parameters("limit".as[Int].withDefault(DefaultLimit), "offset".as[Int].withDefault(0)) { (limit, offset) =>
-          // TODO: this starter hands every note — internal ones included — to every caller, treats a
-          // requester and an agent alike, and pages with offset, so notes appended while a reader
-          // is paging push the rest of the timeline forward. Read the role from X-Actor-Role, drop
-          // internal notes for requesters, keep them for agents, and page by a cursor over seq.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val notes = TicketTimeline.page(ticketId, limit, offset)
           complete(StatusCodes.OK, TimelinePage(ticketId, notes))
         }
@@ -632,10 +612,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/tickets/([A-Za-z0-9_-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter hands every note — internal ones included — to every caller, treats a
-    // requester and an agent alike, and pages with limit/offset, so notes appended while a reader
-    // is paging push the rest of the timeline forward. Read the role from X-Actor-Role, drop
-    // internal notes for requesters, keep them for agents, and page by a cursor over the notes' seq.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto ticketId = req.matches[1].str();
     const int limit = req.has_param("limit") ? std::stoi(req.get_param_value("limit")) : 50;
     const int offset = req.has_param("offset") ? std::stoi(req.get_param_value("offset")) : 0;
@@ -768,5 +745,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question is whether you see the two contracts a timeline read owes its callers — who may see what, and where a page ends — and that they interact. Visibility first: the role arrives in \`X-Actor-Role\`, and the only place that can safely apply it is the page the endpoint builds, because the store does not know the caller. Handlers that "filter later" — in a serializer, in a template, in a second query — leak the first time a field or a caller is added; the check is the one the customer will run, not you. Pagination second: \`LIMIT/OFFSET\` is stable for a frozen dataset and unstable for a live one. A ticket that receives notes while a reader pages shifts every later offset, so notes repeat or vanish — and because the reader cannot tell, it reads as a UI glitch. A keyset cursor over the monotonic \`seq\` (the value that already exists for ordering) names a position instead of a row number, so appends cannot move it. The trap is the composition: filter internal notes before deriving the cursor and a requester whose page was half internal asks for the next page from a position that never advanced, and the endpoint serves the same page forever. Real platforms sign cursors so a client cannot forge a position, cap \`limit\` per plan, and expose the timeline as a per-ticket append-only log whose ordering the store guarantees.`,
+  debrief: `The fix composes two contracts a timeline read owes its callers: who may see what, and where a page ends. Visibility is applied to the page the endpoint builds, because the store does not know the caller; handlers that filter later, in a serializer or a second query, leak the first time a field or a caller is added. Pagination becomes a keyset cursor over the monotonic \`seq\` because \`LIMIT/OFFSET\` is stable for a frozen dataset and unstable for a live one: a ticket that receives notes while a reader pages shifts every later offset. The trap is the composition: derive the cursor from the last entry fetched, not the last one shown, or a requester whose page was half internal asks for the next page from a position that never advanced.
+
+Production platforms sign cursors so a client cannot forge a position, cap \`limit\` per plan, and expose the timeline as a per-ticket append-only log whose ordering the store guarantees.`,
 };

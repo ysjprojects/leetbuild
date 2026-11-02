@@ -8,39 +8,26 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'carrier'],
   task: `## Task
 
-**Starting point.** The starter is working code: a scan arrives, the status is
-written, the tracking page moves. It never fails in a demo where scans arrive in order and one
-carrier scans at a time. Both of those assumptions are false in production. Debug it, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/shipments/{shipment_id}/scans\` with body
+\`{"status": "out_for_delivery", "scan_at": 1761000000, "carrier": "ups"}\`. It reads the current
+status with a client-side \`GET\`, then \`HSET\`s whatever status the body carries onto
+\`shipment:{id}:status\` and answers \`applied: true\`. It serves the demo and hides five flaws.
 
-Implement \`POST /v1/shipments/{shipment_id}/scans\` with body
-\`{"status": "out_for_delivery", "scan_at": 1761000000, "carrier": "ups"}\`.
+**Failure mode the checks target.** A delayed \`in_transit\` scan after the delivery scan rolls the
+shipment backward and the customer's page "un-delivers" a parcel already on the porch. Two carriers
+scanning at once both read the old status and the slower write wins. A \`returned\` scan after
+\`delivered\` reopens a closed shipment.
 
-- The shipment's status is one of \`label\`, \`in_transit\`, \`out_for_delivery\`, \`delivered\`,
-  \`returned\`, ranked in that order (\`STATUS_RANK\`). A status outside the set is **400** and never
-  reaches Redis.
-- The status may only move **forward**: a scan whose rank is not strictly greater than the current
-  one is **dropped, not applied**. A delayed \`in_transit\` scan that arrives after the delivery
-  scan must leave the shipment \`delivered\`.
-- **Terminal states are immutable.** Once the shipment is \`delivered\` or \`returned\`, no scan may
-  move it anywhere, including \`returned\` after \`delivered\` — the parcel has already been handed
-  over.
-- The read, the comparison and the write happen inside **one atomic Lua \`EVAL\`**
-  (\`APPLY_LUA\`). Two carriers scanning at once must resolve to the **furthest valid state**, not
-  to whichever request was slower to write; a client-side \`GET\` followed by \`HSET\` is the race
-  the starter ships.
-- A dropped transition is not applied and is **recorded**: \`LPUSH\` the attempted edge
-  (\`delivered->in_transit\`) onto \`shipment:rejects:{shipment_id}\` and keep it on the hash, so
-  operations can see which carrier is reporting out of order.
-- Answer with \`{"applied": bool, "status": "<current>", "attempted": "<from>-><to>",
-  "terminal": bool}\`.
-
-**Failure mode the checks target.** The starter applies whatever status the latest poll reports, so a
-delayed in-transit scan after delivery rolls the shipment backward and the customer's page
-"un-delivers" a parcel that is already on the porch. Two carriers scanning the same shipment both
-read and both write, and the later write wins regardless of rank, so the outcome depends on
-scheduling. And with no terminal guard, a \`returned\` after \`delivered\` reopens a closed shipment.
-Every one of those is invisible until a real carrier network disagrees with itself.`,
+- Statuses are \`label\`, \`in_transit\`, \`out_for_delivery\`, \`delivered\`, \`returned\`, ranked
+  in that order in \`STATUS_RANK\`. Anything else is **400** before Redis is touched.
+- Only strictly forward moves apply: \`ranks[new] <= ranks[current]\` is dropped.
+- \`delivered\` and \`returned\` are terminal (\`TERMINAL\`, \`is_terminal()\`); the script tests
+  \`terminals[current]\` before the rank comparison.
+- The read, comparison and write run inside one Lua script, \`APPLY_LUA\`, through \`EVAL\` (\`HGET\`
+  and \`HSET\` on the script side). No client-side \`hset\` after a read.
+- A dropped transition is recorded: \`LPUSH\` the attempted edge (\`delivered->in_transit\`) onto
+  \`shipment:rejects:{shipment_id}\` and keep it on the hash.
+- Answer \`{"applied": bool, "status": "<current>", "attempted": "<from>-><to>", "terminal": bool}\`.`,
   sequence: {
     participants: ['Carrier gateway', 'Shipment API', 'Redis'],
     messages: [
@@ -74,9 +61,9 @@ Every one of those is invisible until a real carrier network disagrees with itse
     ],
   },
   hints: [
-    'The comparison has to live where the state lives. `GET`, compare in your process, `HSET`: two carriers do that at the same time and both see the old status. One `APPLY_LUA` script does `HGET`, ranks the statuses and `HSET`s only on a forward move, so the winner is decided inside Redis.',
-    'Forward-only is a rank comparison, and a rejected scan is information, not noise: `LPUSH` the attempted edge (`delivered->in_transit`) onto `shipment:rejects:{id}` and mirror it onto the hash, then answer with `applied: false` and the status you kept. Operations needs to know which carrier is scanning out of order.',
-    'Terminal is a separate guard from monotonic: `delivered` and `returned` are both the end of the line, so a `returned` scan after a delivery would pass a rank check. Test `terminals[current]` before the rank comparison, and keep the language-side `TERMINAL` set and `is_terminal()` helper so the response can say the shipment is closed.',
+    'A customer refreshes the tracking page and a delivered parcel goes back to in transit; a day later the same shipment shows returned. Operations cannot tell which carrier sent the late scan.',
+    "The handler compares nothing: it reads the status in the process and writes the body's status. Two requests that read before either writes both succeed, and the later write wins regardless of rank.",
+    'Move the compare into `APPLY_LUA`: `HGET`, test `terminals[current]`, then `ranks[new] <= ranks[current]` drops and `LPUSH`es `shipment:rejects:{id}`; otherwise `HSET`. Run it with `EVAL`. `STATUS_RANK`, `TERMINAL` and `is_terminal()` shape the response.',
   ],
   checks: [
     {
@@ -170,10 +157,7 @@ def status_key(shipment_id: str) -> str:
 
 @app.post("/v1/shipments/{shipment_id}/scans")
 def record_scan(shipment_id: str, body: ScanRequest) -> dict:
-    # TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
-    # delivery rolls the shipment backward, two carriers scanning at once race and the later write
-    # wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
-    # keep only strictly forward moves, and record the rejected edge instead of applying it.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     current = r.get(f"{status_key(shipment_id)}:status") or "label"
     r.hset(
         status_key(shipment_id),
@@ -261,7 +245,7 @@ def record_scan(shipment_id: str, body: ScanRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/shipments/:shipmentId/scans: flawed code that writes whatever it is told. */
+      starter: `/** POST /v1/shipments/:shipmentId/scans: apply a carrier scan to the shipment status. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -279,10 +263,7 @@ function statusKey(shipmentId: string): string {
 }
 
 app.post('/v1/shipments/:shipmentId/scans', async (request, reply) => {
-  // TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
-  // delivery rolls the shipment backward, two carriers scanning at once race and the later write
-  // wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
-  // keep only strictly forward moves, and record the rejected edge instead of applying it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const {shipmentId} = request.params as {shipmentId: string};
   const body = request.body as ScanBody;
   const current = (await r.hget(statusKey(shipmentId), 'status')) ?? 'label';
@@ -415,10 +396,7 @@ func recordScan(rw http.ResponseWriter, r *http.Request) {
 		Carrier string \`json:"carrier"\`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
-	// delivery rolls the shipment backward, two carriers scanning at once race and the later write
-	// wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
-	// keep only strictly forward moves, and record the rejected edge instead of applying it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	current, _ := rdb.HGet(context.Background(), statusKey(shipmentID), "status").Result()
 	if current == "" {
 		current = "label"
@@ -562,10 +540,7 @@ object StateApi {
     path("v1" / "shipments" / Segment / "scans") { shipmentId =>
       post {
         entity(as[ScanRequest]) { body =>
-          // TODO: this starter applies whatever status the poll reports: a delayed in-transit scan
-          // after a delivery rolls the shipment backward, two carriers scanning at once race and
-          // the later write wins, and nothing protects a terminal state. Apply the transition in
-          // one atomic Lua script, keep only strictly forward moves, and record the rejected edge.
+          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
           val current = Option(jedis.hget(statusKey(shipmentId), "status")).getOrElse("label")
           jedis.hset(
             statusKey(shipmentId),
@@ -702,10 +677,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
-    // delivery rolls the shipment backward, two carriers scanning at once race and the later write
-    // wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
-    // keep only strictly forward moves, and record the rejected edge instead of applying it.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto status = body.value("status", std::string());
     auto rawCurrent = redis.hget(statusKey(shipmentId), "status");
     const auto current = rawCurrent ? *rawCurrent : std::string("label");
@@ -826,5 +798,5 @@ int main() {
 `,
     },
   },
-  debrief: `The question behind this step is monotonicity under concurrency: a status that only moves forward is a compare-and-set on a ranked value, and both halves have to happen in one place. Doing the comparison in your process turns it into a read-modify-write race that passes every serial test and fails when two carriers scan the same parcel a second apart. The rank table makes "forward" checkable; the terminal guard makes it safe to replay any late scan; the rejects list turns a dropped scan into an observed event instead of a mystery in the customer's timeline. Real tracking services add per-scan dedupe by carrier scan id, a separate history list for the full timeline, and a reconciliation job that compares the carrier's own scan history against the state they recorded.`,
+  debrief: `A status that only moves forward is a compare-and-set on a ranked value, and both halves have to run where the value lives. Comparing in the process and writing afterwards is a read-modify-write that passes every serial test and loses when two carriers scan the same parcel a second apart, which is why the fix is one Lua script rather than a smarter handler. The rank table makes "forward" checkable, the terminal guard makes any late scan safe to replay, and the rejects list turns a dropped scan into something operations can see. Production tracking services also dedupe scans by the carrier's own scan id, keep a history list so the timeline is more than the current status, and reconcile the carrier's scan history against the stored one.`,
 };

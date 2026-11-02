@@ -13,35 +13,32 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'engine'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the cache, misses,
-computes and serves, so the demo works. It hides two production flaws that only show up later —
-a key that essentially never hits, and an entry that may be served long after the traffic state it
-was computed under has changed. Debug it, fix it, and prove the fix with the checks below.
-
-Implement the route cache that fronts the routing engine:
-
-- **Cell key.** Round every coordinate to a \`CELL_DEGREES = 0.001\` grid (~110 m) before it goes
-  into the key, so two requests for the same corner share one entry despite GPS jitter. Keying on
-  raw floats never hits; rounding to whole degrees would merge different streets.
-- **Epoch key.** The key is
-  \`route:{origin_cell}:{dest_cell}:{mode}:{epoch}\` with \`epoch = floor(unix_seconds / EPOCH_S)\`
-  and \`EPOCH_S = 300\` — a five-minute traffic window. A route computed at rush hour may not be
-  served under the midnight epoch.
-- **Stale-epoch entry.** The stored entry carries the epoch it was computed under, and a read
-  serves it only when that epoch equals the current one; a mismatch is a miss — recompute and
-  overwrite under the current key.
-- **Honest response.** The response reports \`epoch\` and whether the route was \`cached\`, so a
-  caller can tell which traffic state the geometry belongs to.
-- **Bounded entries.** The write sets an expiry of \`TTL_S = EPOCH_S * 2\`, so old keys leave Redis
-  instead of living forever.
-- The cache is consulted **before** the engine: only a miss costs an engine call, and the computed
-  route is stored before it is returned.
+**Starting point.** The starter is the route cache that fronts the routing engine on
+\`POST /v1/routes\`: it looks up a Redis key built from the raw origin, destination and mode,
+calls the engine on a miss, stores the geometry and returns it. It serves the demo and hides five
+flaws.
 
 **Failure mode the checks target.** Raw floats as keys turn the cache into pure cost: a 6th
 decimal of GPS noise makes every request a miss. An epoch-less entry is worse than no cache: once
 a key does match, the same geometry comes back at any hour, so a rush-hour route is served at
-midnight as if it were current. And with no expiry, every cell ever requested stays in Redis
-forever.`,
+midnight as if it were current, and the response gives the caller no way to tell. With no expiry,
+every cell ever requested stays in Redis forever.
+
+- **Cell key.** Round every coordinate to a \`CELL_DEGREES = 0.001\` grid (~110 m) before it goes
+  into the key, so two requests for the same corner share one entry despite GPS jitter. Rounding
+  to whole degrees would merge different streets.
+- **Epoch key.** The key is
+  \`route:{origin_cell}:{dest_cell}:{mode}:{epoch}\` with \`epoch = floor(unix_seconds / EPOCH_S)\`
+  and \`EPOCH_S = 300\`, a five-minute traffic window.
+- **Stale-epoch entry.** The stored entry carries the epoch it was computed under, and a read
+  serves it only when that epoch equals the current one; a mismatch is a miss: recompute and
+  overwrite under the current key.
+- **Provenance in the response.** The response reports \`epoch\` and whether the route was
+  \`cached\`, so a caller can tell which traffic state the geometry belongs to.
+- **Bounded entries.** The write sets an expiry of \`TTL_S = EPOCH_S * 2\`, so old keys leave Redis
+  instead of living forever.
+- The cache is consulted **before** the engine: only a miss costs an engine call, and the computed
+  route is stored before it is returned.`,
   sequence: {
     participants: ['Client', 'Maps API', 'Redis', 'Routing engine'],
     messages: [
@@ -55,9 +52,9 @@ forever.`,
     ],
   },
   hints: [
-    'Rounding before keying is what makes the cache hit at all: `round(lat / CELL_DEGREES)` collapses 6-decimal GPS readings of the same corner into one integer cell. Keep the grid fine — 0.001° is ~110 m, whole degrees would merge neighbourhoods.',
-    'The traffic epoch is `floor(unix_seconds / 300)`. Put it in the key *and* in the stored entry: the key routes a request to the current epoch, and the entry’s own epoch is what lets a reader refuse a route written under a different one.',
-    'The write must carry the expiry: `TTL_S = EPOCH_S * 2`, passed as `ex=TTL_S` on a Redis `SET` (or its `EX` argument, `setex` on Jedis), so superseded epochs actually leave Redis. The epoch in the key makes them unreachable; the TTL makes them disappear.',
+    'Redis memory grows every day and the hit rate sits near zero, yet one driver who does get a hit at midnight is routed around a traffic jam that cleared six hours ago.',
+    'The key is built from unrounded floats, so GPS jitter makes each request unique; the few entries that do match carry no epoch, no expiry, and the response carries no `epoch` or `cached` field.',
+    'Add `cell()` with `round(lat / CELL_DEGREES)`, `route_key(…)` ending in `{epoch}` with `epoch = floor(now / EPOCH_S)`, store `epoch` in the entry and compare it on read, `SET … ex=TTL_S` with `TTL_S = EPOCH_S * 2`, and return `epoch` and `cached`.',
   ],
   checks: [
     {
@@ -163,10 +160,7 @@ engine = RoutingEngine()
 
 @app.post("/v1/routes")
 def compute_route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
-    # entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush
-    # hour is served at midnight; and the response never says which traffic state it belongs to.
-    # Fix all of it.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = (
         f"route:{body.origin.lat}:{body.origin.lng}"
         f":{body.destination.lat}:{body.destination.lng}:{body.mode}"
@@ -282,10 +276,7 @@ interface RouteBody {
 }
 
 export async function routeWithCache(body: RouteBody): Promise<{route: string}> {
-  // TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
-  // entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush hour
-  // is served at midnight; and the response never says which traffic state it belongs to.
-  // Fix all of it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`route:\${body.origin.lat}:\${body.origin.lng}:\${body.destination.lat}:\${body.destination.lng}:\${body.mode}\`;
   const raw = await r.get(key);
   if (raw !== null) return {route: JSON.parse(raw) as string};
@@ -408,10 +399,7 @@ func handleRoute(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
-	// entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush
-	// hour is served at midnight; and the response never says which traffic state it belongs to.
-	// Fix all of it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("route:%v:%v:%v:%v:%s", body.Origin.Lat, body.Origin.Lng, body.Destination.Lat, body.Destination.Lng, body.Mode)
 	if raw, err := rdb.Get(r.Context(), key).Bytes(); err == nil {
 		writeJSON(rw, http.StatusOK, map[string]any{"route": string(raw)})
@@ -568,10 +556,7 @@ object StateApi {
       post {
         headerValueByName("X-Tenant-Id") { _ =>
           entity(as[RouteRequest]) { body =>
-            // TODO: this starter keys the cache by raw float coordinates, so no two requests ever
-            // share an entry; it stores routes with no traffic epoch and no expiry, so a route
-            // computed at rush hour is served at midnight; and the response never says which
-            // traffic state it belongs to. Fix all of it.
+            // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
             val key = s"route:\${body.origin.lat}:\${body.origin.lng}:\${body.destination.lat}:\${body.destination.lng}:\${body.mode}"
             Option(jedis.get(key)) match {
               case Some(payload) =>
@@ -698,10 +683,7 @@ int main() {
   svr.Post("/v1/routes", [&redis](const httplib::Request& req, httplib::Response& res) {
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
-    // entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush
-    // hour is served at midnight; and the response never says which traffic state it belongs to.
-    // Fix all of it.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const std::string key = "route:" + std::to_string(body["origin"].value("lat", 0.0)) + ":" +
                             std::to_string(body["origin"].value("lng", 0.0)) + ":" +
                             std::to_string(body["destination"].value("lat", 0.0)) + ":" +
@@ -843,24 +825,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is what a cache key *means*. A key is a promise that
-everything two requests share is shared on purpose: the cell size decides how much GPS noise,
-walking-distance start points and map-snapping differences the entry tolerates, and the traffic
-epoch decides how old a route may be before it is a different route. Getting those two into the key
-— and keeping the epoch in the entry so a reader can verify it rather than trust the key alone — is
-the whole step. The \`cached\` and \`epoch\` fields in the response are what let the client, the
-dependency step's fallback and the telemetry step tell an honest story about the geometry they got.
+  debrief: `The fix has the shape of a key that says what two requests are allowed to share. The cell size decides how much GPS noise and map-snapping difference an entry tolerates, and the traffic epoch decides how old a route may be before it is a different route. Keeping the epoch inside the entry as well as in the key lets a reader verify provenance instead of trusting the key alone, and the \`epoch\` and \`cached\` fields hand that provenance to the client, the fallback in the next step and the telemetry. The TTL is twice the epoch so entries survive one bump and then leave on their own.
 
-The TTL is deliberately twice the epoch: long enough that entries survive a traffic bump, short
-enough that superseded epochs leave the keyspace on their own instead of relying on a sweeper. Real
-maps systems go further in three directions: cells are H3 or geohash tiles whose size varies with
-population density instead of a fixed 0.001°; the epoch is derived from the traffic service's
-snapshot ids so every replica shares one notion of "current"; and road closures and incident
-updates invalidate cells explicitly, because waiting for the next epoch to fix a closed motorway is
-not acceptable. Those add a second invalidation channel on top of the pattern here — they do not
-replace it.
-
-What was left out on purpose: neighbour-cell lookups to smooth routing across cell boundaries,
-single-flight de-duplication so a cold popular cell is computed once, negative caching for
-unroutable pairs, per-region epochs, and cache-warming.`,
+Production maps caches vary the cell size with road density (H3 or geohash tiles), derive the epoch from the traffic service's snapshot id so every replica agrees on "current", and invalidate cells explicitly on road closures instead of waiting for the next epoch. Left out here: neighbour-cell lookups, single-flight de-duplication for a cold popular cell, and negative caching for unroutable pairs.`,
 };

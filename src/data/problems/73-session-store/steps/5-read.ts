@@ -8,27 +8,27 @@ export const readStep: Step = {
   focus: ['api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it lists a user's sessions from a cache so
-the page loads fast. It compiles, it serves the demo, and it hides three production flaws. Debug it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/users/{user_id}/sessions\` from an hourly
+\`summary_cache\`, rebuilding the list from the store's index on a miss with only the session id and
+device class, and \`DELETE /v1/users/{user_id}/sessions\` drops the cache entry and returns
+\`{"revoked": true}\`. Neither route checks who is asking. It compiles and hides 5 flaws.
 
-Implement \`GET /v1/users/{user_id}/sessions\` and \`DELETE /v1/users/{user_id}/sessions\`.
+**Failure mode the checks target.** A read endpoint that trusts the path parameter serves one user's session
+metadata to another, and device class and last-seen are exactly the signals an attacker wants. A cached summary
+makes the page fast and the last-seen value a lie. And a revoke-all that returns before the ids are gone leaves
+a "signed out everywhere" screen with sessions still authenticating.
+
+Requirements:
 
 - **Only your own sessions.** The caller's \`user_id\` comes from the validated claims; asking for another
-  user's sessions is **403**. The starter serves anyone's sessions to anyone.
+  user's sessions is **403**.
 - **Active only.** A session past \`ABSOLUTE_TTL_S\` is not listed; the endpoint reads the live record and skips
   expired ones rather than trusting a cached summary.
 - **Fresh last-seen.** Each session reports \`last_seen\` from the live record, accurate to within
   \`LAST_SEEN_WINDOW_S\` = 60 seconds, not the last-seen value from an hour-old cache.
 - **Rotation count.** Each session reports its \`rotation\` count, so a user can see how often the id has changed.
-- **Revoke-all invalidates first.** \`DELETE\` removes every one of the user's session ids **before** it returns,
-  so no id in the list is still authenticating after the response. The starter drops the cache and returns while
-  the ids keep working.
-
-**Failure mode the checks target.** A read endpoint that trusts the path parameter serves one user's session
-metadata to another — device class and last-seen are exactly the signals an attacker wants. A cached summary
-makes the page fast and the last-seen value a lie. And a revoke-all that returns before the ids are gone leaves
-a "signed out everywhere" screen with sessions still authenticating.`,
+- **Revoke-all invalidates first.** \`DELETE\` removes every one of the user's session ids and clears the index
+  **before** it returns, so no id in the list is still authenticating after the response.`,
   sequence: {
     participants: ['Client', 'Session API', 'Session Store'],
     messages: [
@@ -41,9 +41,9 @@ a "signed out everywhere" screen with sessions still authenticating.`,
     ],
   },
   hints: [
-    'The path carries a user id and the request carries claims. Which one decides whose sessions may be read, and what happens when they differ?',
-    'A cached summary is fast and wrong. Which value on this page is only true if you read it from the live record?',
-    'A revoke-all that responds before the ids are gone is not a revoke-all. In what order must the deletes and the response happen?',
+    'Any signed-in user can open another user\'s session page; "signed out everywhere" leaves every device signed in; last-seen lags by up to an hour and expired sessions still appear.',
+    'Neither route compares `request.state.claims["user_id"]` to the path; the list comes from `summary_cache` for an hour, built without `last_seen`, `rotation` or an age check; `DELETE` only pops that cache.',
+    'Return 403 when `caller != user_id`; drop the cache, skip records past `ABSOLUTE_TTL_S`, emit `last_seen` with `LAST_SEEN_WINDOW_S = 60` and `rotation`; in `DELETE`, delete each `session:{session_id}` then `store.clear`.',
   ],
   checks: [
     {
@@ -128,8 +128,7 @@ summary_cache: dict[str, tuple[dict, float]] = {}
 
 @app.get("/v1/users/{user_id}/sessions")
 async def list_sessions(user_id: str, request: Request):
-    # TODO: the list is served from an hourly cache and never checks who is asking, so any caller can
-    # read any user's sessions and the last-seen value can be an hour old.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     now = time.time()
     hit = summary_cache.get(user_id)
     if hit is not None and now < hit[1]:
@@ -148,7 +147,6 @@ async def list_sessions(user_id: str, request: Request):
 
 @app.delete("/v1/users/{user_id}/sessions")
 async def revoke_all(user_id: str, request: Request):
-    # TODO: the cache is dropped but the session ids keep authenticating.
     summary_cache.pop(user_id, None)
     return {"revoked": True}
 `,
@@ -209,8 +207,7 @@ const summaryCache = new Map<string, {body: unknown; expiresAt: number}>();
 
 export async function sessionReadRoutes(app: FastifyInstance) {
   app.get('/v1/users/:userId/sessions', async (req, reply) => {
-    // TODO: the list is served from an hourly cache and never checks who is asking, so any caller can
-    // read any user's sessions and the last-seen value can be an hour old.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const {userId} = req.params as {userId: string};
     const now = Date.now();
     const hit = summaryCache.get(userId);
@@ -230,7 +227,6 @@ export async function sessionReadRoutes(app: FastifyInstance) {
   });
 
   app.delete('/v1/users/:userId/sessions', async (req, reply) => {
-    // TODO: the cache is dropped but the session ids keep authenticating.
     const {userId} = req.params as {userId: string};
     summaryCache.delete(userId);
     return reply.send({revoked: true});
@@ -309,8 +305,7 @@ const cacheTTLS = 3600
 var summaryCache = map[string][]byte{}
 
 func handleListSessions(w http.ResponseWriter, req *http.Request, userID string) {
-	// TODO: the list is served from an hourly cache and never checks who is asking, so any caller can
-	// read any user's sessions and the last-seen value can be an hour old.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	if cached, ok := summaryCache[userID]; ok {
 		w.Write(cached)
 		return
@@ -332,7 +327,6 @@ func handleListSessions(w http.ResponseWriter, req *http.Request, userID string)
 }
 
 func handleRevokeAll(w http.ResponseWriter, req *http.Request, userID string) {
-	// TODO: the cache is dropped but the session ids keep authenticating.
 	delete(summaryCache, userID)
 	_ = time.Now
 	_, _ = json.Marshal(nil)
@@ -429,8 +423,7 @@ object SessionRead {
 
   case class SessionView(sessionId: String, deviceClass: String)
 
-  // TODO: the list is served from an hourly cache and never checks who is asking, so any caller can
-  // read any user's sessions and the last-seen value can be an hour old.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def routes: Route =
     path("v1" / "users" / Segment / "sessions") { userId =>
       get {
@@ -507,8 +500,7 @@ constexpr long kCacheTtlS = 3600;
 
 std::unordered_map<std::string, std::string> summary_cache;
 
-// TODO: the list is served from an hourly cache and never checks who is asking, so any caller can read
-// any user's sessions and the last-seen value can be an hour old.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void register_read_routes(httplib::Server& svr, RedisClient& redis) {
   svr.Get("/v1/users/([^/]+)/sessions", [&redis](const httplib::Request& req, httplib::Response& res) {
     const std::string user_id = req.matches[1];
@@ -596,5 +588,5 @@ void register_read_routes(httplib::Server& svr, RedisClient& redis) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a read endpoint for authorization, freshness and the meaning of "signed out". Three defects are being checked: trusting the path parameter serves one user's session metadata to another; a cached summary makes the last-seen value a lie and advertises sessions the store would reject; and a revoke-all that returns before the ids are gone leaves sessions authenticating behind a "signed out everywhere" screen. The habits to name out loud are: authorize the resource against the claims, read the value that must be fresh from the live record, and make the destructive action complete before you answer. Real systems add pagination for users with many sessions, a per-session "current device" marker, and an audit event for every revoke-all.`,
+  debrief: `The fix has this shape because the three properties a session page owes its user are decided in three different places. Authorization is decided by comparing claims to the path before any read, because the data itself is the leak. Freshness is decided by where the value comes from: \`last_seen\` and the age check are only true on the live record, so the cache goes and the index is walked on every request, which is cheap for the handful of sessions one user has. The meaning of "signed out" is decided by ordering: each key is deleted and the index cleared before the response, so the screen the user sees is already true. Production systems add pagination for users with many sessions, a "current device" marker on the row that belongs to this request, and an audit event for every revoke-all.`,
 };

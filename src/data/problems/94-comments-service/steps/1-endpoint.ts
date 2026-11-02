@@ -8,37 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the JSON, writes a row and returns \`201\`. It compiles, it serves the demo, and it hides three
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/comments\` with body
+\`{"thread_id": "t-1", "parent_id": "c-7", "text": "…"}\`, parses the JSON, writes a row under a fresh
+\`uuid4\` and answers \`201\` with it. It compiles, serves the demo, and hides four flaws.
 
-Implement \`POST /v1/comments\` with body
-\`{"thread_id": "t-1", "parent_id": "c-7", "text": "…"}\`.
+**Failure mode the checks target.** A client retry or a queue redelivery creates a second comment with
+a second id; a reply with a \`parent_id\` from another thread is written into the wrong tree; a body of
+any size is accepted; and whatever markup the client sent is stored as markup the next client renders.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same
-  \`(tenant, key)\` returns the comment that was created the first time — same \`id\`, same
-  \`created_at\` — and never inserts a second row.
+- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
+  returns the comment created the first time, same \`id\` and \`created_at\`, without a second row.
 - \`text\` is a non-empty string of at most **16 KiB** (\`16 * 1024\` bytes) of UTF-8; a longer body
   is **413**.
 - \`parent_id\` is optional. When present it must name a comment **in the same thread**: a parent
-  from another thread (or a parent that does not exist) is **422** — a reply is never grafted onto
-  a thread it does not belong to.
+  from another thread, or one that does not exist, is **422**.
 - \`thread_id\` is required and must be a non-empty string (**400** otherwise).
-- The body is stored **escaped**: raw client markup is never persisted as markup. Rendering is a
-  separate, explicit step that unescapes only tags in the safe subset
-  (\`b\`, \`i\`, \`code\`, \`pre\`, \`a\`, \`br\`), so a \`<script>\` in a comment survives as text
-  and never as an element.
+- The body is stored **escaped**. Rendering is a separate, explicit step that unescapes only tags in
+  the safe subset (\`b\`, \`i\`, \`code\`, \`pre\`, \`a\`, \`br\`), so a \`<script>\` in a comment
+  survives as text, not as an element.
 - A created comment answers **201** with \`{"id", "thread_id", "parent_id", "created_at",
-  "revision", "text"}\`; a replay answers **200** with the stored comment.
-
-**Failure mode the checks target.** Three defects, and every one of them is invisible in a demo.
-The starter never compares \`parent_id\`'s thread with the \`thread_id\` in the request, so a reply
-can be grafted onto any thread — the parent lookup is the only thing that knows where a comment
-lives. It ignores \`Idempotency-Key\` entirely, so a client retry (or a queue redelivery) creates a
-second comment with a second id. And it stores \`text\` verbatim, so whatever markup the client sent
-is markup the next client renders — the classic stored-XSS handoff between two services that both
-believe the other one escaped.`,
+  "revision", "text"}\`; a replay answers **200** with the stored comment.`,
   sequence: {
     participants: ['Client', 'Comments API', 'comment store'],
     messages: [
@@ -154,8 +144,7 @@ store = CommentStore()
 
 @app.post("/v1/comments")
 def create_comment(body: CommentRequest, tenant: str = Header(default="", alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
-    # posts twice, stores the body as markup the client renders raw and caps no size. Fix all of it.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     comment = {
         "id": str(uuid.uuid4()),
         "thread_id": body.thread_id,
@@ -262,8 +251,7 @@ interface CommentBody {
 }
 
 app.post('/v1/comments', async (request, reply) => {
-  // TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
-  // posts twice, stores the body as markup the client renders raw and caps no size.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as CommentBody;
   const comment = {
@@ -426,8 +414,7 @@ func createComment(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
-	// posts twice, stores the text as markup the client renders raw and caps no size.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	comment := &Comment{
 		ID:        uuid.NewString(),
 		ThreadID:  req.ThreadID,
@@ -611,8 +598,7 @@ object CommentsApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[CommentRequest]) { body =>
-            // TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a
-            // replay posts twice, stores the text as markup the client renders raw and caps no size.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val comment = Comment(
               UUID.randomUUID().toString,
               body.thread_id,
@@ -756,8 +742,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
-    // posts twice, stores the text as markup the client renders raw and caps no size.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const json comment = {
         {"id", uuidString()},
         {"thread_id", body.value("thread_id", std::string())},
@@ -894,9 +879,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guard clauses by cost: tenant, `Idempotency-Key`, thread/text shape, byte length, then the parent lookup. The lookup is the only expensive one, so it runs after every cheap rejection.',
-    'The parent check is a comparison of two thread ids, not a truthiness test: `parent_thread(parent_id) != thread_id` is 422, which also covers a parent that does not exist. Fetch the parent’s thread from the store rather than trusting a client-supplied `thread_id`.',
-    'Escape once, at the boundary where the value becomes durable: `html.escape(text)` / `escapeHtml(text)` / `html.EscapeString(text)` before the insert. Rendering then unescapes only the tags in the safe subset — storing raw markup means the renderer is the only thing standing between a comment and the next client.',
+    'Post the same request twice with one `Idempotency-Key` and you get two ids; reply to a comment from thread B while naming thread A and the row lands in A.',
+    'The handler trusts every field of the request. Only the store knows which thread the parent lives in, and nothing is ever looked up under `(tenant, key)` before the insert.',
+    'Guard in cost order: tenant, `Idempotency-Key` via `store.get_by_key`, text shape and `MAX_BODY_BYTES`, then `parent_thread(parent_id) != thread_id` is 422. `html.escape(text)` before `store.insert`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a write endpoint at two boundaries at once: the trust boundary (who says which thread this reply belongs to) and the data boundary (what a client’s bytes become once they are stored). The starter looks right because every demo passes: one thread, one well-formed body, no retries. The parent comparison is the subtle one — the request carries both ids, and only the store can say whether they agree; grafting a reply onto another thread silently corrupts a thread’s tree and cannot be repaired by a later read. Idempotency keyed by \`(tenant, key)\` is what makes a retried POST safe, and it has to be checked before the insert, not after. Escaping at rest is the third: two services that each assume the other escaped are how stored XSS ships. Real comment services add a moderation hook before the write is visible, an edit revision column, soft deletes, and a rate limit per author — the next steps of this course build exactly those.`,
+  debrief: `The fix is a chain of guards in front of one insert, ordered from cheapest to most expensive: header checks, shape checks, the idempotency lookup, and only then the parent lookup that costs a store read. The parent comparison has that shape because the request carries two ids and only the store can say whether they agree; a reply grafted onto another thread corrupts a tree that no later read can repair. The idempotency lookup runs before the insert, not after, because the retry arrives while the first attempt may still be in flight. Escaping at the write boundary means the renderer is not the only thing between a comment and the next client. Production comment services put a moderation hook before the write becomes visible, keep an edit revision column and soft deletes, and rate-limit each author; the next steps build the first two.`,
 };

@@ -7,71 +7,63 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Feedback collector: the course is not "store a thumbs-up", it is the debugging you owe a feedback
- * path before its numbers are trusted. A validated write against a real request id → an atomic Redis
- * ballot with a 30-day TTL → a gRPC attribution lookup with a deadline and an honest fallback →
- * tenant-keyed events carrying a fingerprint and an outbox → a satisfaction read with an honesty
- * floor and an expiring cache.
+ * Feedback collector: a validated write against a served request id, an atomic Redis ballot with a
+ * 30-day TTL, a gRPC attribution lookup with a deadline and an unattributed fallback, tenant-keyed
+ * events carrying a fingerprint and an outbox, and a satisfaction read with a sample floor and an
+ * expiring cache.
  */
 export const feedbackCollectorProblem: Problem = {
   id: 'feedback-collector',
   title: 'Feedback Collector',
-  tagline: 'Attach user ratings to exact request ids and turn them into ordered, attributable signal.',
+  tagline: 'Attach user ratings to served request ids and publish them as tenant-ordered, attributed events.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Feedback Collector
 
-A feedback collector is the piece of an AI platform that attaches a user's rating to the exact request
-it refers to, reserves the right to vote once, resolves which model served that request, publishes an
-ordered signal for downstream consumers, and reports the result without flattering it. The visible part
-is a thumbs-up; the parts that decide whether the signal can be trusted are the request-id check, the
-atomic ballot, the attribution lookup, the event payload, and the honesty floor on the read side.
+A feedback collector attaches a user's rating to the exact request it refers to, allows one vote per
+user and request, resolves which model served that request, publishes an ordered signal for downstream
+consumers, and reports the result without flattering it. The visible part is a thumbs-up; the parts
+that decide whether the signal can be trusted are the request-id check, the atomic ballot, the
+attribution lookup, the event payload and the sample floor on the read side.
 
 ## The real system
 
-Production collectors receive ratings from many tenants, and a rating is only meaningful when it points
-at a request the tenant really served — otherwise a caller can invent ids and move a dashboard. They
-reserve one vote per (tenant, user, request) atomically, because a double-click and a retrying client
-both look like two ratings. They resolve the request id to the model, prompt and route that served it,
-with a short deadline and an honest "unattributed" fallback, because attributing a slow lookup to
-whatever model is active silently rewrites history after every rollout. They publish one event per
-rating, keyed by tenant so a tenant's stream stays ordered, carrying a fingerprint rather than comment
-text that would outlive the row in a retained topic, with an outbox when the broker rejects the write.
-And they never publish a satisfaction score from too few samples, over all time, or from a cache that
-forgot to expire.
+Langfuse models user feedback as a score object that references exactly one trace, observation,
+session or dataset run, typed as numeric, categorical or boolean and optionally bound to a score
+config that fixes the allowed range, so a rating cannot float free of the request it rates. Any
+collector that feeds a model dashboard has the same shape: the request id is the join key, the ballot
+is reserved once per (tenant, user, request), and the serving model is resolved by lookup rather than
+guessed.
 
 ## What you build here
 
 One service, **feedbackd**, with five pieces:
 
-1. \`POST /v1/feedback\`: authenticated tenant, a request id that must belong to a served request,
-   \`rating\` required and in \`-1/0/1\`, and a comment capped at 2 KiB — the comment stays out of the logs.
+1. \`POST /v1/feedback\`: a tenant header, a request id that must belong to a served request,
+   \`rating\` required and in \`-1/0/1\`, a comment capped at 2 KiB and kept out of the logs.
 2. A **Redis** ballot: one write per (tenant, user, request), reserved with a single Lua \`EVAL\` that
-   sets the key if absent with a 30-day expiry, answering \`1\` or \`0\` so the endpoint stores exactly
-   one row.
-3. A **gRPC** attribution client: a 200 ms deadline, an \`unattributed\` fallback that never guesses the
-   active model, a short success-only cache, and a backfill that moves attribution without touching the
-   rating.
-4. A **Kafka** feedback path: \`feedback.recorded\` keyed by tenant, an idempotent producer with
-   \`acks=all\`, a \`comment_fingerprint\` instead of the comment, and an outbox row when the broker
-   rejects the produce.
-5. \`GET /v1/models/{version}/satisfaction\`: a window from the documented set, a 50-sample honesty floor,
-   an aggregate over the recent window only, and a score cached with a 60-second TTL.
+   sets the key if absent with a 30-day expiry and answers \`1\` or \`0\`.
+3. A **gRPC** attribution client: a 200 ms deadline, an \`unattributed\` fallback instead of the
+   active model, a short success-only cache, and a backfill that updates attribution without touching
+   the rating.
+4. A **Kafka** feedback path: \`feedback.recorded\` keyed by tenant, \`acks=all\`, a
+   \`comment_fingerprint\` instead of the comment, and an outbox row when the broker rejects the
+   produce.
+5. \`GET /v1/models/{version}/satisfaction\`: a window from the documented set, a 50-sample floor, an
+   aggregate over the recent window only, and a score cached with a 60-second TTL.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
-failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path and looks
+right. In each step you debug it against the failure modes named in the task, fix it, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Feedback UI, spam and abuse scoring beyond the ballot, per-tenant retention policy, moderator tooling,
-comment translation, and the ranking of comments beside a score. The five pieces above are the ones
-that decide whether the signal is attributable, ordered and honest.`,
+comment translation, and the ranking of comments beside a score.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · read', x: 8, y: 50},

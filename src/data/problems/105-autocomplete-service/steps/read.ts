@@ -8,26 +8,25 @@ export const readStep: Step = {
   focus: ['api', 'trending', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads recent queries and returns the popular
-ones for the trending rail. It compiles, it shows something on the demo, and it hides three
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`GET /v1/trending\`.
+**Starting point.** The starter registers \`GET /v1/trending\`, reads the tenant's recent queries
+from the index and returns each one as a trend entry with its count and the \`user_id\` that
+triggered it. It compiles, it shows something on the demo, and it hides 4 flaws.
 
 - A term trends only when it has at least **\`MIN_TREND_COUNT = 100\` occurrences** in the window. One
   search is a search, not a trend.
 - The window is explicit (\`WINDOW_SECONDS\`), so "popular" has a time bound rather than meaning "ever".
 - Terms whose category is **sensitive** (\`SENSITIVE_CATEGORIES\`) are filtered out and never trend,
   even when their count is high.
-- A trend entry carries the **term and its count only** — never a user id, a session id or anything
+- A trend entry carries the **term and its count only**: no user id, no session id, nothing
   that links the trend back to the person who searched. A trend is an aggregate, not a person.
 - The response shape is \`{"window_seconds": …, "entries": [{"term": …, "count": …}]}\`.
 
 **Failure mode the checks target.** A single occurrence promoted to a trend publishes one person's
-name to everyone on the next page load — the trending rail is the highest-traffic place a search term
-can land. Linking each trend entry to the user who triggered it turns an analytics read into a
-privacy leak that survives in logs and caches. The missing sensitive-category filter is the third:
-without it, a high-count term from a category that should never surface becomes the top trend.`,
+name to everyone on the next page load, and the trending rail is the highest-traffic place a search
+term can land. Linking each entry to the user who triggered it turns an analytics read into a
+privacy leak that survives in logs and caches. The missing window and sensitive-category filter
+are the quieter part: without them a high-count term from a category that should not surface
+becomes the top trend, and "popular" means "ever".`,
   sequence: {
     participants: ['Client', 'Autocomplete API', 'Trend index'],
     messages: [
@@ -80,7 +79,7 @@ without it, a high-count term from a category that should never surface becomes 
     {
       id: 'sensitive-filter',
       title: 'Filters sensitive categories',
-      detail: 'Terms in a sensitive category never trend, whatever their count. The starter has no category filter.',
+      detail: 'Terms in a sensitive category do not trend, whatever their count. The starter has no category filter.',
       match: {
         python: {all: [/SENSITIVE_CATEGORIES/]},
         typescript: {all: [/SENSITIVE_CATEGORIES/]},
@@ -93,7 +92,7 @@ without it, a high-count term from a category that should never surface becomes 
       id: 'no-user-linkage',
       title: 'Carries no user linkage',
       detail:
-        'A trend entry is the term and its count — no user id, no session id. The starter attaches the `user_id` that triggered the trend.',
+        'A trend entry is the term and its count, with no user id and no session id. The starter attaches the `user_id` that triggered the trend.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/trending["']/], none: [/\buser_id\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/trending['"]/], none: [/\buser_id\b/]},
@@ -112,8 +111,7 @@ app = FastAPI()
 
 @app.get("/v1/trending")
 def trending(x_tenant_id: str = ""):
-    # TODO: this starter promotes raw queries with a single occurrence as trends and links each
-    # trend entry to the user who triggered it, so a person's name trends after one search.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     rows = index.recent_queries(x_tenant_id)
     return {
         "entries": [{"term": row.text, "count": row.count, "user_id": row.user_id} for row in rows]
@@ -149,8 +147,7 @@ def trending(x_tenant_id: str = Header(default="")):
 export const app = Fastify();
 
 app.get('/v1/trending', async (request, reply) => {
-  // TODO: this starter promotes raw queries with a single occurrence as trends and links each
-  // trend entry to the user who triggered it, so a person's name trends after one search.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const rows = await index.recentQueries(tenant);
   return {entries: rows.map(row => ({term: row.text, count: row.count, user_id: row.userId}))};
@@ -186,8 +183,7 @@ import (
 )
 
 func trending(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter promotes raw queries with a single occurrence as trends and links each
-	// trend entry to the user who triggered it, so a person's name trends after one search.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	rows := index.RecentQueries(tenant)
 	entries := []map[string]any{}
@@ -264,8 +260,7 @@ object Read {
     path("v1" / "trending") {
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter promotes raw queries with a single occurrence as trends and links
-          // each trend entry to the user who triggered it.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val rows = index.recentQueries(tenant)
           val entries = rows.map(row => s"""{"term":"\${row.text}","count":\${row.count},"user_id":"\${row.userId}"}""")
           complete(StatusCodes.OK, s"""{"entries":[\${entries.mkString(",")}]}""")
@@ -325,8 +320,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/trending", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter promotes raw queries with a single occurrence as trends and links each
-    // trend entry to the user who triggered it.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json entries = json::array();
     for (const auto& row : recentQueries(tenant)) {
@@ -378,9 +372,9 @@ int main() {
     },
   },
   hints: [
-    'A trend is an aggregate over many people. Pick the floor first — 100 occurrences in the window — and apply it before the term reaches the rail, so a single search can never trend.',
-    'Filter by category, not by count: a sensitive term with 100 000 occurrences still must not trend. Exclude the category before you rank.',
-    'The response is the term and its count. Nothing about the user who searched belongs in it — not the user id, not the session id, not the tenant. Aggregates are safe to cache and to log; per-user rows are not.',
+    'The trending rail shows a surname that was searched exactly once, and the JSON next to it carries the user id of whoever typed it.',
+    "The handler maps recent_queries straight into the response: there is no count threshold, no time bound, no category check, and the row's user_id is copied into every entry.",
+    'Aggregate over WINDOW_SECONDS, skip categories in SENSITIVE_CATEGORIES, keep terms with count >= MIN_TREND_COUNT, and emit only term and count.',
   ],
-  debrief: `The interviewer is testing whether you can debug an analytics read at the privacy boundary. The starter reads fine because the demo searches the same term many times. Three defects are being checked. No occurrence floor means the first search of a person's name publishes it to everyone on the next page load — the trending rail is the highest-traffic place a term can land. Attaching the user who triggered the trend turns an aggregate read into a per-user leak that survives in caches and logs. The missing sensitive-category filter is the third: a high-count term from a category that should never surface becomes the top trend. Real reads add k-anonymity over distinct searchers, a rolling window computed offline so the read is a cache hit, and a review path for terms that are trending but should not be.`,
+  debrief: `The fix turns a per-row read into an aggregate. The floor comes first because a trend is a claim about many people, and 100 occurrences is the point where one person's search cannot be read back out of it. The window bounds that claim in time, so "popular" is about this day and not the lifetime of the index. The category filter runs before ranking, not after, because a sensitive term with a huge count is exactly the one that would otherwise win. Stripping the user id is what makes the response safe to cache, log and serve to everyone. Production reads go further: k-anonymity over distinct searchers rather than raw counts, a rolling window computed offline so the request is a cache hit, and a review path for terms that trend but should not.`,
 };

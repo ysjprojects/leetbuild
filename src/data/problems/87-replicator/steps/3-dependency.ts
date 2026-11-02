@@ -8,35 +8,26 @@ export const dependencyStep: Step = {
   focus: ['api', 'target', 'source'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the target is healthy it
-applies every change correctly, so the demo converges. Both failure paths are wrong. Find them, fix
-them, and prove the fix.
+**Starting point.** The starter's \`apply_change(stub, change)\` sends an \`ApplyRequest\` to the
+target over gRPC in a retry loop, and \`target_apply(request)\` is the target's handler that inserts
+the row. When the target is healthy every change applies and the demo converges. It compiles, it
+serves the demo, and it hides 5 flaws.
 
-Implement the target-region client: \`apply_change(stub, change)\` (or the stack's equivalent) plus
-the target-side handler that dedupes by change id.
+**Failure mode the checks target.** The starter retries every error forever with no deadline, builds
+its retry request without the change id, treats a schema mismatch like any other error, and the
+target inserts on every call. So a call that timed out after it was applied is applied again, and
+because the id is gone the target cannot tell that the second call is the same change.
 
-- Every attempt runs under a **3-second deadline** — a call deadline, a context with timeout, a
-  \`withDeadlineAfter\`, or a \`set_deadline\` on the client context. Without one, a wedged target
-  pins the controller's worker until the process is restarted.
-- At most **3 attempts** per change, and only the retryable statuses (\`UNAVAILABLE\`,
-  \`DEADLINE_EXCEEDED\`, \`RESOURCE_EXHAUSTED\`) are retried. A permanent rejection is returned to
-  the caller immediately, never spun on.
+- Every attempt runs under a **3-second deadline** (a call timeout, a context with timeout,
+  \`withDeadlineAfter\`, or \`set_deadline\`). Without one, a wedged target pins the worker.
+- At most **3 attempts** per change, and only \`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\` and
+  \`RESOURCE_EXHAUSTED\` are retried. A permanent rejection is returned immediately; when the
+  attempts run out, the last retryable error is raised.
 - **Every attempt carries the change id.** A timeout does not mean the target did not apply the
-  change: the call may have been applied and the response lost. The retry therefore has to look
-  exactly like the original attempt, so the target can recognise the id and drop the duplicate.
-  Dropping the id on the retry path is the quiet defect in this starter — the retry lands as a new
-  change and inserts a second row.
+  change. Build the request once, before the loop, so the retry looks exactly like the original.
 - A **schema mismatch** (\`FAILED_PRECONDITION\`) is terminal: halt the shard with the target's
-  **named diff** instead of retrying. Retrying a schema mismatch is a hot loop against a target that
-  will never accept the change, and it hides the real problem — the change's shape does not match
-  the target's.
-- \`target_apply(request)\` is the target's handler: it **dedupes by change id**, so applying the
-  same change twice changes nothing — the second call is a no-op and no second row is inserted.
-
-**Failure mode the checks target.** The starter retries forever with no deadline, builds its retry
-request without the change id, and treats a schema mismatch like any other error. The result is the
-incident this course debugs: a call that timed out after it was applied is applied again, and
-because the id is gone the target has no way to tell that the second call is the same change.`,
+  **named diff** instead of retrying a change the target will not accept.
+- \`target_apply(request)\` **dedupes by change id**: the second call is a no-op and inserts no row.`,
   sequence: {
     participants: ['Replication controller', 'Target region', 'Shard halter'],
     messages: [
@@ -157,9 +148,7 @@ import apply_pb2
 import apply_pb2_grpc
 
 
-# TODO: this starter retries every error forever with no deadline, drops the change id on the retry
-# path so a call that timed out after it was applied is applied a second time and inserts a
-# duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 def apply_change(stub, change) -> None:
     attempt = 0
     while True:
@@ -252,9 +241,7 @@ interface ApplyRequest {
   payload: Buffer;
 }
 
-// TODO: this starter retries every error forever with no deadline, drops the change id on the retry
-// path so a call that timed out after it was applied is applied a second time and inserts a
-// duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 export async function applyChange(client: ApplyClient, change: Change): Promise<void> {
   let attempt = 0;
   while (true) {
@@ -363,9 +350,7 @@ type Change struct {
 	Payload  []byte
 }
 
-// TODO: this starter retries every error forever with no deadline, drops the change id on the retry
-// path so a call that timed out after it was applied is applied a second time and inserts a
-// duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func applyChange(ctx context.Context, client ApplyServiceClient, change Change) error {
 	attempt := 0
 	for {
@@ -461,9 +446,7 @@ final case class Change(change_id: String, shard: Int, payload: Array[Byte])
 final case class ApplyRequest(change_id: Option[String], shard: Int, payload: Array[Byte])
 
 object ApplyClient {
-  // TODO: this starter retries every error forever with no deadline, drops the change id on the retry
-  // path so a call that timed out after it was applied is applied a second time and inserts a
-  // duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def applyChange(stub: ApplyServiceGrpc.ApplyServiceBlockingStub, change: Change): Unit = {
     var attempt = 0
     while (true) {
@@ -539,9 +522,7 @@ object ApplyClient {
 
 #include <string>
 
-// TODO: this starter retries every error forever with no deadline, drops the change id on the retry
-// path so a call that timed out after it was applied is applied a second time and inserts a
-// duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void applyChange(apply::ApplyService::Stub& stub, const Change& change) {
   int attempt = 0;
   while (true) {
@@ -625,9 +606,9 @@ void targetApply(const apply::ApplyRequest& request) {
     },
   },
   hints: [
-    'Build the request once, before the loop: `change_id` belongs to the change, not to the attempt. Every retry sends the identical message, which is what lets the target answer a duplicate with a no-op instead of a second insert.',
-    'Bound the loop with a constant and check the status code, not the fact that an error was thrown: retry `UNAVAILABLE` / `DEADLINE_EXCEEDED` / `RESOURCE_EXHAUSTED`, return anything else immediately, and raise the last retryable error when the attempts run out.',
-    'Treat `FAILED_PRECONDITION` as terminal and carry the target’s description with it as the named diff: a schema mismatch is not a transient failure, and retrying it turns one bad change into an infinite loop while hiding the diff that would have explained it in seconds.',
+    'Pause the target for a minute and watch the controller: a worker hangs on one call, and when the target returns, the replica holds two rows for that change. A schema change spins forever.',
+    'The `while True` loop has no deadline and no attempt cap, `except grpc.RpcError` swallows every status alike, the second `ApplyRequest` omits `change_id`, and `target_apply` inserts without looking at the id.',
+    'Build the request once with `change_id`; loop `for attempt in range(MAX_ATTEMPTS)` with `timeout=APPLY_DEADLINE_S`; retry only `RETRYABLE` codes; raise `SchemaMismatch` on `FAILED_PRECONDITION`; dedupe in `target_apply` via `APPLIED_CHANGES`.',
   ],
-  debrief: `The interviewer is testing whether you can debug retry logic for the difference between "the call failed" and "the change did not happen". A timeout is not a negative acknowledgement: the target may have applied the change and lost the response, so the retry has to be recognisable — same change id, so the target dedupes — or the replica silently grows duplicate rows. The second half is the failure classification: a schema mismatch is terminal, and retrying it is both useless and expensive. Real replicators add a per-shard fencing token so two controllers cannot apply the same shard concurrently, apply in the target's transaction with the dedupe row inside it, and record the diff on the shard's state so an operator sees which change halted it.`,
+  debrief: `The fix separates "the call failed" from "the change did not happen". A timeout is not a negative acknowledgement, so the request is built once and resent unchanged: the id is what lets the target recognise a duplicate and answer with a no-op, and the dedupe set on the target side is what makes that answer true. The retry loop is bounded by a count and a per-attempt deadline, and it classifies by status code rather than by the fact that an error was thrown, because a schema mismatch retried is a hot loop that hides the diff explaining it. Production replicators add a per-shard fencing token so two controllers cannot apply one shard concurrently, insert the dedupe row inside the target's transaction, and record the named diff on the shard's state.`,
 };

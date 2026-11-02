@@ -8,26 +8,25 @@ export const rerankEventsStep: Step = {
   focus: ['api', 'kafka', 'db', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds a producer, assembles a payload and
-publishes the outcome. It works until the broker blinks or someone reads the topic. Debug it like
-the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter builds a \`KafkaProducer\` with default settings and, after each
+reranked request, publishes one \`rerank.done\` record keyed by tenant whose payload carries the
+query, the passages, \`candidate_count\` and \`latency_ms\`. It serves the demo and hides 5 flaws.
 
-Publish one \`rerank.done\` event per reranked request:
+**Failure mode the checks target.** The topic is retained and replicated, so what the starter puts
+in it stays: tenant text sits in every replica, one query's events scatter across partitions, a
+timed-out send that is retried lands twice, and when the broker is down the outcome is gone with
+nothing to replay.
 
-- Key the record by the **query fingerprint**, not by the tenant, so every event for one query lands
-  on one partition and stays in order relative to the other events for that query.
-- The payload carries **candidate counts**, **latency** and a **score histogram** — numbers about the
-  rerank, never the **query** or the **passage** text. A retained, replicated topic is not a place
-  for tenant content.
+Requirements:
+
+- Key the record by the **query fingerprint**, so every event for one query lands on one partition
+  and stays ordered.
+- The payload carries **candidate counts**, **latency** and a **score histogram**: numbers about the
+  rerank, not the **query** or the **passage** text.
 - The producer is **idempotent** with \`acks=all\`, so a retry after a timeout cannot duplicate an
   outcome.
 - When the produce fails, write an **outbox** row with the topic, the key and the payload, so a relay
-  can publish it after the broker recovers instead of losing it.
-
-**Failure mode the checks target.** The starter keys by tenant, so one tenant's events scatter across
-partitions and a query's history is not ordered; it publishes the query and the passages "for
-tuning", which ships tenant content into a retained topic; and it has no outbox, so a produce failure
-silently drops the outcome.`,
+  can publish it after the broker recovers.`,
   sequence: {
     participants: ['Rerank API', 'Kafka', 'Outbox'],
     messages: [
@@ -116,14 +115,11 @@ TOPIC = "rerank.done"
 
 
 def build_producer(bootstrap):
-    # TODO: no acks=all and no idempotence, so a retry after a timeout can duplicate an outcome.
     return KafkaProducer(bootstrap_servers=bootstrap)
 
 
 def publish_outcome(producer, tenant: str, query: str, passages, outcome) -> None:
-    # TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
-    # outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
-    # and write an outbox row when the send fails.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = {
         "query": query,
         "passages": passages,
@@ -171,7 +167,6 @@ def publish_outcome(producer, outbox, fingerprint: str, outcome) -> None:
 const TOPIC = 'rerank.done';
 
 export function buildProducer(bootstrap: string) {
-  // TODO: no acks=all and no idempotence, so a retry after a timeout can duplicate an outcome.
   return new Kafka({brokers: [bootstrap]}).producer();
 }
 
@@ -182,9 +177,7 @@ export async function publishOutcome(
   passages: string[],
   outcome: Outcome,
 ): Promise<void> {
-  // TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
-  // outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
-  // and write an outbox row when the send fails.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const payload = {
     query: query,
     passages: passages,
@@ -249,14 +242,11 @@ type Outcome struct {
 }
 
 func buildWriter(brokers []string) *kafka.Writer {
-	// TODO: no RequiredAcks and no idempotence, so a retry after a timeout can duplicate an outcome.
 	return &kafka.Writer{Addr: kafka.TCP(brokers...), Topic: Topic}
 }
 
 func publishOutcome(ctx context.Context, writer *kafka.Writer, tenant string, query string, passages []string, outcome Outcome) error {
-	// TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
-	// outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
-	// and write an outbox row when the write fails.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(map[string]any{
 		"query":           query,
 		"passages":        passages,
@@ -333,16 +323,13 @@ object RerankEvents {
   val Topic = "rerank.done"
 
   def buildProducer(bootstrap: String): KafkaProducer[String, String] = {
-    // TODO: no acks and no idempotence, so a retry after a timeout can duplicate an outcome.
     val props = new Properties()
     props.put("bootstrap.servers", bootstrap)
     new KafkaProducer[String, String](props)
   }
 
   def publishOutcome(producer: KafkaProducer[String, String], tenant: String, query: String, passages: Seq[String], outcome: Outcome): Unit = {
-    // TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
-    // outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
-    // and write an outbox row when the send fails.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = Map(
       "query" -> query,
       "passages" -> passages,
@@ -402,15 +389,12 @@ RdKafka::Producer* buildProducer(const std::string& brokers) {
   std::string errstr;
   auto* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
   conf->set("bootstrap.servers", brokers, errstr);
-  // TODO: no acks and no idempotence, so a retry after a timeout can duplicate an outcome.
   return RdKafka::Producer::create(conf, errstr);
 }
 
 void publishOutcome(RdKafka::Producer* producer, const std::string& tenant, const std::string& query,
                     const std::vector<std::string>& passages, const Outcome& outcome) {
-  // TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
-  // outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
-  // and write an outbox row when the produce fails.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string payload = "{\\"query\\":\\"" + query + "\\",\\"passages\\":[],\\"candidate_count\\":" +
                               std::to_string(outcome.candidate_count) + ",\\"latency_ms\\":" +
                               std::to_string(outcome.latency_ms) + "}";
@@ -457,16 +441,16 @@ void publishOutcome(RdKafka::Producer* producer, Outbox& outbox, const std::stri
     },
   },
   hints: [
-    'The key decides the partition, and the partition decides order. If one query must have ordered events, the query fingerprint — not the tenant — has to be the key.',
-    'A payload is a schema: candidate counts, latency, a histogram. The moment it carries the query or a passage, the topic becomes a retained copy of tenant content.',
-    'Publish inside a `try`; on failure insert an outbox row with the topic, the key and the payload and let a relay retry. `acks=all` and idempotence make that retry safe to repeat.',
+    'A privacy audit finds customer passages in the `rerank.done` topic; the analytics team sees duplicate outcomes after broker timeouts and gaps after a broker outage, and per-query event order is scrambled.',
+    'The record key is the tenant, so one query spreads over partitions; the payload includes `query` and `passages`; the producer has no `acks`/idempotence; and `send` has no failure path.',
+    'Key by the query fingerprint, publish `candidate_count`, `latency_ms` and `score_histogram` only, build the producer with `acks="all"` and idempotence, and insert an outbox row on failure.',
   ],
-  debrief: `The interviewer is testing whether you treat an event stream as a durable contract rather than a debug
-drain. The starter reads fine because the topic is empty and the demo never fails a produce. Three
-defects are being checked: the wrong key (tenant scatters one query's history across partitions), a
-payload that carries tenant content into a retained topic, and a missing outbox (so a produce failure
-loses the outcome). The hash balancer and per-key partitioning are why the fingerprint is the right
-key; the histogram is what makes a regression visible without shipping the text that caused it. Real
-systems add a schema registry so a future producer cannot smuggle content into the topic, and they
-run the outbox relay with the same idempotent key so a republish is a no-op.`,
+  debrief: `The record key is the query fingerprint because the key picks the partition and the partition is
+the only ordering Kafka gives you; keying by tenant spreads one query's history over every
+partition. The payload is a schema of numbers because a retained, replicated topic is the wrong
+place for tenant content, and the histogram is what makes a score regression visible without
+shipping the text that caused it. The outbox exists because a failed produce is not an error the
+caller can act on, so the row waits for a relay instead. A production pipeline would put a schema
+registry in front of the topic so a later producer cannot add a text field, and run the outbox
+relay with the same idempotent key so a republish is a no-op.`,
 };

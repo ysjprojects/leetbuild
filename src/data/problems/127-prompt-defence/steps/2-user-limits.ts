@@ -8,34 +8,27 @@ export const userLimitsStep: Step = {
   focus: ['api', 'redis', 'model'],
   task: `## Task
 
-**Starting point.** The starter is working code: a user with questions left
-gets through, a question that made the model misbehave is remembered, and the session grows with
-each turn — so the demo passes. The Redis layer hides a wrong key, a race, and three keys that never
-die. Debug it, fix it, and prove the fix.
-
-Implement the Redis state used by every \`POST /v1/ask\`:
-
-- Each **user** gets **30 questions** per **60-second window**. The key is
-  \`limits:{user}:{window}\` where \`window\` is \`floor(unix_seconds / 60)\`. The starter keys the
-  limit by document, so one shared document's budget is spent by whoever asks first, and one user
-  can ask without limit across documents.
-- One atomic Lua \`EVAL\` reads the counter, rejects when the window is full, increments with
-  \`INCR\`, and sets \`EXPIRE\` on the first write so the counter dies with its window. A client-side
-  read followed by a separate increment lets concurrent requests all pass the same check.
-- A full window answers **429** with \`Retry-After\` (the key's \`TTL\`) and
-  \`X-RateLimit-Remaining\`, **before** the model is called.
-- A question that made the model leak (the model layer raises \`Rejected\`) is remembered by its
-  SHA-256 under \`flagged:{hash}\` with a **24-hour** TTL (\`FLAG_TTL_S = 86400\`), and the same
-  question is answered **422** without a model call while the key lives. The starter sets the key
-  without a TTL, so a block-list of attacks grows forever and a false positive is permanent.
-- The session \`session:{user}:{document_id}\` keeps the hashes of the last 20 questions and is
-  refreshed to a **30-minute** TTL (\`SESSION_TTL_S = 1800\`) on every write. The starter's sessions
-  never expire.
+**Starting point.** The starter holds the Redis state behind \`POST /v1/ask\`: \`charge()\` reads a
+\`limits:{document_id}\` counter and increments it after the model has answered, a \`Rejected\`
+question is written to \`flagged:{hash}\` with \`SET\`, and each turn is pushed onto
+\`session:{user}:{document_id}\`. It serves the demo and hides five flaws.
 
 **Failure mode the checks target.** Keyed by document, the limit is neither a user limit nor a
 fair one; read-then-increment lets a burst of concurrent asks overspend; and three keys without a
-TTL — the window, the block-list, the session — turn Redis into a slow leak that keeps a user
-locked out, keeps an attack signature forever, and keeps every conversation ever started.`,
+TTL (window, block-list, session) turn Redis into a slow leak that keeps a user locked out, keeps
+an attack signature forever, and keeps every conversation ever started.
+
+- Each **user** gets **30 questions** per **60-second window**, under
+  \`limits:{user}:{window}\` where \`window\` is \`floor(unix_seconds / 60)\`.
+- One atomic Lua \`EVAL\` reads the counter, rejects when the window is full, increments with
+  \`INCR\`, and sets \`EXPIRE\` on the first write so the counter dies with its window.
+- A full window answers **429** with \`Retry-After\` (the key's \`TTL\`) and
+  \`X-RateLimit-Remaining\`, **before** the model is called.
+- A question that made the model raise \`Rejected\` is remembered by its SHA-256 under
+  \`flagged:{hash}\` for **24 hours** (\`FLAG_TTL_S = 86400\`); while the key lives the same
+  question is **422** without a model call.
+- \`session:{user}:{document_id}\` keeps the hashes of the last 20 questions and is refreshed to a
+  **30-minute** TTL (\`SESSION_TTL_S = 1800\`) on every write.`,
   sequence: {
     participants: ['promptguard', 'Redis', 'Model'],
     messages: [
@@ -50,9 +43,9 @@ locked out, keeps an attack signature forever, and keeps every conversation ever
     ],
   },
   hints: [
-    'The limit is a property of the user, not of the document: build the key from the authenticated `X-User-Id` and the minute bucket. Everything that reads and changes the counter has to happen inside one script: `GET`, compare, `INCR`, and `EXPIRE` when the counter was just created.',
-    'The script returns `{ok, remaining, ttl}`; the 429 is built from that reply (`Retry-After` = ttl, `X-RateLimit-Remaining` = remaining), and the handler returns before any model stub is touched.',
-    'Every key written in the request path needs a lifetime: `SETEX flagged:{hash} 86400` for the block-list, and `EXPIRE session:{user}:{doc} 1800` after every `RPUSH` so an active conversation stays alive and an abandoned one disappears.',
+    'A user who asked 30 questions on Monday is still getting 429 on Friday, two tabs sent at once both get answers past the limit, and the block-list key count only ever goes up.',
+    'The starter keys the counter by document, does `GET` then `INCR` as two round trips, charges after the model has already answered, and writes `flagged:` and `session:` keys with no expiry, so nothing resets.',
+    'Key by `limits:{user}:{window}`, move read, compare, `INCR` and first-write `EXPIRE` into one `EVAL` called before `answer()`, build the 429 from its reply, then `SETEX flagged 86400` and `EXPIRE session 1800`.',
   ],
   checks: [
     {
@@ -151,9 +144,7 @@ docs = DocumentStore()
 
 
 def charge(document_id: str) -> tuple[bool, int]:
-    # TODO: key the limit by user and window, make the read-check-increment one atomic EVAL with
-    # an EXPIRE on first write, give the block-list and the session a TTL, and reserve before the
-    # model call instead of after it.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"limits:{document_id}"
     used = int(r.get(key) or 0)
     if used >= LIMIT_QUESTIONS:
@@ -297,9 +288,7 @@ interface AskBody {
 }
 
 async function charge(documentId: string): Promise<[boolean, number]> {
-  // TODO: key the limit by user and window, make the read-check-increment one atomic EVAL with
-  // an EXPIRE on first write, give the block-list and the session a TTL, and reserve before the
-  // model call instead of after it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`limits:\${documentId}\`;
   const used = Number((await r.get(key)) ?? 0);
   if (used >= LIMIT_QUESTIONS) return [false, 0];
@@ -453,9 +442,7 @@ func (s *DocumentStore) Get(id string) (string, bool) {
 }
 
 func charge(ctx context.Context, documentID string) (bool, int) {
-	// TODO: key the limit by user and window, make the read-check-increment one atomic EVAL with
-	// an EXPIRE on first write, give the block-list and the session a TTL, and reserve before the
-	// model call instead of after it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := "limits:" + documentID
 	used, _ := rdb.Get(ctx, key).Int()
 	if used >= limitQuestions {
@@ -654,9 +641,7 @@ object LimitsApi {
   def sha256(text: String): String =
     MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)).map("%02x".format(_)).mkString
 
-  // TODO: key the limit by user and window, make the read-check-increment one atomic EVAL with
-  // an EXPIRE on first write, give the block-list and the session a TTL, and reserve before the
-  // model call instead of after it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def charge(document: String): (Boolean, Long) = {
     val key = s"limits:$document"
     val used = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
@@ -853,9 +838,7 @@ ModelAnswer answer(const std::string& document, const std::string& question);
 std::string sha256Hex(const std::string& text);
 
 std::tuple<bool, long long> charge(sw::redis::Redis& redis, const std::string& documentId) {
-  // TODO: key the limit by user and window, make the read-check-increment one atomic EVAL with
-  // an EXPIRE on first write, give the block-list and the session a TTL, and reserve before the
-  // model call instead of after it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto key = "limits:" + documentId;
   const auto raw = redis.get(key);
   const long long used = raw ? std::stoll(*raw) : 0;
@@ -1034,5 +1017,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is "what is the key, and when does it die?" A limit keyed by the wrong principal is not a limit: the source frames the attacks as coming from user-controlled input, so the user is the unit of accounting. Read-then-increment passes every serial test and fails exactly under the burst that a scripted attack produces; one Lua script makes read, compare, increment and the first-write expiry a single step, and the 429 is built from what the script returned. The three TTLs are the second half: the window must reset, the block-list must forget (a hash of a question is an attack signature today and a false positive tomorrow), and a session must end. Real services add a sliding window, a per-document budget on top of the per-user one, and a block-list keyed by a normalised hash so a trailing space does not make a new attack.`,
+  debrief: `Two questions shape the fix: what is the key, and when does it die? The source frames the attacks as coming from user-controlled input, so the user is the unit of accounting and the window is part of the key. Read-then-increment passes every serial test and fails under the burst a scripted attack produces; one Lua script makes read, compare, increment and first-write expiry a single round trip, and the 429 is built from what the script returned. Charging before the model call is what makes the limit protect the model rather than describe the bill. The TTLs matter because a question hash is an attack signature today and a false positive tomorrow. Production limiters usually move to a sliding window, and key the block-list by a normalised hash so a trailing space is not a fresh attack.`,
 };

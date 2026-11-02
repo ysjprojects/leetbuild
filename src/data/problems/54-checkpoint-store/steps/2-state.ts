@@ -8,33 +8,25 @@ export const uploadStateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it counts chunks, flips a
-\`committed\` flag and answers \`200\`, so the demo commits. It hides a race, a leak and a wrong source
-of truth. Find them, fix them, and prove the fix with the checks below.
-
-Implement the upload state used by every chunk write:
-
-- The received chunk indexes are a **Redis set** — \`upload:{upload_id}\` — so membership is a
-  question about *which* chunks arrived, not how many writes happened. A plain counter cannot tell a
-  complete set from a duplicate.
-- The state key is created with a **TTL** (\`EXPIRE\`, 24 h on first write) and every write refreshes
-  it, so an abandoned upload stops pinning memory and its id can be reused. The starter leaves state
-  without a TTL forever.
-- The **commit marker** — \`committed:{upload_id}\`, the only key a reader checks — is written by one
-  **atomic \`EVAL\`**: the script compares \`SCARD\` of the received set against the expected chunk
-  count and writes the marker only when the set is complete. The starter sets the marker when the byte
-  count derived from caller-supplied metadata reaches the declared size, so an upload missing its
-  last chunk commits.
-- The marker carries the step number and the chunk-set digest, gets a longer TTL (30 days) than the
-  transient state, and the state key is deleted once the marker exists, so a reader can never
-  observe a partially committed checkpoint as complete.
-- The starter's commit is a client-side read-then-write (\`INCRBY\` then \`SET\`): two workers on the last
-  two chunks can both see "complete" and both write a marker, or neither can.
+**Starting point.** The starter serves \`POST /v1/uploads/{upload_id}/chunks\`: it increments a
+\`received:{upload_id}\` counter, multiplies the count by the caller's \`total_bytes\`, writes
+\`committed:{upload_id}\` with a plain \`SET\` once the product reaches \`expected_bytes\`, and answers
+\`200\` with the marker's presence. It compiles, commits the demo, and hides five flaws.
 
 **Failure mode the checks target.** A count is not a set: redelivered chunks inflate it and lost
 chunks never show up, so the marker lies in both directions. A marker derived from a declared size
-commits an incomplete upload — the exact state a resume trusts. And a state key without a TTL turns
-every abandoned upload into permanent memory.`,
+commits an incomplete upload. A client-side read-then-write lets two workers on the last two chunks
+both write a marker, or neither. A state key without a TTL is permanent memory per abandoned upload.
+
+- The received chunk indexes are a **Redis set**, \`upload:{upload_id}\`: *which* chunks arrived,
+  not how many writes happened.
+- The state key gets a **TTL** (\`EXPIRE\`, \`STATE_TTL_S\`, 24 h) that every write refreshes.
+- The **commit marker** \`committed:{upload_id}\` is written by one **atomic \`EVAL\`**
+  (\`COMMIT_LUA\`) that compares \`SCARD\` of the set against the expected chunk count; \`total_bytes\`
+  is not consulted.
+- The marker carries the step number and chunk-set digest and gets a longer TTL (30 days); the
+  state key is deleted once the marker exists.
+- The response reports \`committed\` from \`EXISTS committed:{upload_id}\`.`,
   sequence: {
     participants: ['Checkpoint API', 'Redis', 'Reader'],
     messages: [
@@ -132,10 +124,7 @@ class ChunkState(BaseModel):
 
 @app.post("/v1/uploads/{upload_id}/chunks")
 def record_chunk(upload_id: str, body: ChunkState, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter counts writes instead of tracking which chunks arrived, commits from the
-    # caller's declared size, and leaves the upload state alive forever. Track the received indexes
-    # in a set with a TTL, and let one atomic script write the commit marker only for a complete
-    # chunk set.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     received = r.incrby(f"received:{upload_id}", 1)
     if received * body.total_bytes >= body.expected_bytes:
         r.set(f"committed:{upload_id}", "1")
@@ -204,7 +193,7 @@ def upload_state(upload_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> d
 `,
     },
     typescript: {
-      starter: `/** Upload state: flawed code that commits from the caller's declared size. */
+      starter: `/** Upload state: commits from the caller's declared size. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -219,10 +208,7 @@ interface ChunkState {
 }
 
 app.post('/v1/uploads/:uploadId/chunks', async (request, reply) => {
-  // TODO: this starter counts writes instead of tracking which chunks arrived, commits from the
-  // caller's declared size, and leaves the upload state alive forever. Track the received indexes
-  // in a set with a TTL, and let one atomic script write the commit marker only for a complete
-  // chunk set.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const {uploadId} = request.params as {uploadId: string};
   const body = request.body as ChunkState;
@@ -327,10 +313,7 @@ func recordChunk(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter counts writes instead of tracking which chunks arrived, commits from the
-	// caller's declared size, and leaves the upload state alive forever. Track the received indexes
-	// in a set with a TTL, and let one atomic script write the commit marker only for a complete
-	// chunk set.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	received, _ := rdb.IncrBy(r.Context(), "received:"+uploadID, 1).Result()
 	if received*body.TotalBytes >= body.ExpectedBytes {
 		rdb.Set(r.Context(), "committed:"+uploadID, "1", 0)
@@ -467,10 +450,7 @@ object State {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ChunkState]) { body =>
-            // TODO: this starter counts writes instead of tracking which chunks arrived, commits from
-            // the caller's declared size, and leaves the upload state alive forever. Track the
-            // received indexes in a set with a TTL, and let one atomic script write the commit
-            // marker only for a complete chunk set.
+            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
             val received = jedis.incrBy(s"received:$uploadId", 1L)
             if (received * body.totalBytes >= body.expectedBytes) {
               jedis.set(s"committed:$uploadId", "1")
@@ -592,10 +572,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter counts writes instead of tracking which chunks arrived, commits from the
-    // caller's declared size, and leaves the upload state alive forever. Track the received indexes
-    // in a set with a TTL, and let one atomic script write the commit marker only for a complete
-    // chunk set.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const auto received = r.incrby("received:" + uploadId, 1);
     if (received * body.value("total_bytes", 0LL) >= body.value("expected_bytes", 0LL)) {
       r.set("committed:" + uploadId, "1");
@@ -688,9 +665,9 @@ int main() {
     },
   },
   hints: [
-    'The state is a question about *which* chunks arrived, so store the indexes in a set: `SADD upload:{upload_id} {index}`, then `SCARD` for the count. A counter cannot distinguish 8 distinct chunks from 6 chunks with two redeliveries, and it is exactly that distinction the commit decision needs.',
-    'The marker must be written by the server, in one step, from the set that is actually stored — not from a size the caller declared. Keep the completeness test and the `SET committed:{upload_id}` inside one `EVAL`, so a reader either sees no marker or a marker for a complete upload, never a half-committed checkpoint.',
-    'Give the state key an `EXPIRE` on the first write and let the marker carry its own, longer TTL. Abandoned uploads are the normal case in a training platform, and a state key with no TTL is memory that only a manual flush reclaims.',
+    'An upload that lost its last chunk shows `complete: true`; one that retried a chunk commits early; a week later Redis is full of `received:` keys for runs that died.',
+    'The counter cannot tell eight distinct chunks from six plus two retries, the marker is computed from `total_bytes` the caller sent, the read-then-`SET` is not atomic, and nothing ever expires.',
+    'Use `SADD upload:{upload_id} {index}` plus `EXPIRE` with `STATE_TTL_S`, then one `EVAL` of `COMMIT_LUA` that checks `SCARD` against the expected count and writes `committed:`; report from `EXISTS`.',
   ],
-  debrief: `The interviewer is testing whether you can tell durable state from bookkeeping. The starter is a counter and a flag, which is what a demo needs; the real contract is "a reader can trust the marker". That forces three decisions: the state must answer *which* chunks arrived (a set, not a count), the marker must be derived from that set on the server (never from the caller's metadata), and both the transient state and the marker need TTLs — short for the upload, long for the committed record. Real stores add a manifest written with the marker, per-chunk digests, a monotonic epoch so two uploads of the same step cannot interleave, and a reaper that removes blobs of uploads whose state expired.`,
+  debrief: `The contract is "a reader can trust the marker", and every part of the fix serves it. The state answers *which* chunks arrived, because a set is the only structure that makes a retry a no-op and a gap visible. The marker is computed on the server from that set inside one Lua script, so the completeness test and the write cannot be split by a second worker or a crash. The TTLs are asymmetric on purpose: an upload is transient and should vanish if abandoned; a committed record is what a resume depends on. Production stores pair the marker with a manifest, add a monotonic epoch so two uploads of the same step cannot interleave, and run a reaper that removes blobs whose state expired without a commit.`,
 };

@@ -8,33 +8,24 @@ export const eventsStep: Step = {
   focus: ['registry', 'kafka', 'consumer'],
   task: `## Task
 
-The starter is working code: a promotion publishes an event, a consumer counts
-it, and the dashboard moves. It partitions by the wrong field, copies the wrong payload and returns
-before the broker has the record. Find the flaws, fix them, and prove the fix.
-
-\`POST /v1/prompts/{name}/events\` is how the registry reports what happened to a prompt — the four
-lifecycle events are **registered**, **promoted**, **pinned** and **rolled_back**.
-
-- Publish one event to the **\`prompt.lifecycle\`** topic keyed by the **prompt name**. The key is
-  the partition key: keyed by name, one prompt’s history arrives in order, which is the only way a
-  consumer can replay "promoted 4, rolled back to 3" correctly. The starter keys by the operator.
-- The payload carries **hashes and ids**: the version’s \`content_hash\`, version, the event type
-  and the \`actor\`. It must **never** carry the template text, and no log line may either — the
-  topic is retained for days and replicated, so content written there outlives the retention policy
-  of the request path by a wide margin.
-- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS’s
-  \`idempotent: true\`, or required acks \`all\` with a hash balancer), so a retry cannot duplicate a
-  record.
-- When the broker rejects the produce, write an **outbox row** instead of dropping the event; a relay
-  republishes it when the broker recovers.
-- The handler **waits for the broker’s acknowledgement** (a flush, an awaited send, or
-  \`Async: false\`) before it answers 202. The starter acknowledges first and produces afterwards, so a
-  crash or a broker outage silently loses the event that the audit trail depends on.
+**Starting point.** The starter serves \`POST /v1/prompts/{name}/events\` with body
+\`{"name", "version", "event", "content_hash", "actor", "template"}\`: it logs the request, builds
+a payload, hands it to \`producer.produce\` keyed by the tenant and answers \`{"accepted": true}\`
+without waiting for the broker. It compiles, serves the demo and hides five flaws.
 
 **Failure mode the checks target.** Three contracts, one event: ordering (the key), confidentiality
-(the payload and the logs), and durability (acks plus the outbox). The subtle one is the key —
-keying by the operator reads as "who did it", and it destroys the only property a lifecycle topic
-exists to provide.`,
+(the payload and the logs), and durability (acks plus the outbox). The subtle one is the key:
+keying by the tenant reads as "who did it", and it destroys the only property a lifecycle topic
+exists to provide.
+
+- Publish one event to **\`prompt.lifecycle\`** keyed by the **prompt name**, so one prompt's
+  history arrives in order and a consumer can replay "promoted 4, rolled back to 3" correctly.
+- The payload carries the version's \`content_hash\`, version, event type and \`actor\`. Neither the
+  payload nor any log line may carry the template text; the topic is retained for days.
+- The producer is **idempotent with \`acks=all\`**, so a retry cannot duplicate a record.
+- When the broker rejects the produce, write an **outbox row** instead of dropping the event.
+- The handler **waits for the broker's acknowledgement** (a flush, an awaited send, or
+  \`Async: false\`) before it answers 202.`,
   sequence: {
     participants: ['Prompt Registry', 'prompt.lifecycle', 'Lifecycle consumer', 'Redis'],
     messages: [
@@ -142,10 +133,7 @@ class LifecycleRequest(BaseModel):
 
 @app.post("/v1/prompts/{name}/events")
 def publish_event(name: str, body: LifecycleRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter keys the topic by the operator, copies the full text into the payload and the
-    # log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
-    # actor ids only, use the idempotent producer with acks=all, and write an outbox row when the
-    # broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     logger.info("lifecycle name=%s tenant=%s template=%r", name, tenant, body.template)
     event = {"id": body.content_hash, "name": name, "event": body.event, "template": body.template}
     producer.produce(TOPIC, key=tenant, value=json.dumps(event))
@@ -260,10 +248,7 @@ interface LifecycleBody {
 }
 
 app.post('/v1/prompts/:name/events', async (request, reply) => {
-  // TODO: this starter keys the topic by the operator, copies the full text into the payload and the
-  // log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
-  // actor ids only, use the idempotent producer with acks=all, and write an outbox row when the
-  // broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const {name} = request.params as {name: string};
   const body = request.body as LifecycleBody;
   request.log.info({name, template: body.template}, 'lifecycle');
@@ -362,10 +347,7 @@ func publishEvent(rw http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	var body LifecycleRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter keys the topic by the operator, copies the full text into the payload and the
-	// log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
-	// actor ids only, use required acks all, and write an outbox row when the broker rejects the
-	// produce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	log.Printf("lifecycle name=%s actor=%s template=%q", name, body.Actor, body.Template)
 	event := map[string]any{"id": body.ContentHash, "name": name, "event": body.Event, "template": body.Template}
 	payload, _ := json.Marshal(event)
@@ -467,10 +449,7 @@ object LifecycleApi {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: this starter keys the topic by the operator, copies the full text into the payload and the
-  // log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
-  // actor ids only, use the idempotent producer with acks=all, and write an outbox row when the
-  // broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publish(name: String, eventType: String, version: Int, contentHash: String, actor: String, template: String): Unit = {
     val payload =
       s"""{"id":"$contentHash","name":"$name","event":"$eventType","version":$version,"template":"$template"}"""
@@ -557,10 +536,7 @@ const std::string kLifecycleTopic = "prompt.lifecycle";
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this starter keys the topic by the operator, copies the full text into the payload and the log
-// line, and answers before the broker confirms. Key by the prompt name, publish hashes and actor ids
-// only, use the idempotent producer with acks=all, and write an outbox row when the broker rejects
-// the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publish(const std::string& name, const std::string& eventType, int version, const std::string& contentHash, const std::string& actor, const std::string& text) {
   std::cerr << "lifecycle name=" << name << " actor=" << actor << " text=" << text << "\\n";
   const json event = {{"id", contentHash}, {"name", name}, {"event", eventType}, {"version", version}, {"template", text}};
@@ -634,9 +610,9 @@ void consume(const std::string& group) {
     },
   },
   hints: [
-    'The message key is a partitioning contract, not a label. `key = name` / `Key: []byte(name)` / `key: name` puts one prompt’s whole history in one partition, in order; keying by the operator or the request id undoes that on the first concurrent write.',
-    'Idempotence is producer configuration: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. It only helps if the retry reuses the same key, which is the same fix as the name key.',
-    'Durability is two halves: wait for the ack (a flush, an awaited send, `Async: false`) and, when the broker rejects it, insert an outbox row instead of dropping the event. Answering 202 before that is a promise the audit trail cannot keep.',
+    'A consumer replays "promoted 4, rolled back to 3" in the wrong order and leaves the counter on 4; the audit topic shows a promotion the registry answered 202 for but the broker was down.',
+    'The key is the tenant, so two writes to one prompt land on different partitions; the handler returns before the broker confirms, and the payload and log line copy `body.template` verbatim.',
+    'Key the record by `name`, drop `template` from the event and the log, configure the producer with `enable.idempotence`/`acks=all`, await or flush the send, and call `insert_outbox` when the broker rejects it.',
   ],
-  debrief: `The interview question behind this step is what a topic with a name is for. Partitioning by the entity whose history you want ordered is the entire reason the key exists — everything else is a detail. The second question is what may be written to a log that is retained and replicated: ids, hashes and outcomes, never the content, because the retention policy of the topic is not the retention policy of the request. The third is the difference between "the produce call returned" and "the broker has the record", which is exactly what acks, an awaited send and an outbox are for. Real platforms add schema-registry validation, dead-letter topics for permanently unprocessable events, and a relay that drains the outbox with the same idempotent key so the replay cannot duplicate.`,
+  debrief: `The fix keys the record by prompt name because partitioning by the entity whose history you want ordered is the entire reason the key exists; everything else about the producer is detail. The second property is what may be written to a log that is retained and replicated: ids, hashes and outcomes, not the content, because the retention policy of the topic is not the retention policy of the request. The third is the gap between "the produce call returned" and "the broker has the record", which acks, an awaited send and an outbox close. Production platforms also validate events against a schema registry, route unprocessable events to a dead-letter topic, and drain the outbox with a relay that reuses the idempotent key so a replay cannot duplicate.`,
 };

@@ -16,7 +16,7 @@ import {experimentReadStep} from './steps/5-read';
 export const experimentsPlatformProblem: Problem = {
   id: 'experiments-platform',
   title: 'Experiment Platform',
-  tagline: 'A/B experiments with frozen assignment, guardrails and reports that resist peeking.',
+  tagline: 'A/B experiments with frozen assignment, guardrail-gated ramps and reports that refuse a peek.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -24,29 +24,26 @@ export const experimentsPlatformProblem: Problem = {
 
 An experiment platform is the piece of a product that decides which variant a user sees, when an
 experiment may take more traffic, and whether the number on the final report means anything. The
-visible part is a variant in a response; the parts that decide whether the platform is honest are
-the assignment that is frozen before launch, the bucket that never moves, the gate in front of every
-traffic increase, the exposure stream the analysis is built from, and the report that refuses to call
-a winner it has not earned.
+visible part is a variant in a response; the parts that decide whether the platform can be trusted
+are the assignment that is frozen before launch, the bucket that stays put, the gate in front of
+every traffic increase, the exposure stream the analysis is built from, and the report that refuses
+to call a winner it has not earned.
 
 ## The real system
 
-Production experiment platforms pin the design of an experiment — its variants, its traffic split,
-the unit that is randomized and the sample the result needs — at the moment the experiment starts,
-and a later edit to any of those becomes a new version rather than a live mutation, because a user
-who moved from treatment to control mid-experiment contaminates every number that follows.
-Assignment is a pure function of an experiment id, the assignment unit and a salt that is itself
-frozen, so the same unit lands in the same variant on every request for the life of the experiment,
-and the platform caches that decision per experiment instead of re-deriving it from whatever the
-current split happens to be. Traffic is not raised because a cron fired: before each ramp step the
-platform asks a stats service whether any guardrail metric — error rate, latency, a business
-metric — breached its bound, and a failed check pauses the ramp and names the metric. Exposures are
-published keyed by experiment so one experiment's stream stays ordered, carrying the variant, a unit
-hash and a timestamp and never the user's identity, with a dedupe key of (experiment, unit, variant)
-so a re-rendered page is not a second exposure; the consumer updates analysis state *before* it
-commits the offset, so a crash replays rather than loses. And the read side refuses to declare a
-winner before the minimum sample is reached, treats a sample ratio mismatch as a blocking caveat, and
-never reports a lift without the interval around it.
+GrowthBook, the open source feature-flag and experimentation platform, puts a sample ratio
+mismatch warning at the top of an experiment's results page when the observed variant counts
+diverge from the configured split, because a mismatch means the assignment itself is suspect and
+no metric below it can be read. Its ramp schedules can hold a step until a minimum number of users
+has been exposed, so traffic grows on evidence rather than on a timer. The same pattern shows up in
+every serious platform: the design (variants, split, randomization unit, required sample) is pinned
+when the experiment starts and a later edit becomes a new version; assignment is a pure function of
+experiment id, unit and a frozen salt, cached per experiment so a split edit cannot move a user
+between arms; each ramp step asks a stats service whether a guardrail metric breached its bound and
+pauses with the metric named; exposures are keyed by experiment, carry a unit hash rather than an
+identity, are deduplicated on (experiment, unit, variant), and are applied to analysis state before
+the consumer commits; and the read side waits for the minimum sample, treats SRM as blocking, and
+shows every lift with its interval.
 
 ## What you build here
 
@@ -54,7 +51,7 @@ One service, **expd**, with five pieces:
 
 1. \`POST /v1/experiments\`: validated variants, an assignment unit of \`user\`/\`session\`/\`account\`,
    a traffic split that sums to exactly **100**, a minimum sample size and a frozen salt, all
-   immutable for the life of the experiment — a mid-flight change is **409** and asks for a new
+   immutable for the life of the experiment; a mid-flight change is **409** and asks for a new
    version.
 2. A **Redis** assignment cache keyed by \`(experiment, unit)\` under a hash over
    \`(experiment, unit, salt)\`: the bucket is computed once and cached so a read never re-buckets,
@@ -74,15 +71,15 @@ One service, **expd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real experiment feature: debug
-it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+it against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
+fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Metric definitions and the stats library, sequential test design, multi-armed bandits and adaptive
 allocation, targeting rules and audience segmentation, identity stitching across devices, per-tenant
 experiment quotas, and the dashboard that renders the report. The five pieces above are the ones that
-decide whether an experiment's assignment is stable and its conclusion is honest.`,
+decide whether an experiment's assignment is stable and its conclusion can be trusted.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'assign · report', x: 8, y: 50},

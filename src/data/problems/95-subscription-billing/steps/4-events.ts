@@ -8,42 +8,40 @@ export const invoiceEventsStep: Step = {
   focus: ['billing', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an invoice outcome
-on the right topic and the demo's happy path works end to end. It keys by the customer, publishes
-before the processor answers, only ever announces a successful charge, and uses a default producer
-with no outbox. Debug it like the billing owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter publishes the outcome of a billing run: it builds an event for the
+invoice, produces it to \`billing.invoice\` with a producer created from default settings, and then
+calls the processor's \`Charge\` and returns the reference. It compiles, the demo's happy path works
+end to end, and it hides five flaws.
 
-Once the processor has answered the charge for a (subscription, period), the outcome is published to
-the topic \`billing.invoice\`.
+**Failure mode the checks target.** On the happy path a single subscription is charged once and
+approved, so partition placement, the order of produce and charge, the missing failure event and the
+producer settings are all invisible. The flaws show up when a subscription changes owner, a card is
+declined, or a broker hiccups during a produce.
 
-- Every record goes to \`billing.invoice\` with the **subscription id** as the message key. The key
-  is the partition key, so one subscription's billing history lands on one partition in produce order
-  and a consumer replays it without gaps. The starter keys by the customer id: the moment a
-  subscription changes owner or tenant, its history scatters across partitions and a consumer can
-  apply a later outcome before an earlier one.
+Once the processor has answered the charge for a (subscription, period), the outcome goes to the
+topic \`billing.invoice\`:
+
+- Every record carries the **subscription id** as the message key. The key is the partition key, so
+  one subscription's billing history lands on one partition in produce order and a consumer replays
+  it without gaps. Keyed by the customer id, the moment a subscription changes owner or tenant its
+  history scatters across partitions and a consumer can apply a later outcome before an earlier one.
 - The event carries \`invoice_id\`, \`subscription_id\`, \`period_start\`, \`period_end\`,
-  \`amount_cents\` and \`state\` — \`charged\` or \`failed\` — plus the processor's \`reference\`
+  \`amount_cents\` and \`state\` (\`charged\` or \`failed\`), plus the processor's \`reference\`
   when the charge went through. It carries **no card data**: the topic is retained for days and
-  replicated to every broker, so the masked card the starter ships outlives every retention policy the
-  invoice store has.
-- The produce happens **after** the \`ChargeResult\` is known. The starter publishes first and charges
-  afterwards, so a declined attempt is announced as a charge that never happened.
-- Failed attempts are published too, with \`state\` \`failed\` and the processor's \`reason\`. The
-  starter only ever builds a success, so the topic shows a subscription whose history simply stopped
-  after a decline — a gap in the topic is a gap in support's answer.
+  replicated to every broker, so a masked card there outlives every retention policy the invoice
+  store has.
+- The produce happens **after** the \`ChargeResult\` is known, so a declined attempt is not announced
+  as a charge that never happened.
+- Failed attempts are published too, with \`state\` \`failed\` and the processor's \`reason\`. A
+  history that only holds successes shows a subscription that simply stopped after a decline, and a
+  gap in the topic is a gap in support's answer.
 - The producer is idempotent with required acks \`all\`: Python \`{"enable.idempotence": True,
   "acks": "all"}\`, KafkaJS \`{idempotent: true, maxInFlightRequests: 1}\`, kafka-go \`RequiredAcks:
   kafka.RequireAll\` with \`&kafka.Hash{}\`, kafka-clients \`enable.idempotence\` beside
   \`ProducerConfig.ACKS_CONFIG\`, librdkafka \`enable.idempotence\` with \`acks=all\`. A retried
-  produce must not be able to duplicate a record.
-- When the broker rejects the produce, the event goes to the **outbox** — a row in the billing db —
-  for the relay to republish. It is never dropped, and a Kafka outage does not fail the caller.
-
-**Failure mode the checks target.** Keyed by the customer, ordering per subscription is gone; a
-produce that runs before the processor answers advertises a decline as a charge; a publisher that
-only emits successes is silent exactly when support needs to explain a failure; and a default
-producer with no outbox turns a broker hiccup into a duplicated record or a lost one. Every one of
-these is invisible on the happy path the demo walks.`,
+  produce must not duplicate a record.
+- When the broker rejects the produce, the event goes to the **outbox**, a row in the billing db,
+  for the relay to republish. It is not dropped, and a Kafka outage does not fail the caller.`,
   sequence: {
     participants: ['Payment processor', 'Billing Service', 'billing.invoice', 'billing db', 'Ledger projector'],
     messages: [
@@ -179,11 +177,7 @@ processor = processor_pb2_grpc.ProcessorStub(grpc.insecure_channel("processor:90
 
 
 def publish(invoice: dict) -> None:
-    # TODO: flawed code. It keys the record by the customer id instead of the
-    # subscription id, publishes before the processor answers — so a declined charge is announced
-    # anyway — only ever builds a state="charged" event (a failed attempt is never published and no
-    # reason is carried), ships the masked card, and uses a default producer: no idempotence, no
-    # acks=all, and no outbox fallback when the broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {
         "invoice_id": invoice["invoice_id"],
         "subscription_id": invoice["subscription_id"],
@@ -199,7 +193,6 @@ def publish(invoice: dict) -> None:
 
 
 def bill_period(invoice: dict) -> dict:
-    # The event is on the wire before the charge is even attempted.
     publish(invoice)
     charge = processor.Charge(
         processor_pb2.ChargeRequest(
@@ -333,11 +326,7 @@ const {processor: proto} = grpc.loadPackageDefinition(protoLoader.loadSync('proc
 const processor = new proto.Processor('processor:9000', grpc.credentials.createInsecure());
 
 async function publish(invoice: Invoice): Promise<void> {
-  // TODO: flawed code. It keys by the customer id instead of the subscription id,
-  // publishes before the processor answers — so a declined charge is announced anyway — only ever
-  // builds state 'charged' (a failed attempt is never published and no reason is carried), ships
-  // the masked card, and uses a default producer: no idempotent, no maxInFlightRequests, and no
-  // outbox fallback when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {
     invoice_id: invoice.invoice_id,
     subscription_id: invoice.subscription_id,
@@ -354,7 +343,6 @@ async function publish(invoice: Invoice): Promise<void> {
 }
 
 export async function billPeriod(invoice: Invoice): Promise<void> {
-  // The event is on the wire before the charge is even attempted.
   await publish(invoice);
   const {promise, resolve, reject} = Promise.withResolvers<ChargeResult>();
   processor.Charge(
@@ -505,11 +493,8 @@ func newProcessorClient() pb.ProcessorClient {
 	return pb.NewProcessorClient(conn)
 }
 
-// Publish writes the outcome. TODO: flawed code. It keys by the customer id instead of
-// the subscription id, produces before the processor answers — so a declined charge is announced
-// anyway — only ever builds State "charged" (a failed attempt is never published and no Reason is
-// carried), ships the masked card, and writes with a default writer: no RequiredAcks, no hash
-// balancer, and no outbox fallback when the broker rejects the produce.
+// Publish writes the outcome.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func Publish(ctx context.Context, invoice Invoice) error {
 	event := map[string]any{
 		"invoice_id":      invoice.InvoiceID,
@@ -528,7 +513,6 @@ func Publish(ctx context.Context, invoice Invoice) error {
 }
 
 func BillPeriod(ctx context.Context, invoice Invoice) error {
-	// The event is on the wire before the charge is even attempted.
 	if err := Publish(ctx, invoice); err != nil {
 		return err
 	}
@@ -669,11 +653,7 @@ object BillingEvents {
       amountCents: Long,
   )
 
-  // TODO: flawed code. It keys by the customer id instead of the subscription id,
-  // publishes before the processor answers — so a declined charge is announced anyway — only ever
-  // builds state "charged" (a failed attempt is never published and no reason is carried), ships
-  // the masked card, and uses a bare producer: no enable.idempotence, no ACKS_CONFIG, and no
-  // outbox fallback when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publish(invoice: Invoice): Unit = {
     val event = Map(
       "invoice_id" -> invoice.invoiceId.toJson,
@@ -688,7 +668,6 @@ object BillingEvents {
   }
 
   def billPeriod(invoice: Invoice): String = {
-    // The event is on the wire before the charge is even attempted.
     publish(invoice)
     val charge = stub.charge(ChargeRequest(invoiceId = invoice.invoiceId, amountCents = invoice.amountCents))
     charge.reference
@@ -797,13 +776,8 @@ struct Invoice {
 std::unique_ptr<RdKafka::Producer> producer(
     RdKafka::Producer::create(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL).get(), err));
 
-// TODO: flawed code. It keys by the customer id instead of the subscription id,
-// produces before the processor answers — so a declined charge is announced anyway — only ever
-// builds a state "charged" event (a failed attempt is never published and no reason is carried),
-// ships the masked card, and uses a default producer: no enable.idempotence, no acks=all, and no
-// outbox fallback when the broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void billPeriod(Processor::Stub* processor, const Invoice& invoice) {
-  // The event is on the wire before the charge is even attempted.
   const json early = {{"invoice_id", invoice.invoice_id}, {"state", "charged"}};
   const auto payload = early.dump();
   producer->produce(
@@ -914,9 +888,9 @@ void billPeriod(Processor::Stub* processor, const Invoice& invoice) {
     },
   },
   hints: [
-    'The message key is an ordering contract, not metadata: `key=subscription_id`, `key: subscriptionId`, `Key: []byte(subscriptionID)`, `new ProducerRecord("billing.invoice", subscription.id, payload)`, and in C++ the key plus `subscription_id.size()` handed to `produce`. Keyed by the customer id, one subscription’s history scatters across partitions, and a consumer can then apply a later outcome before an earlier one.',
-    'Publish what happened, including the failures. The produce goes after the processor answers, the payload carries `state` plus either the processor’s `reference` or the failure’s `reason`, and a declined charge is an event of its own — a gap in the topic is a gap in support’s answer. What the payload never carries is card data: the topic is retained and replicated, and a PAN written there is a leak no retention policy can undo.',
-    'The outbox is the durability half, producer idempotence the duplicate half. Configure `enable.idempotence` with `acks=all` (KafkaJS `{idempotent: true, maxInFlightRequests: 1}`, kafka-go `RequiredAcks: kafka.RequireAll` with `&kafka.Hash{}`, kafka-clients `enable.idempotence` plus `ProducerConfig.ACKS_CONFIG`), and on a rejected produce call `insert_outbox` / `insertOutbox` so the relay republishes it instead of the record vanishing.',
+    'The ledger shows a charge for an invoice the processor declined, the declined subscription then has no further history, and after a subscription moved tenants its events arrived out of order on the projector.',
+    'The produce runs before `Charge` is called, the event is always `state: "charged"`, the key is the customer id, and a default producer with no outbox turns a broker error into a lost record or a duplicate.',
+    'Produce after the `ChargeResult`, with `key=subscription_id`, `state` plus `reference` or `reason`, no card field; configure `enable.idempotence` with `acks=all` and call `insert_outbox` when the broker rejects.',
   ],
-  debrief: `The interviewer is checking whether you treat the topic as an ordered, durable contract rather than a notification. The message key is that contract: key by the subscription id and one subscription's outcomes land on one partition in produce order, so the ledger replays a history instead of an interleaving; key by the customer id and the subscription stops being the unit of order the moment ownership changes. Order of effects is the second: the produce follows the ChargeResult, so the topic never advertises a charge that did not happen — and the failure path is not an exception to that, it is a record with state failed and the processor's reason. Failures are first-class because the topic is what support reads back: a history that only holds successes has a hole exactly where the customer's question is. Delivery finishes the job. An idempotent producer with acks=all makes a retried produce a no-op, while an outbox row plus a relay keeps the event when the broker refuses it — the producer's idempotence covers duplicates, the outbox covers loss, and neither covers the other. Consumers are at-least-once, so the projector must be idempotent per key and commit its offset only after its own store moved. Real platforms add a schema registry so the event contract is checked at produce time, a retention and compaction policy per topic (per-subscription compaction keeps the latest outcome of each subscription without unbounded growth), a dead-letter topic for records that can never be projected, and a reconciliation job that compares the topic's history against the invoices stored for the same period.`,
+  debrief: `The topic is an ordered, durable record, which is why the fix has three parts. The key is the subscription id so one subscription's outcomes land on one partition in produce order; keyed by the customer, the subscription stops being the unit of order the moment ownership changes. The produce follows the ChargeResult, and a failure is a record with \`state\` \`failed\` and the processor's reason rather than a gap, because the topic is what support reads back. Producer idempotence with \`acks=all\` covers duplicates and the outbox covers loss; neither covers the other. Production platforms go on from here with a schema registry checked at produce time, per-topic retention and compaction, a dead-letter topic for records that can never be projected, and a projector that is idempotent per key and commits its offset only after its own store moved.`,
 };

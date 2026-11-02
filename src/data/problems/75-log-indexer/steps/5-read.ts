@@ -8,30 +8,25 @@ export const readStep: Step = {
   focus: ['dash', 'api', 'ledger'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the completeness
-route, reads a count and returns it next to an expectation. It compiles, the page renders, and it
-hides three production flaws — the same ones that let the incident review conclude "100 %". Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/services/{service}/completeness\`: it reads the
+tenant header, asks the ledger for the service's all-time \`total_count\`, and returns that total next
+to a global constant \`EXPECTED_PER_HOUR\`. It compiles, the page renders, and it hides four flaws,
+the ones that let the incident review conclude "100 %".
 
-Implement \`GET /v1/services/{service}/completeness\`:
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The report is **per hour**: a list of hour buckets over the last **24 hours** (\`HOUR_MS\`), each
-  with the \`indexed\` count for that tenant's service. A single total cannot show *when* the logs
-  stopped.
-- Each hour carries an \`expected\` count computed from **that tenant's own service history**
-  (\`hourly_expectation(tenant, service, hours)\`), never a global average: one tenant's quiet hour
-  must not look like a gap on another tenant's report, and a global constant must not hide a real one.
-- An hour whose indexed count is below the expectation by more than **\`GAP_THRESHOLD\`** is flagged
-  (\`gap\`), and the response counts the flagged hours.
-- A \`service\` that is not in the caller's registry is **404** — a foreign service id is not the
-  caller's to read, and "not found" tells a prober less than "forbidden" would.
+- Missing \`X-Tenant-Id\` is **401**.
+- The report is **per hour**: buckets over the last **24 hours** (\`HOUR_MS\`), each with the
+  \`indexed\` count for that tenant's service.
+- Each hour carries an \`expected\` count from **that tenant's own service history**
+  (\`hourly_expectation(tenant, service, hours)\`), not a global average.
+- An hour below its expectation by more than **\`GAP_THRESHOLD\`** is flagged (\`gap\`), and the
+  response counts the flagged hours.
+- A \`service\` outside the caller's registry is **404**.
 - Return the service id, the hours, the gap count and the threshold; never the log text.
 
-**Failure mode the checks target.** The starter returns one number and compares it with a global
-constant, so a service that indexed ten records during an outage hour and a million during a normal
-hour both "look fine"; it computes the expectation globally, so one tenant's backfill inflates every
-other tenant's baseline until genuine drops stop flagging; and it answers for any service id, which
-turns the completeness page into an existence oracle for other tenants' pipelines.`,
+**Failure mode the checks target.** One number makes a service that indexed ten records in an outage
+hour and a million in a normal hour "look fine"; a global constant makes one tenant's volume every
+tenant's baseline, so genuine drops stop flagging; nothing is marked as a gap; and answering for any
+service id turns the completeness page into an existence oracle for other tenants' pipelines.`,
   sequence: {
     participants: ['Completeness UI', 'Ingest API', 'Index ledger'],
     messages: [
@@ -78,7 +73,7 @@ turns the completeness page into an existence oracle for other tenants' pipeline
       id: 'expectation-per-tenant',
       title: "Computes the expectation from the tenant's own history",
       detail:
-        'The expected count is read for `(tenant, service)` over the same window, never a global constant or a cross-tenant average. The starter compares every tenant with one global expectation, which hides real drops and invents fake ones.',
+        'The expected count is read for `(tenant, service)` over the same window, not a global constant or a cross-tenant average. The starter compares every tenant with one global expectation, which hides real drops and invents fake ones.',
       match: {
         python: {all: [/hourly_expectation\(tenant,\s*service/]},
         typescript: {all: [/hourlyExpectation\(tenant,\s*service/]},
@@ -136,8 +131,7 @@ ledger = IndexLedger()
 
 @app.get("/v1/services/{service}/completeness")
 def completeness(service: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter reports one total, compares it with a global expectation, and answers for any
-    # service id instead of 404 for one outside the caller's registry. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     total = ledger.total_count(tenant, service)
     return JSONResponse({"service": service, "indexed": total, "expected": EXPECTED_PER_HOUR})
 `,
@@ -222,8 +216,7 @@ export interface IndexLedger {
 export const ledger: IndexLedger = {totalCount: async () => 0};
 
 app.get('/v1/services/:service/completeness', async (request, reply) => {
-  // TODO: this starter reports one total, compares it with a global expectation, and answers for any
-  // service id instead of 404 for one outside the caller's registry. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {service} = request.params as {service: string};
   const tenant = request.headers['x-tenant-id'] as string;
   const total = await ledger.totalCount(tenant, service);
@@ -305,8 +298,7 @@ func (l *IndexLedger) TotalCount(ctx context.Context, tenant, service string) (i
 var ledger = &IndexLedger{}
 
 func completeness(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reports one total, compares it with a global expectation, and answers for any
-	// service id instead of 404 for one outside the caller's registry. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	service := r.PathValue("service")
 	total, _ := ledger.TotalCount(r.Context(), tenant, service)
@@ -439,9 +431,7 @@ object Read {
   val route: Route =
     path("v1" / "services" / Segment / "completeness") { service =>
       get {
-        // TODO: this starter reports one total, compares it with a global expectation, and answers
-        // for any service id instead of 404 for one outside the caller's registry. Fix all
-        // three.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         val total = ledger.totalCount(service)
         complete(StatusCodes.OK, s"""{"service":"$service","indexed":$total,"expected":$ExpectedPerHour}""")
       }
@@ -540,8 +530,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/services/([^/]+)/completeness)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reports one total, compares it with a global expectation, and answers for
-    // any service id instead of 404 for one outside the caller's registry. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto service = req.matches[1].str();
     const auto total = ledger.totalCount(tenant, service);
@@ -636,9 +625,9 @@ int main() {
     },
   },
   hints: [
-    'Start from the window, not the total: bucket the last 24 hours by `HOUR_MS` and report every bucket, including the ones with zero. A number without a time axis cannot tell an operator whether the logs stopped an hour ago or degraded for a week.',
-    "The expectation has to come from the same tenant and the same service, over the same window — otherwise one tenant's backfill raises everyone's baseline until a real drop stops flagging. Read it from the service's own history and compare per hour.",
-    "The registry is what makes the read safe: a `service` id that is not in the caller's registry is a **404**, not an empty report. Returning 200 for a foreign id turns your completeness page into an oracle for other tenants' pipelines.",
+    "A service that shipped nothing for six hours shows `indexed: 2400000, expected: 1000` and reads as healthy; a GET for a competitor's service id returns 200 with their count.",
+    'The handler calls `total_count` once, so time is collapsed into one number; `EXPECTED_PER_HOUR` is a constant shared by every tenant; the service id is used without a registry lookup, so any id is answered.',
+    'Look the service up in the registry and answer 404 when absent; build 24 `hour_bucket` windows of `HOUR_MS`, read `hourly_expectation(tenant, service, hours)`, and mark `"gap"` where indexed falls below expected by more than `GAP_THRESHOLD`.',
   ],
-  debrief: `The interviewer is probing the difference between a number and evidence. A total answers "how much" and hides "when", so the report is buckets — and the expectation must be per tenant and per service, because a shared baseline is exactly how a quiet tenant looks broken and a broken tenant looks fine. The threshold turns the comparison into a signal instead of a judgement the on-call engineer has to make by eye. The 404 is the access-control half: completeness leaks the existence and health of pipelines, so it is scoped to the caller's registry like every other read. Real platforms add per-hour retention and sampling context to the response, an explicit "expected from N days of history" note, anomaly detection on the bucket series, and an alert that fires when the gap count crosses a threshold rather than waiting for someone to open the page.`,
+  debrief: `The report is a list of buckets rather than a total because a total answers "how much" and hides "when", and "when" is the only question an operator has during an outage. The expectation is per tenant and per service because a shared baseline makes a quiet tenant look broken and a broken tenant look fine. The threshold turns the comparison into a signal instead of a judgement made by eye. The 404 scopes the read to the caller's registry like every other read, because a completeness page that answers for any id leaks which pipelines exist and how healthy they are. Production platforms go further: retention and sampling context per hour, an explicit "expected from N days of history" note, anomaly detection on the bucket series, and an alert on the gap count rather than a page someone has to open.`,
 };

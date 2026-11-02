@@ -8,33 +8,24 @@ export const eventsStep: Step = {
   focus: ['broker', 'kafka', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: a \`quota.event\` lands in the
-topic and the demo shows it. Its ordering, its payload and its durability are all wrong. Debug it,
-fix it, and prove the fix.
+**Starting point.** The starter's reserve handler serialises the incoming \`QuotaEvent\` (kind,
+team, window, resource class, amount, reservation id, user id) to JSON, calls
+\`producer.send(TOPIC, key=resource_class, value=payload)\` with a default \`KafkaProducer\`,
+polls once and answers at once. It compiles and hides five flaws.
 
-Implement the quota-event path behind the reserve, release and deny paths:
+**Failure mode the checks target.** Rebuilding one team's ledger from the topic gives the wrong
+order, because every team sharing \`gpu-a100\` interleaves in one partition; the retained payload
+names who asked; and a produce the broker rejects after the response is gone with no trace.
 
-- Every reserve, release and deny publishes a \`quota.event\` **keyed by team**. Kafka orders within
-  a partition, not within a topic, so the key decides which events can be reordered relative to one
-  another — and a team’s ledger is only readable in order. The starter keys by **resource class**, so
-  every team that reserves a \`gpu-a100\` shares one partition and their events interleave.
-- The payload carries the **resource class, the window, the amount and the reservation id**, plus
-  the event kind. It never carries **who** asked: no user id, no email, no request metadata. The
-  topic is retained and replicated far past any request, and the ledger it rebuilds needs amounts,
-  not identities. The starter copies the caller’s \`user_id\` into every event.
-- The producer uses **\`acks=all\`**, so an acknowledged produce is replicated rather than buffered
-  on a single broker.
-- The handler returns only **after the broker confirms**. The starter fires the produce and answers
-  immediately, so a produce that fails after the response is a lost event nobody can replay.
-- When the produce is rejected, the same payload is written to an **outbox** row, so a broker outage
-  delays the event instead of dropping it and the ledger can be rebuilt by draining the outbox.
-
-**Failure mode the checks target.** Three proofs: two events of one team must share a partition
-(per-team ordering), no user identifier may appear in the retained payload, and a rejected produce
-must leave an outbox row rather than a hole in the ledger.
-
-**What to keep.** The topic name and the produce call are fine. The fix is the key, the payload, the
-acknowledgement level and the failure path.`,
+- Publish every reserve, release and deny with \`key=team\`, so one team's events share a
+  partition and stay ordered.
+- The payload is \`{kind, team, window, resource_class, amount, reservation_id}\` and nothing about
+  the caller: no \`user_id\`. The topic outlives every request.
+- Configure the producer with \`ACKS_ALL\` (\`acks=all\`).
+- Wait on the delivery future (\`producer.send(...).get(...)\`) before answering, so the response
+  means the record is replicated.
+- When the produce is rejected, \`rpush\` the same payload onto an \`outbox\` list so a broker outage
+  delays the event and a drainer can replay it.`,
   sequence: {
     participants: ['Quota Broker', 'Kafka', 'Outbox'],
     messages: [
@@ -119,7 +110,7 @@ acknowledgement level and the failure path.`,
   ],
   code: {
     python: {
-      starter: `"""quota.event: flawed code that keys by resource class and describes the requester."""
+      starter: `"""quota.event: the event published behind reserve, release and deny."""
 import json
 
 from fastapi import FastAPI
@@ -144,10 +135,7 @@ class QuotaEvent(BaseModel):
 
 @app.post("/v1/quotas/{team}/reserve")
 def reserve(team: str, event: QuotaEvent) -> dict:
-    # TODO: this starter keys the event by resource class, includes the requester's user id, produces
-    # without acks=all and answers before the broker confirms, and has no outbox. Key by team,
-    # publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
-    # payload in an outbox when the produce is rejected.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = json.dumps(
         {
             "kind": event.kind,
@@ -213,7 +201,7 @@ def reserve(team: str, event: QuotaEvent) -> dict:
 `,
     },
     typescript: {
-      starter: `/** quota.event: flawed code that keys by class and answers before the ack. */
+      starter: `/** quota.event: the event published behind reserve, release and deny. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -233,10 +221,7 @@ interface QuotaEvent {
 
 app.post('/v1/quotas/:team/reserve', async (request, reply) => {
   const event = request.body as QuotaEvent;
-  // TODO: this starter keys the event by resource class, includes the requester's user id, produces
-  // without acks=all and answers before the broker confirms, and has no outbox. Key by team,
-  // publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
-  // payload in an outbox when the produce is rejected.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   void producer.send({
     topic: 'quota.event',
     messages: [
@@ -336,10 +321,7 @@ type quotaEvent struct {
 func reserve(rw http.ResponseWriter, r *http.Request) {
 	var event quotaEvent
 	_ = json.NewDecoder(r.Body).Decode(&event)
-	// TODO: this starter keys the event by resource class, includes the requester's user id, produces
-	// without acks=all and answers before the broker confirms, and has no outbox. Key by team,
-	// publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
-	// payload in an outbox when the produce is rejected.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(event)
 	producer.Input() <- &sarama.ProducerMessage{
 		Topic: "quota.event",
@@ -457,10 +439,7 @@ object EventsApi {
     path("v1" / "quotas" / Segment / "reserve") { team =>
       post {
         entity(as[QuotaEvent]) { event =>
-          // TODO: this starter keys the event by resource class, includes the requester's user id,
-          // produces without acks=all and answers before the broker confirms, and has no outbox.
-          // Key by team, publish kind/window/resource_class/amount/reservation_id only, wait for
-          // the ack, and park the payload in an outbox when the produce is rejected.
+          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
           val payload =
             s"""{"kind":"\${event.kind}","team":"\${event.team}","window":"\${event.window}","resource_class":"\${event.resource_class}","amount":\${event.amount},"reservation_id":"\${event.reservation_id}","user_id":"\${event.user_id}"}"""
           producer.send(new ProducerRecord[String, String](Topic, event.resource_class, payload))
@@ -554,10 +533,7 @@ int main() {
   svr.Post("/v1/quotas/:team/reserve", [&](const httplib::Request& req, httplib::Response& res) {
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this starter keys the event by resource class, includes the requester's user id, produces
-    // without acks=all and answers before the broker confirms, and has no outbox. Key by team,
-    // publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
-    // payload in an outbox when the produce is rejected.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto payload = json{{"kind", body.value("kind", std::string())},
                               {"team", body.value("team", std::string())},
                               {"window", body.value("window", std::string())},
@@ -629,19 +605,16 @@ int main() {
     },
   },
   hints: [
-    'The message key decides the partition, and the partition decides order. `key=team` keeps one team’s reserve, release and deny events readable in sequence; keying by resource class scatters every team that shares a class across one partition and interleaves their ledgers.',
-    'The topic is retained and replicated, so publish what the ledger needs and nothing about the caller: `{kind, team, window, resource_class, amount, reservation_id}`. A `user_id` in the payload outlives the request, the reservation and the team’s membership.',
-    'Do not answer before the broker does. `acks=all` plus a wait on the delivery report (`.get()`, `await`, a delivery channel, a `flush`) makes the write real; when it fails, insert the same payload into an `outbox` row so a replay can rebuild the ledger instead of losing the event.',
+    "A consumer rebuilding team-a's ledger sees a release arrive before the reserve it refunds, and team-b's events are mixed in between. The rebuilt counter goes negative.",
+    'Kafka orders within a partition and the key picks the partition. `key=event.resource_class` puts every team that reserves a `gpu-a100` into one partition, so two events of one team can land apart.',
+    'Use `key=team`. Then the other checks: drop `user_id` from the payload, set `ACKS_ALL`, wait on `producer.send(...).get(...)`, and `rpush` the payload onto `outbox` when the produce is rejected.',
   ],
-  debrief: `The interview question behind this step is what an event stream is for and what it must never
-carry. The ledger is rebuilt from these events, so their order per team is a correctness property,
-and order in Kafka is a property of the partition key: key by team and every event of one team
-serialises behind the others. The payload is the second half — this topic is retained far longer
-than any request, so an identity copied into it becomes a permanent record of who asked, unrelated
-to the accounting the event exists for. Durability is the third: an acknowledged produce needs
-\`acks=all\`, the response must wait for that acknowledgement, and a rejected produce must land in an
-outbox rather than vanish, because a hole in the ledger is indistinguishable from capacity that was
-granted and never returned. Real systems add a schema registry so the payload cannot silently grow
-a field, compaction keyed by team for the latest ledger state, and an outbox drainer with its own
-retry budget.`,
+  debrief: `The ledger is rebuilt from these events, so order per team is a correctness property, and order in
+Kafka is a property of the partition key. Keying by team puts every event of one team behind the
+previous one. The payload shape follows from retention: the topic outlives every request, so an
+identity copied into it becomes a permanent record of who asked, unrelated to the accounting the
+event exists for. Durability is the last piece: \`acks=all\` makes an acknowledgement mean
+replicated, waiting for it makes the response mean acknowledged, and an outbox row turns a rejected
+produce into a delay instead of a hole. Production pipelines register the event schema so a field
+cannot be added silently, and run the outbox drainer as its own process with an alert on its backlog.`,
 };

@@ -8,36 +8,30 @@ export const stateStep: Step = {
   focus: ['queue', 'redis', 'items'],
   task: `## Task
 
-**Starting point.** The starter pops the next item and stamps a deadline. It works on the demo
-because no reviewer ever closes the tab mid-item and every server sits in one region. It strands work
-the moment a reviewer crashes and it misjudges breaches the moment two regions' clocks disagree.
-Debug it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/review/items/next\`: it pops one item from a single
+list with \`queue.pop\`, marks it taken with \`queue.assign\`, stamps \`sla_deadline\` as
+\`time.time()\` plus a per-priority budget from \`SLA_MINUTES\`, and returns the item. It compiles,
+serves the demo and hides 5 flaws.
 
-Implement the assignment path over **Redis**, plus the sweeper that returns abandoned items:
+**Failure mode the checks target.** A reviewer closes the tab mid-item and the item stays assigned to
+nobody; a region whose clock runs fast marks fresh items breached while a slow one hides real
+breaches; a breached item comes back looking like any other; a p3 item is handed out while p1 work
+waits.
 
 - **Redis keys.** \`review:queue:{tenant}:{priority}\` is a list of queued item ids;
   \`review:assigned:{tenant}\` is the set of currently assigned ids; \`review:lease:{tenant}:{item}\`
   is the reviewer's lease; \`review:item:{tenant}:{item}\` is a hash with \`priority\` and
   \`sla_deadline\`.
-- \`POST /v1/review/items/next\` takes \`X-Tenant-Id\` and \`X-Reviewer-Id\`, pops the next item in
-  **priority order** (\`p1\`, \`p2\`, \`p3\`), assigns it, and returns \`item_id\`, \`priority\` and
-  the \`sla_deadline\`. An empty queue is **404**.
+- The endpoint takes \`X-Tenant-Id\` and \`X-Reviewer-Id\`, pops the next item in **priority order**
+  (\`p1\`, \`p2\`, \`p3\`) via \`next_item\` over a \`PRIORITY_ORDER\` table, assigns it, and returns
+  \`item_id\`, \`priority\` and \`sla_deadline\`. An empty queue is **404**.
 - **Assignment takes a lease**: \`assign_item\` writes the lease key for \`LEASE_SECONDS\` with a TTL
-  (\`SET … NX PX\`) and adds the id to \`review:assigned:{tenant}\`, so a reviewer who disappears is
-  not silently holding the item forever.
-- **The SLA clock is monotonic**: the deadline is \`monotonic_now() + SLA_SECONDS[priority]\`, where
-  \`monotonic_now()\` reads a monotonic source. Wall-clock time that jumps forward or drifts minutes
-  per day across regions must never decide a breach.
-- **\`reclaim_expired(tenant)\`** sweeps assigned items whose lease key has expired, requeues each id,
-  and marks a breach: an item past its \`sla_deadline\` is returned to the **front** of its priority
-  list and recorded as **breached**; an item inside its SLA returns to the back.
-- \`mark_breached(tenant, item_id)\` records the breach so the queue read and the events path can see
-  it — a breached item is *visible as breached*, never silently just "first".
-
-**Failure mode the checks target.** The starter pops with no lease at all, so a crashed reviewer leaves
-an item assigned to nobody and it never comes back. And it computes the deadline from the server's
-wall clock, so a region whose clock runs fast marks honest items breached and one that runs slow
-hides real breaches.`,
+  (\`SET … NX PX\`) and adds the id to \`review:assigned:{tenant}\`.
+- **The SLA clock is monotonic**: the deadline is \`monotonic_now() + SLA_SECONDS[priority]\`. Wall
+  clock time that jumps or drifts across regions must not decide a breach.
+- **\`reclaim_expired(tenant)\`** sweeps assigned items whose lease key has expired and requeues each
+  id: an item past its \`sla_deadline\` goes to the **front** of its priority list and is recorded as
+  **breached** via \`mark_breached(tenant, item_id)\`; an item inside its SLA goes to the back.`,
   sequence: {
     participants: ['Reviewer', 'Review Queue', 'Redis', 'Item store'],
     messages: [
@@ -148,9 +142,7 @@ def take_next(
     tenant: str = Header(alias="X-Tenant-Id"),
     reviewer: str = Header(alias="X-Reviewer-Id"),
 ) -> JSONResponse:
-    # TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the item
-    # forever, and it stamps a wall-clock deadline that drifts minutes per day between regions.
-    # Fix both.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     item = queue.pop(tenant)
     queue.assign(tenant, item["item_id"], reviewer)
     deadline = time.time() + SLA_MINUTES[item["priority"]] * 60
@@ -263,9 +255,7 @@ const SLA_MINUTES: Record<string, number> = {p1: 5, p2: 15, p3: 60};
 const lists = new Map<string, string[]>();
 
 app.post('/v1/review/items/next', async (request, reply) => {
-  // TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the item
-  // forever, and it stamps a wall-clock deadline that drifts minutes per day between regions.
-  // Fix both.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const reviewer = request.headers['x-reviewer-id'] as string;
   const queue = lists.get(\`review:queue:\${tenant}:p1\`) ?? [];
@@ -376,9 +366,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func takeNext(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	reviewer := r.Header.Get("X-Reviewer-Id")
-	// TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the
-	// item forever, and it stamps a wall-clock deadline that drifts minutes per day between
-	// regions. Fix both.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := "review:queue:" + tenant + ":p1"
 	list := queues[key]
 	if len(list) == 0 {
@@ -524,8 +512,7 @@ object Api {
   def route: Route =
     path("v1" / "review" / "items" / "next") {
       post {
-        // TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the
-        // item forever, and it stamps a wall-clock deadline that drifts between regions. Fix both.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         headerValueByName("X-Tenant-Id") { tenant =>
           headerValueByName("X-Reviewer-Id") { reviewer =>
             Queue.pop(tenant) match {
@@ -634,8 +621,7 @@ int main() {
   httplib::Server svr;
   svr.Post("/v1/review/items/next", [](const httplib::Request& req, httplib::Response& res) {
     auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the
-    // item forever, and it stamps a wall-clock deadline that drifts between regions. Fix both.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     auto& list = queues["review:queue:" + tenant + ":p1"];
     if (list.empty()) {
       res.status = 404;
@@ -738,9 +724,9 @@ int main() {
     },
   },
   hints: [
-    'A lease is what makes an assignment recoverable: `SET review:lease:{tenant}:{item} {reviewer} NX PX {LEASE_SECONDS * 1000}`, plus the id in `review:assigned:{tenant}` so the sweeper can find it.',
-    'The SLA deadline must not depend on the wall clock. Compute it from a monotonic source and keep the per-priority budget in one table, so a region whose clock drifts cannot mark honest items breached.',
-    'The sweeper is the safety net: for each assigned id whose lease key has expired, requeue it — at the front and marked breached when it is past its deadline, at the back when it is not.',
+    'Symptoms: a reviewer closes the tab and the item vanishes from every queue; after a clock step one region reports breaches on items taken a minute ago; p3 items get served while p1 waits.',
+    'The handler pops a single list and marks the item assigned with nothing that expires, and the deadline is `time.time()` plus a budget, so the breach decision inherits whatever the host clock does.',
+    'Add `assign_item` (`SET … NX PX` for `LEASE_SECONDS`, id into the assigned set), `next_item` over `PRIORITY_ORDER`, deadlines from `time.monotonic()` plus `SLA_SECONDS`, and `reclaim_expired` that requeues expired leases and calls `mark_breached`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an assignment path against reviewer failure. The starter reads fine because the demo never crashes a reviewer and runs in one region. Two defects are being checked. First, assignment without a lease: a lease key with a TTL plus a set of assigned ids is what lets a sweeper notice that the reviewer who took an item is gone and put it back — without it, a crashed tab strands work permanently. Second, a wall-clock deadline: regions drift minutes per day, so a fast clock marks honest items breached and a slow one hides real breaches; the SLA must be computed from a monotonic source, and in production from one clock service all replicas agree on. The subtle third point is visibility: a breached item must come back *marked breached* so the read path and the event path can act on it, not silently first. Real queues add heartbeat extension of the lease, per-tenant lease budgets, and a dead-letter path for items that breach repeatedly.`,
+  debrief: `The lease is what makes an assignment recoverable: a key with a TTL plus a set of assigned ids lets a sweeper notice that the reviewer who took an item is gone and put it back. The deadline comes from a monotonic source because a breach is a duration question, not a wall-clock question, and regions disagree on the wall clock by minutes. Marking the breach is separate from reordering because the queue read and the event trail need to see it; "first in line" is not a signal anyone can alert on. Production queues go further: a lease heartbeat so a long but live review can extend its hold, a shared clock service all replicas agree on, and a dead-letter path for items that breach repeatedly.`,
 };

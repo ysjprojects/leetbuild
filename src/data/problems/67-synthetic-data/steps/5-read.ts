@@ -8,33 +8,31 @@ export const readStep: Step = {
   focus: ['client', 'synth', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: a report comes back, the row
-count looks healthy and the demo ships. It authorizes nothing, it hides the records nobody scored,
-and it cannot say where a single admitted record came from. Find the flaws, fix them, and prove the
-fix.
+**Starting point.** The starter serves \`GET /v1/synthetic/jobs/{job_id}\` for any job id it is
+handed, reads the \`X-Tenant-Id\` header without using it, and returns \`total\`, \`admitted\` and a
+\`provenance_digest\` that \`recompute_digest\` hashes from the seed row as it looks today. It
+compiles, serves the demo and hides 5 flaws.
 
-Implement \`GET /v1/synthetic/jobs/{job_id}\`, the report a reviewer reads before the corpus ships:
+**Failure mode the checks target.** Provenance looks like a field and is the difference between a
+corpus you can defend and a pile of text; recomputing the digest from the current seed is cheap
+and wrong the moment a seed gets re-versioned. Foreign-job reads are the isolation bug, and a
+totals-only body is the report that let the collapsed, timeout-ridden corpus through in the first
+place.
+
+The route is the report a reviewer reads before the corpus ships:
 
 - The job is looked up for the **authenticated tenant**: \`assert_tenant_owns(tenant, job_id)\`. A job
-  belonging to another tenant, or one that does not exist, answers **404** — a foreign job id must be
-  indistinguishable from a missing one. The starter serves any job id it is handed.
+  belonging to another tenant, or one that does not exist, answers **404**, so a foreign job id is
+  indistinguishable from a missing one.
 - The body reports the four outcomes: **\`generated\`**, **\`admitted\`**, **\`parked\`** and
-  **\`rejected\`**. The parked count is the one that matters — records a timed-out judge never scored
-  are neither admitted nor rejected, and a report that only shows a total hides them.
+  **\`rejected\`**. Records a timed-out judge did not score are neither admitted nor rejected, and a
+  report that only shows a total hides them.
 - The body carries **\`coverage\`**: the per-entity counts read from the job's coverage hash
-  (\`HGETALL synth:cov:{job_id}\`), not a single total. Diversity is the thing a reviewer is checking.
-- The body carries the **\`judge_version\`** that scored the corpus, so a set scored by a judge nobody
-  can name cannot ship.
+  (\`HGETALL synth:cov:{job_id}\`), not a single total.
+- The body carries the **\`judge_version\`** that scored the corpus.
 - Every admitted record **resolves to a seed digest**: read the digest stored on the admitted record
-  (\`records.admitted(job_id)\`) and return it per record. The starter recomputes a digest from whatever
-  the seed looks like *now*, so a record generated before a seed version bump points at the wrong
-  seed — the linkage is lost exactly for the records generated across retries.
-
-**Failure mode the checks target.** Provenance is the subtle one: it looks like a field, and it is
-the difference between a corpus you can defend and a pile of text. Recomputing the digest from the
-current seed is plausible, cheap and wrong the moment a seed gets re-versioned. Foreign-job reads are
-the isolation bug — a report is a list of what a tenant's seeds produced. And a totals-only body is
-the report that let the collapsed, timeout-ridden corpus through in the first place.`,
+  (\`records.admitted(job_id)\`) and return it per record, so a record generated before a seed
+  version bump still points at the seed it came from.`,
   sequence: {
     participants: ['Data curator', 'Synthetic Data API', 'record store', 'Redis'],
     messages: [
@@ -64,9 +62,9 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
     ],
   },
   hints: [
-    'Authorize the read like the write: fetch the job row under the authenticated tenant first and answer `404` for anything else, so a foreign job id is indistinguishable from a missing one.',
-    'Report the four outcomes separately, and read coverage from the same hash the workers wrote (`synth:cov:{job_id}`). A totals-only body cannot distinguish a diverse corpus from one entity repeated ten thousand times, and it cannot show the parked records nobody scored.',
-    'The digest belongs to the record, not to the seed: store it at admission and read it back here. Recomputing it from the current seed version is the plausible bug — it silently rewrites history for every record generated before a bump, which is exactly the retry path a reviewer is auditing.',
+    'A curator pastes another tenant\u2019s job id and gets a full report. After a seed version bump, every record admitted last week suddenly claims a digest nobody can find in the archive.',
+    'The handler reads the tenant header and does nothing with it; `recompute_digest` hashes `records.seed_row` as it is now, not as it was at admission; `parked` and `rejected` are not read at all.',
+    'Call `assert_tenant_owns(tenant, job_id)` first (404), return `generated`/`admitted`/`parked`/`rejected`, `coverage` from `hgetall(`, `judge_version`, and `seed_digest` per row from `records.admitted(` with `recompute_digest` removed.',
   ],
   checks: [
     {
@@ -152,7 +150,7 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
   ],
   code: {
     python: {
-      starter: `"""GET /v1/synthetic/jobs/{job_id}: flawed code that reports a total."""
+      starter: `"""GET /v1/synthetic/jobs/{job_id}: report a job's progress and provenance."""
 import hashlib
 
 from fastapi import FastAPI, Header
@@ -180,9 +178,7 @@ records = ReportStore()
 
 
 def recompute_digest(seed_row: str) -> str:
-    # TODO: this starter reports a total and an admitted count, so the records nobody scored are
-    # invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row
-    # as it looks today, so a record generated before a seed version bump points at the wrong seed.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     return hashlib.sha256(seed_row.encode("utf-8")).hexdigest()
 
 
@@ -266,7 +262,7 @@ def read_job(job_id: str, tenant: str | None = Header(default=None, alias="X-Ten
 `,
     },
     typescript: {
-      starter: `/** GET /v1/synthetic/jobs/:jobId: flawed code that reports a total. */
+      starter: `/** GET /v1/synthetic/jobs/:jobId: report a job's progress and provenance. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -275,9 +271,7 @@ import {records} from './store';
 
 export const app = Fastify();
 
-// TODO: this starter reports a total and an admitted count, so the records nobody scored are
-// invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row as
-// it looks today, so a record generated before a seed version bump points at the wrong seed.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 function recomputeDigest(seedRow: string): string {
   const digest = createHash('sha256').update(seedRow).digest('hex');
   return digest;
@@ -370,7 +364,7 @@ void app.listen({port: 8080, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// GET /v1/synthetic/jobs/{job_id}: flawed code that reports a total.
+      starter: `// GET /v1/synthetic/jobs/{job_id}: report a job's progress and provenance.
 package main
 
 import (
@@ -397,9 +391,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 // recomputeDigest re-hashes the seed row as it looks today.
 //
-// TODO: this starter reports a total only, so the records nobody scored are invisible; it serves any
-// tenant's job; and provenance is recomputed from the current seed row instead of the digest
-// stored when the record was admitted, so a record made before a seed version bump drifts.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func recomputeDigest(seedRow string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(seedRow)))
 }
@@ -561,9 +553,7 @@ object SynthReport {
 
   val records = ReportStore
 
-  // TODO: this starter reports a total and an admitted count, so the records nobody scored are
-  // invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row as
-  // it looks today, so a record generated before a seed version bump points at the wrong seed.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def recomputeDigest(seedRow: String): String =
     MessageDigest.getInstance("sha256").digest(seedRow.getBytes("UTF-8")).map("%02x".format(_)).mkString
 
@@ -647,7 +637,7 @@ object SynthReport {
 `,
     },
     cpp: {
-      starter: `// GET /v1/synthetic/jobs/{job_id}: flawed code that reports a total.
+      starter: `// GET /v1/synthetic/jobs/{job_id}: report a job's progress and provenance.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -665,9 +655,7 @@ struct ReportStore {
 ReportStore records;
 std::string sha256Hex(const std::string& input);
 
-// TODO: this starter reports a total and an admitted count, so the records nobody scored are
-// invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row as
-// it looks today, so a record generated before a seed version bump points at the wrong seed.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::string recomputeDigest(const std::string& seedRow) {
   return sha256Hex(seedRow);
 }
@@ -780,5 +768,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell a report from a metric. Totals are cheap and they are exactly what let a collapsed, timeout-ridden corpus pass review: the number went up, so the set looked healthy. The four outcomes are the actual contract — generated, admitted, parked, rejected — and the parked count is the one that turns infrastructure flakiness into a visible, arguable number instead of silent label noise. Coverage per entity is the diversity check, and the judge version is what makes the score auditable later. The provenance field is the subtle one: a digest recomputed from the seed's current version looks equivalent in a demo and rewrites history after the first version bump, so the digest has to be stored at admission and read back unchanged. Real platforms add a rejudge queue for parked records, a diversity metric over entity types, and signed manifests that pin seed digests per released corpus.`,
+  debrief: `The report has four counts instead of one because the parked outcome is the only place a timed-out judge becomes visible; fold it into a total and infrastructure flakiness turns back into silent label noise. Coverage comes from the same hash the workers wrote so the report and the throttle agree on what diversity means, and the judge version is what lets a score be re-read later. The digest is read from the admitted record rather than recomputed because provenance is a fact about the moment of admission: hashing the seed as it looks today rewrites history after the first version bump. Tenant authorization answers 404 for both the foreign and the missing job so the report cannot be used to enumerate ids. A production platform would add signed manifests that pin seed digests per released corpus and a rejudge queue for the parked records.`,
 };

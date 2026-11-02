@@ -8,39 +8,33 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'policy'],
   task: `## Task
 
-**Starting point.** The starter is working code: a decision is recorded, the
-chain moves on, and the demo approval completes in two clicks. It counts approvals instead of
-stepping through them, and it puts an hour of expiry on an approval that waits weeks. Debug it,
-fix it, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/requests/{id}/decision\` with body
+\`{"step_index": 0, "decision": "approved", "reason": ""}\` and the actor from \`X-User-Id\`.
+\`start_chain\` writes the state as a JSON string under \`approval:{request_id}:state\` with a
+one-hour expiry; a decision appends to an \`approvals\` list, sets \`step_index\` to the list's
+length and rewrites the blob. The demo approval completes in two clicks. It serves the demo and
+hides 5 flaws.
 
-Implement the decision path \`POST /v1/requests/{id}/decision\` with body
-\`{"step_index": 0, "decision": "approved", "reason": ""}\`. The actor comes from \`X-User-Id\`
-(**401** when missing) and the request lives in the state written by \`POST /v1/requests\`.
+**Failure mode the checks target.** A list length is not a step index: one approver clicking
+twice, or a client retrying a timed-out decision, advances two steps and a three-step chain
+completes with one signature. Nothing compares the actor with the current step's approver, so any
+participant decides out of order. And the one-hour TTL is a data-loss timer on an object with a
+three-week lifetime: the chain disappears and the next decision answers 404.
 
 - The state of one request is **one Redis hash** \`approval:{request_id}:state\`: \`step_index\`,
   \`step_count\`, \`status\`, \`current_approver\`, an \`approver:{i}\` field per step, and one
   \`decision:{i}\` field per decided step.
-- \`start_chain\` initialises that hash with **no TTL at all**. An approval that waits three weeks
-  for finance must not evaporate because somebody put an hour of expiry on the key at creation;
-  completed requests get cleaned up by a sweeper, not by a mid-flow expiry.
+- \`start_chain\` initialises that hash with **no TTL**; completed requests are cleaned up by a
+  sweeper, not by a mid-flow expiry.
 - One decision is one **compare-and-swap**: a single Lua script reads \`step_index\`, refuses the
-  call when the caller's \`step_index\` no longer matches the stored one, and only then advances the
-  index by **exactly one**. Two approvers deciding at the same moment cannot both advance the chain
-  past one step; the loser gets a no-op, not a second step.
+  call when the caller's \`step_index\` no longer matches, and only then advances the index by
+  **exactly one**. The loser of a race gets a no-op, not a second step.
 - Only the **current step's approver** may decide: an actor that is not \`current_approver\` is
-  refused, so a later approver cannot jump the queue.
-- A repeated decision from the same approver is a **no-op**: \`decision:{i}\` is written with
-  \`HSETNX\`, so the second write changes nothing and the chain stays where it is. An approval
-  advances the chain; a rejection ends it.
+  refused.
+- A repeated decision is a **no-op**: \`decision:{i}\` is written with \`HSETNX\`, so the second write
+  changes nothing. An approval advances the chain; a rejection ends it.
 - Answer \`{"request_id", "step_index", "advanced", "reason"}\`: \`advanced\` is true only for the
-  call that actually moved the chain.
-
-**Failure mode the checks target.** The starter treats the length of an approvals list as the step
-index, so one approver clicking twice — or a client retrying a timed-out decision — advances two
-steps and a three-step chain completes with one signature. Nothing checks that the actor is the
-current step's approver, so any participant can decide out of order. And the state key carries a
-one-hour TTL, which is not a cache policy for an object with a three-week lifetime: the chain
-silently disappears and the next decision answers 404.`,
+  call that actually moved the chain.`,
   sequence: {
     participants: ['Approver', 'Approval API', 'Redis'],
     messages: [
@@ -59,9 +53,9 @@ silently disappears and the next decision answers 404.`,
     ],
   },
   hints: [
-    'A hash per request, not a list of approvals: `step_index` is the chain position, `current_approver` is who may act now, and `decision:{i}` records what each step decided. `len(approvals)` is not a step index — it counts signatures, including the same signature twice.',
-    'The compare-and-swap belongs in one script: read `step_index`, compare it with the `step_index` the caller decided on, `HSETNX` the per-step decision field, and only then `HSET step_index` to `index + 1`. Read-then-write from the client lets two concurrent approvers both see step 0 and both advance.',
-    'Never let the state key expire while the request is open. Create the hash without a TTL and re-assert `PERSIST` on every advance; a sweeper can delete completed requests on a schedule of its own, but a one-hour `EXPIRE` at creation is a data-loss timer on a three-week workflow.',
+    'Approve step 0 twice as the same actor: the second call answers `advanced: true` and `step_index: 2`, and a chain with one approver left is now `completed`. Leave a request alone for an hour and the next decision answers 404.',
+    'The handler does `GET`, `RPUSH`, `LRANGE`, `SET ex=TTL_S` as four separate round trips, derives `step_index` from `len(recorded)` and compares the actor with nothing, so duplicates, races and queue-jumpers all count as signatures.',
+    'Store a hash without `ex=`; move the decision into one `ADVANCE_LUA` script that compares `ARGV[1]` with `step_index`, checks `current_approver`, `HSETNX`s `decision:{i}`, sets `next_index = index + 1` and `PERSIST`s the key.',
   ],
   checks: [
     {
@@ -105,7 +99,7 @@ silently disappears and the next decision answers 404.`,
     },
     {
       id: 'persistent-state',
-      title: 'The state key never expires mid-flow',
+      title: 'The state key does not expire mid-flow',
       detail:
         'The state hash is created without a TTL and `PERSIST`ed on every advance. The starter puts an hour of expiry on the key, so a long approval disappears and the next decision answers 404.',
       match: {
@@ -160,9 +154,7 @@ def approvals_key(request_id: str) -> str:
 
 
 def start_chain(request_id: str, approvers: list[str]) -> None:
-    # TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
-    # the step index. Check the expiry, the missing compare-and-swap and the missing approver
-    # check.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     r.set(
         state_key(request_id),
         json.dumps({"step_index": 0, "step_count": len(approvers), "status": "in_progress"}),
@@ -294,9 +286,7 @@ export const stateKey = (requestId: string): string => \`approval:\${requestId}:
 export const approvalsKey = (requestId: string): string => \`approval:\${requestId}:approvals\`;
 
 export async function startChain(requestId: string, approvers: string[]): Promise<void> {
-  // TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
-  // the step index. Check the expiry, the missing compare-and-swap and the missing approver
-  // check.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const state: ChainState = {step_index: 0, step_count: approvers.length, status: 'in_progress'};
   await r.set(stateKey(requestId), JSON.stringify(state), 'EX', TTL_S);
 }
@@ -430,9 +420,7 @@ func stateKey(requestID string) string { return "approval:" + requestID + ":stat
 func approvalsKey(requestID string) string { return "approval:" + requestID + ":approvals" }
 
 func startChain(ctx context.Context, requestID string, approvers []string) error {
-	// TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
-	// the step index. Check the expiry, the missing compare-and-swap and the missing approver
-	// check.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{
 		"step_index": 0,
 		"step_count": len(approvers),
@@ -628,9 +616,7 @@ object State {
   def approvalsKey(requestId: String): String = s"approval:$requestId:approvals"
 
   def startChain(requestId: String, approvers: List[String]): Unit = {
-    // TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
-    // the step index. Check the expiry, the missing compare-and-swap and the missing approver
-    // check.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"step_index":0,"step_count":\${approvers.size},"status":"in_progress"}"""
     jedis.setex(stateKey(requestId), TtlSeconds, payload)
   }
@@ -794,9 +780,7 @@ std::string stateKey(const std::string& requestId) { return "approval:" + reques
 std::string approvalsKey(const std::string& requestId) { return "approval:" + requestId + ":approvals"; }
 
 void startChain(sw::redis::Redis& redis, const std::string& requestId, const std::vector<std::string>& approvers) {
-  // TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
-  // the step index. Check the expiry, the missing compare-and-swap and the missing approver
-  // check.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const json state = {{"step_index", 0}, {"step_count", approvers.size()}, {"status", "in_progress"}};
   redis.setex(stateKey(requestId), kTtlSeconds, state.dump());
 }
@@ -935,14 +919,5 @@ int main() {
 `,
     },
   },
-  debrief: `This step is about state that must survive concurrency and time. Three properties are being
-  checked, and all three fail silently in a demo. First, the step index is a compare-and-swap, not a
-  count: the script refuses a decision whose \`step_index\` has moved, so a double click, a retried
-  request or two approvers acting at once can move the chain by at most one step, and the loser gets
-  \`advanced: false\` instead of an extra signature. Second, eligibility of the actor is evaluated
-  against \`current_approver\` inside the same script, so a later approver cannot decide out of order
-  and nobody can decide on somebody else's step. Third, the state key has no TTL: approvals wait for
-  people, and a workflow object with a three-week lifetime must not inherit an hour of cache expiry.
-  Real systems add a sweeper that deletes completed or cancelled requests on a schedule, an
-  \`escalate_at\` deadline per step, and an audit row per decision beside the Redis state.`,
+  debrief: `The fix puts every rule about one decision into one Lua script because the rules only hold if they are evaluated against the same snapshot of the hash. A compare on \`step_index\` turns a double click, a retried request or two approvers acting at once into at most one advance; the \`current_approver\` compare in the same script keeps a later approver from deciding early; \`HSETNX\` on \`decision:{i}\` makes the duplicate visible as a no-op rather than a second signature. The hash has no TTL because approvals wait for people, and a cache-style expiry is the wrong lifetime for a workflow object. Production approval stores also run a sweeper that deletes completed or cancelled requests on a schedule, attach an \`escalate_at\` deadline per step, and write an audit row per decision beside the Redis state.`,
 };

@@ -8,31 +8,27 @@ export const readStep: Step = {
   focus: ['client', 'hub', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: a health response comes back and the dashboard
-shows a green connector. It authorizes nothing, it measures the wrong clock, and it hides the reason
-a connector is failing. Find the flaws, fix them, and prove the fix.
-
-Implement \`GET /v1/connectors/{id}/health\`, the endpoint on-call alerts on:
-
-- The connector is authorized against the **authenticated tenant**: a connector that belongs to
-  another tenant, or does not exist, answers **404** — the same answer for both, so ids cannot be
-  probed. The starter serves any id in the path.
-- The read reports **last successful page time** (\`last_success_at\`), the **cursor lag**
-  (\`cursor_lag_s = now − last_success_at\`), \`consecutive_failures\`, \`breaker\` state and the
-  connector's \`sync_interval_s\`.
-- The verdict turns **\`unhealthy\`** when no page has landed in **twice** the connector's
-  configured sync interval (\`STALE_INTERVALS = 2\`): \`cursor_lag_s > STALE_INTERVALS ×
-  sync_interval_s\`, or no successful page at all. Staleness is measured from the last **successful**
-  page, never from the last run: a run that failed every page is not fresh.
-- The **breaker state** is exposed (\`closed\`/\`open\`), so an operator can tell "the vendor is
-  down, we are backing off" from "the connector is broken".
+**Starting point.** The starter's \`GET /v1/connectors/{id}/health\` reads the hash
+\`connector:{id}:health\` for whatever id is in the path, takes \`last_run_at\` from it, and answers
+\`healthy\` when that is under an hour old, \`stale\` otherwise, with the id and the run timestamp.
+It compiles, serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** \`last_run_at\` is the trap: it moves on every attempt, so a
-connector whose every page fails reports healthy forever while it syncs nothing — the alert that
-should have fired never does. Hiding the breaker state removes the difference between a connector
-that is waiting out a vendor outage and one that needs a human. And serving any id means a caller can
-read another tenant's connector ids and their lag, which is an authorization bug in an endpoint that
-looks like a read-only status page.`,
+connector whose every page fails reports healthy for as long as it keeps failing, and the alert that
+should fire does not. Hiding the breaker removes the difference between a connector waiting out a
+vendor outage and one that needs a human. And serving any id lets a caller read another tenant's
+connector ids and their lag: an authorization bug in an endpoint that looks like a status page.
+
+- The connector is authorized against the authenticated tenant: a connector that belongs to
+  another tenant, or does not exist, answers **404**, the same answer for both, so ids cannot be
+  probed.
+- The read reports \`last_success_at\`, \`cursor_lag_s = now − last_success_at\`,
+  \`consecutive_failures\`, \`breaker\` state and the connector's \`sync_interval_s\`.
+- The verdict turns \`unhealthy\` when no page has landed in twice the configured sync interval
+  (\`STALE_INTERVALS = 2\`): \`cursor_lag_s > STALE_INTERVALS × sync_interval_s\`, or no successful
+  page at all. Staleness is measured from the last successful page, not the last run.
+- The breaker state is exposed (\`closed\`/\`open\`), so an operator can tell "the vendor is down,
+  we are backing off" from "the connector is broken".`,
   sequence: {
     participants: ['Operator', 'Connector Hub', 'connector store', 'Redis'],
     messages: [
@@ -134,10 +130,7 @@ class Health(BaseModel):
 
 @app.get("/v1/connectors/{id}/health")
 def health(id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
-    # failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
-    # staleness from the last successful page against twice the sync interval, and expose the
-    # breaker state.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     row = r.hgetall(f"connector:{id}:health")
     last_run_at = int(row.get("last_run_at", 0))
     return {
@@ -210,10 +203,7 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/connectors/:id/health', async (request, reply) => {
-  // TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
-  // failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
-  // staleness from the last successful page against twice the sync interval, and expose the breaker
-  // state.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const row = await r.hgetall(\`connector:\${id}:health\`);
   const lastRunAt = Number(row.last_run_at ?? 0);
@@ -284,10 +274,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func health(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
-	// failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
-	// staleness from the last successful page against twice the sync interval, and expose the
-	// breaker state.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	id := r.PathValue("id")
 	row, _ := rdb.HGetAll(r.Context(), "connector:"+id+":health").Result()
 	lastRunAt := atoiDefault(row["last_run_at"], 0)
@@ -426,10 +413,7 @@ object HealthApi {
     path("v1" / "connectors" / Segment / "health") {
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter trusts the path segment, judges freshness from last_run_at (which moves
-          // on every failed attempt), and hides the breaker. Authorize the connector against the
-          // tenant, measure staleness from the last successful page against twice the sync
-          // interval, and expose the breaker state.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val row = jedis.hgetAll(s"connector:$tenant:health")
           val lastRunAt = Option(row.get("last_run_at")).map(_.toLong).getOrElse(0L)
           val fresh = System.currentTimeMillis() / 1000 - lastRunAt < 3600
@@ -510,10 +494,7 @@ int main() {
   sw::redis::Redis redis("tcp://redis:6379");
 
   svr.Get("/v1/connectors/([^/]+)/health", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
-    // failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
-    // staleness from the last successful page against twice the sync interval, and expose the
-    // breaker state.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto connectorId = req.matches[1];
     const auto row = redis.hgetall("connector:" + connectorId + ":health");
     const auto lastRunAt = row.count("last_run_at") ? std::stoll(row.at("last_run_at")) : 0LL;
@@ -597,9 +578,9 @@ int main() {
     },
   },
   hints: [
-    'Authorize the read like a write: fetch the connector row under the authenticated tenant first and answer `404` for both "missing" and "someone else\'s", so the endpoint cannot be used to enumerate connector ids.',
-    'Staleness is measured from the last **successful** page: `cursor_lag_s = now − last_success_at`, and the connector is `unhealthy` once that exceeds `STALE_INTERVALS × sync_interval_s`. `last_run_at` is the wrong clock — it moves on the runs that fail every page, which is exactly the connector the alert exists for.',
-    'Return the shape an alert needs: `status`, `last_success_at`, `cursor_lag_s`, `consecutive_failures`, `breaker` and `sync_interval_s`. Exposing the breaker is what lets on-call tell a vendor outage (closed → open, backing off) from a connector that will never recover on its own.',
+    'Symptoms: a connector whose token expired a week ago shows green on the dashboard, no page lag alert has fired, and a curl with any connector id from any tenant returns a body.',
+    'The handler reads `connector:{id}:health` without checking who owns `id`, compares `last_run_at` (bumped on every failed attempt) against a fixed hour, and returns only `status` and that timestamp.',
+    'Call `store.owner_of(id)`; mismatch or None is 404. Compute `cursor_lag_s` from `last_success_at`, `unhealthy` above `STALE_INTERVALS * sync_interval_s`. Return `consecutive_failures`, `breaker` and `sync_interval_s` too.',
   ],
-  debrief: `The interview question is what a health endpoint is for. It is not a status page; it is the input an alert evaluates, so every field has to mean something the alert can act on. The starter fails three ways: it trusts the path so it leaks other tenants' lag, it measures freshness from the last run (a clock that a broken connector still advances), and it hides the breaker so a vendor outage and a dead connector look the same. The right verdict is lag against twice the configured interval, measured from the last page that actually landed, with the breaker state exposed beside the failure count. Real hubs add per-connector SLOs instead of a global interval, a scheduler heartbeat so a connector that is not even being attempted is unhealthy too, and a synthetic probe that syncs a sandbox vendor so the health read itself is monitored.`,
+  debrief: `The fix takes the shape of an alert input rather than a status page: every field in the body is one an alert rule can act on, and the verdict is computed from the clock that only moves on success, scaled by the connector's own interval instead of a global hour. Authorization answers 404 for both "missing" and "foreign" because any difference between the two is an enumeration oracle, and the breaker state is in the body because on-call needs to know whether to wait or to page someone. Production hubs add per-connector SLOs in place of a single multiplier, a scheduler heartbeat so a connector that is not even being attempted reads unhealthy too, and a synthetic sandbox connector whose sync exercises the health read itself.`,
 };

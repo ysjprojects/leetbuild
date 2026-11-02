@@ -8,25 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store', 'review'],
   task: `## Task
 
-**Starting point.** The starter is working code for the cluster read. It compiles, it returns a
-cluster, and it hides three production flaws. Debug it like the service owner, fix it, and prove
-the fix with the checks below.
-
-Implement \`GET /v1/clusters/{id}\`.
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The cluster is scoped to the caller's tenant: a cluster that belongs to another tenant is **404**,
-  never a partial or redacted answer.
-- The response returns the member records, the **merge evidence per pair**, and the **merge history**.
-- A cluster may not be presented as merged when one of its links relies on a pair **below the
-  confidence floor**: such a pair must be routed to the review queue instead of silently bridging
-  two clusters. Three records where A–B is strong and B–C is weak must not put A and C in one cluster
-  without review.
+**Starting point.** The starter serves \`GET /v1/clusters/{id}\`: it loads the cluster by id alone,
+returns 404 when there is none, runs a \`union_find\` over every pair regardless of score, and answers
+with \`cluster_id\` and \`members\` only. A \`MIN_MERGE_CONFIDENCE\` constant is defined but unused. It
+compiles, it returns a cluster, and it hides four flaws.
 
 **Failure mode the checks target.** The starter unions transitively on any pair, so one weak link
 collapses unrelated records into one cluster. It hides the evidence and the history, so the operator
 cannot see why the cluster exists. And it does not check the tenant, so a guessed cluster id returns
-another tenant's records.`,
+another tenant's records.
+
+Requirements:
+
+- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- The cluster is scoped to the caller's tenant: a cluster that belongs to another tenant is **404**,
+  not a partial or redacted answer.
+- The response returns the member records, the **merge evidence per pair**, and the **merge history**.
+- A cluster may not be presented as merged when one of its links relies on a pair **below the
+  confidence floor**: such a pair must be routed to the review queue instead of silently bridging
+  two clusters. Three records where A–B is strong and B–C is weak must not put A and C in one cluster
+  without review.`,
   sequence: {
     participants: ['Client', 'Dedupe API', 'record store', 'Review queue'],
     messages: [
@@ -148,8 +149,7 @@ def union_find(clusters: list[dict]) -> list[list[str]]:
 
 @app.get("/v1/clusters/{cluster_id}")
 def read_cluster(cluster_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
-    # history, and returns a cluster without checking the tenant. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     cluster = cluster_store.load(cluster_id)
     if cluster is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -238,8 +238,7 @@ function unionFind(clusters: Cluster[]): string[][] {
 }
 
 app.get('/v1/clusters/:clusterId', async (request, reply) => {
-  // TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
-  // history, and returns a cluster without checking the tenant. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {clusterId} = request.params as {clusterId: string};
   const cluster = clusterStore.load(clusterId);
   if (cluster === null) return reply.code(404).send({error: 'not found'});
@@ -332,8 +331,7 @@ func unionFind(clusters []Cluster) [][]string {
 }
 
 func readCluster(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
-	// history, and returns a cluster without checking the tenant. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	clusterID := strings.TrimPrefix(r.URL.Path, "/v1/clusters/")
 	cluster, err := clusterStore.Load(clusterID)
 	if err != nil {
@@ -424,8 +422,7 @@ object ClusterApi {
   val route: Route =
     path("v1" / "clusters" / Segment) { clusterId =>
       get {
-        // TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
-        // history, and returns a cluster without checking the tenant. Fix all three.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         clusterStore.load(clusterId) match {
           case Some(cluster) =>
             complete(StatusCodes.OK, cluster)
@@ -511,8 +508,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(^/v1/clusters/([^/]+)$)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
-    // history, and returns a cluster without checking the tenant. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string clusterId = req.matches[1];
     const json cluster = cluster_store.load(clusterId);
     if (cluster.is_null()) {
@@ -579,9 +575,9 @@ int main() {
     },
   },
   hints: [
-    'Scope the read first: load the cluster inside `t:{tenant}` and return **404** for anything outside it. A cluster id is guessable; the tenant is what makes it safe.',
-    'A cluster is a claim about identity. Return the `evidence` per pair and the `history` of merges so an operator can see why two records are in the same cluster — an unexplained merge is an unaccountable one.',
-    'The confidence floor is the merge gate: a pair below it cannot union two clusters on its own. Route the weak pair to review and present the cluster as held, so A–B strong and B–C weak never put A and C together silently.',
+    "Symptom: an operator opens a cluster and finds three unrelated customers in it, with no way to see which pair caused the merge; a colleague with a guessed id gets another tenant's cluster.",
+    'Mechanism: `union_find` unions on every pair in `cluster["pairs"]` without reading the score, so one weak link bridges two clusters; the response omits evidence and history; `cluster_store.load` takes no tenant.',
+    'Change: load inside `tenant_scope(tenant)` and 404 otherwise; drop `union_find`; hold any pair with score `< MIN_MERGE_CONFIDENCE` for review; return `evidence` per pair and the merge `history`.',
   ],
-  debrief: `The interviewer is testing whether you treat a cluster as an evidence-backed claim rather than a transitive closure. Three defects are being checked: the tenant scope (a guessed id must not leak another tenant's records), the evidence and history (an unexplained merge cannot be audited or undone), and the confidence floor (one weak pair must not bridge unrelated clusters). The subtle part is transitive union: A–B and B–C each look reasonable, but the merge that puts A and C together rests on the weakest link. Real services keep an immutable merge log so a bad merge can be replayed backwards, require a human review for pairs below the floor, and return the per-pair evidence so a reviewer can adjudicate without loading every record.`,
+  debrief: `The fix replaces transitive closure with a gate because closure has no notion of weakness: A–B and B–C each look reasonable on their own, and the merge that puts A and C together rests on the weakest link. Reading the score before unioning, and holding the pair instead of bridging, keeps the cluster an evidence-backed claim. Evidence and history are returned for the same reason: a merge nobody can explain is a merge nobody can undo. The tenant scope is the step 1 lesson applied to reads, since a cluster id is guessable and the tenant is what makes it safe. Production services keep an immutable merge log so a bad merge can be replayed backwards, route weak pairs to a human queue with a deadline, and expose the per-pair evidence so a reviewer can decide without loading every record.`,
 };

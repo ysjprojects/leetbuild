@@ -8,13 +8,17 @@ export const endpointStep: Step = {
   focus: ['client', 'search', 'engine'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers \`GET /v1/search\`,
-reads the text query, the filter string and the page size off the request, and hands them to the
-query engine. It compiles, it serves the demo, and it hides four production flaws. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/search\`, reads \`q\`, \`filters\` and
+\`page_size\` off the request with the \`X-Tenant-Id\` header, parses the filter string as JSON and
+hands the three values straight to the query engine. It compiles, it serves the demo, and it hides
+four flaws.
 
-Implement \`GET /v1/search\` with query parameters \`q\`, \`filters\`, \`page_size\` and the
-authenticated \`X-Tenant-Id\` header.
+**Failure mode the checks target.** Passing the caller's filter string straight into the engine makes
+every field in the index addressable: a crafted filter can name an unpublished field or another
+tenant's attribute, which is how a search box becomes a data leak. The missing caps turn the endpoint
+into an unbounded read: a page size of 10000 or a megabyte query is a cheap way to exhaust the index.
+The fix is the boring one: validate cheaply before the expensive call, and build the engine query
+only from values that survived the allowlist.
 
 - \`q\` is a non-empty string of at most **256 bytes** of UTF-8 (**400** otherwise). Byte length,
   not character count: one emoji is four bytes.
@@ -22,20 +26,12 @@ authenticated \`X-Tenant-Id\` header.
   \`{"brand", "category", "in_stock", "min_price", "max_price"}\`. An unknown field is **400** and
   the response names the offending field and lists the allowed set. Only allowlisted fields reach
   the engine.
-- \`page_size\` is an integer from **1** to **100** (**400** above the cap). The starter accepts
-  \`page_size=10000\`, so one call can ask the index for the whole catalog.
+- \`page_size\` is an integer from **1** to **100** (**400** above the cap).
 - The engine query is assembled by a helper (\`build_engine_query\` / \`buildEngineQuery\`) from the
-  **validated** fields and the tenant, never by interpolating the caller's filter string. The tenant
+  **validated** fields and the tenant, not by interpolating the caller's filter string. The tenant
   travels in the query, so the engine scopes the result set to the caller's catalog.
-- Log the decision — tenant, page size, the *names* of the filters used — never the raw filter text
-  or the query text.
-
-**Failure mode the checks target.** Passing the caller's filter string straight into the engine makes
-every field in the index addressable: a crafted filter can name an unpublished field or another
-tenant's attribute, which is how a search box becomes a data leak. The missing caps turn the endpoint
-into an unbounded read: a page size of 10000 or a megabyte query is a cheap way to exhaust the index.
-The fix is the boring one — validate cheaply before the expensive call, and build the engine query
-only from values that survived the allowlist.`,
+- Log the decision: tenant, page size, the *names* of the filters used. Keep the raw filter text and
+  the query text out of the log.`,
   sequence: {
     participants: ['Client', 'Search API', 'Query engine'],
     messages: [
@@ -140,8 +136,7 @@ def search(
     page_size: int = Query(default=10),
     tenant: str = Header(default="", alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
-    # query nor the page size, and lets a filter name any index field. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     parsed = json.loads(filters)
     results = engine.search(q, parsed, page_size)
     logger.info("search tenant=%s q=%r filters=%r", tenant, q, filters)
@@ -213,7 +208,7 @@ def search(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/search: flawed code that hands the filter string to the engine. */
+      starter: `/** GET /v1/search: the starter. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -228,8 +223,7 @@ const engine = {
 };
 
 app.get('/v1/search', async (request, reply) => {
-  // TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
-  // query nor the page size, and lets a filter name any index field. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {q = '', filters = '{}', page_size = '10'} = request.query as Record<string, string>;
   const tenant = request.headers['x-tenant-id'] as string;
   const results = await engine.search(q, JSON.parse(filters), Number(page_size));
@@ -334,8 +328,7 @@ func search(rw http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	filters := r.URL.Query().Get("filters")
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
-	// TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
-	// query nor the page size, and lets a filter name any index field. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	results := engineSearch(q, filters, pageSize)
 	log.Printf("search tenant=%s q=%q filters=%q", tenant, q, filters)
 	writeJSON(rw, http.StatusOK, map[string]any{"results": results, "page_size": pageSize})
@@ -482,8 +475,7 @@ object SearchApi {
       get {
         parameters("q".?, "filters".?, "page_size".as[Int].?) { (qOpt, filtersOpt, sizeOpt) =>
           headerValueByName("X-Tenant-Id") { tenant =>
-            // TODO: this starter forwards the caller's filter string straight to the engine, caps
-            // neither the query nor the page size, and lets a filter name any index field.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val q = qOpt.getOrElse("")
             val filters = filtersOpt.getOrElse("{}")
             val pageSize = sizeOpt.getOrElse(10)
@@ -596,8 +588,7 @@ int main() {
     const auto q = req.get_param_value("q");
     const auto filters = req.get_param_value("filters");
     const int pageSize = req.has_param("page_size") ? std::stoi(req.get_param_value("page_size")) : 10;
-    // TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
-    // query nor the page size, and lets a filter name any index field. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto results = engineSearch(q, filters, pageSize);
     std::cerr << "search tenant=" << tenant << " q=" << q << " filters=" << filters << "\\n";
     res.status = 200;
@@ -704,9 +695,9 @@ int main() {
     },
   },
   hints: [
-    'Validate in cost order, all of it before the engine call: tenant, non-empty `q`, byte length, page range, then the filter object. A rejection that happens before the index is touched cannot burn index capacity.',
-    "The allowlist is the whole point: collect the requested keys, diff them against the allowed set, and on a difference return `400` naming the field and listing the allowed set. Only then copy the surviving keys into a fresh object — never pass the caller's object through.",
-    'Build the engine query in one helper that takes the validated fields and the tenant. If the raw filter text is never a parameter of that helper, an injection has nowhere to live; the check looks for exactly that helper.',
+    'A shopper sends `filters={"internal_cost": {"gt": 0}}` and gets a ranked page back; another sends `page_size=10000` and the index spends seconds on one request. Nothing in the handler said no.',
+    "The handler trusts every input and the engine sees the caller's filter object verbatim, so any index field is addressable and no size is bounded. Validation that lives after the engine call protects nothing.",
+    'Before the engine call: check `q` by UTF-8 byte length against `MAX_QUERY_BYTES`, `page_size` against `MAX_PAGE_SIZE`, filter keys against `ALLOWED_FILTER_FIELDS` (400 naming the field), then call `buildEngineQuery(validated, tenant)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends a well-formed query with no filters and a small page. Four defects are being checked: the byte cap on the text query (cheap rejection before the index pays for it), the page cap (8000 results is not a page), the per-tenant filter allowlist (a crafted key must not address a field the tenant cannot see), and the assembly of the engine query from validated values only. The allowlist and the query-assembly helper are two halves of one idea: the caller supplies data, the server decides which fields exist. Real search services add typed filter values (a price is a number, a range is two numbers), per-tenant field visibility driven by the catalog, and a query-language version so old clients cannot smuggle retired fields.`,
+  debrief: `The fix has two halves that are one idea: the caller supplies data, the server decides which fields exist. Cheap checks (byte length, page range, key allowlist) run first so a rejection costs nothing on the index, and the engine query is built by a helper whose parameters are the validated fields and the tenant, so the raw filter text has no path into the engine at all. The tenant inside the query is what scopes the result set; a header that is read and then forgotten scopes nothing. Production search services go further: filter values are typed (a price is a number, a range is two numbers), field visibility per tenant comes from the catalog rather than a constant, and the query language carries a version so old clients cannot address retired fields.`,
 };

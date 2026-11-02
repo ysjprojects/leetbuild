@@ -8,34 +8,27 @@ export const verifyEndpointStep: Step = {
   focus: ['owner', 'metasense', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route,
-reads the caller and the body, stores the tags and returns the tier. It compiles, it serves the demo,
-and it hides four production flaws. Debug it like the data governance office, fix it, and prove
-the fix.
-
-Implement \`POST /v1/entities/{entity_id}/verify\` with body
-\`{"action": "ack" | "edit", "tags": {"merchant_id": "None", "passport_no": "Personal.ID"}}\`.
-
-- The caller comes from the authenticated \`X-User-Id\` header; a missing caller is **401**.
-- Only the entity's **owner** may verify: look the owner up with \`store.owner_of(entity_id)\`
-  (**404** when the entity is unknown) and answer **403** for anyone else. The source's whole
-  verification step exists because the owner is the person who knows what the column holds.
-- \`action\` is \`ack\` (the pending tags are confirmed as they are) or \`edit\` (the body's \`tags\`
-  replace them, column by column); anything else is **400**. On \`edit\`, every tag must be in the
-  taxonomy (\`Personal.ID\`, \`Personal.Name\`, \`Personal.Contact_Info\`, \`Geo.Geohash\`,
-  \`None\`) — **400** otherwise.
-- The **sensitivity tier is derived on the server** from the verified tags and the privacy rules:
-  any \`Personal.ID\` → **Tier 1**; else any \`Personal.Name\` or \`Personal.Contact_Info\` →
-  **Tier 2**; else any \`Geo.Geohash\` → **Tier 3**; else **Tier 4**. A \`tier\` in the request body is
-  ignored. The tier is what access control reads; it is never an input.
-- Record the verification with \`store.record_verification(entity_id, tags, tier, user, action)\`
-  and write an audit row with \`store.audit(entity_id, user, action)\`; the response carries
-  \`entity\`, \`tier\`, \`tags\`, \`verified_by\` and the new \`version\`.
+**Starting point.** The starter serves \`POST /v1/entities/{entity_id}/verify\` with body
+\`{"action": "ack" | "edit", "tags": {...}, "tier": 4}\`: it reads \`X-User-Id\`, takes the body's
+tags on \`edit\` or the pending tags otherwise, stores them with \`body.tier\` through
+\`store.record_verification\` and echoes the tier back. It serves the demo and hides four flaws.
 
 **Failure mode the checks target.** Any caller with a user id can verify any table; a tier copied
 from the body lets a producer mark a passport table Tier 4 and open it; a tag outside the taxonomy
-is a tier nobody defined; and a verification with no audit row is a classification nobody can be
-asked about later — which, in a regulated review, is the same as none.`,
+is a tier nobody defined; a verification with no audit row cannot be defended later.
+
+- The caller comes from \`X-User-Id\`; a missing caller is **401**.
+- Only the **owner** may verify: \`store.owner_of(entity_id)\` (**404** when unknown), **403** for
+  anyone else.
+- \`action\` is \`ack\` (pending tags confirmed as they are) or \`edit\` (the body's \`tags\` replace
+  them); anything else is **400**. On \`edit\`, every tag must be in the taxonomy (\`Personal.ID\`,
+  \`Personal.Name\`, \`Personal.Contact_Info\`, \`Geo.Geohash\`, \`None\`), else **400**.
+- The **tier is derived on the server**: any \`Personal.ID\` → **Tier 1**; else \`Personal.Name\` or
+  \`Personal.Contact_Info\` → **Tier 2**; else \`Geo.Geohash\` → **Tier 3**; else **Tier 4**. A
+  \`tier\` in the body is ignored: the tier is what access control reads, not an input.
+- Record with \`store.record_verification(entity_id, tags, tier, user, action)\` and
+  \`store.audit(entity_id, user, action)\`; respond with \`entity\`, \`tier\`, \`tags\`,
+  \`verified_by\` and the new \`version\`.`,
   sequence: {
     participants: ['Data owner', 'metasense', 'store'],
     messages: [
@@ -54,9 +47,9 @@ asked about later — which, in a regulated review, is the same as none.`,
     ],
   },
   hints: [
-    'Guard clauses first, cheapest first: caller header (401), owner lookup (404, then 403), action whitelist (400), tags against `TAXONOMY` (400). Nothing is written until all four have passed.',
-    'The tier is a pure function of the tags: `derive_tier(tags)` walks `PRIVACY_RULES` — an ordered list of (tag, tier) pairs — and returns the first tier whose tag appears, else 4. The body may carry a `tier` field; the handler never reads it.',
-    '`record_verification` stores the verified tags, tier and version; `audit` stores who did what. Both calls are part of the handler, not an afterthought, and the response echoes `verified_by` so the client can show it.',
+    'A producer on another team posts `{"action": "edit", "tags": {"passport_no": "Public"}, "tier": 4}` against a table they do not own, gets 200, and the table opens to the company.',
+    'The handler trusts what it should compute or check: nobody is compared to the owner, the tier is read from the body, any string passes as a tag, and no record says who did it.',
+    'Guard clauses in order: no header 401, `store.owner_of` 404 then 403, action whitelist 400, tags in `TAXONOMY` 400. Then `derive_tier(tags)` over `PRIVACY_RULES`, `record_verification(..., tier, user, action)`, `audit(...)`, respond with `verified_by`.',
   ],
   checks: [
     {
@@ -154,8 +147,7 @@ store = VerificationStore()
 
 @app.post("/v1/entities/{entity_id}/verify")
 def verify(entity_id: str, body: VerifyRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
-    # TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
-    # any tag string, and records nothing about who verified. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     tags = body.tags if body.action == "edit" else store.pending_tags(entity_id)
     version = store.record_verification(entity_id, tags, body.tier)
     return JSONResponse({"entity": entity_id, "tier": body.tier, "tags": tags, "version": version}, status_code=200)
@@ -258,8 +250,7 @@ interface VerifyBody {
 }
 
 app.post('/v1/entities/:entityId/verify', async (request, reply) => {
-  // TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
-  // any tag string, and records nothing about who verified. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {entityId} = request.params as {entityId: string};
   const body = request.body as VerifyBody;
   const tags = body.action === 'edit' ? (body.tags ?? {}) : await store.pendingTags(entityId);
@@ -371,8 +362,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func verify(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
-	// any tag string, and records nothing about who verified. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	entityID := r.PathValue("entity_id")
 	var body VerifyRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -571,8 +561,7 @@ object VerifyApi {
       post {
         headerValueByName("X-User-Id") { user =>
           entity(as[VerifyRequest]) { body =>
-            // TODO: this starter lets any caller verify any entity, takes the tier from the body,
-            // accepts any tag string, and records nothing about who verified. Fix all four.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val tags = if (body.action.contains("edit")) body.tags.getOrElse(Map.empty) else store.pendingTags(entityId)
             val tier = body.tier.getOrElse(4)
             val version = store.recordVerification(entityId, tags, tier)
@@ -680,8 +669,7 @@ int main() {
   httplib::SSLServer svr("cert.pem", "key.pem");
 
   svr.Post(R"(/v1/entities/([^/]+)/verify)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
-    // any tag string, and records nothing about who verified. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string entityId = req.matches[1];
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
@@ -788,5 +776,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you know which fields of a request are inputs and which are conclusions. The tier is a conclusion: it is what access control and masking read, and the source is explicit that it is *derived* from the tags and the privacy office's rules. A handler that copies it from the body has turned the governance system into a self-service form. Four separate defects are being checked: authorization (the owner, found server-side, is the only verifier — the source's verification step exists because the owner is the one who knows the data), the server-side tier, the taxonomy whitelist on edits (an unknown tag has no rule and therefore no tier), and the audit row with \`verified_by\`, without which the verification cannot be defended in a review. Real services add a four-eyes rule for downgrades (an edit that lowers the tier needs a second approver), a diff of what the owner changed fed back to prompt evaluation as Metasense V2 describes, and a confidence threshold that decides whether the owner is asked to verify at all.`,
+  debrief: `Some request fields are inputs and some are conclusions. The tier is a conclusion: access control and masking read it, and the source is explicit that it is derived from the tags and the privacy office's rules. A handler that copies it from the body turns governance into a self-service form, so the fix computes it from \`PRIVACY_RULES\` and ignores whatever the client sent. The owner check sits first because the source's verification step exists for the one person who knows the data; the taxonomy whitelist exists because an unknown tag has no rule and no tier; the audit row with \`verified_by\` lets the verification be defended later. Production services also require a second approver for an edit that lowers the tier, and feed the owner's diff back into prompt evaluation as Metasense V2 describes.`,
 };

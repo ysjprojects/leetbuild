@@ -8,27 +8,23 @@ export const dependencyStep: Step = {
   focus: ['flagsvc', 'engine'],
   task: `## Task
 
-**Starting point.** An emergency disable must reach **every** evaluator fast; a normal rule change
-may lag. The starter is working code: it pushes the kill switch over gRPC in a retry loop. It
-compiles and works on the demo, and it hides three flaws.
+**Starting point.** The starter pushes a kill switch to \`/flags.FlagService/PushKill\` over gRPC in a
+five-attempt retry loop with no deadline, sending only the flag key, and \`apply_kill\` writes the
+version into the \`flags:kill\` memo unconditionally. It compiles and hides four flaws.
 
-Propagate a kill switch from the flag service to each evaluator over gRPC, and reconcile it against the
-snapshot an evaluator already holds.
+**Failure mode the checks target.** An emergency disable must reach every evaluator fast; a normal
+rule change may lag. Under a retry storm the same kill is replayed on every instance, an evaluator
+waits for the next snapshot before honouring it, and a snapshot that arrives late can resurrect a
+flag a newer kill already disabled.
 
-- The push goes to \`/flags.FlagService/PushKill\` with a **1-second deadline** (**\`KILL_DEADLINE\`**).
-  A kill switch carries an **\`effective_immediately\`** marker so an evaluator applies it without
-  waiting for the next snapshot.
-- Normal changes may be up to **5 seconds** stale (**\`STALENESS_BOUND\`**); a kill switch is not subject
-  to that bound, it is effective at once.
+- The push carries a **1-second deadline** (\`KILL_DEADLINE_S\`) and an **\`effective_immediately\`**
+  marker so an evaluator applies it without waiting for the next snapshot.
+- Normal changes may be up to **5 seconds** stale (\`STALENESS_BOUND_S\`); a kill switch is not subject
+  to that bound.
 - Pushes are **deduped by version**: a push whose version is not newer than the last version this
-  evaluator applied is dropped, so a retry storm cannot replay the same kill.
-- A kill memo is versioned. When a snapshot arrives, apply it **only if its version is newer than the
-  kill memo's version** — a stale snapshot must never overwrite a newer kill memo.
-
-**The subtle flaw.** The starter retries the push with no dedupe and no deadline, so under storm
-conditions the same kill is replayed; it has no staleness bound; and its \`apply_kill\` writes the
-memo unconditionally, so an old snapshot that arrives late can resurrect a flag a newer kill already
-disabled.`,
+  evaluator applied is dropped.
+- The kill memo is versioned. A snapshot is applied **only if its version is newer than the memo's
+  version**; a stale snapshot must not overwrite a newer kill.`,
   sequence: {
     participants: ['Operator', 'Flag Service', 'Evaluation Engine', 'Redis'],
     messages: [
@@ -119,8 +115,7 @@ KILL_MEMO = "flags:kill"
 
 
 def push_kill(channel, flag_key: str, version: int) -> bool:
-    # TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
-    # staleness bound, and lets an old snapshot overwrite a newer kill memo.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     stub = channel.unary_unary("/flags.FlagService/PushKill")
     for _ in range(5):
         try:
@@ -182,8 +177,7 @@ interface FlagStub extends grpc.Client {
 }
 
 async function pushKill(stub: FlagStub, push: KillPush): Promise<boolean> {
-  // TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
-  // staleness bound, and lets an old snapshot overwrite a newer kill memo.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       await stub.pushKill(push);
@@ -260,8 +254,7 @@ type KillRequest struct {
 type KillReply struct{}
 
 func PushKill(ctx context.Context, conn *grpc.ClientConn, req KillRequest) error {
-	// TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
-	// staleness bound, and lets an old snapshot overwrite a newer kill memo.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 5; attempt++ {
 		if err := conn.Invoke(ctx, "/flags.FlagService/PushKill", &req, &KillReply{}); err == nil {
 			return nil
@@ -326,8 +319,7 @@ object KillMemo {
 }
 
 def pushKill(channel: ManagedChannel, flagKey: String, version: Long): Boolean = {
-  // TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
-  // staleness bound, and lets an old snapshot overwrite a newer kill memo.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   var attempt = 0
   while (attempt < 5) {
     attempt += 1
@@ -371,8 +363,7 @@ def applyKill(redis: RedisCommands, flagKey: String, version: Long): Boolean = {
 static const std::string kill_memo = "flags:kill";
 
 bool push_kill(grpc::ChannelInterface* channel, const std::string& flag_key, long version) {
-  // TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
-  // staleness bound, and lets an old snapshot overwrite a newer kill memo.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (int attempt = 0; attempt < 5; attempt += 1) {
     grpc::ClientContext ctx;
     grpc::Status status = grpc::Status::OK;
@@ -415,9 +406,9 @@ bool apply_kill(RedisCommands& redis, const std::string& flag_key, long version)
     },
   },
   hints: [
-    'Give the kill push a **1-second deadline** and mark it `effective_immediately`; a normal change may be up to 5 seconds stale, but a kill switch is not allowed to wait.',
-    'Dedupe by version: keep the last version this evaluator applied and drop a push that is not newer. A storm turns retries into replays otherwise.',
-    'Version the kill memo and compare before writing. An old snapshot that arrives late must not overwrite a newer kill — keep the highest version.',
+    'An operator kills a flag; some instances keep serving it until their next snapshot, a slow instance hangs on the push, and one that received a delayed snapshot turns the flag back on.',
+    'The loop retries with no deadline and no record of what was applied, the request carries only the key so nothing marks it urgent, and `apply_kill` overwrites the memo whatever version arrives.',
+    'Add `KILL_DEADLINE_S` and `STALENESS_BOUND_S`, send `effective_immediately` with the version, drop a push not newer than `last_version`, and in `apply_kill` keep the memo unless the incoming version beats `memo_version`.',
   ],
-  debrief: `The interviewer is testing the failure semantics of a control plane. A kill switch is a correctness event, not a cache warm: it must land within the deadline on every instance and it must not be replayed by retries. Three defects are checked — an unbounded, undeduped retry loop, a missing effective-immediately marker, and an unconditional memo write that lets a stale snapshot resurrect a killed flag. Real systems add per-instance propagation tracking, a health check that reports which snapshot version each instance holds, and a kill audit trail.`,
+  debrief: `A kill switch is a correctness event, not a cache warm, which is why the fix treats it differently from a normal change: a deadline bounds how long one slow instance can hold the operator, the marker lets an evaluator act before its next snapshot, and version comparison in both directions (dedupe on the push, memo on the snapshot) makes replays and late arrivals harmless. The versioned memo matters most, since without it ordering depends on network luck. What this step did not do is tell the operator whether the kill actually landed everywhere. Production control planes track per-instance snapshot versions so a dashboard can show which evaluators are still behind the kill.`,
 };

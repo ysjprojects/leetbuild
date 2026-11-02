@@ -8,34 +8,28 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db', 'storage'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the status route,
-reads the case and returns it together with a document URL. It compiles, it serves the demo, and it
-hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter serves \`GET /v1/applicants/{id}/status\`, the read the applicant app
+polls after a submission: it looks the case up by applicant id, returns the status with the vendor's
+reason codes and attaches a document URL. It compiles, it serves the demo, and it hides four flaws.
 
-Implement \`GET /v1/applicants/{id}/status\`, the read the applicant app polls after a submission.
-The caller is the authenticated tenant in \`X-Tenant-Id\`.
+**Failure mode the checks target.** One tenant's app reads another tenant's applicant, and the 404
+that should hide existence does not happen. Refusals reach customers in the vendor's internal
+vocabulary, one the vendor can change under you. An identity-document link survives the case, the
+account and the deletion request, kept alive by every screenshot and share. And the app shows a
+verdict while the service is still waiting on a human.
+
+Requirements. The caller is the authenticated tenant in \`X-Tenant-Id\`.
 
 - The lookup is scoped to that tenant: an applicant whose case belongs to another tenant is **404**,
   the same answer as an applicant that does not exist, so the read cannot confirm that someone
-  else's case exists. The starter calls \`store.get(applicant_id)\`, so any caller can read any
-  applicant.
+  else's case exists.
 - \`reasons\` are the **customer-facing** reason codes, mapped from the vendor's internal vocabulary
-  through \`PUBLIC_REASONS\`; an internal code with no public mapping never leaves the service. The
-  starter returns the vendor's own codes, so the app explains a refusal in the vendor's language.
-- Document images never come back as permanent links: each document carries a **short-lived signed
-  link** with an \`expires_at\`, so a URL copied out of a response stops working. The starter returns
-  the permanent storage URL itself.
-- The response reports whether the case is \`degraded\` — a vendor timeout or error sent it to a
-  human — and whether it is awaiting manual review, so the app can say "still deciding" instead of
-  showing a verdict the service does not have.
-
-**Failure mode the checks target.** The unscoped lookup is an IDOR: one tenant's app reads another
-tenant's applicant, and the 404 that should hide existence never happens. The raw vendor codes leak
-the vendor's internal vocabulary into customer-facing copy — a vocabulary the vendor can change
-under you. The permanent document URL is the quiet one: an identity-document link that survives the
-case, the account and the deletion request, and that every screenshot, share and search index keeps
-alive.`,
+  through \`PUBLIC_REASONS\`; an internal code with no public mapping does not leave the service.
+- Document images do not come back as permanent links: each document carries a **short-lived signed
+  link** with an \`expires_at\`, so a URL copied out of a response stops working.
+- The response reports whether the case is \`degraded\` (a vendor timeout or error sent it to a
+  human) and whether it is awaiting manual review, so the app can say "still deciding" instead of
+  showing a verdict the service does not have.`,
   sequence: {
     participants: ['Applicant app', 'KYC API', 'Decision store', 'Document storage'],
     messages: [
@@ -145,9 +139,7 @@ storage = DocumentStorage()
 
 @app.get("/v1/applicants/{applicant_id}/status")
 def status(applicant_id: str) -> JSONResponse:
-    # TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
-    # customer-facing reason set, hand document access out through storage's link API, and report
-    # the state a vendor failure leaves the case in. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     case = store.get(applicant_id)
     if case is None:
         raise HTTPException(status_code=404, detail="unknown applicant")
@@ -226,7 +218,7 @@ def status(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/applicants/:id/status: flawed code that serves any caller. */
+      starter: `/** GET /v1/applicants/:id/status: the starter. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -254,9 +246,7 @@ export const store: DecisionStore = {get: async () => null};
 export const storage: DocumentStorage = {url: async ref => ref};
 
 app.get('/v1/applicants/:applicantId/status', async (request, reply) => {
-  // TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
-  // customer-facing reason set, hand document access out through storage's link API, and report
-  // the state a vendor failure leaves the case in. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {applicantId} = request.params as {applicantId: string};
   const caseRecord = await store.get(applicantId);
   if (caseRecord === null) return reply.code(404).send({error: 'unknown applicant'});
@@ -392,9 +382,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 func readStatus(rw http.ResponseWriter, r *http.Request) {
 	applicantID := r.PathValue("id")
-	// TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
-	// customer-facing reason set, hand document access out through storage's link API, and report
-	// the state a vendor failure leaves the case in. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	caseRecord, err := store.Get(r.Context(), applicantID)
 	if err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
@@ -567,9 +555,7 @@ object StatusRead {
   val route: Route =
     path("v1" / "applicants" / Segment / "status") { applicantId =>
       get {
-        // TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
-        // customer-facing reason set, hand document access out through storage's link API, and
-        // report the state a vendor failure leaves the case in. Fix all four.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         store.get(applicantId) match {
           case None =>
             complete(StatusCodes.NotFound, JsObject("error" -> JsString("unknown applicant")))
@@ -728,9 +714,7 @@ int main() {
 
   svr.Get(R"(/v1/applicants/([^/]+)/status)", [](const httplib::Request& req, httplib::Response& res) {
     const std::string applicantId = req.matches[1];
-    // TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
-    // customer-facing reason set, hand document access out through storage's link API, and report
-    // the state a vendor failure leaves the case in. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto caseRecord = store.get(applicantId);
     if (!caseRecord) {
       writeJson(res, 404, R"({"error":"unknown applicant"})");
@@ -850,9 +834,9 @@ int main() {
     },
   },
   hints: [
-    'Scope the read before anything else: take the caller from `X-Tenant-Id`, look the case up under `(tenant, applicant)`, and answer **404** when that pair is unknown — the same answer a foreign applicant gets, so the read never confirms that someone else’s case exists. An applicant id alone is a guess, not a permission.',
-    'Reason codes are a product contract, not a debug view: keep a `PUBLIC_REASONS` map from the vendor’s internal codes onto a small customer-facing set, map every code before it leaves, and drop the codes with no mapping instead of forwarding them. That is also what lets the vendor change its taxonomy without changing what customers read.',
-    'Documents leave only as storage-signed links: ask storage to sign `(tenant, ref)` with a TTL of a few minutes, return `expires_at` beside the URL, and never build or cache the URL yourself. The API should not even be able to serve document bytes — a permanent link is a leaked identity document the first time a response is screenshotted or shared.',
+    'Support in tenant B pastes an applicant id from tenant A and gets a full status back, with a reason code nobody recognises and a document link that still opens a week later.',
+    "The handler calls `store.get(applicant_id)` with no tenant, forwards the vendor's codes as `reasons`, returns storage's permanent URL, and reads a vendor failure as if it were a verdict.",
+    'Look the case up under `(tenant, applicant)` and answer **404** otherwise; map codes through `PUBLIC_REASONS`; ask storage to sign `(tenant, ref)` with a TTL and return `expires_at`; report `degraded` and manual review.',
   ],
-  debrief: `The interviewer is testing the read side of a verification system, where the interesting question is never "does it return a status" but "who may see it, in what language, and for how long". Three properties are checked. Scoping: the case is read under the authenticated tenant, and a foreign applicant gets the same **404** as an unknown one, so the endpoint cannot be used to enumerate other tenants' applicants — an unscoped read is an IDOR no matter how unguessable the id looks. Language: vendor codes are an internal vocabulary, so reason codes are mapped through a fixed public set; that keeps the vendor from writing customer-facing copy and lets its taxonomy evolve without an app release. Least disclosure: documents are photographs of identity papers, so the read returns signed links with a short expiry instead of permanent URLs — the bytes never transit the API, and a link that escapes a response dies on its own. The degraded/manual flag is the honesty part: "still deciding" and "a human has to look" are different answers, and the app can only show them if the service says so. Real systems add role-scoped views (support sees less than a reviewer), audit logging on every document link, and reason codes versioned alongside the app.`,
+  debrief: `The read side of a verification system asks who may see a status, in what language, and for how long. The case is read under the authenticated tenant and a foreign applicant gets the same **404** as an unknown one, because an unscoped read is an IDOR no matter how unguessable the id looks. Vendor codes are an internal vocabulary, so reasons pass through a fixed public set; that keeps the vendor from writing customer-facing copy and lets its taxonomy evolve without an app release. Documents are photographs of identity papers, so the read returns signed links with a short expiry: the bytes do not transit the API, and a link that escapes a response dies on its own. The degraded flag lets the app tell "still deciding" from a verdict. What this step did not do: role-scoped views and audit logging on every document link.`,
 };

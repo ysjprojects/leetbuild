@@ -8,38 +8,27 @@ export const prelabelClientStep: Step = {
   focus: ['client', 'service', 'model'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds the \`PrelabelService\` stub, calls
-\`Predict\` on the item it is about to hand out, and returns the label values. The demo model
-answers in milliseconds and never fails, so the demo is always green; the failure policy is the
-whole subject of this step. Debug it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter is the pre-label client called before an item reaches a human: it
+builds the \`PrelabelService\` stub, loops \`MAX_ATTEMPTS\` times over
+\`stub.Predict(PredictRequest{item_id, item_text, spec_version})\`, returns the label values on
+success, continues on any exception and raises \`RuntimeError\` after the last attempt. It serves
+the demo and hides 4 flaws.
 
-Implement the pre-label client the assignment path calls before an item reaches a human:
+**Failure mode the checks target.** The demo model answers in milliseconds and does not fail, so
+the failure policy, the whole subject of this step, is invisible. The starter treats the model as if
+it always answers: a hung call freezes the assignment, a refusal is retried although it will answer
+the same way, and a model outage becomes a work stoppage instead of an unlabeled item.
 
-- \`PrelabelService.Predict(PredictRequest{item_id, item_text, spec_version})\` →
-  \`PredictResponse{label_values, model_version}\`.
-- \`PRELABEL_DEADLINE_S = 2\` — **every** attempt runs under a 2-second deadline. It is an argument
-  on the call itself, so no attempt can outlive it.
-- \`MAX_ATTEMPTS = 2\` — at most two attempts per item, so one bad model cannot turn assignment into
-  an unbounded wait.
-- Retry **only** \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. A refusal — \`INVALID_ARGUMENT\`,
-  \`PERMISSION_DENIED\`, \`FAILED_PRECONDITION\` — is returned immediately, never retried: the
-  answer will not change on the second attempt, so spending it only burns the deadline.
-- \`prelabel_item(item, spec_version)\` must **never raise out to the caller** and must never sit on
-  the assignment past the deadline it was given. Success returns the model's label values with
-  \`prelabel_status = STATUS_PRELABELED\`; any failure returns \`prelabel_status = STATUS_UNLABELED\`,
-  \`prelabel = None\` and \`prelabel_error\` carrying the status and message of the last failure, so
-  the item still reaches an annotator — marked unlabeled, not missing.
-- Declare \`STATUS_PRELABELED\`, \`STATUS_UNLABELED\` and a helper that builds the unlabeled result,
-  so every failure path returns the same shape.
-
-**Failure mode the checks target.** The starter's flaws are one flaw in three places: it treats the
-model call as if it always answers. \`stub.Predict(request)\` with no timeout means one hung model
-call freezes the assignment that is waiting for it past any deadline; \`except Exception: continue\`
-retries a refusal that will fail identically the second time, so the deadline is spent on an answer
-that was never going to change; and \`raise RuntimeError\` hands the caller an exception instead of
-an assignment, so the item is neither labeled nor queued. A pre-label is a convenience; the only
-correct way for it to fail is to degrade to \`unlabeled\` with the reason recorded.`,
+- \`Predict\` returns \`PredictResponse{label_values, model_version}\`.
+- \`PRELABEL_DEADLINE_S = 2\`: every attempt runs under a 2-second deadline passed as an argument
+  on the call itself.
+- \`MAX_ATTEMPTS = 2\`: at most two attempts per item.
+- Retry only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. A refusal (\`INVALID_ARGUMENT\`,
+  \`PERMISSION_DENIED\`, \`FAILED_PRECONDITION\`) returns immediately.
+- \`prelabel_item(item, spec_version)\` must not raise. Success returns the label values with
+  \`prelabel_status = STATUS_PRELABELED\`; any failure returns \`STATUS_UNLABELED\`,
+  \`prelabel = None\` and \`prelabel_error\` with the status and message of the last failure.
+- Declare \`STATUS_PRELABELED\`, \`STATUS_UNLABELED\` and a helper that builds the unlabeled result.`,
   sequence: {
     participants: ['Annotator', 'Labeling Service', 'Pre-label model'],
     messages: [
@@ -206,10 +195,7 @@ stub = prelabel_pb2_grpc.PrelabelServiceStub(channel)
 
 
 def prelabel_item(item: dict, spec_version: str) -> dict:
-    # TODO: the starter defines PRELABEL_DEADLINE_S but never passes it, so one hung Predict call
-    # freezes the assignment that is waiting for it; it retries every error, including a refusal
-    # that will answer the same way the second time; and it raises after the last attempt instead
-    # of returning an unlabeled item with the reason recorded.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     request = prelabel_pb2.PredictRequest(
         item_id=item["item_id"],
         item_text=item["text"],
@@ -317,10 +303,7 @@ export async function prelabelItem(
   item: {item_id: string; text: string},
   specVersion: string,
 ): Promise<{prelabel_status: string; prelabel: string[]}> {
-  // TODO: the starter defines PRELABEL_DEADLINE_S but never passes it, so one hung Predict call
-  // freezes the assignment that is waiting for it; it retries every error, including a refusal
-  // that will answer the same way the second time; and it lets the last error escape instead of
-  // returning an unlabeled item with the reason recorded.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const request: PredictRequest = {item_id: item.item_id, item_text: item.text, spec_version: specVersion};
   let lastError: grpc.ServiceError | null = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -447,10 +430,7 @@ type AssignmentResult struct {
 	PrelabelError  *string  \`json:"prelabel_error"\`
 }
 
-// TODO: the starter defines prelabelDeadlineS but never gives the call a deadline, so one hung
-// Predict freezes the assignment that is waiting for it; it retries every error, including a
-// refusal that will answer the same way the second time; and it returns the error instead of an
-// unlabeled result with the reason recorded.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 func PrelabelItem(ctx context.Context, client pb.PrelabelServiceClient, itemID, itemText, specVersion string) (AssignmentResult, error) {
 	request := &pb.PredictRequest{ItemId: itemID, ItemText: itemText, SpecVersion: specVersion}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -540,10 +520,7 @@ object PrelabelClient {
       prelabel: Option[Seq[String]],
       prelabelError: Option[String])
 
-  // TODO: the starter defines PrelabelDeadlineS but never gives the call a deadline, so one hung
-  // predict freezes the assignment that is waiting for it; it retries every error, including a
-  // refusal that will answer the same way the second time; and it throws instead of returning an
-  // unlabeled result with the reason recorded.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   def prelabelItem(itemId: String, itemText: String, specVersion: String): AssignmentResult = {
     val request = PredictRequest(itemId = itemId, itemText = itemText, specVersion = specVersion)
     var last: Option[StatusRuntimeException] = None
@@ -631,10 +608,7 @@ struct AssignmentResult {
   std::string prelabel_error;
 };
 
-// TODO: the starter defines kPrelabelDeadlineS but never gives the call a deadline, so one hung
-// Predict freezes the assignment that is waiting for it; it retries every error, including a
-// refusal that will answer the same way the second time; and it throws instead of returning an
-// unlabeled result with the reason recorded.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 AssignmentResult prelabel_item(PrelabelService::Stub* stub, const std::string& item_id,
                                const std::string& item_text, const std::string& spec_version) {
   PredictRequest request;
@@ -715,9 +689,9 @@ AssignmentResult prelabel_item(PrelabelService::Stub* stub, const std::string& i
     },
   },
   hints: [
-    'The deadline is an argument on the call, not a property of the loop: `stub.Predict(request, timeout=PRELABEL_DEADLINE_S)`, `{deadline: Date.now() + PRELABEL_DEADLINE_S * 1_000}`, `context.WithTimeout(ctx, prelabelDeadlineS*time.Second)`, `.withDeadlineAfter(PrelabelDeadlineS, TimeUnit.SECONDS)`, `ctx.set_deadline(now + seconds(kPrelabelDeadlineS))`. The starter defines the constant and never passes it — a bounded `for` loop around an unbounded call is still an unbounded wait.',
-    'Retryability is a property of the status, not of "it threw". Capture the RPC error, compare its code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, and return on anything else: a `FAILED_PRECONDITION` from a stale spec will fail the second attempt too, and only the deadline is spent proving it.',
-    "Degrade, do not raise: catch the error, keep `code: message` as the reason, and return the helper's unlabeled result (`STATUS_UNLABELED`, `prelabel = None`, `prelabel_error` set). The caller must get an assignment back even when the model did not answer.",
+    'During a model outage the next-item button spins, then shows an error page; the logs say only `prelabel failed`, no status code; a stale spec takes two full timeouts to fail.',
+    'The deadline constant is defined but not passed to `Predict`, so an attempt can hang; the loop retries on any exception, including refusals; the last error becomes a bare `RuntimeError` that escapes to the caller.',
+    "Pass `timeout=PRELABEL_DEADLINE_S` on the call, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, and on failure return the helper's unlabeled result with `prelabel_error` set to `code: details` instead of raising.",
   ],
-  debrief: `The interviewer is asking one question under three names: what does an assignment do when the pre-label model is late, refusing or down? The deadline bounds a single attempt, \`MAX_ATTEMPTS\` bounds the whole call, the retryable set decides which failures are even worth the second attempt, and the degrade path decides what the annotator sees. The starter gets the easy half right — it does bound the loop — and the hard half wrong in a way no demo can surface, because the demo model answers in milliseconds and never refuses. A retried refusal is the subtlest of the three flaws: the code looks resilient, but \`FAILED_PRECONDITION\` from a stale spec fails identically the second time, so the retry only spends the deadline the request had to give. The other trap is the raise: an exception out of the pre-label path turns a model outage into a work stoppage, and the human queue — the expensive resource — sits idle while a cheap model is down. Real systems go further: they record the \`model_version\` on every pre-label so agreement math can later be audited per model, keep a circuit breaker per model so a struggling one is skipped rather than hammered, add jittered backoff between the two attempts, and chart the unlabeled rate as a first-class metric — because the honest measure of a pre-label client is not how often it guesses right, it is what the queue does when it cannot.`,
+  debrief: `The deadline bounds a single attempt, \`MAX_ATTEMPTS\` bounds the whole call, the retryable set decides which failures deserve a second attempt, and the degrade path decides what the annotator sees. The deadline belongs on the call rather than around the loop because a bounded loop around an unbounded call is still an unbounded wait. A retried refusal is the subtle flaw: the code looks resilient, but \`FAILED_PRECONDITION\` from a stale spec fails identically the second time, so the retry only spends the deadline. Raising turns a cheap model's outage into idle time for the expensive human queue. Production clients also record \`model_version\` on every pre-label so agreement can be audited per model, keep a circuit breaker per model, and chart the unlabeled rate.`,
 };

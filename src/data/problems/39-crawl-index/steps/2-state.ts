@@ -8,29 +8,25 @@ export const stateStep: Step = {
   focus: ['crawler', 'redis', 'fetcher'],
   task: `## Task
 
-**Starting point.** The starter is working code: with one host and an idle crawl it hands out URLs
-at about the right speed, so the demo looks polite. It is impolite by construction. Find the flaws,
-fix them, and prove the fix.
+**Starting point.** The starter is the frontier the crawl workers take work from: \`enqueue\`
+pushes a URL with \`RPUSH\`, \`take\` refills a bucket and pops with \`LPOP\`, and \`throttle\`
+records a 429. With one host it hands out URLs at about the right speed. It serves the demo and
+hides five flaws.
 
-Implement the **frontier** the crawl workers take work from:
+**Failure mode the checks target.** Politeness is a per-host property. State shared across hosts
+lets the whole crawl's capacity land on one host, a client-side refill overshoots under concurrency,
+and a frontier with nowhere to record "come back in 30 seconds" hammers the host that said so.
 
-- One queue **per host**: the key is \`frontier:{job_id}:{host}\` (\`RPUSH\` to enqueue,
-  \`LPOP\` to take). A single shared queue lets one slow host back up the entire crawl and hides
-  which host is being hit.
-- One **token bucket per host**, keyed \`bucket:{job_id}:{host}\`, whose capacity and refill rate
-  are the host's \`rate_per_minute\`. Tokens accrue with elapsed time (\`elapsed_ms * rate / 60000\`)
-  and are capped at capacity; the key carries a TTL so an abandoned host stops costing memory.
-- The **refill and the take are one atomic Lua \`EVAL\`**: read the bucket, accrue, decide, write and
-  return whether a token was taken. A client-side GET-then-SET leaves a window in which two workers
-  both see a token and the host gets double its rate for the busy minute.
-- A host that answers **429** is **throttled**, not retried at the same rate: \`throttle:{job_id}:{host}\`
-  holds a not-before timestamp derived from \`Retry-After\` and doubled per consecutive attempt, and
-  \`take\` returns nothing while that timestamp is in the future.
-
-**Failure mode the checks target.** The starter keeps one global queue and one global bucket, so the
-whole crawl's capacity can land on a single host. Its client-side refill overshoots under concurrency,
-and it has nowhere to record “this host said 429, come back in 30 seconds”, so a hostile or
-overloaded host is hammered at exactly the rate that provoked it.`,
+- One queue **per host**: \`frontier:{job_id}:{host}\` (\`RPUSH\` to enqueue, \`LPOP\` to take).
+- One **token bucket per host**, keyed \`bucket:{job_id}:{host}\`, with capacity and refill rate
+  from the host's \`rate_per_minute\`. Tokens accrue as \`elapsed_ms * rate / 60000\`, capped at
+  capacity; the key carries a TTL so an abandoned host stops costing memory.
+- The **refill and the take are one atomic Lua \`EVAL\`**: read, accrue, decide, write and return
+  whether a token was taken.
+- No shared \`bucket:global\` key that every host spends from.
+- A host that answers **429** is **throttled**: \`throttle:{job_id}:{host}\` holds a not-before
+  timestamp derived from \`Retry-After\`, doubled per consecutive attempt, and \`take\` returns
+  nothing while it is in the future.`,
   sequence: {
     participants: ['Crawl service', 'Redis frontier', 'Web host'],
     messages: [
@@ -55,9 +51,9 @@ overloaded host is hammered at exactly the rate that provoked it.`,
     ],
   },
   hints: [
-    'Everything the script needs goes in as arguments: capacity, rate, the current time in milliseconds and the TTL. Passing `now` from the caller keeps the script deterministic and testable — `redis.call("TIME")` inside Lua is harder to pin in a unit test.',
-    'The script must return the decision, not just the state: `1` when a token was taken and `0` when the bucket was empty, so the caller pops from the host queue only when the host may be fetched. Write the bucket back on both paths, including the refusal, so `refilled_at` moves forward and elapsed time is never counted twice.',
-    'Backing off is a host-level fact, not a URL-level one: `Retry-After: 30` becomes a not-before timestamp on `throttle:{job}:{host}`, doubled per consecutive attempt and capped, and every worker checks it before taking work for that host. That is what stops three workers from all retrying the host that just refused them.',
+    "Crawl two hosts at once and the fast host eats the slow host's turns; the second host's URLs sit behind the first host's. A host answering 429 keeps getting fetched at the same rate.",
+    '`enqueue` pushes to `frontier:{job_id}` with no host, `take` refills `bucket:global` with a client-side GET-then-SET, and `throttle` returns without writing anything, so no worker can learn that a host asked for a pause.',
+    'Key `FRONTIER_KEY` and `BUCKET_KEY` by host, move the refill-and-take into one `REFILL_LUA` run with `EVAL`, and make `throttle` SET `throttle:{job_id}:{host}` to a not-before time that `take` checks first.',
   ],
   checks: [
     {
@@ -149,11 +145,7 @@ def enqueue(job_id: str, host: str, url: str) -> None:
 
 def take(job_id: str, host: str, policy: HostPolicy) -> str | None:
     """The next URL for a host, if the shared bucket allows a fetch right now."""
-    # TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
-    # whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
-    # GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
-    # one queue and one bucket per host, do the refill and take in one Lua script, and give a
-    # throttled host a not-before time instead of retrying it at the same rate.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     bucket = r.get(BUCKET_KEY)
     tokens = float(bucket) if bucket is not None else float(policy.rate_per_minute)
     tokens = min(float(policy.rate_per_minute), tokens + 1.0)
@@ -263,11 +255,7 @@ const FRONTIER_KEY = 'frontier:job';
 const BUCKET_KEY = 'bucket:global';
 
 export async function enqueue(_jobId: string, _host: string, url: string): Promise<void> {
-  // TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
-  // whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
-  // GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
-  // one queue and one bucket per host, do the refill and take in one Lua script, and give a
-  // throttled host a not-before time instead of retrying it at the same rate.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await r.rpush(FRONTIER_KEY, url);
 }
 
@@ -376,11 +364,7 @@ func (p HostPolicy) rate() int {
 }
 
 func Enqueue(ctx context.Context, jobID, host, url string) error {
-	// TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
-	// whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
-	// GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
-	// one queue and one bucket per host, do the refill and take in one Lua script, and give a
-	// throttled host a not-before time instead of retrying it at the same rate.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	return r.RPush(ctx, fmt.Sprintf("frontier:%s", jobID), url).Err()
 }
 
@@ -517,11 +501,7 @@ object Frontier {
   val bucketKey = "bucket:global"
 
   def enqueue(jobId: String, host: String, url: String): Unit = {
-    // TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
-    // whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
-    // GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
-    // one queue and one bucket per host, do the refill and take in one Lua script, and give a
-    // throttled host a not-before time instead of retrying it at the same rate.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     jedis.rpush(s"frontier:$jobId", url)
   }
 
@@ -621,11 +601,7 @@ struct HostPolicy {
 };
 
 void enqueue(const std::string& jobId, const std::string& host, const std::string& url) {
-  // TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
-  // whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
-  // GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
-  // one queue and one bucket per host, do the refill and take in one Lua script, and give a
-  // throttled host a not-before time instead of retrying it at the same rate.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   r.rpush("frontier:global:" + jobId, url);
 }
 
@@ -723,5 +699,5 @@ int throttle(const std::string& jobId, const std::string& host, int retry_after_
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand politeness as a per-host property. The starter looks reasonable because a crawl of one host cannot show the difference: one queue and one bucket behave exactly like per-host ones when there is only one host. Three defects are being checked: the shared queue and shared bucket couple every host's progress to the slowest and fastest one, the client-side refill is a read-modify-write race that overshoots under concurrency, and there is no representation of "this host asked us to come back later". Real crawlers also spread the frontier across instances with a lease (so a crashing worker does not lose its URL), keep the bucket in memory for the hot path with Redis as the arbiter, and lower a host's rate permanently when 429s keep arriving.`,
+  debrief: `Politeness is a per-host promise, so every piece of state that enforces it is keyed by host: the queue, the bucket and the not-before timestamp. That is what lets a slow host be slow alone and a 429 slow down only the host that sent it. The refill lives in one Lua script because the promise is only as good as the race it closes: two workers reading the same bucket from the client each see a token and the host gets twice the agreed rate. Production frontiers also lease URLs instead of popping them, so a worker that crashes mid-fetch does not lose its URL; keep a hot in-memory bucket with Redis as the arbiter; and lower a host's configured rate for good when 429s keep arriving.`,
 };

@@ -8,40 +8,28 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'engine'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the read, merges every permission
-the subject holds into one list, caches that list for 600 seconds and answers. It compiles, it
-serves the demo, and it hides three production flaws — no provenance, a cache a revocation cannot
-invalidate, and no check on who is asking. Debug it like the service owner, fix it, and prove the
-fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/users/{id}/permissions\` with the \`X-Caller-Id\`
+header, merges every permission the subject holds into one sorted list, caches it under
+\`perms:{id}\` for 600 seconds and answers. It compiles, serves the demo, and hides 4 flaws.
 
-Implement \`GET /v1/users/{id}/permissions\` and \`POST /v1/permissions/check\`.
+**Failure mode the checks target.** A merged list cannot answer *who granted this?*, and with no
+live check beside it the console and the enforcement point drift apart. A 600-second cache with no
+version keeps a revoked contractor's access for up to ten minutes. And without an ownership check,
+any authenticated caller enumerates any user's access.
 
-- The caller comes from the authenticated \`X-Caller-Id\` header; a missing one is **401**. A caller
-  reads only its own permissions: \`X-Caller-Id\` must equal \`{id}\` unless it holds
-  \`permissions:read:any\`, the audit permission the policy engine decides on — a denial is **403**,
-  and a foreign read never returns another subject's entries.
-- The read returns an explanation, never a merged blob: every entry is
+- A missing \`X-Caller-Id\` is **401**. \`X-Caller-Id\` must equal \`{id}\` unless the caller holds
+  \`permissions:read:any\`, which the policy engine decides; a denial is **403**.
+- Every entry is an explanation:
   \`{"permission": "team:read", "granted_by": [{"role_id": "team_admin", "scope": "team:eng", "grant_id": "g-17"}]}\`.
   A permission produced by two grants lists both derivations, in a deterministic order.
 - \`POST /v1/permissions/check\` takes \`{"subject": "user:ada", "permission": "team:read", "scope": "team:eng"}\`
-  and answers the same computation live, so the list and the check agree bit-for-bit: a revoked
-  permission is absent from the list and denied by the check in the same pass. A derivation's scope
-  covers the asked scope only when it is the same scope, \`org\`, or a broader kind — a grant at
-  \`team:eng\` never answers for \`org\`.
-- The read is served from the version-stamped cache: the entry's \`grant_version\` is compared with the
-  current one and the entry is recomputed from the grant store whenever they differ, so a cached list
-  cannot outlive a revocation. A 600-second TTL is not a correctness mechanism.
+  and answers the same \`effective_permissions\` computation live, so the list and the check agree
+  bit-for-bit. A derivation covers the asked scope when it is the same scope, \`org\`, or a broader
+  kind.
+- The read is served from the version-stamped cache: the entry's \`grant_version\` is compared with
+  the current one and the entry is recomputed whenever they differ.
 - Respond \`{"subject": …, "grant_version": …, "permissions": […]}\`, and log the subject, the caller
-  and the entry count — never the subject's permission set itself.
-
-**Failure mode the checks target.** A merged permission list is unfalsifiable: it cannot answer *who
-granted this?*, which is the question every access review and every incident starts with — so the
-derivation has to come out of the same fold that decides the answer, and the read and the live check
-have to be one function, because two code paths drift and then the console says *allowed* while the
-enforcement point says *denied*. A 600-second cache is a promise that a revoked contractor keeps
-access for up to ten minutes; only a version stamp makes a revocation immediate. And a permissions
-read is the map of everything a subject can do — without the ownership check, any authenticated
-caller enumerates any user's access with one request.`,
+  and the entry count, not the permission set.`,
   sequence: {
     participants: ['Client', 'Permission Service', 'Redis', 'Policy engine', 'Grant store'],
     messages: [
@@ -144,7 +132,7 @@ caller enumerates any user's access with one request.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/users/{id}/permissions: flawed code that returns a merged blob."""
+      starter: `"""GET /v1/users/{id}/permissions: the effective permissions of one subject."""
 import json
 import logging
 
@@ -170,8 +158,7 @@ store = GrantStore()
 
 @app.get("/v1/users/{id}/permissions")
 def read_permissions(id: str, caller: str = Header(alias="X-Caller-Id")) -> JSONResponse:
-    # TODO: this starter returns the merged permission list with no provenance, serves it from a 600 s
-    # cache with no version stamp, and never compares X-Caller-Id with {id}. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     key = f"perms:{id}"
     cached = r.get(key)
     if cached is not None:
@@ -287,7 +274,7 @@ def check(body: CheckRequest, caller: str | None = Header(default=None, alias="X
 `,
     },
     typescript: {
-      starter: `/** GET /v1/users/:id/permissions: flawed code that returns a merged blob. */
+      starter: `/** GET /v1/users/:id/permissions: the effective permissions of one subject. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -307,8 +294,7 @@ export const store: GrantStore = {
 };
 
 app.get('/v1/users/:id/permissions', async (request, reply) => {
-  // TODO: this starter returns the merged permission list with no provenance, caches it for 600 s
-  // with no version stamp, and never compares X-Caller-Id with :id. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const caller = request.headers['X-Caller-Id'];
   const key = \`perms:\${id}\`;
@@ -485,8 +471,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func readPermissions(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	caller := r.Header.Get("X-Caller-Id")
-	// TODO: this starter returns the merged permission list with no provenance, caches it for 600 s
-	// with no version stamp, and never compares X-Caller-Id with the {id} in the path.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	key := "perms:" + id
 	if cached, err := rdb.Get(r.Context(), key).Bytes(); err == nil {
 		var permissions []string
@@ -737,8 +722,7 @@ object ReadApi {
     path("v1" / "users" / Segment / "permissions") { id =>
       get {
         optionalHeaderValueByName("X-Caller-Id") { caller =>
-          // TODO: this starter returns the merged permission list with no provenance, caches it for
-          // 600 s with no version stamp, and never compares X-Caller-Id with the id in the path.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val key = s"perms:$id"
           Option(jedis.get(key)) match {
             case Some(cached) =>
@@ -898,8 +882,7 @@ GrantStore store;
 sw::redis::Redis redis("tcp://redis:6379");
 
 void readPermissions(const httplib::Request& req, httplib::Response& res) {
-  // TODO: this starter returns the merged permission list with no provenance, caches it for 600 s
-  // with no version stamp, and never compares X-Caller-Id with the id in the path.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const std::string id = req.matches[1];
   const std::string caller = req.get_header_value("X-Caller-Id");
   const std::string key = "perms:" + id;
@@ -1068,9 +1051,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guards cheapest first: compare `X-Caller-Id` with the path id before Redis or the grant store is touched, and resolve a foreign id against the audit permission — a rejection there is a pure function of the request, so no subject data is ever loaded for it.',
-    "The explanation is a fold, not a set: walk the subject's grants and build `permission → [{role_id, scope, grant_id}]` so a permission produced by two grants lists both. Give `POST /v1/permissions/check` the same function and the same scope-containment comparison, or the list and the live answer drift apart on the same pass.",
-    'Stamp the cached entry with `grant_version` and serve it only while `cache_is_current`: a TTL is a deadline a revocation has to outlive, a version comparison is not. Write the fresh entry back with the version that produced it, so a revocation racing the read invalidates the write instead of the reader.',
+    'Any signed-in user can fetch `/v1/users/user:ada/permissions` and sees a flat list of strings. Revoke one of them; the list keeps showing it for up to ten minutes.',
+    'The starter reads `caller` and only logs it, returns `sorted(store.permissions(id))` with no roles or grants attached, and trusts `perms:{id}` until `CACHE_TTL_S` expires with no version to compare against.',
+    'Compare `X-Caller-Id` with `{id}` (403 unless `permissions:read:any`), fold grants into `granted_by` in `explain_permissions`, share `effective_permissions` with `POST /v1/permissions/check`, and gate the cache on `cache_is_current` against `grant_version`.',
   ],
-  debrief: `The interviewer is testing a read path that looks like a lookup and is really an authorization decision. Three defects are being checked. First, provenance: a merged list is unfalsifiable — when a permission is wrong, nobody can say which role or grant produced it — so the explanation has to come out of the same fold that decides the answer, which is also why the live check must call that fold instead of re-deriving it. Second, freshness: a 600-second TTL is a promise that a revocation can be ten minutes late, so the entry is stamped with \`grant_version\` and a mismatch recomputes; the read must never be able to outlive a revocation. Third, ownership: a permissions read is the map of everything a subject can do, which makes it exactly the endpoint an attacker enumerates — a caller reads its own, unless it holds the audit permission, and a foreign id is 403. Real systems add signed responses, an audit record of every read with the caller's identity, and pagination for subjects with thousands of grants.`,
+  debrief: `The read is shaped like an authorization decision because that is what it is. Provenance comes out of the same fold that decides the answer, so when a permission is wrong someone can say which role or grant produced it, and the live check calls that fold instead of re-deriving it, so the list and the enforcement point cannot drift. The cache is stamped with \`grant_version\` and a mismatch recomputes, because a TTL is a deadline a revocation has to wait out. The ownership check runs before any subject data is loaded, since a permissions read is the endpoint an attacker would enumerate. Production systems add an audit record of every read with the caller's identity, and pagination for subjects with thousands of grants.`,
 };

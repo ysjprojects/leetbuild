@@ -16,7 +16,7 @@ import {monitorReportStep} from './steps/5-read';
 export const driftMonitorProblem: Problem = {
   id: 'drift-monitor',
   title: 'Drift Monitor',
-  tagline: 'Detect input and outcome drift before users notice, without crying wolf.',
+  tagline: 'Frozen baselines, atomic sketch merges and a pager that fires once per window.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -31,22 +31,27 @@ survives a broker outage.
 
 ## The real system
 
-Production drift monitors register what they watch and against what. A monitor names a promoted model
-version, one metric — the input distribution, the outcome rate or the calibration curve — a window and
-a frozen baseline reference; a monitor whose baseline is the live traffic it is meant to watch
-compares the signal with itself and can never fire. Distributions accumulate as sketches in Redis,
-merged by one atomic script per batch so concurrent batches cannot lose counts, kept under a key per
-(tenant, monitor, window) and expired exactly at the window boundary instead of an hour after the
-first write. The baseline sketch is immutable: frozen once, never updated by the live path. When a
-window's distance crosses the threshold the monitor calls the alerting service over gRPC under a
-1-second deadline, carries the evidence — metric, threshold, distance, both window boundaries and the
-sample counts on each side — and deduplicates per (monitor, window) with a cooldown, because a
-detector that pages on every batch tick is worse than no detector. Evaluations publish
-\`drift.evaluated\` keyed by monitor so one monitor's history stays ordered, routine no-drift ticks are
-summarized rather than published one by one, and a rejected produce writes an outbox row so a broker
-outage cannot erase an alert from history. The report endpoint answers with the distance, its counts,
-its baseline window and an explicit insufficient-data state, scoped to the tenant that owns the
-monitor.
+Evidently, the open source monitoring library, frames drift exactly this way: a current dataset is
+compared against a separately supplied reference dataset, column by column, with a statistical test
+chosen per column type (Kolmogorov-Smirnov by default for numerical columns, with PSI and
+Jensen-Shannon selectable) and a per-column drift score next to the verdict. The reference is an
+input you hand it, not something it derives from the traffic it is judging, and the report carries
+the sample sizes behind every score.
+
+A service that runs that comparison continuously has to own more than the test. A monitor names a
+promoted model version, one metric, a window and a frozen baseline reference; a monitor whose
+baseline is the live traffic compares the signal with itself and cannot fire. Distributions
+accumulate as sketches in Redis, merged by one atomic script per batch so concurrent batches cannot
+lose counts, kept under a key per (tenant, monitor, window) and expired at the window boundary. The
+baseline sketch is frozen once and the live path cannot touch it. When a window's distance crosses
+the threshold the monitor calls the alerting service over gRPC under a 1-second deadline, carries
+the evidence (metric, threshold, distance, both window boundaries and the sample counts on each
+side) and deduplicates per (monitor, window) with a cooldown. Evaluations publish
+\`drift.evaluated\` keyed by monitor so one monitor's history stays ordered, routine no-drift ticks
+are summarized rather than published one by one, and a rejected produce writes an outbox row so a
+broker outage cannot erase an alert from history. The report endpoint answers with the distance,
+its counts, its baseline window and an explicit insufficient-data state, scoped to the tenant that
+owns the monitor.
 
 ## What you build here
 
@@ -71,8 +76,8 @@ One service, **driftd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 

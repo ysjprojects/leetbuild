@@ -8,34 +8,24 @@ export const guardEndpointsStep: Step = {
   focus: ['assistant', 'guard'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers both guard
-routes, parses the body and returns a decision. It compiles, it serves the demo, and it hides four
-production flaws. Debug it like the owner of a compliance service, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter registers \`POST /v1/guard/input\` and \`POST /v1/guard/output\`,
+parses \`{"text", "conversation_id"}\`, calls \`guard.evaluate(text, direction)\` and returns
+\`{allowed, tier}\`. The body also carries a \`skip_guard\` flag that short-circuits the call, and
+every request is logged with its text. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/guard/input\` and \`POST /v1/guard/output\` with body
-\`{"text": "…", "conversation_id": "c-8812"}\`. The assistant calls the first before the model sees
-the user's message and the second before the model's answer reaches the user — the double
-integration the Zillow post describes.
+**Failure mode the checks target.** The assistant calls the input route before the model sees the
+user's message and the output route before the answer reaches the user. A flag that skips the guard
+turns a legal control into a suggestion; a missing policy version lets two turns of one conversation
+be judged under different rules with no record of which; no size cap lets a 2 MB "message" reach the
+classifier; and user questions about protected classes end up in a log pipeline.
 
-- The caller is identified by \`X-Api-Key\`, looked up in the key store; a missing or unknown key
-  is **401**. The guard is a legal control, not a convenience: anonymous callers do not exist.
-- \`X-Policy-Version\` is required (**400** when missing or malformed, format
-  \`fh-YYYY-MM-DD[.n]\`). The assistant pins the version at the start of a conversation so one
-  conversation is never judged under two policies; the response echoes it as \`policy_version\`.
-- \`conversation_id\` matches \`[A-Za-z0-9_-]{1,64}\` (**400** otherwise); \`text\` is non-empty
-  (**400**) and at most **8 KiB** (\`1 << 13\` bytes of UTF-8; **413** above).
-- The decision comes from \`guard.evaluate(text, direction, policy_version)\` and is returned as
-  \`{allowed, reasons, tier, policy_version}\`. There is **no** caller-supplied flag that skips the
-  evaluation — remove \`skip_guard\` and anything like it.
-- Log direction, conversation, verdict, tier and policy version — never the text.
-
-**Failure mode the checks target.** A \`skip_guard\` flag turns the compliance control into a
-suggestion: one misconfigured client, one curious integrator, and the model answers steering
-questions with the guard "on". The missing policy version means two turns of one conversation can be
-judged under different rules and the audit trail cannot say which. The missing caps let a 2 MB
-"message" reach the classifier. The text in the log line is the quiet one: user queries about
-protected classes are exactly the data a log pipeline should never retain.`,
+- Identify the caller by \`X-Api-Key\` via \`api_keys.caller(...)\`; missing or unknown is **401**.
+- Require \`X-Policy-Version\` matching \`POLICY_VERSION_RE\` (\`fh-YYYY-MM-DD[.n]\`, **400**
+  otherwise), pass it to \`evaluate\` and echo it as \`policy_version\`.
+- \`conversation_id\` must match \`CONVERSATION_ID_RE\` (\`[A-Za-z0-9_-]{1,64}\`, **400**); \`text\`
+  is non-empty (**400**) and at most \`MAX_TEXT_BYTES\` (\`1 << 13\` bytes of UTF-8, **413**).
+- Return \`{allowed, reasons, tier, policy_version}\`; remove \`skip_guard\` entirely.
+- Log direction, conversation, verdict, tier and policy version, not the text.`,
   sequence: {
     participants: ['Assistant', 'fhguard', 'Guard tiers'],
     messages: [
@@ -150,8 +140,7 @@ guard = Guard()
 
 
 def run_guard(direction: str, body: GuardRequest) -> JSONResponse:
-    # TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
-    # the policy version, caps nothing, and logs the text. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     logger.info("guard direction=%s conversation=%s text=%r", direction, body.conversation_id, body.text)
     if body.skip_guard:
         return JSONResponse({"allowed": True}, status_code=200)
@@ -268,7 +257,7 @@ def guard_output(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/guard/{input,output}: flawed code with a skip flag and no policy version. */
+      starter: `/** POST /v1/guard/{input,output}: guard decisions for the assistant. */
 import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
 
 import {guard} from './guard';
@@ -282,8 +271,7 @@ interface GuardBody {
 }
 
 async function runGuard(direction: 'input' | 'output', request: FastifyRequest, reply: FastifyReply) {
-  // TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
-  // the policy version, caps nothing, and logs the text. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as GuardBody;
   request.log.info({direction, conversation: body.conversation_id, text: body.text}, 'guard');
   if (body.skip_guard === true) return reply.code(200).send({allowed: true});
@@ -389,8 +377,7 @@ func runGuard(direction string) http.HandlerFunc {
 			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		// TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing
-		// about the policy version, caps nothing, and logs the text. Fix all four.
+		// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 		log.Printf("guard direction=%s conversation=%s text=%q", direction, body.ConversationID, body.Text)
 		if body.SkipGuard {
 			writeJSON(rw, http.StatusOK, map[string]any{"allowed": true})
@@ -540,8 +527,7 @@ object GuardApi {
 
   val guard = Guard.open()
 
-  // TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
-  // the policy version, caps nothing, and logs the text. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def guardRoute(direction: String): Route =
     post {
       entity(as[GuardRequest]) { body =>
@@ -660,8 +646,7 @@ void runGuard(const std::string& direction, const httplib::Request& req, httplib
     res.set_content(R"({"error":"invalid json"})", "application/json");
     return;
   }
-  // TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
-  // the policy version, caps nothing, and logs the text. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const auto text = body.value("text", std::string());
   const auto conversationId = body.value("conversation_id", std::string());
   std::cerr << "guard direction=" << direction << " conversation=" << conversationId << " text=" << text << "\\n";
@@ -763,9 +748,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order and return before the tiers run: key lookup, policy version format, conversation_id format, empty text, byte length. The 413 is on bytes, not characters — encode first.',
-    'The policy version is a header the assistant pins per conversation, not something the guard chooses: validate it against `fh-YYYY-MM-DD[.n]`, pass it to `evaluate`, and echo it as `policy_version` so the caller and the audit agree on which rules applied.',
-    'Delete `skip_guard` from the request model, the handler and the response path; there is no "trusted caller" branch in a compliance control. The log line is a contract: direction, conversation, verdict, tier, policy — the text itself never goes to a log sink.',
+    'A client that sets `skip_guard: true` gets `{"allowed": true}` back without the tiers ever running, and the log line for that request contains the full message text.',
+    'The body model declares the flag and the handler honours it before `evaluate`; nothing identifies the caller or the policy the decision was made under, so the response cannot be audited.',
+    'Drop `skip_guard`, look up `X-Api-Key` with `api_keys.caller` (401), validate `X-Policy-Version` with `POLICY_VERSION_RE` and echo it; the caps and the log line are covered by the remaining checks.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the boundary of a legal control. The starter reads fine because the demo sends one well-formed request from one trusted client. Four defects are being checked: authentication (a compliance guard has no anonymous callers), input caps (cheap rejections before classifier work), the policy version as a required, echoed contract (so one conversation is judged under one set of rules and the audit can name it), and the absence of any bypass — a \`skip_guard\` flag is the kind of "helpful" option that creeps into a first version and the kind the owner must delete. The text in the log line is the one candidates miss: queries about protected classes are the most sensitive content this service sees, and a log pipeline retains them far longer than the request. Real guards add per-caller rate limits, request ids threaded to the audit event, and a hashed text fingerprint for dedupe and debugging.`,
+  debrief: `The fix is a stack of cheap guard clauses ahead of the expensive call: key lookup, policy version format, conversation id format, byte length, then \`evaluate\`. Each rejection has its own status so the assistant can tell a misconfigured client (401, 400) from an oversized message (413). The policy version is a header the assistant pins per conversation rather than something the guard picks, so the echoed \`policy_version\` and the audit row agree. Removing \`skip_guard\` is a deletion, not a permission check: a compliance control with a trusted-caller branch is only as strong as its least careful integrator. Production deployments put key lookup in a shared auth layer, rotate keys with an overlap window, and scrub the text field at the source before the log line reaches a pipeline.`,
 };

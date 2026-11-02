@@ -8,34 +8,29 @@ export const transcriptionReadStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the id from the path, returns the
-segments it finds, and answers with a \`status\` it cannot back up. The demo polls its own job, the
-demo job always finishes, and the demo transcript fits on one page — so every defect stays invisible.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/transcriptions/{job_id}\`: it looks the job up by
+id alone, reads the first 1000 segments with no ordering, pulls a completed count from Redis, and
+answers \`done\` whenever any segment exists, returning raw rows instead of a transcript. It
+compiles, it serves the demo, and it hides four flaws.
 
-Implement \`GET /v1/transcriptions/{id}\`:
+**Failure mode the checks target.** Three ways a read endpoint can lie. About identity: a lookup by
+id alone is an IDOR, and a 403 for a foreign id leaks that another tenant's job exists. About
+completion: the presence of segments is not proof the work finished, and a \`done\` that arrives with
+a failed chunk will bill, notify and archive an unfinished transcript. About reachability: a fixed
+\`LIMIT 1000\` looks bounded and silently truncates a four-hour recording, because no cursor is
+returned to walk past it.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header and the job is resolved **scoped to it**:
-  a missing id *and* an id that belongs to another tenant are both **404** — never 403, because 403
-  confirms that the job exists, which is information the caller has no right to. The starter resolves by
-  id alone, so any authenticated caller reads any tenant's transcript.
-- The response reports \`status\`, \`completed_chunks\`, \`total_chunks\` and the \`transcript\` assembled
-  from the stored segments **in order** (\`ORDER BY seq\`). The starter hands back raw rows and calls the
-  caller's job done.
-- \`status\` is \`"done"\` **only** when every chunk is complete. If any chunk is failed, or any chunk is
-  still pending, the status is \`"partial"\`. A job that stalled halfway keeps the segments it already
-  produced and reports them honestly — but it is never certified done.
+Requirements:
+
+- The tenant comes from the authenticated \`X-Tenant-Id\` header and the job is resolved **scoped to
+  it**: a missing id and an id that belongs to another tenant are both **404**, not 403, because 403
+  confirms that the job exists.
+- The response reports \`status\`, \`completed_chunks\`, \`total_chunks\` and the \`transcript\`
+  assembled from the stored segments **in order** (\`ORDER BY seq\`).
+- \`status\` is \`"done"\` **only** when no chunk is failed and none is pending; otherwise it is
+  \`"partial"\`, served with the segments already produced.
 - The transcript is **cursor-paginated**: a \`cursor\` query parameter selects the page
-  (\`seq > cursor\`), and the response carries \`next_cursor\` when the page came back full, so segments
-  past the first page are reachable. The starter hard-caps at the first 1000 segments and never says how
-  to continue.
-
-**Failure mode the checks target.** Three ways a read endpoint can lie. It can lie about identity: a
-lookup by id alone is an IDOR, and a 403 for a foreign id leaks the existence of another tenant's job.
-It can lie about completion: the presence of segments is not proof that the work finished, and a
-\`done\` that arrives with a failed chunk will bill, notify and archive an unfinished transcript.
-And it can lie about reachability: a fixed \`LIMIT 1000\` looks bounded and silently truncates a
-four-hour recording, because no cursor is ever returned to walk past the cap.`,
+  (\`seq > cursor\`), and the response carries \`next_cursor\` when the page came back full.`,
   sequence: {
     participants: ['Client', 'Transcription API', 'jobs store', 'Redis'],
     messages: [
@@ -161,9 +156,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/transcriptions/{job_id}")
 def read_transcription(job_id: str, cur=None) -> JSONResponse:
-    # TODO: this starter resolves the job by id alone, calls it done as soon as a segment exists, and
-    # stops at the first page of 1000 segments. Scope the lookup by tenant, judge the chunk progress
-    # before certifying, and page the transcript with a cursor.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     cur.execute("SELECT total_chunks FROM jobs WHERE id = %s", (job_id,))
     row = cur.fetchone()
     cur.execute("SELECT seq, text FROM segments WHERE job_id = %s LIMIT 1000", (job_id,))
@@ -252,7 +245,7 @@ def read_transcription(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/transcriptions/:id: flawed code that trusts the id and stops at page one. */
+      starter: `/** GET /v1/transcriptions/:id: the starter. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -260,9 +253,7 @@ export const app = Fastify();
 export const redis = new Redis({host: 'redis', port: 6379});
 
 app.get('/v1/transcriptions/:id', async (request, reply) => {
-  // TODO: this starter resolves the job by id alone, calls it done as soon as a segment exists, and
-  // reads only the first 1000 segments. Scope the lookup by tenant, judge the chunk progress before
-  // certifying, and page the transcript with a cursor.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const {rows: jobs} = await db.query('SELECT total_chunks FROM jobs WHERE id = $1', [id]);
   const completed = Number((await redis.hget(\`transcription:\${id}:chunks\`, 'completed')) ?? 0);
@@ -360,9 +351,7 @@ func writeJSON(rw http.ResponseWriter, status int, payload map[string]any) {
 }
 
 func readTranscription(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter resolves the job by id alone, calls it done as soon as a segment exists, and
-	// reads only the first 1000 segments. Scope the lookup by tenant, judge the chunk progress
-	// before certifying, and page the transcript with a cursor.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	jobID := r.PathValue("id")
 
 	var totalChunks int64
@@ -546,9 +535,7 @@ object TranscriptionRead {
   val route: Route =
     path("v1" / "transcriptions" / Segment) { jobId =>
       get {
-        // TODO: this starter resolves the job by id alone, calls it done as soon as a segment exists,
-        // and reads only the first 1000 segments. Scope the lookup by tenant, judge the chunk
-        // progress before certifying, and page the transcript with a cursor.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val job = conn.prepareStatement("SELECT total_chunks FROM jobs WHERE id = ?")
         job.setString(1, jobId)
         val jobRow = job.executeQuery()
@@ -674,9 +661,7 @@ int main() {
 
   svr.Get(R"(/v1/transcriptions/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
     const std::string job_id = req.matches[1];
-    // TODO: this starter resolves the job by id alone, calls it done as soon as a segment exists, and
-    // reads only the first 1000 segments. Scope the lookup by tenant, judge the chunk progress
-    // before certifying, and page the transcript with a cursor.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     pqxx::work tx(db_pool());
     const auto job = tx.exec_params("SELECT total_chunks FROM jobs WHERE id = $1", job_id);
     const auto rows = tx.exec_params("SELECT seq, text FROM segments WHERE job_id = $1 LIMIT 1000", job_id);
@@ -779,9 +764,9 @@ int main() {
     },
   },
   hints: [
-    'Scope first: read `X-Tenant-Id` and resolve the job with `WHERE id = $1 AND tenant_id = $2`. A foreign job and a job that never existed must be the same answer — same 404, same body — because a 403 would confirm the job exists before the caller is allowed to know that.',
-    'Let the chunk-progress hash decide the status, not the segments: `completed` and `failed` for the job, `pending = total_chunks - completed - failed`, and `done` only when nothing is failed and nothing is pending. A stalled job still has the segments it managed to publish; reporting those as `done` is the bug the whole read path exists to prevent.',
-    'Page with keyset, not with a cap: `WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT <page>` and answer `next_cursor` (the last `seq`) only when the page came back full. A fixed `LIMIT 1000` cannot be walked past, so a four-hour recording is permanently truncated.',
+    "Symptom: a tenant reads another tenant's transcript by guessing an id, a job whose chunk 40 failed is billed and archived as done, and a four-hour recording ends mid-sentence at segment 1000.",
+    'Mechanism: the job query has no tenant predicate; `status` is `"done" if segments`, so one row certifies the file; the segment query has no `ORDER BY` and a fixed `LIMIT 1000` with no cursor.',
+    'Change: add `AND tenant_id = %s`, 404 on miss; `partial` unless failed and pending (from the progress hash) are zero; `seq > cursor ORDER BY seq`, join the texts, `next_cursor` on a full page.',
   ],
-  debrief: `The interviewer is testing three ways a read endpoint can lie, and the starter tells all three lies in ten lines. It lies about identity: a lookup by id alone is an IDOR, and the only safe answer for a foreign id is the one a missing id gets — a 404 with the same body and the same latency, because 403 leaks that another tenant's job exists. It lies about completion: the presence of segments is not evidence that the work finished, so status has to be derived from the chunk-progress set — completed, failed, and the remainder that is still pending — and a job that stalled halfway must answer \`partial\` while still serving the segments it produced. It lies about reachability: \`LIMIT 1000\` looks like a bound and is really a wall, because no cursor is ever returned to walk past it; a keyset cursor over \`seq\` is stable under concurrent writes, costs one indexed seek per page, and says \`next_cursor\` only when more rows remain. Real systems push each of the three further — signing the cursor so callers cannot forge positions, reconciling the chunk counters against the ASR provider's usage before certifying \`done\`, and retiring segments that arrive from chunks that later failed — but the contract is decided by these three: who may read, whether the answer is certified, and whether the caller can reach the end.`,
+  debrief: `Each fix is a proof the endpoint can make. Identity: the tenant predicate in the query means a foreign id and a missing id take the same path and get the same 404, so the response carries no information about jobs the caller does not own. Completion: status is derived from the chunk-progress counters rather than from the rows, because rows only prove that some chunks finished; \`partial\` with the segments so far is the truthful answer for a stalled job. Reachability: a keyset cursor over \`seq\` costs one indexed seek per page, is stable under concurrent writes, and says \`next_cursor\` only while rows remain. Production read paths sign the cursor so callers cannot forge positions, and reconcile the chunk counters against provider usage before certifying \`done\`.`,
 };

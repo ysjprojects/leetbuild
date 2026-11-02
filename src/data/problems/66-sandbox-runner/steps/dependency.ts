@@ -8,29 +8,26 @@ export const dependencyStep: Step = {
   focus: ['runner', 'container', 'sandbox'],
   task: `## Task
 
-The starter is working code: when the container service is healthy and fast the
-job starts, so the demo works. Every failure path weakens the boundary. Find them, fix them, and
-prove the fix.
+**Starting point.** The starter’s \`start_container(job_id, image, requested_profile)\` loops five
+times over \`containers.Start(pb.StartRequest(...))\` with no deadline on the call; on any
+\`grpc.RpcError\` it sets the profile to \`runc\` and tries again, and it returns the handle with
+whatever profile the container reports. It compiles and hides five flaws.
 
-Implement \`start_container(job_id, image, requested_profile)\`, the runner’s gRPC client for the
-container service:
+**Failure mode the checks target.** Every failure path weakens the boundary. A wedged container
+service pins the runner, a rejected image is retried against a service that will not accept it, a
+slow start runs the code under the weakest profile, and a node that started \`runc\` when
+\`gvisor\` was asked for is accepted as if nothing happened.
 
-- Every attempt carries a **30-second deadline** (\`START_DEADLINE_S\` / \`StartDeadlineMs\`) on the
-  call itself. Without one, a wedged container service holds the runner forever.
-- The container service reports the **isolation profile it actually used**. If that profile ranks
-  below the requested one, the runner **kills the container and aborts** the job: a downgrade is a
-  boundary failure, not a detail. The starter trusts the profile the container echoes.
-- An **image rejection** (\`FAILED_PRECONDITION\` / \`INVALID_ARGUMENT\`) is **terminal**: it will
-  never succeed, so it is returned to the caller immediately instead of being retried five times.
-- A **start timeout** (\`DEADLINE_EXCEEDED\`) **aborts the job**. It must never fall back to running
-  the code under the default, weaker profile — a slow start is not permission to weaken isolation.
-- At most **2 attempts** (\`MAX_ATTEMPTS\`), and only \`UNAVAILABLE\` is retryable; everything else
-  returns immediately.
-
-**Failure mode the checks target.** Trusting the echoed profile means a misconfigured node silently
-downgrades every job; retrying a rejected image burns the container service on a request that cannot
-succeed; and "the start timed out, so run it anyway" is precisely how a sandboxed job ends up on the
-host with the network. Each is invisible until the pod it runs on cannot be trusted.`,
+- Every attempt carries a 30-second deadline on the call itself (\`START_DEADLINE_S = 30\`, passed
+  as \`timeout=START_DEADLINE_S\`).
+- Rank the reported profile with \`ISOLATION_RANK\`; a weaker result kills the container and raises
+  \`IsolationError\`.
+- An image rejection (\`FAILED_PRECONDITION\`, \`INVALID_ARGUMENT\`, the \`TERMINAL\` set) raises
+  \`IsolationError\` at once.
+- \`DEADLINE_EXCEEDED\` fails the job with \`IsolationError\`; no branch reassigns the profile to
+  \`runc\`.
+- At most \`MAX_ATTEMPTS = 2\` (\`for attempt in range(MAX_ATTEMPTS)\`), and only \`UNAVAILABLE\`
+  is retried.`,
   sequence: {
     participants: ['Runner', 'Container service', 'Sandbox node'],
     messages: [
@@ -49,9 +46,9 @@ host with the network. Each is invisible until the pod it runs on cannot be trus
     ],
   },
   hints: [
-    'The deadline belongs on the call: `timeout=START_DEADLINE_S` (Python), an options object with `deadline` (TypeScript), a `context.WithTimeout` context (Go), `withDeadlineAfter` (Scala), `ctx.set_deadline(...)` (C++). Wrapping the call in a try/except changes nothing.',
-    'Compare ranks, do not compare strings: `ISOLATION_RANK[used] < ISOLATION_RANK[requested]` → kill the container and raise. The container may only ever report a profile *at least as strong* as the one requested.',
-    'Sort the error codes once: a rejection (`FAILED_PRECONDITION`, `INVALID_ARGUMENT`) is terminal, `DEADLINE_EXCEEDED` aborts, only `UNAVAILABLE` is retried — and only while `attempt + 1 < MAX_ATTEMPTS`. There is no branch in which a failed start continues with the default profile.',
+    'A node whose runtime is misconfigured starts every job as `runc`; the runner reports `gvisor` jobs as started anyway, and when the container service hangs, the runner hangs with it.',
+    '`containers.Start` has no deadline, the except branch treats every status code alike and rewrites `requested_profile` to `runc`, and the reply’s `profile` field is handed back unread.',
+    'Add `START_DEADLINE_S = 30`, `MAX_ATTEMPTS = 2`, `ISOLATION_RANK`, `TERMINAL`; call with `timeout=START_DEADLINE_S`; raise `IsolationError` on terminal codes, `DEADLINE_EXCEEDED`, or `ISOLATION_RANK[used] < ISOLATION_RANK[requested]`; retry only `UNAVAILABLE`.',
   ],
   checks: [
     {
@@ -138,9 +135,7 @@ class IsolationError(RuntimeError):
 
 
 def start_container(job_id: str, image: str, requested_profile: str):
-    # TODO: put a 30-second deadline on the call, bound the attempts, treat an image rejection as
-    # terminal, fail on a start timeout instead of downgrading the profile, and refuse a container
-    # whose reported isolation is weaker than the one requested.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for attempt in range(5):
         try:
             handle = containers.Start(pb.StartRequest(job_id=job_id, image=image, profile=requested_profile))
@@ -189,7 +184,7 @@ def start_container(job_id: str, image: str, requested_profile: str):
 `,
     },
     typescript: {
-      starter: `/** Start a container: flawed code that trusts the profile the container echoes. */
+      starter: `/** Start a container for a job through the container service. */
 import {status} from '@grpc/grpc-js';
 
 class IsolationError extends Error {}
@@ -199,9 +194,7 @@ async function startContainer(
   image: string,
   requestedProfile: string,
 ): Promise<{handleId: string; profile: string}> {
-  // TODO: put a 30-second deadline on the call, bound the attempts, treat an image rejection as
-  // terminal, fail on a start timeout instead of downgrading the profile, and refuse a container
-  // whose reported isolation is weaker than the one requested.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       return await containerService.Start({jobId, image, profile: requestedProfile});
@@ -271,9 +264,7 @@ type errIsolation string
 func (e errIsolation) Error() string { return string(e) }
 
 func startContainer(ctx context.Context, jobID, image, requestedProfile string) (*pb.StartReply, error) {
-	// TODO: put a 30-second deadline on the call, bound the attempts, treat an image rejection as
-	// terminal, fail on a start timeout instead of downgrading the profile, and refuse a container
-	// whose reported isolation is weaker than the one requested.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 5; attempt++ {
 		handle, err := containers.Start(ctx, &pb.StartRequest{JobId: jobID, Image: image, Profile: requestedProfile})
 		if err != nil {
@@ -348,9 +339,7 @@ object ContainerClient {
   def startContainer(jobId: String, image: String, requestedProfile: String): ContainerHandle = {
     var profile = requestedProfile
     var attempt = 0
-    // TODO: put a 30-second deadline on the call, bound the attempts, treat an image rejection as
-    // terminal, fail on a start timeout instead of downgrading the profile, and refuse a container
-    // whose reported isolation is weaker than the one requested.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while (attempt < 5) {
       try {
         return containers.start(StartRequest(jobId, image, profile))
@@ -426,9 +415,7 @@ std::unique_ptr<ContainerHandle> startContainer(
     const std::string& jobId,
     const std::string& image,
     std::string requestedProfile) {
-  // TODO: put a 30-second deadline on the call, bound the attempts, treat an image rejection as
-  // terminal, fail on a start timeout instead of downgrading the profile, and refuse a container
-  // whose reported isolation is weaker than the one requested.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (int attempt = 0; attempt < 5; ++attempt) {
     grpc::ClientContext ctx;
     StartRequest request;
@@ -508,15 +495,12 @@ std::unique_ptr<ContainerHandle> startContainer(
 `,
     },
   },
-  debrief: `The question here is "who decides how strong the isolation is?" The caller asks for a profile,
-the scheduler picks a node, and the container service reports what it actually started — and the
-runner is the last place that can refuse a downgrade. Trusting the echoed profile converts a
-misconfigured node into a silent boundary failure across every job it runs, which is why the check
-is a *rank* comparison, not a string comparison, and why the downgrade path kills the container
-before it does anything else. The error taxonomy is the second half: a rejected image is permanent,
-a timeout is a failed start, and only an unavailable service is worth a second attempt. The
-temptation is the timeout branch — "the start was slow, so run it with the default profile" — and
-that single line is the difference between a hard boundary and a suggestion. Real platforms add
-image allowlists and signature checks, node taints per profile, and a probe that verifies the
-sandbox properties from inside the container before the job's code is invoked.`,
+  debrief: `The caller asks for a profile, the scheduler picks a node, and the container service reports what
+it started; the runner is the last place that can refuse a downgrade. That is why the check is a
+rank comparison, not a string comparison, and why the downgrade path kills the container before
+anything else runs. The error taxonomy follows the same logic: a rejected image is permanent, a
+timeout is a failed start, and only an unavailable service earns a second attempt. The one-line
+fallback to the default profile on a slow start turns a boundary into a suggestion. Production
+runners pin images by digest and verify their signatures, and taint nodes per profile so a
+\`kata\` job cannot land on a \`runc\`-only node.`,
 };

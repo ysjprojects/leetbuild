@@ -8,35 +8,31 @@ export const pullReadStep: Step = {
   focus: ['device', 'sync', 'revisions', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it returns changes for a
-device, the demo client renders them, and the watermark makes it look like a proper sync protocol.
-Two of its three answers are lies, and both of them make a device believe it is caught up when it is
-not. Find them, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/sync/pull?cursor={revision}\`, reads the device
+from \`X-Device-Id\`, asks the store for a page at \`offset=cursor\` with a \`DEFAULT_PAGE\` of 1000,
+and answers \`{entries, watermark}\` with \`store.latest_revision()\` as the watermark. It compiles,
+the demo client renders the changes, and it hides four flaws. Two of them make a device believe it
+is caught up when it is not.
 
-Implement \`GET /v1/sync/pull?cursor={revision}\`:
+**Failure mode the checks target.** A phone returns after a week with 2,400 changes waiting, gets the
+first 1,000 and a watermark equal to the newest write, and stops pulling: 1,400 changes are skipped
+with no error anywhere. While another device is writing, the offset shifts and a resuming device
+duplicates one change and skips another. Neither shows in a demo with one device and no concurrent
+writers.
+
+Requirements:
 
 - The device is authenticated by the \`X-Device-Id\` header (**401** when missing); \`cursor\` is the
   last revision the device holds and defaults to **0**.
-- Return the changes **after** that cursor, ordered by revision, **capped at 1000 entries**
-  (\`MAX_DELTA_ENTRIES\`). The cap is not a page size the client can ignore: it is the point at which
-  the device must come back.
-- The response is \`{entries, watermark, next_cursor, has_more}\`. **The watermark covers exactly the
-  entries returned** — it is the revision of the last entry, or the device's own cursor when nothing
-  was returned. It is never the newest write in the system: a device that hit the cap and is told
-  "you are at the newest revision" skips everything it did not receive, forever.
-- **\`has_more\` is true when the cap was reached**, and \`next_cursor\` is the cursor that resumes
-  exactly where this response stopped. A full page is not an error; it is an instruction to pull
-  again.
-- **Pagination is cursor-based, not offset-based.** \`offset\` counts rows in a table that is being
-  written to, so a concurrent change shifts every later page: the device duplicates one change and
-  skips another. A cursor names a revision, and rows are ordered by revision, so the same cursor
-  always resumes at the same place.
-
-**Failure mode the checks target.** Returning the latest write as the watermark after a partial page
-tells a device it is synced when it is missing entries — silent data loss with no error anywhere.
-Offset pagination makes the returned set depend on writes that happen *after* the request: a device
-resuming from an offset can skip a change forever. Both bugs are invisible in a demo with one device
-and no concurrent writers.`,
+- Return the changes after that cursor, ordered by revision, capped at 1000 entries
+  (\`MAX_DELTA_ENTRIES\`). The cap is the point at which the device must come back.
+- The response is \`{entries, watermark, next_cursor, has_more}\`. The watermark covers exactly the
+  entries returned (\`covered_watermark\`): the revision of the last entry, or the device's own cursor
+  when nothing was returned. It is not the newest write in the system.
+- \`has_more\` is true when the cap was reached, and \`next_cursor\` resumes exactly where this
+  response stopped. A full page is an instruction to pull again.
+- Pagination is cursor-based (\`changes_after(start_after, limit)\`), not offset-based. A cursor names
+  a revision and rows are ordered by revision, so the same cursor always resumes at the same place.`,
   sequence: {
     participants: ['Device', 'Sync Engine', 'revisions'],
     messages: [
@@ -75,7 +71,7 @@ and no concurrent writers.`,
       id: 'watermark-covers-returned',
       title: 'The watermark covers exactly the returned entries',
       detail:
-        'The watermark is derived from the entries actually returned (`covered_watermark(entries, cursor)`), falling back to the device’s cursor when the page is empty — never the newest write in the system. The starter answers with the latest revision regardless of what it returned.',
+        'The watermark is derived from the entries actually returned (`covered_watermark(entries, cursor)`), falling back to the device’s cursor when the page is empty, not the newest write in the system. The starter answers with the latest revision regardless of what it returned.',
       match: {
         python: {all: [/covered_watermark\(/, /"watermark"/], none: [/latest_revision/]},
         typescript: {all: [/coveredWatermark\(/, /watermark/], none: [/latestRevision/]},
@@ -86,7 +82,7 @@ and no concurrent writers.`,
     },
     {
       id: 'cursor-pagination',
-      title: 'Paginates by cursor, never by offset',
+      title: 'Paginates by cursor, not by offset',
       detail:
         'The query is expressed as "changes after this revision" (`start_after` / `startAfter`), so a concurrent write cannot shift the next page. The starter paginates by `offset`, which duplicates or skips changes while writes are happening.',
       match: {
@@ -149,9 +145,7 @@ store = RevisionStore()
 
 @app.get("/v1/sync/pull")
 def pull(cursor: int = 0, device: str = Header(alias="X-Device-Id")) -> JSONResponse:
-    # TODO: cap the page at 1000 entries with a resumable cursor, answer with a watermark that
-    # covers exactly the entries returned instead of the latest write, and paginate by cursor
-    # instead of by offset.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     entries = store.page(offset=cursor, limit=DEFAULT_PAGE)
     return JSONResponse(
         {"entries": entries, "watermark": store.latest_revision()},
@@ -216,9 +210,7 @@ export const app = Fastify();
 const DEFAULT_PAGE = 1000;
 
 app.get('/v1/sync/pull', async (request, reply) => {
-  // TODO: cap the page at 1000 entries with a resumable cursor, answer with a watermark that
-  // covers exactly the entries returned instead of the latest write, and paginate by cursor
-  // instead of by offset.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const cursor = Number((request.query as {cursor?: string}).cursor ?? 0);
   const entries = await store.page(cursor, DEFAULT_PAGE);
   return reply.code(200).send({entries, watermark: await store.latestRevision()});
@@ -292,9 +284,7 @@ func (s *RevisionStore) LatestRevision(ctx context.Context) (int64, error) {
 var store = &RevisionStore{}
 
 func pull(rw http.ResponseWriter, r *http.Request) {
-	// TODO: cap the page at 1000 entries with a resumable cursor, answer with a watermark that
-	// covers exactly the entries returned instead of the latest write, and paginate by cursor
-	// instead of by offset.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	entries, _ := store.Page(r.Context(), 0, defaultPage)
 	watermark, _ := store.LatestRevision(r.Context())
 	rw.Header().Set("Content-Type", "application/json")
@@ -394,9 +384,7 @@ object PullApi {
     path("v1" / "sync" / "pull") {
       get {
         parameter("cursor".as[Long].?) { cursorOpt =>
-          // TODO: cap the page at 1000 entries with a resumable cursor, answer with a watermark
-          // that covers exactly the entries returned instead of the latest write, and paginate by
-          // cursor instead of by offset.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val cursor = cursorOpt.getOrElse(0L)
           val entries = store.page(offset = cursor, limit = DefaultPage)
           complete(StatusCodes.OK, s"""{"entries":$entries,"watermark":\${store.latestRevision()}}""")
@@ -479,9 +467,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/sync/pull", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: cap the page at 1000 entries with a resumable cursor, answer with a watermark that
-    // covers exactly the entries returned instead of the latest write, and paginate by cursor
-    // instead of by offset.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string raw = req.get_param_value("cursor");
     const long long cursor = raw.empty() ? 0 : std::stoll(raw);
     const auto entries = store.page(cursor, kDefaultPage);
@@ -561,9 +547,11 @@ int main() {
     },
   },
   hints: [
-    'The watermark is not "how far the system has got", it is "how far *this device* has been brought". Build it from the page you are returning: the revision of the last entry, or the device\'s own cursor when the page is empty. Anything else lets a device that stopped at the cap claim to be caught up.',
-    'A full page is a resumable state, not a success: return `has_more` and a `next_cursor` equal to the watermark you just computed, so the client pulls again from exactly the last entry it received. Without those two fields, a capped device has no way to know it stopped early.',
-    'Pagination by `offset` reads a table that is being appended to: a write between two pages shifts every later row, so the client skips or duplicates changes. Query by revision instead — "changes after this cursor, ordered by revision, at most N" — and the same cursor always names the same point in the stream.',
+    'A phone back from a week away shows "up to date" with 1,000 new changes, while the laptop next to it has 2,400. Nothing in the logs, no error on either device.',
+    'The starter returns `store.latest_revision()` as the watermark whatever it returned, and no `has_more`, so a capped device stops. `store.page(offset=cursor)` counts rows in a table other devices are appending to.',
+    'Fetch `store.changes_after(cursor, MAX_DELTA_ENTRIES)`, compute `covered_watermark(entries, cursor)` (last revision, or the cursor), and answer with it plus `next_cursor` and `has_more = len(entries) == MAX_DELTA_ENTRIES`.',
   ],
-  debrief: `The interview question is "what makes a sync response safe to act on?" A device trusts the answer enough to discard its local notion of "not yet synced", so two things must be true. The watermark has to describe the entries actually returned: it is the device's new position, and a position beyond the page it received marks unreceived changes as synced — a silent, permanent hole in the client. And the page boundary has to be a cursor: offsets are positions in a result set that changes under you, so a device resuming from an offset can be handed a page whose rows shifted, duplicating one change and skipping its neighbour. The cap completes the trio: it exists to bound the response, and it must come with has_more and next_cursor so the client resumes rather than stops. Real systems add per-device concurrency limits, a snapshot path for cursors older than the compaction horizon, and an ordering guarantee that the entries are strictly increasing in revision so a client can validate the page it got.`,
+  debrief: `A device trusts the pull response enough to discard its own notion of "not yet synced", so the fix makes every field in that response describe only what the device actually received. The watermark becomes a function of the returned page because it is the device's new position, and a position past the page marks unreceived changes as synced. The page boundary becomes a revision because an offset is a position in a result set that changes under the reader. The cap stays, and \`has_more\` with \`next_cursor\` turns it from a silent stop into an instruction to pull again.
+
+Production pull endpoints also enforce a per-device concurrency limit, offer a snapshot path for cursors older than the compaction horizon, and guarantee strictly increasing revisions within a page so a client can validate what it got.`,
 };

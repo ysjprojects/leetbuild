@@ -8,27 +8,26 @@ export const readStep: Step = {
   focus: ['api', 'db', 'console'],
   task: `## Task
 
-**Starting point.** The starter is working code: a caller with a case id gets the case. The starter
-treats the case id as the only proof of access, and the case file as a place to be helpful. Fix the
-scope, the reporter's identity and the free text, and prove the fix.
-
-Implement \`GET /v1/moderation/items/{case_id}\`:
-
-- The case is scoped to the **content owner's tenant**: resolve the case's tenant from the catalogue
-  and answer **404** — not 403 — when it belongs to someone else or does not exist. The starter
-  returns any case by id across tenants, so a case id is a skeleton key to another tenant's reports.
-- The body carries the status, the action history and links to the moderated content. The
-  **reporter's identity is included only for the \`surveyor\` role**; for every other role it is
-  absent, not blanked, not hashed. The starter volunteers it "for context" to anyone who asks.
-- The free-text **detail is truncated** to \`MAX_DETAIL_CHARS\` and **escaped** before it is returned,
-  so the case file is not a stored-XSS payload and not an unbounded copy of a private statement.
-  The starter echoes it raw.
-- A missing tenant is **401**.
+**Starting point.** The starter registers \`GET /v1/moderation/items/{case_id}\`, reads the tenant
+from \`X-Tenant-Id\`, fetches the case by id and returns its status, reporter id and detail as
+stored. It compiles, serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** A case file is a dossier that names the person who reported
 someone else, so it is the most sensitive read in the service. The starter fails on authorisation
 (the case id is not an access token), on data minimisation (reporter identity for everyone), and on
-output handling (raw free text straight back to the caller).`,
+output handling (raw, unbounded free text straight back to the caller). The demo fetches its own
+case from a trusted console, so none of this shows.
+
+Requirements:
+
+- The case is scoped to the **content owner's tenant**: resolve the case's tenant from the catalogue
+  and answer **404**, not 403, when it belongs to someone else or does not exist.
+- The body carries the status, the action history and links to the moderated content. The
+  **reporter's identity is included only for the \`surveyor\` role**; for every other role it is
+  absent, not blanked, not hashed.
+- The free-text **detail is truncated** to \`MAX_DETAIL_CHARS\` and **escaped** before it is returned,
+  so the case file is not a stored-XSS payload and not an unbounded copy of a private statement.
+- A missing tenant is **401**.`,
   sequence: {
     participants: ['Moderator console', 'Moderation API', 'case store'],
     messages: [
@@ -127,8 +126,7 @@ cases = CaseStore()
 
 @app.get("/v1/moderation/items/{case_id}")
 def read_case(case_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter returns any case by id across tenants, includes the reporter identity for
-    # context, and echoes the free-text detail raw.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     record = cases.get(case_id)
     return JSONResponse(
         {
@@ -208,8 +206,7 @@ import Fastify from 'fastify';
 export const app = Fastify();
 
 app.get('/v1/moderation/items/:caseId', async (request, reply) => {
-  // TODO: this starter returns any case by id across tenants, includes the reporter identity for
-  // context, and echoes the free-text detail raw.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {caseId} = request.params as {caseId: string};
   const record = await cases.get(caseId);
   return reply.code(200).send({
@@ -277,8 +274,7 @@ import (
 )
 
 func readCase(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter returns any case by id across tenants, includes the reporter identity for
-	// context, and echoes the free-text detail raw.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	caseID := r.PathValue("case_id")
 	record, _ := cases.Get(caseID)
 	if record == nil {
@@ -389,8 +385,7 @@ object CaseFileApi {
   val route: Route =
     path("v1" / "moderation" / "items" / Segment) { caseId =>
       get {
-        // TODO: this starter returns any case by id across tenants, includes the reporter identity
-        // for context, and echoes the free-text detail raw.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         cases.get(caseId) match {
           case None => complete(StatusCodes.NotFound, """{"error":"unknown case"}""")
           case Some(record) =>
@@ -483,8 +478,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/moderation/items/([A-Za-z0-9_]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter returns any case by id across tenants, includes the reporter identity for
-    // context, and echoes the free-text detail raw.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto caseId = req.matches[1];
     const json record = cases.get(caseId);
     res.status = 200;
@@ -593,9 +587,9 @@ int main() {
     },
   },
   hints: [
-    'Authorisation is a lookup, not a guess. Resolve the case’s tenant from the catalogue the same way the report intake does, and answer 404 for anything that is not the caller’s — a 403 confirms the case exists, which is itself a leak.',
-    'Reporter identity is a named exception, not a default. Build the body without it, then add `reporter_id` only inside the `surveyor` branch. Minimising the response is easier to review than blanking fields later.',
-    'Output is not “just data”: escape the detail before it reaches the reviewer’s console so a report cannot store markup, and truncate it to `MAX_DETAIL_CHARS` so the case file stays a summary rather than a copy of someone’s private statement.',
+    "A reported user who guesses a case id reads who reported them, a tenant can browse another tenant's cases, and a report containing `<script>` runs in the moderator console.",
+    'The handler does `cases.get(case_id)` with no tenant comparison, builds the body with `reporter_id` unconditionally, and copies `record["detail"]` into the response without escaping or bounding it.',
+    'Compare `CASE_TENANT[case_id]` to the header (404 on mismatch), add `reporter_id` only when the role is `SURVEYOR_ROLE`, and return `html.escape(detail)` cut to `MAX_DETAIL_CHARS`.',
   ],
-  debrief: `The interviewer is testing whether you can debug the read side of a sensitive record with the same care as the write side. The starter looks fine because the demo fetches its own case. Three defects are being checked: tenant scoping on a resource addressed by an opaque id, minimisation of the reporter’s identity to a single privileged role, and safe rendering of free text (escaped and truncated). Real systems add an access log per case view, a break-glass flow for surveyors with a recorded reason, field-level auditing so you can answer “who saw the reporter?”, and a retention policy that seals the raw detail separately from the case metadata.`,
+  debrief: `The read side needs the same care as the write side because an opaque id is not an access token. The tenant check uses the same catalogue as the report intake and answers 404 rather than 403 so a probe cannot learn that a case exists. The body is built without the reporter and the identity is added only inside the surveyor branch, which is easier to audit than blanking fields later. Escaping happens before truncation so a cut cannot split an entity, and the cap keeps the case file a summary rather than a copy of a private statement. Production case systems also log every view per case, require a recorded reason when a surveyor unmasks a reporter, and seal the raw detail under its own retention policy apart from the case metadata.`,
 };

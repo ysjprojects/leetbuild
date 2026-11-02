@@ -8,34 +8,31 @@ export const dependencyStep: Step = {
   focus: ['api', 'job'],
   task: `## Task
 
-**Starting point.** The starter is working code: when nothing was missed it
-calls the job and the job runs, so the demo passes. Its failure path is a storm. Debug it like the
-owner of the scheduler, fix it, and prove the fix with the checks below.
-
-Implement the fire path that turns **missed windows** into calls against the target job service.
-
-- Triggering goes over gRPC with a **3-second deadline** on every attempt
-  (\`DEADLINE_S = 3\` / \`DEADLINE_MS = 3000\` / \`withDeadlineAfter\` / \`set_deadline\`). A call
-  with no deadline lets one wedged job hold a scheduler tick open for the rest of the day.
-- The **misfire policy decides**, it is not a retry problem. \`decide(policy, windows)\` returns the
-  windows to fire now plus a reason:
-  - \`skip\` — fire nothing, record the skipped windows with the policy as the reason.
-  - \`fire_once_now\` — fire **at most one** window immediately: \`MAX_IMMEDIATE_FIRES = 1\`, and it
-    is the most recent missed window, not the oldest.
-  - \`catch_up\` — replay the missed windows, rate-limited to \`CATCH_UP_PER_SECOND = 1\` (one fire
-    per \`CATCH_UP_INTERVAL_MS = 1000\`).
-- **The trigger itself is never retried.** One attempt per window per tick: if the deadline
-  expires or the job returns an error, the policy and the next tick decide what happens, not a
-  \`while True\`.
-- **Every decision is recorded**, including the ones that fire nothing:
-  \`record_decision(schedule_id, window, "skipped", reason)\`, \`"fired"\` or \`"error"\` with the
-  reason that produced it.
+**Starting point.** The starter's \`run_misfire(schedule, windows, owner)\` walks every missed
+window and calls \`stub.Trigger\` over gRPC inside a \`while True\` that retries on any
+\`RpcError\` until the call succeeds, then returns the windows it fired. It serves the demo and
+hides 5 flaws.
 
 **Failure mode the checks target.** After a ten-minute pause a minutely job has **200** missed
-windows. The starter loops over them and retries each one until it succeeds, which is a catch-up
-burst fired as fast as the network allows — the target database gets 200 executions in seconds. The
-policy is the thing that is supposed to cap that; a retry loop that ignores it turns a scheduler
-pause into a self-inflicted DDoS.`,
+windows. The starter fires them as fast as the network allows and retries each one until it
+succeeds, so the target database gets 200 executions in seconds. The misfire policy is what is
+supposed to cap that; a retry loop that ignores it turns a scheduler pause into a self-inflicted
+outage.
+
+- Triggering goes over gRPC with a **3-second deadline** on every attempt
+  (\`DEADLINE_S = 3\` / \`DEADLINE_MS = 3000\` / \`withDeadlineAfter\` / \`set_deadline\`).
+- The **misfire policy decides**. \`decide(policy, windows)\` returns the windows to fire now plus
+  a reason:
+  - \`skip\`: fire nothing, record the skipped windows with the policy as the reason.
+  - \`fire_once_now\`: fire **at most one** window immediately, \`MAX_IMMEDIATE_FIRES = 1\`, and
+    it is the most recent missed window, not the oldest.
+  - \`catch_up\`: replay the missed windows, rate-limited to \`CATCH_UP_PER_SECOND = 1\` (one fire
+    per \`CATCH_UP_INTERVAL_MS = 1000\`).
+- **The trigger itself is not retried.** One attempt per window per tick: if the deadline expires
+  or the job returns an error, the policy and the next tick decide what happens.
+- **Every decision is recorded**, including the ones that fire nothing:
+  \`record_decision(schedule_id, window, "skipped", reason)\`, \`"fired"\` or \`"error"\` with the
+  reason that produced it.`,
   sequence: {
     participants: ['Scheduler API', 'schedule store', 'Job service'],
     messages: [
@@ -126,9 +123,7 @@ stub = jobs_pb2_grpc.JobServiceStub(grpc.insecure_channel("jobs:9000"))
 
 
 def run_misfire(schedule: dict, windows: list[int], owner: str) -> list[int]:
-    # TODO: this starter treats every missed window as owed and retries the trigger itself until it
-    # succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no
-    # deadline and no decision record. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     fired = []
     for window in windows:
         while True:
@@ -220,11 +215,9 @@ def run_misfire(schedule: dict, windows: list[int], owner: str) -> list[int]:
 `,
     },
     typescript: {
-      starter: `/** Misfire handling: flawed code that treats every missed window as owed. */
+      starter: `/** Misfire handling: treats every missed window as owed. */
 export async function runMisfire(schedule: Schedule, windows: number[]): Promise<number[]> {
-  // TODO: this starter treats every missed window as owed and retries the trigger itself until it
-  // succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no deadline
-  // and no decision record. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const fired: number[] = [];
   for (const window of windows) {
     for (;;) {
@@ -306,9 +299,7 @@ import (
 )
 
 func RunMisfire(schedule Schedule, windows []int64) []int64 {
-	// TODO: this starter treats every missed window as owed and retries the trigger itself until it
-	// succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no
-	// deadline and no decision record. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	fired := make([]int64, 0, len(windows))
 	for _, window := range windows {
 		for {
@@ -399,9 +390,7 @@ func RunMisfire(schedule Schedule, windows []int64) []int64 {
 
 object Misfire {
   def runMisfire(schedule: Schedule, windows: List[Long]): List[Long] = {
-    // TODO: this starter treats every missed window as owed and retries the trigger itself until it
-    // succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no
-    // deadline and no decision record. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val fired = ListBuffer.empty[Long]
     for (window <- windows) {
       var done = false
@@ -483,9 +472,7 @@ object Misfire {
 #include <vector>
 
 std::vector<long> runMisfire(const Schedule& schedule, const std::vector<long>& windows) {
-  // TODO: this starter treats every missed window as owed and retries the trigger itself until it
-  // succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no deadline
-  // and no decision record. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   std::vector<long> fired;
   for (const long window : windows) {
     for (;;) {
@@ -568,9 +555,9 @@ std::vector<long> runMisfire(const Schedule& schedule, const std::vector<long>& 
     },
   },
   hints: [
-    'Put the deadline on the call itself — `timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — and keep it in one constant (`DEADLINE_S = 3`). Then delete the retry loop: one attempt per window per tick is the whole contract, and the policy, not the loop, decides what happens to windows that did not fire.',
-    'The decision is data: `decide(policy, windows)` returns the windows to fire now plus a reason. For `fire_once_now` that is exactly the latest window (`windows[-1:]`), which is what turns ten minutes of pause into one execution instead of two hundred.',
-    'Catch-up is a rate, not a loop: `CATCH_UP_PER_SECOND = 1` gives `CATCH_UP_INTERVAL_MS = 1000`, and every catch-up window after the first waits that long. Record the decision either way — a skip with a reason is the only way on-call can tell a deliberate ignore from a lost run.',
+    'The scheduler was paused for ten minutes during a deploy; when it came back, the reporting database took 200 executions of a minutely job in a few seconds and fell over.',
+    'Every missed window is treated as owed, each trigger is retried in a `while True` with no deadline, and no policy or record is consulted, so a pause becomes a burst nobody decided on.',
+    'Add `DEADLINE_S = 3` to the call, replace the loop with `decide(policy, windows)` (`windows[-1:]` for fire_once_now, `time.sleep` per catch-up window) and `record_decision` for every outcome.',
   ],
-  debrief: `The interviewer is testing whether the failure path is a policy or a retry loop. The starter passes because the demo never pauses the scheduler. Four defects are checked: a trigger with no deadline, no policy at all, a fire-once decision that does not collapse the burst, and a catch-up replay with no rate limit. The burst is the one that takes down a database: after a ten-minute pause a minutely job owes 200 executions and the starter delivers them as fast as the network allows. Real schedulers also persist a cursor per schedule so catch-up resumes after a crash, cap the catch-up window by wall-clock age rather than count, and skip anything older than the retention the target can tolerate.`,
+  debrief: `The fix moves the decision out of the loop and into data because the question after a pause is not "how do I make these calls succeed" but "which of these windows still deserve a call". \`decide\` answers that per policy, which is why fire-once picks the latest window rather than the oldest (the most recent state is the one worth recomputing) and why catch-up is paced rather than replayed. The deadline and the single attempt per window keep one wedged job from holding a tick open, and the decision record is what lets an operator distinguish a deliberate skip from a lost run. Production schedulers also persist a catch-up cursor per schedule so a crash mid-replay resumes where it stopped, and bound catch-up by wall-clock age rather than by count.`,
 };

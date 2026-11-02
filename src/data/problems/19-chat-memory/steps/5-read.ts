@@ -8,25 +8,25 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-The starter is working code: a context comes back and the demo shows a
-conversation. It authorizes nothing, bounds nothing, and serves a stale cache. Find the flaws, fix
-them, and prove the fix.
-
-Implement the context-read endpoint used when a model call or the UI needs the conversation:
-
-- \`GET /v1/sessions/{id}/context\` returns the **summary plus the recent buffer**. The tenant comes
-  from the request context and the session is authorized like any other read: a foreign session id
-  answers **404**, never another tenant's conversation.
-- The assembled context is capped at **6000 tokens**. Drop from the **oldest** end until the budget
-  fits, so the newest turns always survive; the starter loads the whole list and never measures it.
-- The response carries the **turn ids** the UI cites (\`turn_id\`) alongside the role and content,
-  so a reader can point at the exact turn that produced an answer.
-- The cache key includes the **latest turn id**: \`context:{tenant}:{session}:{latest_turn_id}\`.
-  The starter caches under \`context:{session}\` for 60 seconds, so a read right after an append can
-  return a context without the new turn.
+**Starting point.** The starter serves \`GET /v1/sessions/{id}/context\`: it returns a body cached
+under \`context:{id}\` when one exists, otherwise reads \`summary:{id}\` and the whole
+\`turns:{id}\` list, assembles \`{summary, turns:[{turn_id, role, content}]}\`, caches it for 60
+seconds and returns it. It serves the demo and hides four flaws.
 
 **Failure mode the checks target.** A read after an append must see the new turn, a foreign session
-must answer 404, and the turns dropped at the 6000-token cap must be the oldest ones.
+must answer 404, and the turns dropped at the 6000-token cap must be the oldest ones, from a
+bounded slice of the list rather than all of it.
+
+Requirements:
+
+- The tenant comes from the request context and the session is authorized like any other read: a
+  foreign session id answers **404**, not another tenant's conversation.
+- The assembled context is capped at **6000 tokens**. Drop from the **oldest** end until the budget
+  fits, so the newest turns always survive, and bound how many recent turns are loaded.
+- The response carries the **turn ids** the UI cites (\`turn_id\`) alongside the role and content,
+  so a reader can point at the exact turn that produced an answer.
+- The cache key includes the **latest turn id**: \`context:{tenant}:{session}:{latest_turn_id}\`, so
+  an append changes the key and the next read misses the stale entry.
 
 ## What to keep
 
@@ -45,9 +45,9 @@ authorization, the budget and the cache key.`,
     ],
   },
   hints: [
-    'Authorize the read like the write: `assert_tenant_owns(tenant, id)` before a single key is read, and answer `404` so a foreign session id is indistinguishable from a missing one.',
-    'Walk the turns from the newest end and subtract an estimated cost per turn; stop when the next turn would cross 6000 tokens. Truncating that way keeps the newest turns and drops the oldest, which is the half of the conversation a UI can still summarize.',
-    'Put the latest turn id in the cache key. `context:{tenant}:{session}:{latest_turn_id}` changes the moment a turn is appended, so a read-after-append misses the stale entry instead of serving it; the old entry expires on its own.',
+    "Symptoms: a user sends a message and the next model call does not see it for up to a minute, a long session blows the model's context window, and any session id in the path returns a conversation.",
+    'Mechanism: `context:{id}` stays valid for 60 seconds no matter how many turns land; `lrange 0 -1` loads everything and nothing is measured; no owner lookup runs before the keys are read.',
+    'Fix: `assert_tenant_owns` first (404), `lrange 0 MAX_RECENT_TURNS-1`, a `truncate_to_budget` that walks newest-first under `MAX_CONTEXT_TOKENS = 6000`, and a cache key ending in `latest_turn_id`.',
   ],
   checks: [
     {
@@ -129,9 +129,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/sessions/{id}/context")
 def read_context(id: str) -> dict:
-    # TODO: check that the session belongs to the tenant and answer 404 otherwise, cap the context
-    # at 6000 tokens by dropping the oldest turns first, and key the cache on the latest turn id so
-    # a read after an append does not return a stale context.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     cached = r.get(f"context:{id}")
     if cached is not None:
         return json.loads(cached)
@@ -206,7 +204,7 @@ def read_context(id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/sessions/:id/context: flawed code that caches forever and authorizes nothing. */
+      starter: `/** GET /v1/sessions/:id/context: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -221,9 +219,7 @@ interface Turn {
 
 app.get('/v1/sessions/:id/context', async (request, reply) => {
   const {id} = request.params as {id: string};
-  // TODO: check that the session belongs to the tenant and answer 404 otherwise, cap the context
-  // at 6000 tokens by dropping the oldest turns first, and key the cache on the latest turn id so
-  // a read after an append does not return a stale context.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const cached = await r.get(\`context:\${id}\`);
   if (cached !== null) return reply.code(200).send(JSON.parse(cached));
   const summary = await r.get(\`summary:\${id}\`);
@@ -323,9 +319,7 @@ type turn struct {
 func readContext(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	id := r.PathValue("id")
-	// TODO: check that the session belongs to the tenant and answer 404 otherwise, cap the context
-	// at 6000 tokens by dropping the oldest turns first, and key the cache on the latest turn id so
-	// a read after an append does not return a stale context.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	if cached, err := rdb.Get(ctx, "context:"+id).Result(); err == nil {
 		rw.Header().Set("Content-Type", "application/json")
 		_, _ = rw.Write([]byte(cached))
@@ -453,9 +447,7 @@ object ContextApi {
   val route: Route =
     path("v1" / "sessions" / Segment / "context") { id =>
       get {
-        // TODO: check that the session belongs to the tenant and answer 404 otherwise, cap the
-        // context at 6000 tokens by dropping the oldest turns first, and key the cache on the
-        // latest turn id so a read after an append does not return a stale context.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         Option(jedis.get(s"context:$id")) match {
           case Some(cached) => complete(StatusCodes.OK, cached)
           case None =>
@@ -575,9 +567,7 @@ int main() {
 
   svr.Get("/v1/sessions/:id/context", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto id = req.path_params.at("id");
-    // TODO: check that the session belongs to the tenant and answer 404 otherwise, cap the context
-    // at 6000 tokens by dropping the oldest turns first, and key the cache on the latest turn id so
-    // a read after an append does not return a stale context.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     auto cached = redis.get("context:" + id);
     if (cached) {
       res.set_content(*cached, "application/json");
@@ -680,13 +670,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is a read path with three obligations that are easy to
-skip because the happy path works without them. The first is authorization: a read is not safer
-than a write, and a session id in a path is still a claim, so the owner check runs before any key
-is touched and a foreign session is a 404 rather than another tenant's conversation. The second is
-budget: the model call has a token limit, and the assembler must drop the oldest turns to fit it,
-which means walking the newest-first buffer and stopping when the next turn would cross the cap.
-The third is freshness: a cache keyed only by session id serves a context that no longer exists
-after the next append, so the key must carry the latest turn id and change with the conversation.
-The 60-second TTL is then just garbage collection, not correctness.`,
+  debrief: `A read is not safer than a write: a session id in a path is still a claim, so the owner check runs
+before any key is touched and a foreign session is a 404 rather than another tenant's conversation.
+The budget walks the newest-first buffer and stops when the next turn would cross the cap, because
+the newest turns matter most; the same walk bounds how much of the list is loaded. The cache key
+carries the latest turn id because a key by session alone serves a context that stopped existing at
+the next append; the 60-second TTL is then garbage collection, not correctness. Production read
+paths also count tokens with the provider's tokenizer instead of an estimate, and they pin the
+summary to the turn range it covers so a stale summary and a fresh buffer cannot overlap.`,
 };

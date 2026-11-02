@@ -8,36 +8,32 @@ export const stateStep: Step = {
   focus: ['auditd', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it computes a digest, appends
-an entry and writes a head. It compiles, the demo verifies, and it hides two flaws that only show up
-under a crash or under concurrency. Debug it, fix it, and prove the fix.
-
-Each tenant’s records form a **hash chain** stored in Redis under \`audit:chain:{tenant}\`:
-
-- Field \`head\` holds the digest of the newest entry; field \`next\` holds the counter of the last
-  position written. Entry \`n\` lives in fields \`rec:{n}\` (that record’s own digest) and \`pos:{n}\`
-  (the chain digest).
-- The chain digest of position \`n\` is \`sha1(prev | record_digest | n)\` where \`prev\` is the chain
-  digest at \`n-1\` (empty for the first entry). \`prev\` is what makes a broken chain detectable:
-  changing any earlier entry changes every digest after it.
-- **Append and head advance in one atomic unit.** One Lua \`EVAL\` reads \`head\`, takes the position
-  from \`next\` with \`HINCRBY\`, writes \`rec:{n}\`, \`pos:{n}\` and \`head\`, and returns
-  \`[position, digest]\`. The starter writes the entry first and the head second with two round trips,
-  so a crash in between leaves an entry the verifier cannot place in the chain.
-- **Positions are dense and unique.** They come from the head’s counter, never from a count of rows.
-  The starter uses \`LLEN\` of an entries list as the position, so two concurrent appends choose the
-  same position and one silently overwrites the other.
-- **The head key has no TTL.** An audit chain is retained, not cached: there is no \`EXPIRE\` on
-  \`audit:chain:{tenant}\`. The starter adds a day-long TTL "for hygiene", which makes the whole trail
-  disappear after a day.
-- \`verify_chain(tenant, from_position)\` walks from \`from_position\` to the head, recomputing each
-  digest, and reports \`{"valid", "chain_length", "first_divergence"}\`: the chain length actually
-  covered and the exact position of the first record whose recomputed digest disagrees, or the first
-  missing position. The starter returns \`valid\` whenever the record key exists.
+**Starting point.** The starter implements \`append_decision(tenant, record_digest)\` and
+\`verify_chain(tenant, from_position)\` over Redis: it hashes the record alone, pushes an entry, takes
+\`LLEN\` as the position, writes the head in a second round trip with a day-long \`EXPIRE\`, and reports
+\`valid\` whenever the head exists. It compiles, serves the demo and hides 5 flaws.
 
 **Failure mode the checks target.** Atomicity and identity. Two writes where one is needed is a
-window; a count where the head already tracks the position is a race. Both leave a chain that *looks*
-fine until the day an auditor asks a question the starter cannot answer.`,
+crash window; a count where the head already tracks the position is a race; a digest that ignores
+its predecessor and a verifier that checks existence leave a chain that looks fine until an auditor
+asks a question it cannot answer.
+
+Each tenant's records form a **hash chain** stored under \`audit:chain:{tenant}\`:
+
+- Field \`head\` holds the digest of the newest entry; field \`next\` holds the counter of the last
+  position written. Entry \`n\` lives in fields \`rec:{n}\` (that record's own digest) and \`pos:{n}\`
+  (the chain digest).
+- The chain digest of position \`n\` is \`sha1(prev | record_digest | n)\` where \`prev\` is the chain
+  digest at \`n-1\` (empty for the first entry), so changing any earlier entry changes every digest
+  after it.
+- Append and head advance in one atomic unit: one Lua \`EVAL\` reads \`head\`, takes the position
+  from \`next\` with \`HINCRBY\`, writes \`rec:{n}\`, \`pos:{n}\` and \`head\`, and returns
+  \`[position, digest]\`.
+- Positions are dense and unique; they come from the head's counter, not from a count of rows.
+- The head key has no TTL: an audit chain is retained, not cached.
+- \`verify_chain\` walks from \`from_position\` to the head, recomputing each digest, and reports
+  \`{"valid", "chain_length", "first_divergence"}\`: the length actually covered and the exact position
+  of the first digest that disagrees or is missing.`,
   sequence: {
     participants: ['Audit Service', 'Redis', 'Verifier'],
     messages: [
@@ -137,9 +133,7 @@ CHAIN_PREFIX = "audit:chain"
 
 
 def append_decision(rdb: redis.Redis, tenant: str, record_digest: str) -> dict:
-    # TODO: the starter writes the entry first and the head second, uses the number of entries as the
-    # position and sets a day-long TTL on the head key. Move both writes into one Lua script, take
-    # the position from the head, and let the head live forever.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"{CHAIN_PREFIX}:{tenant}"
     position = rdb.llen(f"{key}:entries")  # a count, so two appends race onto one position
     digest = hashlib.sha256(record_digest.encode()).hexdigest()
@@ -229,9 +223,7 @@ export const redis = new IORedis({host: 'redis', port: 6379});
 const CHAIN_PREFIX = 'audit:chain';
 
 export async function appendDecision(tenant: string, recordDigest: string): Promise<Record<string, unknown>> {
-  // TODO: the starter writes the entry first and the head second, uses the number of entries as the
-  // position and sets a day-long TTL on the head key. Move both writes into one Lua script, take the
-  // position from the head, and let the head live forever.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = \`\${CHAIN_PREFIX}:\${tenant}\`;
   const position = await redis.llen(\`\${key}:entries\`); // a count, so two appends race onto one position
   const digest = createHash('sha256').update(recordDigest).digest('hex');
@@ -344,9 +336,7 @@ const chainPrefix = "audit:chain"
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func appendDecision(ctx context.Context, tenant, recordDigest string) (map[string]any, error) {
-	// TODO: the starter writes the entry first and the head second, uses the number of entries as the
-	// position and sets a day-long TTL on the head key. Move both writes into one Lua script, take
-	// the position from the head, and let the head live forever.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("%s:%s", chainPrefix, tenant)
 	position, err := rdb.LLen(ctx, key+":entries").Result() // a count, so two appends race onto one position
 	if err != nil {
@@ -496,9 +486,7 @@ object AuditChain {
   val jedis = new Jedis("redis", 6379)
 
   def appendDecision(tenant: String, recordDigest: String): Map[String, Any] = {
-    // TODO: the starter writes the entry first and the head second, uses the number of entries as the
-    // position and sets a day-long TTL on the head key. Move both writes into one Lua script, take
-    // the position from the head, and let the head live forever.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = s"$ChainPrefix:$tenant"
     val position = jedis.llen(s"$key:entries") // a count, so two appends race onto one position
     val digest = java.security.MessageDigest
@@ -603,9 +591,7 @@ using sw::redis::Redis;
 Redis conn("tcp://redis:6379");
 
 std::map<std::string, std::string> append_decision(const std::string& tenant, const std::string& record_digest) {
-  // TODO: the starter writes the entry first and the head second, uses the number of entries as the
-  // position and sets a day-long TTL on the head key. Move both writes into one Lua script, take the
-  // position from the head, and let the head live forever.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string key = "audit:chain:" + tenant;
   const long long position = conn.llen(key + ":entries"); // a count, so two appends race on one position
   const std::string digest = sha256_hex(record_digest);
@@ -696,9 +682,9 @@ std::map<std::string, std::string> verify_chain(const std::string& tenant, int f
     },
   },
   hints: [
-    'Two writes with a network round trip between them is a window, not a transaction. Put the `HGET head`, the `HINCRBY next`, the two `HSET`s for the entry and the `HSET` of the new head inside a single Lua body and run it once — the script is the unit of atomicity, and it is also what makes the position dense: `HINCRBY` hands each append its own number.',
-    'The chain digest must fold in `prev`. `sha1(prev .. "|" .. record_digest .. "|" .. position)` means changing entry 3 changes entry 4, 5, … — that cascade is what the verifier detects. If you hash only the record, every record still "verifies" and the trail proves nothing.',
-    'Retention is a design decision, not hygiene. An `EXPIRE` on `audit:chain:{tenant}` is a deletion with a delay: the head must have no TTL, and the entry fields live as long as the head does. Verification should return the `chain_length` it actually covered so a partial walk cannot be mistaken for a whole one.',
+    'A day after launch every tenant chain is empty, and before that two parallel appends produced one position while a crashed append left an entry no head pointed at. Verify still said valid.',
+    'Position comes from `LLEN`, so concurrent appends read the same count; entry and head are separate round trips; `EXPIRE` deletes the chain; the digest ignores `prev`; verify only tests existence.',
+    'One Lua script: `HGET head`, `HINCRBY next`, `HSET rec/pos/head`, return `[position, digest]` with `sha1hex(prev|record|n)`. Remove `EXPIRE`. Verify recomputes each position and returns `first_divergence` and `chain_length`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a stateful write path for the two things that only show up in production: crashes and concurrency. The starter looks right because in a single-threaded demo \`LLEN\` is a perfectly good position and the head always follows the entry. Under load, two appends read the same count and one position is lost; under a crash, the entry exists but no head points at it, and the verifier — which trusts the head — cannot place it. One Lua script removes both: the script is atomic, and the position comes from the head it just read. The subtler point is that "verify" must recompute rather than check existence: a stored \`valid\` flag is a claim, a recomputed digest from \`prev\` to the head is evidence, and it has to run inside the same key-space so the walk cannot be split. Real audit chains add periodic signed checkpoints of the head, so an auditor can prove the chain was whole at a point in time without pulling every entry.`,
+  debrief: `The fix collapses the write path into one script because the two failure modes, crash and concurrency, both live in the gap between round trips. Inside the script the position comes from \`HINCRBY\` on the same key the head lives in, so density and uniqueness fall out of atomicity rather than being enforced separately. Folding \`prev\` into each digest is what turns a list of hashes into a chain: a change at position 3 changes every digest after it, which is exactly what the verifier walks for. Verification recomputes instead of checking existence and reports how far it got, so a partial walk cannot pass as a whole one. Production ledgers persist the chain outside Redis, anchor periodic signed heads to an external store or transparency log, and run the verifier on a schedule rather than only on request.`,
 };

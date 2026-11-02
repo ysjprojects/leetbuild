@@ -8,33 +8,28 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'coverage'],
   task: `## Task
 
-**Starting point.** The starter is working code: it decodes the route request,
-hands the points straight to the routing engine and returns the plan. It compiles, it serves the
-demo, and it hides three production flaws. Debug it like the service owner, fix it, and prove the
-fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/routes\` with body
+\`{"origin": {"lat": 37.77, "lng": -122.41}, "destination": {"lat": 34.05, "lng": -118.24}, "waypoints": [{"lat": 36.77, "lng": -119.41}]}\`
+(\`waypoints\` optional, default \`[]\`): it decodes the request, hands the points straight to
+\`solver.plan(…)\` and answers **201** with \`{"route_id": …, "distance_m": …, "geometry": …}\`.
+It compiles, it serves the demo, and it hides four flaws.
 
-Implement \`POST /v1/routes\`. The body is
-\`{"origin": {"lat": 37.77, "lng": -122.41}, "destination": {"lat": 34.05, "lng": -118.24}, "waypoints": [{"lat": 36.77, "lng": -119.41}]}\`;
-\`waypoints\` is optional and defaults to \`[]\`.
+**Failure mode the checks target.** The starter forwards whatever floats arrived straight into the
+solver. One \`NaN\` in an origin poisons the spatial index the engine builds, a 5000-waypoint
+request turns one client call into a stalled solver for every other tenant, and a handler that
+treats the map as global answers an out-of-coverage pair with a plan the tenant's data does not
+support. Cheap rejections first, so no request buys engine time its caller cannot pay for.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`origin\` and \`destination\` are required, and every point — the two endpoints and each waypoint
-  — is a pair of finite numbers: \`lat\` inside **±90**, \`lng\` inside **±180**. NaN, ±Infinity,
+- \`origin\` and \`destination\` are required, and every point (the two endpoints and each waypoint)
+  is a pair of finite numbers: \`lat\` inside **±90**, \`lng\` inside **±180**. NaN, ±Infinity,
   a missing point or an out-of-range value is **422**, before the routing engine sees anything.
 - At most **25 waypoints**. The cap is a length check, so it runs before the points are validated
   and before the solver is called: a 5000-waypoint list is rejected, not forwarded.
 - Both endpoints must fall inside the tenant's map coverage (\`coverage.covers(tenant, …)\`); an
-  out-of-coverage pair is **403** with an \`OUT_OF_COVERAGE\` error — never a straight-line guess
+  out-of-coverage pair is **403** with an \`OUT_OF_COVERAGE\` error, not a straight-line guess
   dressed up as a route.
-- Call the engine with the validated points and answer **201** with
-  \`{"route_id": …, "distance_m": …, "geometry": …}\`.
-
-**Failure mode the checks target.** The starter forwards whatever floats arrived straight into the
-solver. One \`NaN\` in an origin poisons the spatial index the engine builds, and a 5000-waypoint
-request turns one client call into a stalled solver for every other tenant. Coverage is the quiet
-one: a handler that treats the map as global answers an out-of-coverage pair with a plan the tenant's
-data does not support. Cheap rejections first — authentication, shape, the cap, coordinate validity,
-then coverage — so no request buys engine time its caller cannot pay for.`,
+- Call the engine with the validated points, not the raw body fields.`,
   sequence: {
     participants: ['Client', 'Maps API', 'Coverage store', 'Routing engine'],
     messages: [
@@ -161,8 +156,7 @@ solver = Solver()
 
 @app.post("/v1/routes")
 def create_route(body: RouteRequest) -> JSONResponse:
-    # TODO: this starter hands coordinates to the engine unchecked, lets a 5000-waypoint list reach
-    # the solver, and treats the tenant's map coverage as global. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     plan = solver.plan(body.origin, body.destination, body.waypoints)
     return JSONResponse(
         {"route_id": str(uuid.uuid4()), "distance_m": plan["distance_m"], "geometry": plan["geometry"]},
@@ -262,11 +256,10 @@ const solver = {
 };
 
 app.post('/v1/routes', async (request, reply) => {
-  // TODO: this starter hands coordinates to the engine unchecked, lets a 5000-waypoint list reach
-  // the solver, and treats the tenant's map coverage as global. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as RouteBody;
   const plan = solver.plan(body.origin, body.destination, body.waypoints ?? []);
-  return reply.code(201).send({route_id: 'draft-route', distance_m: plan.distance_m, geometry: plan.geometry});
+  return reply.code(201).send({route_id: 'demo-route', distance_m: plan.distance_m, geometry: plan.geometry});
 });
 
 void app.listen({port: 8443, host: '0.0.0.0'});
@@ -381,15 +374,14 @@ func createRoute(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter hands coordinates to the engine unchecked, lets a 5000-waypoint list reach
-	// the solver, and treats the tenant's map coverage as global. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	plan, err := solver.Plan(body.Origin, body.Destination, body.Waypoints)
 	if err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "ENGINE_UNAVAILABLE"})
 		return
 	}
 	writeJSON(rw, http.StatusCreated, map[string]any{
-		"route_id":   "draft-route",
+		"route_id":   "demo-route",
 		"distance_m": plan["distance_m"],
 		"geometry":   plan["geometry"],
 	})
@@ -552,10 +544,9 @@ object RouteApi {
     path("v1" / "routes") {
       post {
         entity(as[RouteRequest]) { body =>
-          // TODO: this starter hands coordinates to the engine unchecked, lets a 5000-waypoint list
-          // reach the solver, and treats the tenant's map coverage as global. Fix all three.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val plan = solver.plan(body.origin, body.destination, body.waypoints)
-          complete(StatusCodes.Created, RouteResult("draft-route", plan.distance_m, plan.geometry))
+          complete(StatusCodes.Created, RouteResult("demo-route", plan.distance_m, plan.geometry))
         }
       }
     }
@@ -691,12 +682,11 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter hands coordinates to the engine unchecked, lets a 5000-waypoint list reach
-    // the solver, and treats the tenant's map coverage as global. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto plan = solver.plan(body["origin"], body["destination"], body.value("waypoints", json::array()));
     res.status = 201;
     res.set_content(
-        json{{"route_id", "draft-route"}, {"distance_m", plan["distance_m"]}, {"geometry", plan["geometry"]}}.dump(),
+        json{{"route_id", "demo-route"}, {"distance_m", plan["distance_m"]}, {"geometry", plan["geometry"]}}.dump(),
         "application/json");
   });
 
@@ -795,10 +785,9 @@ int main() {
     },
   },
   hints: [
-    'Validate in cost order and return early: tenant (**401**), the waypoint cap, coordinate validity, then coverage (**403**) — every guard returns before `solver.plan(…)` is reached. The engine solve is the expensive resource; nothing may buy it before the request has earned it.',
-    'A coordinate is two separate checks: it must be finite (`math.isfinite`, `Number.isFinite`, `math.IsNaN`/`math.IsInf`, `isNaN`/`isInfinite`, `std::isfinite`) and in range (`abs(lat) > 90`, `abs(lng) > 180`). Both answer **422** — a point the engine cannot place is not something the engine should discover.',
-    'Coverage is a per-tenant fact: look it up with the header tenant (`coverage.covers(tenant, …)`) and answer **403** with an `OUT_OF_COVERAGE` error for an uncovered pair. If you find yourself estimating a straight line for just this once, the endpoint has stopped being a router and become a guesser.',
+    'A client sends `{"lat": NaN}` and the solver stalls for every tenant for minutes; another tenant posts a route across a country its map data does not cover and gets a plausible polyline back.',
+    'Nothing stands between the decoded body and `solver.plan(…)`: no tenant header, no waypoint cap, no finite or range check, no coverage lookup. Every guard the engine depends on is assumed by the handler.',
+    'Before `solver.plan(…)`: require `X-Tenant-Id` (401), reject `len(waypoints) > MAX_WAYPOINTS` (422), check `math.isfinite` and `MAX_LAT`/`MAX_LNG` on every point (422), then `coverage.covers(tenant, …)` (403 `OUT_OF_COVERAGE`). Pass the validated points.',
   ],
-  debrief: `The interviewer is testing whether you can debug a geo endpoint at the trust boundary. The starter reads fine because the demo always sends two well-formed points from one tenant and never asks for 5000 stops. Three separate defects are being checked: coordinates that are not numbers the planet has (\`NaN\` is a valid float in every language here, and a missing point decodes to \`(0, 0)\` — Null Island — in a typed decoder), a waypoint list that is a denial-of-service against the solver's super-linear solve time, and coverage that is a per-tenant fact the starter replaced with an assumption. The order of the guards is the interview answer: cheap and decisive first (auth, shape, cap), expensive last (coverage, solver). Real routing APIs add geohash or H3 cell validation, coverage polygons with a border tolerance, snapping to the nearest graph node, per-tenant quotas, and a \`route_id\` that the later steps use to read the stored route back.
-`,
+  debrief: `The fix is a validation funnel in cost order, and its shape protects the solver's time: authentication, shape, the waypoint cap and coordinate validity are constant-time rejections, the coverage lookup is one store read, and the engine solve is the only expensive thing left, reached by requests that have earned it. The order matters because \`NaN\` is a valid float in every language here, a missing point decodes to \`(0, 0)\` in a typed decoder, and a 5000-stop list is a denial of service against a super-linear solver. Coverage is a per-tenant fact, so the starter's global map was an assumption, not a check. Production routing APIs go further: they snap each point to the nearest graph node and reject points too far from any road, hold coverage as polygons with a border tolerance, and meter solves per tenant.`,
 };

@@ -8,24 +8,23 @@ export const readStep: Step = {
   focus: ['read', 'engine', 'audit'],
   task: `## Task
 
-**Starting point.** When a user asks "why did I get this?", the service has to answer with the
-decision it actually served. The starter is working code: it recomputes the decision for whatever
-user the caller names. It runs on the demo and hides two flaws.
+**Starting point.** The starter registers \`GET /v1/flags/{key}/evaluations\`, takes \`user_id\` from the
+query string, loads the snapshot, buckets the user with a salt from \`new_salt()\`, and returns the
+bucket, the value and the flag's whole evaluation history. It serves the demo and hides four flaws.
 
-Implement \`GET /v1/flags/{key}/evaluations\`, the explain view for one user.
+**Failure mode the checks target.** When a user asks "why did I get this?", the service has to answer
+with the decision it actually served. A user served \`true\` is explained as \`false\`, anyone can read
+another user's history for the same flag, and the reader cannot tell which rule set the explanation
+describes.
 
-- The caller's user comes from the authenticated **\`X-User-Id\` header**; the endpoint must expose only
-  the **caller's own** user, never another user's evaluation history (**403** for a mismatched query).
-- The explanation must **agree with the served evaluation bit-for-bit**: same bucket, same value. The
-  starter recomputes with a **fresh salt**, so the explanation flips while the served value does not.
-- The response names the **exact snapshot version** that produced the decision —
+- The caller's user comes from the authenticated **\`X-User-Id\` header**; the endpoint exposes only
+  the caller's own user (**403** for a mismatched query).
+- The explanation **agrees with the served evaluation bit-for-bit**: same salt, same bucket, same
+  value.
+- The response names the **exact snapshot version** that produced the decision:
   \`{"flag_key", "user_id", "matched_rule", "bucket", "value", "version"}\`.
 - The response is computed from the snapshot only; it must not mutate the flag or record a new
-  evaluation as a side effect.
-
-**The subtle flaw.** The starter salts the bucket with a value generated per request, so a user who was
-served \`true\` is explained as \`false\`; and it reads the user from a query parameter, so anyone can read
-another user's evaluation history for the same flag.`,
+  evaluation as a side effect.`,
   sequence: {
     participants: ['Client', 'Explain API', 'Evaluation Engine', 'Redis'],
     messages: [
@@ -113,8 +112,7 @@ app = FastAPI()
 
 @app.get("/v1/flags/{key}/evaluations")
 def evaluations(key: str, user_id: str) -> JSONResponse:
-    # TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
-    # the served evaluation, and it returns other users' evaluation history from the same flag.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     snapshot = load_snapshot(redis_client)
     flag = snapshot["flags"][key]
     salt = new_salt()
@@ -167,8 +165,7 @@ interface Snapshot {
 }
 
 app.get('/v1/flags/:key/evaluations', async (req, reply) => {
-  // TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
-  // the served evaluation, and it returns other users' evaluation history from the same flag.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const key = (req.params as {key: string}).key;
   const user = (req.query as {user_id: string}).user_id;
   const snapshot = JSON.parse((await redis.get('flags:snapshot')) ?? '{}') as Snapshot;
@@ -216,8 +213,7 @@ import (
 )
 
 func evaluations(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
-	// the served evaluation, and it returns other users' evaluation history from the same flag.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	key := r.PathValue("key")
 	user := r.URL.Query().Get("user_id")
 	snapshot := loadSnapshot(rdb)
@@ -288,8 +284,7 @@ import spray.json._
 def evaluations: Route = path("v1" / "flags" / Segment / "evaluations") { key =>
   get {
     parameter("user_id") { user =>
-      // TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees
-      // with the served evaluation, and it returns other users' history from the same flag.
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
       val snapshot = loadSnapshot()
       val flag = snapshot.flags(key)
       val salt = newSalt()
@@ -336,8 +331,7 @@ def evaluations: Route = path("v1" / "flags" / Segment / "evaluations") { key =>
 
 using json = nlohmann::json;
 
-// TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
-// the served evaluation, and it returns other users' evaluation history from the same flag.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 json explain(const json& snapshot, const std::string& flag_key, const std::string& user_id) {
   json flag = snapshot["flags"][flag_key];
   std::string salt = new_salt();
@@ -394,9 +388,9 @@ int main() {
     },
   },
   hints: [
-    "Explain with the **flag's stored salt**, not a salt generated per request. If you salt the explanation freshly, a user served `true` is explained as `false`.",
-    "Take the user from the authenticated **`X-User-Id` header**. A `user_id` query parameter lets a caller read another user's evaluation history.",
-    'Return the **snapshot version** that produced the decision. Without it, a reader cannot tell whether the explanation describes the current rule set.',
+    'Support asks why a user saw the old checkout; the explain call says they are in the new one, shows other users in the response, and gives no version to compare against the rollout log.',
+    'The handler calls `new_salt()` per request so the bucket differs from the one served, reads `user_id` from the query string, and omits `snapshot["version"]` from the response.',
+    'Bucket with `flag["salt"]`, return the stored `served_value` rather than a fresh computation, read the user from the `X-User-Id` header, and include `snapshot["version"]` in the response.',
   ],
-  debrief: `The interviewer is testing whether an explanation endpoint is a *read* of the decision or a second, independent decision. It must be the same decision: same salt, same bucket, same value, and it must name the version that produced it. The starter fails on all three — a per-request salt makes the explanation flip, a query parameter exposes another user's history, and the version is missing. Real systems read the explanation from the evaluation that was served, or recompute from the exact snapshot version, and they scope every read to the authenticated caller.`,
+  debrief: `The fix makes the explanation a read of the decision rather than a second, independent decision: the same stored salt yields the same bucket, and returning the served value rather than a recomputation is what makes "bit-for-bit" provable. Taking the user from the authenticated header is the whole access control, since a query parameter is just a suggestion from the caller. The version turns the answer into something a reader can check against the rollout log. What this step did not do is keep explanations correct after the snapshot moves on: production services store the snapshot version alongside each served evaluation and explain from that exact version, so a rollout change made an hour later does not rewrite yesterday's answer.`,
 };

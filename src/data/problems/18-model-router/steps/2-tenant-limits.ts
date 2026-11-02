@@ -8,29 +8,24 @@ export const tenantLimitsStep: Step = {
   focus: ['router', 'redis', 'provider'],
   task: `## Task
 
-The starter is working code: a tenant with budget left gets its request
-through, so the demo passes. The limiter hides a race, a leak and a wrong order of operations.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter's \`charge\` reads two counters under \`limits:{tenant}:req\` and
+\`:tok\` with \`GET\`, compares them to the limits and decrements both with \`DECRBY\`; \`route\`
+calls the provider, then charges, and answers 429 with a fixed \`Retry-After: 60\`. It compiles, it
+serves the demo, and it hides four flaws.
 
-Implement the per-tenant rate limit used by every routed request:
+**Failure mode the checks target.** Two concurrent requests both pass the same check and overspend;
+a key without a window or a TTL never resets, so a tenant that had one busy minute stays locked out;
+and charging after the call means the provider is paid even when the tenant was over budget.
 
 - Each tenant gets **60 requests** and **100 000 tokens** per **60-second window**. The key is
   \`limits:{tenant}:{window}\` where \`window\` is the UTC minute bucket
-  (\`floor(unix_seconds / 60)\`) — a tenant-less key leaks budget across tenants, a window-less key
-  never resets.
-- One **atomic Lua \`EVAL\`** must read both counters, reject when either reservation does not fit,
-  and increment both when it does. A read followed by a separate decrement lets two concurrent
-  requests both observe budget that only one of them can spend.
-- The key must expire with its window: set \`EXPIRE\` inside the same script on the first write, so
-  the counters reset instead of living forever.
+  (\`floor(unix_seconds / 60)\`).
+- One **atomic Lua \`EVAL\`** reads both counters, rejects when either reservation does not fit,
+  and increments both when it does.
+- The key expires with its window: set \`EXPIRE\` inside the same script on the first write.
 - When either budget is exhausted, answer **429** with \`Retry-After\` (seconds, the key's TTL) and
-  \`X-RateLimit-Remaining\` (tokens left), and **do not call the provider**.
-- Reserve **before** the provider call. The starter bills after the answer, so a rejected request has
-  already been paid for.
-
-**Failure mode the checks target.** Two concurrent requests both pass the same check and overspend;
-the key without a TTL never resets, so a tenant that had one busy minute is locked out forever; and
-charging after the call means the provider is paid even when the tenant was over budget.`,
+  \`X-RateLimit-Remaining\` (tokens left), and do not call the provider.
+- Reserve **before** the provider call.`,
   sequence: {
     participants: ['Model Router', 'Redis', 'Provider'],
     messages: [
@@ -47,9 +42,9 @@ charging after the call means the provider is paid even when the tenant was over
     ],
   },
   hints: [
-    'The script must do all of it on the server: `HGET` both counters, compare against the limits, `HINCRBY` both on success. `GET` followed by `DECRBY` from the client leaves a window between the two commands where another request passes the same check.',
-    'A window key must die with its window. Inside the same script, check `TTL` and call `EXPIRE` when the key was just created — afterwards the counter resets every minute instead of accumulating forever.',
-    'The 429 is not just a status: `Retry-After` tells the client how long the window has left and `X-RateLimit-Remaining` lets it slow down before the next refusal. Return from the handler before the provider stub is touched.',
+    'Fire 50 parallel requests at one tenant with 10 tokens of budget left: most of them get a 200, and the provider is called for all 50. Come back an hour later and the tenant is still refused.',
+    '`charge` runs `GET` on the client, then `DECRBY`; between the two every concurrent request sees the same balance. The key has no window and no TTL, and `route` calls `providers.Complete` before `charge`.',
+    'Write `RESERVE_LUA` (`HGET` both fields, compare, `HINCRBY` both, `EXPIRE` when `TTL` is -1, return ok/remaining/ttl), key it `limits:{tenant}:{window}` with `WINDOW_S`, call `reserve(` before `providers.Complete(`, and build the 429 headers from its result.',
   ],
   checks: [
     {
@@ -82,7 +77,7 @@ charging after the call means the provider is paid even when the tenant was over
       id: 'reject-headers',
       title: 'Answers 429 with Retry-After and remaining tokens',
       detail:
-        'An exhausted tenant gets `429 Too Many Requests`, a `Retry-After` in seconds and `X-RateLimit-Remaining`, built from the script’s return value — not a hardcoded constant.',
+        'An exhausted tenant gets `429 Too Many Requests`, a `Retry-After` in seconds and `X-RateLimit-Remaining`, built from the script’s return value, not a hardcoded constant.',
       match: {
         python: {all: [/Retry-After/, /X-RateLimit-Remaining/, /status_code\s*=\s*429/]},
         typescript: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\.code\(\s*429\s*\)/]},
@@ -144,8 +139,7 @@ class RouteRequest(BaseModel):
 
 
 def charge(tenant: str, tokens: int) -> tuple[bool, int, int]:
-    # TODO: replace the client-side GET-then-DECRBY with one atomic EVAL, give the window key a
-    # TTL on first write, and reserve before calling the provider instead of charging after it.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     key = f"limits:{tenant}"
     left_req = int(r.get(f"{key}:req") or LIMIT_REQUESTS)
     left_tok = int(r.get(f"{key}:tok") or LIMIT_TOKENS)
@@ -240,7 +234,7 @@ def route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict
 `,
     },
     typescript: {
-      starter: `/** POST /v1/route: flawed code that charges after the call and never expires keys. */
+      starter: `/** POST /v1/route with the per-tenant limiter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -258,8 +252,7 @@ interface RouteBody {
 }
 
 async function charge(tenant: string, tokens: number): Promise<[boolean, number, number]> {
-  // TODO: replace the client-side GET-then-DECRBY with one atomic EVAL, give the window key a
-  // TTL on first write, and reserve before calling the provider instead of charging after it.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const key = \`limits:\${tenant}\`;
   const leftReq = Number((await r.get(\`\${key}:req\`)) ?? LIMIT_REQUESTS);
   const leftTokens = Number((await r.get(\`\${key}:tok\`)) ?? LIMIT_TOKENS);
@@ -386,8 +379,7 @@ var (
 )
 
 func charge(ctx context.Context, tenant string, tokens int) (bool, int, int) {
-	// TODO: replace the client-side GET-then-DECRBY with one atomic EVAL, give the window key a
-	// TTL on first write, and reserve before calling the provider instead of charging after it.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("limits:%s", tenant)
 	leftReq, _ := rdb.Get(ctx, key+":req").Int()
 	if leftReq == 0 {
@@ -533,8 +525,7 @@ object LimitsApi {
   val jedis = new Jedis("redis", 6379)
   val stub = ProviderGrpc.blockingStub(ManagedChannelBuilder.forAddress("providers", 9000).usePlaintext().build())
 
-  // TODO: replace the client-side GET-then-DECRBY with one atomic EVAL, give the window key a
-  // TTL on first write, and reserve before calling the provider instead of charging after it.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def charge(tenant: String, tokens: Long): (Boolean, Long, Long) = {
     val key = s"limits:$tenant"
     val leftReq = Option(jedis.get(key + ":req")).map(_.toLong).getOrElse(LimitRequests)
@@ -694,8 +685,7 @@ constexpr long long kLimitTokens = 100000;
 std::unique_ptr<Provider::Stub> stub;
 
 std::tuple<bool, long long, long long> charge(sw::redis::Redis& redis, const std::string& tenant, long long tokens) {
-  // TODO: replace the client-side GET-then-DECRBY with one atomic EVAL, give the window key a
-  // TTL on first write, and reserve before calling the provider instead of charging after it.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const auto key = "limits:" + tenant;
   auto rawReq = redis.get(key + ":req");
   long long leftReq = rawReq ? std::stoll(*rawReq) : kLimitRequests;
@@ -843,5 +833,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is atomicity under concurrency. A read-then-decrement limiter passes every serial test and fails exactly when the product is under load, which is when the limit matters. One Lua script makes read, check and increment a single step, and it can also set the window's expiry at creation, so the counters die with their window instead of accumulating forever. Reserving before the provider call is the second half of the contract: a limited request must never be paid for. The 429 headers are the third: clients that honor \`Retry-After\` and \`X-RateLimit-Remaining\` back off, clients that get a bare 429 retry immediately. Real gateways add sliding windows, per-model token weights, and a budget that is refunded when the provider call fails before generating.`,
+  debrief: `The fix moves the whole decision into Redis. A read-then-decrement limiter passes every serial test and fails exactly under load, which is when the limit matters; one Lua script makes read, check and increment a single step on the server, and because the script is also the only writer, it is the right place to set the window's expiry on the first write. Keying by tenant and minute bucket is what makes the expiry meaningful: a key without the window has nothing to expire into. Reserving before the provider call means a rejected request costs nothing, and the 429 headers come from the script's return so clients back off for the right interval. Production gateways go further with sliding windows, per-model token weights, and a refund of the reserved tokens the provider did not actually use.`,
 };

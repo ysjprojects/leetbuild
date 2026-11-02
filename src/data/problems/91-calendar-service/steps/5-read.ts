@@ -8,40 +8,28 @@ export const readStep: Step = {
   focus: ['client', 'api', 'expander', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the range route,
-reads the window, expands each event's rule and answers with the instances. It compiles, it serves
-the week view in the demo, and it hides four production flaws. Debug it like the service owner,
-fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/calendars/{id}/events?from=<iso>&to=<iso>\`: it
+looks up the calendar (404 when unknown), defaults a missing window to a year and clamps a wider
+one, lists each event's rule with its instances, and appends overrides from the store. It
+compiles, serves the week view in the demo, and hides four flaws.
 
-Implement \`GET /v1/calendars/{id}/events?from=<iso>&to=<iso>\`.
+**Failure mode the checks target.** The silent clamp is the subtle one: defaulting to a year and
+truncating a wider request look like resilience, but they turn a caller's bug into a year of
+expansion work for a window nobody asked for. Around it: instances without an occurrence id cannot
+be deduped client-side, an override listed beside its original double-books the slot, and a
+private calendar whose membership is not checked leaks its events to any authenticated caller.
 
-- The caller is the \`X-Tenant-Id\` header. A calendar that does not exist is **404**; a calendar
-  whose \`visibility\` is \`private\` is **403** for a caller who is not a member. Both checks come
-  before any cache or expansion work, so a request that cannot be authorized never pays for
-  instances.
-- \`from\` and \`to\` are ISO-8601 instants and both are required (**400** when missing), \`to\` must be
-  strictly after \`from\` (**400** when inverted), and the window may span at most **90 days**
-  (\`MAX_RANGE_DAYS\`) — a wider range is **400**, never a silent clamp. The cap is the request's
-  budget: the expander pays for every occurrence in the window and an infinite rule has no upper
-  bound of its own.
-- Expansion happens server-side. The raw expansion is memoised under
-  \`(calendar, window, generation)\` — the calendar's \`generation\` stamps the key, so a slice built
-  before an override bump is never read again — and every occurrence carries
-  \`occurrence_id = "<event_id>:<start_iso>"\` plus the \`revision\` it was expanded from, so a client
-  can dedupe instances across refreshes.
-- Instance overrides from the store are keyed by that same \`occurrence_id\`. Overlay them after the
-  expansion: an occurrence covered by an override is skipped by the expansion and emitted **once**,
-  in its place, with the override's own \`revision\`. An overridden instance must never appear beside
-  its original.
+- The caller is the \`X-Tenant-Id\` header. An unknown calendar is **404**; a \`private\` calendar
+  is **403** for a non-member. Both checks run before any cache or expansion work.
+- \`from\` and \`to\` are required instants (**400** when missing or inverted) and the window spans
+  at most **90 days** (\`MAX_RANGE_DAYS\`); a wider range is **400**, not a clamp.
+- Expansion happens server-side, memoised under \`(calendar, window, generation)\`; every
+  occurrence carries \`occurrence_id = "<event_id>:<start_iso>"\` plus the \`revision\` it was
+  expanded from.
+- Overrides from the store are keyed by that same \`occurrence_id\`. A covered occurrence is
+  skipped by the expansion and emitted **once**, in its place, with the override's \`revision\`.
 - Respond with \`{"calendar_id": …, "events": [{"occurrence_id", "event_id", "start", "revision"}, …]}\`,
-  ordered by \`start\`.
-
-**Failure mode the checks target.** The silent clamp is the quiet one: defaulting to a year and
-truncating a wider request both look like resilience, but they turn a caller's bug into a year of
-expansion work and hand back a window nobody asked for. Around it: instances without an occurrence
-id cannot be deduped client-side, an override listed beside its original double-books the slot the
-user is looking at, and a private calendar whose membership is never checked leaks its events to any
-authenticated caller.`,
+  ordered by \`start\`.`,
   sequence: {
     participants: ['Calendar client', 'Calendar API', 'Expansion worker', 'Redis'],
     messages: [
@@ -258,9 +246,7 @@ def read_events(
     from_: str | None = Query(default=None, alias="from"),
     to_: str | None = Query(default=None, alias="to"),
 ) -> JSONResponse:
-    # TODO: this starter expands a year when the range is missing and silently clamps a wider one,
-    # returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-    # replace, and never asks whether the caller may read this calendar. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     calendar = store.get_calendar(id)
     if calendar is None:
         raise HTTPException(status_code=404, detail="unknown calendar")
@@ -395,7 +381,7 @@ def read_events(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/calendars/:id/events: flawed code that expands a year by default. */
+      starter: `/** GET /v1/calendars/:id/events: range read for calendard. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -445,9 +431,7 @@ declare const cache: ExpansionCache;
 declare function expand(event: EventRow, fromMs: number, toMs: number): string[];
 
 app.get('/v1/calendars/:id/events', async (request, reply) => {
-  // TODO: this starter expands a year when the range is missing and silently clamps a wider one,
-  // returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-  // replace, and never asks whether the caller may read this calendar. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const calendar = await store.getCalendar(request.params.id);
   if (calendar === null) return reply.code(404).send({error: 'unknown calendar'});
 
@@ -650,9 +634,7 @@ func expand(event Event, from, to time.Time) []string {
 }
 
 func readEvents(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter expands a year when the range is missing and silently clamps a wider one,
-	// returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-	// replace, and never asks whether the caller may read this calendar. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	id := r.PathValue("id")
 	calendar, err := store.GetCalendar(r.Context(), id)
 	if err != nil {
@@ -963,9 +945,7 @@ object ReadApi {
   }
 
   def readEvents(id: String, fromRaw: Option[String], toRaw: Option[String]): (StatusCode, String) = {
-    // TODO: this starter expands a year when the range is missing and silently clamps a wider one,
-    // returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-    // replace, and never asks whether the caller may read this calendar. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     store.getCalendar(id) match {
       case None => (StatusCodes.NotFound, """{"error":"unknown calendar"}""")
       case Some(_) =>
@@ -1186,9 +1166,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/calendars/([^/]+)/events)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter expands a year when the range is missing and silently clamps a wider one,
-    // returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-    // replace, and never asks whether the caller may read this calendar. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string id = req.matches[1];
     const auto calendar = store.getCalendar(id);
     if (!calendar) {
@@ -1369,9 +1347,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guards before the work: calendar (404) → membership (403) → window (400), and only then the cache and the expander. Every rejection here is free, while every expansion is paid for in occurrences — a request that cannot be authorized or bounded must never reach it.',
-    'The occurrence id is the dedupe key, and it must be built from the expanded start, not from the event\'s DTSTART: `"<event_id>:<start_iso>"`. The store keys its overrides by that same string, so the table can filter the expansion and supply the replacement.',
-    "Apply the overrides in place, after the expansion: skip any instance whose occurrence id is in the table and append the override once with its own revision — never both. The cached slice stays the raw expansion, stamped with the calendar's `generation`, so an override bump replaces the slice instead of being overlaid on a stale one.",
+    'A week view shows a moved standup at both its old and new time, a request with no window takes seconds to answer, and a private calendar opens for anyone who guesses its id.',
+    'The starter substitutes a year for a missing window and clamps a wide one, returns raw rules without an occurrence id, appends overrides without removing the originals, and skips the membership check after the 404.',
+    'Return 400 beyond `MAX_RANGE_DAYS`, expand server-side with `occurrence_id = "<event_id>:<start_iso>"` and revision, skip instances the override table covers, and answer 403 to non-members of private calendars before expanding.',
   ],
-  debrief: `The interviewer is asking about the read path, which is also the most expensive path in a calendar service. The starter looks calm because the demo asks for one week from a public calendar. Four contracts are being checked: the window cap (a range is a budget, and the starter's "default to a year and clamp the rest" spends it silently on an infinite rule), server-side expansion with stable occurrence ids (a client cannot dedupe what the server never names, so every refresh re-books the same slot), the overlay (an override listed beside its original shows the meeting twice), and membership (a private calendar is not a URL secret; the 404 alone is not an authorization check). Real calendars go further: per-calendar expansion budgets, ETag/If-None-Match on the range so an unchanged week is a 304, windows that page the expansion, and a background worker that precomputes popular ranges so the read path usually answers straight from the cache.`,
+  debrief: `The read path is the most expensive path in a calendar service, and the starter looks calm only because the demo asks for one week of a public calendar. The window cap is a budget: a range is paid for in occurrences and an infinite rule has no upper bound of its own, so "default to a year and clamp the rest" spends that budget on the caller's behalf. Occurrence ids exist because a client cannot dedupe what the server does not name. The overlay skips the original because an override is a replacement, not an addition. Membership is checked apart from existence because a private calendar is not a URL secret. Production calendars add expansion budgets per calendar, ETag/If-None-Match so an unchanged week is a 304, paged windows, and a worker that precomputes popular ranges.`,
 };

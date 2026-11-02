@@ -8,37 +8,32 @@ export const dependencyStep: Step = {
   focus: ['api', 'eligibility', 'hr'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the eligibility service
-answers, the decision is recorded and the demo approves a request. Every answer that is not a clean
-yes is treated as a yes anyway. Debug it, fix it, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/requests/{id}/decision\` (actor from
+\`X-User-Id\`, body \`{"step_index": 0, "decision": "approved", "reason": ""}\`). It records the
+decision through \`state.advance\`, then calls \`CheckEligibility(actor, request_id)\` on the
+Eligibility gRPC stub in a loop until a reply with \`eligible == true\` arrives, and returns the
+recorded result. It serves the demo and hides 5 flaws.
 
-Implement the eligibility gate that runs **before** any decision is recorded, and the decision entry
-point that uses it: \`POST /v1/requests/{id}/decision\`, actor from \`X-User-Id\` (**401** when
-missing), body \`{"step_index": 0, "decision": "approved", "reason": ""}\`.
+**Failure mode the checks target.** An approver who left the company decides, an ineligible
+approver is retried until the call happens to succeed, a hung eligibility service holds the
+approval open indefinitely, and a transport error is swallowed and retried. The chain has already
+moved before any of this is known. All of it is invisible in a demo where the dependency is healthy
+and every approver is valid.
 
 - Eligibility and delegation status come from the **Eligibility service over gRPC**:
   \`CheckEligibility(actor, request_id)\` → \`{active, eligible, delegated_to}\`. A session cookie is
-  not eligibility, and the workflow does not own the directory that says who still works here.
-- Every attempt carries a **1-second deadline** (\`1000 ms\`). Without one, a stuck eligibility
-  service holds the approval open for as long as it likes.
+  not eligibility; the workflow does not own the directory that says who still works here.
+- Every attempt carries a **1-second deadline** (\`1000 ms\`).
 - Retries are **bounded** (\`2\` attempts) and only a deadline is retried; any other transport error
-  is simply an unverified decision.
-- **A timeout denies.** When the deadline expires — or anything else stops the service from
-  answering — the decision is refused (\`eligibility_timeout\` / \`eligibility_unverified\`).
-  Failing open “because the approver has a valid session” is how an outage approves spend.
+  is an unverified decision.
+- **A timeout denies** (\`eligibility_timeout\` / \`eligibility_unverified\`). Failing open because
+  the approver has a valid session is how an outage approves spend.
 - **A departed approver cannot decide**: \`active == false\` is denied (\`approver_departed\`).
 - A delegation must name the actor: a \`delegated_to\` that is somebody else is denied
   (\`delegation_mismatch\`), and so is \`eligible == false\` (\`approver_ineligible\`).
-- A denial from eligibility is **terminal**: the call returns immediately. Retrying an ineligible
-  answer until it becomes eligible is how a rejection silently turns into an approval.
-- The order is part of the contract: **verify first, then record**. A denied decision must leave
-  the chain exactly where it was, and the response is the denial, not a chain advance.
-
-**Failure mode the checks target.** The starter asks eligibility with no deadline, loops until it
-hears something it likes, and records the decision before it asks at all. So an approver who left
-the company decides, an ineligible approver is retried until the call happens to succeed, and a
-timeout becomes an approval because nothing checks the error. Each of those is invisible in a demo
-where the dependency is healthy and every approver is valid.`,
+- A denial from eligibility is **terminal**: the call returns immediately.
+- **Verify first, then record.** A denied decision leaves the chain exactly where it was and the
+  response is the denial, not a chain advance.`,
   sequence: {
     participants: ['Approver', 'Approval API', 'Eligibility', 'Redis'],
     messages: [
@@ -58,9 +53,9 @@ where the dependency is healthy and every approver is valid.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call in a timer changes nothing. Bound the attempts with a constant: an unbounded retry around a dependency that answers “no” turns a rejection into a queue of rejections.',
-    'Classify the error before you decide anything: `DEADLINE_EXCEEDED` is retryable within the bound, everything else is an unverified decision that must be denied. Returning `allowed` on the error path is the difference between a fail-closed workflow and an outage that approves spend.',
-    'Read all three fields before returning a yes: `active` (a departed approver is never eligible), `delegated_to` (a delegation to somebody else means the actor is not the approver), `eligible`. And call this gate *before* `state.advance` — a denied decision must not have moved the chain.',
+    'Point the stub at a stopped eligibility service: the decision request hangs forever, and the chain has already advanced by the time anyone notices. Mark an approver `active: false` and their approval still lands.',
+    '`state.advance` runs before the RPC; the `while True` has no deadline argument, `except grpc.RpcError: continue` retries every error, and only `reply.eligible` is read, so `active` and `delegated_to` are not conditions.',
+    'Add `verify_eligibility` returning `(allowed, reason)`: `timeout=DEADLINE_S`, `range(MAX_ATTEMPTS)`, deny on `DEADLINE_EXCEEDED`, other errors, `not reply.active`, a foreign `delegated_to` or `not eligible`; call it before `state.advance`.',
   ],
   checks: [
     {
@@ -120,7 +115,7 @@ where the dependency is healthy and every approver is valid.`,
       id: 'departed-approver',
       title: 'A departed approver cannot decide',
       detail:
-        'The reply’s `active` flag is read and a false value denies the decision with the `approver_departed` reason. The starter never looks at it, so anybody who ever had the role keeps approving.',
+        'The reply’s `active` flag is read and a false value denies the decision with the `approver_departed` reason. The starter does not look at it, so anybody who ever had the role keeps approving.',
       match: {
         python: {all: [/not reply\.active/, /REASON_DEPARTED/]},
         typescript: {all: [/!reply\.active/, /REASON_DEPARTED/]},
@@ -176,8 +171,7 @@ class DecisionRequest(BaseModel):
 
 
 def record_decision(request_id: str, body: DecisionRequest, actor: str) -> dict:
-    # TODO: the starter records the decision before it asks eligibility, calls with no deadline,
-    # loops until the reply looks acceptable, and never reads active. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     recorded = state.advance(request_id, body.step_index, actor, body.decision, body.reason)
     while True:
         try:
@@ -318,8 +312,7 @@ async function recordDecision(
   body: DecisionBody,
   actor: string,
 ): Promise<Record<string, unknown>> {
-  // TODO: the starter records the decision before it asks eligibility, calls with no deadline,
-  // loops until the reply looks acceptable, and never reads active. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const recorded = await state.advance(requestId, body.step_index, actor, body.decision, body.reason ?? '');
   for (;;) {
     try {
@@ -478,8 +471,7 @@ type DecisionBody struct {
 }
 
 func recordDecision(ctx context.Context, requestID string, body DecisionBody, actor string) map[string]any {
-	// TODO: the starter records the decision before it asks eligibility, calls with no deadline,
-	// loops until the reply looks acceptable, and never reads Active. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	recorded := state.Advance(ctx, requestID, body.StepIndex, actor, body.Decision, body.Reason)
 	for {
 		_, err := eligibility.CheckEligibility(ctx, &EligibilityRequest{Actor: actor, RequestID: requestID})
@@ -648,8 +640,7 @@ object Client {
   val stub = EligibilityGrpc.blockingStub(ManagedChannelBuilder.forAddress("eligibility", 9000).usePlaintext().build())
 
   def recordDecision(requestId: String, body: DecisionRequest, actor: String): String = {
-    // TODO: the starter records the decision before it asks eligibility, calls with no deadline,
-    // loops until the reply looks acceptable, and never reads active. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val recorded = state.advance(requestId, body.step_index, actor, body.decision, body.reason)
     var done = false
     while (!done) {
@@ -775,8 +766,7 @@ using json = nlohmann::json;
 std::unique_ptr<Eligibility::Stub> stub;
 
 json recordDecision(const std::string& requestId, const json& body, const std::string& actor) {
-  // TODO: the starter records the decision before it asks eligibility, calls with no deadline,
-  // loops until the reply looks acceptable, and never reads active. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   json recorded = state::advance(requestId, body.value("step_index", 0), actor, body.value("decision", ""), body.value("reason", ""));
   while (true) {
     grpc::ClientContext ctx;
@@ -889,15 +879,5 @@ int main() {
 `,
     },
   },
-  debrief: `The question behind this step is what a workflow does when a dependency cannot answer. The starter
-  is the classic fail-open shape: it asks eligibility, but nothing about the answer is a condition —
-  no deadline means the request waits forever, no error classification means a timeout is treated
-  like silence, and the retry loop exists only to hear a yes. The fix is three lines of policy in
-  one place: a 1-second deadline on the call, a bounded attempt count, and a denial on every path
-  where the answer is not a verified yes — timeout, transport error, departed approver, delegation
-  to somebody else, or \`eligible == false\`. A decision from an unverified approver must not move
-  the chain, so the gate runs before \`state.advance\` and a denial returns the reason instead of a
-  step index. Real systems cache eligibility for a few seconds, carry the delegation chain in the
-  audit trail, and page on the timeout rate rather than the error rate, because “slow but answering”
-  is the failure mode that approves spend.`,
+  debrief: `The fix has the fail-closed shape: the only path that returns a yes is the one where a reply arrived inside the deadline and all three fields agreed, and every other path returns a named denial. The deadline is an argument on the call because a timer around the call cannot cancel the RPC. The attempt cap exists because an unbounded retry around a dependency that answers "no" turns a rejection into a queue of rejections. The gate runs before \`state.advance\` because a decision that has already moved the chain cannot be un-decided by a denial. Production approval services also cache eligibility for a few seconds, carry the delegation chain in the audit trail, and alert on the timeout rate rather than the error rate, since "slow but answering" is the failure that approves spend.`,
 };

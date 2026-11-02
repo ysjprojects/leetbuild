@@ -8,35 +8,26 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'worker', 'audit'],
   task: `## Task
 
-**Starting point.** The starter is working code for the lifecycle publisher: it writes an event for
-every rotation and returns it. It compiles, the demo shows events flowing, and it hides three
-production flaws — the key is the consumer instead of the secret, the payload carries the material
-"so workers can pick it up directly from the topic", and the event is published before the pointer
-moves. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter implements \`publish_event(consumer_id, event_type, version_id,
+material)\`, which produces a \`{type, consumer, version_id, material}\` record to \`secret.event\`
+keyed by \`consumer_id\`, and \`rotate(name, new_version_id, material)\`, which publishes an
+\`activated\` event and then calls \`activate\`. It compiles, the demo shows events flowing, and it
+hides four flaws.
 
-Implement the lifecycle publisher on topic **\`secret.event\`**:
+**Failure mode the checks target.** The topic is treated as a scratchpad rather than a durable,
+ordered, retained contract. A key that is not the secret scatters one secret's history across
+partitions. A payload without a fingerprint cannot be correlated with what a consumer holds.
+Material in the payload puts plaintext into a topic whose retention outlives the version. And
+publishing before the swap announces an activation that has not happened.
 
 - Event types are a **closed set**: \`created\`, \`activated\`, \`retired\`, \`revoked\`. Anything
-  else is rejected before the produce — a typo must not become a topic record nobody consumes.
-- The message key is the **secret name**, so every event of one secret lands on one partition and a
-  consumer sees that secret's lifecycle in order. Keying by consumer, by version id or by request id
-  scatters a secret's history and makes "what happened to this secret, in what order" unanswerable.
-- The payload is \`{type, secret, version_id, fingerprint, at}\` — ids, the fingerprint and a
-  timestamp. The topic is retained and replicated, so **no material ever goes into it**, for no
-  consumer, for no worker convenience.
-- Publishing happens **after the pointer swap**: \`rotate\` calls \`activate\` first and announces
-  the new version second. An event that names a version the fleet cannot yet use is a lie that
-  consumers act on.
+  else is rejected before the produce.
+- The message key is the **secret name**, so one secret's lifecycle lands on one partition in order.
+- The payload is \`{type, secret, version_id, fingerprint, at}\`. **No material goes into it**, for
+  no consumer, for no worker convenience.
+- Publishing happens **after the pointer swap**: \`rotate\` calls \`activate\` first.
 - One helper (\`publish_event\`) owns the produce: an idempotent producer with \`acks=all\`, and a
-  rejected produce is written to the outbox row rather than dropped.
-
-**Failure mode the checks target.** Three flaws, one shape: the topic is treated as a scratchpad
-rather than a durable, ordered, retained contract. Keying by consumer destroys the ordering the
-secret's lifecycle needs and makes replay per-secret impossible. The material in the payload looks
-like a shortcut that removes a fetch — it puts plaintext into a topic whose retention outlives the
-version, readable by every team with consume rights, and it defeats the whole point of the vault.
-And publishing before the swap races the pointer: consumers and workers act on an activation that
-has not happened yet, so the newest version is announced while the old one is still current.`,
+  rejected produce is written to the outbox row rather than dropped.`,
   sequence: {
     participants: ['Rotation worker', 'Secrets API', 'Kafka secret.event', 'Audit consumer'],
     messages: [
@@ -132,8 +123,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_event(consumer_id: str, event_type: str, version_id: str, material: str) -> dict:
-    # TODO: this starter keys by consumer, ships the material into the topic so workers can pick it
-    # up directly, and publishes before the pointer swap. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {
         "type": event_type,
         "consumer": consumer_id,
@@ -211,7 +201,7 @@ def revoke(name: str, version_id: str, fingerprint: str) -> None:
 `,
     },
     typescript: {
-      starter: `/** secret.event: flawed code that keys by consumer and ships the material. */
+      starter: `/** secret.event: the starter. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'secret.event';
@@ -226,8 +216,7 @@ export async function publishEvent(
   versionId: string,
   material: string,
 ): Promise<Record<string, unknown>> {
-  // TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
-  // directly, and publishes before the pointer swap. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const event = {type: eventType, consumer: consumerId, version_id: versionId, material};
   await producer.send({topic: TOPIC, messages: [{key: consumerId, value: JSON.stringify(event)}]});
   return event;
@@ -322,8 +311,7 @@ type SecretEvent struct {
 }
 
 func publishEvent(ctx context.Context, consumerID, eventType, versionID, material string) (SecretEvent, error) {
-	// TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
-	// directly, and publishes before the pointer swap. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	event := SecretEvent{Type: eventType, Consumer: consumerID, VersionID: versionID, Material: material}
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -444,8 +432,7 @@ object RotationEvents {
     props
   })
 
-  // TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
-  // directly, and publishes before the pointer swap. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def publishEvent(consumerId: String, eventType: String, versionId: String, material: String): Map[String, String] = {
     val event = Map(
       "type" -> eventType,
@@ -535,8 +522,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
-// directly, and publishes before the pointer swap. Fix all three.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 json publishEvent(const std::string& consumerId, const std::string& eventType, const std::string& versionId,
                   const std::string& material) {
   const json event = {{"type", eventType}, {"consumer", consumerId}, {"version_id", versionId}, {"material", material}};
@@ -621,9 +607,9 @@ json revoke(const std::string& name, const std::string& versionId, const std::st
     },
   },
   hints: [
-    'The key is the ordering contract: `key=name` / `key: name` / `Key: []byte(name)` / a `ProducerRecord(topic, name, payload)` / the key pointer in `produce(...)`. Every event for one secret must hash to one partition, or "create, activate, retire, revoke" arrives interleaved with other secrets and out of order.',
-    'Build the payload from the closed vocabulary: `{type, secret, version_id, fingerprint, at}`. The fingerprint is what lets a consumer correlate the event with the material it holds without the topic ever carrying the material — that is the entire point of publishing a fingerprint.',
-    'Publish after the swap: `const previous = await activate(...)` then `publishEvent(...)`. If the produce fails, the outbox row is the durable record; the event is never the source of truth for whether the pointer moved, the pointer is.',
+    'Symptom: the audit consumer sees `retired` before `activated` for the same secret, cannot tell which bytes an event refers to, and a grep of the topic turns up plaintext.',
+    'Mechanism: the record is keyed by `consumer_id` so one secret spans partitions, the payload carries `material` and no `fingerprint`, and `rotate` produces before `activate` has moved the pointer.',
+    'Change: `key=name`, a `{type, secret, version_id, fingerprint, at}` payload with no `material` anywhere in the publisher, and `activate(name, new_version_id)` before `publish_event` in `rotate`.',
   ],
-  debrief: `The interviewer is checking whether you treat a topic as a contract. Ordering first: a lifecycle is a sequence, and a sequence is only ordered within a partition, so the key must be the entity whose history you need — the secret name — not the consumer you happen to notify. Content second: the topic is retained, replicated and readable by every team with consume rights, so it carries ids and a fingerprint; a fingerprint is enough for any consumer to prove which version an event refers to, and it is useless to an attacker who has no material. Timing third: the pointer is the source of truth, so the event reports a fact that has already happened; publishing first makes consumers act on an activation that has not occurred, which is the same class of bug as reading a stale pointer. Real platforms add a schema registry so an event cannot drift, a compacted \`secret.state\` topic for the current version, and a consumer that rebuilds its verification state from the event log after a restart.`,
+  debrief: `The fix has its shape because a topic is a contract with three clauses. Ordering: a sequence is only ordered within a partition, so the key must be the entity whose history you need, the secret name, not the consumer you happen to notify. Content: the topic is retained, replicated and readable by every team with consume rights, so it carries ids and a fingerprint; a fingerprint lets a consumer prove which version an event refers to and is useless to an attacker holding no material. Timing: the pointer is the source of truth, so the event reports a fact that has already happened. Production platforms go further than this step: a schema registry so the payload cannot drift, and a compacted current-state topic beside the event log.`,
 };

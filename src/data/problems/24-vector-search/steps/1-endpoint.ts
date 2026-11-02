@@ -8,30 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'search', 'index'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns hits. It compiles, it serves the demo, and it hides four production flaws.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/search\` with body \`{"query": [0.1, …], "k": 10, "tenant": "acme", "index_version": "idx-42"}\`.
-
-- The tenant is the authenticated \`X-Tenant-Id\` header and is **required** (**401** when absent).
-  A \`tenant\` field in the body is never trusted: when it contradicts the header the request is
-  **403**. The header is the only tenant the search ever runs as.
-- The query vector must have exactly the active index's dimension (**768**) — a mismatch is **400**
-  and the error names the active index version it was compared against.
-- \`k\` is an integer from **1** to **100**; anything above the cap is **400**, never silently
-  clamped, and the response echoes the \`k\` that was actually searched.
-- The index version is resolved **server-side** to the active one. A body \`index_version\` that is
-  not the active version is **409** with the active version in the error, so a caller cannot make
-  the service search a retired or a not-yet-built index.
-- The response carries \`hits\`, \`k\` and the \`index_version\` the search actually ran against.
+**Starting point.** The starter registers \`POST /v1/search\` with body
+\`{"query": [0.1, …], "k": 10, "tenant": "acme", "index_version": "idx-42"}\`, clamps \`k\` into
+1..100, searches the index as the tenant and version the body names, and returns \`hits\`, \`k\`
+and \`index_version\`. It compiles, serves the demo and hides four flaws.
 
 **Failure mode the checks target.** Trusting a body \`tenant\` turns an authenticated search into an
-unauthenticated one: any caller can read any tenant's corpus by naming it in the body. An unbounded
-\`k\` lets one request ask the index for everything it has. A caller-named \`index_version\` returns
-results from a snapshot that has been retired — or one that does not exist yet — and comparing the
-vector against *the active* dimension is the only thing that stops a wrong-width query from reaching
-the shards.`,
+unauthenticated one: any caller can read any tenant's corpus by naming it. An unbounded \`k\` lets
+one request ask the index for everything it has. A caller-named \`index_version\` returns results
+from a retired snapshot, or one that does not exist yet, and comparing the vector against the
+active dimension is the only thing that stops a wrong-width query from reaching the shards.
+
+- The tenant is the authenticated \`X-Tenant-Id\` header and is **required** (**401** when absent).
+  A \`tenant\` field in the body is not trusted: when it contradicts the header the request is
+  **403**. The header is the only tenant the search runs as.
+- The query vector must have exactly the active index's dimension (**768**); a mismatch is **400**
+  and the error names the active index version it was compared against.
+- \`k\` is an integer from **1** to **100**; anything above the cap is **400**, not clamped, and the
+  response echoes the \`k\` that was actually searched.
+- The index version is resolved **server-side** to the active one. A body \`index_version\` that is
+  not the active version is **409** with the active version in the error.
+- The response carries \`hits\`, \`k\` and the \`index_version\` the search actually ran against.`,
   sequence: {
     participants: ['Client', 'Search API', 'Index versions'],
     messages: [
@@ -44,9 +41,9 @@ the shards.`,
     ],
   },
   hints: [
-    'Write the guard clauses in cost order: tenant from the header, body tenant agreement, index version, dimension, then `k`. Every one of them returns before the index is touched, so a malformed or hostile request never reaches a shard.',
-    'The active version is state, not a request field: read it once from the index registry and use that one string for the dimension check, the search and the response. A body `index_version` may only confirm it — anything else is a 409 naming the version that is live.',
-    'Reject `k > 100` instead of clamping it. Silent clamping hides a client bug and makes the response `k` disagree with what the caller asked for; a 400 tells the caller to fix the request.',
+    "A request with a forged body `tenant` returns another tenant's documents, `k: 500` comes back 200 with `k: 100`, and a 512-wide vector reaches the shards.",
+    'The handler reads tenant and version from the body and clamps `k` with `min`; nothing reads `X-Tenant-Id`, compares `len(query)` to the index dimension, or checks the version.',
+    'Read `X-Tenant-Id` (401 absent, 403 on body mismatch), reject `len(query) != INDEX_DIMENSIONS` with 400, reject `k > MAX_K` with 400, and 409 any body `index_version` that is not `ACTIVE_INDEX_VERSION`.',
   ],
   checks: [
     {
@@ -146,9 +143,7 @@ index = Index()
 
 @app.post("/v1/search")
 def search(body: SearchRequest) -> JSONResponse:
-    # TODO: this starter searches as whoever the body names, clamps k to the cap instead of
-    # rejecting it, compares the vector against nothing and trusts the body's index version.
-    # Fix all four before this endpoint is allowed to take traffic.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     k = max(1, min(body.k, 100))
     hits = index.search(body.tenant, body.query, k, body.index_version)
     logger.info("search tenant=%s k=%d version=%s", body.tenant, k, body.index_version)
@@ -246,9 +241,7 @@ interface SearchBody {
 }
 
 app.post('/v1/search', async (request, reply) => {
-  // TODO: this starter searches as whoever the body names, clamps k to the cap instead of
-  // rejecting it, compares the vector against nothing and trusts the body's index version.
-  // Fix all four before this endpoint is allowed to take traffic.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const body = request.body as SearchBody;
   const version = body.index_version ?? 'idx-42';
   const k = Math.min(Math.max(body.k ?? 10, 1), 100);
@@ -351,9 +344,7 @@ func search(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter searches as whoever the body names, clamps k to the cap instead of
-	// rejecting it, compares the vector against nothing and trusts the body's index version.
-	// Fix all four before this endpoint is allowed to take traffic.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	version := body.IndexVersion
 	if version == "" {
 		version = activeIndexVersion
@@ -514,9 +505,7 @@ object SearchApi {
     path("v1" / "search") {
       post {
         entity(as[SearchRequest]) { body =>
-          // TODO: this starter searches as whoever the body names, clamps k to the cap instead of
-          // rejecting it, compares the vector against nothing and trusts the body's index version.
-          // Fix all four before this endpoint is allowed to take traffic.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val version = body.index_version.getOrElse(ActiveIndexVersion)
           val k = math.max(1, math.min(body.k, 100))
           val hits = index.search(body.tenant, body.query, k, version)
@@ -630,9 +619,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter searches as whoever the body names, clamps k to the cap instead of
-    // rejecting it, compares the vector against nothing and trusts the body's index version.
-    // Fix all four before this endpoint is allowed to take traffic.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto tenant = body.value("tenant", std::string());
     const auto version = body.value("index_version", kActiveIndexVersion);
     const auto query = body.value("query", std::vector<double>());
@@ -722,16 +709,13 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, and
-the search endpoint has three cross-tenant seams that a demo never trips. The body \`tenant\` is the
-first and quietest: the starter never reads the header, so the authenticated identity is decorative and
-any caller can ask for any corpus by name — the fix is that the authenticated tenant is the only
-tenant, and a contradicting body field is a 403 rather than a silent override. The cap is the second:
-clamping \`k\` to 100 hides the client's mistake and lets a response disagree with its request, where a
-400 makes the contract explicit. The third is the index version: resolving it server-side is what
-keeps a query from being served by a retired snapshot, and comparing the vector against the *active*
-dimension is what keeps a stale client from pushing the wrong width into the shards. Real services add
-per-tenant dimension overrides from the index registry, a handshake that returns \`active_version\`
-plus \`dimensions\` so clients can pre-validate, and a per-tenant cap that an operator can lower.
+  debrief: `The fix has the shape of guard clauses in trust order: the header tenant first, because
+every later decision runs as that tenant; then the version, read once from the registry so the
+dimension check, the search and the response all agree on one string; then the width and \`k\`.
+Rejecting \`k > 100\` instead of clamping keeps the response consistent with what was searched, and a
+body \`tenant\` that contradicts the header is a 403 rather than a silent override. Production
+search services go further: the index registry carries per-tenant dimensions and caps an operator
+can lower, and a handshake endpoint returns \`active_version\` and \`dimensions\` so clients can
+validate a query before sending it.
 `,
 };

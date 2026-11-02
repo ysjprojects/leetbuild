@@ -8,11 +8,18 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the body and
-returns a match. It compiles, it serves the demo, and it hides four production flaws. Debug it like
-the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/dedupe/check\` with body
+\`{"keys": [{"type": "email_hash", "value": "…"}], "fuzzy": "…"}\`, reads the tenant from
+\`X-Tenant-Id\`, joins the key values into one candidate string, searches a similarity index shared by
+every tenant and returns the hit's \`record_id\` and \`tenant_id\`. It compiles, it serves the demo,
+and it hides four flaws.
 
-Implement \`POST /v1/dedupe/check\` with body \`{"keys": [{"type": "email_hash", "value": "…"}], "fuzzy": "…"}\`.
+**Failure mode the checks target.** Querying a global similarity index lets one tenant's check
+confirm, and name, another tenant's record: a cross-tenant data leak dressed up as a duplicate. The
+starter also validates neither the key type nor the hash shape, so a raw value can reach the index
+and a typo in a key type silently becomes "no match".
+
+Requirements:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`keys\` is a non-empty array; each \`type\` must be one of \`email_hash\`, \`content_hash\`,
@@ -20,16 +27,11 @@ Implement \`POST /v1/dedupe/check\` with body \`{"keys": [{"type": "email_hash",
   SHA-256 hex digest (**400** otherwise).
 - \`fuzzy\` is optional and, when present, at most 512 characters (**400** otherwise).
 - The comparison runs inside the caller's tenant only: the index namespace is derived from the tenant
-  (\`t:{tenant}\`) and the fuzzy lookup is scoped the same way. A check must never read a global
+  (\`t:{tenant}\`) and the fuzzy lookup is scoped the same way. A check must not read a global
   index shared across tenants.
 - A hit is a record of the caller's tenant; the response returns its \`record_id\` and the matching
-  \`key_type\`. It never returns another tenant's record id or tenant id.
-- A check with no \`fuzzy\` text is an exact-only check and says so in the response.
-
-**Failure mode the checks target.** Querying a global similarity index lets one tenant's check
-confirm — and name — another tenant's record, which is a cross-tenant data leak dressed up as a
-duplicate. The starter does exactly that, and it validates neither the key type nor the hash shape, so a
-raw value can reach the index and a typo in a key type silently becomes "no match".`,
+  \`key_type\`, and no tenant id.
+- A check with no \`fuzzy\` text is an exact-only check and says so in the response.`,
   sequence: {
     participants: ['Client', 'Dedupe API', 'Redis', 'record store'],
     messages: [
@@ -95,9 +97,9 @@ raw value can reach the index and a typo in a key type silently becomes "no matc
     },
     {
       id: 'no-foreign-id',
-      title: "Never names another tenant's record",
+      title: "Returns only the caller's record id",
       detail:
-        "The hit returned is the caller's `record_id` and its `key_type`; a foreign tenant id is never echoed in the response. The starter returns the matched record's tenant id, confirming the existence of another tenant's record.",
+        "The hit returned is the caller's `record_id` and its `key_type`; no tenant id is echoed in the response. The starter returns the matched record's tenant id, confirming the existence of another tenant's record.",
       match: {
         python: {all: [/record_id/], none: [/\btenant_id\b/]},
         typescript: {all: [/record_id/], none: [/\btenant_id\b/]},
@@ -137,8 +139,7 @@ GLOBAL_SIMILARITY_INDEX = GlobalSimilarityIndex()
 
 @app.post("/v1/dedupe/check")
 def check(body: CheckRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter compares the candidate against a global similarity index, returns the matched
-    # tenant's record id, and validates neither the key type nor the hash. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     candidate = " ".join(key.value for key in body.keys)
     hit = GLOBAL_SIMILARITY_INDEX.search(candidate)
     if hit is None:
@@ -249,8 +250,7 @@ class GlobalSimilarityIndex {
 const GLOBAL_SIMILARITY_INDEX = new GlobalSimilarityIndex();
 
 app.post('/v1/dedupe/check', async (request, reply) => {
-  // TODO: this starter compares the candidate against a global similarity index, returns the matched
-  // tenant's record id, and validates neither the key type nor the hash. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as CheckBody;
   const candidate = body.keys.map(k => k.value).join(' ');
   const hit = await GLOBAL_SIMILARITY_INDEX.search(candidate);
@@ -359,8 +359,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func check(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter compares the candidate against a global similarity index, returns the matched
-	// tenant's record id, and validates neither the key type nor the hash. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	var body CheckBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -525,8 +524,7 @@ object DedupeApi {
     path("v1" / "dedupe" / "check") {
       post {
         entity(as[CheckRequest]) { body =>
-          // TODO: this starter compares the candidate against a global similarity index, returns the
-          // matched tenant's record id, and validates neither the key type nor the hash.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val candidate = body.keys.map(_.value).mkString(" ")
           GlobalSimilarity.search(candidate) match {
             case Some(hit) =>
@@ -636,8 +634,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/dedupe/check", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter compares the candidate against a global similarity index, returns the
-    // matched tenant's record id, and validates neither the key type nor the hash. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     std::string candidate;
     for (const auto& key : body.value("keys", json::array())) {
@@ -742,9 +739,9 @@ int main() {
     },
   },
   hints: [
-    'Scope the comparison first: derive the index namespace from the tenant (`t:{tenant}`) and pass it to every lookup and to the similarity call. A check that reads a shared index is a cross-tenant read, however fast it is.',
-    'Validate before you compare: whitelist the key types and require a 64-hex digest per value. A raw value in the index is both a privacy leak and a silent miss when the next request sends the hash.',
-    "The response is part of the contract: return the caller's `record_id` and the matching `key_type`, and never echo a tenant id. If you want the tenant in the payload for debugging, you already have it in the header.",
+    'Symptom: tenant A submits a record and the response names a `record_id` that belongs to tenant B, plus the `tenant_id` field that proves it.',
+    'Mechanism: the handler joins the key values and searches `GLOBAL_SIMILARITY_INDEX`, which every tenant shares, and nothing checks key types or hash shapes before that search.',
+    'Change: derive `t:{tenant}` with a `tenant_scope()` helper and look up only there; whitelist `ALLOWED_KEY_TYPES`, require `HASH_RE` 64-hex values; return `record_id` and `key_type`, drop `tenant_id`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the isolation boundary. The starter reads fine because the demo has one tenant and well-formed keys. Four defects are being checked: the comparison scope (a global index leaks across tenants), key-type validation (a typo silently becomes "no match"), hash validation (raw values reach the index), and the response payload (returning another tenant's record id confirms its existence). The fix is small but the reasoning is the interview: dedupe is a read over other people's data, so the search space is part of the security boundary. Real services add per-tenant key-type registries, constant-time lookups to avoid timing leaks, and an audit log of which tenant ran which check — without ever logging the values.`,
+  debrief: `The fix moves the tenant from a header you happen to have into the search space itself: the namespace is derived from the tenant before any lookup, so there is no code path that can read a shared index, and the response is built from the caller's view of the hit rather than from the index row. Validation sits in front for the same reason: a raw value in a hashed index is both a privacy leak and a guaranteed miss on the next request. Production services go further with per-tenant key-type registries, constant-time membership lookups so a timing difference cannot reveal a hit, and an audit log of which tenant ran which check that stores hashes only.`,
 };

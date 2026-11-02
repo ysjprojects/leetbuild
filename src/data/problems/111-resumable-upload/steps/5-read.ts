@@ -8,28 +8,25 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-The starter is working code: it registers the status route and returns a
-percentage. A dashboard can render a progress bar from that, so the demo passes. But a client on a
-flaky network needs more than a percentage, and the starter also lets anyone read anyone's upload.
-Find the defects, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/uploads/{upload_id}\`, the read a client makes to
+resume after a dropped connection. It loads the manifest by id and returns
+\`{"percent_complete": ...}\` computed from the entry count over \`part_count\`. A dashboard can draw
+a progress bar from that, so the demo passes. It hides four flaws.
 
-Implement \`GET /v1/uploads/{upload_id}\`, the read a client makes to resume after a dropped connection.
+**Failure mode the checks target.** A percentage is not resumable: the client knows it is 73% done
+but not which 27% to send, so one failed part costs a full multi-gigabyte re-upload. A read that
+trusts the id without checking the tenant is an enumeration bug, since upload ids leak in logs and
+referrers. And a part whose bytes were corrupted in the store, but whose manifest entry still says
+stored, is reported as fine until finalize discovers it.
 
 - The response names the **stored** parts (number, size, checksum), the **missing** part numbers and
   the **corrupt** parts (number and the checksum that did not match), plus a \`resume\` list that is
-  exactly the numbers to re-send. The starter returns only a percentage complete, so the client cannot
-  tell which parts to re-send and restarts the upload from zero.
+  exactly the numbers to re-send.
 - A part whose stored checksum does not match the expected checksum is **corrupt** and belongs in
-  \`resume\` — it must not be reported as stored. The starter never verifies anything.
-- The upload belongs to the tenant that created it. A read from a **foreign tenant** — or for an id
-  that does not exist — is **404**. The starter lets any caller read any upload by id.
-- \`part_count\` is included so the client can compute the gaps itself.
-
-**Failure mode the checks target.** A percentage is not resumable: the client knows it is 73% done but
-not which 27% to send, so a single failed part costs a full multi-gigabyte re-upload. A status read
-that trusts the id without checking the tenant is an object-store enumeration bug — upload ids leak in
-logs and referrers. And a part whose bytes were corrupted in the store, but whose manifest entry still
-says stored, is reported as fine until finalize discovers it.`,
+  \`resume\`, not in \`stored\`.
+- The upload belongs to the tenant that created it. A read from a **foreign tenant**, or for an id
+  that does not exist, is **404**.
+- \`part_count\` is included so the client can compute the gaps itself.`,
   sequence: {
     participants: ['Uploader', 'Upload API', 'Part manifest'],
     messages: [
@@ -41,9 +38,9 @@ says stored, is reported as fine until finalize discovers it.`,
     ],
   },
   hints: [
-    'Resume needs a list, not a number: walk `1..part_count`, put each part in `stored` when its manifest entry exists and matches, in `missing` when there is no entry, and in `corrupt` when the checksum disagrees. `resume` is `missing + corrupt` in order.',
-    'The tenant check is one guard: load the upload, compare its tenant to `X-Tenant-Id`, and return **404** — not **403** — when they differ or the id does not exist. A 404 keeps a foreign id indistinguishable from a missing one.',
-    'Corruption is a first-class state. A part whose stored checksum does not match the expected checksum goes in `corrupt` and in `resume`, never in `stored`; the client re-sends it and the next read sees it move to `stored`.',
+    "After a dropped connection the mobile app reads the status, sees `73`, and re-sends the file from part 1. Separately, a support engineer pastes an upload id from a log and gets another tenant's manifest.",
+    'The handler divides the manifest length by `part_count` and returns that number; it does not read `X-Tenant-Id` at all, and it compares no checksum, so a corrupted part counts as present.',
+    "In `get_upload`: return 404 when the upload's tenant differs from the header; walk `1..part_count` into `stored`, `missing` and `corrupt` (checksum mismatch), and return `resume = missing + corrupt`.",
   ],
   checks: [
     {
@@ -121,8 +118,7 @@ app = FastAPI()
 
 @app.get("/v1/uploads/{upload_id}")
 def get_upload(upload_id: str) -> JSONResponse:
-    # TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
-    # gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     manifest = load_manifest(upload_id)
     percent = 100 * len(manifest) // manifest["part_count"]
     return JSONResponse({"upload_id": upload_id, "percent_complete": percent}, status_code=200)
@@ -180,8 +176,7 @@ import Fastify from 'fastify';
 export const app = Fastify();
 
 app.get('/v1/uploads/:uploadId', async (request, reply) => {
-  // TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
-  // gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const uploadId = (request.params as {uploadId: string}).uploadId;
   const manifest = await loadManifest(uploadId);
   const percent = Math.floor((Object.keys(manifest).length / manifest.part_count) * 100);
@@ -259,8 +254,7 @@ import (
 )
 
 func getUpload(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
-	// gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	uploadID := r.PathValue("uploadId")
 	manifest, _ := loadManifest(r.Context(), uploadID)
 	percent := 100 * len(manifest) / partCountOf(manifest)
@@ -353,9 +347,7 @@ object UploadReadApi {
   val route: Route =
     path("v1" / "uploads" / Segment) { uploadId =>
       get {
-        // TODO: this starter returns only a percentage complete, so a client cannot resume from the
-        // exact gaps and restarts the upload; it also lets any caller read any upload without a
-        // tenant check.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         onSuccess(loadManifest(uploadId)) { manifest =>
           val percent = 100 * manifest.size / partCountOf(manifest)
           complete(StatusCodes.OK, s"""{"upload_id":"$uploadId","percent_complete":$percent}""")
@@ -437,8 +429,7 @@ object UploadReadApi {
 using json = nlohmann::json;
 
 void GetUpload(const httplib::Request& req, httplib::Response& res) {
-  // TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
-  // gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const auto uploadId = req.path_params.at("uploadId");
   const auto manifest = LoadManifest(uploadId);
   const auto percent = 100 * static_cast<long long>(manifest.size()) / PartCountOf(uploadId);
@@ -508,5 +499,5 @@ int main() {
 `,
     },
   },
-  debrief: `The status read is the endpoint the client actually resumes from, so it has to answer "which parts" rather than "how far". A percentage cannot be acted on: the client knows it is 73% done but not which 27% to send, so one failed part costs the whole upload. Partitioning the manifest into stored, missing and corrupt turns the read into a work list — and corruption is its own state, because a part whose bytes were altered in the store must not be reported as present. The tenant guard is the security half: upload ids travel in logs and referrers, so a read that trusts the id is an enumeration bug. Answering 404 for a foreign id keeps it indistinguishable from a missing one. Real services sign the read URL, return a short-lived per-part upload URL per gap, and include the object store's ETag so the client can verify the part it already sent.`,
+  debrief: `The fix returns a work list instead of a number because the property it protects is that one read tells the client exactly which parts to send next. Partitioning the manifest into stored, missing and corrupt makes corruption its own state, so a part whose bytes were altered in the store is re-sent rather than reported as present. The tenant guard answers 404 for a foreign id so it stays indistinguishable from a missing one; upload ids travel in logs and referrers, and a read that trusts the id alone is an enumeration bug. Production services go further than this step: a signed read URL, a short-lived per-part upload URL for each gap, and the object store's ETag per part so the client can verify what it already sent.`,
 };

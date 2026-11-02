@@ -8,31 +8,28 @@ export const dependencyStep: Step = {
   focus: ['classifier', 'model', 'rules'],
   task: `## Task
 
-The starter is working code: when the model is healthy it returns labels, so the
-demo passes. Every failure path is wrong. Find the flaws, fix them, and prove the fix.
-
-Implement \`classify(text, taxonomy_version)\` for the classifier's model layer:
-
-- Each model call carries a **700 ms** deadline — a call timeout, a context with timeout,
-  \`withDeadlineAfter\`, \`set_deadline\` or \`deadline: Date.now() + DEADLINE_MS\`. A call without one
-  lets one stuck model pin the worker indefinitely.
-- At most **3 attempts**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may be retried. A
-  **refusal** is a decision, not a failure: it is **terminal** and must never be retried to the
-  deadline.
-- When the model cannot answer, classify with the **deterministic keyword rules** instead of passing
-  the outage through, and mark the result with its **provenance** (\`model\` or \`fallback\`).
-- **Never** return a safe label with no evidence behind it. A rules pass that matches no rule
-  produces the **review** bucket, not an unexamined classification the pipeline downstream treats as
-  real.
-- Metrics count the fallback path **separately** from real classifications
-  (\`classifier_fallback_total\`), so a model outage is visible as a spike and not as a quiet drop in
-  quality.
+**Starting point.** \`classify(text, taxonomy_version)\` calls the model's \`Classify\` RPC inside a
+\`while True\` loop with no deadline and returns its labels with provenance \`model\`; on any gRPC
+error it answers \`["safe"]\`, also marked \`model\`. When the model is healthy it serves the demo.
+It hides 5 flaws.
 
 **Failure mode the checks target.** Catching every failure and answering \`safe\` launders an outage
-past review: nothing downstream can tell a real classification from a shrug. Retrying a refusal
-wastes the deadline on a decision that will not change. And a fallback result without provenance
-makes a rules guess indistinguishable from a model answer in the data, so nobody can ever measure
-whether the fallback is any good.`,
+past review: nothing downstream can tell a real classification from a shrug. A loop with no attempt
+cap and no status check wastes the deadline on a refusal that will not change. And a fallback
+without provenance makes a rules guess indistinguishable from a model answer in the data, so nobody
+can measure whether the fallback is any good.
+
+Requirements:
+
+- Each model call carries a **700 ms** deadline on the call itself (\`timeout=\`, a context with
+  timeout, \`withDeadlineAfter\`, \`set_deadline\`, \`deadline: Date.now() + DEADLINE_MS\`).
+- At most **3 attempts** (\`MAX_ATTEMPTS = 3\`), and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
+  retried. A **refusal** is a decision, not a failure: it is terminal.
+- When the model cannot answer, classify with the **deterministic keyword rules** and mark the
+  result's **provenance** (\`model\` or \`fallback\`).
+- No safe label without evidence: a rules pass that matches nothing produces the **review** bucket.
+- The fallback path is counted separately (\`classifier_fallback_total\`), so an outage shows as a
+  spike rather than a quiet drop in quality.`,
   sequence: {
     participants: ['Content Classifier', 'Model', 'Rules fallback', 'metrics'],
     messages: [
@@ -140,9 +137,7 @@ models = providers_pb2_grpc.ClassifierStub(channel)
 
 
 def classify(text: str, taxonomy_version: str) -> dict:
-    # TODO: this starter retries a refusal until the deadline and maps every failure to the label
-    # "safe" with no provenance, so an outage launders everything past review. It also calls the
-    # model with no deadline at all. Fix it.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = models.Classify(providers_pb2.ClassifyRequest(text=text))
@@ -215,9 +210,7 @@ import {ClassifyRequest} from './gen/classifier_pb';
 
 const client = new ClassifierClient('models:9000', grpc.credentials.createInsecure());
 
-// TODO: this starter retries a refusal until the deadline and maps every failure to the label "safe"
-// with no provenance, so an outage launders everything past review. It also calls the model with
-// no deadline at all. Fix it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 export async function classify(text: string, taxonomyVersion: string): Promise<Result> {
   while (true) {
     try {
@@ -313,9 +306,7 @@ var conn, _ = grpc.Dial("models:9000", grpc.WithInsecure())
 
 var models = classifierv1.NewClassifierClient(conn)
 
-// TODO: this starter retries a refusal until the deadline and maps every failure to the label "safe"
-// with no provenance, so an outage launders everything past review. It also calls the model with
-// no deadline at all. Fix it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func Classify(ctx context.Context, text, taxonomyVersion string) (Result, error) {
 	for {
 		reply, err := models.Classify(ctx, &classifierv1.ClassifyRequest{Text: text})
@@ -420,9 +411,7 @@ object ModelClient {
   val channel = ManagedChannelBuilder.forAddress("models", 9000).usePlaintext().build()
   val models: ClassifierGrpc.ClassifierBlockingStub = ClassifierGrpc.blockingStub(channel)
 
-  // TODO: this starter retries a refusal until the deadline and maps every failure to the label
-  // "safe" with no provenance, so an outage launders everything past review. It also calls the
-  // model with no deadline at all. Fix it.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def classify(text: String, taxonomyVersion: String): Result = {
     var done = false
     var result: Result = null
@@ -506,9 +495,7 @@ object ModelClient {
 
 #include "classifier.grpc.pb.h"
 
-// TODO: this starter retries a refusal until the deadline and maps every failure to the label "safe"
-// with no provenance, so an outage launders everything past review. It also calls the model with
-// no deadline at all. Fix it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 Result Classify(const std::string& text, const std::string& taxonomyVersion) {
   while (true) {
     grpc::ClientContext ctx;
@@ -592,9 +579,9 @@ Result Classify(const std::string& text, const std::string& taxonomyVersion) {
     },
   },
   hints: [
-    'The deadline is an argument on the call itself: `timeout=`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. Wrapping the call in a timeout helper does not reach the wire, and an unbounded call turns a slow provider into a queue that never drains.',
-    'Retryability is a property of the status, not of “it threw”: read the status code, retry only `UNAVAILABLE` and `DEADLINE_EXCEEDED` up to three times, and treat a refusal like any other decision — return it now, because the model will answer the same way on the next attempt.',
-    'The fallback is a real classifier, not a placeholder: run the keyword rules, and when nothing matches return the review bucket. Tag the result with provenance and increment a fallback counter, so the outage shows up as a metric spike instead of an unexplained drop in label quality.',
+    'During a model outage every document comes back `safe`, the fallback dashboard stays flat, and when the model hangs the worker hangs with it.',
+    'The call has no deadline, the loop has no attempt cap and reads no status code, and the `except` turns every error into the same constant with the same provenance as a real answer.',
+    'Pass `timeout=DEADLINE_S` on the call; loop to `MAX_ATTEMPTS`, retry only UNAVAILABLE/DEADLINE_EXCEEDED, return a REFUSAL at once; otherwise `rules_classify` with `PROVENANCE_FALLBACK`, `REVIEW_LABEL` when nothing matches, and bump `FALLBACK_METRIC`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a dependency layer where the failure policy is the deliverable. Three defects are being checked: the deadline (a call without one converts a slow dependency into an outage of your own service), the retry policy (retrying a terminal refusal burns the deadline on an answer that will not change), and the failure representation (a constant label with no provenance is a silent data-quality bug — nothing downstream, and no metric, can tell it apart from a real classification). The fallback itself is the fourth idea: when the model is gone, the service must still produce evidence-based labels, which is exactly what a small deterministic rules pass gives you. Real classifiers add a per-label confidence, a sampled human review of fallback results, and a circuit breaker so a hard-down model is not called three times per request forever.`,
+  debrief: `The deadline sits on the RPC because that is the only place it reaches the wire; a timeout wrapper around a blocking stub leaves the connection open. Retry decisions read the status code because retryability belongs to the failure, not to the fact that something threw: UNAVAILABLE may clear, a refusal is the model's answer and will repeat. The fallback is a real classifier with its own provenance and counter because the alternative, a constant labelled as a model answer, is a data-quality bug nobody can see until the outage shows up as a quality dip weeks later. Production clients go further: a circuit breaker stops attempts while the model is known down, and fallback results are sampled into review so the rules get measured against the model they stand in for.`,
 };

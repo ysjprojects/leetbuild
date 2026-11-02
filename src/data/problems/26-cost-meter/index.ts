@@ -17,37 +17,33 @@ import {readStep} from './steps/5-read';
 export const costMeterProblem: Problem = {
   id: 'cost-meter',
   title: 'AI Cost Meter',
-  tagline: 'Meter tokens per tenant per window atomically so spend is enforceable before it happens.',
+  tagline: 'Meter tokens per tenant per hour in one atomic Redis counter, priced from a versioned rate table.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# AI Cost Meter
 
-An AI cost meter is the piece of an AI platform that turns tokens into money: it records what each
-tenant spent, prices it against the model's published rates, and hands the number to the two people
-who care — the engineer deciding whether the next request fits the budget, and finance reconciling
-the invoice months later. The visible part is a number on a spend dashboard; the parts that decide
-whether anyone can trust that number are the durability of the usage write, the atomicity of the
-counter, the freshness of the rates, the ordering of the billing events, and the read that has to
-agree with the limit that was actually enforced.
+An AI cost meter turns tokens into money: it records what each tenant spent, prices it against the
+model's published rates, and hands the number to the engineer deciding whether the next request fits
+the budget and to finance reconciling the invoice months later. The visible part is a number on a
+spend dashboard. The parts that decide whether anyone can trust it are the durability of the usage
+write, the atomicity of the counter, the freshness of the rates, the ordering of the billing events,
+and a read that agrees with the limit that was actually enforced.
 
 ## The real system
 
-Production meters sit on the hot path of every request, so every one of their steps is a failure
-mode with a bill attached. A usage report is written durably **before** the response leaves, because
-a process that crashes between the two has accepted tokens it will never charge for, and it is
-idempotent on the client's \`Idempotency-Key\` so a retried report cannot be billed twice. Spend
-accumulates in one window-keyed counter per tenant, updated atomically with the expiry of that
-window, because the meter and the budget limiter must read the same number: if the limiter checks a
-counter that the meter updates in two commands, a request that dies between them spends budget the
-tenant is never charged for. Rates come from a pricing service under a deadline, with a cached,
-versioned rate table as the fallback — a table old enough to be wrong is worse than an honest
-"uncosted", and a pricing failure must never be cached as a rate. Usage events go out keyed by
-tenant so one tenant's ledger stays ordered, carry the idempotency key so downstream billing can
-dedupe a retry, and survive a broker outage through an outbox. And the spend read reconstructs the
-current window from those same counters, scoped to the authenticated tenant, with rounding applied
-once at statement level instead of to every request.
+Stripe's Billing Meters take usage as meter events: each event names a customer and a value, and an
+optional \`identifier\` makes it idempotent, with uniqueness enforced over a rolling window of at
+least 24 hours so an accidental retry does not count twice. Every usage-based billing stack solves
+the same list. A usage report is written durably before the response leaves, because a process that
+crashes between the two has accepted tokens it will not charge for. Spend accumulates in one
+window-keyed counter per tenant, updated atomically with the expiry of that window, because the
+meter and the budget limiter must read the same number. Rates come from a pricing service under a
+deadline, with a cached, versioned rate table as the fallback, and a pricing failure is not cached as
+a rate. Usage events go out keyed by tenant so one ledger stays ordered, carry the idempotency key so
+billing can dedupe a retry, and survive a broker outage through an outbox. The spend read
+reconstructs the current window from those same counters, scoped to the authenticated tenant.
 
 ## What you build here
 
@@ -55,32 +51,28 @@ One service, **meterd**, with five pieces:
 
 1. \`POST /v1/usage\`: authenticated tenant, a checked model name and token counts, an
    \`Idempotency-Key\` so a replay stores one row, and a write that is durable before the 202.
-2. A **Redis** ledger: one hash per \`(tenant, hour bucket)\`, both token counters and the
-   window expiry moved inside one atomic \`EVAL\`, and a TTL set only when the window opens.
-3. A **gRPC** pricing client: a 200 ms deadline per lookup, a cached rate table the fallback serves
-   from, a versioned table no older than one hour, an unknown model reported as uncosted, and no
-   failure ever cached.
+2. A **Redis** ledger: one hash per \`(tenant, hour bucket)\`, both token counters and the window
+   expiry inside one atomic \`EVAL\`, a TTL set only when the window opens.
+3. A **gRPC** pricing client: a 200 ms deadline per lookup, a cached rate table as the fallback,
+   versioned and no older than one hour, an unknown model reported as uncosted, no failure cached.
 4. A **Kafka** usage path: one \`billing.usage\` event per report keyed by tenant, the idempotency
-   key embedded in the event, an idempotent producer with \`acks=all\`, and an outbox row when the
-   broker rejects the produce.
+   key embedded, an idempotent producer with \`acks=all\`, and an outbox row when the broker rejects
+   the produce.
 5. \`GET /v1/tenants/{t}/spend\`: tenant-scoped with a **403** for a foreign read, current-window
-   spend and remaining budget read from the limiter's own counters, integer micro-dollars per
-   request, and rounding applied once at statement level.
+   spend and remaining budget from the limiter's own counters, integer micro-dollars per request,
+   rounding once at statement level.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step you debug it against the failure modes, fix it, optimize what is
+wasteful, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Provider-side reconciliation of reported usage, per-model tokenizers, currency conversion and tax,
 invoice generation, payment collection, price-change approval workflows, spend forecasting, and the
-finance dashboard. The five pieces above are the ones that decide whether the meter's number is
-durable, atomic, priced from current rates, ordered per tenant, and identical to the limit the
-platform enforced.`,
+finance dashboard.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Billing client', sub: 'report · read', x: 8, y: 50},

@@ -8,42 +8,18 @@ export const dependencyStep: Step = {
   focus: ['worker', 'driver', 'profile'],
   task: `## Task
 
-**Starting point.** The starter is working code: it sends every action to the
-driver through one \`for\` loop with a single \`RETRIES = 3\` constant and no deadline on any call, and
-the demo passes because the first click lands on a page that is already open. It hides a
-double-submitted form, a hung page that keeps receiving actions, and a retry policy that replays
-whatever side effect it is handed. Debug it like the owner of the worker’s driver client, fix it,
-and prove the fix with the checks below.
+**Starting point.** The starter's \`execute_action\` sends every action to the driver's \`Act\` through one \`for\` loop over a single \`RETRIES = 3\` constant, with no deadline on any call, and charges the budget on reply. It compiles and hides five flaws.
 
-Every action the step loop runs goes out over **gRPC** through the worker’s \`BrowserDriver\` stub
-(\`Navigate\`, \`Act\`, \`Snapshot\`, \`ClosePage\`):
+**Failure mode the checks target.** \`click\` and \`submit\` get the same three attempts as a \`navigate\`, and every error is caught alike. A click whose deadline expired after the page handled it is sent again and the form submits twice; a permanent \`INVALID_ARGUMENT\` is attempted three times; a hung page pins the worker and stays open.
 
-- Every driver call carries an explicit **15 s** deadline — \`DEADLINE_MS = 15_000\` — passed as the
-  call’s own timeout, and the returned status is checked. A call without one lets a stuck driver pin
-  a worker for the rest of the session.
-- Retryability is **per action**, never one global flag: a \`RETRYABLE_ACTIONS\` table names only the
-  repeatable actions (\`navigate\`, \`snapshot\`, \`wait\`); \`click\`, \`submit\` and \`type\` get exactly one
-  attempt, because a replay clicks a button that was already clicked and submits a form twice.
-- A retry is gated on the gRPC **status**, not on “it threw”: only \`UNAVAILABLE\` and
-  \`DEADLINE_EXCEEDED\` are retryable, and every other status (\`INVALID_ARGUMENT\`,
-  \`FAILED_PRECONDITION\`) goes straight back to the caller.
-- A \`click\` that times out is **verified against page state before any retry decision**: the worker
-  reads \`Snapshot\` and compares the page digest against the action’s target. The order matters —
-  snapshot/verify first, and only if the page proves the first click did not land may the action run
-  again. A blind replay is exactly how the form gets submitted twice.
-- A **hung page** is closed with \`ClosePage\` before the next action is started on that session, and
-  until the page is closed the next action on it is refused rather than queued behind a dead page.
-- The action loop charges the session budget **once per accepted action**, after the driver accepts
-  it, so a retried attempt cannot silently double the side effect — the budget and resume contract
-  the state step keeps in \`session:{id}\` stays true.
+Every action goes out over **gRPC** through the \`BrowserDriver\` stub (\`Navigate\`, \`Act\`, \`Snapshot\`, \`ClosePage\`):
 
-**Failure mode the checks target.** The starter loops \`click\` and \`submit\` through the same
-three-attempt retry it uses for a \`navigate\`, sends every call with no deadline, and its \`RETRIES\`
-constant is the only policy it has. So a click whose deadline expired after the page already handled
-it is sent again — the form is submitted twice — a permanent \`INVALID_ARGUMENT\` is attempted three
-times, and a page that never answers is left open while the loop starts the next action on it. None
-of it shows up in a demo where the first attempt lands in milliseconds; all of it is
-customer-visible in production.`,
+- Every call carries a **15 s** deadline from \`DEADLINE_MS = 15_000\` as its own timeout; the returned status is checked.
+- Retryability is **per action**: \`RETRYABLE_ACTIONS\` names \`navigate\`, \`snapshot\`, \`wait\`; \`click\`, \`submit\`, \`type\` (\`SIDE_EFFECTING_ACTIONS\`) get one attempt.
+- A retry is gated on the gRPC **status**: only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`; anything else goes back to the caller.
+- A timed-out \`click\` is **verified first**: read \`Snapshot\`, compare the page digest against the target, replay only if the click did not land.
+- A **hung page** is closed with \`ClosePage\` before the next action on that session.
+- The budget is charged **once per accepted action**.`,
   sequence: {
     participants: ['Worker', 'Browser driver', 'Session state'],
     messages: [
@@ -240,12 +216,7 @@ class Budget:
 
 
 def execute_action(session, action: str, target: str, stub: BrowserDriverStub, budget: Budget) -> str:
-    # TODO: one global retry count and no deadline on any driver call, and a timed-out click is sent
-    # again three times; a hung page is left open and the next action runs on it. Put a 15 s deadline
-    # on every call from DEADLINE_MS, keep a per-action retry table so click/submit/type get one
-    # attempt, read page state with Snapshot before any retry, close a hung page with ClosePage
-    # before the next action, gate retries on UNAVAILABLE / DEADLINE_EXCEEDED and charge the budget
-    # once per accepted action.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if action not in ACTIONS:
         raise KeyError(action)
     for _ in range(RETRIES):
@@ -377,12 +348,7 @@ export async function executeAction(
   stub: DriverClient,
   budget: Budget,
 ): Promise<string> {
-  // TODO: one global retry count and no deadline on any driver call, and a timed-out click is sent
-  // again three times; a hung page is left open and the next action runs on it. Put a 15 s deadline
-  // on every call from DEADLINE_MS, keep a per-action retry table so click/submit/type get one
-  // attempt, read page state with snapshot before any retry, close a hung page with closePage before
-  // the next action, gate retries on UNAVAILABLE / DEADLINE_EXCEEDED and charge the budget once per
-  // accepted action.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   if (!ACTIONS.includes(action)) throw new Error(\`unknown action \${action}\`);
   for (let attempt = 0; attempt < RETRIES; attempt += 1) {
     try {
@@ -531,12 +497,7 @@ func (b *Budget) Charge() {
 	b.remaining--
 }
 
-// TODO: one global retry count and no deadline on any driver call, and a timed-out click is sent
-// again three times; a hung page is left open and the next action runs on it. Put a 15 s deadline on
-// every call from deadlineMS, keep a per-action retry table so click/submit/type get one attempt,
-// read page state with Snapshot before any retry, close a hung page with ClosePage before the next
-// action, gate retries on UNAVAILABLE / DEADLINE_EXCEEDED and charge the budget once per accepted
-// action.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func executeAction(ctx context.Context, session *Session, action, target string, stub DriverClient, budget *Budget) (string, error) {
 	if !actions[action] {
 		return "", fmt.Errorf("unknown action %s", action)
@@ -687,12 +648,7 @@ object DriverClient {
     def charge(): Unit
   }
 
-  // TODO: one global retry count and no deadline on any driver call, and a timed-out click is sent
-  // again three times; a hung page is left open and the next action runs on it. Put a 15 s deadline
-  // on every call from DeadlineMs, keep a per-action retry table so click/submit/type get one
-  // attempt, read page state with snapshot before any retry, close a hung page with closePage
-  // before the next action, gate retries on UNAVAILABLE / DEADLINE_EXCEEDED and charge the budget
-  // once per accepted action.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def executeAction(session: Session, action: String, target: String, stub: BrowserDriverStub, budget: Budget): String = {
     if (!Actions.contains(action)) throw new IllegalArgumentException(action)
     var attempt = 0
@@ -801,12 +757,7 @@ struct Budget {
   void charge() { remaining -= 1; }
 };
 
-// TODO: one global retry count and no deadline on any driver call, and a timed-out click is sent
-// again three times; a hung page is left open and the next action runs on it. Put a 15 s deadline on
-// every call from kDeadlineMs, keep a per-action retry table so click/submit/type get one attempt,
-// read page state with Snapshot before any retry, close a hung page with ClosePage before the next
-// action, gate retries on UNAVAILABLE / DEADLINE_EXCEEDED and charge the budget once per accepted
-// action.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::string execute_action(
     BrowserDriver::Stub* stub,
     Session& session,
@@ -934,9 +885,9 @@ std::string execute_action(
     },
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline: Date.now() + ms`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) and it comes from one constant — `DEADLINE_MS = 15_000`. One loop that sends every call with no timeout is the flaw: a driver that stops answering pins the worker.',
-    'Two gates make a retry legal: the action and the status. Keep a per-action table — `RETRYABLE_ACTIONS` = `navigate`, `snapshot`, `wait`, and `click`, `submit`, `type` get exactly one attempt — and treat only `UNAVAILABLE` and `DEADLINE_EXCEEDED` as retryable; a global `RETRIES = 3` applied to every action is what double-submits the form.',
-    'A timed-out side effect may already have run: `Snapshot` the page and compare the digest against the target before deciding anything — snapshot first, retry only if the page proves the click did not land — and `ClosePage` a hung session before the next action, charging the budget once per accepted action.',
+    'In production a slow checkout page submits the order twice, a bad selector is attempted three times before failing, and a page that stopped answering keeps receiving actions while the worker sits waiting.',
+    "execute_action sends stub.Act with no timeout, loops every action RETRIES times, catches every RpcError alike, and never looks at the page or the session's hung flag before sending the next attempt.",
+    'Pass timeout=DEADLINE_MS / 1000 on each call; gate attempts on RETRYABLE_ACTIONS and RETRYABLE_STATUS; Snapshot and compare state.digest before resending a click; ClosePage when session.hung before Act.',
   ],
-  debrief: `The interviewer is testing whether you can read a retry policy as a statement about side effects: which actions may be attempted twice, under whose clock, and what the first attempt may already have done when the deadline expires. The starter looks fine because the driver answers on the first attempt in every demo — nothing about the deadline, the per-action table or the hung page shows up until a click is slow, a status is permanent, or a page stops answering. The fix has three data-driven decisions: one deadline constant applied to every call, a per-action retry table so a click and a submit are never replayed, and a status gate that revisits only UNAVAILABLE and DEADLINE_EXCEEDED. The subtle one is the timed-out side effect: a gRPC deadline says the socket gave up, not that the click did not land, so the worker reads page state with Snapshot and only replays once the page proves the action never happened — and closes a hung page before it starts anything else on that session. Real workers add jittered backoff between attempts, a per-action idempotency key so the driver can dedupe a verified replay, a screenshot before and after each side effect as evidence, and a session-level breaker so a driver that keeps hanging is taken out of rotation instead of retried.`,
+  debrief: `The fix turns the retry policy into data: one deadline constant on every call, a per-action table that gives \`click\`, \`submit\` and \`type\` a single attempt, and a status set that retries only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. That shape follows from what a retry is: a statement about side effects. A gRPC deadline only says the socket gave up, not that the click failed to land, so the worker reads \`Snapshot\` first and replays only when the page digest proves the action never happened, and it closes a hung page before touching that session again. Production workers usually attach an idempotency key to each side-effecting action so the driver can dedupe a replay, and open a per-driver breaker so an instance that keeps hanging leaves rotation.`,
 };

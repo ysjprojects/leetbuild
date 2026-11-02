@@ -8,35 +8,27 @@ export const dependencyStep: Step = {
   focus: ['registry', 'sandbox', 'vault', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the sandbox is up it
-validates the candidate and the promotion goes through, so the demo ships. Every failure path
-promotes anyway. Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement the validation the registry runs on a candidate version before promotion — the work behind
-\`POST /v1/tools/{name}/versions/{version}/validate\`:
+**Starting point.** The starter is the validation the registry runs on a candidate version before
+promotion, behind \`POST /v1/tools/{name}/versions/{version}/validate\`. When the sandbox is up it
+validates the candidate and promotes, so the demo ships. It compiles and hides 5 flaws.
 
 - Every candidate is exercised in the **sandbox** over gRPC under a **10-second deadline**
-  (\`VALIDATE_DEADLINE_S\` / \`VALIDATE_DEADLINE_MS\` / \`validateDeadline\`). No deadline means one
-  wedged sandbox pins the worker that asked for the promotion.
-- The sandbox is dialled with **its own scoped credential** — the sandbox endpoint and token from
-  the sandbox config, carried as \`authorization\` metadata. The production provider credential never
-  reaches this path: the sandbox runs candidate code, so a credential handed to it is a credential
-  the candidate can spend.
-- A **timeout or any RPC error is a rejection, not a pass**: the version that is currently active
-  stays active, and the rejection is recorded with a visible reason
-  (\`verdicts.record(name, version, …)\`) so the operator can see why the candidate did not ship.
-- A **schema rejection** — the sandbox answers \`INVALID_ARGUMENT\` — is **terminal for that
-  version**: record the verdict, do not retry it, and answer a re-request for the same version from
-  the recorded verdict (\`verdicts.get(name, version)\`) instead of calling the sandbox again.
+  (\`VALIDATE_DEADLINE_S\` / \`VALIDATE_DEADLINE_MS\` / \`validateDeadline\`).
+- The sandbox is dialled with **its own scoped credential**: the sandbox endpoint and token from
+  config, carried as \`authorization\` metadata. The sandbox runs candidate code, so any credential
+  handed to it is one the candidate can spend.
+- A **timeout or any RPC error is a rejection, not a pass**: the active version stays active and
+  the rejection is recorded with a reason (\`verdicts.record(name, version, …)\`).
+- A **schema rejection** (\`INVALID_ARGUMENT\`) is **terminal for that version**: record it, do not
+  retry, and answer a re-request from \`verdicts.get(name, version)\`.
 - **Promotion happens only after a validation that returned OK**: \`catalog.promote(name, version,
-  actor)\` is reached by the OK branch, and by nothing else.
+  actor)\` is reached by the OK branch and by nothing else.
 
-**Failure mode the checks target.** Treating silence as consent is the whole bug: the starter reads a
-timeout as "the checks would surely have passed" and promotes, so a wedged sandbox ships a version
-nobody validated. The second is the credential: dialling the sandbox with the production provider
-key puts a live key in the process that runs the candidate's own code. The third is the retry on a
-schema rejection: the same bytes produce the same rejection, so the retry only turns a measured "no"
-into a load test against the sandbox.`,
+**Failure mode the checks target.** Treating silence as consent is the core bug: the starter reads a
+timeout as a pass and promotes, so a wedged sandbox ships a version nobody validated, and nothing
+bounds the wait. Next is the credential: dialling the sandbox with the production provider key puts
+a live key in the process that runs the candidate's code. Last is the retry on a schema rejection:
+the same bytes produce the same answer, so the retry only turns a measured "no" into a load test.`,
   sequence: {
     participants: ['Registry', 'Sandbox', 'Vault', 'Catalog'],
     messages: [
@@ -70,9 +62,9 @@ into a load test against the sandbox.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call: `timeout=VALIDATE_DEADLINE_S`, `deadline: Date.now() + VALIDATE_DEADLINE_MS`, `context.WithTimeout(ctx, validateDeadline)`, `withDeadlineAfter(ValidateDeadlineMs, …)`, `ctx.set_deadline(…)`. Wrapping the call in a timer changes nothing.',
-    'Credentials are per hop. Build the sandbox client from the sandbox endpoint and put the sandbox token in the call’s `authorization` metadata; the production credential belongs to the provider call, not to the process that runs candidate code. The starter’s `prod_metadata()` is the leak.',
-    'Sort the failure before you react to it. A transport failure (`DEADLINE_EXCEEDED` / `UNAVAILABLE`) leaves the active version alone and records the rejection with its reason; `INVALID_ARGUMENT` is a verdict on the version, so record it and stop. Check `verdicts.get(name, version)` before you call the sandbox, and let only the OK branch reach `catalog.promote(...)`.',
+    'Symptom: the sandbox hangs during a deploy and the candidate goes live anyway; a tool with a broken schema gets validated ten times in a row; the sandbox logs show the production provider key.',
+    'Mechanism: the call has no deadline, the `except`/`catch` branch falls through to `catalog.promote`, the metadata comes from `prod_metadata()`, and `INVALID_ARGUMENT` hits `continue` in the retry loop.',
+    'Fix: pass the 10-second deadline on the call, dial with the sandbox endpoint and `SANDBOX_TOKEN`, record every error via `verdicts.record` and return, check `verdicts.get` first, and let only `reply.ok` reach `catalog.promote`.',
   ],
   checks: [
     {
@@ -238,10 +230,7 @@ catalog = Catalog()
 
 
 def validate_candidate(name: str, version: str, actor: str) -> None:
-    # TODO: the sandbox call carries no deadline, it is dialled with the production provider
-    # credential, a schema rejection is retried and every other failure is treated as a pass. Make
-    # a timeout leave the active version alone with a recorded reason, dial the sandbox with its
-    # own token, make a schema rejection terminal, and promote only after the sandbox answers OK.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     request = sandbox_pb2.ValidateRequest(name=name, version=version)
     for _ in range(SCHEMA_RETRIES):
         try:
@@ -373,10 +362,7 @@ function prodMetadata(): grpc.Metadata {
 }
 
 export async function validateCandidate(name: string, version: string, actor: string): Promise<void> {
-  // TODO: the sandbox call carries no deadline, it is dialled with the production provider
-  // credential, a schema rejection is retried and every other failure is treated as a pass. Make a
-  // timeout leave the active version alone with a recorded reason, dial the sandbox with its own
-  // token, make a schema rejection terminal, and promote only after the sandbox answers OK.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < SCHEMA_RETRIES; attempt++) {
     const {promise, resolve, reject} = Promise.withResolvers<ValidateReply>();
     sandbox.Validate({name, version}, prodMetadata(), {}, (error, reply) =>
@@ -520,10 +506,7 @@ func (c *Catalog) Promote(ctx context.Context, name, version, actor string) erro
 
 var catalog = &Catalog{}
 
-// TODO: the sandbox call carries no deadline, it is dialled with the production provider
-// credential, a schema rejection is retried and every other failure is treated as a pass. Make a
-// timeout leave the active version alone with a recorded reason, dial the sandbox with its own
-// token, make a schema rejection terminal, and promote only after the sandbox answers OK.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func validateCandidate(ctx context.Context, client pb.SandboxClient, name, version, actor string) error {
 	request := &pb.ValidateRequest{Name: name, Version: version}
 	for attempt := 0; attempt < schemaRetries; attempt++ {
@@ -670,10 +653,7 @@ object ToolValidation {
     def promote(name: String, version: String, actor: String): Unit = ()
   }
 
-  // TODO: the sandbox call carries no deadline, it is dialled with the production provider
-  // credential, a schema rejection is retried and every other failure is treated as a pass. Make a
-  // timeout leave the active version alone with a recorded reason, dial the sandbox with its own
-  // token, make a schema rejection terminal, and promote only after the sandbox answers OK.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def validateCandidate(name: String, version: String, actor: String): Unit = {
     var attempt = 0
     var done = false
@@ -788,10 +768,7 @@ void add_prod_auth(grpc::ClientContext& ctx) {
   ctx.AddMetadata("authorization", "Bearer " + kProviderApiKey);
 }
 
-// TODO: the sandbox call carries no deadline, it is dialled with the production provider credential,
-// a schema rejection is retried and every other failure is treated as a pass. Make a timeout leave
-// the active version alone with a recorded reason, dial the sandbox with its own token, make a
-// schema rejection terminal, and promote only after the sandbox answers OK.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void validate_candidate(Sandbox::Stub* stub, const std::string& name, const std::string& version,
                         const std::string& actor) {
   ValidateRequest request;
@@ -884,5 +861,5 @@ Verdict validate_candidate(Sandbox::Stub* stub, const std::string& name, const s
 `,
     },
   },
-  debrief: `The interview question is what silence from a validation service means. There are two honest answers — refuse to release, or release behind a documented exception — and "the checks would surely have passed" is not one of them: an unevaluated version is a version nobody has evidence for. The deadline is what turns "unknown" into a fast, recorded decision, and recording it is what makes the refusal visible to the operator who asked. The credential rule is separate and non-negotiable: the sandbox executes candidate code, so it gets its own scoped token, and the production provider credential never leaves the request path — a leaked sandbox token costs one sandbox run, a leaked provider key costs the bill and the tenant data. Finally, a schema rejection is a verdict, not a transient failure: the same bytes produce the same answer, so retrying it only hides the decision the candidate earned, and a re-request for the same version must be answered from the record. Real registries add sandbox resource limits, carry a validation id onto the promotion, and expire verdicts so a tool is re-validated when the sandbox image changes.`,
+  debrief: `The fix has the shape of a verdict pipeline: a bounded call, a recorded outcome for every branch, and exactly one branch that reaches promotion. The deadline turns "unknown" into a fast, recorded decision; recording it makes the refusal visible to the operator who asked. The credential split is separate: the sandbox executes candidate code, so it gets a token whose blast radius is one sandbox run, while the provider key stays on the request path. A schema rejection is a property of the bytes, so the record of verdicts answers the re-request. Production validators go further: they run the candidate against recorded fixtures rather than one synthetic call, enforce sandbox resource limits, carry a validation id onto the promotion, and expire verdicts when the sandbox image changes.`,
 };

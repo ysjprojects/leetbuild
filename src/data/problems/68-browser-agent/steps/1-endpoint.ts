@@ -8,37 +8,17 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'profile'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the session route,
-decodes the body, mints a session id and answers 202 with the URL the caller asked for. It compiles,
-it serves the demo — a session that starts on a public page and stays there — and it hides four
-production flaws. Debug it like the owner of the browser platform, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter registers \`POST /v1/browser/sessions\` with body \`{"task": "…", "profile": "public-web", "start_url": "…", "max_steps": 20}\`, mints a session id and answers 202 with the caller's \`start_url\`. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/browser/sessions\` with body \`{"task": "…", "profile": "public-web", "max_steps": 20}\`.
+**Failure mode the checks target.** The starter takes the caller's \`start_url\` as the entry point and resolves no profile, so the advertised allowlist does not exist in code. Nothing re-checks a hop after the first, so a **302** to \`http://10.0.0.5/\` goes through and a refused hop leaves no trace. \`max_steps\` defaults to unlimited.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`task\` is a non-empty string of at most **4 KiB** (\`4 << 10\` bytes of UTF-8); anything larger is
-  **413**. The task text describes the job; it is never a destination.
-- \`profile\` names an **egress allowlist profile** that the server resolves against its own catalog
-  (\`EGRESS_PROFILES\`, each with \`schemes\`, \`hosts\` and an \`entry\` point). An unknown profile is
-  **400**, and the session starts at the profile's entry point — the request carries **no start URL**,
-  because a URL from the caller is a destination the caller chose.
-- \`max_steps\` is required and must be an integer from **1** to **60**; omitted or out of range is
-  **400**. A session without a budget is not a session.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the stored session instead of opening a second browser.
-- Every navigation is **re-validated against the profile at action time**, including each **redirect**
-  hop and each **subresource** the page pulls: \`authorize_navigation(profile, url)\` resolves scheme
-  and host, and an off-profile target is **blocked** and recorded with its reason — never followed
-  and never dropped silently.
-- Log the start with tenant, session id, budget and profile name — never the task text or a URL.
-
-**Failure mode the checks target.** The starter treats the caller's \`start_url\` as the session's entry
-point and never resolves a profile, so the allowlist the platform advertises does not exist in the
-code path that matters. It follows whatever the page sends next — a **302** to \`http://10.0.0.5/\` or
-an \`<img src>\` pointing at an internal service — because nothing re-checks a hop after the first one.
-It also lets \`max_steps\` default to "unlimited", so one task runs until someone notices the spend.
-None of it shows up in a demo where the page is friendly and the first URL is the only URL.`,
+- Tenant from the \`X-Tenant-Id\` header; missing is **401**.
+- \`task\` is a non-empty string of at most **4 KiB**; larger is **413**.
+- \`profile\` is resolved against \`EGRESS_PROFILES\` (\`schemes\`, \`hosts\`, \`entry\`). Unknown is **400**; the session starts at the profile's entry point and the request carries **no start URL**.
+- \`max_steps\` is required, an integer from **1** to **60**; omitted or out of range is **400**.
+- \`Idempotency-Key\` is required (**400** when missing); a retry with the same \`(tenant, key)\` returns the stored session.
+- Every navigation is **re-validated at action time**, redirect hops and subresources included: \`authorize_navigation(profile, url)\` resolves scheme and host; an off-profile target is **blocked** and recorded with its reason.
+- Log tenant, session id, budget and profile, not the task text or a URL.`,
   sequence: {
     participants: ['Client', 'Session API', 'Egress profiles', 'Session state'],
     messages: [
@@ -151,9 +131,7 @@ class SessionRequest(BaseModel):
 
 @app.post("/v1/browser/sessions")
 def start_session(body: SessionRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: the starter takes the caller's start_url as the session's entry point, resolves no egress
-    # profile, treats an omitted max_steps as unlimited, and validates nothing about a later redirect
-    # or subresource. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     session = {
         "session_id": str(uuid.uuid4()),
         "tenant": tenant,
@@ -320,9 +298,7 @@ interface SessionBody {
 }
 
 app.post('/v1/browser/sessions', async (request, reply) => {
-  // TODO: the starter takes the caller's startUrl as the session's entry point, resolves no egress
-  // profile, treats an omitted max_steps as unlimited, and validates nothing about a later redirect
-  // or subresource. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as SessionBody;
   const session = {
@@ -492,9 +468,7 @@ type sessionRequest struct {
 }
 
 func startSession(w http.ResponseWriter, r *http.Request) {
-	// TODO: the starter takes the caller's StartURL as the session's entry point, resolves no egress
-	// profile, treats an omitted MaxSteps as unlimited, and validates nothing about a later redirect
-	// or subresource. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	var body sessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
@@ -724,9 +698,7 @@ object SessionApi {
   val route: Route =
     path("v1" / "browser" / "sessions") {
       post {
-        // TODO: the starter takes the caller's startUrl as the session's entry point, resolves no
-        // egress profile, treats an omitted max_steps as unlimited, and validates nothing about a
-        // later redirect or subresource. Fix all four.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         entity(as[String]) { body =>
           val request = body.parseJson.asJsObject
           complete(
@@ -873,9 +845,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/browser/sessions", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the starter takes the caller's start_url as the session's entry point, resolves no egress
-    // profile, treats an omitted max_steps as unlimited, and validates nothing about a later redirect
-    // or subresource. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto body = json::parse(req.body);
     const auto tenant = req.get_header_value("X-Tenant-Id");
     res.status = 202;
@@ -1056,9 +1026,9 @@ int main() {
     },
   },
   hints: [
-    'A session takes a **policy**, not a destination. `profile` is a name the server resolves against its own catalog (`EGRESS_PROFILES`), and an unknown name is **400**. There is no start-URL field to trust: the session begins at the profile’s entry point, so the caller never names an address.',
-    'Authorize at action time, not at start time. One `authorize_navigation(profile, url)` helper resolves scheme and host against the profile, and **every** hop goes through it — the redirect follower and the subresource check included — so a `302` to `http://10.0.0.5/` cannot walk past the allowlist. When a hop is refused, record the URL and the reason on the session so the trace shows what the page tried.',
-    'A session without a budget is not a session: `max_steps` is mandatory, an integer from 1 to 60, and an unbounded browser session is how one task runs until someone notices the spend. Reject it with **400** rather than defaulting to “unlimited”.',
+    'The demo stays on a public site. Make the first page answer 302 to http://10.0.0.5/ and the agent follows it; the trace shows nothing blocked and the step counter runs on.',
+    'The handler copies start_url into the session, never consults EGRESS_PROFILES, and nothing between navigations checks the next hop. max_steps is Optional and stays None, which the loop treats as no limit.',
+    'Drop start_url, resolve profile against EGRESS_PROFILES (unknown is 400), require max_steps in MIN_STEPS..MAX_STEPS, add authorize_navigation used by follow_redirect and check_subresource, and record_block a refused hop with its reason.',
   ],
-  debrief: `The interviewer is testing whether you can debug a browser session start as a **policy** boundary rather than a convenience API. The starter reads fine because the demo sends a public URL and the page stays there. Four defects are being checked. First, the destination: a browser agent’s blast radius is everything the page can reach, so the caller names an egress *profile* and the server resolves it — an unknown profile is a 400, not a default. Second, re-validation at action time: checking the first URL and then trusting the page is how the agent walks into the intranet on the second hop, because redirects and subresources are the page’s own choices, not the caller’s. Third, the record: a blocked navigation has to leave a reason behind, or the operator sees a blank page and cannot tell a hostile redirect from a broken site. Fourth, the budget: an omitted \`max_steps\` must be a rejection, because “unlimited” is the only setting nobody can afford. Real platforms add per-profile rate limits, a separate profile for authenticated sessions, and a policy service so the allowlist changes without a deploy.`,
+  debrief: `The fix moves the destination decision from the caller to the server: a session names a profile, the server resolves it to an entry point, and every later hop is authorized against that profile at the moment the driver is asked to move. Redirects and subresources are the page's choices, not the caller's, so checking the first URL once proves nothing about the second. Recording a refused hop with its reason turns a blank page into an explainable trace, and a mandatory step budget turns an open-ended spend into a bounded one. Production browser platforms go further on the network side: egress leaves through a proxy that resolves DNS itself and refuses private ranges, so a hostname that re-resolves to 10.0.0.5 after the allowlist check still cannot reach it.`,
 };

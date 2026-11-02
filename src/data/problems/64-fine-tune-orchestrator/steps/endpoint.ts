@@ -8,33 +8,29 @@ export const endpointStep: Step = {
   focus: ['api', 'registry'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the body and returns
-a job id. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/finetune/jobs\`, reads the team from
+\`X-Team-Id\`, stores whatever the body carries (\`base_model\`, a raw \`dataset_file\`, the
+hyperparameter block, \`compute_budget\`) and returns a fresh job id. It serves the demo and hides
+four flaws.
 
-Implement \`POST /v1/finetune/jobs\` with body
-\`{"base_model": "…", "dataset_version": "…", "hyperparameters": {…}, "compute_budget": 1200}\`.
+**Failure mode the checks target.** A caller-supplied \`dataset_file\` bypasses registry provenance,
+so a fine-tune can train on an export nobody can reproduce. An unchecked hyperparameter key means
+"the same config" says nothing a year later. A zero budget reserves nothing and still runs. And an
+un-keyed submit launches a twin on every client retry, each reserving its own GPU budget.
 
-- The team comes from the authenticated \`X-Team-Id\` header; a missing team is **401**.
-- \`base_model\` is a **registered model version**; an unknown version is **400**.
-- \`dataset_version\` is a **registered dataset version**, never a path or a file name. A raw
-  reference such as \`"dataset_file": "s3://…"\` is **400** — the trainer may only read data the
-  registry has hashed and versioned. The job record stores the version id and its \`sha256\`.
-- \`hyperparameters\` is an object whose keys must all be in the base model's supported set
-  (\`learning_rate\`, \`lora_rank\`, \`lora_alpha\`, \`epochs\`, \`batch_size\`); an unknown key is
-  **400**. The whole block is stored verbatim and canonicalised into a \`config_hash\` so two jobs
-  with the same recipe hash identically.
-- \`compute_budget\` is a positive integer (**400** otherwise) and is stored verbatim on the job.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(team, key)\`
-  returns the original job instead of starting a second one.
-- Log the submission with team and job id — never the hyperparameter block.
+Body: \`{"base_model", "dataset_version", "hyperparameters": {…}, "compute_budget": 1200}\`.
 
-**Failure mode the checks target.** Trusting the caller's \`dataset_file\` bypasses registry
-provenance entirely, so a fine-tune can train on an unregistered export that nobody can reproduce.
-Accepting arbitrary hyperparameter keys lets a caller pass a knob the base model's recipe does not
-define, so "the same config" means nothing a year later. And an un-keyed submit endpoint starts a
-new job on every retry, so a flaky client quietly launches twins that each reserve their own GPU
-budget.`,
+- The team comes from \`X-Team-Id\`; a missing team is **401**.
+- \`base_model\` is a registered model version; unknown is **400**.
+- \`dataset_version\` is a registered dataset version, not a path; anything else is **400**. The job
+  stores the version id and its \`sha256\`.
+- Every \`hyperparameters\` key must be in the base model's supported set (\`learning_rate\`,
+  \`lora_rank\`, \`lora_alpha\`, \`epochs\`, \`batch_size\`); an unknown key is **400**. The block is
+  canonicalised into a \`config_hash\`.
+- \`compute_budget\` is a positive integer (**400** otherwise).
+- \`Idempotency-Key\` is required (**400** when missing); a retry with the same \`(team, key)\`
+  returns the original job.
+- Log team and job id, not the hyperparameter block.`,
   sequence: {
     participants: ['Client', 'Fine-tune API', 'Registry', 'Redis'],
     messages: [
@@ -148,9 +144,7 @@ class JobRequest(BaseModel):
 
 @app.post("/v1/finetune/jobs")
 async def create_job(body: JobRequest, x_team_id: str = Header(...)) -> JSONResponse:
-    # TODO: the dataset must be a registered version (not a raw file), the hyperparameters must be
-    # validated against the base model's supported set, and a replayed Idempotency-Key must return
-    # the original job instead of starting a new one.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     job_id = f"job-{len(jobs) + 1}"
     jobs[job_id] = {
         "id": job_id,
@@ -267,9 +261,7 @@ interface JobRequest {
 app.post('/v1/finetune/jobs', async (request, reply) => {
   const team = request.headers['x-team-id'] as string;
   const body = request.body as JobRequest;
-  // TODO: reject a raw dataset file unless it is a registered version, validate the hyperparameters
-  // against the base model's supported set, and replay the original job for a repeated
-  // Idempotency-Key instead of starting a new one.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const jobId = \`job-\${Date.now()}\`;
   await redis.set(\`job:\${jobId}\`, JSON.stringify({...body, team}));
   return reply.code(201).send({job_id: jobId});
@@ -373,9 +365,7 @@ func Register(mux *http.ServeMux) {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		// TODO: the dataset must be a registered version, the hyperparameters must be validated
-		// against the base model's supported set, and a replayed Idempotency-Key must return the
-		// original job instead of starting a new one.
+		// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 		team := r.Header.Get("X-Team-Id")
 		jobID := "job-" + team
 		jobs[jobID] = map[string]any{
@@ -503,8 +493,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 
 object Api {
-  // TODO: the dataset must be a registered version, the hyperparameters must be validated against
-  // the base model's supported set, and a replayed Idempotency-Key must return the original job.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   final case class JobRequest(
       baseModel: String,
       datasetFile: String,
@@ -599,8 +588,7 @@ using json = nlohmann::json;
 
 void Register(httplib::Server& svr) {
   svr.Post("/v1/finetune/jobs", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the dataset must be a registered version, the hyperparameters must be validated against
-    // the base model's supported set, and a replayed Idempotency-Key must return the original job.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body);
     json job = {
         {"id", "job-" + body["base_model"].get<std::string>()},
@@ -702,9 +690,9 @@ void Register(httplib::Server& svr) {
     },
   },
   hints: [
-    'The dataset field is a version id, not a path: resolve it against the registry and answer **400** for anything that is not a registered version.',
-    'The base model names the hyperparameters its recipe supports; a key outside that set means "the same config" is meaningless later, so reject it with **400**.',
-    'A retried submission carries the same `Idempotency-Key`; store the job under `(team, key)` and return the original instead of creating a twin.',
+    'A client that timed out and retried now owns two jobs, both burning budget, and one of them trains on an `s3://` export the registry has no record of.',
+    'The handler copies the body straight into the job record: no registry lookup for the dataset, no key check against `SUPPORTED_HYPERPARAMS`, no `<= 0` budget test, and nobody reads `Idempotency-Key`.',
+    'In `create_job`, resolve `dataset_version` via `registry.get_dataset`, reject keys outside `SUPPORTED_HYPERPARAMS` and `compute_budget <= 0` with 400, then `store.get`/`store.put` the job under `(team, key)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one team and never retries. Three separate defects are being checked: dataset provenance (only a registered version may be trained on), recipe reproducibility (the hyperparameter block must be a subset of what the base model supports, then hashed so equal recipes are equal), and idempotency keyed by team so a retry cannot launch a twin that reserves its own budget. The subtle one is the dataset: a path looks convenient in a demo, but without the registry's hash and version nothing about the run can be reproduced. Real orchestrators also pin the tokenizer, the training image digest and the random seed, and record all of them in the config hash.`,
+  debrief: `The fix has this shape because a submission is the only place where reproducibility can still be enforced cheaply: once the trainer starts, a dataset without a registry hash or a knob the recipe does not define is already baked into a week of GPU time. Resolving the version, restricting the hyperparameter keys and hashing the block make two equal recipes hash equal; the idempotency store keyed by team keeps a retry from paying for the same recipe twice; the budget check keeps a zero reservation from starting a real job. Production orchestrators go further on the same axis: the tokenizer version, the training image digest and the random seed are pinned and folded into the config hash.`,
 };

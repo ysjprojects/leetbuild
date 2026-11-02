@@ -8,34 +8,29 @@ export const refundEventsStep: Step = {
   focus: ['api', 'bus', 'outbox', 'reconciler'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event on the
-happy path and the reconciler's counters move, so the demo looks finished. Three production
-contracts are broken. Find them, fix them, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/refunds/{refund_id}/publish\`: it builds an
+event from the body's \`customer_id\` and free-text \`note\` with status \`refund.succeeded\`,
+produces it to \`refund.event\` keyed by the customer with a default \`Producer\`, flushes and
+answers \`{"accepted": true}\`. It compiles and hides five flaws.
 
-Implement the publisher for the refund lifecycle on the \`refund.event\` topic:
+**Failure mode the checks target.** Keying by customer loses per-payment ordering; publishing
+before the PSP is called puts a success in the stream for a refund that may not settle; the
+payload carries a customer note but no amount, reason code or PSP reference; a default producer
+duplicates on its own retries; and a dropped produce error means the refund exists in the database
+and nowhere else.
 
-- Publish exactly one \`refund.event\` per refund with the **payment id as the message key**:
-  partitioning by payment keeps one payment's refund lifecycle ordered, so a partial refund can
-  never be replayed after the refund that completed the payment. The starter keys by customer, so one
-  payment's events interleave with every other payment that customer owns.
-- Publish **only after the PSP confirmed** the refund: announce nothing you do not have yet. The
-  starter publishes a success event before the provider call, and the topic then carries a success
-  that never happened.
-- The payload carries ids and money — \`refund_id\`, \`payment_id\`, \`amount_minor\`,
-  \`reason_code\`, \`psp_ref\`, \`status\` — and nothing else about the customer. Never card data,
-  customer name or a free-text note: the topic is retained for days and replicated.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
-  with hashed keys), so a produce retry cannot duplicate a refund event and reconcile a refund
-  twice.
-- When the broker rejects the produce, insert an **outbox row** instead of dropping the event; a
-  relay republishes it when the broker recovers. The starter discards the produce error.
-- The consumer — the reconciliation worker — only rebuilds the ledger once the event is safely
-  handled, so a crash replays an event rather than losing it.
+Requirements:
 
-**Failure mode the checks target.** Keying by customer loses per-payment ordering; publishing before
-the PSP confirms puts a success in the stream for a refund that may never settle; an unconfigured
-producer duplicates on retry; and a dropped produce error means the refund exists in the database
-and nowhere else.`,
+- One \`refund.event\` per refund with the **payment id as the message key**, so one payment's
+  lifecycle stays on one partition and in order.
+- Call \`refund_via_psp\` first and produce **only after the PSP confirmed** the refund.
+- The payload carries \`refund_id\`, \`payment_id\`, \`amount_minor\`, \`reason_code\`,
+  \`psp_ref\` and \`status\`, and nothing else about the customer: the topic is retained and
+  replicated.
+- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` plus \`acks\`, or the
+  stack's equivalent), so a produce retry cannot duplicate a refund event.
+- When the broker rejects the produce, insert an **outbox row** (\`insert_outbox\`) in the error
+  branch instead of dropping the event; a relay republishes it when the broker recovers.`,
   sequence: {
     participants: ['Refund API', 'PSP', 'refund.event', 'Reconciler', 'Redis ledger'],
     messages: [
@@ -112,7 +107,7 @@ and nowhere else.`,
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` plus `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. A produce retry must not duplicate a refund event.',
+        'The producer is configured for idempotence and `acks=all`: `enable.idempotence` plus `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. A produce retry must not duplicate a refund event.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -168,9 +163,7 @@ class RefundRequest(BaseModel):
 
 @app.post("/v1/refunds/{refund_id}/publish")
 def publish(refund_id: str, body: RefundRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter keys by customer instead of the payment, publishes the success before the PSP
-    # has confirmed anything, writes the customer's note into a retained topic, and drops the
-    # produce error instead of falling back to the outbox. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {"id": refund_id, "customer_id": body.customer_id, "note": body.note, "status": "refund.succeeded"}
     logger.info("refund event customer=%s note=%r", body.customer_id, body.note)
     producer.produce("refund.event", key=body.customer_id, value=json.dumps(event))
@@ -264,9 +257,7 @@ interface PublishBody {
 
 app.post('/v1/refunds/:refundId/publish', async (request, reply) => {
   const body = request.body as PublishBody;
-  // TODO: this starter keys by customer instead of the payment, publishes the success before the PSP
-  // has confirmed anything, writes the customer's note into a retained topic, and drops the produce
-  // error instead of falling back to the outbox. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {id: body.refund_id, customer_id: body.customer_id, note: body.note ?? '', status: 'refund.succeeded'};
   request.log.info({customer_id: body.customer_id}, 'refund event');
   await producer.send({
@@ -359,9 +350,7 @@ type PublishBody struct {
 	Note       string \`json:"note"\`
 }
 
-// TODO: this starter keys by customer instead of the payment, publishes the success before the PSP has
-// confirmed anything, writes the customer's note into a retained topic, and drops the produce error
-// instead of falling back to the outbox. Fix all four.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func publish(ctx context.Context, body PublishBody) error {
 	event := map[string]any{
 		"id":          body.RefundID,
@@ -450,9 +439,7 @@ object Events {
     def insertOutbox(paymentId: String, payload: String): Unit = ()
   }
 
-  // TODO: this starter keys by customer instead of the payment, publishes the success before the PSP
-  // has confirmed anything, writes the customer's note into a retained topic, and drops the produce
-  // error instead of falling back to the outbox. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publish(refundId: String, customerId: String, paymentId: String, note: String): Unit = {
     val event =
       Map("id" -> refundId, "customer_id" -> customerId, "note" -> note, "status" -> "refund.succeeded").toJson.compactPrint
@@ -522,9 +509,7 @@ struct OutboxStore {
 
 OutboxStore store;
 
-// TODO: this starter keys by customer instead of the payment, publishes the success before the PSP has
-// confirmed anything, writes the customer's note into a retained topic, and drops the produce error
-// instead of falling back to the outbox. Fix all four.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publish(
     const std::string& refundId,
     const std::string& customerId,
@@ -614,9 +599,9 @@ void publish(
     },
   },
   hints: [
-    'The message key is the partition key: `key=payment_id`, `Key: []byte(paymentID)`, `key: paymentId`, `ProducerRecord("refund.event", paymentId, …)`. Keyed by the customer, one payment’s refund events land in different partitions and their order stops being guaranteed.',
-    'Publish after the provider answers: call the PSP client first and only produce once the outcome is `CONFIRMED`. A success event published before the confirmation is a message the reconciler cannot take back.',
-    'Idempotence is producer configuration — `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with hashed routing. Wrap the produce and, when the broker rejects it, `insert_outbox(payment_id, event)`: the outbox is the durability half of the same contract.',
+    'Symptom: the reconciler sees a partial refund replayed after the full one; a refund the PSP rejected shows as succeeded in the stream; during a broker outage refunds vanish from the topic.',
+    'Mechanism: `key=body.customer_id` spreads one payment across partitions; `produce` runs before any PSP call; `Producer({"bootstrap.servers": ...})` has no idempotence; `produce`/`flush` run with no `except`.',
+    'Change: call `refund_via_psp` first, then `produce("refund.event", key=body.payment_id, …)` with `amount_minor`, `reason_code`, `psp_ref`; configure `enable.idempotence` and `"acks": "all"`; wrap in `except KafkaException` → `insert_outbox`.',
   ],
-  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by payment and one payment’s refund lifecycle arrives in order — which is what lets the reconciler rebuild a balance — while keying by customer interleaves every payment that customer owns. Second, publish-after-confirm: the stream is a record of what happened, so an event produced before the provider answers is a lie that the ledger will later disagree with. Third, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for its own retries, and the broker is not a database, so a rejected produce goes to the outbox for a relay to republish. Real platforms add a schema registry so a future producer cannot smuggle customer text into a retained topic, plus a dead-letter path and a lag alarm on the reconciliation group.`,
+  debrief: `The message key is an ordering contract: partition by payment and one payment's refund lifecycle arrives in order, which is what lets the reconciler rebuild a balance, while keying by customer interleaves every payment that customer owns. Publishing after the PSP confirms keeps the stream a record of what happened rather than a prediction the ledger will later contradict, and carrying the amount and provider reference lets a consumer act without a second lookup. Exactly-once looking code is not exactly-once: the producer needs idempotence and \`acks=all\` for its own retries, and the broker is not a database, so a rejected produce goes to the outbox for a relay. Production platforms also enforce a schema on the topic and alarm on consumer lag for the reconciliation group.`,
 };

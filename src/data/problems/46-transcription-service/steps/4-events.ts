@@ -8,37 +8,31 @@ export const transcriptionEventsStep: Step = {
   focus: ['worker', 'redactor', 'kafka', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: every chunk worker publishes a
-\`transcript.segment\` record and the topic looks healthy in the console. It hides four flaws, and two
-of them are the kind that never show in a demo — segments of one job come out shuffled, and the raw
-text of a customer's audio lands in a retained topic. Debug it, fix it, and prove the fix.
+**Starting point.** The starter's \`publish_segment\` builds a JSON payload of job id, chunk index,
+text and timestamps, produces it to \`transcript.segment\` keyed by the chunk index through a bare
+producer, flushes, and then calls the redactor. It compiles, it serves the demo, and it hides five
+flaws.
+
+**Failure mode the checks target.** Kafka orders records per partition, and the key is the only
+thing that decides the partition, so a key of \`chunk_index\` throws away per-job ordering for free.
+The redaction order is the second half of the same sentence: a topic is the longest-lived copy of a
+transcript you own, so publishing before the redaction pass writes the raw audio transcript into
+storage that no buffer TTL will reclaim. The rest is what a demo cannot show: a produce the broker
+rejected, a leader failover, a line with no speaker.
 
 Each finished chunk publishes one \`transcript.segment\` record:
 
-- **Keyed by job id.** The key decides the partition, so every segment of one job lands on one
-  partition in produce order and the consumer reassembles the transcript without sorting. The starter
-  keys by \`chunk_index\`, so segments from concurrent jobs interleave on the same partition and one
-  job's segments scatter across many.
-- **Redaction runs before the produce.** The worker sends the segment to the redactor and only the
-  *redacted* text goes into the record. The starter produces first and calls the redactor afterwards,
-  so a topic that is retained and replicated long outlives the buffer TTL holding a copy of the raw
-  transcript. Order is the whole point: redact, then produce.
-- **The payload carries timestamps and the speaker label.**
-  \`{"job_id", "chunk_index", "text", "start_s", "end_s", "speaker_label"}\` — the offsets let the read
-  path assemble a transcript with timings and attribute each line to a speaker. The starter ships
-  \`text\` and timestamps but drops \`speaker_label\`, so every diarized line loses its speaker.
-- **An outbox row on rejection.** If the producer rejects the record — broker down, acks not met —
+- **Keyed by job id**, so every segment of one job lands on one partition in produce order and the
+  consumer reassembles the transcript without sorting.
+- **Redaction runs before the produce.** The worker sends the text to the redactor and only the
+  *redacted* text goes into the record.
+- **The payload carries timestamps and the speaker label**:
+  \`{"job_id", "chunk_index", "text", "start_s", "end_s", "speaker_label"}\`.
+- **An outbox row on rejection.** If the producer rejects the record (broker down, acks not met),
   \`INSERT INTO outbox (id, topic, key, payload)\` so the segment survives and the relay publishes it
-  later. The starter logs the failure and drops the event: the chunk is marked complete in Redis and
-  the transcript silently loses a minute.
-- **A durable producer.** \`acks=all\` and the idempotent producer: a segment must survive a broker
-  failover, and the producer's own retries must not publish the same segment twice.
-
-**Failure mode the checks target.** Kafka orders records per partition, and the key is the only
-thing that decides the partition — a key of \`chunk_index\` throws away per-job ordering for free.
-The redaction order is the second half of the same sentence: a topic is the longest-lived copy of a
-transcript you own, so publishing before the redaction pass writes the un-redacted audio transcript
-into storage that no buffer TTL will ever reclaim.`,
+  later.
+- **A durable producer.** \`acks=all\` and the idempotent producer, so a segment survives a broker
+  failover and the producer's own retries do not publish it twice.`,
   sequence: {
     participants: ['Chunk worker', 'Redactor', 'transcript.segment topic', 'jobs store'],
     messages: [
@@ -158,9 +152,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_segment(job_id: str, chunk_index: int, text: str, start_s: float, end_s: float) -> None:
-    # TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
-    # redaction pass runs, drops the event when the broker rejects the produce, and leaves the
-    # speaker label out of the payload.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = json.dumps(
         {
             "job_id": job_id,
@@ -241,9 +233,7 @@ export async function publishSegment(
   end_s: number,
 ): Promise<void> {
   await producer.connect();
-  // TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
-  // redaction pass runs, drops the event when the broker rejects the produce, and leaves the
-  // speaker label out of the payload.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: TOPIC,
     messages: [
@@ -305,9 +295,7 @@ const topic = "transcript.segment"
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
 func publishSegment(ctx context.Context, cur *sql.DB, jobID string, chunkIndex int, text string, startS, endS float64) error {
-	// TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
-	// redaction pass runs, drops the event when the broker rejects the produce, and leaves the
-	// speaker label out of the payload.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{
 		"job_id":      jobID,
 		"chunk_index": chunkIndex,
@@ -380,9 +368,7 @@ object TranscriptEvents {
   props.put("bootstrap.servers", "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
-  // redaction pass runs, drops the event when the broker rejects the produce, and leaves the
-  // speaker label out of the payload.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publishSegment(jobId: String, chunkIndex: Int, text: String, startS: Double, endS: Double): Unit = {
     val payload = s"""{"job_id":"$jobId","chunk_index":$chunkIndex,"text":"$text","start_s":$startS,"end_s":$endS}"""
     producer.send(new ProducerRecord[String, String](Topic, chunkIndex.toString, payload))
@@ -441,9 +427,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 
 auto producer = make_producer();
 
-// TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
-// redaction pass runs, drops the event when the broker rejects the produce, and leaves the
-// speaker label out of the payload.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publish_segment(pqxx::work& tx, const std::string& job_id, int chunk_index, const std::string& text, double start_s, double end_s) {
   const std::string key = std::to_string(chunk_index);
   const std::string payload =
@@ -498,21 +482,9 @@ void publish_segment(pqxx::work& tx, const std::string& job_id, int chunk_index,
     },
   },
   hints: [
-    'The key is the ordering contract. Kafka orders records per partition and the key is the only thing that picks the partition, so key by `job_id`: every segment of one job lands on one partition in produce order. Keying by `chunk_index` puts chunk 7 of every job on the same partition and scatters one job’s transcript across the topic.',
-    'Order of operations is the security property here. Send the text to the redactor first and produce the *returned* text: a topic is retained and replicated long after the buffer that held the raw audio transcript, so producing first writes the un-redacted text into the longest-lived copy you own. The payload still needs `start_s`, `end_s` and `speaker_label` so the read path can time and attribute each line.',
-    'A rejected produce must not be a lost minute. Wrap the `produce`/`send`/`WriteMessages` call and, on failure, `INSERT INTO outbox (id, topic, key, payload)` — the row id `job_id:chunk_index` keeps the retry idempotent and the relay you already have for step 2 ships it. Configure `acks=all` and `enable.idempotence=true` so a leader failover and the producer’s own retries are both safe.',
+    "Symptom: a consumer rebuilding one job reads its segments interleaved with other jobs' and out of order, a compliance scan finds raw card numbers in the retained topic, and diarized lines have no speaker.",
+    'Mechanism: the key is `str(chunk_index)`, so the partition follows the chunk, not the job; `redactor.redact` runs after `produce`, on text already sent; nothing guards the send and the producer uses default acks.',
+    'Change: `key=job_id`; `text = redactor.redact(text)` before `produce`; add `speaker_label` to the payload; wrap the produce in try/except and `INSERT INTO outbox (id, topic, key, payload)` on failure; configure `acks=all`, `enable.idempotence=true`.',
   ],
-  debrief: `The interview question behind this step is what the key buys you. Kafka gives per-partition
-ordering for free, and the key is the only lever on the partition, so keying a transcript segment by
-\`chunk_index\` throws away the one guarantee the consumer needs — it now has to sort by timestamp and
-hope the clocks agree. Keying by \`job_id\` means the consumer reads one job's segments in produce order
-without any reordering, and it costs nothing. The second defect is the one that becomes an incident
-rather than a bug report: publishing before redaction writes raw customer audio text into the topic,
-the most retained and most replicated copy of the transcript in the system. Order matters more than
-the redactor's accuracy, because the buffer TTL does not reach the topic. The third is the classic
-produce-without-outbox: catching the broker error and logging it converts a transient failure into a
-permanently short transcript, while the chunk stays marked complete in Redis — so the read path
-reports "done" on a file that lost a minute. The outbox row is what makes "the segment exists iff the
-chunk was transcribed" true, and \`acks=all\` plus idempotence is what makes the retry that follows
-safe.`,
+  debrief: `The key carries ordering because Kafka orders only within a partition and the key is the only lever on partition choice; keyed by \`job_id\`, one job's segments arrive in produce order and the consumer does no sorting. Redaction runs before the produce because the topic is the most retained copy of the transcript in the system and no buffer TTL reaches it, so the order of two calls decides whether raw speech is stored for the topic's lifetime. The outbox row turns a rejected produce from a lost minute into a deferred one, which keeps "the segment exists if the chunk was transcribed" true; \`acks=all\` plus idempotence makes the retry that follows safe. Production pipelines also version the payload schema so consumers can tell old segments from new.`,
 };

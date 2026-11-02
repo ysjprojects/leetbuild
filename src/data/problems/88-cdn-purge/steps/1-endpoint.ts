@@ -8,39 +8,18 @@ export const endpointStep: Step = {
   focus: ['client', 'purge', 'tenant'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route,
-reads the body and hands the paths to the provider. It compiles, it purges the demo domain, and
-it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter serves \`POST /v1/purges\` with body \`{"domain": "shop.example.com", "paths": ["/pricing", "/img/*"], "reason": "…"}\`: it reads the body, hands the paths to the provider and answers \`200 queued\`. It purges the demo domain and hides five flaws.
 
-Implement \`POST /v1/purges\` with body \`{"domain": "shop.example.com", "paths": ["/pricing", "/img/*"], "reason": "…"}\`.
+**Failure mode the checks target.** Nothing stands between a caller and the provider. A wildcard from a normal token fans a domain-wide purge out to every edge POP and stamps the origin; one body can carry an unbounded path list; a client retrying after a timeout submits the same batch twice; and the response says done before anything reached an edge.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`domain\` must be one of the tenant's own domains (\`owns_domain\`) — a domain that belongs to
-  another tenant is **403**, never a purge.
-- \`paths\` is a non-empty list of at most **500** entries (\`MAX_PATHS\`), each a string starting
-  with \`/\`; an empty list, an over-long list or a malformed path is **400**.
-- Duplicate entries inside one request are collapsed before anything is sent (\`dedupe_paths\`),
-  and the duplicates are reported back so the caller can see what it sent twice.
-- **Wildcards are a privilege, not a parameter.** A pattern containing \`*\` needs the elevated
-  scope \`purge:wildcard\`; a whole-domain pattern (\`/*\`) needs \`purge:domain\`. Scopes arrive in
-  \`X-Purge-Scope\` as a comma-separated list; a wildcard request without the matching scope is
-  **403** and the provider is never called. A normal user token purging an entire domain is the
-  outage this endpoint exists to prevent.
-- \`Idempotency-Key\` is required (**400** when missing). A replay with the same
-  \`(tenant, key)\` returns the **original** purge — same \`purge_id\`, same paths — instead of
-  submitting the batch to the provider a second time.
-- A new purge answers **202** with \`{"purge_id", "status": "accepted", "domain", "paths",
-  "wildcard", "duplicates"}\`. Queued is not propagated: this endpoint only promises that the
-  purge was accepted and recorded.
+- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
+- \`domain\` must be one of the tenant's own domains (\`owns_domain\`); another tenant's domain is **403**.
+- \`paths\` is a non-empty list of at most **500** entries (\`MAX_PATHS\`), each starting with \`/\`; otherwise **400**. Duplicates are collapsed (\`dedupe_paths\`) and reported back.
+- A pattern containing \`*\` needs the scope \`purge:wildcard\`; \`/*\` needs \`purge:domain\`. Scopes arrive comma-separated in \`X-Purge-Scope\`; without the matching scope the request is **403** before any provider call.
+- \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(tenant, key)\` returns the **original** purge without a second submission.
+- A new purge answers **202** with \`{"purge_id", "status": "accepted", "domain", "paths", "wildcard", "duplicates"}\`.
 
-:::widget idempotency {}
-
-**Failure mode the checks target.** The starter treats the wildcard as ordinary input, so one
-request from a normal token fans a domain-wide purge out to every edge POP and stamps the origin.
-It never bounds \`paths\`, so a single body can hold a whole year of URLs. And it re-runs the
-whole purge on every retry of the same \`Idempotency-Key\`, doubling provider calls in exactly the
-situation — a client retrying after a timeout — where the first batch already went out.`,
+:::widget idempotency {}`,
   sequence: {
     participants: ['Client', 'Purge API', 'tenant registry', 'CDN provider'],
     messages: [
@@ -186,10 +165,7 @@ providers = PurgeProvider()
 
 @app.post("/v1/purges")
 def create_purge(body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
-    # any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
-    # three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a
-    # replay from the stored purge instead of calling the provider again.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     purge = {
         "purge_id": str(uuid.uuid4()),
         "status": "queued",
@@ -369,10 +345,7 @@ const providers = {
 };
 
 app.post('/v1/purges', async (request, reply) => {
-  // TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
-  // any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
-  // three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a replay
-  // from the stored purge instead of calling the provider again.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as PurgeBody;
   const purge = {purge_id: randomUUID(), status: 'queued', domain: body.domain, paths: body.paths};
@@ -567,10 +540,7 @@ func createPurge(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
-	// any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
-	// three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a replay
-	// from the stored purge instead of calling the provider again.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	purge := Purge{PurgeID: uuid.NewString(), Status: "queued", Domain: body.Domain, Paths: body.Paths}
 	_ = provider.SubmitPurge(r.Context(), purge.PurgeID, body.Domain, body.Paths)
 	_ = tenant
@@ -809,10 +779,7 @@ object PurgeApi {
       post {
         optionalHeaderValueByName("X-Tenant-Id") { tenant =>
           entity(as[PurgeRequest]) { body =>
-            // TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path
-            // list of any size, and re-runs the whole purge when the same Idempotency-Key is
-            // replayed. Fix all three: gate wildcards behind the elevated scope, cap and dedupe
-            // the paths, and answer a replay from the stored purge instead of calling the provider.
+            // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
             val purge = Purge(UUID.randomUUID().toString, "queued", body.domain, body.paths)
             provider.submitPurge(purge.purge_id, body.domain, body.paths)
             complete(StatusCodes.OK, purge)
@@ -970,10 +937,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
-    // any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
-    // three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a replay
-    // from the stored purge instead of calling the provider again.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto domain = body.value("domain", std::string());
     const auto paths = body.value("paths", std::vector<std::string>());
     const json purge = {{"purge_id", uuidString()}, {"status", "queued"}, {"domain", domain}, {"paths", paths}};
@@ -1147,9 +1111,11 @@ int main() {
     },
   },
   hints: [
-    'Order the guard clauses by cost, and put the expensive one — the provider call — last: tenant (401), Idempotency-Key (400), domain shape (400), ownership (403), path count and shape (400), dedupe, wildcard scope (403), idempotency lookup, then submit.',
-    'Wildcards are two privileges, not one: `purge:wildcard` covers patterns inside a domain, `purge:domain` covers `/*`. Parse `X-Purge-Scope` as a comma-separated set, compute the scope the request needs from the paths, and reject with 403 when the caller does not hold it — before anything reaches the provider.',
-    'The idempotency lookup must come before the submission, and it must return the *stored* purge so the replayed response carries the original `purge_id`. Storing after the provider call is fine as long as the record is written once and the replay path never submits again.',
+    'A deploy script retries after a timeout and the provider receives the same batch twice; a normal token sends `/*` and every edge misses at once against the origin.',
+    'The handler builds the purge and calls `SubmitPurge` first; no guard runs before it. Tenant, ownership, `X-Purge-Scope`, the path cap and the `Idempotency-Key` lookup are all absent, and the response says `queued`.',
+    'Before `SubmitPurge`: `owns_domain` (403), `MAX_PATHS` plus `dedupe_paths` (400), `has_wildcard` against `WILDCARD_SCOPE`/`DOMAIN_SCOPE` (403), then `store.get` under `(tenant, key)`; answer `STATUS_ACCEPTED` with 202.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo purges one literal path on the tenant's own domain. Three separate defects are being checked: authorization granularity (which the wildcard check measures — a normal token must not be able to turn one request into a domain-wide origin stampede), input caps and dedupe (cheap rejections that keep one body from carrying a year of URLs, plus collapsing what the caller sent twice), and idempotency keyed by \`(tenant, key)\` so the retry of a deploy purge returns the first purge instead of doubling provider calls. Real control planes add a per-tenant purge budget, a domain allowlist that ops can lock during a launch, and an audit row for every wildcard that was granted — the three things the later steps of this course build.`,
+  debrief: `The fix has its shape because a purge is a capability, not a parameter. Every guard sits in front of the provider call and runs in cost order: tenant, key, ownership, path shape, scope, then the idempotency lookup, so nothing irreversible happens for a request that was never allowed. The \`(tenant, key)\` lookup returns the stored purge, so a retry after a timeout is a read rather than a second batch. The \`202\` states only what is true: accepted and recorded.
+
+Production control planes go further. A wildcard grant is audited as its own row, ops can freeze a domain during a launch, and the per-domain budget that keeps a deploy loop off the origin lives in shared state. The next step builds that budget.`,
 };

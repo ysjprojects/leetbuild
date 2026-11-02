@@ -8,31 +8,27 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'coverage'],
   task: `## Task
 
-**Starting point.** The starter is working code: a report arrives, the counter goes up and the
-caller gets a total. It compiles, it serves the demo, and it hides four production flaws. Debug it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the Redis layer behind \`POST /v1/usage\`: \`apply_usage\` reads the
+account's counter with \`GET\`, compares it to the plan cap, refuses with \`429\` when over, and
+otherwise \`INCRBY\`s the counter in a second call and returns the total. It compiles, serves the
+demo and hides five flaws.
 
-Implement the Redis metering layer used by \`POST /v1/usage\`.
+**Failure mode the checks target.** A crash or a concurrent writer between the read and the
+increment loses a report and leaves the total apart from any record; the key has no expiry and no
+hour bucket, so the "hour" never ends; and the cap check refuses traffic, so a Redis hiccup becomes
+a \`429\` storm on a path that was only supposed to count.
 
 - Each account gets one counter per hour: the key is \`usage:{account}:{window}\`, where \`window\` is
-  \`floor(unix_seconds / WINDOW_SECONDS)\` with \`WINDOW_SECONDS = 3600\`. An account-less key leaks
-  one account's usage into another's; a window-less key never resets.
-- One **atomic Lua script** must increment the window's units (\`HINCRBY\`), set the window's expiry
-  (\`EXPIRE\`) when the key is created, and compare the running total against the plan cap — all in a
-  single round trip. A \`GET\` followed by a separate \`INCRBY\` leaves a window where a crash loses
-  the report and two writers disagree about the total.
-- **Metering observes; it does not block.** When the total passes the plan cap the script writes an
-  \`overage\` flag into the window and returns it; it must never refuse the report and must never
-  answer with \`429\`. A metering outage must not become an availability outage.
-- The usage record — the request id, the account, the route, the units and the gateway — commits in
-  the **same script** as the counters, so the row and the total can never disagree after recovery.
+  \`floor(unix_seconds / WINDOW_SECONDS)\` with \`WINDOW_SECONDS = 3600\`.
+- One **atomic Lua script** increments the window's units (\`HINCRBY\`), sets the window's expiry
+  (\`EXPIRE\`) when the key is created, and compares the running total against the plan cap, all in
+  a single round trip.
+- **Metering observes; it does not block.** Past the plan cap the script writes an \`overage\` flag
+  into the window and returns it; the report is still counted and nothing answers \`429\`.
+- The usage record (request id, account, route, units, gateway) commits in the **same script** as
+  the counters, so the row and the total cannot disagree after recovery.
 - The layer returns the window total, the cap and whether the account is over, so the API can report
-  cap state without gating traffic.
-
-**Failure mode the checks target.** The starter reads the counter, decides, then increments in a
-separate call — a crash between the two loses the report and leaves the row and the total apart; the
-key has no expiry, so the "hour" never ends; and the cap check refuses the request, so the first
-Redis hiccup turns into a \`429\` storm on a path that was only supposed to count.`,
+  cap state without gating traffic.`,
   sequence: {
     participants: ['Metering API', 'Redis', 'Plan coverage'],
     messages: [
@@ -65,7 +61,7 @@ Redis hiccup turns into a \`429\` storm on a path that was only supposed to coun
       id: 'expire',
       title: 'Window key expires on its boundary',
       detail:
-        'The script sets the window key’s expiry (`EXPIRE`) from the window length when it creates it. Without a TTL the "hour" never ends and an account’s usage only ever grows. The starter never sets one.',
+        'The script sets the window key’s expiry (`EXPIRE`) from the window length when it creates it. Without a TTL the "hour" never ends and an account’s usage only ever grows. The starter sets none.',
       match: {
         python: {all: [/EXPIRE/, /WINDOW_SECONDS/]},
         typescript: {all: [/EXPIRE/, /WINDOW_SECONDS/]},
@@ -124,10 +120,7 @@ PLAN_CAP = 1_000_000
 
 
 def apply_usage(account: str, request_id: str, route: str, units: int, gateway: str) -> dict:
-    # TODO: this starter reads the counter with GET and refuses the report at the plan cap with a 429,
-    # increments with INCRBY in a separate call so a crash loses the report, leaves the key without
-    # a TTL so the hour never ends, and keys by account alone instead of the hour window. Fix all
-    # of it: metering observes, it does not block.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"usage:{account}"
     total = int(r.get(key) or 0)
     if total + units > PLAN_CAP:
@@ -198,10 +191,7 @@ export interface WindowResult {
 }
 
 export async function applyUsage(account: string, units: number): Promise<WindowResult> {
-  // TODO: this starter reads the counter with GET and refuses the report at the plan cap with a 429,
-  // increments with INCRBY in a separate call so a crash loses the report, leaves the key without
-  // a TTL so the hour never ends, and keys by account alone instead of the hour window. Fix all
-  // of it: metering observes, it does not block.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = \`usage:\${account}\`;
   const total = Number((await r.get(key)) ?? 0);
   if (total + units > PLAN_CAP) {
@@ -292,10 +282,7 @@ const planCap = 1_000_000
 var errPlanCapReached = errors.New("plan cap reached")
 
 func ApplyUsage(ctx context.Context, account, requestID, route string, units int, gateway string) (map[string]any, error) {
-	// TODO: this starter reads the counter with GET and refuses the report at the plan cap with a 429,
-	// increments with INCRBY in a separate call so a crash loses the report, leaves the key without
-	// a TTL so the hour never ends, and keys by account alone instead of the hour window. Fix all
-	// of it: metering observes, it does not block.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := "usage:" + account
 	total, err := r.Get(ctx, key).Int64()
 	if err != nil && err != redis.Nil {
@@ -381,10 +368,7 @@ object MeteringState {
   val PlanCap = 1_000_000
 
   def applyUsage(account: String, request_id: String, route: String, units: Int, gateway: String): Map[String, Any] = {
-    // TODO: this starter reads the counter with GET and refuses the report at the plan cap with a 429,
-    // increments with INCRBY in a separate call so a crash loses the report, leaves the key without
-    // a TTL so the hour never ends, and keys by account alone instead of the hour window. Fix all
-    // of it: metering observes, it does not block.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = s"usage:$account"
     val total = r.get(key).toLongOption.getOrElse(0L)
     if (total + units > PlanCap) {
@@ -453,10 +437,7 @@ constexpr long long kPlanCap = 1'000'000;
 
 long long applyUsage(Redis& r, const std::string& account, const std::string& request_id,
                      const std::string& route, int units, const std::string& gateway) {
-  // TODO: this starter reads the counter with GET and refuses the report at the plan cap with a 429,
-  // increments with INCRBY in a separate call so a crash loses the report, leaves the key without
-  // a TTL so the hour never ends, and keys by account alone instead of the hour window. Fix all
-  // of it: metering observes, it does not block.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto key = "usage:" + account;
   const auto current = r.get(key);
   const long long total = current ? std::stoll(*current) : 0;
@@ -516,18 +497,16 @@ long long applyUsage(Redis& r, const std::string& account, const std::string& re
     },
   },
   hints: [
-    'Everything the report needs must happen in one script: `HINCRBY` the units, `HSET` the record, set the window `EXPIRE` when the key is new. Two round trips mean a crash between them leaves the row and the total disagreeing after recovery.',
-    'The cap is an observation, not a gate. Write the `overage` flag into the window and return it in the script result; never raise, never `429`. Metering that refuses traffic converts a Redis outage into an availability outage.',
-    'The key is the window: `usage:{account}:{window}` with `window = floor(unix_seconds / WINDOW_SECONDS)`. A key without the bucket never resets, and a key without the account leaks usage between tenants.',
+    'An account that hit its cap on Monday is still refused on Friday, and during a Redis blip every report from every account comes back `429`. Totals also drift from what the gateway logged.',
+    'The starter does `GET`, compare, then `INCRBY`: two round trips with nothing holding them together, a key with no TTL and no hour bucket, and a cap branch that raises instead of recording.',
+    'Move the decision into one Lua script run with `eval`: `HINCRBY` units, `HSET` the record under `RECORD_PREFIX`, `EXPIRE` by `WINDOW_SECONDS` on creation, set `overage` past the cap. Key by `window_key(account, now)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a Redis layer for atomicity and for the
-right failure posture. The starter looks like ordinary cache code: read, compare, write. Three defects
-follow from that shape. First, read-then-write is not atomic, so a crash or a concurrent writer
-leaves the counter and the record disagreeing — the fix is to move the whole decision into one Lua
-script. Second, the key has no expiry, so "per hour" is a comment rather than a property; the window
-bucket in the key and the \`EXPIRE\` in the script are what make the counter reset. Third, the cap check
-refuses traffic. Metering is a side effect of serving a request, so the honest posture is to count
-everything and flag overage for the plan and billing paths to act on. Real systems add a fallback
-counter in the request path when Redis is unavailable, a bounded dedupe key for the request id, and a
-reconciliation job that compares Redis totals against the gateway's own counters.`,
+  debrief: `The script has its shape because every piece of the decision depends on the same number: the
+increment, the record, the expiry and the cap flag all read the running total, and only Redis can
+give them one consistent view of it. Moving them into one \`EVAL\` makes the crash window disappear
+rather than shrink. The expiry lives next to the increment for the same reason: a key that is created
+without its TTL is a key that outlives its hour. Flagging instead of refusing follows from what
+metering is: a side effect of serving the request, not a gate on it. Production meters usually keep a
+local fallback counter for the seconds Redis is unreachable and run a reconciliation job that compares
+window totals against the gateways' own request logs.`,
 };

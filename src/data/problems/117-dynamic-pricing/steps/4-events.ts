@@ -14,39 +14,29 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db', 'relay'],
   task: `## Task
 
-**Starting point.** \`events\` — the publish path of **priced** — is working code with a flaw: it
-produces \`price.changed\` on the happy path, every consumer sees a price move, and the demo looks
-finished. Four contracts are broken and none of them is visible until the day it matters: the
-starter keys the record by the **model version** that proposed the price, produces inside the same
-block *before* \`store.publish\` commits, ships an envelope that keeps only the new price, and never
-looks at the produce result, so a record the broker rejects is simply gone.
+**Starting point.** The starter's \`publish_change(body, reservation)\` builds a \`price.changed\`
+event with \`sku\`, \`model_version\` and \`price_cents\`, produces it keyed by \`body.model_version\`,
+flushes, then calls \`store.publish\` with a fixed update id. It compiles, serves the demo and hides
+five flaws.
 
-- Produce **exactly one** \`price.changed\` per published price, **keyed by the sku** (\`key=sku\`,
-  \`key: sku\`, \`Key: []byte(sku)\`, \`ProducerRecord("price.changed", sku, …)\`): a sku's history then
-  stays in one partition and in order, so a replay answers what this sku's price did. Keyed by the
-  model version it scatters the moment a different model suggests the price.
-- Produce **only after the price store commits**: \`store.publish(sku, price_cents, reason, source,
-  update_id)\` first, the produce second. A price the store rolled back — or a proposal the guard
-  rejected after the model spoke — must never be announced as live.
-- The envelope is the audit chain: \`sku\`, \`old_price_cents\`, \`new_price_cents\`, \`source\`,
-  \`reason\`, \`update_id\`, plus the window's guardrail accounting — \`moved_bp\`, the basis points this
-  change consumed from what the guard reserved against \`MAX_MOVE_BP = 2000\`, and \`headroom_bp\`,
-  what is left of it.
-- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS's
-  \`idempotent: true\` with \`acks: -1\`, kafka-go's \`RequiredAcks: kafka.RequireAll\` with a
-  \`kafka.Hash\` balancer): the relay republishes the same record after a rejection, and a duplicate
-  would double-count the move.
-- A rejected produce writes a **\`price_outbox\`** row instead of dropping the event
-  (\`store.insert_outbox(sku, event)\` / \`insertOutbox\` / \`InsertOutbox\`); the relay reads the
-  undelivered rows back (\`store.pending_outbox(limit)\` / \`pendingOutbox\`), republishes each under
-  the same sku key, and marks only the rows the broker acknowledged as sent.
+**Failure mode the checks target.** Keying by the model version scatters a sku's history across
+partitions, so "why did this price move" cannot be replayed from the topic. Producing before the
+commit announces prices the store may roll back. An envelope without the old price, the reason or
+the headroom cannot explain a change. A produce result nobody reads loses the event when the
+broker is unhealthy, with no outbox to recover it from.
 
-**Failure mode the checks target.** Keying by the model version scatters a sku's history, so "why did
-this price move" cannot be replayed from the topic; producing before the commit announces prices that
-never existed and leaves every downstream catalog copy disagreeing with the store; an envelope without
-\`old_price_cents\` or the reason is a sequence of numbers nobody can explain; and ignoring the produce
-result loses the event exactly when the broker is unhealthy — which is when the outbox and an
-idempotent producer are what keep the stream complete.`,
+- One \`price.changed\` per published price, **keyed by the sku** (\`key=sku\`, \`key: sku\`,
+  \`Key: []byte(sku)\`, \`ProducerRecord("price.changed", sku, …)\`).
+- \`store.publish(sku, price_cents, reason, source, update_id)\` first, the produce second.
+- The envelope carries \`sku\`, \`old_price_cents\`, \`new_price_cents\`, \`source\`, \`reason\`,
+  \`update_id\`, and from \`reservation\` the \`moved_bp\` consumed against \`MAX_MOVE_BP = 2000\` and
+  the \`headroom_bp\` left.
+- The producer is idempotent with \`acks=all\` (\`enable.idempotence\` + \`acks\`, KafkaJS
+  \`idempotent: true\` with \`acks: -1\`, kafka-go \`RequiredAcks: kafka.RequireAll\` with a
+  \`kafka.Hash\` balancer), so the relay's republish cannot double-count a move.
+- A rejected produce writes a \`price_outbox\` row (\`store.insert_outbox(sku, event)\` /
+  \`insertOutbox\` / \`InsertOutbox\`); the relay reads \`store.pending_outbox(limit)\` /
+  \`pendingOutbox\`, republishes under the same sku key, and marks only acknowledged rows sent.`,
   sequence: {
     participants: ['Pricing API', 'Price store', 'Kafka', 'Outbox relay'],
     messages: [
@@ -67,9 +57,9 @@ idempotent producer are what keep the stream complete.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=sku`, `key: sku`, `Key: []byte(sku)`, `ProducerRecord("price.changed", sku, …)`. Keyed by the model version, one sku’s price history lands in different partitions every time the model behind it changes — and a consumer replaying the topic can no longer answer what this sku’s price did.',
-    'Commit, then announce: read the old price with `store.get_sku(sku)`, call `store.publish(sku, price_cents, reason, source, update_id)`, and only then produce. The starter produces inside the same block *before* the commit, so a price the store rolled back still reaches every consumer.',
-    'The outbox is the durability half, and the producer config is what makes the retry safe: wrap the produce and, when the broker rejects it, `store.insert_outbox(sku, event)`; have the relay loop over `store.pending_outbox(limit)` and produce each row under the same sku key; and configure `enable.idempotence=true` with `acks=all` (KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` and a `kafka.Hash` balancer), or the republish can duplicate a price move.',
+    'An analyst replays `price.changed` for one sku and gets its history out of order, with a gap on the afternoon the broker was degraded and some moves nobody can explain.',
+    '`key=body.model_version` sends one sku to a new partition whenever the model changes; `producer.produce` runs before `store.publish`; the event has no old price, reason or headroom; the produce result is discarded.',
+    'Read `store.get_sku(sku)` for the old price, `store.publish(...)` first, then produce with `key=sku` and the full envelope from `reservation`; on `KafkaException` call `store.insert_outbox(sku, event)` and have the relay drain `store.pending_outbox(limit)`.',
   ],
   checks: [
     {
@@ -177,9 +167,7 @@ class PriceBody(BaseModel):
 
 
 def publish_change(body: PriceBody, reservation: dict) -> dict:
-    # TODO: this starter keys price.changed by the model version, produces inside the same block
-    # before store.publish commits, drops the old price, the reason and the guardrail headroom from
-    # the envelope, and never looks at the produce result. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {"sku": body.sku, "model_version": body.model_version, "price_cents": body.price_cents}
     producer.produce(TOPIC, key=body.model_version, value=json.dumps(event))
     producer.flush()
@@ -336,9 +324,7 @@ export const store = {
 };
 
 export async function publishChange(body: PriceBody, reservation: Reservation): Promise<{published: boolean}> {
-  // TODO: this starter keys price.changed by the model version, produces inside the same block before
-  // store.publish commits, drops the old price, the reason and the guardrail headroom from the
-  // envelope, and never looks at the produce result. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event = {sku: body.sku, model_version: body.model_version, price_cents: body.price_cents};
   await producer.send({
     topic: TOPIC,
@@ -508,9 +494,7 @@ type Reservation struct {
 	Window int64 \`json:"window"\`
 }
 
-// TODO: this starter keys price.changed by the model version, produces inside the same block before
-// store.Publish commits, drops the old price, the reason and the guardrail headroom from the
-// envelope, and never looks at the produce result. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func publishChange(ctx context.Context, body PriceBody, reservation Reservation) error {
 	event := map[string]any{
 		"sku":           body.SKU,
@@ -677,9 +661,7 @@ object Events {
 
   case class Reservation(moved: Int, left: Int, window: Long)
 
-  // TODO: this starter keys price.changed by the model version, produces inside the same block before
-  // store.publish commits, drops the old price, the reason and the guardrail headroom from the
-  // envelope, and never looks at the produce result. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publishChange(body: PriceBody, reservation: Reservation): Unit = {
     val event =
       Map("sku" -> body.sku, "model_version" -> body.modelVersion, "price_cents" -> body.priceCents).toJson.compactPrint
@@ -802,9 +784,7 @@ struct PriceStore {
 
 PriceStore store;
 
-// TODO: this starter keys price.changed by the model version, produces inside the same block before
-// store.publish commits, drops the old price, the reason and the guardrail headroom from the
-// envelope, and never looks at the produce result. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void publish_change(
     const std::string& sku,
     const std::string& model_version,
@@ -943,17 +923,13 @@ int relay_once(int limit) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong.
-First, the message key is an ordering contract: partition by sku and one sku's price history arrives
-in one partition in order, which is what lets an analyst or a consumer replay "what did this price
-do" — key by the model version and the same sku's events scatter across partitions the moment the
-model behind it changes. Second, publish after the commit: the stream is a record of what happened,
-so an event produced before \`store.publish\` is a number the store may never hold, and every
-downstream copy of the catalog disagrees with the database until someone notices. Third, exactly-once
-*looking* code is not exactly-once: the audit chain needs the old price, the new price and the reason
-or it cannot explain a change at all, the producer needs idempotence and \`acks=all\` for its own
-retries, and the broker is not a database, so a rejected produce becomes an outbox row that the relay
-republishes under the same sku key. Real platforms add a schema registry so consumers can trust the
-envelope, a per-sku partition count that matches the traffic of hot skus, and a dead-letter topic for
-events that are still unprocessable after the retries.`,
+  debrief: `The message key is an ordering contract: partition by sku and one sku's price history
+arrives in one partition in order, which is what lets a consumer replay "what did this price do".
+Keyed by the model version, the same sku's events scatter the moment the model changes. The produce
+comes after \`store.publish\` because the stream is a record of what happened, and an event produced
+before the commit is a number the store may never hold. The envelope carries the old price, the
+reason and the headroom because the audit chain has to explain a change, not just announce it. The
+broker is not a database, so a rejected produce becomes an outbox row the relay republishes under
+the same key, safe only with an idempotent producer. Production pipelines also register the
+envelope schema, size partitions for hot skus, and route rows that still fail to a dead-letter topic.`,
 };

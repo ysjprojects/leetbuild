@@ -8,28 +8,28 @@ export const dependencyStep: Step = {
   focus: ['api', 'auth'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the auth service to validate a
-token and caches the answer so every request does not pay a round trip. It compiles, it serves the
-demo, and it hides four production flaws. Debug it like the service owner, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter's \`validate(token)\` calls the auth service's gRPC \`Validate\`
+method with a 5-second timeout, retries any error three times, caches a successful answer for an
+hour and, when every attempt fails, returns the cached claims. \`revoke(token)\` is a no-op. It
+compiles and hides 5 flaws.
 
-Implement \`validate(token)\` against the auth service's gRPC \`Validate\` method.
+**Failure mode the checks target.** The starter caches a validation for an hour and, when the auth service is down,
+answers from that cache, so a token revoked ten minutes ago still authenticates. It has no deadline, so a slow
+auth service becomes a slow session layer. And it retries a rejection three times, turning a correct "no" into
+load on a service that already said no.
+
+Requirements:
 
 - **Deadline.** Every validation carries a \`DEADLINE_MS\` deadline of **150 ms**; a call that misses it must not
   hold the request open.
 - **Short positive cache.** A successful validation may be cached, but only for \`CACHE_TTL_S\` = **30 seconds**,
   so a revocation is visible inside the window.
-- **Fail closed.** A timeout or an unavailable auth service **denies** the request; the starter's habit of
-  returning the last known claims on failure is exactly how a revoked session keeps working during an outage.
+- **Fail closed.** A timeout or an unavailable auth service **denies** the request; returning the last known
+  claims on failure is exactly how a revoked session keeps working during an outage.
 - **Revocation reaches the cache.** \`revoke(token)\` drops the cached entry immediately, so the next request
   re-validates rather than trusting the copy.
-- **Rejections are terminal.** \`UNAUTHENTICATED\` and \`PERMISSION_DENIED\` are never retried; only a transient
-  failure may be retried, and even then the deadline still applies.
-
-**Failure mode the checks target.** The starter caches a validation for an hour and, when the auth service is down,
-answers from that cache — so a token revoked ten minutes ago still authenticates. It has no deadline, so a slow
-auth service becomes a slow session layer. And it retries a rejection three times, turning a correct "no" into
-load on a service that already said no.`,
+- **Rejections are terminal.** \`UNAUTHENTICATED\` and \`PERMISSION_DENIED\` are not retried; only a transient
+  failure may be retried, and even then the deadline still applies.`,
   sequence: {
     participants: ['Session API', 'Auth Service', 'Session Cache'],
     messages: [
@@ -42,9 +42,9 @@ load on a service that already said no.`,
     ],
   },
   hints: [
-    'What should a request do when the auth service cannot answer? The starter answers with the last copy it saw — say out loud why that is a revocation bypass.',
-    'A cache is only as safe as its window. How long may a validated token stay trusted after the auth service has already revoked it?',
-    'Not every gRPC status is retryable. Which two mean "the caller is wrong" and must end the request on the first answer?',
+    'An operator revokes a stolen token; the attacker keeps browsing for the rest of the hour, and during an auth outage every cached session keeps working while new logins hang for 15 seconds.',
+    'The cache window is 3600 s and `revoke` leaves it untouched; after three failed attempts the fallback returns `hit[0]`; and the loop retries every `RpcError`, rejections included, with a 5 s timeout.',
+    'Set `CACHE_TTL_S = 30` and `DEADLINE_MS = 150`, return `None` on `DEADLINE_EXCEEDED` or `UNAVAILABLE`, stop on `TERMINAL_CODES` (`UNAUTHENTICATED`, `PERMISSION_DENIED`), and make `revoke` call `cache.pop(token, None)`.',
   ],
   checks: [
     {
@@ -128,8 +128,7 @@ cache: dict[str, tuple[dict, float]] = {}
 
 
 async def validate(stub: AuthServiceStub, token: str) -> dict | None:
-    # TODO: the cache lives an hour and a failed call falls back to the stale copy, so a revoked
-    # token keeps working and an auth outage is answered with old claims.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     now = time.time()
     hit = cache.get(token)
     if hit is not None and now < hit[1]:
@@ -146,7 +145,6 @@ async def validate(stub: AuthServiceStub, token: str) -> dict | None:
 
 
 def revoke(token: str) -> None:
-    # TODO: revocation never reaches the cache.
     return None
 `,
       solution: `import time
@@ -198,8 +196,7 @@ const cache = new Map<string, {claims: Record<string, unknown>; expiresAt: numbe
 const client = new AuthServiceClient('auth:50051', credentials.createInsecure());
 
 export async function validate(token: string): Promise<Record<string, unknown> | null> {
-  // TODO: the cache lives an hour and a failed call falls back to the stale copy, so a revoked
-  // token keeps working and an auth outage is answered with old claims.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const now = Date.now();
   const hit = cache.get(token);
   if (hit !== undefined && now < hit.expiresAt) {
@@ -224,7 +221,6 @@ function callValidate(client: AuthServiceClient, token: string): Promise<Record<
 }
 
 export function revoke(token: string): void {
-  // TODO: revocation never reaches the cache.
   void token;
 }
 `,
@@ -298,8 +294,7 @@ type cachedClaims struct {
 var cache = map[string]cachedClaims{}
 
 func Validate(ctx context.Context, client authpb.AuthServiceClient, token string) (*authpb.Claims, error) {
-	// TODO: the cache lives an hour and a failed call falls back to the stale copy, so a revoked
-	// token keeps working and an auth outage is answered with old claims.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	hit, ok := cache[token]
 	if ok && time.Now().Before(hit.expiresAt) {
 		return hit.claims, nil
@@ -323,7 +318,6 @@ func Validate(ctx context.Context, client authpb.AuthServiceClient, token string
 }
 
 func Revoke(token string) {
-	// TODO: revocation never reaches the cache.
 }
 `,
       solution: `package session
@@ -396,8 +390,7 @@ object AuthValidation {
 
   private var cache: Map[String, Claims] = Map.empty
 
-  // TODO: the cache lives an hour and a failed call falls back to the stale copy, so a revoked token
-  // keeps working and an auth outage is answered with old claims.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def validate(stub: AuthServiceGrpc.AuthServiceBlockingStub, token: String): Option[Claims] = {
     cache.get(token) match {
       case Some(claims) => Some(claims)
@@ -418,7 +411,6 @@ object AuthValidation {
   }
 
   def revoke(token: String): Unit = {
-    // TODO: revocation never reaches the cache.
   }
 }
 `,
@@ -476,8 +468,7 @@ namespace session {
 
 constexpr int kCacheTtlS = 3600;
 
-// TODO: the cache lives an hour and a failed call falls back to the stale copy, so a revoked token
-// keeps working and an auth outage is answered with old claims.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::optional<auth::Claims> validate(auth::AuthService::Stub& stub, const std::string& token) {
   static std::unordered_map<std::string, auth::Claims> cache;
   const auto hit = cache.find(token);
@@ -500,7 +491,6 @@ std::optional<auth::Claims> validate(auth::AuthService::Stub& stub, const std::s
 }
 
 void revoke(const std::string& token) {
-  // TODO: revocation never reaches the cache.
 }
 
 }  // namespace session
@@ -560,5 +550,5 @@ void revoke(const std::string& token) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a dependency call for the failure modes that matter when the dependency is unavailable. Four defects are being checked: a long cache window means a revocation is not seen until the window ends; a missing deadline turns a slow auth service into a slow session layer; failing open on a timeout returns the exact stale claims a revoker was trying to invalidate; and retrying a rejection multiplies a correct "no" into load. The habits to name out loud are: bound every remote call with a deadline, keep the trust window short and invalidate it on the event that matters, deny when you cannot verify, and never retry a decision the server has already made. Real services add a negative cache with a very short TTL, a circuit breaker on the auth path, and a metric on cache hit rate next to one on revocation-to-invalidation latency.`,
+  debrief: `The fix has this shape because a validation path can only be as trustworthy as its least trustworthy answer. A 150 ms deadline bounds what a slow auth service can cost a request. A 30-second cache keeps the round-trip savings while capping how long a revoked token outlives its revocation, and \`revoke\` dropping the entry makes that cap zero for the case that matters most. Returning \`None\` on a timeout is the uncomfortable choice: it means an auth outage logs people out, which is the correct trade against an outage that keeps revoked sessions alive. Classifying \`UNAUTHENTICATED\` and \`PERMISSION_DENIED\` as terminal stops the client from retrying a decision the server already made. Production auth clients add a short negative cache, a circuit breaker on the auth path, and a metric on revocation-to-invalidation latency.`,
 };

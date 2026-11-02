@@ -17,69 +17,56 @@ export const promptRegistryProblem: Problem = {
   id: 'prompt-registry',
   title: 'Prompt Registry',
   tagline:
-    'Versioned prompt templates with eval-gated promotion and tenant pins, debugged until they are safe to ship.',
+    'Versioned prompt templates behind an atomic Redis pointer and an eval gate, debugged until a rollback lands on every reader.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Prompt Registry
 
-A prompt registry is the piece of an AI platform that owns the text of every prompt as a versioned,
-immutable artifact: who may change it, which version each tenant is served, what evidence justified a
-promotion, and how a rollback lands on every reader at once. The visible part is a version number in a
-response; the parts that decide whether the platform is safe are content identity, atomic promotion,
+A prompt registry owns the text of every prompt as a versioned, immutable artifact: which version
+each tenant is served, what evidence justified a promotion, and how a rollback lands on every reader
+at once. The parts that decide whether the platform is safe are content identity, atomic promotion,
 the eval gate, and the read path that renders a template with caller-supplied values.
 
 ## The real system
 
-Production registries never edit a version in place: a version is a name for a piece of content that
-never changes, so the same bytes always resolve to the same content hash and a replayed registration
-cannot fork history. They move the active pointer in one atomic operation — a promotion and a rollback
-racing each other must leave every reader on one version, never half the fleet on each — and they keep
-an audit row for every swap. They call an eval service before any promotion and treat an unavailable
-evaluator as a block, because an eval that never ran cannot be evidence. They publish lifecycle events
-keyed by prompt name so one prompt's history stays ordered, carrying hashes and actor ids instead of
-the template text that the topic would retain for days. And they render templates for a specific
-tenant with escaping, so a caller's value can never rewrite the template or leak another tenant's
-eval record.
+Langfuse's prompt management is a worked example: every save creates a new immutable version, and
+labels such as \`production\`, \`staging\` or a tenant name are pointers the application fetches by
+label, so promoting a version means moving the label rather than editing text in place. A registry
+built on that idea moves the pointer in one atomic operation with an audit row per swap, blocks a
+promotion when the evaluator is unavailable because an eval that did not run cannot be evidence,
+publishes lifecycle events keyed by prompt name with hashes instead of template text, and renders
+templates per tenant with escaping so a caller's value cannot rewrite the template.
 
 ## What you build here
 
 One service, **registryd**, with five pieces:
 
-1. \`POST /v1/prompts\`: authenticated tenant, a name, a template capped at 32 KiB, an optional parent
-   version, and an \`Idempotency-Key\`. Versions are immutable — a second write of the same name and
-   version is \`409\` — placeholders are checked against a declared allowlist, and a replayed
-   registration returns the original content hash instead of minting a new version.
-2. A **Redis** pointer cache: \`pointer:{name}\` holds the global version and \`pin:{tenant}:{name}\`
-   holds a tenant's own, resolved pin first. One atomic Lua \`EVAL\` writes the pointer, the audit
-   entry and the revision together, so a promotion racing a rollback cannot split the fleet and a
-   rollback takes effect on the next read rather than when a cached pointer expires.
-3. A **gRPC** eval gate: a 3-second deadline per call to \`EvalService.Evaluate\`, at most three
-   attempts, retryable only on \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a timeout or error blocks the
-   promotion, a completed \`failed\` verdict is terminal, and a fresh eval is required once the
-   version's bytes change — the gate is keyed by the content hash.
-4. A **Kafka** lifecycle path: \`registered\`, \`promoted\`, \`pinned\` and \`rolled_back\` events on
-   \`prompt.lifecycle\`, keyed by prompt name for per-prompt order, an idempotent producer with
-   \`acks=all\`, no template text in the event or the logs, an outbox row when the broker rejects the
-   produce, and a consumer that updates Redis counters before it commits the offset.
-5. \`GET /v1/prompts/{name}/versions/{v}\`: tenant-scoped reads that return the template, its declared
-   variables and the eval record of the **exact content hash** asked for, plus a render mode that
-   validates every supplied value against the allowlist and escapes it so no value can break the
-   template.
+1. \`POST /v1/prompts\`: authenticated tenant, a template capped at 32 KiB and an
+   \`Idempotency-Key\`. Versions are immutable (a different write of the same version is \`409\`),
+   placeholders are checked against an allowlist, and a replay returns the original content hash.
+2. A **Redis** pointer cache: \`pointer:{name}\` and a tenant's \`pin:{tenant}:{name}\`, pin
+   resolved first. One Lua \`EVAL\` writes pointer, audit entry and revision together.
+3. A **gRPC** eval gate: a 3-second deadline per \`EvalService.Evaluate\` call, at most three
+   attempts, retryable only on \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, a timeout or error blocks, a
+   \`failed\` verdict is terminal, and the gate is keyed by the content hash.
+4. A **Kafka** lifecycle path: events on \`prompt.lifecycle\` keyed by prompt name, an idempotent
+   producer with \`acks=all\`, no template text anywhere, and an outbox row when the broker rejects
+   the produce.
+5. \`GET /v1/prompts/{name}/versions/{v}\`: tenant-scoped reads returning the eval record of the
+   **exact content hash**, plus a render mode that validates and escapes every value.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path, and
+looks right. Debug it against the failure modes, fix it, and prove the fix with checks that fail on
+the starter and pass on your version.
 
 ## Left out on purpose
 
-Prompt authoring UIs, ownership and approval workflows, per-model tokenizers, secret interpolation,
-dataset management for evals, multi-region replication of the pointer, and billing. The five pieces
-above are the ones that decide whether the registry is correct, isolated and shippable.`,
+Prompt authoring UIs, approval workflows, per-model tokenizers, secret interpolation, eval dataset
+management, multi-region replication of the pointer, and billing.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'register · read', x: 8, y: 50},

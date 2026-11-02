@@ -8,32 +8,29 @@ export const dependencyStep: Step = {
   focus: ['generator', 'judge', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: while the judge is healthy every
-record comes back scored and admitted, and the demo looks finished. Its failure paths are all wrong,
-and it does not even judge the whole job. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter's \`judge_record(record)\` builds a \`JudgeRequest\`, calls
+\`judge.Score\` up to \`RETRY_LIMIT = 3\` times with no deadline, retries a \`"refused"\` verdict,
+admits with \`DEFAULT_SCORE\` on any exception or when the attempts run out, and declares a
+\`JUDGE_PREFIX = 100\` cut-off for the job. It compiles, serves the demo and hides 5 flaws.
 
-Implement \`judge_record(record)\`, the judge call a generator worker makes before a record can be
-admitted to the corpus:
+**Failure mode the checks target.** A judge that is slow rather than down produces a corpus of
+records nobody scored, and every later metric treats them as admitted truth. Retrying a refusal
+burns budget and still refuses. The prefix cap hides in plain sight: the job reports 100% judged
+because only the first hundred records were ever in scope.
+
+\`judge_record\` is the judge call a generator worker makes before a record can be admitted:
 
 - Each attempt carries a **900 ms deadline** (\`DEADLINE_MS = 900\`). A call without one lets one slow
   judge hold a worker open for the whole job.
 - At most \`MAX_ATTEMPTS = 3\` attempts, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are worth
-  retrying. A malformed record — \`INVALID_ARGUMENT\` — returns to the caller immediately.
+  retrying. A malformed record (\`INVALID_ARGUMENT\`) returns to the caller immediately.
 - When the attempts run out on a timeout, the record is **parked**, not admitted and not discarded:
-  \`park(record_id, "judge_timeout")\`. Parking is the honest third outcome — the record was generated,
-  nobody scored it, and the report has to say so. The starter logs the timeout and admits the record
-  "as likely fine", which turns an infrastructure hiccup into silent label noise.
-- The judge answers a verdict. \`VERDICT_REFUSED\` is **terminal**: the record is rejected
-  (\`reject(record_id, "refused")\`) and never retried or re-judged. Only \`VERDICT_ADMIT\` carries a
-  score into \`admit(record_id, score)\`; a record is never admitted without a score.
-- Every record of the job is judged. The starter skips everything after the first
-  \`JUDGE_PREFIX = 100\` records "to save cost", which is exactly the prefix a demo never looks past.
-
-**Failure mode the checks target.** The quiet one is the timeout: a judge that is slow rather than
-down produces a corpus of records that were never scored, and every later metric treats them as
-admitted truth. The terminal refusal is the correctness one — retrying a refusal burns budget and
-still refuses. The prefix cap is the one that hides in plain sight: the job reports 100% judged
-because only the first hundred records were ever in scope.`,
+  \`park(record_id, "judge_timeout")\`. The record was generated, nobody scored it, and the report
+  has to say so.
+- \`VERDICT_REFUSED\` is **terminal**: the record is rejected (\`reject(record_id, "refused")\`) and
+  not retried or re-judged. Only \`VERDICT_ADMIT\` carries a score into \`admit(record_id, score)\`;
+  a record is never admitted without a score.
+- Every record of the job is judged; there is no prefix cut-off.`,
   sequence: {
     participants: ['Generator worker', 'Judge service', 'record store'],
     messages: [
@@ -53,9 +50,9 @@ because only the first hundred records were ever in scope.`,
     ],
   },
   hints: [
-    'The deadline belongs on the call itself — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline` — and the attempts belong in a counted loop with a named bound. The starter has no deadline and no bound, so a slow judge is indistinguishable from a hanging one.',
-    'Three outcomes, not two: admit with a score, reject on a refusal, and park on an exhausted timeout. Parked records are the ones the report counts separately, because a record that was neither scored nor refused is a data-quality fact the reviewer has to see.',
-    'Retryability is a property of the status, not of "it threw": compare the code and return anything outside `UNAVAILABLE`/`DEADLINE_EXCEEDED` at once. And drop the prefix: judging the first hundred records of a ten-thousand-record job is not a cost saving, it is an admission that the rest of the corpus is unverified.',
+    'During a judge slowdown the admitted count keeps climbing and every record carries score 1.0. On a ten-thousand-record job the report still says fully judged after a hundred calls.',
+    'The bare `except Exception` turns a timeout, a refusal that threw, and a malformed request into the same `DEFAULT_SCORE` admission; `continue` on a refusal re-asks a question with a fixed answer.',
+    'Pass `timeout=DEADLINE_S` to `judge.Score`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, `reject(` on `VERDICT_REFUSED`, `park(` after the last timeout, `admit(` only with the reply score, and delete `JUDGE_PREFIX`.',
   ],
   checks: [
     {
@@ -145,10 +142,7 @@ logger = logging.getLogger("synthd.generator")
 
 
 def judge_record(record: dict) -> None:
-    # TODO: put the 900 ms deadline on every attempt, bound the attempts at 3 and retry only
-    # UNAVAILABLE / DEADLINE_EXCEEDED, park a record whose attempts run out instead of admitting it
-    # with DEFAULT_SCORE, treat a refusal as terminal, and judge every record instead of the first
-    # JUDGE_PREFIX ones.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     record_id = record["record_id"]
     request = judge_pb2.JudgeRequest(
         record_id=record_id,
@@ -222,7 +216,7 @@ def judge_job(records: list[dict]) -> None:
 `,
     },
     typescript: {
-      starter: `/** judgeRecord: flawed code that retries every failure and skips the tail of the job. */
+      starter: `/** judgeRecord: score a generated record with the judge before admission. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -257,10 +251,7 @@ const {judge} = grpc.loadPackageDefinition(protoLoader.loadSync('judge.proto')) 
 const client = new judge.Judge('judge:9000', grpc.credentials.createInsecure());
 
 export async function judgeRecord(record: SyntheticRecord): Promise<void> {
-  // TODO: put the 900 ms deadline on every attempt, bound the attempts at 3 and retry only
-  // UNAVAILABLE / DEADLINE_EXCEEDED, park a record whose attempts run out instead of admitting it
-  // with DEFAULT_SCORE, treat a refusal as terminal, and judge every record instead of the first
-  // JUDGE_PREFIX ones.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const request = {record_id: record.record_id, seed_digest: record.seed_digest, content: record.content};
   for (let attempt = 0; attempt < RETRY_LIMIT; attempt += 1) {
     try {
@@ -383,10 +374,7 @@ type Record struct {
 }
 
 func judgeRecord(ctx context.Context, record Record) {
-	// TODO: put the 900 ms deadline on every attempt, bound the attempts at 3 and retry only
-	// UNAVAILABLE / DEADLINE_EXCEEDED, park a record whose attempts run out instead of admitting it
-	// with defaultScore, treat a refusal as terminal, and judge every record instead of the first
-	// judgePrefix ones.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < retryLimit; attempt++ {
 		reply, err := judge.Score(ctx, &pb.JudgeRequest{
 			RecordId:   record.RecordID,
@@ -501,10 +489,7 @@ object Judge {
   )
 
   def judgeRecord(record: Record): Unit = {
-    // TODO: put the 900 ms deadline on every attempt, bound the attempts at 3 and retry only
-    // UNAVAILABLE / DEADLINE_EXCEEDED, park a record whose attempts run out instead of admitting it
-    // with DefaultScore, treat a refusal as terminal, and judge every record instead of the first
-    // JudgePrefix ones.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for (_ <- 0 until RetryLimit) {
       try {
         val reply = judge.score(
@@ -605,10 +590,7 @@ struct Record {
 };
 
 void judgeRecord(const Record& record) {
-  // TODO: put the 900 ms deadline on every attempt, bound the attempts at 3 and retry only
-  // UNAVAILABLE / DEADLINE_EXCEEDED, park a record whose attempts run out instead of admitting it
-  // with kDefaultScore, treat a refusal as terminal, and judge every record instead of the first
-  // kJudgePrefix ones.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   JudgeRequest request;
   request.set_record_id(record.record_id);
   request.set_seed_digest(record.seed_digest);
@@ -703,5 +685,5 @@ void judgeJob(const std::vector<Record>& records) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can name a third outcome. Most first attempts have admit and reject, and then a timeout error that has to become one of them; the correct answer is neither — park it, count it, and let the report carry the number. That is what stops infrastructure flakiness from becoming label noise: an unscored record cannot be admitted as truth because the admission path requires a score. The refusal matters because it is the one verdict the judge will repeat forever: retrying it spends budget on an answer that does not change. The prefix cap is the trap for the cost-minded candidate: judging a prefix optimizes a metric that no longer measures the corpus. Real systems add a rejudge queue for parked records, per-entity judge cost budgets, and a separate score for the judge's own confidence.`,
+  debrief: `The fix has three outcomes instead of two because a timeout is neither an admission nor a rejection: parking it and counting it is what stops infrastructure flakiness from becoming label noise, and routing \`admit\` only through a reply score is what makes an unscored admission impossible by construction. Retryability is read from the status code rather than from "it threw", so a refusal, which the judge will repeat every time, is rejected once and a malformed request goes back to the caller at once. Dropping the prefix restores the meaning of "judged": a percentage of the whole corpus, not of its first hundred rows. A production pipeline would add a rejudge queue for parked records, a per-job judge cost budget, and a separate confidence score from the judge itself.`,
 };

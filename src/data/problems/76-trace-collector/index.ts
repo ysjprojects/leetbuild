@@ -17,64 +17,54 @@ import {stateStep} from './steps/state';
 export const traceCollectorProblem: Problem = {
   id: 'trace-collector',
   title: 'Trace Collector',
-  tagline: 'Assemble distributed traces from spans that arrive late, out of order and twice.',
+  tagline: 'Assemble distributed traces in Redis from spans that arrive out of order and get retried.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Trace Collector
 
-A trace collector is the piece of an observability platform that turns the spans a fleet of services
-emits into one tree per trace. The visible part is a waterfall in a UI; the parts that decide whether
-that waterfall can be trusted are the validation funnel at the edge, the assembly state that has to
-survive spans arriving late, out of order and twice, the failure policy for the day storage is slow,
-and the honesty of the read path about the spans it never received.
+A trace collector turns the spans a fleet of services emits into one tree per trace. The visible
+part is a waterfall in a UI; what decides whether it can be trusted is the validation at the edge,
+the assembly state that survives spans arriving late and twice, the failure policy for the day
+storage is slow, and whether the read path admits which spans it did not receive.
 
 ## The real system
 
 Production collectors ingest from thousands of SDKs that each keep their own clock and flush on their
-own schedule. Nothing arrives in order: a parent span can show up minutes after the children that
-name it, one exporter can retry the same batch, and a trace can simply stop half way because a
-service crashed before it flushed. So the collector validates ids and units before it stores
-anything, assembles each trace under a key that expires when the trace goes quiet, deduplicates a
-span that arrives twice, and writes only complete traces to cold storage — where a storage timeout
-must leave the trace to be retried rather than discard the only copy. It also publishes latency
-events per service so a rollup stays ordered, without copying span tags (which carry user
-identifiers) into a topic that is retained and replicated. And when a trace is read back, the gaps
-are part of the answer: a trace whose child never arrived is marked partial, because an incident
-review that sees a tidied-up tree draws the wrong conclusion.
+own schedule. A parent span can show up minutes after its children, one exporter can retry the same
+batch, and a trace can stop half way because a service crashed. The OpenTelemetry Collector's tail
+sampling processor makes this explicit: it groups spans by \`trace_id\` in memory, waits
+\`decision_wait\` (30 seconds by default) before judging a trace, caps the traces it holds with
+\`num_traces\`, and requires every span of one trace to reach the same collector instance, because
+a decision made on half a trace is wrong. The same pressures shape this course: validate ids and
+units before storing anything, expire each trace's key when it goes quiet, make a redelivered span
+a no-op, and let a storage timeout keep the trace for a retry. When a trace is read back, the gaps
+are part of the answer.
 
 ## What you build here
 
 One service, **traced**, with five pieces:
 
 1. \`POST /v1/spans\`: authenticated tenant, 32-hex trace ids, 16-hex span ids, an explicit
-   millisecond duration unit, and a self-parenting span rejected as **422** before any state is
-   written.
-2. A **Redis** assembly: one atomic Lua script inserts the span and updates root/child state, a
-   per-span dedupe key makes a redelivered span a no-op, and every key expires 15 minutes after the
-   last span of the trace.
-3. A **gRPC** storage client: a 2-second deadline, deletion of the assembly state only after storage
-   confirms the write, a timeout that keeps the trace for the next cycle, and a schema rejection
-   that quarantines the trace instead of being retried forever.
+   millisecond duration unit, and a self-parenting span rejected as **422** before any write.
+2. A **Redis** assembly: one atomic Lua script, a per-span dedupe key, and every key expiring 15
+   minutes after the last span.
+3. A **gRPC** storage client: a 2-second deadline, deletion only after storage confirms the write,
+   and a schema rejection that is quarantined instead of retried.
 4. A **Kafka** completion path: one \`trace.completed\` event per service, keyed by service id,
-   carrying duration percentiles and span counts and never span tags, with the consumer updating its
-   rollup counters before it commits the offset.
-5. \`GET /v1/traces/{id}\`: the tree with absolute timestamps and per-span durations, an explicit
-   partial marker plus the gaps when a child never arrived, and access scoped to the tenant that
-   owns the trace.
+   without span tags, with rollup counters updated before the offset commit.
+5. \`GET /v1/traces/{id}\`: absolute timestamps, a partial marker plus the gaps when a child did
+   not arrive, and access scoped to the owning tenant.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real observability feature:
-debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter compiles, serves the happy path and looks right. In every step you debug it against
+the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Sampling decisions, the OpenTelemetry wire format, span attribute schemas, tail-based sampling,
-multi-region collectors, the trace UI, and retention policies per tenant. The five pieces above are
-the ones that decide whether a trace is complete, honest and isolated.`,
+Sampling decisions, the OpenTelemetry wire format, span attribute schemas, multi-region collectors,
+the trace UI, and retention policies per tenant.`,
   diagram: {
     nodes: [
       {id: 'sdk', kind: 'client', label: 'Traces SDK', sub: 'OTel exporters', x: 8, y: 34},

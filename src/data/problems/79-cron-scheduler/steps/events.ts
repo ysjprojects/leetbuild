@@ -8,34 +8,28 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: a fire publishes an event and
-the ledger consumer writes a row, so the demo shows a run. Three production contracts are broken.
-Debug it like the owner of the scheduler, fix it, and prove the fix with the checks below.
-
-Every fire attempt and its outcome publishes to \`schedule.fired\` so a run ledger and the history
-read can reconstruct what happened.
-
-- **Key by the schedule id.** The message key is the partition key: \`key=schedule_id\` (or the
-  stack's equivalent). A schedule's events then share a partition and keep their order. The starter
-  keys by job type, so one schedule's history is scattered across partitions and arrives
-  interleaved with every other schedule that shares the job type.
-- The payload carries the ids and the decision: \`schedule_id\`, \`window\`, \`decision\`,
-  \`outcome\` and \`reason\`. Never a job payload — the topic is retained for days and replicated.
-- **Publish skips and misses too.** A window the misfire policy skipped, and a window that was
-  missed while the scheduler was down, are both events with \`decision\` and \`reason\`. The starter
-  publishes only successful fires, so a schedule that stopped running looks like a schedule that
-  had nothing to do.
-- The producer must be **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`,
-  KafkaJS \`idempotent: true\` + \`acks: -1\`, or required acks \`all\` with a hash balancer), so a
-  retry of a produce cannot duplicate a record.
-- When the broker rejects the produce, write the event to the **outbox** (\`insert_outbox\`) instead
-  of dropping it; a relay republishes outbox rows when the broker recovers. The starter ignores the
-  broker result entirely.
+**Starting point.** The starter's \`publish_fire(schedule, window, outcome)\` produces a
+\`{job_type, window, outcome}\` event to \`schedule.fired\` keyed by the job reference, and
+\`publish_run\` calls it once per window that fired. It serves the demo and hides 5 flaws.
 
 **Failure mode the checks target.** Keying by job type destroys per-schedule ordering, which is the
-only property the ledger needs. Omitting skipped windows hides exactly the pauses an on-call
-engineer is looking for. And a produce with no outbox means a broker blip silently deletes the
-record of a fire that really happened.`,
+one property the ledger needs. Omitting skipped windows hides exactly the pauses an on-call
+engineer is looking for, since a schedule that stopped running looks like one that had nothing to
+do. A produce with no outbox means a broker blip silently deletes the record of a fire that really
+happened.
+
+- **Key by the schedule id.** The message key is the partition key: \`key=schedule_id\` (or the
+  stack's equivalent), so a schedule's events share a partition and keep their order.
+- The payload carries the ids and the decision: \`schedule_id\`, \`window\`, \`decision\`,
+  \`outcome\` and \`reason\`. No job payload; the topic is retained for days and replicated.
+- **Publish skips and misses too.** A window the misfire policy skipped, and a window that was
+  missed while the scheduler was down, are both events with \`decision\` and \`reason\`.
+- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS
+  \`idempotent: true\` + \`acks: -1\`, or required acks \`all\` with a hash balancer), so a retry
+  of a produce cannot duplicate a record.
+- When the broker rejects the produce, write the event to the **outbox** (\`insert_outbox\`)
+  inside the error branch instead of dropping it; a relay republishes outbox rows when the broker
+  recovers.`,
   sequence: {
     participants: ['Scheduler API', 'schedule.fired', 'Ledger consumer', 'schedule store'],
     messages: [
@@ -139,8 +133,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_fire(schedule: dict, window: int, outcome: str) -> None:
-    # TODO: this starter keys by job type, publishes only successful fires so a stalled schedule
-    # looks idle, and drops the event when the broker rejects the produce. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "job_type": schedule["job_ref"],
         "window": window,
@@ -230,7 +223,7 @@ def publish_missed(schedule_id: str, window: int, reason: str) -> None:
 `,
     },
     typescript: {
-      starter: `/** schedule.fired: flawed code that keys events by job type and only publishes successes. */
+      starter: `/** schedule.fired: keys events by job type and publishes successes only. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'schedule.fired';
@@ -238,8 +231,7 @@ const TOPIC = 'schedule.fired';
 const producer = new Kafka({clientId: 'cron-scheduler', brokers: ['kafka:9092']}).producer();
 
 export async function publishFire(jobType: string, window: number, outcome: string): Promise<void> {
-  // TODO: this starter keys by job type, publishes only successful fires so a stalled schedule looks
-  // idle, and drops the event when the broker rejects the produce. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: TOPIC,
     messages: [{key: jobType, value: JSON.stringify({job_type: jobType, window, outcome})}],
@@ -315,8 +307,7 @@ const topic = "schedule.fired"
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: topic}
 
 func PublishFire(ctx context.Context, jobType string, window int64, outcome string) error {
-	// TODO: this starter keys by job type, publishes only successful fires so a stalled schedule
-	// looks idle, and drops the event when the broker rejects the produce. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	value, err := json.Marshal(map[string]any{"job_type": jobType, "window": window, "outcome": outcome})
 	if err != nil {
 		return err
@@ -399,8 +390,7 @@ object ScheduleEvents {
   val producer = new KafkaProducer[String, String](props)
 
   def publishFire(jobType: String, window: Long, outcome: String): Unit = {
-    // TODO: this starter keys by job type, publishes only successful fires so a stalled schedule
-    // looks idle, and drops the event when the broker rejects the produce. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val event = s"""{"job_type":"$jobType","window":$window,"outcome":"$outcome"}"""
     producer.send(new ProducerRecord(Topic, jobType, event))
     producer.flush()
@@ -469,8 +459,7 @@ std::string eventJson(const std::string& jobType, long window, const std::string
 }
 
 void publishFire(const std::string& jobType, long window, const std::string& outcome) {
-  // TODO: this starter keys by job type, publishes only successful fires so a stalled schedule looks
-  // idle, and drops the event when the broker rejects the produce. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string event = eventJson(jobType, window, outcome);
   producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                     const_cast<char*>(event.c_str()), event.size(), jobType.c_str(), nullptr);
@@ -533,9 +522,9 @@ void publishMissed(const std::string& scheduleId, long window, const std::string
     },
   },
   hints: [
-    'The message key is the partition key, so `key=schedule_id` (or `Key: []byte(scheduleID)`, `key: scheduleId`, `ProducerRecord(topic, scheduleId, …)`) is what keeps one schedule ordered. Keyed by job type, every schedule that shares the type interleaves into one stream and the ledger cannot reconstruct a single schedule.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. It needs the same key on every retry, which is the same fix as the schedule key.',
-    'The outbox is the durability half: wrap the produce and, when the broker rejects it, insert the event as an outbox row for the relay. Publish the decisions you did not act on as well — `skipped` and `missed` with their reason are the rows an on-call engineer reads first.',
+    'On-call opened the ledger for a schedule that stalled for an hour and saw a clean, idle history; a second schedule with the same job type shows its runs out of order.',
+    'The event is keyed by `job_ref`, so schedules sharing a job interleave across partitions; only fired windows are produced, the producer is not idempotent, and a rejected produce is ignored.',
+    'Use `key=schedule_id`, carry `schedule_id`/`window`/`decision`/`outcome`/`reason`, publish `skipped` and `missed` too, set `enable.idempotence` with `acks=all`, and `insert_outbox` in the except branch.',
   ],
-  debrief: `The interviewer is testing whether the event stream can answer "what did this schedule do?" The starter passes because the demo fires successfully and the broker is up. Four defects are checked: keying by job type instead of schedule, publishing only successes, no idempotent producer, and no outbox when the broker rejects the produce. The subtle one is the omission: a history built from successful fires only is indistinguishable from a healthy idle schedule, which is exactly the state a stalled scheduler is in. Real ledgers also carry a producer sequence number so a duplicate is detectable, and reconcile the outbox against the topic before they mark a window final.`,
+  debrief: `The fix keys by schedule id because the ledger asks one question, "what did this schedule do, in order", and Kafka only orders within a partition. Publishing skips and misses with their reason is what makes a stall visible at all: a history built from successful fires alone is indistinguishable from a healthy idle schedule. The idempotent producer with \`acks=all\` pairs with the outbox: the first stops a retried produce from doubling a record, the second stops a rejected one from vanishing. Production ledgers also carry a producer sequence number so a consumer can detect a duplicate on its side, and reconcile the outbox against the topic before marking a window final.`,
 };

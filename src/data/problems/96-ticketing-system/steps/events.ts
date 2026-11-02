@@ -8,36 +8,26 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'worker', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: the recorder answers **202**, a
-record lands on \`ticket.event\` and the demo shows the timeline filling up. Four production contracts
-are broken. It keys the record by the **agent id** instead of the **ticket id**, so one ticket's
-events scatter across partitions and the order they arrive in is gone; it copies the **note body**
-and the **requester's email** into the payload "so the timeline widget fetches nothing"; it lets the
-produce be acknowledged **before the ticket store commits**, so the topic can announce a change the
-database never stored; and the producer is a bare one with no idempotence.
+**Starting point.** The starter serves \`POST /v1/tickets/{ticket_id}/events\`: it builds a payload
+from the event type, actor id, note body and requester email, produces it to \`ticket.event\` keyed
+by the actor id, flushes, commits the ticket write and answers **202**; a consumer folds the
+records into the timeline. It serves the demo and hides 5 flaws.
 
-\`POST /v1/tickets/{ticket_id}/events\` records a state, assignment or note change on a ticket and
-announces it on \`ticket.event\`, which the event worker folds into the timeline the ticket page
-reads. Implement the publisher:
+**Failure mode the checks target.** An agent key scatters one ticket's timeline across partitions.
+The note body and the requester's address on a retained, replicated topic outlive every delete the
+ticket store performs. Producing before the commit announces state a crash can roll back. A
+default producer duplicates entries on retry. And a payload with no actor role or \`from\`/\`to\`
+leaves the consumer unable to build a timeline without asking the ticket store.
 
-- every state, assignment and note event is produced to **\`ticket.event\`** with the **ticket id**
-  as the message key, so one ticket's timeline stays in order inside one partition.
-- the payload carries the event **type**, the **actor id** and the **actor role**, and the state
-  transition as **\`from\` / \`to\`**, plus ids such as \`note_id\` — fields a consumer can build a
-  timeline from.
-- **no \`note_body\` and no \`requester_email\`**, and no other requester identity beyond ids, may
-  reach the topic: it is retained and replicated for days, so a note written there outlives every
-  delete the ticket store performs.
-- the ticket store **commits before** the produce: a rolled-back write must not be announced, and a
-  failed commit must not produce anything.
-- the producer is **idempotent with \`acks=all\`**, so a retried produce cannot duplicate a timeline
-  entry.
-- a committed change answers **202**.
+Requirements for the publisher:
 
-**Failure mode the checks target.** An agent key scatters one ticket's timeline across partitions, so
-a consumer can order two tickets but never one; the note body and the requester's address on the
-topic are a data leak with the topic's retention; publishing before the commit announces state a
-crash can roll back; and a default producer duplicates entries when a produce is retried.`,
+- every state, assignment and note event is produced to **\`ticket.event\`** keyed by the **ticket id**.
+- the payload carries the event **type**, the **actor id** and **actor role**, the transition as
+  **\`from\` / \`to\`**, and ids such as \`note_id\`.
+- **no \`note_body\` and no \`requester_email\`**, and no requester identity beyond ids.
+- the ticket store **commits before** the produce; a failed commit produces nothing.
+- the producer is **idempotent with \`acks=all\`**.
+- a committed change answers **202**.`,
   sequence: {
     participants: ['Ticket API', 'Ticket store', 'ticket.event', 'Event worker'],
     messages: [
@@ -60,9 +50,9 @@ crash can roll back; and a default producer duplicates entries when a produce is
     ],
   },
   hints: [
-    'The message key is the partition key: `key=ticket_id` (`key: ticketId`, `Key: []byte(ticketID)`, `ProducerRecord(topic, ticketId, …)`). Keyed by the agent, one ticket’s events land in different partitions, and the timeline a consumer rebuilds is no longer the order things happened in.',
-    'Order the write and the produce: `store.commit_ticket(...)` (or `commitTicket`, `CommitTicket`) returns before the produce, so a rolled-back write is never announced. The payload is a contract, not a copy of the request: project it onto ids, the actor role and the `from`/`to` transition — the topic is retained and replicated, so a note body written there outlives every delete the ticket store performs.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence` with `acks=all` (KafkaJS `idempotent: true` plus `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a `&kafka.Hash{}` balancer). It needs the same message key on every retry, which is the ticket key again.',
+    'The ticket page shows `resolved` before `pending`, a deleted note is still readable by anyone who can tail the topic, and after a broker hiccup a timeline entry appears twice.',
+    'The record is keyed by `actor_id`, so one ticket spans partitions; the payload copies `note_body` and `requester_email`; `produce` and `flush` run before `store.commit_ticket`; the producer has no idempotence or acks setting.',
+    'Produce with `key=ticket_id` after `store.commit_ticket` returns; project the payload onto ids, `actor_role` and `from`/`to`; configure `enable.idempotence` and `acks=all` (KafkaJS `idempotent: true`, `acks: -1`; kafka-go `RequireAll` with `&kafka.Hash{}`).',
   ],
   checks: [
     {
@@ -169,9 +159,7 @@ def record_event(
     event: TicketEvent,
     actor_id: str = Header(alias="X-Actor-Id"),
 ) -> dict:
-    # TODO: key the record by the ticket id instead of the agent, keep the note body and the
-    # requester's address off the topic, configure the producer with enable.idempotence and
-    # acks=all, and commit the ticket write before the produce is acknowledged.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = {
         "id": f"{ticket_id}:{event.type}",
         "ticket_id": ticket_id,
@@ -310,9 +298,7 @@ interface TicketEvent {
 }
 
 app.post('/v1/tickets/:id/events', async (request, reply) => {
-  // TODO: key the record by the ticket id instead of the agent, keep the note body and the
-  // requester's address out of the payload, set \`idempotent: true\` and \`acks: -1\` on the
-  // producer, and commit the ticket write before the produce is acknowledged.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const ticketId = (request.params as {id: string}).id;
   const actorId = request.headers['x-actor-id'] as string;
   const event = request.body as TicketEvent;
@@ -458,9 +444,7 @@ type ticketEvent struct {
 }
 
 func recordEvent(rw http.ResponseWriter, r *http.Request) {
-	// TODO: key the record by ticket_id instead of the agent, keep the note body and the requester's
-	// address out of the payload, configure RequiredAcks: kafka.RequireAll with a &kafka.Hash{}
-	// balancer, and commit the ticket write before the writer acknowledges the record.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	ticketID := r.PathValue("ticket_id")
 	actorID := r.Header.Get("X-Actor-Id")
 	event := ticketEvent{}
@@ -642,10 +626,7 @@ object Events {
       post {
         headerValueByName("X-Actor-Id") { actorId =>
           entity(as[String]) { bodyText =>
-            // TODO: key the record by ticketId instead of the agent, keep the note body and the
-            // requester's address out of the payload, configure the producer with
-            // enable.idempotence and acks=all, and commit the ticket write before the send is
-            // acknowledged.
+            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
             val event = bodyText.parseJson.asJsObject
             val payload = JsObject(
               "id" -> JsString(ticketId + ":" + event("type").convertTo[String]),
@@ -786,9 +767,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: key the record by ticket.id instead of the agent, keep the note body and the requester's
-// address out of the payload, set enable.idempotence and acks=all on the producer, and commit the
-// ticket write before the produce is acknowledged.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void recordEvent(const Ticket& ticket, const json& event, const std::string& actorId) {
   const json fields = {
       {"id", ticket.id + ":" + event["type"].get<std::string>()},
@@ -923,5 +902,7 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether the event stream is a contract or a copy of the request. The key is the first contract: a Kafka key chooses the partition, so keying by the ticket id keeps one ticket's open → pending → resolved sequence in one partition and in order, while keying by the agent puts two tickets' events in the same partition and one ticket's events in several — the timeline a consumer rebuilds is then not the order things happened in. The payload is the second: the topic is replicated and retained for days, so a note body or a requester's address written there outlives every delete the ticket store performs, and the "the widget fetches nothing" argument optimises a read that a consumer can answer from ids. The third contract is ordering between the two systems: a produce is durable and immediate, a database commit can still roll back, so publishing first announces a change that may never exist — commit, then produce, and let a failed commit reach the caller instead of the topic. Idempotence with acks=all is the producer-side half: without it a retry after a timeout duplicates a timeline entry a consumer counts. The role and transition fields are what make the topic self-sufficient for the timeline. Real platforms add a schema registry so producers and consumers agree on the payload, an outbox row when the broker is unreachable so a committed change is not lost, and consumer-side dedupe on the event id for the at-least-once handoff the broker still gives.`,
+  debrief: `The fix treats the event stream as a contract rather than a copy of the request. The key chooses the partition, so keying by the ticket id keeps one ticket's open → pending → resolved sequence in one partition and in order. The payload is projected onto ids, role and transition because the topic is replicated and retained for days, and "the widget fetches nothing" optimises a read a consumer can answer from ids. The commit comes before the produce because a produce is durable and immediate while a database commit can still roll back; a failed commit reaches the caller instead of the topic. Idempotence with \`acks=all\` is the producer-side half: without it a retry after a timeout duplicates a timeline entry a consumer counts.
+
+Production platforms add a schema registry so producers and consumers agree on the payload, an outbox row for when the broker is unreachable, and consumer-side dedupe on the event id.`,
 };

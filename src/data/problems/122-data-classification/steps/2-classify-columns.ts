@@ -8,36 +8,27 @@ export const classifyColumnsStep: Step = {
   focus: ['metasense', 'llm'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds the prompt, calls
-the gateway and parses the JSON the model returns, so the demo tags a ten-column table correctly.
-It hides five production flaws. Debug it like the owner of the model bill and the tag library,
-fix it, and prove the fix.
+**Starting point.** The starter's \`classify_columns(entity, columns)\` builds one prompt from the
+whole column list, calls \`Classifier.Classify\` at \`llm-gateway:9000\` with no deadline, runs
+\`json.loads\` on \`content\` and returns one row per array element with whatever \`assigned_tag\`
+the model wrote. It tags a ten-column demo table correctly and hides five flaws.
 
-Implement \`classify_columns(entity, columns)\` for the classifier worker. The LLM gateway exposes
-\`Classifier.Classify(ClassifyRequest{entity, prompt}) → ClassifyReply{content}\` at
-\`llm-gateway:9000\`; \`content\` is the model's raw text, which the prompt asks to be a JSON array
-of \`{"column_name", "assigned_tag"}\`.
+**Failure mode the checks target.** A 600-column table in one prompt is truncated or answered for
+the first hundred columns; a call without a deadline pins the worker on a slow provider; a retry on
+every error turns \`INVALID_ARGUMENT\` into a hot loop against a paid API; a tag string copied
+straight from the model looks like a classification and is not one.
 
 - The tag library is closed: \`Personal.ID\`, \`Personal.Name\`, \`Personal.Contact_Info\`,
-  \`Geo.Geohash\` and \`None\` (\`TAXONOMY\`). A tag the model invents — \`PII\`, \`Personal.Email\`,
-  \`<Personal.ID>\` with the angle brackets left in — becomes \`None\` with confidence \`0\`. The
-  taxonomy is what the privacy rules are written against; an unknown tag downstream is a tier
-  nobody defined.
-- Batch the columns so each prompt stays under **3000 tokens** (\`MAX_PROMPT_TOKENS\`, estimated
-  as \`len(text) // 4 + 1\`): the source's model had a 4000-token context shared by prompt and
-  answer. One call per batch; the results are concatenated in column order.
+  \`Geo.Geohash\`, \`None\` (\`TAXONOMY\`). A tag the model invents (\`PII\`, \`<Personal.ID>\` with
+  brackets left in) becomes \`None\` with confidence \`0\`.
+- Batch the columns so each prompt stays under **3000 tokens** (\`MAX_PROMPT_TOKENS\`, estimated as
+  \`len(text) // 4 + 1\`); one call per batch, results concatenated in column order.
 - Every call carries a **15 s** deadline (\`DEADLINE_S\`).
-- At most **2 attempts** per batch (\`MAX_ATTEMPTS\`), and only \`UNAVAILABLE\` is retried; any
-  other status fails the job so the worker can requeue it later.
-- Parse defensively: content that is not a JSON array fails the batch (do not crash the worker);
-  a column missing from the array gets \`None\`; a column the model adds is ignored; confidence, when
-  present, is clamped to \`0..1\`, else \`1\`.
-
-**Failure mode the checks target.** A 600-column table in one prompt is silently truncated by the
-gateway or answered for the first hundred columns; a call without a deadline pins the worker on a
-slow provider; a retry loop on every error turns an \`INVALID_ARGUMENT\` into a hot loop against a
-paid API; and a tag string copied straight from the model into the metadata store is the quiet one —
-it looks like a classification and is not one.`,
+- At most **2 attempts** per batch (\`MAX_ATTEMPTS\`); only \`UNAVAILABLE\` is retried, any other
+  status fails the job.
+- Parse defensively: content that is not a JSON array fails the batch without crashing the worker;
+  a missing column gets \`None\`; an extra column is ignored; confidence is clamped to \`0..1\`,
+  else \`1\`.`,
   sequence: {
     participants: ['metasense', 'LLM gateway'],
     messages: [
@@ -50,9 +41,9 @@ it looks like a classification and is not one.`,
     ],
   },
   hints: [
-    'Write the batching as a greedy loop over columns: keep a running token estimate that starts at the prompt header, and start a new batch when adding the next column would cross `MAX_PROMPT_TOKENS`. The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`).',
-    'Retry is a `for attempt in range(MAX_ATTEMPTS)` whose body catches the RPC error, checks `code() == UNAVAILABLE`, and otherwise re-raises. There is no `while True` anywhere in a client that pays per call.',
-    'Parsing is a funnel: `json.loads` in a `try` that turns a decode error into a failed batch; `isinstance(data, list)`; a dict from `column_name` to `assigned_tag` built with `.get`; then one output row per *requested* column, `tag if tag in TAXONOMY else "None"`, confidence clamped.',
+    'A 600-column table comes back with 120 rows tagged and a worker that has been sitting on one call for eleven minutes; another table shows the tag `Personal.Email`, which no privacy rule mentions.',
+    'One prompt, no deadline, no retry policy, and the reply is trusted twice: `json.loads` assumes an array, and `assigned_tag` is stored as-is. The model is told the library, not bound by it.',
+    'Greedy batches under `MAX_PROMPT_TOKENS`; `timeout=DEADLINE_S` on the call; `for attempt in range(MAX_ATTEMPTS)` retrying only `UNAVAILABLE`; parse into a dict and emit one row per requested column, `tag if tag in TAXONOMY else "None"`.',
   ],
   checks: [
     {
@@ -159,8 +150,7 @@ def build_prompt(entity: str, columns: list[str]) -> str:
 
 
 def classify_columns(entity: str, columns: list[str]) -> list[dict]:
-    # TODO: this starter sends every column in one prompt, calls without a deadline, never retries
-    # a flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     request = classifier_pb2.ClassifyRequest(entity=entity, prompt=build_prompt(entity, columns))
     reply = classifier.Classify(request)
     data = json.loads(reply.content)
@@ -302,8 +292,7 @@ function buildPrompt(entity: string, columns: string[]): string {
 }
 
 export async function classifyColumns(entity: string, columns: string[]): Promise<ColumnTag[]> {
-  // TODO: this starter sends every column in one prompt, calls without a deadline, never retries
-  // a flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const reply = await new Promise<{content: string}>((resolve, reject) => {
     classifier.Classify({entity, prompt: buildPrompt(entity, columns)}, (error, result) =>
       error ? reject(error) : resolve(result),
@@ -478,8 +467,7 @@ func buildPrompt(entity string, columns []string) string {
 	return b.String()
 }
 
-// TODO: this starter sends every column in one prompt, calls without a deadline, never retries a
-// flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func classifyColumns(ctx context.Context, client pb.ClassifierClient, entity string, columns []string) ([]ColumnTag, error) {
 	reply, err := client.Classify(ctx, &pb.ClassifyRequest{Entity: entity, Prompt: buildPrompt(entity, columns)})
 	if err != nil {
@@ -670,8 +658,7 @@ object ClassifyColumns {
     s"""$PromptHeader These columns belong to the "$entity" table\\n""" + lines.mkString("\\n")
   }
 
-  // TODO: this starter sends every column in one prompt, calls without a deadline, never retries a
-  // flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def classifyColumns(entity: String, columns: List[String]): List[ColumnTag] = {
     val reply = stub.classify(ClassifyRequest(entity = entity, prompt = buildPrompt(entity, columns)))
     reply.content.parseJson.asInstanceOf[JsArray].elements.toList.map { element =>
@@ -805,8 +792,7 @@ std::string buildPrompt(const std::string& entity, const std::vector<std::string
   return prompt;
 }
 
-// TODO: this starter sends every column in one prompt, calls without a deadline, never retries a
-// flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::vector<ColumnTag> classifyColumns(Classifier::Stub* stub, const std::string& entity,
                                        const std::vector<std::string>& columns) {
   grpc::ClientContext ctx;
@@ -950,5 +936,5 @@ std::vector<ColumnTag> classifyColumns(Classifier::Stub* stub, const std::string
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat a model's output as input. The starter trusts three things at once: that the prompt fits (it does not, past a few hundred columns — the source's team split tables at 150 for exactly this reason), that the reply is the JSON the prompt asked for (usually; not always), and that the string in \`assigned_tag\` is a tag (the model is told the library, not bound by it). Five separate defects are being checked: the token-budgeted batches, the per-call deadline, the bounded retry that only follows \`UNAVAILABLE\`, the closed taxonomy, and the defensive parse that maps each *requested* column to a tag instead of each returned row. The taxonomy is the one that matters most downstream: the tier rules in step 4 are written against five names, so an unknown tag is not a classification, it is a gap that looks filled. Real classifiers add the few-shot example from the source's prompt, a confidence threshold below which the owner is asked rather than told, and a second, PII-only pass with the 8-tag prompt Metasense V2 describes.`,
+  debrief: `A model's output is input, and the fix is shaped like any input boundary: size what goes out (token-budgeted batches, because the source's context window was shared by prompt and answer), bound what you wait for (a deadline and two attempts, retrying only the status that means "try again"), and validate what comes back column by column. Emitting one row per requested column rather than per returned row makes the result a function of the schema instead of the model's mood; the closed taxonomy lets step 4 derive a tier without a case for strings nobody defined. Production classifiers also carry the few-shot example from the source's prompt, ask the owner below a confidence threshold, and run the 8-tag PII-only pass Metasense V2 describes.`,
 };

@@ -8,27 +8,31 @@ export const experimentEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an exposure on every
-call, the consumer counts it, and the demo shows a number climbing. It compiles, it serves the happy
-path, and it quietly corrupts the analysis it exists to feed. Debug it like the service owner, fix
-it, and prove the fix with the checks below.
+**Starting point.** The starter's \`record_exposure(experiment_id, unit, variant, ts)\` produces a
+record on the \`experiment.exposure\` topic on every call, and the \`exposure-stats\` consumer
+increments a counter per variant, so the demo shows a number climbing. It serves the demo and
+hides 5 flaws.
 
-Every exposure — the moment a unit is shown a variant — is a record on the **\`experiment.exposure\`**
-topic. Implement the exposure path of \`expd\`:
+**Failure mode the checks target.** The analysis stream is wrong in ways no dashboard shows: an
+experiment's exposures lose their order, a re-rendered page inflates every rate, the user's identity
+travels on the topic, a producer retry double-writes, and a consumer crash drops an exposure the
+offset says was applied.
 
-- \`record_exposure(experiment_id, unit, variant, ts)\` publishes **one** event per
-  \`(experiment, unit, variant)\`. The message key is the **experiment id** — \`key=experiment_id\`,
-  \`Key: []byte(experimentID)\`, \`new ProducerRecord(..., experimentId, ...)\` — never the unit id and
-  never a request id, so every exposure of one experiment lands on one partition, in the order it
-  happened.
+Every exposure (the moment a unit is shown a variant) is a record on **\`experiment.exposure\`**.
+Implement the exposure path of \`expd\`:
+
+- \`record_exposure\` publishes **one** event per \`(experiment, unit, variant)\`. The message key is
+  the **experiment id** (\`key=experiment_id\`, \`Key: []byte(experimentID)\`,
+  \`new ProducerRecord(..., experimentId, ...)\`), not the unit id and not a request id, so every
+  exposure of one experiment lands on one partition in the order it happened.
 - Before producing, claim the exposure in Redis with a conditional write: \`SET NX\` on
   \`dedupe:exp:{id}:{unit}:{variant}\` with a TTL (**7 days**, longer than any replay window). \`NX\`
-  returns nothing when the triple is already claimed — a re-rendered page calling again with the same
+  returns nothing when the triple is already claimed: a re-rendered page calling again with the same
   \`(experiment, unit, variant)\` logs it and **returns without producing**. The claim happens
   **before** the produce.
 - The payload carries \`experiment_id\`, \`variant\`, **\`unit_hash\`** and \`ts\`. \`unit_hash\` is a
-  SHA-256 digest of the unit — the only unit-derived value that may leave the service: a raw user
-  identifier is PII and must never appear in the event or in a log line.
+  SHA-256 digest of the unit and the only unit-derived value that may leave the service; a raw user
+  identifier is PII and must not appear in the event or in a log line.
 - The producer is **idempotent with \`acks=all\`**: \`"acks": "all"\` with
   \`"enable.idempotence": True\`, \`acks: -1\` with \`idempotent: true\` (KafkaJS), \`RequiredAcks:
   kafka.RequireAll\` with a \`Hash\` balancer (kafka-go has no idempotent mode), or \`"acks", "all"\`
@@ -36,18 +40,11 @@ topic. Implement the exposure path of \`expd\`:
   produce must not write the exposure twice.
 - A produce refused for back-pressure (a full producer buffer, \`ERR__QUEUE_FULL\`) is **retried**,
   \`MAX_PRODUCE_ATTEMPTS\` (3), polling the local queue between attempts. A produce the broker
-  permanently rejects is logged with the experiment id and the unit hash — never the raw unit — and
+  permanently rejects is logged with the experiment id and the unit hash (not the raw unit) and
   does not fail the caller's request path.
 - The consumer, group \`exposure-stats\`, applies the exposure to the analysis state **before** it
   commits the offset: \`HINCRBY stats:{experiment_id} {variant} 1\` (a store row is the same shape),
-  then the commit. A broker error commits nothing, so the record is redelivered.
-
-**Failure mode the checks target.** The starter keys the record by the unit id, so the exposures of one
-experiment are scattered across partitions and its analysis stream has no order; it publishes on every
-call with no dedupe, so a re-rendered page is a second exposure and every rate is inflated; it ships
-\`user_id\` in the payload, so the topic and the consumer logs carry the user's identity; it leaves the
-producer at its defaults, so a retry can write the exposure twice; and it commits the offset before
-the counter, so a crash in between loses the exposure while the offset says it was applied.`,
+  then the commit. A broker error commits nothing, so the record is redelivered.`,
   sequence: {
     participants: ['Experiment API', 'Redis', 'experiment.exposure', 'Analysis consumer'],
     messages: [
@@ -85,7 +82,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
       id: 'key-by-experiment',
       title: 'Keys every exposure by experiment id',
       detail:
-        "The produced record is keyed by the **experiment id**, so every exposure of one experiment lands on one partition, in the order it happened — the only key that keeps an experiment's analysis stream ordered. The starter keys by the unit id, which scatters one experiment across partitions.",
+        "The produced record is keyed by the **experiment id**, so every exposure of one experiment lands on one partition in the order it happened, which is what keeps an experiment's analysis stream ordered. The starter keys by the unit id, which scatters one experiment across partitions.",
       match: {
         python: {all: [/producer\.produce\(\s*TOPIC\s*,\s*key\s*=\s*experiment_id\b/]},
         typescript: {all: [/topic:\s*TOPIC/, /key:\s*experimentId\b/]},
@@ -114,7 +111,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
     },
     {
       id: 'payload',
-      title: 'Carries the variant, a unit hash and a timestamp — never the raw unit',
+      title: 'Carries the variant, a unit hash and a timestamp, not the raw unit',
       detail:
         "The event carries `experiment_id`, `variant`, `unit_hash` (a SHA-256 digest of the unit) and `ts`; a raw user identifier is PII and must not appear in the event or in a log line. The starter ships `user_id`, so the topic and the consumer logs carry the user's identity.",
       match: {
@@ -148,7 +145,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
       id: 'state-before-commit',
       title: 'Writes the analysis counter before committing the offset',
       detail:
-        'The consumer applies the exposure to the analysis state — `HINCRBY stats:{experiment_id} {variant} 1` — and only then commits the offset, so a crash replays the record instead of losing it, and a broker error commits nothing. The starter commits first, so the exposure is lost while the offset says it was applied.',
+        'The consumer applies the exposure to the analysis state (`HINCRBY stats:{experiment_id} {variant} 1`) and only then commits the offset, so a crash replays the record instead of losing it, and a broker error commits nothing. The starter commits first, so the exposure is lost while the offset says it was applied.',
       match: {
         python: {all: [/hincrby/, /"enable\.auto\.commit"\s*:\s*False/], order: [/r\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {all: [/hincrby/, /autoCommit:\s*false/], order: [/redis\.hincrby\(/, /commitOffsets\(/]},
@@ -186,8 +183,7 @@ consumer = Consumer(
 
 
 def record_exposure(experiment_id: str, unit: str, variant: str, ts: float) -> None:
-    # TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
-    # second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = json.dumps({"experiment_id": experiment_id, "variant": variant, "user_id": unit, "ts": ts})
     producer.produce(TOPIC, key=unit, value=event)
     producer.poll(0)
@@ -204,7 +200,6 @@ def run() -> None:
             continue
         event = json.loads(msg.value())
         consumer.commit(message=msg, asynchronous=False)
-        # TODO: commit last — the counter below is the exposure, and committing before it loses one on a crash
         r.hincrby(f"stats:{event['experiment_id']}", event["variant"], 1)
 `,
       solution: `import hashlib
@@ -299,8 +294,7 @@ export async function recordExposure(
   variant: string,
   ts: number,
 ): Promise<void> {
-  // TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
-  // second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event = JSON.stringify({experiment_id: experimentId, variant, user_id: unit, ts});
   await producer.send({topic: TOPIC, messages: [{key: unit, value: event}]});
 }
@@ -311,7 +305,6 @@ async function handle({topic, partition, message}: EachMessagePayload): Promise<
     variant: string;
   };
   await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-  // TODO: commit last — the counter below is the exposure, and committing before it loses one on a crash
   await redis.hincrby(\`stats:\${event.experiment_id}\`, event.variant, 1);
 }
 
@@ -419,8 +412,7 @@ type exposureEvent struct {
 	Ts           float64 \`json:"ts"\`
 }
 
-// TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
-// second exposure), ships the raw user id in the payload, and leaves the writer at its defaults.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: exposureTopic}
 
 func recordExposure(ctx context.Context, experimentID, unit, variant string, ts float64) error {
@@ -443,7 +435,6 @@ func run(ctx context.Context) error {
 		var event exposureEvent
 		_ = json.Unmarshal(msg.Value, &event)
 		_ = reader.CommitMessages(ctx, msg)
-		// TODO: commit last — the counter below is the exposure, and committing before it loses one on a crash
 		if err := rdb.HIncrBy(ctx, "stats:"+event.ExperimentID, event.Variant, 1).Err(); err != nil {
 			return err
 		}
@@ -582,8 +573,7 @@ object ExposureEvents {
   producerProps.put("bootstrap.servers", "kafka:9092")
   private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
 
-  // TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
-  // second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def recordExposure(experimentId: String, unit: String, variant: String, ts: Double): Unit = {
     val payload = s"""{"experiment_id":"$experimentId","variant":"$variant","user_id":"$unit","ts":$ts}"""
     producer.send(new ProducerRecord[String, String](Topic, unit, payload))
@@ -608,7 +598,6 @@ object ExposureEvents {
         val experimentId = fields("experiment_id").convertTo[String]
         val variant = fields("variant").convertTo[String]
         commit(record)
-        // TODO: commit last — the counter below is the exposure, and committing before it loses one on a crash
         jedis.hincrBy(s"stats:$experimentId", variant, 1)
       }
 }
@@ -721,14 +710,12 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
   std::string err;
   auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  // TODO: acks=all and enable.idempotence=true
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
 auto producer = make_producer();
 
-// TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
-// second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void record_exposure(const std::string& experiment_id, const std::string& unit, const std::string& variant,
                      double ts) {
   const json event = {{"experiment_id", experiment_id}, {"variant", variant}, {"user_id", unit}, {"ts", ts}};
@@ -762,7 +749,6 @@ void run() {
     const json event = json::parse(static_cast<const char*>(msg->payload()),
                                    static_cast<const char*>(msg->payload()) + msg->len());
     consumer->commitSync(msg.get());
-    // TODO: commit last — the counter below is the exposure, and committing before it loses one on a crash
     redis.hincrby("stats:" + event["experiment_id"].get<std::string>(), event["variant"].get<std::string>(), 1);
   }
 }
@@ -876,19 +862,18 @@ void run() {
     },
   },
   hints: [
-    'The key is the ordering contract: `key=experiment_id`, `Key: []byte(experimentID)`, `ProducerRecord(Topic, experimentId, …)` puts every exposure of one experiment on one partition. Keyed by the unit id the stream of an experiment is scattered and its analysis has no order.',
-    'Redis makes `record_exposure` idempotent: `SET NX` on `dedupe:exp:{id}:{unit}:{variant}` with the dedupe TTL, *before* the produce, and a refused claim returns without a record. `unit_hash` is the only unit-derived field the event may carry, and producer durability is configuration (`enable.idempotence` + `acks=all`, KafkaJS `idempotent: true` + `acks: -1`, kafka-go `RequireAll` + `Hash`).',
-    'In the consumer the order is the point: `HINCRBY stats:{experiment_id} {variant} 1` first, commit second. Commit first and a crash loses the exposure the offset claims was applied; a broker error must commit nothing at all.',
+    'The report for a two-arm test shows 140 % of the traffic the experiment was given, a privacy audit finds user ids on the topic, and after a consumer restart the counts drop by a few hundred.',
+    'Every call produces, keyed by the unit, with `user_id` in the payload and a default producer; the consumer commits the offset and only then increments the counter, so a crash in between loses the record.',
+    'Claim `dedupe:exp:{id}:{unit}:{variant}` with `SET NX` and a TTL before producing; key by `experiment_id`; send `unit_hash`; enable `acks=all` + idempotence; in the consumer, `HINCRBY` first, commit second.',
   ],
-  debrief: `The interviewer is testing whether you can debug a Kafka exposure path as the analysis contract
-instead of a publish call. The starter looks right because the demo renders one page, on one cluster, with
-no re-render and no crash. Five defects are being checked: a unit-keyed record (the stream of an
-experiment loses its order), a produce with no dedupe claim (a re-rendered page is a second exposure and
-every rate is inflated), a payload carrying \`user_id\` (PII on the topic and in the logs), a producer at
-its defaults (a retry writes the exposure twice), and a commit that runs before the counter (a crash
-drops the exposure the offset claims was applied). The subtle one is the position of the dedupe claim:
-it belongs *before* the produce, because a claim written after a rejected produce leaves an exposure
-marked as recorded that never happened, and the analysis undercounts it forever. Real pipelines add the
-sample-ratio check on the consumer side, a versioned event schema, and a per-experiment quota so one
-runaway experiment cannot flood the topic.`,
+  debrief: `The fix treats the exposure path as the analysis contract rather than a publish call. The dedupe
+claim sits before the produce because a claim written after a rejected produce leaves an exposure
+marked as recorded that was not, and the analysis undercounts it forever. The record is keyed by the
+experiment because that is the stream whose order the analysis reads. \`unit_hash\` replaces the user
+id because the topic outlives the request and is read by people who should not see identities. The
+consumer writes the counter before the commit so a crash replays rather than loses; the idempotent
+producer makes that replay safe on the other side.
+
+Production pipelines add the sample-ratio check on the consumer side, a versioned event schema, and a
+per-experiment quota so one runaway experiment cannot flood the topic.`,
 };

@@ -7,8 +7,8 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Form service: the course is not "render a form and save the fields", it is the debugging you owe
- * an intake pipeline before a public form is pointed at the internet. A submission validates
+ * Form service: the course is not "render a form and save the fields", it is the debugging an
+ * intake pipeline needs before a public form is pointed at the internet. A submission validates
  * against the form's *published* schema, is rate-limited on form and IP and gated by a one-time
  * captcha → its delivery to downstream handlers is keyed by the submission id → its event is keyed
  * by the form and carries hashes, not values → and the read side redacts by default with an
@@ -17,7 +17,7 @@ import {stateStep} from './steps/state';
 export const formServiceProblem: Problem = {
   id: 'form-service',
   title: 'Form Service',
-  tagline: 'Public forms that resist spam, validate precisely and deliver submissions once.',
+  tagline: 'Public forms with a pinned schema, a one-shot captcha and a redacted read path.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -30,17 +30,19 @@ validation contract, the abuse controls, the delivery key, and the read path.
 
 ## The real system
 
-Production form services receive submissions from anyone, so every request is hostile until proven
-otherwise. They validate against the schema version the author *published*, not the starter still
-being edited, because a published form is a contract with the people submitting to it. They reject
-unknown fields and oversized values field by field so the client learns what to fix. They assume a
-public endpoint will be scraped: a captcha token is consumed exactly once, and submissions are
-limited on the form and the submitter address together, so neither one address nor a botnet can
-sweep a form. Markup in a field is escaped at rest, because the admin dashboard renders it and an
-unescaped \`<script>\` is a stored-XSS hole. Downstream delivery is keyed by the submission id, so a
-retry is not a second lead. Events are keyed by the form so intake stays ordered and carry hashes
-rather than values, because a topic is retained and replicated. And the read side redacts personal
-data by default, with a separate, audited export for the callers who are allowed to see it.
+Formspree, a hosted form backend, documents the shape of this problem from the abuse side: every
+form gets reCAPTCHA, and a hidden \`_gotcha\` honeypot input causes the server to silently drop any
+submission that fills it in, because a scraper fills every field it finds. The rest of the pipeline
+follows the same reasoning. A form service validates against the schema version the author
+*published*, not the draft still being edited, because a published form is a contract with the
+people submitting to it. It rejects unknown fields and oversized values field by field so the
+client learns what to fix. A captcha token is consumed exactly once, and submissions are limited on
+the form and the submitter address together, so neither one address nor a botnet can sweep a form.
+Markup in a field is escaped at rest, because the admin dashboard renders it and an unescaped
+\`<script>\` is a stored-XSS hole. Downstream delivery is keyed by the submission id, so a retry is
+not a second lead. Events are keyed by the form so intake stays ordered and carry hashes rather
+than values, because a topic is retained and replicated. And the read side redacts personal data by
+default, with a separate, audited export for the callers who are allowed to see it.
 
 ## What you build here
 
@@ -57,7 +59,7 @@ One service, **formd**, with five pieces:
    the idempotency key, per-handler outcomes recorded, and a replay that re-invokes only the failed
    handlers.
 4. A **Kafka** event path: one \`form.submission\` event per submission keyed by the form id, carrying
-   \`field_names\` and a \`value_hash\` — never the raw values — with an outbox row when the produce is
+   \`field_names\` and a \`value_hash\` rather than the raw values, with an outbox row when the produce is
    rejected.
 5. \`GET /v1/forms/{id}/submissions\` and its export: owner-only, redacted by default, cursor-paged,
    with a generated export filename and an audit record for the PII export.
@@ -65,9 +67,9 @@ One service, **formd**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+it looks right. The job in every step is the job you will have on a real feature: debug it against
+the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 

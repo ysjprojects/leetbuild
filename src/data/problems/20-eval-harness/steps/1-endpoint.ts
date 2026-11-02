@@ -8,32 +8,29 @@ export const endpointStep: Step = {
   focus: ['client', 'harness', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the body and answers \`202\` with a fresh run id. It compiles, it serves the demo, and it starts
-scoring a dataset this service has never seen, with whatever budget the caller felt like. Debug it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/evals/runs\` with body
+\`{"dataset_id": "…", "model_version": "…", "sample_budget": 500}\`, reads \`X-Tenant-Id\` as an
+optional label, generates a run id, enqueues the run and answers \`202\`. It compiles, serves the
+demo and hides 4 flaws.
 
-Implement \`POST /v1/evals/runs\` with body
-\`{"dataset_id": "…", "model_version": "…", "sample_budget": 500}\`.
+**Failure mode the checks target.** The handler trusts the caller for everything: a dataset id
+nobody owns starts an eval that measures nothing, an unbounded budget can queue a million judge
+calls, a request with no tenant is accepted, and the retry every CI client does starts a second
+run that the release gate later reads as two half-populated records.
+
+Requirements:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`model_version\` is a required non-empty string (**400** otherwise). A run without a version
-  cannot be compared with the previous release, which is the only thing the numbers are for.
-- \`sample_budget\` is a required integer from **1** to **5000**; a missing budget or anything above
-  5000 is **400**. The starter caps nothing, so one request can queue an unbounded eval.
-- \`dataset_id\` must name a dataset the service owns: look it up in the dataset registry before
-  anything is queued and answer **404** for an unknown id. Scoring against a dataset that does not
-  exist produces a green report with no samples behind it.
+- \`model_version\` is a required non-empty string (**400** otherwise).
+- \`sample_budget\` is a required integer from **1** to **5000** (\`MAX_SAMPLES\`); missing or
+  oversized is **400**.
+- \`dataset_id\` must name a dataset the service owns: look it up in the registry before anything
+  is queued and answer **404** for an unknown id.
 - \`Idempotency-Key\` is required (**400** when missing) and the created run is stored under
-  \`(tenant, key)\`. A replay with the same key returns the **stored run** — same \`run_id\`, same
-  status, \`200\` — instead of queueing a competing run.
-- Validate everything **before** the run is enqueued: a rejected request must leave no run behind.
-- Log the decision with tenant, run id and dataset — never the sample or prompt data.
-
-**Failure mode the checks target.** The starter trusts the caller for the dataset id, so a typo
-produces an eval that measures nothing; it caps no budget, so a typo'd budget can queue a million
-judge calls; and it ignores \`Idempotency-Key\`, so the CI retry that every client does starts a
-second run against the same dataset and the release gate later reads two half-populated records.`,
+  \`(tenant, key)\`. A replay with the same key returns the **stored run** with \`200\`, same
+  \`run_id\`, instead of queueing a second one.
+- Validate everything **before** the run is enqueued: a rejected request leaves no run behind.
+- Log tenant, run id and dataset, not the sample or prompt data.`,
   sequence: {
     participants: ['Client', 'Eval Harness', 'dataset registry', 'run store'],
     messages: [
@@ -141,8 +138,7 @@ def enqueue(run_id: str, dataset_id: str, model_version: str) -> None:
 
 @app.post("/v1/evals/runs")
 def start_run(body: RunRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
-    # validates, and ignores Idempotency-Key, so a retry starts a second competing run.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     run_id = str(uuid.uuid4())
     enqueue(run_id, body.dataset_id, body.model_version)
     return {"run_id": run_id, "status": "queued", "sample_budget": body.sample_budget}
@@ -244,8 +240,7 @@ async function enqueue(runId: string, datasetId: string, modelVersion: string): 
 }
 
 app.post('/v1/evals/runs', async (request, reply) => {
-  // TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
-  // validates, and ignores Idempotency-Key, so a retry starts a second competing run.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RunBody;
   const runId = randomUUID();
@@ -347,8 +342,7 @@ func startRun(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
-	// validates, and ignores Idempotency-Key, so a retry starts a second competing run.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	runID := uuid.NewString()
 	enqueue(runID, body.DatasetID, body.ModelVersion)
 	writeJSON(rw, http.StatusAccepted, map[string]any{
@@ -494,8 +488,7 @@ object EvalApi {
       post {
         headerValueByName("X-Tenant-Id") { _ =>
           entity(as[RunRequest]) { body =>
-            // TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues
-            // before it validates, and ignores Idempotency-Key, so a retry starts a second run.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val runId = UUID.randomUUID().toString
             enqueue(runId, body.dataset_id, body.model_version)
             complete(StatusCodes.Accepted, s"""{"run_id":"$runId","sample_budget":\${body.sample_budget}}""")
@@ -612,8 +605,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
-    // validates, and ignores Idempotency-Key, so a retry starts a second competing run.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto runId = uuidString();
     enqueue(runId, body.value("dataset_id", std::string()), body.value("model_version", std::string()));
     std::cerr << "run started tenant=" << tenant << " run_id=" << runId << "\\n";
@@ -719,9 +711,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant, Idempotency-Key, model_version, sample_budget range, and only then the dataset lookup. Each one returns before the run is queued, so a rejected request can never leave a half-started eval behind.',
-    'The registry lookup is the check that keeps the numbers honest: `datasets.exists(dataset_id)` before `store.put`. Without it, a typo in the CI job starts a run that scores nothing and reports `pending` forever — or worse, a green report over zero samples.',
-    'The idempotency lookup is keyed by `(tenant, key)` and happens before the new run is written; a hit returns the stored run with `200`. Storing the run object — not just a request hash — is what lets the replay answer with the same `run_id` the first call returned.',
+    'Symptom: a CI job retries its POST after a timeout and the dashboard shows two runs for one dataset, one of them against a typo of a dataset id that will sit at `pending` forever.',
+    'Mechanism: the handler enqueues before it checks anything. The tenant header is optional, the budget is unchecked, the registry is not consulted, and `Idempotency-Key` is read by nobody, so every request is new.',
+    'Fix: guard clauses in cost order (tenant 401, Idempotency-Key 400, model_version and budget 400, `datasets.exists` 404), then `store.get(tenant, key)` returns the stored run with 200, else `store.put` and enqueue.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, where a wrong acceptance is expensive rather than slow. The starter reads fine because the demo posts a known dataset, a sane budget and never retries. Four defects are being checked: authentication (the tenant is never optional), existence (a dataset id is a claim until the registry confirms it), caps (cheap rejections before expensive work), and idempotency keyed by tenant so the retry loop every CI client runs cannot start a competing run. Real harnesses add per-tenant dataset grants, a run state machine (\`queued\` → \`running\` → \`passed\`/\`failed\`), and a hashed request fingerprint so two different bodies under one key are rejected instead of silently replaying the first.`,
+  debrief: `The fix is a funnel because every rejection is cheaper than the work it prevents: a header check costs nothing, a registry lookup costs one read, and a queued run costs thousands of judge calls, so the guards run in that order and the enqueue is the last line. Idempotency is keyed by tenant and stores the whole run object, which is what lets a replay answer with the same \`run_id\` the first call got instead of a fresh one. Production harnesses go further than a registry lookup: a per-tenant grant decides which datasets a team may score at all, and the idempotency row keeps a fingerprint of the body so a different request under a reused key is rejected rather than silently replayed as the first.`,
 };

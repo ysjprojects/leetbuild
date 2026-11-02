@@ -8,38 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'catalog', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the body, writes
-an assignment and answers \`200\`. It compiles, it serves the demo, and it hides three production
-flaws — an escalation hole, an unvalidated scope, and a missing idempotency key. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/roles/assignments\` with body
+\`{"subject": "user:ada", "role": "team_admin", "scope": "team:eng"}\` and the \`X-Assigner-Id\`
+header, checks that the assigner holds an admin role somewhere, writes the assignment and answers
+\`200\`. It compiles, serves the demo, and hides 4 flaws.
 
-Implement \`POST /v1/roles/assignments\` with body \`{"subject": "user:ada", "role": "team_admin",
-"scope": "team:eng"}\` and the authenticated \`X-Assigner-Id\` header.
+**Failure mode the checks target.** "Is this caller an admin?" is not "does this caller hold what
+they are handing out?", which is how a team admin grants \`org_admin\` at \`org\`. Any scope string
+is accepted, so a grant can land on \`*\`. An un-keyed endpoint re-grants on every retry.
 
-- The assigner comes from \`X-Assigner-Id\`; a missing or empty one is **401**. \`subject\`, \`role\`
-  and \`scope\` are required and non-empty (**400** otherwise).
-- **No escalation.** A grant is authorized only when the assigner already holds **every** permission
-  the role confers, at a scope that covers the target scope. Compare sets, not role names: "the
-  assigner is an admin somewhere" is how a team admin ends up granting \`org_admin\` at \`org\`.
-  A grant the assigner cannot back is **403**, and the body names the first missing permission:
+- A missing or empty \`X-Assigner-Id\` is **401**; \`subject\`, \`role\` and \`scope\` are required
+  (**400**).
+- **No escalation.** The assigner must already hold **every** permission the role confers, at a
+  scope covering the target. Compare permission sets, not role names. Otherwise **403** with
   \`{"error": "insufficient_permissions", "missing_permission": "org:write"}\`.
-- **Scope containment.** A permission held at a broader scope covers a narrower one (\`org\` covers
-  everything, a team scope covers a project inside it); a permission held only at a narrow scope
-  never authorizes a broader grant. Held at \`team:eng\`, you cannot grant at \`org\`.
-- **The catalog decides scopes.** \`role\` must exist in the role catalog and \`scope\` must be of a
-  kind the catalog allows for that role, otherwise **422**. Wildcards are not in the catalog:
-  \`scope: "*"\` is **422**, not a super-grant.
-- **Idempotency.** \`Idempotency-Key\` is required (**400** when missing). A replay of the same
-  \`(Idempotency-Key, subject, role, scope)\` returns the stored assignment with **200** and writes
-  nothing; only the first call mutates state.
-- Log the assignment id with subject, role, scope and assigner — ids only, never the subject's full
-  permission set.
-
-**Failure mode the checks target.** Checking "is this caller an admin?" instead of "does this caller
-hold what they are handing out?" turns every delegated admin into a path to organization-wide roles.
-Accepting any scope string lets a grant land on \`*\`, a scope no policy was ever written for. And an
-un-keyed assignment endpoint re-grants on every client retry, which is exactly how a revocation
-audit ends up with duplicate grants nobody can explain.`,
+- **Scope containment.** \`org\` covers everything, a team covers a project inside it, and a narrow
+  holding does not authorize a broader grant.
+- **The catalog decides.** \`role\` must exist in the catalog and \`scope\` must be of a kind it
+  allows for that role, otherwise **422**. \`scope: "*"\` is **422**.
+- **Idempotency.** \`Idempotency-Key\` is required (**400**). A replay of the same
+  \`(Idempotency-Key, subject, role, scope)\` returns the stored assignment, writing nothing.
+- Log the assignment id with subject, role, scope and assigner, ids only.`,
   sequence: {
     participants: ['Client', 'Permission Service', 'Role catalog', 'Grant store'],
     messages: [
@@ -60,9 +49,9 @@ audit ends up with duplicate grants nobody can explain.`,
     ],
   },
   hints: [
-    'Order the guards cheapest first: assigner, Idempotency-Key, body shape, catalog lookup, then the escalation check — the only one that reads the grant store. Every earlier rejection is a pure function of the request.',
-    'Authorize by permission sets, not by role names. `required = ROLE_CATALOG[role].permissions`, `held = store.holdings(assigner)` as `scope → permissions`, and a permission counts only when some holding scope *covers* the target scope. The first uncovered permission is the one you name in the 403.',
-    'Scope containment is one comparison: equal scopes cover, `org` covers everything, and otherwise a lower-ranked kind covers a higher-ranked one (`org` < `team` < `project`). A wildcard `*` has a kind the catalog never lists, so it dies at the 422, not at the 403.',
+    'A team admin at `team:eng` posts `role: org_admin, scope: "*"` and gets `200`. Retrying the same request after a timeout grants it a second time.',
+    'The starter asks `store.admin_roles(assigner)` and accepts any admin role anywhere, so the target role and scope are not compared with anything the assigner holds. The catalog and `Idempotency-Key` are not read.',
+    'Look up `ROLE_CATALOG[role]` (422 on miss or a disallowed scope kind), compare its permissions with `store.holdings(assigner)` under `scope_covers` using `SCOPE_RANK` (403 naming the first gap), then `store.assignment(key, …)` before `store.put`.',
   ],
   checks: [
     {
@@ -132,7 +121,7 @@ audit ends up with duplicate grants nobody can explain.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/roles/assignments: flawed code that trusts any admin to grant anything."""
+      starter: `"""POST /v1/roles/assignments: assign a role to a subject at a scope."""
 import logging
 
 from fastapi import FastAPI, Header
@@ -164,8 +153,7 @@ store = GrantStore()
 
 @app.post("/v1/roles/assignments")
 def assign(body: Assignment, assigner: str = Header(alias="X-Assigner-Id")) -> JSONResponse:
-    # TODO: this starter only checks that the assigner is an admin somewhere, never consults the
-    # role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     roles = store.admin_roles(assigner)
     if "org_admin" not in roles and "team_admin" not in roles:
         return JSONResponse({"error": "forbidden"}, status_code=403)
@@ -294,7 +282,7 @@ def assign(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/roles/assignments: flawed code that trusts any admin to grant anything. */
+      starter: `/** POST /v1/roles/assignments: assign a role to a subject at a scope. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -320,8 +308,7 @@ export const store: GrantStore = {
 };
 
 app.post('/v1/roles/assignments', async (request, reply) => {
-  // TODO: this starter only checks that the assigner is an admin somewhere, never consults the role
-  // catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const assigner = request.headers['x-assigner-id'] as string;
   const body = request.body as AssignmentBody;
   const roles = await store.adminRoles(assigner);
@@ -487,8 +474,7 @@ func assign(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter only checks that the assigner is an admin somewhere, never consults the
-	// role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	roles, _ := store.AdminRoles(r.Context(), assigner)
 	admin := false
 	for _, role := range roles {
@@ -705,8 +691,7 @@ object AssignmentApi {
       post {
         headerValueByName("X-Assigner-Id") { assigner =>
           entity(as[AssignmentRequest]) { body =>
-            // TODO: this starter only checks that the assigner is an admin somewhere, never consults
-            // the role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val roles = store.adminRoles(assigner)
             if (!roles.contains("org_admin") && !roles.contains("team_admin")) {
               complete(StatusCodes.Forbidden, """{"error":"forbidden"}""")
@@ -855,8 +840,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter only checks that the assigner is an admin somewhere, never consults the
-    // role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     bool admin = false;
     for (const auto& role : store.adminRoles(assigner)) {
       if (role == "org_admin" || role == "team_admin") admin = true;
@@ -1010,5 +994,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the *delegation* boundary, not just the authentication one. The starter reads fine because the demo has one assigner who is an organization admin and one role that happens to be grantable — so the escalation hole never fires. What is really being checked is that authorization and assignment are the same question: to hand out a permission you must hold it, at a scope that covers the one you are writing to. Three defects follow from that single idea: the set comparison (not an "is admin" flag), scope containment (so a team grant cannot reach \`org\`), and the catalog as the only source of valid scopes (so \`*\` is a 422 instead of a super-grant). Idempotency is the fourth: without a key, every client retry writes another grant, and the audit trail of "who could grant what" stops being readable. Real systems add approval workflows for privileged roles, a separate grant id per assignment, and an append-only audit log of the assigner, the role and the scope.`,
+  debrief: `The fix has its shape because authorization and assignment are one question: to hand out a permission you must hold it, at a scope that covers the one you are writing to. That is why the check is a set comparison over the catalog's permissions rather than an "is admin" flag, why scope containment is a rank comparison rather than string equality, and why the catalog is the only source of valid scopes, so \`*\` is a 422 instead of a super-grant. The Idempotency-Key sits in front of the write because a retried assignment must be the same assignment. Production systems go further: approval workflows for privileged roles, grant expiry, and an append-only audit log of assigner, role and scope that an access review can read directly.`,
 };

@@ -8,37 +8,25 @@ export const readStep: Step = {
   focus: ['client', 'query', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the series route,
-reads the points and answers, so the dashboard draws. It compiles, the demo passes, and it hides four
-production flaws — each one a way for a single refresh to read years of every tenant's data. Debug it
-like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`GET /v1/series?series=…&from=…&to=…&cursor=…&limit=…\`:
-
-- The caller's tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is
-  **401**.
-- \`from\` and \`to\` are **required** epoch seconds and \`to\` must be after \`from\` (**400**
-  otherwise). The window may span at most **7 days** (\`MAX_RANGE_DAYS\`): a wider range — and a
-  missing \`from\`, which is an open lower bound — is **400**, and the cap must be enforced **before**
-  the store is called. An open-ended range that reaches the store is a scan of the whole retention,
-  and every dashboard refresh repeats it.
-- A query may name at most **50 series** (\`MAX_SERIES\`); a longer list is **400** before the store
-  is touched, so one query can never multiply a scan by an unbounded number of series.
-- Every name is resolved against its **owner tenant**: a series whose tenant differs from the
-  caller's is **404**, exactly like a name that does not exist, so the endpoint is not an oracle for
-  other tenants' metrics.
-- Points are **downsampled** to at most one per **10 seconds** (\`RESOLUTION_SECONDS\`) per series,
-  and the method is named in the response
-  (\`"downsample": {"method": "max", "bucket_seconds": 10}\`). Raw full-resolution points are never
-  returned, whatever the range.
-- The page is explicit: the request takes \`limit\` and an opaque \`cursor\`, and the response carries
-  the next \`cursor\` when a page fills, instead of silently truncating the series.
+**Starting point.** The starter registers \`GET /v1/series?series=…&from=…&to=…&cursor=…&limit=…\`,
+splits the series list, reads every point for each name from the store and answers with the raw
+rows. It compiles, serves the demo and hides 5 flaws.
 
 **Failure mode the checks target.** The starter passes an open lower bound and a far-future \`to\`
-straight to the store, so one refresh reads the entire retention; it returns every raw point at full
-resolution forever, so a chatty series is hundreds of thousands of rows per call; and it answers for
-any series name in any tenant, which turns the query API into an enumeration oracle over everyone's
-metrics.`,
+straight to the store, so one refresh reads the entire retention; it returns every raw point, so a
+chatty series is hundreds of thousands of rows per call; and it answers for any series in any
+tenant, so the query API doubles as an enumeration oracle.
+
+- \`from\` and \`to\` are **required** epoch seconds, \`to\` after \`from\`, spanning at most **7 days**
+  (\`MAX_RANGE_DAYS\`); a wider range or a missing \`from\` is **400** before the store is called.
+- A query names at most **50 series** (\`MAX_SERIES\`); a longer list is **400** before the store is
+  touched.
+- Every name is resolved against its **owner tenant** and compared with the caller's \`X-Tenant-Id\`:
+  a mismatch is **404**, exactly like a name that does not exist.
+- Points are **downsampled** to one per **10 seconds** (\`RESOLUTION_SECONDS\`) per series, and the
+  response names the method (\`"downsample": {"method": "max", "bucket_seconds": 10}\`).
+- The request takes \`limit\` and an opaque \`cursor\`; the response carries the next \`cursor\` when a
+  page fills, instead of silently truncating the series.`,
   sequence: {
     participants: ['Dashboard', 'Query API', 'Redis', 'Series store'],
     messages: [
@@ -163,9 +151,7 @@ store = SeriesStore()
 
 @app.get("/v1/series")
 def series(series: str, to_s: int | None = None) -> dict:
-    # TODO: this starter takes an open lower bound and a far-future to, returns raw points at full
-    # resolution, and serves any tenant's series by name. Bound the range and the series list,
-    # downsample to 10 s buckets, page with a cursor and 404 a series the caller does not own.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     names = series.split(",")
     points = store.query(names, 0, to_s or 4_102_444_800)
     return {"series": names, "points": points}
@@ -271,9 +257,7 @@ export interface SeriesStore {
 declare const store: SeriesStore;
 
 app.get('/v1/series', async (request, reply) => {
-  // TODO: this starter takes an open lower bound and a far-future to, returns raw points at full
-  // resolution, and serves any tenant's series by name. Bound the range and the series list,
-  // downsample to 10 s buckets, page with a cursor and 404 a series the caller does not own.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const query = request.query as {series?: string; to?: string};
   const names = (query.series ?? '').split(',').filter(Boolean);
   const toS = Number(query.to ?? 4102444800);
@@ -393,10 +377,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 func Series(store Store) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: this starter takes an open lower bound and a far-future to, returns raw points at
-		// full resolution, and serves any tenant's series by name. Bound the range and the series
-		// list, downsample to 10 s buckets, page with a cursor and 404 a series the caller does
-		// not own.
+		// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 		names := strings.Split(r.URL.Query().Get("series"), ",")
 		toS, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
 		if toS == 0 {
@@ -569,9 +550,7 @@ object SeriesQuery {
     path("v1" / "series") {
       get {
         parameters("series".?, "to".as[Long].?) { (series, toOpt) =>
-          // TODO: this starter takes an open lower bound and a far-future to, returns raw points at
-          // full resolution, and serves any tenant's series by name. Bound the range and the series
-          // list, downsample to 10 s buckets, page with a cursor and 404 a foreign series.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val names = series.getOrElse("").split(",").filter(_.nonEmpty).toIndexedSeq
           val points = store.query(names, 0L, toOpt.getOrElse(4102444800L))
           complete(StatusCodes.OK, """{"series":"ok"}""")
@@ -688,9 +667,7 @@ SeriesStore store;
 
 void registerSeriesRoutes(httplib::Server& svr) {
   svr.Get("/v1/series", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter takes an open lower bound and a far-future to, returns raw points at full
-    // resolution, and serves any tenant's series by name. Bound the range and the series list,
-    // downsample to 10 s buckets, page with a cursor and 404 a series the caller does not own.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     std::vector<std::string> names;
     const auto series = req.get_param_value("series");
     std::size_t start = 0;
@@ -845,9 +822,9 @@ void registerSeriesRoutes(httplib::Server& svr) {
     },
   },
   hints: [
-    'Bound both axes before the store is touched: `from` and `to` are required and the window may span at most `MAX_RANGE_DAYS` (7) days, and a query may name at most `MAX_SERIES` (50) series. An open lower bound (`from=0`) is not a convenience, it is a scan of the whole retention — and every dashboard refresh repeats it.',
-    'Resolve ownership before you read: `owner(name)` compares the series’ tenant with `X-Tenant-Id`, and a mismatch answers **404** exactly like an unknown name, so a prober cannot learn that a series exists on another tenant.',
-    'Downsample per series to `RESOLUTION_SECONDS` (10) buckets and name the method in the response (`"downsample": {"method": "max"}`), then page with the `cursor` the store hands back when a page fills — a page that fills must return a token, never a silent truncation.',
+    "One dashboard refresh with `from` omitted takes seconds and returns hundreds of thousands of raw points, and a request naming another tenant's series answers 200 with their data.",
+    'The handler forwards `from`/`to` and every name straight to the store with no range, count or ownership check, then returns the rows it read at full resolution without a cursor.',
+    'Before any read: require both bounds, cap at `MAX_RANGE_DAYS` and `MAX_SERIES` (400), compare `owner(name)` with the tenant (404), then bucket by `RESOLUTION_SECONDS` with `"method": "max"` and page with `cursor`.',
   ],
-  debrief: `Four contracts, one endpoint. First, a range cap enforced in the handler means the store only ever sees a window it can answer: an open lower bound is a scan of the entire retention, and a dashboard that refreshes every five seconds repeats it until the query path is down. Second, both axes are bounded — a series list cap is what stops one scan from being multiplied by an unbounded number of names — and each name is resolved against the tenant that owns it, with a mismatch indistinguishable from an unknown name, so the endpoint never becomes an enumeration oracle over other tenants’ metrics. Third, resolution is a contract with the reader: points are max-aggregated into 10-second buckets and the method is named, so no reader receives thousands of raw points per series per minute and the spike the dashboard exists to show survives the aggregation instead of being averaged away. Fourth, the cursor makes the page explicit: a page that fills hands back an opaque token rather than silently truncating the series, and the client decides whether to continue. Real platforms add pre-aggregated rollups per resolution, per-tenant read budgets, and a separate raw path with its own tighter caps, but bounded axes, named downsampling and tenant scoping are what make a series query safe to expose.`,
+  debrief: `The fix bounds the query before the store sees it, which is the only place a bound can hold: an open lower bound that reaches the store is a scan of the whole retention, and a dashboard refreshing every five seconds repeats it until the query path is down. The series cap keeps that scan from being multiplied, and resolving each name against its owner, with a mismatch answered like an unknown name, keeps the endpoint from becoming an oracle over other tenants. Max-downsampling into 10-second buckets preserves the spike the chart exists to show, and the cursor makes a full page explicit. Production query paths add pre-aggregated rollups per resolution, per-tenant read budgets and a separate raw path with tighter caps.`,
 };

@@ -8,29 +8,25 @@ export const endpointStep: Step = {
   focus: ['client', 'batchd', 'db', 'worker'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and starts a job, so the demo submits a batch and shards appear in the work set. It hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter registers \`POST /v1/batches\` with body \`{"manifest_uri": "s3://…"}\`,
+reads the tenant header, builds a ten-million-record list in memory, creates a job, seeds the work
+set, writes the manifest and answers 200 with a fresh job id. It serves the demo and hides 5 flaws.
 
-Implement \`POST /v1/batches\` with body \`{"manifest_uri": "s3://…"}\`.
+**Failure mode the checks target.** A submit that starts expensive work in the wrong order: a job is
+minted for every client retry, a manifest of any size is accepted, and shards are enqueued before the
+input object is readable, so the first worker lists a half-written manifest and fails for a reason that
+has nothing to do with the model.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The input manifest is an object whose metadata carries \`record_count\` and \`records\`. Read that
-  metadata with a **\`HEAD\`** *before* anything is stored: while the object is not readable the submit
-  is a **409**, and when \`record_count\` is over **1 000 000** the submit is a **400** with no job
-  written. The starter reads ten million records into memory and seeds shards before the manifest
-  exists, so the first worker races a half-written input.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the stored job instead of minting a new one — the starter creates a job on every submit.
+  returns the stored job instead of minting a new one.
+- The input manifest is an object whose metadata carries \`record_count\` and \`records\`. Read that
+  metadata with a **\`HEAD\`** before anything is stored: while the object is not readable the submit
+  is a **409**, and when \`record_count\` is over **1 000 000** the submit is a **400** with no job
+  written.
 - Only after the manifest is durably readable and the count passes: create the job, write the
   manifest pointer, then enqueue one work-set entry per shard (\`ceil(record_count / 1000)\`).
 - Answer **202 Accepted** with \`{job_id, status, shards}\`.
-
-**Failure mode the checks target.** An unbounded manifest turns one submit into a ten-million-record
-memory spike; a job minted per submit makes every client retry run the batch twice; and enqueueing
-before the manifest is readable hands workers a half-written input, so the first shard fails for a
-reason that has nothing to do with the model.
 
 :::widget idempotency {}`,
   sequence: {
@@ -50,9 +46,9 @@ reason that has nothing to do with the model.
     ],
   },
   hints: [
-    'Validate in cost order: tenant, `Idempotency-Key`, then the manifest `HEAD`. Every guard returns before any job row or Redis write, so a malformed submit never spends anything.',
-    'The idempotency lookup is keyed by `(tenant, key)` and happens before the job is created; a hit returns the stored job with the same 202. Storing the whole job — not just the key — is what lets a replay answer without re-deriving the shard count.',
-    'The order is the contract: `HEAD` the manifest, reject an over-cap count, write the manifest pointer, and only then seed the work set. Enqueue first and the first worker lists an object that is still being written.',
+    'Submit the same request twice and two batches run; submit while the manifest upload is still in flight and the first shard fails on a missing object before any model call happens.',
+    'The handler trusts every input: no tenant or key check, a record list built in memory, `store.create` and `enqueue_shards` called before `put_manifest`, so the work set exists before the object does.',
+    'Guard in cost order: 401 on no tenant, 400 on no key, `find_by_key` hit returns the stored job, `HEAD` the manifest (409 unreadable, 400 over `MAX_RECORDS`), then create, then `enqueue_shards`, answer 202.',
   ],
   checks: [
     {
@@ -157,8 +153,7 @@ def enqueue_shards(batch_id: str, shard_count: int) -> None:
 
 @app.post("/v1/batches")
 def submit(body: BatchRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
-    # and seeds shards before the manifest is readable. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     records = [f"record-{i}" for i in range(10_000_000)]
     job = store.create(tenant, body.manifest_uri, body.shard_count)
     enqueue_shards(job["job_id"], body.shard_count)
@@ -240,7 +235,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/batches: flawed code that starts before the manifest exists. */
+      starter: `/** POST /v1/batches: submit handler. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -271,8 +266,7 @@ async function enqueueShards(batchID: string, shardCount: number): Promise<void>
 }
 
 app.post('/v1/batches', async (request, reply) => {
-  // TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
-  // and seeds shards before the manifest is readable. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as BatchBody;
   const records = Array.from({length: 10_000_000}, (_, i) => 'record-' + i);
@@ -411,8 +405,7 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
-	// and seeds shards before the manifest is readable. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	records := make([]string, 10_000_000)
 	job, _ := store.Create(r.Context(), tenant, body.ManifestURI, body.ShardCount)
 	batchID := job["job_id"].(string)
@@ -561,8 +554,7 @@ object BatchApi {
     path("v1" / "batches") {
       post {
         entity(as[BatchRequest]) { body =>
-          // TODO: this starter reads the manifest into memory unbounded, mints a new job on every
-          // submit, and seeds shards before the manifest is readable. Fix all three.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val records = (0 until 10_000_000).map(i => s"record-$i").toList
           val job = store.create(body.manifest_uri, body.shard_count)
           enqueueShards(job.job_id, body.shard_count)
@@ -673,8 +665,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
-    // and seeds shards before the manifest is readable. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const std::vector<std::string> records(10000000, "record");
     const auto manifestURI = body.value("manifest_uri", std::string());
     const int shardCount = body.value("shard_count", 1000);
@@ -776,13 +767,15 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing an endpoint that starts expensive work, and every defect is about the
-order of operations. Authentication first, then the idempotency lookup, then the manifest gate, then
-the job write, then the shards. The starter reverses the last two: it starts processing before the
-input is durably readable, so the first shard is a race, not a model failure. Two more flaws hide
-behind the happy path: an unbounded manifest that trusts the caller for ten million records, and a
-minted job id that makes every client retry run the batch twice. The contract is that a submit is a
-single, idempotent, bounded promise — a \`HEAD\` on the manifest before anything is stored is what
-makes the promise true. Real services add a manifest schema version, a record-count checksum, and a
-reservation on the tenant's batch quota before the job row.`,
+  debrief: `The fix is an ordering, not a feature. Every guard that can reject a submit runs before
+anything is written: tenant, key, idempotency lookup, manifest \`HEAD\`, record cap. Only then does the
+job row exist, and only after the manifest pointer is stored does the work set get its shards. The
+\`HEAD\` is the load-bearing call: it proves the input is readable without pulling a single record into
+the API process, which is what makes a one-million-record cap enforceable at all. Storing the whole
+job under \`(tenant, key)\` lets a replay answer 202 without recomputing anything.
+
+What this step left out: the stored idempotency record should carry a hash of the request body so a
+key reused with a different manifest is rejected rather than silently answered, the key needs an
+expiry, and a tenant quota reservation belongs before the job row so a burst of submits cannot
+exceed the account's concurrency.`,
 };

@@ -8,34 +8,32 @@ export const invoiceLedgerStep: Step = {
   focus: ['client', 'billing', 'db', 'processor'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the ledger route,
-reads the periods and returns an amount per period. It compiles, it serves the demo, and it hides four
-production flaws. Debug it like the billing owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/subscriptions/{id}/invoices\`: it takes the
+subscription id from the path, lists the subscription's periods, computes an amount for each from
+the plan price and the granted credits, and returns \`{"subscription_id", "periods"}\`. It compiles,
+it serves the demo, and it hides four flaws.
 
-Implement the ledger read on \`GET /v1/subscriptions/{id}/invoices\`.
+**Failure mode the checks target.** Every flaw survives the demo. The seeded subscription belongs to
+the caller and its plan does not change, so a figure recomputed from plan prices agrees with the
+invoice by accident, until a proration or a mid-period change makes the two disagree. No credit has
+been granted yet, so a response that nets credits into the amount looks correct. The processor's
+records have not yet differed from the ledger, so a response that does not ask it looks reconciled.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**, and a
-  subscription that belongs to another tenant is **404** — never another tenant's ledger. A **403**
-  would confirm that the id exists, so it is the wrong answer.
+  subscription that belongs to another tenant is **404**. A **403** would confirm that the id
+  exists, so it is the wrong answer.
 - Each period carries \`period_start\`, \`period_end\` and \`amount_cents\` read from the **stored
-  invoice row** — the amount that was actually charged — never a figure recomputed from plan prices.
-  A ledger that re-derives the number cannot be tied out against the processor.
-- Credits are always returned as their own lines (\`credit_id\`, \`amount_cents\`, \`reason\`), never
-  netted into the period's amount: the customer is entitled to see why the total is what it is.
+  invoice row**, the amount that was actually charged, not a figure recomputed from plan prices. A
+  ledger that re-derives the number cannot be tied out against the processor.
+- Credits are returned as their own lines (\`credit_id\`, \`amount_cents\`, \`reason\`), not netted
+  into the period's amount: the customer is entitled to see why the total is what it is.
 - \`payment_references\` lists the processor charge references for the period.
 - \`reconciled\` is true only when the stored invoiced amount agrees with the processor's own records
   for that period: read the processor's total with \`GetInvoice\` and report the comparison as
   \`processor_total_cents\`, so a missing or a duplicated charge is visible to the customer and to
   support instead of surfacing in a nightly report nobody reads.
-- The endpoint is read-only: it charges nothing, mutates nothing, and never puts card data in the
-  response or in the logs.
-
-**Failure mode the checks target.** Every one of these flaws survives a demo. The seeded subscription
-belongs to the caller and its plan never changes, so a figure recomputed from plan prices agrees with
-the invoice by accident — until a proration or a mid-period change makes the two disagree. No credit
-has been granted yet, so a response that nets credits into the amount looks correct. And the
-processor's records have never differed from the ledger, so a response that never asks it looks
-reconciled. Each of those is silent in a demo and loud in production.`,
+- The endpoint is read-only: it charges nothing, mutates nothing, and puts no card data in the
+  response or in the logs.`,
   sequence: {
     participants: ['Client', 'Billing Service', 'billing db', 'Payment processor'],
     messages: [
@@ -185,12 +183,7 @@ subscriptions = SubscriptionStore()
 
 @app.get("/v1/subscriptions/{subscription_id}/invoices")
 def read_ledger(subscription_id: str) -> JSONResponse:
-    # TODO: flawed code. It re-derives each period's amount_cents from the plan price
-    # (PLANS[plan] * days / MONTH_DAYS) instead of reading the stored invoice row, subtracts the
-    # period's credit from the amount so the customer never sees a credit line or its credit_id,
-    # takes the subscription id straight from the path with no tenant check (any tenant can read any
-    # ledger, and a foreign subscription is answered with the ledger instead of a 404), and never
-    # contacts the processor, so the response carries no reconciled flag and no processor_total_cents.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     subscription = subscriptions.load(subscription_id)
     periods = []
     for period in subscriptions.list_periods(subscription_id):
@@ -318,7 +311,7 @@ def read_ledger(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/subscriptions/:subscriptionId/invoices: flawed code of the ledger read. */
+      starter: `/** GET /v1/subscriptions/:subscriptionId/invoices: the ledger read starter. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -352,12 +345,7 @@ function daysBetween(start: string, end: string): number {
 
 app.get('/v1/subscriptions/:subscriptionId/invoices', async (request, reply) => {
   const {subscriptionId} = request.params as {subscriptionId: string};
-  // TODO: flawed code. It re-derives each period's amount_cents from the plan price
-  // (PLANS[plan] * days / MONTH_DAYS) instead of reading the stored invoice row, subtracts the
-  // period's credit from the amount so the customer never sees a credit line or its credit_id,
-  // takes the subscription id straight from the path with no tenant check (any tenant can read any
-  // ledger, and a foreign subscription is answered with the ledger instead of a 404), and never
-  // contacts the processor, so the response carries no reconciled flag and no processor_total_cents.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const subscription = await loadSubscription(subscriptionId);
   const periods = [];
   for (const period of await listPeriods(subscriptionId)) {
@@ -520,12 +508,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func readLedger(rw http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	subscriptionID := r.PathValue("subscriptionID")
-	// TODO: flawed code. It re-derives each period's amount_cents from the plan price
-	// (plans[plan] * days / monthDays) instead of reading the stored invoice row, subtracts the
-	// period's credit from the amount so the customer never sees a credit line or its credit_id,
-	// takes the subscription id straight from the path with no tenant check (any tenant can read any
-	// ledger, and a foreign subscription is answered with the ledger instead of a 404), and never
-	// contacts the processor, so the response carries no reconciled flag and no ProcessorTotalCents.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	subscription, _ := subscriptions.Load(ctx, subscriptionID)
 	stored, _ := subscriptions.ListPeriods(ctx, subscriptionID)
 	periods := make([]map[string]any, 0, len(stored))
@@ -703,13 +686,7 @@ object Read {
   val route: Route =
     path("v1" / "subscriptions" / Segment / "invoices") { subscriptionId =>
       get {
-        // TODO: flawed code. It re-derives each period's amount_cents from the plan price
-        // (Plans(plan) * days / MonthDays) instead of reading the stored invoice row, subtracts the
-        // period's credit from the amount so the customer never sees a credit line or its credit_id,
-        // takes the subscription id straight from the path with no tenant check (any tenant can read
-        // any ledger, and a foreign subscription is answered with the ledger instead of a 404), and
-        // never contacts the processor, so the response carries no reconciled flag and no
-        // processor_total_cents.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val plan = subscriptions.plan(subscriptionId)
         val periods = subscriptions.periods(subscriptionId).map { period =>
           val days = (period("period_end") - period("period_start")) / 86400L
@@ -844,12 +821,7 @@ int main() {
 
   svr.Get("/v1/subscriptions/:id/invoices", [](const httplib::Request& req, httplib::Response& res) {
     const auto subscription_id = req.path_params.at("id");
-    // TODO: flawed code. It re-derives each period's amount_cents from the plan price
-    // (kPlans.at(plan) * days / kMonthDays) instead of reading the stored invoice row, subtracts the
-    // period's credit from the amount so the customer never sees a credit line or its credit_id,
-    // takes the subscription id straight from the path with no tenant check (any tenant can read any
-    // ledger, and a foreign subscription is answered with the ledger instead of a 404), and never
-    // contacts the processor, so the response carries no reconciled flag and no processor_total_cents.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto plan = subscriptions.plan_of(subscription_id);
     json periods = json::array();
     for (const auto& period : subscriptions.list_periods(subscription_id)) {
@@ -969,9 +941,9 @@ int main() {
     },
   },
   hints: [
-    'The ledger is a read of what was charged, so read the invoice rows: `invoices.list_invoices(subscription_id)` returns the stored rows and `invoice.amount_cents` is the number to report. Re-deriving it from the plan price makes the ledger a second, weaker opinion about a figure the invoice already fixed.',
-    'Credits are information, not arithmetic: keep the granted credits out of the amount and emit them as their own lines with `credit_id`, `amount_cents` and `reason`, filtered to the period they belong to. Subtracting them into the total hides the only explanation the customer has for a total that differs from the plan price.',
-    'A total nobody reconciled is an assertion. For every period, call the processor with `GetInvoice(invoice_id)` under a deadline, take its own total, compare it with the stored `amount_cents`, and publish both the figure and the flag. Support needs to see the disagreement, not a promise that there is none.',
+    "A customer who changed plans mid-month sees a ledger amount that differs from what their card was charged, a credit they were promised is nowhere in the response, and a tenant can open another tenant's ledger by id.",
+    'The handler trusts the path id, recomputes each amount as `PLANS[plan] * days / MONTH_DAYS`, subtracts credits into that number, and builds the response without ever asking the processor what it holds.',
+    'Check `X-Tenant-Id` (401, foreign subscription 404), report `invoice.amount_cents` from `list_invoices`, emit `credits` lines with `credit_id`, and call `GetInvoice` per period to fill `processor_total_cents` and `reconciled`.',
   ],
-  debrief: `The interviewer is testing whether you can tell a read that reports money from a read that invents it. Four defects are being checked: tenancy at the boundary (another tenant's ledger is not yours to serve, and a 404 is the answer that does not confirm the id exists), the source of the amount (the stored invoice row is the record of what was charged, while a recomputation from plan prices is a second opinion that drifts the moment a proration, a discount or a mid-period change happens), credits as visible lines rather than arithmetic buried in a total (a customer who cannot see the credit cannot dispute it), and reconciliation as part of the response (the processor's own total per period, compared and reported, so a missing or a duplicated charge is caught by the read that a support agent is looking at rather than by a nightly job that nobody reads). The second one is what candidates miss: recomputing a stored figure feels like verification, but it silently overwrites the record with arithmetic the processor never agreed to. Real billing systems add explicit adjustment actions rather than edits to a closed period, credit notes instead of negative amounts, and a durable audit trail of every reconciliation run with what it compared and what it found.`,
+  debrief: `A read that reports money and a read that invents it look identical on a seeded demo, which is why the fix is about sources. The stored invoice row is the record of what was charged; a recomputation from plan prices is a second opinion that drifts at the first proration, and recomputing feels like verification while it quietly overwrites the record. Credits stay visible because a customer who cannot see the credit cannot dispute it. The processor's own total per period, compared and reported, moves the disagreement into the response a support agent is looking at rather than a nightly job. Tenancy sits at the boundary, with 404 as the answer that does not confirm the id exists. Production ledgers add explicit adjustment actions rather than edits to a closed period, credit notes instead of negative amounts, and a durable audit trail of every reconciliation run.`,
 };

@@ -8,33 +8,25 @@ export const readStep: Step = {
   focus: ['reader', 'collector', 'redis', 'storage'],
   task: `## Task
 
-**Starting point.** The starter is working code: it loads the trace and renders a
-tree, and the tree looks tidy because the starter removes whatever did not fit. A partial trace renders
-as complete, the missing spans vanish so the waterfall is shorter than the truth, and any tenant can
-read any trace. Three defects, one habit: the read path tells a nicer story than the data.
+**Starting point.** The starter serves \`GET /v1/traces/{trace_id}\`: it loads the assembly state,
+keeps the spans whose parent is present, renders them as a tree with per-span durations, marks the
+trace complete and answers \`200\` to any tenant. The tree looks tidy because the starter removes
+whatever did not fit, and it hides four flaws.
 
-Implement \`GET /v1/traces/{trace_id}\`.
+**Failure mode the checks target.** This is the step where an incident analysis is misled. The
+starter's answer is internally consistent, every span it returns has a parent, so nobody doubts it;
+the latency it shows is the sum of the spans present, with no timeline to place them on. And since
+the endpoint does not compare the trace's owner with the caller, one tenant can read another's.
 
-- The caller is authenticated by \`X-Tenant-Id\` (**401** when missing) and the trace belongs to the
-  tenant whose spans assembled it: a trace owned by someone else is **404**, not 403 — "not yours"
-  and "not there" have to be indistinguishable, or the endpoint becomes a way to enumerate other
-  tenants' trace ids.
-- The response carries the trace \`root_span_id\`, and one entry per stored span with \`span_id\`,
+- The caller is authenticated by \`X-Tenant-Id\` (**401** when missing); a trace owned by another
+  tenant is **404**, not 403, so "not yours" and "not there" are indistinguishable.
+- The response carries \`root_span_id\` and one entry per stored span with \`span_id\`,
   \`parent_span_id\`, \`service\`, **\`start_ms\`** (absolute), \`duration_ms\` and
-  **\`end_ms\` = \`start_ms\` + \`duration_ms\`**. Without absolute timestamps the waterfall can only
-  show durations, so a 400 ms span cannot be placed against the request it slowed down.
-- Every parent reference that never got its span is reported in **\`gaps\`** (its \`parent_span_id\`
-  and how many stored spans name it as their parent) and the trace is marked **\`partial\`** when the
-  gap list is not empty. The starter drops the orphans instead, so the tree it returns is shorter than
-  the request that actually ran. A trace that stopped half way is a finding, not a formatting
-  problem.
-- A missing trace is **404**, and a malformed trace id is **422** before the state is read.
-
-**Failure mode the checks target.** This is the step where an incident review is misled. The starter's
-answer is internally consistent — every span it returns has a parent — so nobody doubts it; the
-latency it shows is simply the sum of the spans that happen to be present. And because the endpoint
-never compares the trace's owner with the caller, one tenant can read another tenant's checkout
-latency, which is both a correctness bug and a data leak.`,
+  **\`end_ms\` = \`start_ms\` + \`duration_ms\`**.
+- Every parent reference that never got its span is reported in **\`gaps\`** (the
+  \`parent_span_id\` and how many stored spans name it) and the trace is marked **\`partial\`** when
+  the gap list is not empty.
+- A missing trace is **404**; a malformed trace id is **422** before the state is read.`,
   sequence: {
     participants: ['Trace reader', 'Trace Collector', 'Redis'],
     messages: [
@@ -62,9 +54,9 @@ latency, which is both a correctness bug and a data leak.`,
     ],
   },
   hints: [
-    'The owner check is one comparison but it decides the whole endpoint: `owner != tenant` → 404, before any span is serialized. Returning 403 leaks that the trace exists, and returning 200 leaks the trace itself.',
-    'A trace is partial when a parent reference never got its span, and the assembly state already knows exactly which ones: the `refs:{span_id}` fields whose span id is not in the state are the gaps. Report them and set `partial` from that count — never filter the tree down to the spans that happen to fit.',
-    'Absolute time is what makes a waterfall comparable: each span carries `start_ms` and `duration_ms` and the response adds `end_ms`; `missing` alone tells an on-call engineer that the trace cannot be trusted for a latency conclusion, which is the honest answer.',
+    'An on-call engineer opens a checkout trace, sees a short, complete-looking waterfall with no timeline, and rolls forward; the same URL also works with a tenant header that does not own the trace.',
+    'The handler filters out spans whose parent is absent, hardcodes the trace as complete, emits durations without `start_ms`/`end_ms`, and reads the state without comparing its `owner` field to the caller.',
+    'In `read_trace`, return 404 when `owner != tenant`, build `gaps` from the `refs:` fields whose span is absent, set `partial` from `missing = len(gaps)`, and add `end_ms = start_ms + duration_ms` per span.',
   ],
   checks: [
     {
@@ -150,9 +142,7 @@ store = TraceReader()
 
 @app.get("/v1/traces/{trace_id}")
 def read_trace(trace_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
-    # state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
-    # gaps, mark the trace partial and scope the read to the tenant that owns it.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     trace = store.load(trace_id)
     stored = {span["span_id"] for span in trace["spans"]}
     spans = [
@@ -251,9 +241,7 @@ interface Span {
 }
 
 app.get('/v1/traces/:trace_id', async (request, reply) => {
-  // TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
-  // state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
-  // gaps, mark the trace partial and scope the read to the tenant that owns it.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {trace_id: traceId} = request.params as {trace_id: string};
   const trace = await store.load(traceId);
   const stored = new Set(trace.spans.map((span: Span) => span.span_id));
@@ -358,9 +346,7 @@ type traceState struct {
 func readTrace(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	traceID := r.PathValue("trace_id")
-	// TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
-	// state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
-	// gaps, mark the trace partial and scope the read to the tenant that owns it.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	trace := store.Load(r.Context(), traceID)
 	stored := map[string]bool{}
 	for _, span := range trace.Spans {
@@ -517,9 +503,7 @@ object ReadApi {
     path("v1" / "traces" / Segment) { traceId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: the starter renders every trace as complete, drops the spans whose parent is not in
-          // the state so the waterfall looks shorter, and serves any tenant's trace to any caller.
-          // Report the gaps, mark the trace partial and scope the read to the tenant that owns it.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val trace = store.load(traceId)
           val stored = trace.spans.map(_.span_id).toSet
           val spans = trace.spans
@@ -666,9 +650,7 @@ int main() {
 
   svr.Get(R"(/v1/traces/([0-9a-f]{32}))", [](const httplib::Request& req, httplib::Response& res) {
     const std::string traceId = req.matches[1];
-    // TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
-    // state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
-    // gaps, mark the trace partial and scope the read to the tenant that owns it.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const traceState trace = loadTrace(traceId);
     std::set<std::string> stored;
     for (const auto& span : trace.spans) stored.insert(span.span_id);
@@ -785,5 +767,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether the read path tells the truth. A trace that stopped half way is the normal case, not the exception: a service crashed, an exporter flushed before its parent arrived, a span was dropped by a sampler. The starter's answer hides all of that and stays internally consistent, which is precisely why it is dangerous — an on-call engineer reads a shorter waterfall and concludes the request was fast. Reporting the gaps and marking the trace partial turns an unreliable trace into a usable answer: here is the tree, here is what is missing, do not draw a latency conclusion from it. The owner check is the other half: traces carry a tenant, so the read path is a data boundary, and returning 404 for someone else's trace keeps it from being used to enumerate what exists. Real platforms add per-tenant read quotas, a redaction pass over attributes before they reach a browser, and a "trace is older than the retention window" answer — all of which assume the read path is already honest about the state it holds.`,
+  debrief: `The fix reports the gaps instead of hiding them because a trace that stopped half way is the normal case: a service crashed, an exporter flushed before its parent arrived, a sampler dropped a span. The starter's answer hides all of that and stays internally consistent, which is what makes it dangerous; an on-call engineer reads a shorter waterfall and concludes the request was fast. Marking the trace partial and attaching absolute timestamps turns it into a usable answer: here is the tree, here is what is missing, place it on the timeline before concluding anything. The owner check makes the read path a data boundary; 404 for a foreign trace keeps it from enumerating what exists. Production platforms add a redaction pass over attributes before they reach a browser.`,
 };

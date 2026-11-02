@@ -8,54 +8,31 @@ export const progressReadStep: Step = {
   focus: ['client', 'service', 'redis', 'quality'],
   task: `## Task
 
-**Starting point.** The starter is working code: the route is registered, the
-task resolves, and for the one-annotator demo the numbers add up and the body looks complete. With a
-real team it is wrong in three ways — it hands every peer's submitted labels to everyone "so the team
-can align", it averages agreement over the whole annotator pool including the annotators quality
-review has flagged, and it reads labels straight off the mutable item records. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is \`GET /v1/tasks/{task_id}/progress\`: it loads
+\`task:{task_id}\`, walks the \`items:{task_id}\` records, groups each item's \`label\` under its
+annotator, and answers \`completed\`, \`total\`, one row per annotator with every label they gave,
+and a per-label \`percent\` over the whole annotator pool. It serves the demo and hides 4 flaws.
 
-Implement \`GET /v1/tasks/{task_id}/progress\`:
+**Failure mode the checks target.** For the one-annotator demo the numbers add up. With a team
+the read crosses three boundaries: visibility (a peer reads labels for items they have not
+answered, a copying channel that poisons the metric), fairness (flagged annotators stay in the
+denominator), and provenance (numbers from mutable item records change with the queue's in-flight
+state and cannot be reproduced by a replay).
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the caller's annotator from
-  \`X-Annotator-Id\`; the task id comes from the path. A task that does not exist, or that belongs to
-  another tenant, is **404** — never 403, which would confirm that the task exists.
-- \`task:{task_id}\` holds the tenant and the frozen \`total_items\`; \`annotators:{task_id}\` is the
-  roster written when an annotator first takes work; \`flagged:{task_id}\` is the quality review's
-  exclusion set; \`label.submitted:{task_id}\` is the per-task projection the events consumer appends
-  every applied record to. The record keeps the topic's fields — \`label_id\`, \`item_id\`, \`annotator\`,
-  \`values\`, \`spec_version\`, \`ms_spent\` — so a reader never has to guess what a record is.
-- The body is \`{"task_id", "completed", "total", "annotators": [{"annotator", "submitted",
-  "excluded", "labels"}], "agreement": {"<label>": {"annotated", "percent_agreement"}}}\`:
-  \`completed\` counts the items that carry at least one record, \`total\` is \`total_items\`,
-  \`submitted\` is how many records that annotator produced, \`annotated\` is how many **included**
-  annotators used that label at least once, and \`percent_agreement\` is \`100 * annotated /
-  included\` rounded to one decimal (\`0.0\` when no annotator is included).
-- **Peer peeking is forbidden.** A row carries its \`labels\` list only when the row is the caller or
-  when that annotator has already submitted; a peer who has not submitted gets \`null\`, not \`[]\` —
-  an empty list means "submitted, with nothing", which is a different fact. Showing a label before
-  its annotator has answered lets a peer copy an answer they have not thought about, and it puts that
-  copied label into the very agreement number this endpoint reports.
-- **Agreement excludes flagged annotators.** Consult \`SISMEMBER flagged:{task_id} <annotator>\` for
-  every annotator you are about to count, drop the flagged ones from the agreement denominator, and
-  mark their row \`excluded: true\` so the drop is visible rather than silent. One annotator who
-  cannot do the task must not move the score for everyone else.
-- **The metrics rebuild from the events alone.** \`rebuild_progress(events, total_items)\` is a pure
-  fold over the task's \`label.submitted\` records, and the endpoint serves that fold applied to
-  \`label.submitted:{task_id}\` — never the item records. Same events in, same metrics out: a replayed
-  offset or a retried submission must not move the number. The consumer's
-  \`agreement:{task_id}:{value}\` counters are the fast dashboard path and cannot be used here: a
-  counter cannot be un-counted once quality review flags the annotator who moved it.
-
-**Failure mode the checks target.** Three boundaries in one read. Visibility: the starter lets a peer
-read labels they have not answered yet, which is a copying channel and a poisoned metric, and the fix
-is a null for the peer, not an empty list. Fairness: filtering the flagged annotators out of the
-*display* while leaving them in the *denominator* makes the percentage move for reasons no client can
-see. Provenance: computing from item records ties the number to whatever the records currently say, and
-folding the consumer's live counters ties it to the flags that existed when the counter moved — a
-counter cannot be un-counted when quality review flags an annotator afterwards. The projection is the
-one input that is the same for every reader. The starter fails all three while looking finished, which
-is exactly why it needs debugging before it ships.`,
+- Tenant from \`X-Tenant-Id\` (**401** when absent), caller from \`X-Annotator-Id\`. A missing task
+  or another tenant's task is **404**, not 403.
+- Keys: \`task:{task_id}\` (tenant, \`total_items\`), \`annotators:{task_id}\`, \`flagged:{task_id}\`
+  (quality review's exclusion set), \`label.submitted:{task_id}\` (projection of applied records).
+- Body: \`{"task_id", "completed", "total", "annotators": [{"annotator", "submitted", "excluded",
+  "labels"}], "agreement": {"<label>": {"annotated", "percent_agreement"}}}\`; \`annotated\` counts
+  **included** annotators who used the label, \`percent_agreement\` is \`100 * annotated / included\`
+  to one decimal (\`0.0\` with nobody included).
+- A row carries \`labels\` only for the caller or an annotator who has submitted; otherwise
+  \`null\`, not \`[]\`.
+- \`SISMEMBER flagged:{task_id} <annotator>\` drops an annotator from the denominator and marks the
+  row \`excluded: true\`.
+- \`rebuild_progress(events, total_items)\` is a pure fold over \`label.submitted:{task_id}\`; the
+  endpoint serves that fold, not the item records or the consumer's counters.`,
   sequence: {
     participants: ['Client', 'labeld', 'Redis', 'Events consumer'],
     messages: [
@@ -88,9 +65,9 @@ is exactly why it needs debugging before it ships.`,
     ],
   },
   hints: [
-    'The row has three states and they must stay distinguishable: the caller’s own labels, a peer’s labels once that peer has submitted, and `null` for a peer who has not. Return `null` rather than an empty list — "has not answered yet" and "answered with nothing" are different facts, and only the first one is a leak.',
-    '`SISMEMBER flagged:{task_id} <annotator>` is the quality review’s veto, and it has to reach the denominator: build the set of included annotators first (`submitted` minus `flagged`) and use it for `annotated` and for the divisor. Marking the row `excluded: true` keeps the removal auditable instead of letting the percentage quietly change.',
-    'Read the projection (`LRANGE label.submitted:{task_id} 0 -1`) and push it through one pure fold that returns completed, per-annotator and per-label counts. Run it twice on the same list and you get the same numbers; run it on the item records and you get whatever an in-flight claim happens to say, and the consumer’s `agreement:{task_id}:{value}` counters cannot drop an annotator that quality review flagged after the counter moved.',
+    "Annotator B opens the task and already sees A's labels on items B has not reached; when quality review flags C, the agreement percentage does not move; two reads minutes apart disagree although nobody submitted.",
+    'Rows are built from `items:{task_id}` and every row carries its full `labels` list; nothing reads `X-Annotator-Id` or `flagged:{task_id}`; the divisor is the whole `submitted` map, and the body has no `excluded` flag.',
+    'Fold `LRANGE label.submitted:{task_id} 0 -1` in `rebuild_progress`, compute the included set as submitted minus `SISMEMBER flagged`, divide by it, mark `excluded: true`, and have `visible_labels` return `None` for an unsubmitted peer.',
   ],
   checks: [
     {
@@ -181,11 +158,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/tasks/{task_id}/progress")
 def progress(task_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter streams every submitted label to every annotator on the task so they can
-    # "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
-    # and reads labels straight from the item records instead of the event projection. Hide a peer's
-    # labels until that peer submits, consult SISMEMBER on flagged:{task_id}, and serve the metrics
-    # that rebuild_progress folds from the label.submitted events.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     task = json.loads(r.get(f"task:{task_id}") or "{}")
     items = r.hgetall(f"items:{task_id}")
     submitted: dict[str, list[str]] = {}
@@ -330,11 +303,7 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/tasks/:task_id/progress', async (request, reply) => {
-  // TODO: this starter streams every submitted label to every annotator on the task so they can
-  // "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
-  // and reads labels straight from the item records instead of the event projection. Hide a peer's
-  // labels until that peer submits, consult SISMEMBER on flagged:{task_id}, and serve the metrics
-  // that rebuildProgress folds from the label.submitted events.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
   if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const {task_id} = request.params as {task_id: string};
@@ -494,11 +463,7 @@ func progress(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	taskID := r.PathValue("task_id")
-	// TODO: this starter streams every submitted label to every annotator on the task so they can
-	// "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
-	// and reads labels straight from the item records instead of the event projection. Hide a peer's
-	// labels until that peer submits, consult SIsMember on flagged:{task_id}, and serve the metrics
-	// that rebuildProgress folds from the label.submitted events.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	rawTask, err := rdb.Get(r.Context(), fmt.Sprintf("task:%s", taskID)).Result()
 	if err != nil {
 		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -782,12 +747,7 @@ object ProgressApi {
     path("v1" / "tasks" / Segment / "progress") { taskId =>
       get {
         headerValueByName("X-Tenant-Id") { _ =>
-          // TODO: this starter streams every submitted label to every annotator on the task so they
-          // can "align", counts agreement over the unfiltered annotator pool (flagged annotators
-          // included), and reads labels straight from the item records instead of the event
-          // projection. Hide a peer's labels until that peer submits, drop the annotators that
-          // SISMEMBER on flagged:{taskId} reports, and serve the metrics that rebuildProgress folds
-          // from the label.submitted events.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val items = jedis.hgetAll(s"items:$taskId").asScala
           val submitted: Map[String, List[String]] = items.values
             .map(raw => raw.parseJson.asJsObject)
@@ -977,11 +937,7 @@ int main() {
       return;
     }
     const std::string task_id = req.matches[1];
-    // TODO: this starter streams every submitted label to every annotator on the task so they can
-    // "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
-    // and reads labels straight from the item records instead of the event projection. Hide a
-    // peer's labels until that peer submits, drop the annotators SISMEMBER reports on
-    // flagged:{task_id}, and serve the metrics that rebuild_progress folds from the events.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto raw_task = redis.get("task:" + task_id);
     if (!raw_task) {
       res.status = 404;
@@ -1180,19 +1136,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing what a progress view owes a labeling queue, and the answer is
-three boundaries that a single-annotator demo cannot show. Visibility is the first: the endpoint is
-the only place where one annotator can see another's judgment, so the peer's labels must be \`null\`
-until that peer has submitted — an empty list would blur "has not answered" into "answered nothing",
-and a shared label turns the queue into a copying exercise that quietly poisons the agreement number
-the endpoint exists to report. Fairness is the second: quality review's \`flagged:{task_id}\` veto has
-to reach the denominator, not just the display, or an annotator who cannot do the task drags the
-percentage for everyone else, and \`excluded: true\` is what keeps that removal auditable. Provenance
-is the third and the one candidates miss: metrics computed from mutable item records change with the
-in-flight state of the queue, and the consumer's \`agreement:{task_id}:{value}\` counters freeze in the
-flags that existed when they were incremented — a counter cannot be un-counted when quality review
-flags an annotator later. A pure fold over the per-task \`label.submitted\` projection is the same for
-every reader and every replay. In a real system the endpoint caches that fold per task with the last
-applied record as its version, and serves the cached value until a new one lands — same numbers,
-without re-reading the log on every poll.`,
+  debrief: `The progress endpoint is the only place one annotator can see another's judgment, so a peer's labels are \`null\` until that peer has submitted: an empty list would blur "has not answered" into "answered nothing", and a shared label turns the queue into a copying exercise that poisons the number the endpoint reports. The \`flagged:{task_id}\` veto has to reach the denominator, not only the display, and \`excluded: true\` keeps the removal auditable. Provenance is the subtle one: item records change with the in-flight state of the queue, and the consumer's counters freeze in the flags that existed when they moved, while a pure fold over the projection is the same for every reader and every replay. Production systems cache that fold per task, versioned by the last applied record.`,
 };

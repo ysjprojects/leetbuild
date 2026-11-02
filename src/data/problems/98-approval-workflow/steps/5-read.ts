@@ -8,35 +8,32 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: a trail comes back and the UI
-renders a chain, so the demo looks complete. It drops the steps that were skipped, it paints every
-step with one summary flag, and it answers for any tenant. Debug it, fix it, and prove the fix.
-
-Implement \`GET /v1/requests/{id}\` — the read the UI, the auditor and the on-call engineer all use.
-
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing) and the request is authorized like any
-  other read: a request that belongs to another tenant answers **404**, exactly like one that does
-  not exist. The starter serves any request id in the path.
-- The response reports the chain that was **pinned at submit time**: \`chain_version\` from the stored
-  request, then one entry per step in chain order.
-- **Every step accounts for itself.** A step that was skipped appears with its **reason** — the
-  approval above the threshold, the policy waiver, the manager who was on leave — instead of being
-  filtered out so the chain *looks* complete. Dropping skipped steps is how a two-signature chain
-  reads like a four-signature one.
-- Each step reports **its own** state — \`pending\`, \`approved\`, \`rejected\`, \`skipped\`,
-  \`delegated\` — from its own decision record. A later approval must never repaint an earlier
-  pending step as approved; a reader has to be able to tell “nobody has decided this yet” from
-  “somebody decided this”.
-- **Delegations are part of the trail**: when a step was decided by a delegate, the response names
-  the step, who it was delegated from and who actually acted.
-- The response shape is \`{"request_id", "chain_version", "status", "steps": [{step, approver,
-  state, reason, actor}], "delegations": [{step, from, to}]}\`.
+**Starting point.** The starter serves \`GET /v1/requests/{id}\`: it loads the stored request,
+reads the \`decision:{i}\` fields of the state hash, computes one \`approved\` flag from whether any
+step approved, builds a \`trail\` entry per approver that is not in the request's \`skipped\` map,
+and answers \`{"request_id", "trail"}\`. The UI renders a chain, so the demo looks complete. It
+serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** A read that hides skipped steps and flattens every step under
 one flag is worse than no read: an auditor concludes the chain was signed in order when two of its
-steps never happened, and nobody can see that the approver for step 1 was actually a delegate. The
-missing tenant check is the quiet one — a request id is guessable, and the trail contains the
-requester, the reasons and the amounts.`,
+steps did not happen, and nobody can see that the approver for step 1 was actually a delegate. The
+missing tenant check is the one that leaks: a request id is guessable, and the trail contains the
+requester, the reasons and the amounts.
+
+- The tenant comes from \`X-Tenant-Id\` (**401** when missing); a request that belongs to another
+  tenant answers **404**, exactly like one that does not exist.
+- The response reports the chain **pinned at submit time**: \`chain_version\` from the stored
+  request, then one entry per step in chain order.
+- **Every step accounts for itself.** A skipped step appears with its **reason** (the threshold,
+  the policy waiver, the manager on leave) instead of being filtered out so the chain looks
+  complete.
+- Each step reports **its own** state (\`pending\`, \`approved\`, \`rejected\`, \`skipped\`,
+  \`delegated\`) from its own decision record. A later approval does not repaint an earlier
+  pending step.
+- **Delegations are part of the trail**: when a step was decided by a delegate, the response names
+  the step, who it was delegated from and who acted.
+- The response shape is \`{"request_id", "chain_version", "status", "steps": [{step, approver,
+  state, reason, actor}], "delegations": [{step, from, to}]}\`.`,
   sequence: {
     participants: ['Client', 'Approval API', 'Redis', 'request store'],
     messages: [
@@ -60,9 +57,9 @@ requester, the reasons and the amounts.`,
     ],
   },
   hints: [
-    'Authorize before you assemble: compare the stored request’s tenant with `X-Tenant-Id` and answer `404` for a foreign one, so a guessed id is indistinguishable from an unknown one. Never build the body first and check afterwards.',
-    'Build one entry per step of the pinned chain, in order, and give each entry the state of *its own* decision record — `decision:{i}` from the state hash. A single `any approved` flag stamps every earlier step as approved, which is exactly the claim an auditor is checking.',
-    'Keep the skipped steps in the trail with the reason they were skipped, and read `delegated_from` out of the decision record into `delegations`. The shape of the answer is the contract: ids, per-step states, reasons, and who actually acted.',
+    'Approve step 2 of a four-step chain whose step 1 was skipped: the trail now shows three steps, all `approved`, with no mention of a skip or a delegate. Read the same id with another tenant header and the trail comes back.',
+    'The handler reads no tenant header; `approved = any(...)` is computed once and stamped on every entry; the comprehension filters `if str(index) not in skipped`; and the response omits `chain_version` and delegations.',
+    'Require `X-Tenant-Id` and 404 when it differs from the stored owner; emit every step with `step_state(record, skip_reason)` (`"pending"` when undecided), carry `skipped_steps` reasons, and add `chain_version` and `delegations` from `delegated_from`.',
   ],
   checks: [
     {
@@ -107,7 +104,7 @@ requester, the reasons and the amounts.`,
       id: 'tenant-404',
       title: 'A foreign request is 404',
       detail:
-        'The read requires the tenant, compares it with the stored request’s owner and answers `404` when they differ — never another tenant’s request, and never a 403 that confirms the id exists.',
+        'The read requires the tenant, compares it with the stored request’s owner and answers `404` when they differ: not another tenant’s request, and not a 403 that confirms the id exists.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*404/]},
         typescript: {all: [/'x-tenant-id'/, /code\(\s*404\s*\)/]},
@@ -157,9 +154,7 @@ def state_key(request_id: str) -> str:
 
 @app.get("/v1/requests/{id}")
 def read_request(id: str) -> JSONResponse:
-    # TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
-    # soon as one step approved, never checks the tenant, and reports neither the pinned chain
-    # version nor the delegations. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     request = store.get(id)
     if request is None:
         return JSONResponse({"error": "unknown request"}, status_code=404)
@@ -283,9 +278,7 @@ export const store = {
 const stateKey = (requestId: string): string => \`approval:\${requestId}:state\`;
 
 app.get('/v1/requests/:id', async (request, reply) => {
-  // TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
-  // soon as one step approved, never checks the tenant, and reports neither the pinned chain
-  // version nor the delegations. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const stored = await store.get(id);
   if (stored === null) return reply.code(404).send({error: 'unknown request'});
@@ -418,9 +411,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readRequest(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
-	// soon as one step approved, never checks the tenant, and reports neither the pinned chain
-	// version nor the delegations. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	id := r.PathValue("id")
 	request, err := store.Get(r.Context(), id)
 	if err != nil || request == nil {
@@ -635,9 +626,7 @@ object Read {
   val route: Route =
     path("v1" / "requests" / Segment) { id =>
       get {
-        // TODO: this starter filters the skipped steps out of the chain, stamps every step "approved"
-        // as soon as one step approved, never checks the tenant, and reports neither the pinned
-        // chain version nor the delegations. Fix all four.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         store.get(id) match {
           case None =>
             complete(StatusCodes.NotFound, """{"error":"unknown request"}""")
@@ -773,9 +762,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/requests/:id", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
-    // soon as one step approved, never checks the tenant, and reports neither the pinned chain
-    // version nor the delegations. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto id = req.path_params.at("id");
     const auto request = store.get(id);
     if (!request) {
@@ -902,14 +889,5 @@ int main() {
 `,
     },
   },
-  debrief: `A read endpoint is where a workflow stops being a state machine and becomes evidence. Three
-  properties decide whether the trail can be trusted. Every step of the pinned chain is present,
-  including the ones that were skipped, each with its reason: a filtered trail is not shorter
-  evidence, it is wrong evidence, because it makes a two-signature chain look complete. Every step
-  carries its own state, so a reader can distinguish “nobody has decided yet” from “somebody decided
-  and it was not me” — a single “approved somewhere” flag destroys exactly the information an
-  auditor came for. And the read is tenant-scoped with a 404 for a foreign id, because a request id
-  is guessable and the response contains the requester, the reasons and the amount. Real systems add
-  a signed, append-only audit export, a redaction pass on reasons shown to parties who are not on
-  the chain, and pagination for chains that grow with escalations.`,
+  debrief: `The fix treats the read as evidence rather than a summary. Every step of the pinned chain is present, including the skipped ones with their reasons, because a filtered trail is not shorter evidence, it is wrong evidence. Each step's state comes from its own decision record, so a reader can tell "nobody has decided yet" from "somebody decided", which is the distinction an auditor came for and the one a single flag destroys. The tenant check comes first and answers 404 because a 403 would confirm that a guessed id exists. Production audit reads also offer a signed, append-only export, redact reasons for parties who are not on the chain, and paginate chains that grow with escalations.`,
 };

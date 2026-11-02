@@ -8,31 +8,29 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis', 'storage'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the caller's documents and answers **200** with a case. It serves the demo because the demo sends a
-well-formed body, one tenant, and one attempt — and it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/verifications\` with body
+**Starting point.** The starter registers \`POST /v1/verifications\`, reads
 \`{"applicant": "a-123", "documents": [{"type": "passport", "ref": "documents/tenant-a/passport-9.jpg"}]}\`
-and header \`X-Tenant-Id\`:
+with header \`X-Tenant-Id\`, fetches each \`ref\` and answers **200** with a case. It serves the demo
+because the demo sends a well-formed body, one tenant and one attempt, and it hides four flaws.
+
+**Failure mode the checks target.** A caller opens a case that is already \`approved\`, submits an
+unknown document type, retries without limit until the review pipeline drowns, or points \`ref\` at
+an address inside the tenant's network and has the API fetch it.
+
+Requirements:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**. The
-  tenant is the only owner of its documents — the body never names storage.
+  tenant is the only owner of its documents; the body does not name storage.
 - \`documents\` is a non-empty array of \`{type, ref}\`. \`type\` must come from the allowlist
   \`passport\`, \`drivers_license\`, \`national_id\` (**400** otherwise); a \`ref\` outside
   \`documents/{tenant}/\` is **403**.
 - The prefix check happens **before** anything is fetched, signed or reserved: the API is not a
-  proxy, and it must never dereference a caller-supplied URL.
+  proxy and must not dereference a caller-supplied URL.
 - Attempts per applicant are bounded: **4** reservations (\`MAX_ATTEMPTS = 4\`), made atomically in
   Redis before the case opens, and a fifth attempt is **429** with \`Retry-After\`.
 - The response is the opened case: \`{"case_id": …, "applicant": …, "status": "pending"}\`. No
-  caller input may set a status — a \`status\` field in the body is ignored, and the verdict is
-  always the service's.
-
-**Failure mode the checks target.** The starter reads \`status\` from the body and persists it, so a
-caller opens a case that is already \`approved\`; it never counts attempts, so one applicant can
-grind the review pipeline forever; and it fetches whatever URL arrives in \`ref\`, so the API
-becomes an open proxy pointed at the tenant's own network.`,
+  caller input may set a status: a \`status\` field in the body is ignored, and the verdict is
+  always the service's.`,
   sequence: {
     participants: ['Client', 'KYC API', 'Redis', 'Document storage'],
     messages: [
@@ -153,8 +151,7 @@ class Submission(BaseModel):
 
 @app.post("/v1/verifications")
 def submit(body: Submission, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
-    # dereferences whatever document URL the caller sends. Fix all three flaws.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     for document in body.documents:
         response = requests.get(document.ref)
         response.raise_for_status()
@@ -245,7 +242,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/verifications: flawed code that trusts the caller. */
+      starter: `/** POST /v1/verifications: the starter. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -262,8 +259,7 @@ interface Submission {
 }
 
 app.post('/v1/verifications', async (request, reply) => {
-  // TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
-  // dereferences whatever document URL the caller sends. Fix all three flaws.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as Submission;
   for (const document of body.documents) {
@@ -381,8 +377,7 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
-	// dereferences whatever document URL the caller sends. Fix all three flaws.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	for _, document := range body.Documents {
 		response, err := http.Get(document.Ref)
 		if err != nil {
@@ -553,8 +548,7 @@ object VerificationApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[Submission]) { body =>
-            // TODO: this starter persists a caller-supplied status, never bounds attempts per
-            // applicant, and dereferences whatever document URL the caller sends. Fix all three.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             body.documents.foreach { document =>
               Http().singleRequest(HttpRequest(uri = document.ref))
             }
@@ -688,8 +682,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
-    // dereferences whatever document URL the caller sends. Fix all three flaws.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     for (const auto& document : body["documents"]) {
       const auto ref = document.value("ref", std::string());
       httplib::Client client(ref);
@@ -792,19 +785,16 @@ int main() {
     },
   },
   hints: [
-    'Write the guards in cost order — tenant, body shape, `type` allowlist, then the tenant-prefix check — and answer there when one of them fails. All of them are local string comparisons, so they run before anything is reserved, signed or fetched.',
-    'A `ref` is a key in tenant storage under `documents/{tenant}/`, not a URL. Compare the prefix (`startswith` / `startsWith` / `HasPrefix` / `rfind(prefix, 0)`) and never open it; a signed reference is created by the service with a TTL for the reviewer path, never from caller input.',
-    'The verdict is server-side: the case is stored `pending` whatever the body says. Reserve the attempt atomically in Redis before opening the case, cap it at `MAX_ATTEMPTS = 4`, and answer the refusal with **429** plus `Retry-After`.',
+    'An applicant lands in the review queue already approved, another has submitted thirty times today, and storage logs show the API fetching a URL that is not in tenant storage.',
+    'The handler trusts every field: it stores whatever `status` arrives, accepts any `type`, opens cases without counting, and calls `requests.get` on `ref` as if it were a URL, not a storage key.',
+    'Guard in cost order: tenant, body shape, `ALLOWED_DOCUMENT_TYPES`, then a `documents/{tenant}/` prefix check with no fetch. Reserve the attempt atomically (`MAX_ATTEMPTS = 4`, **429** plus `Retry-After`), then store `pending`.',
   ],
-  debrief: `The interviewer is testing whether you treat submission as a trust boundary. The caller supplies
-an applicant, a document type and a storage key — nothing else. The starter reads well because the
-demo never sends a \`status\` field, never retries and never points \`ref\` at an internal address.
-Three separate defects are being checked: the verdict is the service's (the case opens \`pending\`
-and the body cannot name a status), attempts are bounded per applicant (4 reservations, atomic in
-Redis, refused with \`Retry-After\`), and a \`ref\` is scoped to \`documents/{tenant}/\` before any
-side effect, so the API cannot be turned into a proxy that fetches whatever URL arrives. Real KYC
-services add idempotency keys so a client retry does not burn an attempt, per-jurisdiction retention
-and deletion schedules for the documents themselves, sanctions and PEP screening after identity,
-reviewer tooling with its own access logs, and audit export formats that prove who saw which
-document and when.`,
+  debrief: `Submission is a trust boundary. The caller supplies an applicant, a document type and a storage
+key, nothing else, and the fix has that shape: every guard is a local string comparison that runs
+before any side effect, the attempt is reserved atomically so a burst cannot slip past the cap, and
+the verdict belongs to the service, so the case opens \`pending\` whatever the body says. The
+\`ref\` is a key under \`documents/{tenant}/\`, not a URL, which is why the fix compares a prefix
+instead of validating an address. What this step did not do: idempotency keys so a client retry does
+not burn an attempt, per-jurisdiction retention schedules for the documents themselves, sanctions
+screening after identity, and audit export that proves who saw which document and when.`,
 };

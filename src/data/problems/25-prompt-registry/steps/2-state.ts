@@ -8,30 +8,24 @@ export const stateStep: Step = {
   focus: ['registry', 'redis', 'db'],
   task: `## Task
 
-The starter is working code: a promotion moves the pointer, the demo reader
-picks it up, and the audit list grows. It swaps in pieces, caches for an hour, and keeps no
-revision. Find the three flaws, fix them, and prove the fix.
-
-Implement the registry’s version state in Redis:
-
-- The **global pointer** \`pointer:{name}\` holds the version every unpinned tenant reads, and
-  \`pin:{tenant}:{name}\` holds a tenant’s own version. A reader resolves the **pin first** and the
-  pointer second, falling back to \`DEFAULT_VERSION\`.
-- \`promote(name, version, actor)\` and \`rollback(name, version, actor)\` go through the **same
-  atomic Lua \`EVAL\`**: it reads the previous pointer, writes the new one, appends the audit entry
-  (\`audit:{name}\`) and bumps \`revision:{name}\` — all in one script, so no reader can ever observe
-  a pointer whose promotion was never audited, and a promotion can never half-apply.
-- The reader’s cache key carries the **revision** (\`pointer_cache:{tenant}:{name}:{revision}\`) with
-  a short \`CACHE_TTL_S\`. Keyed by the revision, a promotion or a rollback changes the key, so the
-  next read misses the stale entry instead of serving the old version for the whole TTL.
-- A promotion followed immediately by a rollback must leave **every** reader on the rolled-back
-  version, for pinned and unpinned tenants alike.
+**Starting point.** The starter holds the registry's version state in Redis: \`set_pointer\`
+writes \`pointer:{name}\` and then the tenant pin as separate commands, pushes an audit row from the
+client afterwards, and the reader caches the resolved version under a name-keyed key for an hour.
+It compiles, serves the demo and hides five flaws.
 
 **Failure mode the checks target.** Writing the pointer and the pins as two commands means a
-promotion racing a rollback leaves half the fleet on each version — the exact incident in the
-scenario. Caching the resolved pointer for an hour turns a rollback into a slow, invisible change.
-And an audit row written from the client after the swap is a second fact that can be lost while the
-first one is already live.`,
+promotion racing a rollback leaves half the fleet on each version. An hour-long cache turns a
+rollback into a slow, invisible change, and an audit row written after the swap can be lost while
+the pointer is already live.
+
+- \`pointer:{name}\` holds the global version; \`pin:{tenant}:{name}\` holds a tenant's own. A
+  reader resolves the **pin first**, the pointer second, then \`DEFAULT_VERSION\`.
+- \`promote(name, version, actor)\` and \`rollback(name, version, actor)\` go through the **same
+  atomic Lua \`EVAL\`**: it reads the previous pointer, writes the new one, appends the audit entry
+  (\`audit:{name}\`) and bumps \`revision:{name}\` in one script.
+- The reader's cache key carries the **revision** (\`pointer_cache:{tenant}:{name}:{revision}\`)
+  with a short \`CACHE_TTL_S\`, so a swap changes the key and the next read misses the stale entry.
+- A promotion followed by a rollback leaves **every** reader on the rolled-back version.`,
   sequence: {
     participants: ['Prompt Registry', 'Redis', 'Reader'],
     messages: [
@@ -123,9 +117,7 @@ CACHE_TTL_S = 3600  # cache the resolved pointer for an hour
 
 
 def set_pointer(name: str, version: int, tenant: str = "", actor: str = "") -> None:
-    # TODO: the pointer and the tenant pins go out as separate commands, the audit row is a second
-    # round trip after the swap, and readers cache the resolved pointer for an hour. Make the
-    # promotion and its audit row one atomic operation, keep a revision, and add rollback.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     r.set(f"pointer:{name}", version)
     if tenant:
         r.set(f"pin:{tenant}:{name}", version)
@@ -223,9 +215,7 @@ export async function setPointer(
   tenant?: string,
   actor?: string,
 ): Promise<void> {
-  // TODO: the pointer and the tenant pins go out as separate commands, the audit row is a second
-  // round trip after the swap, and readers cache the resolved pointer for an hour. Make the
-  // promotion and its audit row one atomic operation, keep a revision, and add rollback.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await r.set(\`pointer:\${name}\`, String(version));
   if (tenant !== undefined) await r.set(\`pin:\${tenant}:\${name}\`, String(version));
   await r.rpush(\`audit:\${name}\`, \`\${Date.now()}:\${actor ?? ''}:\${version}\`);
@@ -316,9 +306,7 @@ const (
 
 var rdb *redis.Client
 
-// TODO: the pointer and the tenant pins go out as separate commands, the audit row is a second
-// round trip after the swap, and readers cache the resolved pointer for an hour. Make the
-// promotion and its audit row one atomic operation, keep a revision, and add rollback.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func setPointer(ctx context.Context, name string, version int, tenant, actor string) {
 	rdb.Set(ctx, fmt.Sprintf("pointer:%s", name), version, 0)
 	if tenant != "" {
@@ -445,9 +433,7 @@ object PointerState {
   val CacheTtlS = 3600 // cache the resolved pointer for an hour
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: the pointer and the tenant pins go out as separate commands, the audit row is a second
-  // round trip after the swap, and readers cache the resolved pointer for an hour. Make the
-  // promotion and its audit row one atomic operation, keep a revision, and add rollback.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def setPointer(name: String, version: Int, tenant: String = "", actor: String = ""): Unit = {
     jedis.set(s"pointer:$name", version.toString)
     if (tenant.nonEmpty) jedis.set(s"pin:$tenant:$name", version.toString)
@@ -539,9 +525,7 @@ object PointerState {
 constexpr int kDefaultVersion = 1;
 constexpr long long kCacheTtlS = 3600;  // cache the resolved pointer for an hour
 
-// TODO: the pointer and the tenant pins go out as separate commands, the audit row is a second
-// round trip after the swap, and readers cache the resolved pointer for an hour. Make the promotion
-// and its audit row one atomic operation, keep a revision, and add rollback.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void set_pointer(sw::redis::Redis& redis, const std::string& name, int version, const std::string& tenant, const std::string& actor) {
   redis.set("pointer:" + name, std::to_string(version));
   if (!tenant.empty()) redis.set("pin:" + tenant + ":" + name, std::to_string(version));
@@ -624,9 +608,9 @@ int active_version(sw::redis::Redis& redis, const std::string& tenant, const std
     },
   },
   hints: [
-    'Everything a promotion changes must be inside the script: `redis.call("SET", KEYS[1], ARGV[1])`, the `RPUSH` audit entry and the `INCR` revision. A script is atomic, a sequence of commands is not — and the sequence is exactly what a racing rollback splits in half.',
-    'Give readers a revision to key on. Bumping `revision:{name}` in the same script means the next read builds a different `pointer_cache:{tenant}:{name}:{revision}`, so the stale entry is simply unreachable instead of being served until it expires.',
-    'A short `CACHE_TTL_S` is not the fix by itself — the revision is. The TTL only bounds how long an orphaned key lives; the revision is what makes a rollback visible on the very next read for pinned and unpinned tenants alike.',
+    'An operator rolls back a bad prompt and half the tenants keep serving it for an hour; the audit list shows a promotion that some readers observed before it was recorded.',
+    'The pointer, the pins and the audit row leave the client as separate commands with gaps between them, and the reader caches the resolved version under a key that no swap can change.',
+    'Put `SET`, `RPUSH audit:{name}` and `INCR revision:{name}` inside `PROMOTE_LUA`, call it from both `promote` and `rollback`, read `pin:` before `pointer:`, and build `cache_key` with the revision and `CACHE_TTL_S`.',
   ],
-  debrief: `The interview question is what "the fleet is on one version" means when reads are cached and writes are concurrent. Two separate writes can be split by a race, and the split is invisible until someone compares two readers. One script removes the interleaving; a revision removes the staleness, because the cache key itself changes on every swap; and the audit row inside the same script removes the window where a live pointer has no history. Note the shape of the answer: nothing here is about Redis performance, it is about making a multi-step state change a single fact. Real registries add per-tenant pin writes under a lease, a monotonic revision per name for cache validation, and a reconciliation job that compares the Redis pointer with the durable record and repairs drift.`,
+  debrief: `The fix makes a multi-step state change a single fact, because "the fleet is on one version" only holds when no reader can observe a half-applied swap. Two separate writes can be split by a race, and the split stays invisible until someone compares two readers. One Lua script removes the interleaving; a revision in the cache key removes the staleness, since every swap changes the key; and the audit row inside the same script closes the window where a live pointer has no history. Nothing here is about Redis speed. Production registries write tenant pins under a lease, validate caches with a monotonic revision per name, and run a reconciliation job that compares the Redis pointer with the durable record and repairs drift.`,
 };

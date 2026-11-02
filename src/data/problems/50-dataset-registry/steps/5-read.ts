@@ -8,27 +8,25 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'db', 'storage'],
   task: `## Task
 
-**Starting point.** The starter is working code for the read endpoint: it looks
-the version up, returns the provenance it has and a URL to the object. It compiles, it serves the
-demo, and it hides three production flaws that only matter once there are two tenants or one failed
-validation. Debug it like the owner of the endpoint a training run starts from.
+**Starting point.** The starter serves \`GET /v1/datasets/{dataset}/versions/{version}\`: it reads
+the tenant header, calls \`store.head\`, answers \`404\` when there is no record, builds provenance
+from \`source\`, \`license\` and \`row_count\`, attaches the validator record only when it passed, and
+returns a \`raw_url\` built from \`PERMANENT_BASE\`. It compiles, it serves the demo, and it hides
+four flaws that only matter once there are two tenants or one failed validation.
 
-Implement \`GET /v1/datasets/{dataset}/versions/{version}\`.
+**Failure mode the checks target.** The URL is the one clients paste into tickets: without an
+expiry it is a permanent public link to training data. Omitting a negative validator report is
+subtler: the field that says "this version failed schema conformance" is exactly the field a
+reviewer needs, and its absence reads as "nothing to report".
 
 - The caller comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- A version **belongs to a tenant**. A version another tenant owns is **404**, not 403 — the
-  endpoint must not confirm that a foreign version exists. The starter serves any tenant's record.
+- A version **belongs to a tenant**. A version another tenant owns is **404**, not 403: the
+  endpoint must not confirm that a foreign version exists.
 - The response carries the version's **provenance**: \`source\`, \`license\`, \`row_count\` and the
-  **full \`validator_report\`**, present whether validation passed or failed. The starter omits the
-  report when it was negative, so a caller cannot tell a bad version from a clean one.
+  **full \`validator_report\`**, present whether validation passed or failed.
 - The object is reachable only through a **short-lived signed URL** (\`SIGNED_URL_TTL_S\`, 300 s)
-  scoped to the caller's tenant, returned with its expiry. The starter returns a permanent URL to the
-  raw object, which anyone who sees it can replay forever.
-
-**Failure mode the checks target.** The signed URL is the one clients paste into tickets: without an
-expiry it is a permanent public link to training data. Omitting a negative validator report is the
-quiet one: the field that says "this version failed schema conformance" is exactly the field a
-reviewer needs, and its absence reads as "nothing to report".`,
+  scoped to the caller's tenant, returned with its \`expires_at\`. No permanent \`raw_url\` appears
+  in the response.`,
   sequence: {
     participants: ['Client', 'Dataset Registry', 'registry store', 'object store'],
     messages: [
@@ -131,8 +129,7 @@ store = RegistryStore()
 
 
 def permanent_url(dataset: str, version: str) -> str:
-    # TODO: this starter returns a permanent URL to the raw object, serves versions across tenants,
-    # and omits the validator report when it was negative. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     return f"{PERMANENT_BASE}/{dataset}/{version}"
 
 
@@ -250,8 +247,7 @@ class RegistryStore {
 const store = new RegistryStore();
 
 function permanentUrl(dataset: string, version: string): string {
-  // TODO: this starter returns a permanent URL to the raw object, serves versions across tenants,
-  // and omits the validator report when it was negative. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   return \`\${PERMANENT_BASE}/\${dataset}/\${version}\`;
 }
 
@@ -377,8 +373,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/datasets/{dataset}/versions/{version}", func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: this starter returns a permanent URL to the raw object, serves versions across
-		// tenants, and omits the validator report when it was negative. Fix all three.
+		// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 		dataset := r.PathValue("dataset")
 		version := r.PathValue("version")
 		record, err := store.Head(r.Context(), dataset, version)
@@ -523,8 +518,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "datasets" / Segment / "versions" / Segment) { (dataset, version) =>
       get {
-        // TODO: this starter returns a permanent URL to the raw object, serves versions across
-        // tenants, and omits the validator report when it was negative. Fix all three.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val stored = store.head(dataset, version)
         if (stored.isEmpty) {
           complete(StatusCodes.NotFound, """{"error":"unknown version"}""")
@@ -640,8 +634,7 @@ struct RegistryStore {
 RegistryStore store;
 
 static std::string permanent_url(const std::string& dataset, const std::string& version) {
-  // TODO: this starter returns a permanent URL to the raw object, serves versions across tenants,
-  // and omits the validator report when it was negative. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   return kObjectBase + "/" + dataset + "/" + version;
 }
 
@@ -770,9 +763,9 @@ int main() {
     },
   },
   hints: [
-    'Tenant scoping belongs in the same `if` as the existence check: a foreign version is **404**, because a 403 would confirm that the version exists. Compare the record’s tenant to the authenticated caller, not the path.',
-    'The URL is a capability, so it needs an expiry and a scope: sign `tenant/version/expires` and return the expiry with it. A permanent link to the raw object is a public link the moment it lands in a ticket.',
-    'Provenance is returned as a whole: `source`, `license`, `row_count`, `validator_report` — the failed report included. Hiding a negative report is the same as reporting success.',
+    'A link from a support ticket still downloads the dataset months later, from any account. A version that failed schema validation reads back with no `validator` field at all, as if it were clean.',
+    '`read_version` never compares `record["tenant"]` to the caller; `permanent_url` is a plain path with no signature or expiry; the validator record is attached inside `if record["validator"]["passed"]`.',
+    'Answer 404 when `record["tenant"] != tenant`, replace `permanent_url` with `signed_url(tenant, dataset, version)` over `SIGNED_URL_TTL_S = 300` returning `expires_at`, drop `raw_url`, and always include `validator_report`.',
   ],
-  debrief: `The interviewer is testing the read path as a security boundary and a provenance surface. The starter reads correctly for the tenant that registered the dataset. Three defects are checked: cross-tenant reads (404, not a silent success), a permanent object URL instead of a scoped, expiring one, and a validator report that disappears exactly when it matters. The provenance point is the one candidates forget: a version read is how a training run records what it trained on, so the fields that say where the bytes came from, under which license and whether validation passed must be present regardless of the outcome. Real registries add per-request audit logging, range requests through the same signed scope, a URL signing key with rotation, and a check that the dataset’s license is still compatible with the tenant’s declared use.`,
+  debrief: `The read answers 404 for a foreign version because the response itself is information: a 403 confirms the version exists under some other tenant. The URL is signed with an expiry because it is a capability, and a capability that lands in a ticket or a log needs to stop working on its own. The validator report is unconditional because a version read is how a training run records what it trained on; a missing field is read as "nothing to report", which is the opposite of what a failed validation means. Production registries add per-request audit logging on the read, range requests through the same signed scope, rotation of the URL signing key, and a check that the dataset's license is still compatible with the tenant's declared use.`,
 };

@@ -7,15 +7,14 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Returns processing: the course is not "accept a return and refund it", it is
- * the debugging you owe a returns service before it counts a customer's money twice.
- * Measured eligibility → atomic returnable quantities → inspection that gates refunds → events
- * keyed by return → a read that never shows a refund the processor has not confirmed.
+ * Returns processing: measured eligibility, atomic returnable quantities, inspection that gates
+ * refunds, events keyed by return, and a read that reports a refund only once the processor
+ * confirmed it.
  */
 export const returnsProcessingProblem: Problem = {
   id: 'returns-processing',
   title: 'Returns Processing',
-  tagline: 'Return requests measured against policy, inspected before refunds and visible end to end.',
+  tagline: 'Return requests measured against the policy window and graded at the warehouse before any refund leaves.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -30,14 +29,15 @@ quantity, the gated refund and the ordered event log.
 
 ## The real system
 
-Production returns systems receive a request against a specific order line. They compute eligibility
-from the delivery date and the item's policy window rather than believing the customer. They keep a
-returnable quantity per line and decrement it atomically, so two returns cannot both take the last
-unit. They call the warehouse to grade the item under a deadline, and they hold the refund — not pay
-it — while the grade is unknown. They publish one event per state change keyed by the return so a
-return's history stays ordered, without copying photo evidence into a topic that is retained and
-replicated. And they never read a pending refund as complete, because "we started a refund" and "the
-customer was paid" are different facts.
+Shopify's Admin GraphQL API models exactly this boundary. Before an app creates a \`Return\` with
+\`returnCreate\`, it queries a \`ReturnableFulfillment\`: a delivered order whose line items carry
+the quantity still available for return, computed by the platform from fulfilled and already
+returned units rather than supplied by the caller. The same shape applies here: eligibility comes
+from the delivery date and the policy window, the returnable quantity per line is decremented
+atomically so two returns cannot both take the last unit, the warehouse grades the item under a
+deadline and the refund is held while the grade is unknown, one event per state change is keyed by
+the return so its history stays ordered, and a pending refund is not read as complete, because "we
+started a refund" and "the customer was paid" are different facts.
 
 ## What you build here
 
@@ -60,9 +60,9 @@ One service, **returnsd**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+it looks right. In every step you debug it against the failure modes, find the subtle one, fix it,
+optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on your
+version.
 
 ## Left out on purpose
 

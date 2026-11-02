@@ -8,33 +8,32 @@ export const answerGuardStep: Step = {
   focus: ['api', 'model', 'client'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the model layer and
-returns what came back, so the demo shows answers. Nothing between the model and the user checks
-the answer. Five production flaws; find them, fix them, prove the fix.
-
-Implement the output guard that runs inside \`POST /v1/ask\` after \`answer(document, question)\`
-returns \`{answer, spans}\`:
-
-- **Grounding.** Every cited span must be a substring of the document, and there must be at least
-  one. An answer whose spans are not in the document was not answered from the document.
-- **Secrets and PII.** A table of patterns — AWS access keys (\`AKIA\` + 16), private-key headers,
-  e-mail addresses, US social-security numbers, card numbers — is run over the answer; a match that
-  the document does **not** contain came from somewhere else, and the source shows where: memorised
-  training data, PII included.
-- **Degeneration.** The answer's tokens are measured with the same repeat ratio as the input: above
-  **0.4** (\`MAX_OUTPUT_REPEAT_RATIO\`) at 64 tokens or more, the model has diverged into a loop —
-  the source's "It is to be a good person." repeated until the token limit — and the output is a
-  training-data-extraction signal, not an answer.
-- When any signal fires, or the model layer raised \`Rejected\`, **refuse**: respond with the fixed
-  refusal text and \`refused: true\`, and log user, document hash, the signal names and a
-  **signature** (SHA-256 of document hash and sorted signals, 16 hex). Never log the answer text or
-  the document.
-- Only an answer with no signals is returned, with its spans.
+**Starting point.** The starter is the \`POST /v1/ask\` handler after the model layer: it loads the
+document, calls \`answer(document, question)\`, logs the answer text and returns \`result.answer\`
+to the client as it came back. It serves the demo and hides five flaws.
 
 **Failure mode the checks target.** The starter trusts the model: a diverged reply, a leaked
 instruction block or a memorised e-mail address goes straight to the user, and the starter writes the
 answer into the log on the way. Each guard is cheap; the signature is what lets the next step count
-attacks without ever storing what the model said.`,
+attacks without storing what the model said.
+
+The output guard runs after \`answer\` returns \`{answer, spans}\`:
+
+- **Grounding.** Every cited span must be a substring of the document, and there must be at least
+  one. An answer whose spans are not in the document was not answered from the document.
+- **Secrets and PII.** A table of patterns (AWS access keys \`AKIA\` + 16, private-key headers,
+  e-mail addresses, US social-security numbers, card numbers) is run over the answer; a match that
+  the document does **not** contain came from somewhere else, and the source shows where: memorised
+  training data, PII included.
+- **Degeneration.** The answer's tokens are measured with the same repeat ratio as the input: above
+  **0.4** (\`MAX_OUTPUT_REPEAT_RATIO\`) at 64 tokens or more, the model has diverged into a loop,
+  the source's "It is to be a good person." repeated until the token limit, and the output is a
+  training-data-extraction signal, not an answer.
+- When any signal fires, or the model layer raised \`Rejected\`, **refuse**: respond with the fixed
+  refusal text and \`refused: true\`, and log user, document hash, the signal names and a
+  **signature** (SHA-256 of document hash and sorted signals, 16 hex). The answer text and the
+  document stay out of the log.
+- Only an answer with no signals is returned, with its spans.`,
   sequence: {
     participants: ['Client', 'promptguard', 'Model'],
     messages: [
@@ -57,9 +56,9 @@ attacks without ever storing what the model said.`,
     ],
   },
   hints: [
-    'The guard is a list of named signals computed from `(document, result)`: `ungrounded` when a span is missing from the document or there are none, `secret:<name>` per pattern whose match the document does not contain, `degenerate` when the answer’s token repeat ratio is above 0.4. An empty list is the only path that returns the answer.',
-    'Reuse the input-side `repeat_ratio` on the answer’s tokens; a model that has diverged repeats a short phrase until `max_tokens`, so the ratio is close to 1. For the secret table, run each pattern’s matches and keep the ones the document does not contain — a key that is in the document is cited, a key that is not was remembered.',
-    'A refusal is a function: fixed text, `refused: true`, one `reason`, and a log line with user, document hash, signal names and a signature (`sha256(document_hash + sorted signals)[:16]`). The answer text and the document never go into a log line — on either path.',
+    'A user asks about a pricing page and receives an unrelated e-mail address, or the same sentence repeated for 256 tokens, as a normal answer, and the ops log shows that text in full.',
+    'The starter returns `result.answer` straight from the model layer: nothing compares the spans to the document, scans the text, measures its repeat ratio, or catches `Rejected`, and the log line formats the answer.',
+    'Collect `ungrounded`, `secret:<name>` and `degenerate` signals from `(document, result)`; any signal or `Rejected` goes through `refuse()`, which returns `REFUSAL`, `refused: true` and logs user, document hash, signals and the 16-hex signature.',
   ],
   checks: [
     {
@@ -163,8 +162,7 @@ docs = DocumentStore()
 
 @app.post("/v1/ask")
 def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
-    # TODO: this starter returns whatever the model says: no grounding check on the spans, no
-    # secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     document = docs.get(body.document_id)
     if document is None:
         raise HTTPException(status_code=404, detail="unknown document")
@@ -288,8 +286,7 @@ interface AskBody {
 }
 
 app.post('/v1/ask', async (request, reply) => {
-  // TODO: this starter returns whatever the model says: no grounding check on the spans, no
-  // secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const user = request.headers['x-user-id'] as string;
   const body = request.body as AskBody;
   const document = await docs.get(body.document_id);
@@ -429,8 +426,7 @@ func ask(rw http.ResponseWriter, r *http.Request) {
 		Question   string \`json:"question"\`
 	}{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter returns whatever the model says: no grounding check on the spans, no
-	// secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	document, ok := docs.Get(body.DocumentID)
 	if !ok {
 		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown document"})
@@ -634,9 +630,7 @@ object AnswerGuard {
       post {
         headerValueByName("X-User-Id") { user =>
           entity(as[AskRequest]) { body =>
-            // TODO: this starter returns whatever the model says: no grounding check on the spans,
-            // no secret/PII scan, no degeneration check, no refusal path, and the answer goes
-            // into the log.
+            // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
             docs.get(body.document_id) match {
               case None => complete(StatusCodes.NotFound, """{"error":"unknown document"}""")
               case Some(document) =>
@@ -787,8 +781,7 @@ int main() {
     const auto user = req.get_header_value("X-User-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this starter returns whatever the model says: no grounding check on the spans, no
-    // secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto document = docs.get(body.value("document_id", std::string()));
     if (!document) {
       res.status = 404;
@@ -947,5 +940,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat model output as untrusted input. The starter looks finished because a cooperative model gives good answers; the source's second post shows the other case — a model that has diverged into a memorised passage or a looped phrase — and nothing in the starter would notice. Three guards cover it: grounding ties the answer to the document the user is allowed to read, the secret table catches the memorised PII and keys the source warns about, and the repeat ratio on the output is the same signal as on the input, pointed the other way. Refusal is a function with fixed text so the user never sees the model's slip, and the signature is a stable, text-free fingerprint of the incident that the next step can count. Real guards add a second-model judge for groundedness beyond substring matching, a per-document secret allow-list, and a quarantine of refused answers for human review under access control.`,
+  debrief: `Model output is untrusted input. The starter looks finished because a cooperative model gives good answers; the source's second post shows the other case, a model that has diverged into a memorised passage or a looped phrase, and nothing in the starter would notice. Grounding ties the answer to the document the user is allowed to read, the secret table catches the memorised PII and keys the source warns about, and the repeat ratio on the output is the same signal as on the input, pointed the other way. Refusal is one function with fixed text so the user does not see the model's slip, and the signature is a text-free fingerprint of the incident that the next step can count. Production guards often add a second-model judge for groundedness beyond substring matching, and quarantine refused answers under access control for human review.`,
 };

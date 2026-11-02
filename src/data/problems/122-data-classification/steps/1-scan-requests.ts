@@ -8,35 +8,27 @@ export const scanRequestsStep: Step = {
   focus: ['platforms', 'schema', 'metasense', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it subscribes to the topic,
-reads an event and enqueues a classification job, so the demo shows jobs appearing. It hides four
-production flaws. Debug it like the owner of the intake, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter subscribes to \`schema.changed\` in group \`metasense\`, commits the
+offset as soon as a record is polled, parses the payload and enqueues one job with the entity, owner
+and full column list. It runs and the demo shows jobs appearing; it hides five flaws.
 
-Data platforms produce one \`schema.changed\` event per entity whose schema appeared or changed,
-keyed by entity: \`{"entity": "deliveries", "owner": "team-logistics", "columns": ["merchant_id",
-"status", "delivery_time"]}\`. The intake turns events into classification jobs.
-
-- Consume \`schema.changed\` in the consumer group \`metasense\` with **auto-commit off**; the
-  offset is committed by the code, after the work.
-- **Validate** before anything else: \`entity\` and \`owner\` are non-empty strings and \`columns\`
-  is a non-empty list of strings. A malformed event is produced to \`schema.changed.dlq\` with the
-  original payload and then committed — it must not block the partition and must not be lost.
-- Compute \`schema_hash\` as the hex SHA-256 of the columns joined by \`\\n\`. Ask the store whether
-  \`(entity, schema_hash)\` was already \`seen\`; if so, commit and move on. Re-scanning an unchanged
-  schema is the most expensive no-op the service can do.
-- Split entities with more than **150** columns (\`MAX_COLUMNS_PER_JOB\`) into several jobs of at
-  most 150 columns each, with \`part\` and \`parts\` so the results can be reassembled. The source
-  found the model loses attention past that size.
-- **Enqueue the job, then commit.** A commit before the enqueue means a crash between the two
-  loses the schema change until the next manual scan — which, for an entity nobody re-touches, is
-  never.
-
-**Failure mode the checks target.** Auto-commit and a commit at the top of the loop both move the
+**Failure mode the checks target.** Auto-commit and the commit at the top of the loop move the
 offset past work that has not happened; a 600-column table in one job produces tags the model did
-not actually look at; the missing hash makes every re-emitted event a full re-scan on a paid API;
-and an unvalidated event either crashes the consumer on the same record forever or quietly becomes a
-job for an entity named \`null\`.`,
+not look at; the missing hash makes every re-emitted event a paid re-scan; an unvalidated event
+crashes the consumer on the same record forever or becomes a job for an entity named \`null\`.
+
+Events arrive one per entity, keyed by entity: \`{"entity": "deliveries", "owner":
+"team-logistics", "columns": ["merchant_id", "status", "delivery_time"]}\`.
+
+- Consume with **auto-commit off**; the code commits, after the work.
+- **Validate** first: \`entity\` and \`owner\` non-empty strings, \`columns\` a non-empty list of
+  strings. A malformed event goes to \`schema.changed.dlq\` with the original payload, then commit.
+- \`schema_hash\` is the hex SHA-256 of the columns joined by \`\\n\`; if the store has
+  \`seen(entity, schema_hash)\`, commit and move on.
+- Split entities with more than **150** columns (\`MAX_COLUMNS_PER_JOB\`) into jobs of at most 150,
+  with \`part\` and \`parts\`.
+- **Enqueue every part, then commit.** A crash between a commit and the enqueue loses the schema
+  change until the next manual scan.`,
   sequence: {
     participants: ['Data platforms', 'schema.changed', 'metasense', 'job store'],
     messages: [
@@ -51,9 +43,9 @@ job for an entity named \`null\`.`,
     ],
   },
   hints: [
-    'Turn auto-commit off in the consumer configuration and make the commit the last statement of the loop body. Everything the loop does — validate, hash, split, enqueue — happens before it, so a crash replays the record instead of losing it.',
-    'Validation is a function that returns the parsed event or `None`; the `None` branch produces the raw payload to `schema.changed.dlq` and commits. The hash is `sha256("\\n".join(columns))` — a string the store can index — and `store.seen(entity, schema_hash)` decides whether a job exists at all.',
-    'Splitting is a slice loop: `for start in range(0, len(columns), MAX_COLUMNS_PER_JOB)` with `part = start // MAX_COLUMNS_PER_JOB + 1` and `parts = ceil(len / 150)`. Each slice is its own `store.enqueue(...)`; the commit comes after the loop, once every part is durable.',
+    'Kill the consumer right after it polls a record and restart it: the schema change is gone, the job was never enqueued, and nobody re-emits the event for that entity.',
+    'The client commits on a timer and the loop commits on line one, so the offset says "handled" before validation, hashing, splitting or enqueueing. Wide, duplicate and malformed events all take the same path.',
+    'Set `enable.auto.commit` false. Per record: validate or produce to `schema.changed.dlq`; `sha256("\\n".join(columns))` and `store.seen`; slice `range(0, len(columns), MAX_COLUMNS_PER_JOB)` into `store.enqueue` calls; commit last.',
   ],
   checks: [
     {
@@ -141,8 +133,7 @@ store = JobStore()
 
 
 def consume() -> None:
-    # TODO: this starter commits before the job exists, enqueues entities of any size as one job,
-    # re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "metasense"})
     consumer.subscribe(["schema.changed"])
     while True:
@@ -257,8 +248,7 @@ interface SchemaChanged {
 }
 
 export async function consume(): Promise<void> {
-  // TODO: this starter commits before the job exists, enqueues entities of any size as one job,
-  // re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const consumer = kafka.consumer({groupId: 'metasense'});
   await consumer.connect();
   await consumer.subscribe({topic: 'schema.changed'});
@@ -377,8 +367,7 @@ func (s *JobStore) Enqueue(ctx context.Context, job Job) error { return nil }
 
 var store = &JobStore{}
 
-// TODO: this starter lets the client commit on its own schedule, enqueues entities of any size as
-// one job, re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func consume(ctx context.Context) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{"kafka:9092"},
@@ -532,8 +521,7 @@ import spray.json._
 final case class Job(entity: String, owner: String, columns: List[String])
 
 object ScanIntake {
-  // TODO: this starter lets the client commit on its own schedule, enqueues entities of any size as
-  // one job, re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def consume(): Unit = {
     val props = new Properties()
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
@@ -648,8 +636,7 @@ struct JobStore {
 
 JobStore store;
 
-// TODO: this starter lets the client commit on its own schedule, enqueues entities of any size as
-// one job, re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void consume() {
   std::string err;
   std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
@@ -778,5 +765,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand what an offset commit promises. It says "everything before this record is handled", and the starter says it before anything is handled: auto-commit moves the offset on a timer, and the explicit commit at the top of the loop moves it before the enqueue. Four separate defects are being checked: the commit position (enqueue, then commit, so a crash replays instead of loses), validation with a dead-letter topic (a poison record must neither crash the consumer forever nor become a job), deduplication by schema hash (the source's service is paid per entity scanned, and re-emitted events for unchanged schemas are the cheapest thing to skip), and the 150-column split the Metasense team added after seeing the model lose attention on wide tables. Real intakes add a schema registry for the event itself, per-platform rate limits on the producer side, and the mini-batch window the source uses to group requests before they hit the model.`,
+  debrief: `An offset commit says "everything before this record is handled", and the fix makes that true: validate, hash, split and enqueue first, commit last, with auto-commit off so the client cannot say it early. The dead-letter topic exists because a poison record has two other outcomes, a crash loop on the same offset or a job for an entity named null, and both are worse than a parked payload. The schema hash is the cheapest check in the pipeline and guards the most expensive call. The 150-column split comes from Metasense V2, which saw the model lose attention on wide tables. Production intakes also register a schema for the event itself, rate-limit each producing platform, and group requests into the mini-batch window the source describes.`,
 };

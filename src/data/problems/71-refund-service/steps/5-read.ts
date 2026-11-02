@@ -8,35 +8,29 @@ export const refundReadStep: Step = {
   focus: ['finance', 'api', 'records', 'ledger', 'psp'],
   task: `## Task
 
-**Starting point.** The starter is working code: the endpoint returns a number
-and the support tool renders it, so the demo passes. The number is the cache, not the truth, and the
-endpoint answers about anybody's payment. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/payments/{payment_id}/refunds\` with no tenant
+header: it reads \`ledger.refunded_total(payment_id)\` from Redis and answers **200** with that
+number as \`refunded_minor\` and one synthetic row \`{"refund_id": "from-the-ledger",
+"amount_minor": …}\`. It compiles and hides five flaws.
 
-Implement the read endpoint finance and support reconcile against:
+**Failure mode the checks target.** Reporting the ledger alone understates the refunds exactly when
+the service crashed between the PSP's success and the refund row; the ledger is not compared with
+the records, so drift stays silent; pending refunds are not reconciled; the rows carry no reason
+code, reference or status; and any tenant can read another merchant's refund history.
 
-- \`GET /v1/payments/{payment_id}/refunds\`, tenant from the authenticated \`X-Tenant-Id\` header
-  (**401** when missing). A payment owned by another tenant answers **404** — a foreign payment id
-  must be indistinguishable from a missing one.
-- The reported \`refunded_minor\` is reconstructed from the **durable refund records**
-  (\`records.sum_refunds(payment_id)\`), never from the Redis ledger alone: a crash between the PSP's
-  success and the refund row must not make the customer's refunds vanish. The starter returns the
-  ledger's number, so it understates every refund that is settled but not yet written.
-- The Redis ledger is **matched against the records** in the same response: report
-  \`drift_minor = refunded_minor - ledger.refunded_total(payment_id)\` and
-  \`ledger_reconciled = drift_minor == 0\`, so the reconciliation worker can repair a cache nobody
-  notices drifting.
-- Every refund still \`PENDING\` is **reconciled with the PSP** before it is reported
-  (\`GetRefund(refund_id)\`, 5-second deadline): a settled refund folds into the total as
-  \`CONFIRMED\` with its PSP reference, a rejected one is dropped from the total, and an unanswered
-  one stays \`PENDING\`. The starter hides pending refunds entirely.
+Requirements:
+
+- Tenant from \`X-Tenant-Id\` (**401** when missing); \`assert_tenant_owns\` answers **404** for a
+  payment owned by another tenant, indistinguishable from a missing one.
+- \`refunded_minor\` comes from the durable records, \`records.sum_refunds(payment_id)\`.
+- The response reports \`drift_minor = refunded_minor - ledger.refunded_total(payment_id)\` and
+  \`ledger_reconciled = drift_minor == 0\`, so the reconciliation worker can repair the cache.
+- Every refund still \`PENDING\` is reconciled with the PSP (\`GetRefund(refund_id)\`, 5-second
+  deadline) before it is reported: settled folds in as \`CONFIRMED\` with its reference, rejected
+  drops from the total, unanswered stays \`PENDING\` and is summed into \`pending_minor\`.
 - Every refund row carries \`refund_id\`, \`amount_minor\`, \`reason_code\`, \`psp_ref\` and
-  \`status\`; the body also carries \`paid_minor\`, \`remaining_minor\` and \`pending_minor\` so
-  support can answer "how much is still to come?" without opening the ledger.
-- Log tenant, payment, totals and drift — never the customer's name or card data.
-
-**Failure mode the checks target.** Reading the ledger alone makes the endpoint lie exactly when the
-service crashed mid-refund; hiding pending refunds hides the PSP reference support needs; and
-answering without an ownership check lets any tenant read another merchant's refund history.`,
+  \`status\`; the body also carries \`paid_minor\` and \`remaining_minor\`.
+- Log tenant, payment, totals and drift; never the customer's name or card data.`,
   sequence: {
     participants: ['Finance client', 'Refund API', 'refund records', 'PSP', 'Redis ledger'],
     messages: [
@@ -118,7 +112,7 @@ answering without an ownership check lets any tenant read another merchant's ref
       id: 'refund-rows',
       title: 'Every refund carries its PSP reference and status',
       detail:
-        'Each refund row carries `refund_id`, `amount_minor`, `reason_code`, `psp_ref` and `status`, so a reviewer can point at the provider reference for a specific refund. The starter returns ids and amounts only.',
+        'Each refund row carries `refund_id`, `amount_minor`, `reason_code`, `psp_ref` and `status`, so support can point at the provider reference for a specific refund. The starter returns ids and amounts only.',
       match: {
         python: {all: [/"refund_id":/, /"psp_ref":/, /"status":/]},
         typescript: {all: [/refund_id:\s*row\.refund_id/, /psp_ref:/, /status:/]},
@@ -157,9 +151,7 @@ ledger = RefundLedger()
 
 @app.get("/v1/payments/{payment_id}/refunds")
 def read_refunds(payment_id: str) -> JSONResponse:
-    # TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
-    # refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-    # their references, and serves any tenant's payment. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     refunded_minor = ledger.refunded_total(payment_id)
     logger.info("refunds read payment=%s", payment_id)
     return JSONResponse(
@@ -302,9 +294,7 @@ const r = new Redis('redis://redis:6379');
 
 app.get('/v1/payments/:paymentId/refunds', async (request, reply) => {
   const {paymentId} = request.params as {paymentId: string};
-  // TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
-  // refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-  // their references, and serves any tenant's payment. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const cached = await r.hget(\`refunded:\${paymentId}\`, 'refunded');
   const refunded_minor = cached === null ? 0 : Number(cached);
   return reply.code(200).send({
@@ -416,9 +406,7 @@ var rdb *redis.Client
 func readRefunds(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	paymentID := r.PathValue("payment_id")
-	// TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
-	// refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-	// their references, and serves any tenant's payment. Fix all four.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	cached, _ := rdb.HGet(ctx, "refunded:"+paymentID, "refunded").Int64()
 	body, _ := json.Marshal(map[string]any{
 		"payment_id":     paymentID,
@@ -591,9 +579,7 @@ object Read {
   val route: Route =
     path("v1" / "payments" / Segment / "refunds") { paymentId =>
       get {
-        // TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and
-        // the refund row understates the refunds; it never reconciles pending refunds with the PSP,
-        // hides their references, and serves any tenant's payment. Fix all four.
+        // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         val cached = Option(jedis.hget(s"refunded:$paymentId", "refunded")).map(_.toLong).getOrElse(0L)
         complete(StatusCodes.OK, s"""{"payment_id":"$paymentId","refunded_minor":$cached}""")
       }
@@ -758,9 +744,7 @@ int main() {
 
   svr.Get("/v1/payments/([^/]+)/refunds", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto payment_id = req.matches[1].str();
-    // TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
-    // refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-    // their references, and serves any tenant's payment. Fix all four.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     auto cached = redis.hget("refunded:" + payment_id, "refunded");
     const long long refunded_minor = cached ? std::stoll(*cached) : 0;
     res.status = 200;
@@ -921,9 +905,9 @@ int main() {
     },
   },
   hints: [
-    'Authorize first: `assert_tenant_owns(tenant, payments.get(payment_id))` before any key is read, and answer **404** so a foreign payment id is indistinguishable from one that does not exist.',
-    'The records are the source of truth and the ledger is a cache: take `refunded_minor` from `records.sum_refunds(payment_id)`, compare it with `ledger.refunded_total(payment_id)` and publish `drift_minor`. A response that only echoes the cache can never be reconciled against the provider.',
-    'Reconcile before you answer: for every row whose status is `PENDING`, ask the PSP with `GetRefund(refund_id)`, fold a settled answer in as `CONFIRMED` with its `psp_ref`, drop a rejected one from the total, and report what is still unknown as `pending_minor`. Support needs the provider reference, not a promise.',
+    'Symptom: after a crash mid-refund, finance sees a smaller refunded total than the PSP paid; support cannot find a provider reference for a pending refund; a merchant reads a payment another merchant owns.',
+    'Mechanism: the handler takes no tenant and loads no payment row, reads only `ledger.refunded_total`, and fabricates one row from that number; nothing touches `records` or the PSP.',
+    'Change: `assert_tenant_owns(tenant, payments.get(payment_id))` → 404; total from `records.sum_refunds`; `drift_minor` against the ledger; `GetRefund` for each `PENDING` row into `pending_minor`; rows with `psp_ref` and `status`.',
   ],
-  debrief: `The interviewer is testing whether you can tell a cache from the truth in a system whose whole job is money. The durable refund records are the ledger of record; Redis is a fast copy of it, and a read endpoint that reports the copy alone lies exactly when the service crashed between the PSP's success and the row write — the failure the reconciliation worker exists to repair. Matching the two in the response (\`drift_minor\`, \`ledger_reconciled\`) turns a silent disagreement into an alarm and gives the worker its input. Reconciling pending refunds before answering is the second half: a refund the PSP already applied must not be shown as missing, and support needs its provider reference to talk to the customer. The ownership check is the plain one that read endpoints forget: a read is still a read of one tenant's money, and a foreign payment id answers 404. Real services add an append-only refund log with monotonic offsets, a per-payment reconciliation interval, and a metric on both drift and pending age.`,
+  debrief: `The durable refund records are the ledger of record and Redis is a fast copy, so the endpoint sums the records and reports the copy's disagreement as \`drift_minor\` rather than reporting the copy as truth: the one case where the two differ, a crash between the PSP's success and the row write, is the case the reconciliation worker exists to repair, and the drift field is its input. Reconciling pending refunds before answering is the other half: a refund the PSP already applied must not be shown as missing, and support needs the provider reference. The ownership check is the plain one read endpoints forget: a read is still a read of one tenant's money. Production services also track pending age and alert on drift that persists across passes.`,
 };

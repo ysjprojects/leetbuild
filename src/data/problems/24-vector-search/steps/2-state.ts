@@ -8,29 +8,27 @@ export const stateStep: Step = {
   focus: ['search', 'cache', 'index'],
   task: `## Task
 
-**Starting point.** The starter is working code: the second identical query is
-fast and the demo looks great. The cache hides a leak, a stale entry and the wrong expiry
-discipline. Find them, fix them, and prove the fix with the checks below.
-
-Identical lookups must be served from a Redis cache in front of the index.
-
-- The key is \`search:{tenant}:{index_version}:{query_digest}:{k}\` — built from the authenticated
-  tenant, the active index version, a stable digest of the query vector and the cap that was
-  actually searched. The starter hashes the query and appends \`k\`, so the first tenant to run a
-  query populates an entry that the next tenant reads.
-- The digest must be stable across processes: pack the vector's IEEE-754 bytes (or quantize them)
-  and hash that. \`str(vector)\` (or any float formatting) is not a key — the same floats print
-  differently in another runtime and the hit rate silently drops to zero.
-- Entries **expire**: write with a **60-second TTL** in the same \`SET\` (\`ex=TTL_S\`, \`EX\`,
-  \`setex\`, \`std::chrono::seconds\`). The starter deletes entries by hand before writing, which
-  leaves a window where the entry is gone for every tenant and never bounds staleness.
-- The read path keys by the authenticated tenant only and never trusts a body tenant for the cache.
+**Starting point.** The starter puts a Redis cache in front of the index: it digests
+\`str(query)\` with SHA-256, builds the key \`search:{digest}:{k}\`, serves a hit straight from the
+cache, and on a miss deletes the key, searches as the body's tenant and writes the payload back
+with no expiry. It compiles, serves the demo and hides five flaws.
 
 **Failure mode the checks target.** A key without the tenant is a cross-tenant read: the query hash
 is identical for two tenants who embed similar text, so the cache serves one tenant's private hits
 to another. A key without the index version serves results from a snapshot the tenant no longer
-sees. Manual invalidation has no bound on staleness — the TTL is the bound — and float formatting
-as a key makes the cache miss forever.`,
+sees. Manual deletion has no bound on staleness (the TTL is the bound), and float formatting as a
+key makes the cache miss forever.
+
+- The key is \`search:{tenant}:{index_version}:{query_digest}:{k}\`, built from the authenticated
+  tenant, the active index version, a stable digest of the query vector and the cap that was
+  actually searched.
+- The digest must be stable across processes: pack the vector's IEEE-754 bytes (or quantize them)
+  and hash that. \`str(vector)\` (or any float formatting) is not a key; the same floats print
+  differently in another runtime and the hit rate silently drops to zero.
+- Entries **expire**: write with a **60-second TTL** in the same \`SET\` (\`ex=TTL_S\`, \`EX\`,
+  \`setex\`, \`std::chrono::seconds\`). No \`DEL\` anywhere.
+- The read path keys by the authenticated \`X-Tenant-Id\` tenant only; a contradicting body tenant
+  is **403**.`,
   sequence: {
     participants: ['Search API', 'Result cache', 'Index shards'],
     messages: [
@@ -43,9 +41,9 @@ as a key makes the cache miss forever.`,
     ],
   },
   hints: [
-    'Build the key from four inputs, not two: `cache_key(tenant, version, digest, k)`. The tenant and the index version are the isolation half; the digest and `k` are what make the entry *this* query. If any of the four is missing, the entry answers a question nobody asked.',
-    'The digest is a fingerprint, not a serialization: `struct.pack(">f", v)` over the floats, `Buffer.writeFloatBE`, `math.Float64bits` into a `sha256`, a `ByteBuffer.putDouble`, an FNV-1a walk over the bits. All of them are stable across processes and machines; `str([0.1, 0.2])` is not.',
-    'Expiry is the invalidation strategy: `SET ... EX 60` (or `setex`, `SETEX`, the `ex=` keyword, `std::chrono::seconds(60)`). Never `DEL` before a write — that is a stampede with a stale-data tail, and the 60-second TTL is the only staleness bound the tenant agreed to.',
+    "Tenant B runs the query tenant A ran a minute ago and gets A's hits back. The same query from a second worker misses every time, and entries written an hour ago still answer.",
+    'The key is built from `query_digest(body.query)` and `k` alone, the digest hashes `str(query)`, the tenant comes from the body, and the miss path does `delete` then `set` with no `ex`.',
+    'Add `cache_key(tenant, version, digest, k)`, digest `struct.pack` bytes of the floats, take the tenant from `X-Tenant-Id` (403 on mismatch), drop the `delete`, and `set(..., ex=TTL_S)` with `TTL_S = 60`.',
   ],
   checks: [
     {
@@ -152,9 +150,7 @@ def query_digest(query: list[float]) -> str:
 
 @app.post("/v1/search")
 def search(body: SearchRequest) -> JSONResponse:
-    # TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-    # that every other tenant then reads. The starter also deletes entries by hand instead of giving
-    # them a TTL, and it takes the tenant straight from the body.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     tenant = body.tenant
     key = f"search:{query_digest(body.query)}:{body.k}"
     cached = cache.get(key)
@@ -268,9 +264,7 @@ function queryDigest(query: number[]): string {
 }
 
 app.post('/v1/search', async (request, reply) => {
-  // TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-  // that every other tenant then reads. The starter also deletes entries by hand instead of giving
-  // them a TTL, and it takes the tenant straight from the body.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const body = request.body as SearchBody;
   const k = body.k ?? 10;
   const key = \`search:\${queryDigest(body.query)}:\${k}\`;
@@ -399,9 +393,7 @@ func search(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "invalid json", http.StatusBadRequest)
 		return
 	}
-	// TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-	// that every other tenant then reads. The starter also deletes entries by hand instead of giving
-	// them a TTL, and it takes the tenant straight from the body.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	k := body.K
 	if k == 0 {
 		k = 10
@@ -589,9 +581,7 @@ object SearchApi {
     path("v1" / "search") {
       post {
         entity(as[SearchRequest]) { body =>
-          // TODO: the key is the digest and k alone, so the first tenant to run a query populates an
-          // entry that every other tenant then reads. The starter also deletes entries by hand instead
-          // of giving them a TTL, and it takes the tenant straight from the body.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val k = math.max(1, math.min(body.k, 100))
           val key = s"search:\${queryDigest(body.query)}:$k"
           val cached = cache.get(key)
@@ -743,9 +733,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-    // that every other tenant then reads. The starter also deletes entries by hand instead of giving
-    // them a TTL, and it takes the tenant straight from the body.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const auto tenant = body.value("tenant", std::string());
     const auto query = body.value("query", std::vector<double>());
     const int k = body.value("k", 10);
@@ -880,15 +868,14 @@ int main() {
 `,
     },
   },
-  debrief: `The cache key is the security boundary of a tenant-scoped service, and the starter's key is a
-sentence that reads fine: hash the query, append the cap, cache the hits. The four
-things you have to notice are that the key must name the tenant (otherwise one tenant's
-popular query populates an entry another tenant reads), the index version (otherwise a hit can outlive
-the snapshot it came from), the digest must be built from the vector's bytes rather than its formatted
-text, and expiry — not deletion — is what bounds staleness. Two tenants embedding different private
-corpora can produce the very same vector, so a tenant-less key is not a cache miss waiting to happen,
-it is a cross-tenant read waiting to happen. Real services add a per-tenant hit-rate metric so a
-missing key component shows up as a traffic spike rather than a support ticket, and a key-version bump
-so a bad cache can be drained without flushing everyone's entries.
+  debrief: `The cache key is the security boundary of a tenant-scoped service, which is why the fix
+is a four-part key rather than a longer hash: tenant and index version are the isolation half, digest
+and \`k\` are what make the entry this query. Two tenants embedding different private corpora can
+produce the very same vector, so a tenant-less key is not a cache miss waiting to happen, it is a
+cross-tenant read waiting to happen. The digest hashes bytes rather than formatted floats so every
+worker computes the same key, and expiry replaces deletion because a TTL bounds staleness while a
+\`DEL\` only opens a window where everyone misses. Production caches add a per-tenant hit-rate
+metric so a missing key component shows up as a traffic spike rather than a support ticket, and a
+key-version prefix so a bad cache can be drained without flushing everyone's entries.
 `,
 };

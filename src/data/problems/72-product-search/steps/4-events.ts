@@ -8,32 +8,29 @@ export const eventsStep: Step = {
   focus: ['search', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds a payload, produces
-it to \`search.event\`, and a consumer moves a counter. It compiles, the analytics demo shows data,
-and it hides four production flaws. Debug it like the service owner, fix it, and prove the fix with
-the checks below.
-
-Implement the search telemetry producer and consumer for \`search.event\`.
-
-- The message **key is the tenant** (\`key=tenant\` / \`key: tenant\` / \`Key: []byte(tenant)\` /
-  \`ProducerRecord("search.event", tenant, …)\`). The starter keys by the query hash, so one tenant's
-  events scatter across partitions and their order is no longer guaranteed.
-- The payload carries a **query hash**, the **result count** and the **latency**, never the raw query
-  text — the starter copies the shopper's words into a retained, replicated topic "for relevance
-  tuning".
-- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS's
-  \`idempotent: true\`, or \`RequiredAcks: kafka.RequireAll\` with a hash balancer), so a produce retry
-  cannot duplicate the event.
-- The consumer updates the Redis counters (\`INCR\` / \`HINCRBY\`) **and only then** commits the
-  offset. Commit first and one crash loses the counter update forever, because the offset already
-  moved past the unprocessed record.
+**Starting point.** The starter is the telemetry path for \`search.event\`: the producer builds a
+payload from a \`SearchEvent\`, keys the record by a hash of the query, and produces it with a
+default-configured producer; the consumer polls the topic, commits the offset, and increments a
+per-tenant Redis counter. It compiles, the analytics demo shows data, and it hides five flaws.
 
 **Failure mode the checks target.** Search telemetry is the classic place where convenience beats
 contracts: the raw query is the most useful field for relevance work and the most dangerous one to
 retain; the query hash is the natural key if you are thinking about the query instead of the tenant,
 and it destroys per-tenant order; and a commit that happens before the counter update looks faster
 and is exactly-once only until the first crash. The fix keeps the tenant as the partition key, ships
-the query as a hash, configures the producer instead of hoping, and processes before it commits.`,
+the query as a hash, configures the producer instead of hoping, and processes before it commits.
+
+- The message **key is the tenant** (\`key=tenant\` / \`key: tenant\` / \`Key: []byte(tenant)\` /
+  \`ProducerRecord("search.event", tenant, …)\`), so one tenant's events share a partition and keep
+  their order.
+- The payload carries a **query hash**, the **result count** and the **latency**. The raw query text
+  stays out of the event and out of the log line; the topic is retained and replicated.
+- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS's
+  \`idempotent: true\`, or \`RequiredAcks: kafka.RequireAll\` with a hash balancer), so a produce retry
+  cannot duplicate the event.
+- The consumer updates the Redis counters (\`INCR\` / \`HINCRBY\`) **and only then** commits the
+  offset. Commit first and one crash loses the counter update for good, because the offset already
+  moved past the unprocessed record.`,
   sequence: {
     participants: ['Search API', 'search.event', 'Telemetry consumer', 'Redis'],
     messages: [
@@ -68,7 +65,7 @@ the query as a hash, configures the producer instead of hoping, and processes be
       id: 'no-raw-query',
       title: 'No raw query in the event payload',
       detail:
-        'The event and the log lines carry a query hash, never `query` text. The starter publishes the raw query into a topic that is retained and replicated — a leak with a long tail.',
+        'The event and the log lines carry a query hash, never `query` text. The starter publishes the raw query into a topic that is retained and replicated: a leak with a long tail.',
       match: {
         python: {none: [/raw_query/, /["']?query["']?\s*:/]},
         typescript: {none: [/raw_query/, /["']?query["']?\s*:/]},
@@ -139,8 +136,7 @@ class SearchEvent(BaseModel):
 
 
 def publish_search(event: SearchEvent) -> None:
-    # TODO: this starter keys by the query hash so tenant streams interleave, publishes the raw query
-    # for relevance tuning, and never configures idempotence. Fix all three.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = hashlib.sha256(event.query.encode("utf-8")).hexdigest()
     payload = {"query": event.query, "results": event.results}
     logger.info("search tenant=%s query=%r", event.tenant, event.query)
@@ -217,7 +213,7 @@ def consume_search_events() -> None:
 `,
     },
     typescript: {
-      starter: `/** search.event producer: flawed code that keys by the query hash. */
+      starter: `/** search.event producer: the starter. */
 import {createHash} from 'node:crypto';
 
 import {Redis} from 'ioredis';
@@ -234,8 +230,7 @@ interface SearchEvent {
 }
 
 export async function publishSearch(event: SearchEvent): Promise<void> {
-  // TODO: this starter keys by the query hash so tenant streams interleave, publishes the raw query
-  // for relevance tuning, and never configures idempotence. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = createHash('sha256').update(event.query).digest('hex');
   const payload = {query: event.query, results: event.results};
   await producer.send({topic: 'search.event', messages: [{key, value: JSON.stringify(payload)}]});
@@ -328,8 +323,7 @@ type SearchEvent struct {
 }
 
 func publishSearch(ctx context.Context, event SearchEvent) error {
-	// TODO: this starter keys by the query hash so tenant streams interleave, publishes the raw query
-	// for relevance tuning, and never configures idempotence. Fix all three.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	sum := sha256.Sum256([]byte(event.Query))
 	payload, _ := json.Marshal(map[string]any{"query": event.Query, "results": event.Results})
 	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(hex.EncodeToString(sum[:])), Value: payload})
@@ -427,8 +421,7 @@ object SearchEvents {
   val jedis = new Jedis("redis", 6379)
 
   def publishSearch(event: SearchEvent): Unit = {
-    // TODO: this starter keys by the query hash so tenant streams interleave, publishes the raw query
-    // for relevance tuning, and never configures idempotence. Fix all three.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = Integer.toHexString(event.query.hashCode)
     val payload = s"""{"query":"\${event.query}","results":\${event.results}}"""
     producer.send(new ProducerRecord("search.event", key, payload))
@@ -505,8 +498,7 @@ object SearchEvents {
 #include <string>
 
 void publishSearch(RdKafka::Producer* producer, const std::string& tenant, const std::string& query, int results) {
-  // TODO: this starter keys by the query hash so tenant streams interleave, publishes the raw query
-  // for relevance tuning, and never configures idempotence. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const std::string key = std::to_string(std::hash<std::string>{}(query));
   const std::string text = R"({"query":")" + query + R"(","results":)" + std::to_string(results) + "}";
   producer->produce("search.event", RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
@@ -575,9 +567,9 @@ void consumeSearchEvents(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& red
     },
   },
   hints: [
-    'The message key is the partition key. `key=tenant` (or `key: tenant`, `Key: []byte(tenant)`, `ProducerRecord("search.event", tenant, …)`) is what keeps one tenant\'s events in order; the query hash is a fine *field* and a terrible key.',
-    'Hash the query on the way out, not on the way in: the producer has the text, the topic never should. The payload is `{tenant, query_hash, result_count, latency_ms, partial}` — no `query` field at all.',
-    "Idempotence is configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS's `idempotent: true`, or required acks `all` with a hash balancer and the same key on every retry. In the consumer, `INCR` first and `commit` second so a crash replays instead of losing the update.",
+    "The analytics dashboard shows one tenant's searches out of order, the topic holds shoppers' raw search text, a producer retry during a broker failover doubles a count, and a consumer crash drops counts.",
+    'The record key is a hash of the query, so tenant events scatter across partitions; the payload copies the text; the producer runs on broker defaults; the consumer commits before it touches Redis.',
+    'Key by `tenant`, send `{tenant, query_hash, result_count, latency_ms}`, configure `enable.idempotence` with `acks=all` (or the client equivalent), and in the consumer call `INCR` before `commit`.',
   ],
-  debrief: `The interviewer is checking whether you can keep telemetry honest. The starter is useful — that is the trap: the raw query is the field the analytics team actually wants, and it is the field that must not leave the service. Four defects are being checked: the tenant is the partition key (per-tenant order is a feature, not a detail), the payload carries a hash rather than the text, the producer is configured idempotent with acks=all so retries do not duplicate, and the consumer updates counters before it commits so a crash replays instead of losing. Real systems add a schema registry so a future producer cannot smuggle text in, an outbox for produce failures, and separate topics for billing-grade counts versus sampled relevance data.`,
+  debrief: `The starter is useful, and that is the trap: the raw query is the field the analytics team wants most, and it is the field that must not leave the service. The fix has one shape throughout: decide the contract at the producer. The tenant is the partition key because per-tenant order is a feature; the query travels as a hash because a retained topic is a long-lived copy; idempotence with acks=all is producer configuration rather than application logic; and the consumer increments before it commits so a crash replays one record instead of losing it. Production telemetry pipelines also register a schema so a future producer cannot reintroduce a text field, buffer produce failures in an outbox, and keep billing-grade counts on a separate topic from sampled relevance data.`,
 };

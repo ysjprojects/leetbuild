@@ -8,28 +8,26 @@ export const endpointStep: Step = {
   focus: ['client', 'gateway', 'sessions'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and hands back a session id, so the demo call connects. It hides four production flaws at
-the trust boundary. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/voice/sessions\`, parses the body
+\`{"codec": "opus", "sample_rate": 48000, "max_duration_s": 1800}\`, reads \`X-Tenant-Id\` and hands
+back a session id, so the demo call connects. It serves the demo and hides four flaws at the trust
+boundary.
 
-Implement \`POST /v1/voice/sessions\` with body \`{"codec": "opus", "sample_rate": 48000, "max_duration_s": 1800}\`.
+**Failure mode the checks target.** Any codec string opens a stream the media pipeline cannot
+decode; an unlimited default duration lets one stuck caller hold a stream and its GPU; a new session
+on every reconnect forks the conversation, bills it twice and splits the transcript; and an
+anonymous caller gets a session id.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`codec\` must be one of **\`opus\`**, **\`pcm16\`**, **\`g711_ulaw\`** and \`sample_rate\` must be a
   rate the media pipeline accepts (**8000**, **16000**, **24000** or **48000**). Anything else is
-  **415 Unsupported Media Type** — a codec the pipeline cannot decode must never open a stream.
+  **415 Unsupported Media Type**.
 - \`max_duration_s\` is optional and defaults to **1800** (30 minutes). It must be an integer from
-  **1** to **1800**; a longer or non-positive value is **400**. Never leave a session unbounded.
+  **1** to **1800**; a longer or non-positive value is **400**.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the **live session it already created** — same \`session_id\`, same \`turn_count\` — with
-  **200**, instead of forking a second session that bills twice. A first create answers **201**.
-- Log the accepted session (tenant, session id, codec) — never raw audio.
-
-**Failure mode the checks target.** Accepting any codec string lets a caller open a stream the media
-pipeline cannot decode; an unlimited default duration means one stuck caller holds a stream and its
-GPU forever; and starting a new session on every reconnect forks the conversation, doubles the
-billing and splits the transcript. The reconnecting client is the common case on a flaky mobile
-network, so the idempotent resume is the flaw candidates miss most.`,
+  returns the **live session it already created**, same \`session_id\`, same \`turn_count\`, with
+  **200**. A first create answers **201**.
+- Log the accepted session (tenant, session id, codec), not raw audio.`,
   sequence: {
     participants: ['Client', 'Voice Gateway', 'Session store'],
     messages: [
@@ -52,9 +50,9 @@ network, so the idempotent resume is the flaw candidates miss most.`,
     ],
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant 401, Idempotency-Key 400, body shape, codec whitelist 415, duration range 400 — all before any session state is written, so a caller the media pipeline cannot serve never gets a session id.',
-    'The idempotency lookup is keyed by `(tenant, key)` and happens before minting a session id; a hit returns the stored session — same `session_id`, same `turn_count` — with 200. A reconnect is the common case on a flaky mobile network, and a second session bills the conversation twice and splits its transcript.',
-    'The default duration is a constant, not `None`/`null`/`0`: an omitted `max_duration_s` must mean 1800 seconds, and the cap must be enforced on the value the caller sent too. A session with no deadline holds a media stream and its GPU until someone notices.',
+    'On a flaky mobile network a caller reconnects mid-call and the agent restarts from the greeting; the bill shows two sessions for one conversation, and the transcript is split in half.',
+    'The handler mints a fresh session id on every request because it never looks at `Idempotency-Key`; the validation gaps have the same root cause, the request is trusted before anything is checked.',
+    'Guard in order: tenant 401, missing key 400, codec and rate against the supported sets 415, duration 1..1800 with default 1800 else 400; then `sessions.get((tenant, key))` and return that session with 200, else create, `sessions.put`, 201.',
   ],
   checks: [
     {
@@ -73,7 +71,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
       id: 'codec',
       title: 'Rejects an unsupported codec or sample rate with 415',
       detail:
-        '`codec` is checked against the supported set and `sample_rate` against the rates the pipeline accepts; an unsupported pair is **415**. The starter accepts any codec string and opens a stream the media pipeline cannot decode.',
+        '`codec` is checked against the supported set and `sample_rate` against the rates the pipeline accepts; an unsupported pair is **415**.',
       match: {
         python: {all: [/SUPPORTED_CODECS/, /status_code\s*=\s*415/]},
         typescript: {all: [/SUPPORTED_CODECS/, /code\(\s*415\s*\)/]},
@@ -86,7 +84,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
       id: 'duration',
       title: 'Caps the session at 30 minutes',
       detail:
-        'The duration defaults to 1800 s and anything from 1..1800 is accepted; a longer or non-positive value is **400**. The starter leaves the duration unlimited by default.',
+        'The duration defaults to 1800 s and anything from 1..1800 is accepted; a longer or non-positive value is **400**.',
       match: {
         python: {all: [/MAX_DURATION_S/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_DURATION_S/, /code\(\s*400\s*\)/]},
@@ -99,7 +97,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
       id: 'idempotent-resume',
       title: 'Resumes the live session for a replayed Idempotency-Key',
       detail:
-        '`Idempotency-Key` is required and `(tenant, key)` maps to the session that already exists; a replay answers 200 with the same `session_id` and its prior `turn_count`. The starter ignores the header and forks a second session on every reconnect.',
+        '`Idempotency-Key` is required and `(tenant, key)` maps to the session that already exists; a replay answers 200 with the same `session_id` and its prior `turn_count`.',
       match: {
         python: {all: [/Idempotency-Key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count/]},
         typescript: {all: [/idempotency-key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count/]},
@@ -111,8 +109,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
     {
       id: 'tenant',
       title: 'Authenticates the tenant with 401',
-      detail:
-        'The tenant comes from `X-Tenant-Id` and a missing or empty one is **401** before anything else happens. The starter reads the header but lets an anonymous caller through.',
+      detail: 'The tenant comes from `X-Tenant-Id` and a missing or empty one is **401** before anything else happens.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
@@ -145,9 +142,7 @@ class CreateSession(BaseModel):
 
 @app.post("/v1/voice/sessions")
 def create_session(body: CreateSession, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
-    # with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-    # anonymous caller through. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     session = {
         "session_id": f"vs_{uuid.uuid4().hex}",
         "codec": body.codec,
@@ -248,9 +243,7 @@ interface CreateSessionBody {
 }
 
 app.post('/v1/voice/sessions', async (request, reply) => {
-  // TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
-  // with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-  // anonymous caller through. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
   const body = request.body as CreateSessionBody;
   const session = {
@@ -381,9 +374,7 @@ func createSession(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
-	// with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-	// anonymous caller through. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	maxDuration := body.MaxDurationS
 	if maxDuration == 0 {
 		maxDuration = defaultDurationS
@@ -556,9 +547,7 @@ object Api {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[CreateSession]) { body =>
-            // TODO: this starter accepts any codec string and any sample rate, defaults the duration
-            // to a day with no cap, ignores Idempotency-Key (a reconnect forks a second session)
-            // and lets an anonymous caller through. Fix all four.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val session = VoiceSession(
               s"vs_\${java.util.UUID.randomUUID()}",
               body.codec,
@@ -693,9 +682,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
-    // with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-    // anonymous caller through. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const json session = {
         {"session_id", "vs_" + uuidString()},
         {"codec", body.value("codec", std::string())},
@@ -816,5 +803,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo call sends one well-formed request from one tenant that never reconnects; the flaws only appear when the traffic does. A missing 401 lets an anonymous caller open media sessions on your capacity, and a codec whitelist is not pedantry: the media pipeline can only decode \`opus\`, \`pcm16\` and \`g711_ulaw\`, so any other string is a stream that is admitted and then dies mid-sentence, after the caller has already been billed for the attempt. The duration cap is what keeps one stuck client from holding a stream and its GPU forever, and the default matters as much as the cap — an omitted \`max_duration_s\` must mean 1800 seconds, not "unbounded". The idempotent resume is the flaw candidates miss most: on a flaky mobile network the reconnect is the common case, not the exception, so keying by \`Idempotency-Key\` and returning the live session with its prior \`turn_count\` is the difference between one conversation and two forked ones that bill twice and split the transcript. Real voice platforms layer on a per-tenant codec policy (the whitelist is the intersection of what the pipeline decodes and what the tenant negotiated), session affinity so the media node that owns the stream serves the resume, capacity accounting per media node before a session is admitted, and a reconnect path that rejoins the live session instead of starting over.`,
+  debrief: `The fix is a handler that distrusts its input in cost order: tenant, idempotency key, codec and rate, duration, and only then state. The codec whitelist exists because the media pipeline decodes exactly \`opus\`, \`pcm16\` and \`g711_ulaw\`; any other string is a stream admitted and then killed mid-sentence after the caller was billed for it. The default duration matters as much as the cap: an omitted \`max_duration_s\` means 1800 seconds, not unbounded. Keying the resume by \`(tenant, Idempotency-Key)\` and returning the live session with its \`turn_count\` is what keeps one conversation from becoming two. Voice platforms go further: a per-tenant codec policy, session affinity so the media node that owns the stream serves the resume, and capacity accounting per node before a session is admitted.`,
 };

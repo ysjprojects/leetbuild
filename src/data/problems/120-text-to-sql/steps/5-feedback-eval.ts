@@ -8,37 +8,29 @@ export const feedbackEvalStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: a rating goes onto a topic
-and a consumer moves a counter, so the dashboard shows numbers. Four production contracts are
-broken: the event carries almost none of the signals the evaluation needs, it is keyed so that one
-user's events scatter across partitions, the producer can duplicate on retry, and the consumer
-commits before it writes. Find them, fix them, and prove the fix.
-
-\`POST /v1/queries/{id}/feedback\` with body \`{"rating": 4}\` (1–5, **400** otherwise) is how the
-product reports the outcome of a query, and the consumer turns those events into the per-workspace
-numbers the source's evaluation tracks.
-
-- Publish exactly one \`query.feedback\` event per call with the **user** as the message key, so
-  one user's events stay ordered. The event carries the **signals** the source evaluates:
-  \`query_id\`, \`user\`, \`workspace\` (the intent), \`tables_proposed\` (the table agent's pick),
-  \`tables_acked\` (what the user confirmed), \`run_ok\`, \`has_output\` and \`rating\`. All of them
-  come from the query record, not from the request body.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent) so a retried produce
-  cannot duplicate a record. A broker failure is **503** to the caller — never a silently dropped
-  event.
-- The consumer (group \`eval\`, manual commits) computes the **table overlap**
-  (\`table_overlap\`: \`|proposed ∩ acked| / |acked|\`, the source's 0–1 score — one of two
-  required tables found is 0.5) and updates the hash \`eval:{workspace}\` with \`HINCRBY\` on
-  \`queries\`, \`run_ok\`, \`has_output\`, \`overlap_milli\` (the score × 1000, so the field stays
-  an integer) and \`rating_sum\`. Success rate and mean overlap per workspace fall out of the hash.
-- Commit the offset **after** the Redis write. Commit first and one crash loses the update
-  forever, because the offset already moved past the unprocessed record.
+**Starting point.** The starter registers \`POST /v1/queries/{id}/feedback\`, looks the record up,
+produces \`{query_id, user, rating}\` to \`query.feedback\` keyed by the query id from a default
+producer, and its \`eval\` consumer commits each message and then adds the rating to
+\`feedback:{user}\`. A rating goes onto the topic and a counter moves, so the dashboard shows
+numbers. It compiles and hides 5 flaws.
 
 **Failure mode the checks target.** An event with only a rating cannot tell "the intent was
-wrong" from "the tables were wrong" from "it ran but returned nothing" — the three distinct
-failures the source's evaluation separates; keying by query id destroys per-user order; a plain
-producer duplicates under retry and double-counts a workspace's success rate; and
-commit-before-write is the crash that quietly makes the dashboard lie.`,
+wrong" from "the tables were wrong" from "it ran but returned nothing", the failures the source's
+evaluation separates; keying by query id destroys per-user order; a plain producer duplicates under
+retry and double-counts a workspace's success rate; and commit-before-write is the crash that
+quietly makes the dashboard lie.
+
+Requirements. Body \`{"rating": 4}\` (1–5, **400** otherwise).
+
+- Publish one \`query.feedback\` event per call keyed by the **user**, carrying the signals the
+  source evaluates: \`query_id\`, \`user\`, \`workspace\`, \`tables_proposed\`, \`tables_acked\`,
+  \`run_ok\`, \`has_output\` and \`rating\`, taken from the query record.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent). A broker failure is
+  **503** to the caller.
+- The consumer (group \`eval\`, manual commits) computes \`table_overlap\`
+  (\`|proposed ∩ acked| / |acked|\`) and updates \`eval:{workspace}\` with \`HINCRBY\` on
+  \`queries\`, \`run_ok\`, \`has_output\`, \`overlap_milli\` (score × 1000) and \`rating_sum\`.
+- Commit the offset **after** the Redis write.`,
   sequence: {
     participants: ['querygen', 'query.feedback', 'Eval consumer', 'Redis'],
     messages: [
@@ -57,9 +49,9 @@ commit-before-write is the crash that quietly makes the dashboard lie.`,
     ],
   },
   hints: [
-    'The event is assembled from the stored query record — workspace, `tables_proposed`, `tables_acked`, `run_ok`, `has_output` — plus the rating from the body. The message key is the user (`key=user`, `Key: []byte(user)`, `ProducerRecord(topic, user, …)`), not the query id.',
-    'Idempotence is producer configuration: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or kafka-go’s `RequireAll` with a hash balancer. Catch the produce failure and answer 503 instead of returning `accepted`.',
-    'Overlap is a set intersection over lower-cased names divided by the ACKed count; multiply by 1000 and truncate so `HINCRBY` can add it. Turn auto-commit off, do the five `HINCRBY`s on `eval:{workspace}`, and commit the message only after they succeed.',
+    'Symptoms: the dashboard cannot say whether the intent or the tables were wrong, a workspace shows two successes for one retried query, and a consumer crash leaves a rating missing for good.',
+    'The event is built from the body alone and keyed by `query_id`; the producer has no idempotence or `acks` setting and a broker error still returns `accepted`; `consume` commits before the `HINCRBY`.',
+    'Build the event from the record (`workspace`, `tables_proposed`, `tables_acked`, `run_ok`, `has_output`), `key=user`, `enable.idempotence` + `acks=all`, 503 on produce failure; consumer: auto-commit off, `HINCRBY` on `eval:{workspace}` including `overlap_milli`, then commit.',
   ],
   checks: [
     {
@@ -152,8 +144,7 @@ class FeedbackRequest(BaseModel):
 
 @app.post("/v1/queries/{query_id}/feedback")
 def feedback(query_id: str, body: FeedbackRequest, user: str = Header(alias="X-User-Id")) -> dict:
-    # TODO: carry the evaluation signals from the query record, key by user instead of the query
-    # id, configure the idempotent producer with acks=all, and answer 503 when the broker fails.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     record = store.get_query(query_id)
     if record is None:
         raise HTTPException(status_code=404, detail="unknown query")
@@ -164,7 +155,6 @@ def feedback(query_id: str, body: FeedbackRequest, user: str = Header(alias="X-U
 
 
 def consume() -> None:
-    # TODO: compute the table overlap per workspace and commit only after the Redis write.
     consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "eval"})
     consumer.subscribe([TOPIC])
     while True:
@@ -258,7 +248,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** query.feedback: flawed code that ships a rating keyed by query id and commits early. */
+      starter: `/** query.feedback: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {Kafka} from 'kafkajs';
@@ -278,8 +268,7 @@ interface FeedbackBody {
 }
 
 app.post('/v1/queries/:id/feedback', async (request, reply) => {
-  // TODO: carry the evaluation signals from the query record, key by user instead of the query
-  // id, configure the idempotent producer with acks=all, and answer 503 when the broker fails.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const user = request.headers['x-user-id'] as string;
   const {id} = request.params as {id: string};
   const body = request.body as FeedbackBody;
@@ -291,7 +280,6 @@ app.post('/v1/queries/:id/feedback', async (request, reply) => {
 });
 
 export async function consume(): Promise<void> {
-  // TODO: compute the table overlap per workspace and commit only after the Redis write.
   const consumer = kafka.consumer({groupId: 'eval'});
   await consumer.connect();
   await consumer.subscribe({topic: TOPIC});
@@ -422,8 +410,7 @@ type FeedbackRequest struct {
 }
 
 func feedback(rw http.ResponseWriter, r *http.Request) {
-	// TODO: carry the evaluation signals from the query record, key by user instead of the query
-	// id, configure acks=all / idempotence, and answer 503 when the broker fails.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	user := r.Header.Get("X-User-Id")
 	id := r.PathValue("id")
 	body := FeedbackRequest{}
@@ -440,7 +427,6 @@ func feedback(rw http.ResponseWriter, r *http.Request) {
 }
 
 func consume(ctx context.Context) {
-	// TODO: compute the table overlap per workspace and commit only after the Redis write.
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{"kafka:9092"},
 		Topic:   "query.feedback",
@@ -604,14 +590,12 @@ object FeedbackApi {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: carry the evaluation signals from the query record, key by user instead of the query
-  // id, configure the idempotent producer with acks=all, and fail the caller when the broker does.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publish(user: String, queryId: String, rating: Int): Unit = {
     val payload = JsObject("query_id" -> JsString(queryId), "user" -> JsString(user), "rating" -> JsNumber(rating)).compactPrint
     producer.send(new ProducerRecord("query.feedback", queryId, payload))
   }
 
-  // TODO: compute the table overlap per workspace and commit only after the Redis write.
   def consume(): Unit = {
     val consumer = new KafkaConsumer[String, String](new Properties())
     consumer.subscribe(java.util.List.of("query.feedback"))
@@ -729,8 +713,7 @@ const std::string kFeedbackTopic = "query.feedback";
 std::unique_ptr<RdKafka::Producer> producer;
 std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
 
-// TODO: carry the evaluation signals from the query record, key by user instead of the query id,
-// configure the idempotent producer with acks=all, and fail the caller when the broker does.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void publish(const std::string& user, const std::string& queryId, int rating) {
   const json event = {{"query_id", queryId}, {"user", user}, {"rating", rating}};
   const auto payload = event.dump();
@@ -747,7 +730,6 @@ void publish(const std::string& user, const std::string& queryId, int rating) {
   producer->flush(2000);
 }
 
-// TODO: compute the table overlap per workspace and commit only after the Redis write.
 void consume() {
   std::string err;
   std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
@@ -876,5 +858,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you understand what the evaluation is *for*. QueryGPT's evaluation captures five signals per question — intent, table overlap, successful run, run-has-output, and a judged similarity — because each one isolates a different component: the intent agent, the table agent, the generator, and the generator's taste in filter values. An event that carries only a rating collapses all of them into one number nobody can act on; an event with the tables proposed and ACKed lets the consumer compute the overlap score per workspace, which is the number that tells you which workspace's curation needs work. The Kafka half is the usual three contracts a Kafka snippet gets wrong: the key is an ordering contract (user, not query), the producer needs idempotence and acks=all so a retry cannot double-count a success, and the consumer writes before it commits or a crash loses the update. Real pipelines add the LLM-judged similarity against a golden query for the questions that have one, the vanilla/decoupled split so the generator can be scored with the true tables instead of the inferred ones, and a dead-letter topic for events that fail to parse.`,
+  debrief: `The event's shape follows what the evaluation is for. QueryGPT records five signals per question (intent, table overlap, successful run, run-has-output, judged similarity) because each one isolates a component: the intent agent, the table agent, the generator, and the generator's taste in filter values. A rating alone collapses them into one number nobody can act on; tables proposed and ACKed let the consumer compute overlap per workspace, the number that says which curation needs work. The Kafka half is three contracts: the key is an ordering contract (user, not query), the producer needs idempotence and acks=all so a retry cannot double-count a success, and the consumer writes before it commits. Production pipelines add the LLM-judged similarity against golden SQL, the vanilla/decoupled split that scores the generator with the true tables, and a dead-letter topic for unparseable events.`,
 };

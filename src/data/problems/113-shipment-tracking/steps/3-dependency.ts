@@ -8,35 +8,26 @@ export const dependencyStep: Step = {
   focus: ['api', 'carrier', 'scheduler'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the carrier answers, the
-status flows and the shipment moves. It has no deadline, it retries inside the request, and it
-treats a failed poll as "still in transit", so a carrier that has been unreachable for a day looks
-identical to a parcel sitting at a depot. Debug it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/shipments/{shipment_id}/poll\`. It calls the
+carrier gateway's \`PollStatus\` up to five times in a loop inside the request, with no deadline on
+any attempt; on success it calls \`mark_poll_ok\` and returns the status, and when all five fail it
+writes the previous status (or \`in_transit\`) with the current timestamp and answers
+\`poll: failed\`. It serves the demo and hides five flaws.
 
-Implement \`poll_carrier(shipment_id)\`, the only path that talks to the carrier gateway:
+**Failure mode the checks target.** A carrier unreachable for a day looks identical to a parcel
+sitting at a depot: nothing goes stale, nothing is listed, and the tracking page keeps promising a
+delivery nobody has scanned. One hung call pins a worker and the loop adds load to a carrier that
+cannot answer.
 
-- Every attempt carries a **4-second deadline** (\`DEADLINE_S = 4\`): one hung carrier call must not
-  pin a worker for the rest of the hour.
-- **A failed poll never writes a status.** The shipment keeps the status the state store last
-  accepted; the poll path only records the failure. Inventing \`in_transit\` on a failure is what
-  makes a stalled feed look healthy.
-- A failure calls \`mark_poll_failed(shipment_id, at, error)\` (which increments the consecutive
-  failure count and keeps the last error) and **hands the next attempt to the scheduler**:
-  \`schedule_retry(shipment_id, attempt, backoff_s)\` with an increasing backoff. The request returns
-  immediately — a retry loop inside the request is how one slow carrier becomes a hot loop.
-- A successful poll calls \`mark_poll_ok(shipment_id, now)\`; the returned status is handed to the
-  state store (step 2's monotonic apply), never written here.
-- A shipment whose last successful poll is older than \`STALE_AFTER_S = 900\` is **stale**.
-  \`poll_health(shipment_id, now)\` reports \`{"stale", "last_ok_at", "failures"}\`, and
-  \`stale_shipments(now)\` lists the stale ids so the operations view can surface the shipments whose
-  carrier feed has gone quiet.
-
-**Failure mode the checks target.** Three ways a stuck shipment hides. Without the deadline, one
-unresponsive carrier holds the request open until the client gives up. Treating a failure as "still
-in transit" with the previous timestamp is worse: nothing is stale, nothing is listed, and the
-tracking page keeps promising a delivery for a parcel nobody has scanned. And retrying the carrier
-in a tight loop inside the request turns a carrier outage into self-inflicted load exactly when the
-carrier is least able to answer.`,
+- Every attempt carries a 4-second deadline, \`DEADLINE_S = 4\`, passed as \`timeout=DEADLINE_S\`.
+- A failed poll writes no status. It calls \`mark_poll_failed(shipment_id, at, error)\` (consecutive
+  failure count plus last error), hands the next attempt to the scheduler through
+  \`schedule_retry(shipment_id, attempt, backoff_s)\` with a growing backoff, and returns.
+- A successful poll calls \`mark_poll_ok(shipment_id, now)\`; the status goes to the state store's
+  monotonic apply, not to a write here.
+- A shipment whose \`last_ok_at\` is older than \`STALE_AFTER_S = 900\` is stale.
+  \`poll_health(shipment_id, now)\` reports \`{"stale", "last_ok_at", "failures"}\` and
+  \`stale_shipments(now)\` lists the stale ids for the operations view.`,
   sequence: {
     participants: ['Poll scheduler', 'Shipment API', 'Carrier gateway'],
     messages: [
@@ -50,9 +41,9 @@ carrier is least able to answer.`,
     ],
   },
   hints: [
-    'The deadline belongs on the call, not around the loop: `timeout=`, the third argument with `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. Without one, a carrier that accepts the connection and never answers holds the worker as long as the client waits — and the worker is holding a request.',
-    "A failed poll is a fact about the poll, not about the parcel. Record it (`mark_poll_failed` increments the consecutive count and keeps the error), leave the shipment's status exactly as the state store has it, and let the reply say the status is unchanged. A caller that receives `in_transit` cannot tell a scan from an outage.",
-    'Staleness is a derived fact: `last_ok_at` plus `STALE_AFTER_S` answers it, so `poll_health()` and `stale_shipments()` can be computed without another write. And the retry belongs to the scheduler: `schedule_retry(shipment_id, attempt, backoff_s)` with a growing backoff returns the request now and lets the tick pick the shipment up when the carrier is more likely to answer.',
+    'A carrier gateway has been down since morning, yet every shipment on it still shows in transit with a fresh timestamp, and request latency on the poll route climbs to minutes.',
+    'The loop retries the carrier inside the request with no deadline, and the fallback branch writes the old status with a new timestamp, erasing the only evidence that the poll failed.',
+    'Add `DEADLINE_S = 4` as `timeout=`, replace the loop with `mark_poll_failed` plus `schedule_retry(shipment_id, attempt, backoff_s)`, and derive `poll_health` and `stale_shipments` from `last_ok_at` against `STALE_AFTER_S`.',
   ],
   checks: [
     {
@@ -156,10 +147,7 @@ polls = PollStore()
 
 @app.post("/v1/shipments/{shipment_id}/poll")
 def poll(shipment_id: str) -> dict:
-    # TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
-    # treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
-    # healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
-    # a status, and move the next attempt to the scheduler with a backoff.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     current = polls.current_status(shipment_id)
     for attempt in range(5):
         try:
@@ -256,7 +244,7 @@ def poll_carrier(shipment_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Carrier polls: flawed code with no deadline and a tight retry loop. */
+      starter: `/** Carrier polls: ask the carrier gateway for a shipment's latest status. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -306,10 +294,7 @@ function pollOnce(client: CarrierClient, shipmentId: string): Promise<PollReply>
 }
 
 export async function pollCarrier(shipmentId: string): Promise<{status: string}> {
-  // TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
-  // treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
-  // healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
-  // a status, and move the next attempt to the scheduler with a backoff.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const current = await polls.currentStatus(shipmentId);
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
@@ -455,10 +440,7 @@ func (s *pollStore) MarkPollOk(ctx context.Context, shipmentID string, at int64)
 var polls = &pollStore{}
 
 func pollCarrier(ctx context.Context, carrier pb.CarrierClient, shipmentID string) (string, error) {
-	// TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
-	// treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
-	// healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
-	// a status, and move the next attempt to the scheduler with a backoff.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	current, _ := polls.CurrentStatus(ctx, shipmentID)
 	for attempt := 0; attempt < 5; attempt++ {
 		reply, err := carrier.PollStatus(ctx, &pb.PollRequest{ShipmentId: shipmentID})
@@ -579,10 +561,7 @@ object PollCarrier {
 
   def markPollOk(shipmentId: String, at: Long): Unit = ()
 
-  // TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
-  // treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
-  // healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
-  // a status, and move the next attempt to the scheduler with a backoff.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def pollCarrier(shipmentId: String): String = {
     val current = currentStatus(shipmentId)
     var attempt = 0
@@ -673,10 +652,7 @@ struct PollStore {
 
 PollStore polls;
 
-// TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
-// treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
-// healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing a
-// status, and move the next attempt to the scheduler with a backoff.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::string pollCarrier(Carrier::Stub* carrier, const std::string& shipmentId) {
   const auto current = polls.currentStatus(shipmentId);
   for (int attempt = 0; attempt < 5; ++attempt) {
@@ -766,5 +742,5 @@ std::string pollCarrier(Carrier::Stub* carrier, const std::string& shipmentId) {
 `,
     },
   },
-  debrief: `The interviewer is probing one question under many names: what does this code do when the carrier stops answering? A deadline bounds one attempt, a recorded failure keeps the failure visible, staleness turns "no successful poll for fifteen minutes" into something operations can query, and the scheduler keeps the retry off the request path so a carrier outage cannot be amplified by the callers waiting on it. The subtle defect is the invented status: mapping a failure to the previous status with the previous timestamp destroys the only evidence that anything is wrong, and the shipment then looks healthy for exactly as long as the outage lasts. Real pollers add jittered backoff, per-carrier concurrency limits, and a reconciliation job that compares the carrier's own scan history with what the state store recorded.`,
+  debrief: `Every piece of the fix answers the same question: what happens when the carrier stops answering? The deadline bounds one attempt, the recorded failure keeps the outage visible, staleness turns "no successful poll for fifteen minutes" into something operations can query, and the scheduler keeps the retry off the request path so waiting callers cannot amplify a carrier outage. The invented status is the flaw that hides the others: writing the previous status with a fresh timestamp destroys the evidence that anything went wrong, so the shipment looks healthy for exactly as long as the outage lasts. Production pollers also jitter the backoff so stale shipments do not retry in lockstep, and cap in-flight polls per carrier so one slow partner cannot starve the rest.`,
 };

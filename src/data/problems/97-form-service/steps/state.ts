@@ -8,32 +8,26 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: the happy path — a captcha token the client just
-received, one submission from one address — always works. The limiter and the captcha hide three
-races and a leak. Find them, fix them, and prove the fix.
+**Starting point.** The starter runs every submission through \`consume_captcha\`, which reads the
+token with \`GET\` and then deletes it, and through a limiter that increments one counter keyed on
+the submitter IP before the storage write. It compiles, it serves the demo, and it hides 5 flaws.
 
-Implement the abuse controls every public form submission runs through:
+**Failure mode the checks target.** Two parallel replays of one captcha token both pass; a botnet
+sweeps one form from many addresses while a shared office address is blocked; and the first busy
+minute locks a key forever.
 
-- A captcha token is **consumed exactly once**. The client presents \`captcha\`, the service removes
-  the token from Redis and allows the submission only if the token was still there. Consuming it
-  must be **one atomic compare-and-delete** (\`GETDEL\`, or \`GET\` then \`DEL\` inside one \`EVAL\`):
-  a client-side \`GET\` followed by a separate \`DEL\` leaves a window where two parallel replays both
-  observe the same token and both pass.
-- A submission is limited on **two dimensions**: the form and the submitter IP. Both are reserved by
-  one atomic script and the request is allowed only when **both** have room. A key that names only
-  the IP lets a botnet sweep one form from many addresses while a single office IP is throttled; a
-  key that names only the form lets one address exhaust the form for everyone.
+Requirements:
+
+- A captcha token is **consumed exactly once**: the client presents \`captcha\`, the service removes
+  the token and allows the submission only if it was still there, in **one atomic compare-and-delete**
+  (\`GETDEL\`, or \`GET\` then \`DEL\` inside one \`EVAL\`).
+- A submission is limited on **two dimensions**, the form and the submitter IP, reserved by one
+  atomic script; the request is allowed only when **both** have room.
 - The keys carry the **window bucket** (\`floor(unix_seconds / 60)\`), so each key expires with its
-  window instead of counting forever. Keys are \`limit:form:{form_id}:{window}\` and
-  \`limit:ip:{ip}:{window}\`.
+  window: \`limit:form:{form_id}:{window}\` and \`limit:ip:{ip}:{window}\`.
 - When either dimension is exhausted answer **429** with \`Retry-After\` and
   \`X-RateLimit-Remaining\`; when the captcha token is missing or already used answer **409** naming
-  the replay. Neither answer may reach the storage write.
-
-**Failure mode the checks target.** The starter's \`GET\`/\`DEL\` pair lets two concurrent replays both
-consume one token; its IP-only key lets a distributed sweep pass while one shared address is blocked
-and gives no per-form ceiling; and without a window bucket the first busy minute locks the key
-forever.`,
+  the replay. Neither answer may reach the storage write.`,
   sequence: {
     participants: ['Client', 'Form API', 'Redis'],
     messages: [
@@ -56,9 +50,9 @@ forever.`,
     ],
   },
   hints: [
-    'A compare-and-delete must be one server-side operation. `GETDEL` removes and returns the value in a single command; if the key is gone the answer is nil and the replay loses. Doing `GET` and then `DEL` from the client means both replays read the same token before either deletes it.',
-    'The limit is not one counter — it is the intersection of a form counter and an IP counter. The Lua script reads both, rejects when either is full, and increments both with `EXPIRE` on first write so each key dies with its window. Name the keys `limit:form:…` and `limit:ip:…` so neither dimension can be skipped.',
-    'Put the window bucket in the key: `floor(unix_seconds / 60)`. A key without the bucket counts forever, so one busy minute blocks the form permanently. Return the remaining budget from the script so the 429 headers report real numbers.',
+    'Submit the same captcha token from two tabs at once: both submissions land. Then watch one form stay at 429 an hour after the burst ended, while a second form from the same address is open.',
+    'The `GET` and the `DEL` are separate round trips, so both replays read the token before either deletes it; the counter key names only the IP and has no window, so it is shared across forms and counts forever.',
+    'Run `CONSUME_LUA` through `r.eval` for the token; have one script reserve `limit:form:{id}:{window}` and `limit:ip:{ip}:{window}` with `EXPIRE` on first write, and build the 429 headers from its return value.',
   ],
   checks: [
     {
@@ -78,7 +72,7 @@ forever.`,
       id: 'captcha-replay',
       title: 'Refuses a replayed captcha token',
       detail:
-        'A token that is already gone is refused with a distinct answer naming the replay (**409**), never allowed through to storage.',
+        'A token that is already gone is refused with a distinct answer naming the replay (**409**) and is not allowed through to storage.',
       match: {
         python: {all: [/already used/]},
         typescript: {all: [/already used/]},
@@ -117,7 +111,7 @@ forever.`,
       id: 'limit-headers',
       title: 'Answers 429 with Retry-After and remaining budget',
       detail:
-        'An exhausted dimension gets `429 Too Many Requests` with `Retry-After` and `X-RateLimit-Remaining` built from the script’s return value, and the storage write never runs.',
+        'An exhausted dimension gets `429 Too Many Requests` with `Retry-After` and `X-RateLimit-Remaining` built from the script’s return value, and the storage write does not run.',
       match: {
         python: {all: [/Retry-After/, /X-RateLimit-Remaining/, /status_code\s*=\s*429/]},
         typescript: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\.code\(\s*429\s*\)/]},
@@ -143,9 +137,7 @@ submissions = {}
 
 
 def consume_captcha(token: str) -> bool:
-    # TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
-    # parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
-    # one office IP stays blocked), and omits the window bucket so the counter never resets.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     value = r.get(f"captcha:{token}")
     if value is None:
         return False
@@ -254,9 +246,7 @@ const LIMIT_PER_WINDOW = 5;
 const submissions: Record<string, unknown> = {};
 
 async function consumeCaptcha(token: string): Promise<boolean> {
-  // TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
-  // parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
-  // one office IP stays blocked), and omits the window bucket so the counter never resets.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const value = await r.get('captcha:' + token);
   if (value === null) return false;
   await r.del('captcha:' + token);
@@ -359,9 +349,7 @@ const limitPerWindow = 5
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func consumeCaptcha(ctx context.Context, token string) bool {
-	// TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
-	// parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
-	// one office IP stays blocked), and omits the window bucket so the counter never resets.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	value, err := rdb.Get(ctx, "captcha:"+token).Result()
 	if err != nil {
 		return false
@@ -483,9 +471,7 @@ object State {
   val jedis = new Jedis("redis", 6379)
 
   def consumeCaptcha(token: String): Boolean = {
-    // TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
-    // parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
-    // one office IP stays blocked), and omits the window bucket so the counter never resets.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val value = jedis.get("captcha:" + token)
     if (value == null) false
     else {
@@ -599,9 +585,7 @@ void RegisterRoutes(httplib::Server& svr, Redis& redis) {
   const int limitPerWindow = 5;
 
   auto consumeCaptcha = [&](const std::string& token) {
-    // TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
-    // parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
-    // one office IP stays blocked), and omits the window bucket so the counter never resets.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     auto value = redis.get("captcha:" + token);
     if (!value) return false;
     redis.del("captcha:" + token);
@@ -704,5 +688,5 @@ void RegisterRoutes(httplib::Server& svr, Redis& redis) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand that abuse controls are concurrency problems, not counters. A captcha token is a one-shot value, so reading and deleting it must be one server-side operation — \`GETDEL\`, or \`GET\` and \`DEL\` inside a Lua script — because a client-side pair leaves the read and the delete in different round trips. The limit has two dimensions for a reason: an IP-only key is defeated by a botnet with many addresses, and a form-only key lets one address exhaust a form for everyone, so the script reads both and increments both in one pass. Keys carry the window bucket so the budget resets instead of locking forever. Real systems add a sliding-window or token-bucket script when a fixed minute bucket is too coarse, a captcha issuer that signs tokens so a token cannot be minted offline, and \`Retry-After\` reporting the actual TTL left in the window.`,
+  debrief: `Abuse controls are concurrency problems, not counters. A captcha token is a one-shot value, so reading and deleting it has to be one server-side operation, \`GETDEL\` or a Lua script, because a client-side pair leaves the read and the delete in different round trips. The limit has two dimensions because each one alone has a cheap bypass: an IP-only key falls to a botnet with many addresses, and a form-only key lets one address exhaust a form for everyone, so the script reads both and increments both in one pass. The window bucket in the key is what makes the budget reset. What this step did not do: a sliding-window or token-bucket script where a fixed minute is too coarse, a captcha issuer that signs tokens so one cannot be minted offline, and a \`Retry-After\` that reports the TTL actually left on the key.`,
 };

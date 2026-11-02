@@ -19,29 +19,31 @@ message ConfirmRequest { string reservation_id = 1; string sku = 2; int64 quanti
 message ConfirmReply   { string status = 1; }  // CONFIRMED, or REJECTED for FAILED_PRECONDITION (out of stock)
 \`\`\`
 
-Implement \`confirm(store, redis, reservation_id, sku, quantity)\` on top of the generated stub. The
-warehouse treats \`reservation_id\` as the **idempotency id**: a retry carrying the same id is the
-same confirmation, a retry that mints a fresh id is a second reservation for the same units.
+**Starting point.** The starter implements \`confirm(store, redis, reservation_id, sku, quantity)\`
+on top of the generated stub: it calls \`ConfirmReservation\`, records \`confirmed\` on success, and
+releases the hold on anything else, retrying once. It compiles, serves the demo and hides four flaws.
+
+**Failure mode the checks target.** The starter reads a deadline as a rejection: it releases the hold
+when the warehouse is merely slow, so a valid sale is cancelled and the units go to the next buyer;
+it retries with a fresh \`uuid()\`, so the warehouse books a second reservation for units it already
+holds; and its rejection path releases without reading the reservation status, so a replayed
+confirmation gives the units back twice. A demo where the warehouse answers in milliseconds enters
+none of those paths.
+
+The warehouse treats \`reservation_id\` as the **idempotency id**: a retry carrying the same id is
+the same confirmation, a retry that mints a fresh id is a second reservation for the same units.
 
 - Every attempt carries a **2 second** deadline (\`CONFIRM_DEADLINE_MS = 2000\`) as the call's own
   deadline, and at most \`MAX_CONFIRM_ATTEMPTS = 2\` attempts are made.
-- \`CONFIRMED\` → record the reservation as \`confirmed\` and keep the hold.
-- Terminal rejection (\`FAILED_PRECONDITION\`, out of stock) → **release the Redis hold exactly
-  once**: only while the reservation still reads \`reserved\`, then record it \`released\`. A replayed
-  confirmation must be a no-op, not a second release.
-- \`DEADLINE_EXCEEDED\` or \`UNAVAILABLE\` → the answer never came. Record the reservation as
+- \`CONFIRMED\`: record the reservation as \`confirmed\` and keep the hold.
+- Terminal rejection (\`FAILED_PRECONDITION\`, out of stock): **release the Redis hold exactly
+  once**, only while the reservation still reads \`reserved\`, then record it \`released\`. A replayed
+  confirmation must be a no-op.
+- \`DEADLINE_EXCEEDED\` or \`UNAVAILABLE\`: the answer did not come. Record the reservation as
   \`pending\`, **keep the hold**, and retry once with the **same** \`reservation_id\`; only after the
-  retry also fails is the outcome \`PENDING\`. Releasing here would destroy a sale the warehouse may
-  still confirm.
+  retry also fails is the outcome \`PENDING\`.
 - Return the outcome (\`CONFIRMED\` / \`REJECTED\` / \`PENDING\`) so the caller can tell a pending retry
-  from a terminal rejection.
-
-**Failure mode the checks target.** The starter reads a deadline as a rejection: it releases the hold
-when the warehouse is merely slow, so a valid sale is cancelled and the units go to the next buyer,
-and it retries with a fresh \`uuid()\`, so the warehouse books a second reservation for units it
-already holds. Its rejection path releases without looking at the reservation status, so a replayed
-confirmation gives the units back a second time. A demo where the warehouse answers in milliseconds
-never enters any of those paths.`,
+  from a terminal rejection.`,
   sequence: {
     participants: ['Inventory API', 'Warehouse', 'Redis'],
     messages: [
@@ -65,16 +67,16 @@ never enters any of those paths.`,
     ],
   },
   hints: [
-    'The deadline belongs to the call, not around it: `timeout=CONFIRM_DEADLINE_MS / 1000`, `{deadline: Date.now() + CONFIRM_DEADLINE_MS}`, `context.WithTimeout(ctx, confirmDeadlineMs*time.Millisecond)`, `withDeadlineAfter(ConfirmDeadlineMs, TimeUnit.MILLISECONDS)`, `ctx.set_deadline(now + milliseconds(kConfirmDeadlineMs))`. When it fires you know only that you did not hear back — that is `PENDING`, not a rejection.',
-    'The retry is the *same* call: rebuild the request from the caller’s `reservation_id` on every attempt (the warehouse dedupes on it) and never mint a fresh id, or the retry reserves twice. Bound the loop with `MAX_CONFIRM_ATTEMPTS = 2` and treat only `DEADLINE_EXCEEDED` / `UNAVAILABLE` as retryable.',
-    'Release is a guarded transition, not an action: `if reservation.status == "reserved"` → release the hold, then record `released`. The second confirmation of that reservation then sees `released` and returns without touching Redis.',
+    'Symptom: on a slow warehouse afternoon, confirmed orders show up cancelled, the warehouse ledger holds two reservations per order, and some skus gain units back twice.',
+    'Mechanism: the starter treats `DEADLINE_EXCEEDED` like a rejection and releases, mints a new `uuid()` for the retry, and releases without checking whether the reservation is still `reserved`.',
+    'Change: on a deadline record `pending`, keep the hold, retry with the caller’s `reservation_id` up to `MAX_CONFIRM_ATTEMPTS`; release only `if reservation.status == "reserved"`, then record `released`.',
   ],
   checks: [
     {
       id: 'grpc-client',
       title: 'Calls ConfirmReservation under a 2 s deadline',
       detail:
-        'The stub is the generated `ConfirmReservation` client and every attempt carries a deadline built from **`CONFIRM_DEADLINE_MS = 2000`** — `timeout=CONFIRM_DEADLINE_MS / 1000`, `{deadline: Date.now() + CONFIRM_DEADLINE_MS}`, `context.WithTimeout(ctx, confirmDeadlineMs*time.Millisecond)`, `withDeadlineAfter(ConfirmDeadlineMs, TimeUnit.MILLISECONDS)`, or `set_deadline(… kConfirmDeadlineMs)`. Without a deadline one stuck warehouse pins the caller.',
+        'The stub is the generated `ConfirmReservation` client and every attempt carries a deadline built from **`CONFIRM_DEADLINE_MS = 2000`**: `timeout=CONFIRM_DEADLINE_MS / 1000`, `{deadline: Date.now() + CONFIRM_DEADLINE_MS}`, `context.WithTimeout(ctx, confirmDeadlineMs*time.Millisecond)`, `withDeadlineAfter(ConfirmDeadlineMs, TimeUnit.MILLISECONDS)`, or `set_deadline(… kConfirmDeadlineMs)`.',
       match: {
         python: {
           all: [/CONFIRM_DEADLINE_MS\s*=\s*2000/, /ConfirmReservation\(/, /timeout=CONFIRM_DEADLINE_MS\s*\/\s*1000/],
@@ -107,9 +109,9 @@ never enters any of those paths.`,
     },
     {
       id: 'timeout-pending',
-      title: 'A timeout leaves the reservation pending — never releases the hold',
+      title: 'A timeout leaves the reservation pending and keeps the hold',
       detail:
-        '`DEADLINE_EXCEEDED` / `UNAVAILABLE` records the reservation as `pending` and returns **`PENDING`**, with the hold left alone: the confirmation may still arrive. The starter calls `release` from the timeout branch, so a slow warehouse silently loses a valid sale.',
+        '`DEADLINE_EXCEEDED` / `UNAVAILABLE` records the reservation as `pending` and returns **`PENDING`**, with no `release` call in that branch: the confirmation may still arrive.',
       match: {
         python: {
           all: [/StatusCode\.DEADLINE_EXCEEDED/, /return PENDING/, /['"]pending['"]/],
@@ -142,7 +144,7 @@ never enters any of those paths.`,
       id: 'retry-same-id',
       title: 'Retries once with the same reservation id',
       detail:
-        'At most **`MAX_CONFIRM_ATTEMPTS = 2`** attempts, and every attempt puts the caller’s `reservation_id` into the request — the retry never mints a fresh id (`uuid`, `randomUUID`, `uuid.NewString`, `UUID.randomUUID`), because the warehouse dedupes on that id. The starter retries once with a new id and double-reserves.',
+        'At most **`MAX_CONFIRM_ATTEMPTS = 2`** attempts, and every attempt puts the caller’s `reservation_id` into the request; no fresh id (`uuid`, `randomUUID`, `uuid.NewString`, `UUID.randomUUID`) is minted, because the warehouse dedupes on that id.',
       match: {
         python: {
           all: [/MAX_CONFIRM_ATTEMPTS\s*=\s*2/, /range\(MAX_CONFIRM_ATTEMPTS\)/, /reservation_id\s*=\s*reservation_id/],
@@ -183,7 +185,7 @@ never enters any of those paths.`,
       id: 'release-once',
       title: 'Releases the hold exactly once, guarded by the reservation status',
       detail:
-        'The rejection path releases only while the reservation is still `reserved` — `if reservation.status == "reserved"` → release the hold → record `released` — so a replayed confirmation is a no-op instead of a second release. The starter releases unconditionally, from both the rejection and the timeout branch.',
+        'The rejection path releases only while the reservation is still `reserved` (`if reservation.status == "reserved"`, release the hold, record `released`), so a replayed confirmation is a no-op instead of a second release.',
       match: {
         python: {
           all: [/REJECTED/, /release_hold\(redis,/, /['"]reserved['"]/],
@@ -211,7 +213,7 @@ never enters any of those paths.`,
       id: 'status-model',
       title: 'Records and reports the reservation status',
       detail:
-        'All four states are written through the reservation record — `reserved` → `pending` on a timeout, `confirmed` on acceptance, `released` after the hold is given back — and the return reports `PENDING` / `REJECTED` / `CONFIRMED` so the caller can tell a pending retry from a terminal rejection. The starter only ever records `confirmed` or `released` and answers `REJECTED` for a timeout.',
+        'All four states are written through the reservation record (`reserved`, `pending` on a timeout, `confirmed` on acceptance, `released` after the hold is given back) and the return reports `PENDING` / `REJECTED` / `CONFIRMED` so the caller can tell a pending retry from a terminal rejection.',
       match: {
         python: {
           all: [/['"]reserved['"]/, /['"]pending['"]/, /['"]confirmed['"]/, /['"]released['"]/, /return PENDING/],
@@ -265,9 +267,7 @@ def release_hold(redis, reservation_id: str, sku: str, quantity: int) -> None:
 
 
 def confirm(store, redis, reservation_id: str, sku: str, quantity: int) -> str:
-    # TODO: a deadline is not a rejection — keep the reservation pending and the hold in place,
-    # retry once with the same reservation id, and release the hold exactly once, guarded by the
-    # reservation status.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     attempts = 0
     while attempts < 2:
         request = warehouse_pb2.ConfirmRequest(
@@ -382,9 +382,7 @@ export async function confirm(
   sku: string,
   quantity: number,
 ): Promise<string> {
-  // TODO: a deadline is not a rejection — keep the reservation pending and the hold in place,
-  // retry once with the same reservation id, and release the hold exactly once, guarded by the
-  // reservation status.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const request = {
       reservation_id: attempt === 0 ? reservationId : randomUUID(),
@@ -553,8 +551,7 @@ func releaseHold(ctx context.Context, rdb *redis.Client, reservationID, sku stri
 	return rdb.Del(ctx, "hold:"+reservationID).Err()
 }
 
-// TODO: a deadline is not a rejection — keep the reservation pending and the hold in place, retry
-// once with the same reservation id, and release the hold exactly once, guarded by the status.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 func confirm(ctx context.Context, client pb.WarehouseClient, store ReservationStore, rdb *redis.Client, reservationID, sku string, quantity int64) (string, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		id := reservationID
@@ -687,9 +684,7 @@ object WarehouseClient {
     redis.del("hold:" + reservationId)
   }
 
-  // TODO: a deadline is not a rejection — keep the reservation pending and the hold in place,
-  // retry once with the same reservation id, and release the hold exactly once, guarded by the
-  // reservation status.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   def confirm(store: ReservationStore, redis: Jedis, reservationId: String, sku: String, quantity: Int): String = {
     var attempt = 0
     while (attempt < 2) {
@@ -799,8 +794,7 @@ void releaseHold(sw::redis::Redis& redis, const std::string& reservation_id, con
 
 std::string newUuid();
 
-// TODO: a deadline is not a rejection — keep the reservation pending and the hold in place, retry
-// once with the same reservation id, and release the hold exactly once, guarded by the status.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 std::string confirm(
     Warehouse::Stub* stub,
     ReservationStore& store,
@@ -922,5 +916,5 @@ Outcome confirm(
 `,
     },
   },
-  debrief: `\`PENDING\` is the honest answer to a deadline: the client knows only that the warehouse did not answer within two seconds, and a rejection is a fact it does not have. Releasing the hold on a timeout converts "we do not know" into "sold to someone else", which is the wrong default for a sale that may still be confirmed — so the timeout path records \`pending\` and leaves the hold alone. The retry then has to be the *same* request: the reservation id is the idempotency id the warehouse dedupes on, and a retry with a fresh id turns one confirmation into two reservations, which is worse than the timeout it was meant to fix. The release itself is a guarded state transition rather than an action, so a duplicate confirmation — the client retried, the warehouse replayed — finds \`released\` and does nothing. Real services add a reconciliation sweep for reservations left pending past the hold TTL, export the pending count as a metric so a slow warehouse is visible before the units are lost, and let the warehouse push a late confirmation back over a callback instead of relying on the client's single retry.`,
+  debrief: `\`PENDING\` is the only answer a deadline supports: the client knows that the warehouse did not answer within two seconds, and a rejection is a fact it does not have. Releasing the hold on a timeout converts "we do not know" into "sold to someone else", which is the wrong default for a sale that may still be confirmed, so the timeout path records \`pending\` and leaves the hold alone. The retry then has to be the *same* request, because the reservation id is what the warehouse dedupes on; a fresh id turns one confirmation into two reservations. The release is a guarded state transition rather than an action, so a duplicate confirmation finds \`released\` and does nothing. Production services add a reconciliation sweep for reservations left pending past the hold TTL, export the pending count as a metric so a slow warehouse is visible before units are lost, and accept a late confirmation over a callback instead of relying on one client retry.`,
 };

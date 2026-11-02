@@ -8,37 +8,28 @@ export const steerAwayStep: Step = {
   focus: ['guard', 'model', 'review', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the guarded turn: it calls
-the model, runs the output guard and returns an answer. The demo shows a disclaimer under a flagged
-answer and everyone nods. It hides four production flaws, and the first is the exact behaviour the
-Fair Housing Act forbids. Debug it, fix it, and prove the fix.
+**Starting point.** The starter's \`POST /v1/turn\` takes \`{"conversation_id", "question"}\`, calls
+\`model.complete(question)\`, runs \`guard.evaluate(answer, "output")\` and returns the answer. When
+the output is blocked it returns the model's text with \`WARNING_NOTE\` appended and outcome
+\`flagged\`. It serves the demo and hides five flaws.
 
-Implement \`POST /v1/turn\` with body \`{"conversation_id": "c-8812", "question": "…"}\`, the
-endpoint an assistant calls to get a guarded answer in one round trip:
-
-- **Input guard first.** \`guard.evaluate(question, "input")\` runs **before** any model call. A
-  blocked question never reaches the model: the user gets \`FALLBACK_MESSAGE\` with outcome
-  \`blocked_input\`.
-- **Output guard.** The model's answer goes through \`guard.evaluate(answer, "output")\`.
-- **Regenerate once.** When the output is blocked, call the model again with
-  \`constraint = FHA_CONSTRAINT\` — the fair-housing instructions the Zillow post adds to the
-  prompt — and guard the new answer. \`MAX_REGENERATIONS = 1\`: a second block means the question
-  cannot be answered compliantly.
-- **Never the blocked text.** A blocked turn returns \`FALLBACK_MESSAGE\` — the post's predefined
-  message explaining that the assistant cannot help with that part of the request under fair
-  housing rules, and what it can help with — with outcome \`blocked_output\`. The model's text is
-  not returned, not with a warning, not "for transparency", not at all.
-- **Escalate repeat offenders.** Every blocked turn records a strike (\`strikes.record\`, the
-  expiring counter from the Redis step). When the count reaches \`REVIEW_AFTER_STRIKES = 3\` the
-  conversation is enqueued for human review (\`review.enqueue\`) and the response carries
-  \`escalated: true\` so the assistant can slow the conversation down.
-
-**Failure mode the checks target.** Appending a warning to a blocked answer *is* the violation: the
+**Failure mode the checks target.** Appending a warning to a blocked answer is the violation: the
 user still gets the neighborhood-by-demographic list, now with a footnote. Skipping the input guard
-sends the steering question to the model, spending tokens on an answer that must then be thrown
-away — and if the output guard misses it (recall is never 1.0), it ships. No regeneration means a
-flagged answer always ends in a refusal when a compliant one was available. And without strikes,
-the user who rephrases the same question twenty times is indistinguishable from twenty users.`,
+sends the steering question to the model and, if the output guard misses it (recall is below 1.0),
+it ships. No regeneration means a flagged answer always ends in a refusal when a compliant one was
+available. Without strikes, a user who rephrases the same question twenty times looks like twenty
+users.
+
+- Run \`guard.evaluate(question, "input")\` before any model call; a blocked question returns
+  \`FALLBACK_MESSAGE\` with outcome \`blocked_input\`.
+- Guard the model's answer with \`guard.evaluate(answer, "output")\`.
+- When the output is blocked, regenerate inside \`for _ in range(MAX_REGENERATIONS)\`
+  (\`MAX_REGENERATIONS = 1\`) with \`model.complete(question, constraint=FHA_CONSTRAINT)\` and guard
+  the new answer with \`"output"\` before returning it.
+- A still-blocked turn returns \`FALLBACK_MESSAGE\` with outcome \`blocked_output\`; delete
+  \`WARNING_NOTE\`. The model's text is not returned after a block.
+- Every blocked turn calls \`strikes.record(conversation_id)\`; at \`REVIEW_AFTER_STRIKES = 3\`
+  call \`review.enqueue\` and return \`escalated: true\`.`,
   sequence: {
     participants: ['Assistant', 'fhguard', 'Model', 'Review queue'],
     messages: [
@@ -54,9 +45,9 @@ the user who rephrases the same question twenty times is indistinguishable from 
     ],
   },
   hints: [
-    'Order the handler as the post orders the system: input guard, model, output guard. The first guard call must sit above the first model call — a blocked question returns the fallback before the model is ever touched.',
-    'Regeneration is a bounded loop: `for _ in range(MAX_REGENERATIONS)` (or `i < MAX_REGENERATIONS`), call `model.complete(question, constraint=FHA_CONSTRAINT)` and guard the result; break on the first allowed answer. The constraint is the fair-housing instruction block from the post, not a vague "be nice".',
-    'One function builds every blocked response: record the strike, compare against `REVIEW_AFTER_STRIKES`, enqueue the conversation for review when it is reached, and return `FALLBACK_MESSAGE` with the outcome and `escalated`. Delete `WARNING_NOTE` and every path that returns the model text after a block.',
+    'A user asks which neighborhoods have "fewer families with kids" and gets a full list followed by a disclaimer; asking the same thing twenty times produces twenty lists and no ticket.',
+    'The model runs before any guard, and the blocked branch builds its answer from the model text plus `WARNING_NOTE`; nothing counts blocked turns per conversation.',
+    'Move `guard.evaluate(question, "input")` above `model.complete`, return `FALLBACK_MESSAGE` with `blocked_output` and delete `WARNING_NOTE`; the regeneration loop and `strikes.record` with `REVIEW_AFTER_STRIKES` are covered by the other checks.',
   ],
   checks: [
     {
@@ -167,8 +158,7 @@ model = Model()
 
 @app.post("/v1/turn")
 def turn(body: TurnRequest) -> dict:
-    # TODO: this starter never guards the question, returns the blocked text with a warning
-    # appended, never regenerates, and keeps no strikes. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     answer = model.complete(body.question)
     outbound = guard.evaluate(answer, "output")
     if not outbound.allowed:
@@ -286,7 +276,7 @@ def turn(body: TurnRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/turn: flawed code that returns flagged answers with a warning. */
+      starter: `/** POST /v1/turn: a guarded model turn for the assistant. */
 import Fastify from 'fastify';
 
 import {guard} from './guard';
@@ -302,8 +292,7 @@ interface TurnBody {
 }
 
 app.post('/v1/turn', async (request, reply) => {
-  // TODO: this starter never guards the question, returns the blocked text with a warning
-  // appended, never regenerates, and keeps no strikes. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const body = request.body as TurnBody;
   const answer = await model.complete(body.question);
   const outbound = await guard.evaluate(answer, 'output');
@@ -433,8 +422,7 @@ func turn(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter never guards the question, returns the blocked text with a warning
-	// appended, never regenerates, and keeps no strikes. Fix all four.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	answer, err := model.Complete(r.Context(), body.Question, "")
 	if err != nil {
 		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "model failed"})
@@ -621,8 +609,7 @@ object SteerAway {
   val guard = Guard.open()
   val model = Model.open()
 
-  // TODO: this starter never guards the question, returns the blocked text with a warning appended,
-  // never regenerates, and keeps no strikes. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   val route: Route =
     path("v1" / "turn") {
       post {
@@ -763,8 +750,7 @@ int main() {
     if (!body.is_object()) body = json::object();
     const auto conversationId = body.value("conversation_id", std::string());
     const auto question = body.value("question", std::string());
-    // TODO: this starter never guards the question, returns the blocked text with a warning
-    // appended, never regenerates, and keeps no strikes. Fix all four.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const std::string answer = model.complete(question);
     const Decision outbound = guard.evaluate(answer, "output");
     res.status = 200;
@@ -888,5 +874,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand what a guardrail's "block" has to mean at the product edge. The starter's warning footnote is the classic generated compromise — it keeps the answer and adds a disclaimer — and it is precisely the behaviour the law forbids, because the user still received the steered list. Four defects are being checked: the input guard before the model (the post's pre-processing integration: a blocked question costs nothing and never risks a miss on the way out), the fallback as the only thing a blocked turn returns (the post's predefined message), one constrained regeneration before giving up (the post's prompt-instruction layer, applied when it is needed instead of refusing outright), and the strike counter that turns twenty rephrasings into a review ticket. The regeneration recheck is the one candidates skip: a constrained answer is more likely to comply, not guaranteed to. Real systems add a per-conversation cooldown after escalation, a human-readable reason code the assistant can show, and sampled logging of blocked turns (hashes and scores, never text) for the human review loop the post describes.`,
+  debrief: `A block at the product edge has to mean the user receives none of the model's text. The warning footnote keeps the steered list and adds a disclaimer, which is what the Fair Housing Act forbids, so the fix is a deletion plus one fixed message. The input guard sits above the model call because a blocked question is cheap to refuse there and the output guard's recall is below 1.0. One constrained regeneration applies the prompt-instruction layer when needed instead of refusing outright, and the result is rechecked because a constraint makes compliance likelier, not certain. The strike counter turns twenty rephrasings into one review ticket. Production assistants add a cooldown after escalation, a reason code the UI can render, and sampled logging of blocked turns as hashes.`,
 };

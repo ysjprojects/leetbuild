@@ -8,33 +8,26 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the report and
-answers that the usage was counted. It compiles, it serves the demo, and it hides three production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/usage\` with body
+\`{"request_id": "req_8f21", "account": "acct_1", "route": "/v1/generate", "units": 1200}\` and reads
+the reporting gateway from the optional \`X-Gateway-Id\` header. It validates the three strings,
+writes a ledger row and answers that the usage was counted. It compiles, serves the demo and hides
+four flaws.
 
-Implement \`POST /v1/usage\` with body
-\`{"request_id": "req_8f21", "account": "acct_1", "route": "/v1/generate", "units": 1200}\` and the
-reporting gateway in the \`X-Gateway-Id\` header.
+**Failure mode the checks target.** A gateway that retries after a timeout re-sends the same report,
+and the starter counts it again, so an hour of retries reads as twice the traffic. A \`units\` value
+of any magnitude lets one malformed report dominate the account's hour, and a row without the
+gateway cannot be joined to gateway logs when a spike needs explaining.
 
 - The account, the request id and the route are non-empty strings; a report missing any of them is
   **400**.
-- \`units\` is an integer from **0** to \`MAX_UNITS_PER_REQUEST\` (**400** otherwise). A units value
-  of any magnitude lets one malformed report — or one compromised gateway — dominate an account's
-  bill for the hour.
-- \`X-Gateway-Id\` is required: a report nobody can attribute to the gateway that sent it cannot be
-  reconciled against gateway logs, so a missing header is **400**.
+- \`units\` is an integer from **0** to \`MAX_UNITS_PER_REQUEST\` (**400** otherwise).
+- \`X-Gateway-Id\` is required; a missing header is **400** with \`missing X-Gateway-Id\`.
 - The same \`(account, request_id)\` is counted **once**, no matter how many times the gateway
-  reports it. A replay returns the stored count with **200** and increments nothing — the request id
-  is the unit of truth, not the delivery attempt.
+  reports it. A replay returns the stored count with **200** and increments nothing.
 - The stored record carries the account, the route, the units and the reporting gateway, and the
   response echoes the counted units and the gateway.
-- Log the report with the account, the gateway and the units — never the request body.
-
-**Failure mode the checks target.** A retrying gateway re-sends the same report and the starter counts
-it again, so an hour of retries reads as twice the traffic; the missing per-request cap turns one
-bad \`units\` value into an account-wide overage; and the record without a gateway leaves on-call
-unable to tell which edge produced a spike. The subtle one is the dedupe: it has to be keyed by
-\`(account, request_id)\` and answered from the stored count, not merely re-reported.`,
+- Log the report with the account, the gateway and the units, not the request body.`,
   sequence: {
     participants: ['Gateway', 'Metering API', 'Usage ledger'],
     messages: [
@@ -142,9 +135,7 @@ ledger = UsageLedger()
 
 @app.post("/v1/usage")
 def report_usage(body: UsageReport, gateway: str | None = Header(default=None, alias="X-Gateway-Id")) -> JSONResponse:
-    # TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
-    # value of any magnitude, never checks whether the request id was already counted, and does not
-    # store which gateway reported it. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     entry = {"request_id": body.request_id, "account": body.account, "route": body.route, "units": body.units}
     ledger.record(entry)
     logger.info("usage account=%s gateway=%s units=%d", body.account, gateway, body.units)
@@ -234,9 +225,7 @@ const ledger = {
 };
 
 app.post('/v1/usage', async (request, reply) => {
-  // TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
-  // value of any magnitude, never checks whether the request id was already counted, and does not
-  // store which gateway reported it. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const gateway = request.headers['x-gateway-id'] as string;
   const body = request.body as UsageReport;
   const entry: UsageEntry = {
@@ -363,9 +352,7 @@ func reportUsage(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
-	// value of any magnitude, never checks whether the request id was already counted, and does not
-	// store which gateway reported it. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	entry := UsageEntry{RequestID: body.RequestID, Account: body.Account, Route: body.Route, Units: body.Units}
 	if err := ledger.Record(r.Context(), entry); err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
@@ -508,9 +495,7 @@ object Api {
       post {
         optionalHeaderValueByName("X-Gateway-Id") { gatewayOpt =>
           entity(as[UsageReport]) { body =>
-            // TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts
-            // a units value of any magnitude, never checks whether the request id was already
-            // counted, and does not store which gateway reported it. Fix all four.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val entry = UsageEntry(body.request_id, body.account, body.route, body.units)
             ledger.record(entry)
             system.log.info(s"usage account=\${body.account} gateway=\${gatewayOpt.getOrElse("-")} units=\${body.units}")
@@ -620,9 +605,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
-    // value of any magnitude, never checks whether the request id was already counted, and does not
-    // store which gateway reported it. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const UsageEntry entry{body.value("request_id", std::string()), body.value("account", std::string()),
                            body.value("route", std::string()), body.value("units", 0)};
     ledger.record(entry);
@@ -708,17 +691,16 @@ int main() {
     },
   },
   hints: [
-    'Dedupe on the request id, not on the delivery. The gateway retries the *same* report, so the lookup key is `(account, request_id)` and a hit returns the stored count — the endpoint never increments twice for one request id.',
-    'Order the guards by cost: gateway header, then the three non-empty strings, then the units cap. Each returns before the ledger is touched, so a malformed report can never be counted at all.',
-    'The row you store is the reconciliation join: account, route, units and the reporting gateway. If the gateway is not in the row, the only way to find a spike is to guess — which is exactly what the missing `X-Gateway-Id` check leaves on-call doing.',
+    'Replay the same report twice with the demo gateway and read the account total: it doubles. Then send `units: 10000000` once and watch the hour exceed the plan on its own.',
+    'The handler validates the strings, builds the entry and records it. Nothing consults the ledger before the write, nothing bounds `units`, and the entry never includes the gateway header, which is also allowed to be absent.',
+    'Reject a missing `X-Gateway-Id` and out-of-range `units` with 400 first; then call `ledger.already_counted(account, request_id)` and return the stored count on a hit; add `gateway` to the stored entry.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The
-starter reads fine because the demo sends one well-formed report from one gateway and never retries.
-Four separate defects are being checked: the request id is the unit of truth (so a replay is answered
-from the ledger instead of counted again), the per-request units cap (so one bad report cannot
-dominate an account's hour), the reporting gateway (so every row can be joined to gateway logs), and
-the stored record itself (so the join exists at all). Real metering services add a short-lived dedupe
-key next to the durable row, a signed gateway identity instead of a plain header, and a per-route
-cap as well as a per-request one, because a single compromised edge should never be able to write an
-arbitrary number of units.`,
+  debrief: `The fix keys dedupe on \`(account, request_id)\` because the request id is the one thing a
+retry preserves; the delivery attempt is not. Answering a replay from the stored row rather than
+re-counting it makes the endpoint safe under any retry policy the gateway chooses. The guards run
+before the ledger is touched so a rejected report leaves no trace to reconcile later, and the gateway
+goes into the row because reconciliation is a join, and a join needs a key on both sides.
+Production meters usually put a short-lived dedupe key in a cache next to the durable row, so the
+hot path does not hit the ledger for every replay, and they authenticate the gateway identity with a
+signed token instead of trusting a plain header.`,
 };

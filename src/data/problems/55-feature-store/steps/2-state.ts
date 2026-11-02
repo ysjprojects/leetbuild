@@ -8,39 +8,28 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: values are written to Redis and
-read back, and the demo shows the latest number. It is wrong in two ways that only matter when it is
-used for training. Find them, fix them, and prove the fix with the checks below.
-
-Implement the online value store behind both handlers:
-
-- \`POST /v1/features/{name}/values\` with body \`{"entity": "e-1", "version": 2, "value": 12.5, "event_ts": 1712345678}\`.
-- \`GET /v1/features/{name}/values?entity=e-1&version=2&as_of=1712345678\`.
-
-Requirements:
-
-- Values live under **\`feature:{name}:{version}:{entity}\`**. Both the version and the entity are part
-  of the key. The starter's \`feature:{name}:{entity}\` key drops the version, so a version bump reads
-  the old value; and a version bump must serve the new keys **without deleting the old ones**, because
-  a backfill for a past cutoff still has to read the version that was live then.
-- The entry **expires after the definition's freshness SLO** seconds: read
-  \`definition:{name}:{version}\` from Redis and use its \`freshness_slo\`, falling back to a small
-  default when the definition is unknown. The starter hard-codes one TTL for every feature, which is
-  either far too long for a 5-minute feature or uselessly short for a daily one.
-- A read is **as-of**: it may only return a value whose \`event_ts\` is **at or before \`as_of\`**. The
-  starter reads the key and returns whatever is there, so a value computed *after* the training cutoff
-  leaks into the backfill — the offline score that looks too good and the online score that does not.
-- The response carries the stored **\`event_ts\`** and an **\`age_s\`** so a consumer can decide whether
-  the value is usable, and a missing or too-new value is **404** — never a zero-fill, because a zero
-  is indistinguishable from a real zero.
+**Starting point.** The starter writes \`POST /v1/features/{name}/values\` (body
+\`{"entity": "e-1", "version": 2, "value": 12.5, "event_ts": 1712345678}\`) into Redis under
+\`feature:{name}:{entity}\` with one fixed TTL, and \`GET /v1/features/{name}/values?entity=e-1&version=2&as_of=1712345678\`
+returns whatever is under that key. It serves the demo and hides five flaws.
 
 **Failure mode the checks target.** Point-in-time correctness: a value newer than the requested
-\`as_of\` must never be returned, no matter how convenient the latest key is to read.
+\`as_of\` must not be returned, however convenient the latest key is to read.
+
+- Values live under **\`feature:{name}:{version}:{entity}\`**. The starter's key drops the version, so
+  a bump reads the old value; a bump serves new keys **without deleting the old ones**, which a
+  backfill for a past cutoff still reads.
+- The entry **expires after the definition's freshness SLO**: read \`definition:{name}:{version}\`
+  and use its \`freshness_slo\`, with a small default when unknown. The starter hard-codes one TTL.
+- A read is **as-of**: only a value whose \`event_ts\` is **at or before \`as_of\`** may be returned.
+  The starter returns whatever is there, so a value computed after the cutoff leaks into training.
+- The response carries the stored **\`event_ts\`** and an **\`age_s\`**; a missing or too-new value is
+  **404**, not a null body.
 
 ## What to keep
 
 The key namespace, the JSON payload and the write path are fine. The fix is the versioned key, the
-SLO-derived TTL and the as-of guard on the read.`,
+SLO-derived TTL, the timestamped response and the as-of guard.`,
   sequence: {
     participants: ['Backfill job', 'Feature API', 'Redis'],
     messages: [
@@ -154,9 +143,7 @@ class Value(BaseModel):
 
 @app.post("/v1/features/{name}/values")
 def write_value(name: str, body: Value) -> dict:
-    # TODO: keep the feature version in the key, derive the TTL from the definition's freshness SLO
-    # instead of one constant, and honour as_of on the read so a value computed after the training
-    # cutoff can never be served.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"feature:{name}:{body.entity}"
     r.set(key, json.dumps({"value": body.value, "ts": body.ts}), ex=TTL_S)
     return {"entity": body.entity}
@@ -248,9 +235,7 @@ interface Value {
 app.post('/v1/features/:name/values', async (request, reply) => {
   const {name} = request.params as {name: string};
   const body = request.body as Value;
-  // TODO: keep the feature version in the key, derive the TTL from the definition's freshness SLO
-  // instead of one constant, and honour as_of on the read so a value computed after the training
-  // cutoff can never be served.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await r.set(
     \`feature:\${name}:\${body.entity}\`,
     JSON.stringify({value: body.value, ts: body.ts}),
@@ -341,9 +326,7 @@ func writeValue(rw http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: keep the feature version in the key, derive the TTL from the definition's freshness SLO
-	// instead of one constant, and honour as_of on the read so a value computed after the training
-	// cutoff can never be served.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	entity, _ := body["entity"].(string)
 	payload, _ := json.Marshal(body)
 	rdb.Set(ctx, "feature:"+name+":"+entity, payload, ttlS*time.Second)
@@ -480,9 +463,7 @@ object ValuesApi {
     path("v1" / "features" / Segment / "values") { name =>
       post {
         entity(as[String]) { payload =>
-          // TODO: keep the feature version in the key, derive the TTL from the definition's
-          // freshness SLO instead of one constant, and honour as_of on the read so a value computed
-          // after the training cutoff can never be served.
+          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
           jedis.setex(s"feature:$name:body", TtlSeconds, payload)
           complete(StatusCodes.Created, s"""{"stored":true}""")
         }
@@ -585,9 +566,7 @@ int main() {
       res.set_content(json{{"error", "invalid body"}}.dump(), "application/json");
       return;
     }
-    // TODO: keep the feature version in the key, derive the TTL from the definition's freshness SLO
-    // instead of one constant, and honour as_of on the read so a value computed after the training
-    // cutoff can never be served.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto entity = body.value("entity", std::string());
     redis.setex("feature:" + name + ":" + entity, std::chrono::seconds(kTtlSeconds), body.dump());
     res.status = 201;
@@ -680,9 +659,9 @@ int main() {
     },
   },
   hints: [
-    'The key is a scope, not a label: `feature:{name}:{version}:{entity}`. Dropping the version makes a version bump read the previous version’s value, and deleting old keys on a bump breaks every backfill that re-reads a past window — so write the new keys and leave the old ones to expire on their own SLO.',
-    'The TTL is a property of the feature, not of the service: read `definition:{name}:{version}` and use its `freshness_slo`, with a small fallback when the definition is unknown. One hard-coded TTL is either far too long for a five-minute feature or uselessly short for a daily one.',
-    'A read is a question about a moment, not about now: compare the stored `event_ts` with `as_of` and refuse anything newer. Return the timestamp and an `age_s` alongside the value so the caller can decide for itself, and answer 404 rather than fabricating a zero.',
+    'A backfill with as_of set to last Tuesday gets the value written this morning, and a version bump reads version 1\'s number. A missing entity comes back as {"value": null} with no timestamp.',
+    'The key omits the version, the write uses TTL_S for every feature, the model stores ts rather than event_ts, and the read ignores as_of entirely and returns the raw record.',
+    "Key by feature:{name}:{version}:{entity}; set ex= from the definition's freshness_slo; on read compare event_ts with as_of, answer 404 when missing or newer, else return value, event_ts and age_s.",
   ],
-  debrief: `The interview question behind this step is point-in-time correctness, which is the difference between a feature store and a cache. A cache may serve the latest value because the caller only ever asks about now; a feature store is asked about the past, so "latest" is the wrong answer whenever the request carries a cutoff. The subtle bug is that everything still looks correct: the value returned is real, it is just from the future relative to the training window, and a model trained on it scores well offline and badly in production — the classic leak. The version in the key is the other half: without it a bump silently re-points every reader at new values, and with a delete on bump a backfill cannot reproduce last week's training set at all. Real stores keep the event timestamp with the value, materialize into an offline store with the same semantics, and add a watermark so a partition that is not yet complete is never read as final.`,
+  debrief: `The fix keeps the version in the key and compares \`event_ts\` with \`as_of\` because point-in-time correctness is the difference between a feature store and a cache. A cache may serve the latest value since the caller only asks about now; a feature store is asked about the past, so "latest" is the wrong answer whenever the request carries a cutoff. The leak is subtle because everything still looks correct: the value is real, it is just from the future relative to the training window, and a model trained on it scores well offline and badly in production. Without the version in the key a bump silently re-points every reader. Production stores add a watermark per partition, so a window that is not yet complete is not read as final.`,
 };

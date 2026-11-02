@@ -8,30 +8,30 @@ export const dependencyStep: Step = {
   focus: ['api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code for the object-store client: it
-calls \`PutChunk\`, retries on failure, and marks the file complete. It compiles, it works on a healthy
-network, and it hides three production flaws. Debug it, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter is the gRPC object-store client: \`upload_chunk\` calls \`PutChunk\`
+with no deadline and no hash, restarts the whole multipart upload on any \`RpcError\`, and
+\`complete\` marks the file finished in the local index before \`CommitMultipart\` returns. It
+compiles and hides five flaws.
 
-Implement the gRPC object-store client:
+**Failure mode the checks target.** Restarting the whole multipart upload on one failed chunk turns a
+flaky connection into a multi-gigabyte re-upload; the bytes that already landed are sent again. Marking
+the file complete before the commit returns means readers and the search index see a file whose bytes
+the store never committed. And a listing that does not filter on the committed state shows interrupted
+uploads as finished ones.
+
+Requirements:
 
 - Every \`PutChunk\` runs under a **15-second deadline**, so a stuck stream cannot hold the upload open
   forever.
 - The chunk request carries the chunk's \`chunk_hash\` (SHA-256 of the bytes), so the store can dedupe a
-  chunk that has already been written — including one written by another upload.
+  chunk that has already been written, including one written by another upload.
 - A failed chunk is retried **in place**: only that chunk is re-sent, up to three attempts, and only on
-  \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. Anything else surfaces immediately. The retry must never
+  \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. Anything else surfaces immediately. The retry must not
   restart the multipart upload or re-send the chunks that already succeeded.
 - \`complete\` waits for the store's \`CommitMultipart\` response and only then marks the file complete in
   the local index; a commit the store did not confirm leaves the file incomplete.
 - Listings only contain files whose state is \`committed\`, so an upload interrupted between its chunks
-  and its commit never appears to a reader as a finished file.
-
-**Failure mode the checks target.** Restarting the whole multipart upload on one failed chunk turns a
-flaky connection into a multi-gigabyte re-upload — the bytes that already landed are sent again. Marking
-the file complete before the commit returns means readers and the search index see a file whose bytes
-the store never committed. And a listing that does not filter on the committed state shows interrupted
-uploads as finished ones.`,
+  and its commit is not shown to a reader as a finished file.`,
   sequence: {
     participants: ['Upload API', 'Object store'],
     messages: [
@@ -131,8 +131,7 @@ class ObjectStoreClient:
         return self.stub.PutChunk(PutChunkRequest(multipart_id=multipart_id, index=index, data=data))
 
     def upload_chunk(self, multipart_id, tenant, index, data):
-        # TODO: this starter retries by restarting the whole multipart upload and marks the file
-        # finished before the store confirms the commit.
+        # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         try:
             return self._put_chunk(multipart_id, index, data)
         except grpc.RpcError:
@@ -233,8 +232,7 @@ export class ObjectStoreClient {
   }
 
   async uploadChunk(multipartId: string, tenant: string, index: number, data: Buffer): Promise<PutChunkResponse> {
-    // TODO: this starter retries by restarting the whole multipart upload and marks the file
-    // finished before the store confirms the commit.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     try {
       return await this.putChunk(multipartId, index, data);
     } catch {
@@ -333,8 +331,7 @@ func (c *ObjectStoreClient) putChunk(ctx context.Context, multipartID string, in
 }
 
 func (c *ObjectStoreClient) uploadChunk(ctx context.Context, multipartID, tenant string, index int, data []byte) (*PutChunkResponse, error) {
-	// TODO: this starter retries by restarting the whole multipart upload and marks the file
-	// finished before the store confirms the commit.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	response, err := c.putChunk(ctx, multipartID, index, data)
 	if err == nil {
 		return response, nil
@@ -466,8 +463,7 @@ class ObjectStoreClient(stub: ObjectStoreGrpc.ObjectStoreStub, index: FileIndex)
     stub.putChunk(PutChunkRequest(multipartId = multipartId, index = index, data = data)).map(_ => ())
 
   def uploadChunk(multipartId: String, tenant: String, index: Int, data: ByteString): Future[Unit] = {
-    // TODO: this starter retries by restarting the whole multipart upload and marks the file
-    // finished before the store confirms the commit.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     putChunk(multipartId, index, data).recoverWith { case _: StatusRuntimeException =>
       restartUpload(tenant, data)
     }
@@ -556,8 +552,7 @@ struct ObjectStoreClient {
 
   bool uploadChunk(const std::string& multipartId, const std::string& tenant, int index, const std::string& data,
                    PutChunkResponse* out) {
-    // TODO: this starter retries by restarting the whole multipart upload and marks the file
-    // finished before the store confirms the commit.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if (putChunk(multipartId, index, data, out)) return true;
     return restartUpload(tenant, data, out);
   }
@@ -655,9 +650,9 @@ struct ObjectStoreClient {
     },
   },
   hints: [
-    'The deadline belongs on the chunk call, not on the whole upload: one slow chunk should fail its own attempt and be retried, while the chunks that already landed stay landed. Fifteen seconds is long enough for a large chunk on a bad link and short enough to fail before the client gives up.',
-    'The chunk hash is what makes the retry cheap. The store keeps a map from hash to object, so a re-sent chunk that already exists is acknowledged without writing bytes again — the retry costs a round-trip, not a re-upload.',
-    'Order matters at the end: `CommitMultipart` first, then the local index. If you mark the file complete first, a reader can list a file whose bytes the store has not committed, and the listing is the first thing every client sees.',
+    'One dropped packet at chunk 900 of 1000 and the client re-sends all 1000. Meanwhile a file whose commit failed is already listed as finished, and a stuck PutChunk hangs the upload for hours.',
+    "The starter's PutChunk has no timeout and no chunk_hash, its except clause catches every RpcError and calls _restart_upload, complete() marks the index before CommitMultipart, and list_files returns every row.",
+    'Add CHUNK_DEADLINE_S as timeout=, send chunk_hash with each PutChunk, retry one chunk in _retry_chunk only on RETRYABLE codes, call stub.CommitMultipart before _finalize_object, and filter list_files on committed.',
   ],
-  debrief: `The interviewer is testing whether you can debug a retry path. The starter's retry reads like resilience and is the opposite: restarting the multipart upload re-sends gigabytes because one chunk failed. The fix is to make the retry the unit of work — one chunk, one hash, one deadline — so the store can dedupe and the client only pays for what it did not already send. The second half is ordering: a file is complete when the store says so, not when the client stops sending. Real clients add jitter to the retry backoff, a circuit breaker so one dead store does not absorb every chunk attempt, and a resumable manifest so a client that reconnects after a crash knows exactly which chunks are already committed.`,
+  debrief: `The retry unit shrank to one chunk because that is the unit the store can reason about: with a hash on each request the store acknowledges a re-sent chunk it already holds, and with a deadline on each call a stuck stream fails one attempt rather than the whole upload. Restricting retries to UNAVAILABLE and DEADLINE_EXCEEDED keeps a permanent error from being hammered three times. Committing before marking the index, and listing only committed rows, means readers see a file exactly when the store has all of its bytes. Production clients keep a resumable manifest of acknowledged chunk hashes so a process that restarts after a crash resumes from the last confirmed chunk instead of the first.`,
 };

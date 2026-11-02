@@ -8,29 +8,29 @@ export const dependencyStep: Step = {
   focus: ['worker', 'model', 'small'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the large model is healthy
-it returns a real classification and the demo passes. Every failure path invents an answer. Find the
-flaws, fix them, and prove the fix.
+**Starting point.** The starter's \`infer(image_key, task)\` loops five times, alternates the
+\`model_version\` in the \`PredictRequest\` between the large and the small model, calls
+\`predictor.Predict\` with no timeout, returns \`{label, confidence}\` on the first success, retries on
+any \`RpcError\`, and answers \`{"label": "unknown", "confidence": 0.0}\` when the loop runs out. It
+serves the demo and hides five flaws.
 
-Implement \`infer(image_key, task)\`, the worker's model layer:
+**Failure mode the checks target.** A timeout becomes a 200 with a label nobody predicted, so
+downstream consumers train on it. Every error is retried, including permanent rejections, which only
+repeats the rejection and spends the tenant's latency budget. One overloaded model pins the worker
+for as long as the provider feels like. And no result records which model produced it, so a stored
+prediction cannot be traced to a version.
 
-- Every call carries a **2-second deadline** (\`DEADLINE_MS = 2000\`). A call without a deadline lets
-  one overloaded model pin the worker for as long as the provider feels like.
+Requirements for the worker's model layer:
+
+- Every call carries a **2-second deadline** (\`DEADLINE_S = 2\`, \`DEADLINE_MS = 2000\`).
 - At most **\`MAX_ATTEMPTS = 3\`** attempts against the large model, and **only**
-  \`UNAVAILABLE\` / \`DEADLINE_EXCEEDED\` are retryable (see \`RETRYABLE_CODES\`). A validation
-  rejection is terminal: it is returned to the caller immediately, because retrying it just repeats
-  the same rejection.
-- When the large model's attempts are exhausted, **downgrade to the small model** and answer from it
-  — with the downgrade **recorded** in the response (\`downgraded: true\` and a
-  \`downgrade_reason\`). A timeout is never turned into a prediction: never return a default label
-  (a literal \`"unknown"\`) as if the model had produced it.
+  \`UNAVAILABLE\` / \`DEADLINE_EXCEEDED\` are retryable (\`RETRYABLE_CODES\`). A validation
+  rejection is terminal and returned to the caller immediately.
+- When the large model's attempts are exhausted, **downgrade to the small model** and answer from it,
+  with the downgrade **recorded** in the response (\`downgraded: true\` and a \`downgrade_reason\`).
+  No default label (a literal \`"unknown"\`) is ever returned as if a model had produced it.
 - Every result names the **exact model version** that produced it (\`model_version\`), including the
-  downgraded one.
-
-**Failure mode the checks target.** The starter maps a timeout to \`{"label": "unknown", "confidence":
-0.0}\` with a 200, so downstream consumers train on a label nobody predicted; it retries every error,
-including permanent rejections; and it picks a model per attempt with no provenance, so no one can
-tell which model version a stored prediction came from.`,
+  downgraded one.`,
   sequence: {
     participants: ['Inference worker', 'Large model', 'Small model'],
     messages: [
@@ -52,7 +52,7 @@ tell which model version a stored prediction came from.`,
       id: 'deadline',
       title: 'Every attempt carries a 2-second deadline',
       detail:
-        'The call itself is created with a 2000 ms deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, a context with timeout, `withDeadlineAfter`, `set_deadline`. The starter passes no deadline at all.',
+        'The call itself is created with a 2000 ms deadline: `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, a context with timeout, `withDeadlineAfter`, `set_deadline`. The starter passes no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*2/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -129,9 +129,7 @@ MODEL_VERSIONS = ["vision-large-3.1.0", "vision-small-1.7.2"]
 
 
 def infer(image_key: str, task: str) -> dict:
-    # TODO: this starter retries every error — a validation rejection included — calls the models with
-    # no deadline, alternates between them with no recorded provenance, and answers a timeout with
-    # the label "unknown" as if the model had predicted it. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     for attempt in range(5):
         model_version = MODEL_VERSIONS[attempt % len(MODEL_VERSIONS)]
         request = vision_pb2.PredictRequest(
@@ -214,9 +212,7 @@ const predictor = new vision.Predictor('models:9000', grpc.credentials.createIns
 const MODEL_VERSIONS = ['vision-large-3.1.0', 'vision-small-1.7.2'];
 
 export async function infer(imageKey: string, task: string): Promise<Record<string, unknown>> {
-  // TODO: this starter retries every error — a validation rejection included — calls the models with
-  // no deadline, alternates between them with no recorded provenance, and answers a timeout with
-  // the label "unknown" as if the model had predicted it. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 5; attempt++) {
     const modelVersion = MODEL_VERSIONS[attempt % MODEL_VERSIONS.length];
     try {
@@ -326,9 +322,7 @@ import (
 var modelVersions = []string{"vision-large-3.1.0", "vision-small-1.7.2"}
 
 func Infer(ctx context.Context, client pb.PredictorClient, req *pb.PredictRequest) (map[string]any, error) {
-	// TODO: this starter retries every error — a validation rejection included — calls the models with
-	// no deadline, alternates between them with no recorded provenance, and answers a timeout with
-	// the label "unknown" as if the model had predicted it. Fix all four.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 5; attempt++ {
 		req.ModelVersion = modelVersions[attempt%len(modelVersions)]
 		reply, err := client.Predict(ctx, req)
@@ -421,9 +415,7 @@ object ModelClient {
   private val blocking = PredictorGrpc.newBlockingStub(channel)
 
   def infer(request: PredictRequest): Map[String, Any] = {
-    // TODO: this starter retries every error — a validation rejection included — calls the models with
-    // no deadline, alternates between them with no recorded provenance, and answers a timeout with
-    // the label "unknown" as if the model had predicted it. Fix all four.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     var attempt = 0
     while (attempt < 5) {
       val modelVersion = ModelVersions(attempt % ModelVersions.size)
@@ -511,9 +503,7 @@ const std::vector<std::string> kModelVersions{"vision-large-3.1.0", "vision-smal
 
 std::map<std::string, std::string> infer(std::unique_ptr<vision::Predictor::Stub>& predictor,
                                          const vision::PredictRequest& request) {
-  // TODO: this starter retries every error — a validation rejection included — calls the models with
-  // no deadline, alternates between them with no recorded provenance, and answers a timeout with
-  // the label "unknown" as if the model had predicted it. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (int attempt = 0; attempt < 5; ++attempt) {
     ClientContext context;
     vision::PredictRequest scoped = request;
@@ -588,16 +578,17 @@ Prediction infer(vision::Predictor::Stub* predictor, const vision::PredictReques
     },
   },
   hints: [
-    'The deadline belongs to the call: `timeout=DEADLINE_S`, `{deadline: Date.now() + DEADLINE_MS}`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. Bounding attempts with `range(MAX_ATTEMPTS)` is what turns a stuck model into a bounded delay instead of an unbounded one.',
-    'Retryability is a property of the status, not of “it threw”: capture the error, compare its code against `RETRYABLE_CODES`, and re-raise anything else immediately. A rejection will be rejected again — retrying it only spends the tenant’s latency budget.',
-    'The downgrade is data, not a footnote: return the small model’s label with `downgraded: true` and the reason, and put the concrete `model_version` on every path. Never synthesise a label: a fabricated `unknown` is indistinguishable downstream from a real prediction.',
+    'Stall the large model: the worker hangs for as long as the model takes, then answers 200 `{"label": "unknown", "confidence": 0.0}` with no model version, and a rejected request is sent five times.',
+    '`Predict` has no `timeout`, `except grpc.RpcError: continue` treats every status as retryable, `attempt % len(MODEL_VERSIONS)` picks the model silently, and the final `return` fabricates a label.',
+    'Use `range(MAX_ATTEMPTS)` with `timeout=DEADLINE_S`, re-raise codes outside `RETRYABLE_CODES`, then call `SMALL_MODEL_VERSION` and return `downgraded: true`, `downgrade_reason` and `model_version` on every path.',
   ],
-  debrief: `The interviewer is testing honest degradation. The starter is dangerous precisely because it always
-answers: a timeout becomes a 200 with a convincing-looking label, so the metric dashboard stays green
-while the training set fills with labels no model produced. Three fixes are being checked — a deadline
-per attempt, a retry policy keyed on the status code, and a downgrade that is *recorded* rather than
-hidden — plus provenance, because on a multi-version model a prediction without a version cannot be
-audited or reproduced. Real systems add a per-model circuit breaker, a separate confidence signal for
-downgraded results, and a rule for which tasks may downgrade at all (an embedding usually may, a
-safety-critical detection usually may not).`,
+  debrief: `The starter is dangerous because it always answers: a timeout becomes a 200 with a
+convincing label, the dashboard stays green and the training set fills with labels no model produced.
+The fix has three parts that only work together. The deadline belongs to the call, so a stuck model
+costs a bounded delay. Retryability is a property of the status code, not of "it threw", because a
+rejection rejected again is pure cost. And the downgrade is data in the response, with the concrete
+version on every path, because on a multi-version model a prediction without a version cannot be
+audited or reproduced. Production workers also put a circuit breaker per model, report a separate
+confidence signal for downgraded results, and decide per task whether downgrading is allowed at all:
+an embedding usually may, a safety-critical detection usually may not.`,
 };

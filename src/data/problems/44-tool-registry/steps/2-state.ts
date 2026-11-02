@@ -8,39 +8,26 @@ export const stateStep: Step = {
   focus: ['registry', 'redis', 'client', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it writes every tool of the
-catalog into Redis as its own key, field by field, and flips a pointer called \`catalog:active\` to
-the string \`"latest"\` when it is done. It serves the demo. It hides three production flaws. Debug
-it like the platform owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the catalog module the registry and the resolve endpoint share.
+It writes every tool into Redis as its own key, flips \`catalog:active\` to the string
+\`"latest"\`, and resolves a tool by reading the per-tool key. It serves the demo and hides 5 flaws.
 
-Implement the catalog module that the registry and the resolve endpoint both use.
+- One catalog **version** is one Redis hash, \`catalog:version:{version}\`, one field per tool.
+  \`promote(version, catalog)\` writes it with **one** \`HSET\` and publishes it with a **single**
+  \`SET\` of \`catalog:active\`; a reader sees the old pointer or the new one.
+- Promotion requires a **passing validation**: refuse a candidate whose
+  \`catalog:validation:{version}\` is not \`passed\` before writing anything.
+- Record the replaced version at \`catalog:previous\` before the swap; \`rollback()\` points
+  \`catalog:active\` back at it in one write.
+- \`pin_run(run_id, version)\` writes \`catalog:pin:{run_id}\` with a 6-hour TTL. \`resolve(name,
+  run_id)\` reads the pin, falls back to \`catalog:active\`, then does **one** \`HGET\` on the
+  version's hash.
+- A missing version or tool raises a distinguishable error, not a partial catalog.
 
-- One catalog **version** is one Redis hash: key \`catalog:version:{version}\`, one field per tool,
-  the stored tool record as the field value. \`promote(version, catalog)\` writes that whole hash with
-  **one** \`HSET\` (one command, every tool of the version) and then publishes it with a **single**
-  \`SET\` of \`catalog:active\`. A reader sees the old pointer or the new one, and never a hash still
-  being filled in. The starter's per-tool \`HSET\` loop is the flaw: an agent that resolves while a
-  promotion is running reads a catalog assembled from two versions — the new side-effect class with
-  the old schema.
-- Promotion requires a **passing validation**: read \`catalog:validation:{version}\` — the marker the
-  registry sets once the candidate catalog's tool versions have passed sandbox validation (step 3) —
-  and refuse anything that is not \`passed\` *before* writing anything, so a rejected candidate cannot
-  leave a hash behind.
-- Record the version being replaced at \`catalog:previous\` before the swap, and give the module a
-  \`rollback()\` that points \`catalog:active\` back at it in one write; the next resolution then serves
-  the previous catalog. The starter has no rollback at all, so a bad promotion is only fixable by hand.
-- \`pin_run(run_id, version)\` writes \`catalog:pin:{run_id}\` with a TTL (6 hours) — a pin belongs to a
-  run, not forever. \`resolve(name, run_id)\` reads the pin first, falls back to \`catalog:active\`, then
-  reads the tool with **one** \`HGET\` against \`catalog:version:{version}\`: never a per-tool scan, and
-  never a pinned run silently moved onto a newer catalog. The starter pins nothing, so a promotion
-  flips running agents mid-plan.
-- A resolution whose version or tool is missing raises a distinguishable error rather than returning
-  a partial catalog.
-
-**Failure mode the checks target.** All three flaws are the same mistake in different clothes:
-treating a multi-key structure as if it were atomic, and treating a run as if it had no identity.
-The unit that must be atomic is one hash per version plus the pointer; a run is a thing that pinned a
-version when it started.`,
+**Failure mode the checks target.** One mistake in different clothes: treating a multi-key
+structure as atomic, and treating a run as if it had no identity. An agent resolving mid-promotion
+reads a catalog assembled from two versions; a promotion moves every running agent at once; a bad
+promotion is fixable only by hand; a candidate that failed validation promotes anyway.`,
   sequence: {
     participants: ['Registry', 'Redis', 'Agent runtime'],
     messages: [
@@ -136,9 +123,7 @@ def load_catalog(entries: dict) -> None:
 
 
 def promote(entries: dict) -> None:
-    # TODO: this starter writes the catalog one tool per command, so an agent resolving mid-promotion
-    # sees half a catalog; it pins nothing, so a promotion flips running agents mid-plan; and it
-    # never checks that the candidate version was validated. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     load_catalog(entries)
     r.set("catalog:active", "latest")
 
@@ -218,9 +203,7 @@ export async function loadCatalog(entries: Record<string, unknown>): Promise<voi
 }
 
 export async function promote(entries: Record<string, unknown>): Promise<void> {
-  // TODO: this starter writes the catalog one tool per command, so an agent resolving mid-promotion
-  // sees half a catalog; it pins nothing, so a promotion flips running agents mid-plan; and it
-  // never checks that the candidate version was validated. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await loadCatalog(entries);
   await redis.set('catalog:active', 'latest');
 }
@@ -316,9 +299,7 @@ func loadCatalog(ctx context.Context, entries map[string]any) error {
 }
 
 func promote(ctx context.Context, entries map[string]any) error {
-	// TODO: this starter writes the catalog one tool per command, so an agent resolving mid-promotion
-	// sees half a catalog; it pins nothing, so a promotion flips running agents mid-plan; and it
-	// never checks that the candidate version was validated. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	if err := loadCatalog(ctx, entries); err != nil {
 		return err
 	}
@@ -470,9 +451,7 @@ object Catalog {
     }
 
   def promote(entries: Map[String, JsObject]): Unit = {
-    // TODO: this starter writes the catalog one tool per command, so an agent resolving mid-promotion
-    // sees half a catalog; it pins nothing, so a promotion flips running agents mid-plan; and it
-    // never checks that the candidate version was validated. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     loadCatalog(entries)
     jedis.set("catalog:active", "latest")
   }
@@ -551,9 +530,7 @@ void loadCatalog(sw::redis::Redis& redis, const json& entries) {
 }
 
 void promote(sw::redis::Redis& redis, const json& entries) {
-  // TODO: this starter writes the catalog one tool per command, so an agent resolving mid-promotion
-  // sees half a catalog; it pins nothing, so a promotion flips running agents mid-plan; and it
-  // never checks that the candidate version was validated. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   loadCatalog(redis, entries);
   redis.set("catalog:active", "latest");
 }
@@ -626,9 +603,9 @@ json resolve(sw::redis::Redis& redis, const std::string& name, const std::string
     },
   },
   hints: [
-    'Atomicity here is not a transaction across many keys — it is writing one version with one command and having exactly one pointer to swap. Put every tool of the version into `catalog:version:{version}` with a single `HSET`, and publish it by setting `catalog:active` once.',
-    'A pin is a read-path decision: look up `catalog:pin:{run_id}` first, fall through to `catalog:active`, then answer with one `HGET` on that version’s hash. Give the pin a TTL, or every abandoned run pins a catalog until someone remembers to clean it up.',
-    'Record the outgoing version at `catalog:previous` *before* the pointer swap — that one key is what makes a rollback a single write instead of a rewrite of the catalog. And refuse a candidate whose `catalog:validation:{version}` is not `passed` before writing anything.',
+    'Symptom: during a promotion an agent resolves `payments.charge` and gets the new side-effect class with the old schema; after it, every in-flight run is on the new catalog and nobody can go back.',
+    'Mechanism: `load_catalog` issues one write per tool and the pointer points at a string, not a version; resolve reads the per-tool key with no run identity, and promote trusts whatever it is handed.',
+    'Fix: one `HSET` with the whole mapping into `catalog:version:{v}`, `catalog:previous` then one `SET` of `catalog:active`, a `rollback()`, pins under `catalog:pin:{run_id}` with a TTL, and a `catalog:validation:{v}` guard first.',
   ],
-  debrief: `The interviewer is looking for the difference between "the data is in Redis" and "a reader can trust what it reads". The starter’s per-tool HSET loop is the classic form: every individual command succeeds, so nothing looks broken, while one resolution can read a catalog assembled from two versions — a tool that exists with the new side-effect class and the old schema. The fix is structural: one hash per version written in one command, one pointer for the active version, which makes promotion atomic without a transaction and makes rollback one write. The pin is the second half of the story: a run is a unit with a catalog pinned at start, so a promotion only affects runs that have not started yet. Real registries add a monotonic revision for optimistic reads, a warm-up check that the hash parses before the swap, and pin eviction driven by run completion rather than only by TTL.`,
+  debrief: `The fix is structural rather than transactional: one hash per version written in a single command and one pointer for the active version makes promotion atomic without MULTI, makes rollback one write, and gives the resolver a stable unit (a version) to read with one HGET. The pin is the other half: a run is something that chose a catalog when it started, so a promotion only affects runs that begin after it, and the TTL stops abandoned runs from pinning versions forever. Production catalogs add a monotonic revision for optimistic promotion, a warm-up check that the hash parses before the swap, pin eviction driven by run completion rather than only by TTL, and retention of old version hashes bounded by the longest pin.`,
 };

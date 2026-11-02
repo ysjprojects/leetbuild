@@ -2,44 +2,35 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Moderation and notification calls that never double-apply',
+  title: 'Moderation and notification calls that apply once',
   concept: 'grpc',
   file: 'client',
   focus: ['api', 'moderation', 'notifier', 'review'],
   task: `## Task
 
-**Starting point.** The starter is working code: it notifies the author, calls
-moderation, and returns a status. It compiles, the happy path redirects correctly, and it hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter's \`fanout\` calls the notifier first with a fresh \`uuid4\` as its
+\`idempotency-token\`, queues a retry entry with another fresh UUID when that call raises, and
+otherwise calls moderation with no deadline and returns \`allowed\` or \`blocked\`. It compiles, the
+happy path answers correctly, and it hides five flaws.
 
-Implement the fan-out that a comment write performs against two gRPC services.
+**Failure mode the checks target.** A single comment eventually rings the author twice, because the
+retry carries a token neither service has seen; a slow moderation service holds the write open
+instead of flagging the comment for review; and a notifier exception returns before moderation runs,
+so a failed ping ships an unchecked comment.
 
 - Both calls run under a **500 ms deadline** (\`FANOUT_DEADLINE_MS = 500\`, applied as the call
-  timeout / \`withDeadlineAfter\` / \`set_deadline\`). A dependency that hangs must not hold the
-  request open.
-- Every attempt of one comment's fan-out carries the **same idempotency token**, and the token is
-  derived from the comment id by one function (\`idempotency_token(comment_id)\` →
-  \`comment:{id}\`), sent as the \`idempotency-token\` metadata on the moderation call, on the
-  notification call and on any retry. Never mint a fresh token for a retry: that is what turns one
-  comment into two pings for the author.
-- **Moderation runs first**, and a notification failure can never cancel it. Moderation is the
-  decision the product depends on; the ping is best-effort.
+  timeout / \`withDeadlineAfter\` / \`set_deadline\`).
+- Every attempt of one comment's fan-out carries the **same idempotency token**, derived from the
+  comment id by one function (\`idempotency_token(comment_id)\` → \`comment:{id}\`) and sent as the
+  \`idempotency-token\` metadata on the moderation call, the notification call and any retry.
+- **Moderation runs first**; a notification failure cannot cancel it. Moderation is the decision
+  the product depends on; the ping is best-effort.
 - A moderation call that hits the deadline is **not** a failed post: flag the comment
   \`pending_review\`, enqueue it on the review queue, and answer the write successfully. Other
   moderation failures still surface as errors.
 - When the notification call fails, enqueue a retry entry that carries the **same token**
-  (\`token: idempotency_token(comment_id)\` / \`Token: idempotencyToken(commentID)\`), so the retry
-  pings once, not twice.
-- Return the moderation outcome (\`allowed\` / \`blocked\` / \`pending_review\`) to the caller.
-
-**Failure mode the checks target.** The starter fans out in the wrong order and with the wrong
-identity. It calls the notifier first and mints a brand-new token for that call **and** for the retry
-entry, so a single comment eventually rings the author twice — a duplicate that no rate limit
-catches because both calls are "successful". It calls moderation with no deadline, so a slow
-moderation service makes the write hang instead of flagging the comment for asynchronous review. And
-because the notification path decides whether the request continues, its exception skips moderation
-entirely — a failed ping silently ships an unchecked comment.`,
+  (\`token: idempotency_token(comment_id)\` / \`Token: idempotencyToken(commentID)\`).
+- Return the moderation outcome (\`allowed\` / \`blocked\` / \`pending_review\`) to the caller.`,
   sequence: {
     participants: ['Comments API', 'Moderation', 'Notifier', 'Review queue'],
     messages: [
@@ -133,7 +124,7 @@ entirely — a failed ping silently ships an unchecked comment.`,
       id: 'retry-token',
       title: 'Queues the retry with the same token',
       detail:
-        'The retry entry written when the notification fails carries `idempotency_token(comment_id)` — the same token as the attempt that failed — so the replay pings the author once.',
+        'The retry entry written when the notification fails carries `idempotency_token(comment_id)`, the same token as the attempt that failed, so the replay pings the author once.',
       match: {
         python: {all: [/retry_queue\.put\(/, /"token": idempotency_token\(comment_id\)/]},
         typescript: {all: [/retryQueue\.put\(/, /token: idempotencyToken\(commentId\)/]},
@@ -181,8 +172,7 @@ notifier = notification_pb2.NotifierStub()
 
 
 def fanout(comment_id: str, thread_id: str, author_id: str) -> str:
-    # TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
-    # timeout, and drops the moderation call entirely when the notification path throws.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     try:
         notifier.Notify(
             notification_pb2.NotifyRequest(comment_id=comment_id, author_id=author_id),
@@ -302,8 +292,7 @@ export const reviewQueue = {enqueue: async (_commentId: string): Promise<void> =
 export const retryQueue = {put: async (_entry: {comment_id: string; author_id: string; token: string}): Promise<void> => {}};
 
 export async function fanout(commentId: string, threadId: string, authorId: string): Promise<string> {
-  // TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
-  // timeout, and drops the moderation call entirely when the notification path throws.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const meta = new grpc.Metadata();
   meta.set('idempotency-token', randomUUID());
   try {
@@ -411,8 +400,7 @@ var (
 	retryQueue RetryQueue
 )
 
-// TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
-// timeout, and drops the moderation call entirely when the notification path throws.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func Fanout(ctx context.Context, commentID, threadID, authorID string) (string, error) {
 	ctx = metadata.AppendToOutgoingContext(ctx, "idempotency-token", uuid.NewString())
 	if _, err := notifier.Notify(ctx, &NotifyRequest{CommentId: commentID, AuthorId: authorID}); err != nil {
@@ -508,8 +496,7 @@ object CommentFanout {
     meta
   }
 
-  // TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
-  // timeout, and drops the moderation call entirely when the notification path throws.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def fanout(commentId: String, threadId: String, authorId: String): String = {
     try {
       notifier.notify(
@@ -593,8 +580,7 @@ std::unique_ptr<Notifier::Stub> notifier;
 RetryQueue retryQueue;
 std::string uuidString();
 
-// TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
-// timeout, and drops the moderation call entirely when the notification path throws.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::string fanout(const std::string& commentId, const std::string& threadId, const std::string& authorId) {
   NotifyRequest notifyRequest;
   notifyRequest.set_comment_id(commentId);
@@ -685,9 +671,9 @@ std::string fanout(const std::string& commentId, const std::string& threadId, co
     },
   },
   hints: [
-    'Two rules, one flow: moderation is the decision, so it runs first and is never skipped; the notification is best effort, so its failure only queues a retry. Write the moderation call, then the notify call inside its own `try`, and the order falls out of the code.',
-    'One token per comment, not per attempt: `idempotency_token(comment_id)` → `comment:{id}`, attached as `idempotency-token` metadata by a helper both calls use, and written into the retry entry unchanged. A retry that mints a new UUID is a second ping, and neither service can tell it apart from a new comment.',
-    'A deadline is not an error path to swallow: `DEADLINE_EXCEEDED` from moderation means "we do not know yet", so set the status to `pending_review`, enqueue the comment for the review queue, and let the write succeed. Anything else still raises — the product depends on the decision being real.',
+    'An author gets two pings for one reply after a notifier blip; a post hangs for as long as moderation takes; when the notifier is down, comments go live that moderation never saw.',
+    'Each `uuid.uuid4()` is a new identity, so the retry looks like a new comment to the notifier. Moderation has no `timeout`, and the `except` returns before `moderation.Check` is ever reached.',
+    '`moderation.Check` first, with `timeout=FANOUT_DEADLINE_S`; `DEADLINE_EXCEEDED` becomes `pending_review` plus `review_queue.enqueue`. Then `notifier.Notify` in its own `try`, with `idempotency_token(comment_id)` on the call and in the `retry_queue.put` entry.',
   ],
-  debrief: `The interviewer is asking three questions about a fan-out. Who decides the outcome? Moderation does, so it runs first and cannot be cancelled by a best-effort side effect — the starter reverses that and ships an unchecked comment whenever the notifier hiccups. What is the unit of identity? The comment, not the attempt: one token derived from the comment id means the retry the queue eventually performs lands on the same moderation check and the same notification, instead of creating two of each. And what does a timeout mean? Not failure, but "unknown": the honest answer to a moderation service that is too slow is to accept the comment and flag it for asynchronous review, which keeps the write path's latency bound and never lets a dependency decide the availability of posting. Real platforms add a review queue with a deadline of its own, per-dependency circuit breakers, and a notification service that deduplicates on the token server-side as a second line of defence.`,
+  debrief: `The fix has the shape of three answers. Who decides the outcome? Moderation, so it runs first and a best-effort side effect cannot cancel it; the starter reversed that and shipped an unchecked comment whenever the notifier hiccupped. What is the unit of identity? The comment, not the attempt: one token derived from the comment id means the retry the queue eventually performs lands on the same moderation check and the same notification instead of creating two of each. What does a timeout mean? Not failure but "unknown", so the comment is accepted and flagged for asynchronous review, which keeps the write path's latency bounded. Production platforms give the review queue a deadline of its own, put a circuit breaker in front of each dependency, and have the notification service deduplicate on the token server-side as a second line of defence.`,
 };

@@ -8,16 +8,16 @@ import {rolloutStep} from './steps/5-rollout';
 
 /**
  * Model router: the course is not "call an LLM from an endpoint", it is the debugging you owe a
- * routing layer before it spends a tenant's budget. Validated, idempotent routing decisions → one
- * atomic Redis reservation per tenant window → a provider call with a deadline, bounded retries,
- * a fallback and a breaker → tenant-keyed feedback events with an outbox and counters before the
- * offset commit → a canary rollout gated by evals with per-tenant pins.
+ * routing layer before it spends a tenant's budget. Validated, idempotent routing decisions, one
+ * atomic Redis reservation per tenant window, a provider call with a deadline, bounded retries,
+ * a fallback and a breaker, tenant-keyed feedback events with an outbox and counters before the
+ * offset commit, and a canary rollout gated by evals with per-tenant pins.
  */
 export const modelRouterProblem: Problem = {
   id: 'model-router',
   title: 'Model Router',
   tagline:
-    'Route requests across models with tenant limits, deadlines and gated rollouts, debugged until it is safe to ship.',
+    'Route requests across a small and a large model with Redis budgets, provider deadlines and eval-gated canaries.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -32,14 +32,17 @@ front of every traffic increase.
 
 ## The real system
 
-Production routers receive requests from many tenants, estimate cost before spending it, and reserve
-budget atomically so two concurrent requests cannot both pass the same check. They select models
-from a policy, not from whatever string a caller sends. They call providers under a deadline, retry
-only the statuses that are worth retrying, fail over to a smaller model, and stop hammering a
-provider that is already down. They emit one feedback event per request, keyed by tenant so quality
-signals stay ordered, without copying prompt text into a topic that is retained and replicated. And
-they never ship a routing change "because the demo looked better": traffic increases are gated on
-eval scores, and rollbacks pin each tenant's version so no conversation flips models mid-session.
+LiteLLM's proxy is an open source router of this shape: \`model_list\` names the deployments behind
+one model name, \`router_settings.fallbacks\` maps a model group to the groups tried when it fails,
+and \`num_retries\` with \`request_timeout\` bound each call before the fallback is reached. The same
+jobs show up in every production router: estimate cost before spending it and reserve budget
+atomically so two concurrent requests cannot both pass the same check; select models from a
+policy, not from whatever string a caller sends; call providers under a deadline, retry only the
+statuses that are worth retrying, fail over to a smaller model, and stop hammering a provider that
+is already down; emit one feedback event per request, keyed by tenant so quality signals stay
+ordered, without copying prompt text into a topic that is retained and replicated; and gate every
+traffic increase on eval scores, with rollbacks that pin each tenant's version so no conversation
+flips models mid-session.
 
 ## What you build here
 
@@ -47,7 +50,7 @@ One service, **routerd**, with five pieces:
 
 1. \`POST /v1/route\`: authenticated tenant, validated prompt and token caps, server-side policy
    selection between a small and a large model, and an \`Idempotency-Key\` so a retry cannot
-   double-route. Decisions are logged with ids, never the prompt.
+   double-route. Decisions are logged with ids, not the prompt.
 2. A **Redis** limiter: per tenant, 60 requests and 100 000 tokens per 60-second window, reserved by
    one atomic Lua \`EVAL\` with the expiry set at first write, answering \`429\` with
    \`Retry-After\` and \`X-RateLimit-Remaining\` before any provider call.
@@ -66,8 +69,8 @@ One service, **routerd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path,
 and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
+fail on the starter and pass on your version.
 
 ## Left out on purpose
 

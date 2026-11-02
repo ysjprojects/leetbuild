@@ -10,14 +10,15 @@ import {readStep} from './steps/5-read';
  * Recommendation ranking: the course is not "call a model and show a list", it is the debugging
  * you owe a ranking service before real users see its output. Validated, identity-scoped candidate
  * intake → a tenant-keyed feature cache with one refresh per miss → a deadline-bounded gRPC rank
- * with a popularity fallback that is honest about degrading → impression events keyed by user with
+ * with a popularity fallback that is marked as degraded → impression events keyed by user with
  * ids instead of features and an outbox behind them → a surface config read that every reader
  * resolves so a rollout is one switch.
  */
 export const recommendationRankingProblem: Problem = {
   id: 'recommendation-ranking',
   title: 'Recommendation Ranking',
-  tagline: 'Rank candidates per user with a fallback that still recommends, and impressions that carry no PII.',
+  tagline:
+    'Rank candidates per user behind a feature cache, with a popularity fallback the impression stream can tell apart.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -31,20 +32,22 @@ model, the exposure stream you emit, and the config read that every reader share
 
 ## The real system
 
-Production rankers take candidates and a surface, never a user id a caller chose: the requester is
-resolved from the authenticated identity, and personalized output is impossible to fetch for anyone
+Production rankers take candidates and a surface, not a user id a caller chose: the requester is
+resolved from the authenticated identity, so personalized output cannot be fetched for anyone
 else. Candidate lists are bounded, because an unbounded list is a free way to stall the ranking
-pool. Features are cached per tenant and user with a TTL, and a miss triggers a single refresh that
-concurrent requests share instead of a thundering herd, with the previous value kept long enough to
-serve when the feature service is down. Ranking itself runs over gRPC under a deadline, retries only
-the failures that deserve it, and degrades to a precomputed popularity order that is clearly marked
-as degraded, because an empty list looks like a bug and an unmarked list corrupts the offline
-comparison. Impressions go to Kafka keyed by user — so one person's exposure stream stays ordered —
-carrying ids, positions and the model version rather than raw feature vectors that would leak
-behavior into a retained topic, with an outbox row behind the produce so a broker rejection cannot
-silently drop an exposure that will never be re-captured. And every reader resolves the surface's
-active version through one config read, so a rollout or a rollback is one switch rather than
-per-reader drift.
+pool. Features are served from an online store keyed by entity with an expiry: Feast's Redis online
+store collocates every feature view for one entity in a single hash and lets you set
+\`key_ttl_seconds\`, a Redis \`EXPIRE\` on that hash, so stale entity data is evicted automatically
+instead of living until someone flushes it. A miss triggers one refresh that concurrent requests
+share, with the previous value kept long enough to serve when the feature service is down. Ranking
+itself runs over gRPC under a deadline, retries only the failures that deserve it, and degrades to
+a precomputed popularity order that is marked as degraded, because an empty list looks like a bug
+and an unmarked list corrupts the offline comparison. Impressions go to Kafka keyed by user, so one
+person's exposure stream stays ordered, carrying ids, positions and the model version rather than
+raw feature vectors that would leak behavior into a retained topic, with an outbox row behind the
+produce so a broker rejection cannot drop an exposure that will not be re-captured. And every
+reader resolves the surface's active version through one config read, so a rollout or a rollback
+is one switch rather than per-reader drift.
 
 ## What you build here
 

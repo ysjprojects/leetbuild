@@ -8,36 +8,30 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and answers \`201\` with a reservation. It compiles, it serves the demo, and it hides three
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/reservations\` with body
+\`{"sku": "sku-123", "quantity": 2}\`, reads the tenant, parses the body, calls \`stock.reserve\` and
+answers \`201\` with a reservation. It compiles, serves the demo and hides four flaws.
 
-Implement \`POST /v1/reservations\` with body \`{"sku": "sku-123", "quantity": 2}\`.
+**Failure mode the checks target.** A value believed before it is checked, and a request executed
+twice. The starter trusts the raw \`quantity\`, so a negative value *increases* stock and \`1e6\`
+walks past a cap that does not exist; it does not look the sku up, so any string becomes a
+reservation; and it ignores \`Idempotency-Key\`, so a client retry after a timeout holds the units
+twice. None of that shows up in a demo that sends one well-formed request per key.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing or empty tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing or empty) — it is a header, never a body field.
-- \`sku\` must be a non-empty string (**400** otherwise) **and** must be a sku this tenant sells:
-  the catalog lookup decides, and an unknown sku is **404** with no reservation created and no stock
-  touched.
+- The tenant comes from the \`X-Tenant-Id\` header; a missing or empty tenant is **401**.
+- \`Idempotency-Key\` is a required header (**400** when missing or empty).
+- \`sku\` must be a non-empty string (**400**) **and** a sku this tenant sells: the catalog lookup
+  decides, and an unknown sku is **404** with no reservation created and no stock touched.
 - \`quantity\` must be an integer from **1** to **MAX_ORDER_QUANTITY** (**1000**). \`0\`, a negative
-  value, \`2.5\` and \`1000000\` are all **400** \`quantity out of range\`. The cap is per order, and a
-  negative quantity is not "a small order" — it is how a caller *adds* stock while pretending to
-  take some.
-- Only once those guards have passed may the service call the stock collaborator
-  (\`stock.reserve(sku, quantity)\`). Validation, the catalog lookup and the idempotency lookup all
-  run **before** it: a rejected request must never move a counter.
+  value, \`2.5\` and \`1000000\` are all **400** \`quantity out of range\`.
+- Only once those guards have passed may the service call \`stock.reserve(sku, quantity)\`.
+  Validation, the catalog lookup and the idempotency lookup all run **before** it: a rejected
+  request must not move a counter.
 - Idempotency is keyed by \`(tenant, Idempotency-Key)\`: the record
-  \`{reservation_id, sku, quantity, status: "reserved", expires_at}\` is stored under that pair, and
-  \`expires_at\` is \`now + RESERVATION_TTL_S\` (**900**) in epoch seconds. A replay of the key returns
-  the **stored** record — same \`reservation_id\`, same \`expires_at\` — with **200**, and does not
-  reserve a second time.
-- A fresh reservation answers **201** with the reservation id, the sku, the quantity and \`expires_at\`.
-
-**Failure mode the checks target.** The starter trusts the raw \`quantity\`, so a negative value
-quietly *increases* stock and \`1e6\` walks past a cap that does not exist; it never looks the sku up,
-so any string becomes a reservation; and it ignores \`Idempotency-Key\`, so a client retry after a
-timeout holds the units twice and the shopper is charged for both. None of that shows up in a demo
-that sends one well-formed request per key.`,
+  \`{reservation_id, sku, quantity, status: "reserved", expires_at}\` is stored under that pair, with
+  \`expires_at = now + RESERVATION_TTL_S\` (**900**) in epoch seconds. A replay returns the **stored**
+  record with **200** and does not reserve again.
+- A fresh reservation answers **201** with the reservation id, sku, quantity and \`expires_at\`.`,
   sequence: {
     participants: ['Client', 'Inventory API', 'catalog', 'stock store', 'reservations'],
     messages: [
@@ -84,7 +78,7 @@ that sends one well-formed request per key.`,
       id: 'quantity-range',
       title: 'Quantity is an integer in 1..1000, rejected with 400 before the reserve',
       detail:
-        '`MAX_ORDER_QUANTITY` is 1000 and the guard rejects a non-integer, `0`, a negative value and anything above the cap with **400** `quantity out of range` — and it sits above the stock call. The starter passes `body["quantity"]` straight through, so `-5` adds stock and `1e6` is never capped.',
+        '`MAX_ORDER_QUANTITY` is 1000 and a guard above the stock call rejects a non-integer, `0`, a negative value and anything above the cap with **400** `quantity out of range`.',
       match: {
         python: {
           all: [/MAX_ORDER_QUANTITY/, /status_code\s*=\s*400/],
@@ -112,7 +106,7 @@ that sends one well-formed request per key.`,
       id: 'sku-unknown',
       title: 'Unknown sku is 404 and touches nothing',
       detail:
-        'The catalog decides: a sku the tenant does not sell is **404** `unknown sku`, no reservation row is written and no stock moves — the lookup runs before the reserve call. The starter never looks the sku up, so `sku-nope` reserves happily.',
+        'A `catalog.lookup(sku)` before the reserve call decides: a sku the tenant does not sell is **404** `unknown sku`, with no reservation row written and no stock moved.',
       match: {
         python: {
           all: [/catalog\.lookup\(/, /status_code\s*=\s*404/],
@@ -137,7 +131,7 @@ that sends one well-formed request per key.`,
       id: 'idempotency',
       title: 'A replay returns the stored reservation under (tenant, key)',
       detail:
-        'The record with `reservation_id` and `expires_at = now + RESERVATION_TTL_S` is stored under `(tenant, Idempotency-Key)`; a second request with the same key answers **200** with the stored record — the same reservation id and the same expiry — and never reaches the stock call again. The starter mints a new id and reserves again on every retry.',
+        'The record with `reservation_id` and `expires_at = now + RESERVATION_TTL_S` is stored under `(tenant, Idempotency-Key)`; a second request with the same key answers **200** with the stored record and does not reach the stock call again.',
       match: {
         python: {
           all: [/Idempotency-Key/, /reservations\.get\(/, /reservations\.put\(/, /RESERVATION_TTL_S/, /reservation_id/],
@@ -177,7 +171,7 @@ that sends one well-formed request per key.`,
       id: 'no-decrement-on-reject',
       title: 'Every rejection precedes the stock mutation',
       detail:
-        'The checks read the first `400`, the first `404` and the first stock call in order: a malformed request, an unknown sku or a replayed key is answered before `stock.reserve(...)` can touch a counter. Lifting the reserve above the guards — the starter does exactly that — fails this check even while the status codes look right, because a rejected request has already decremented.',
+        'The checks read the first `400`, the first `404` and the first stock call in order: a malformed request, an unknown sku or a replayed key is answered before `stock.reserve(...)` can touch a counter, even when the status codes already look right.',
       match: {
         python: {order: [/status_code\s*=\s*400/, /status_code\s*=\s*404/, /stock\.reserve\(/]},
         typescript: {order: [/code\(\s*400\s*\)/, /code\(\s*404\s*\)/, /stock\.reserve\(/]},
@@ -209,9 +203,7 @@ stock = StockStore()
 
 @app.post("/v1/reservations")
 async def create_reservation(request: Request) -> JSONResponse:
-    # TODO: this starter hands the raw quantity to the store (so -5 adds stock and 1000000 skips the
-    # 1000-unit cap), never looks the sku up, and ignores Idempotency-Key, so a retry reserves
-    # twice. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     tenant = request.headers.get("X-Tenant-Id")
     if not tenant:
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
@@ -333,9 +325,7 @@ const stock: StockStore = {
 };
 
 app.post('/v1/reservations', async (request, reply) => {
-  // TODO: this starter hands the raw quantity to the store (so -5 adds stock and 1000000 skips the
-  // 1000-unit cap), never looks the sku up, and ignores Idempotency-Key, so a retry reserves
-  // twice. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
   if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const body = request.body as {sku: string; quantity: number};
@@ -473,8 +463,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// TODO: this starter hands the raw quantity to the store (so -5 adds stock and 1000000 skips the
-// 1000-unit cap), never looks the sku up, and ignores Idempotency-Key, so a retry reserves twice.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 func createReservation(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
@@ -664,8 +653,7 @@ object ReservationApi {
   implicit val reserveFormat: RootJsonFormat[ReserveRequest] = jsonFormat2(ReserveRequest)
   implicit val reservationFormat: RootJsonFormat[Reservation] = jsonFormat5(Reservation)
 
-  // TODO: this starter hands the raw quantity to the store (so -5 adds stock and 1000000 skips the
-  // 1000-unit cap), never looks the sku up, and ignores Idempotency-Key, so a retry reserves twice.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   val route: Route =
     path("v1" / "reservations") {
       post {
@@ -813,8 +801,7 @@ int main() {
       res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
       return;
     }
-    // TODO: this starter hands the raw quantity to the store (so -5 adds stock and 1000000 skips the
-    // 1000-unit cap), never looks the sku up, and ignores Idempotency-Key, so a retry reserves twice.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -945,9 +932,9 @@ int main() {
     },
   },
   hints: [
-    'The cheapest guard is the quantity: one comparison against `MAX_ORDER_QUANTITY` (1000) that rejects a non-integer, `0`, a negative value and anything above the cap with **400** `quantity out of range`. The starter never compares — it hands `body["quantity"]` to the store, so a negative quantity *adds* stock while looking like a reservation.',
-    'The 404 gate is a catalog lookup before anything that mutates stock: `catalog.lookup(sku)` returns nothing for a sku this tenant does not sell, and the handler answers **404** `unknown sku` without writing a reservation or moving a counter.',
-    'Idempotency is a lookup keyed by `(tenant, Idempotency-Key)` placed *before* the reserve call: on a hit return the stored record with **200** so the retry carries the original `reservation_id` and `expires_at`; on a miss reserve once, store `expires_at = now + RESERVATION_TTL_S` (900) under the same pair, and answer **201**.',
+    'Symptom: after a flash sale the shelf count for one sku is higher than it started, one customer holds twice the units they ordered, and a sku nobody sells has a reservation.',
+    'Mechanism: the handler calls `stock.reserve` with whatever `quantity` the body carried, with no catalog lookup first and no memory of `Idempotency-Key`, so each retry mints a new id.',
+    'Change: before the reserve call, reject quantity outside 1..`MAX_ORDER_QUANTITY` with 400, answer 404 when `catalog.lookup` is empty, and return the record stored under `(tenant, key)` with 200 on a hit.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler against the two failure modes that cost real money: a value that is believed before it is checked, and a request that is executed twice. The starter looks right because the demo sends \`{"sku": "sku-123", "quantity": 2}\` once, from one tenant, with one key — under that traffic there is nothing to notice. The defects only appear at the edges: a negative quantity turns the reserve into a credit and inflates the shelf count, a quantity of a million bypasses a cap that was never written, an unknown sku becomes a reservation for something nobody sells, and a client retry after a timeout holds the same units a second time. The ordering matters as much as the guards: validation, catalog and idempotency all run *before* the stock call, so a rejected request can never have moved a counter — which is why the checks read the first \`400\`, the first \`404\` and the first reserve call in order rather than just grepping for their presence. Real services add a per-tenant rate limit on the reservation path, a request fingerprint so a replayed key with a *different* body is a \`409\` instead of a silent replay, and a background sweep that releases holds whose \`expires_at\` has passed.`,
+  debrief: `The fix is a funnel: cheap validation first, then the catalog, then the idempotency lookup, and only then the one call that moves a counter. The order is the point. A guard placed after \`stock.reserve\` returns the right status code while the decrement has already happened, which is why the last check reads positions rather than status codes. Idempotency works because the key is scoped to the tenant and the stored record is returned whole, so a retry carries the original \`reservation_id\` and \`expires_at\` instead of a fresh pair. Production services also persist the idempotency record with its own TTL, answer a replay whose body differs from the original with 409 instead of a silent replay, and run a background sweep that releases holds whose \`expires_at\` has passed.`,
 };

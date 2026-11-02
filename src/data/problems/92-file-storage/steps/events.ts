@@ -8,28 +8,29 @@ export const eventsStep: Step = {
   focus: ['api', 'store', 'kafka'],
   task: `## Task
 
-**Starting point.** The starter is working code for the event publisher: it
-serialises an event and produces it to \`file.event\`. It compiles, the happy path works, and it hides
-three production flaws. Debug it, fix it, and prove the fix with the checks below.
-
-Implement the \`file.event\` publisher:
-
-- Upload, finalize and delete events all publish to the topic \`file.event\`.
-- The message **key is the file id**, so every event for one file lands in the same partition and a
-  consumer sees that file's lifecycle in order. Keying by tenant scatters one file's events across
-  partitions and reorders them.
-- The payload carries the object's **digest** (SHA-256), its **sniffed mime** and its **size**, plus
-  opaque ids. It never carries the original filename, the file's bytes, or anything a consumer would
-  have to treat as untrusted user text.
-- The **finalize** event publishes only after the object store's \`CommitMultipart\` has returned. A
-  consumer that reacts to "finalized" must never race the commit and find the bytes missing.
-- The producer is configured for **\`acks=all\`** and **idempotence**, so a broker-side retry cannot
-  duplicate an event and a lost acknowledgement cannot silently drop one.
+**Starting point.** The starter is the \`file.event\` publisher: it builds a JSON payload with the
+file id, tenant, original filename and size, produces it to \`file.event\` keyed by tenant with a
+default producer, and \`finalize\` publishes before \`commit_multipart\`. It compiles and hides five
+flaws.
 
 **Failure mode the checks target.** A tenant key puts one file's events in different partitions and a
 consumer sees "deleted" before "finalized". Publishing before the commit lets a downstream index mark a
-file readable before its bytes exist. And a payload that carries the original filename ships user text
-into a retained, replicated topic — the extension alone tells an attacker what the tenant is storing.`,
+file readable before its bytes exist. A payload that carries the original filename ships user text
+into a retained, replicated topic; the extension alone tells an attacker what the tenant is storing.
+And a default producer can duplicate an event on a broker-side retry.
+
+Requirements:
+
+- Upload, finalize and delete events all publish to the topic \`file.event\`.
+- The message **key is the file id**, so every event for one file lands in the same partition and a
+  consumer sees that file's lifecycle in order.
+- The payload carries the object's **digest** (SHA-256), its **sniffed mime** and its **size**, plus
+  opaque ids. It carries neither the original filename, nor the file's bytes, nor anything a consumer
+  would have to treat as untrusted user text.
+- The **finalize** event publishes only after the object store's \`CommitMultipart\` has returned, so a
+  consumer that reacts to "finalized" cannot race the commit and find the bytes missing.
+- The producer is configured for **\`acks=all\`** and **idempotence**, so a broker-side retry cannot
+  duplicate an event and a lost acknowledgement cannot silently drop one.`,
   sequence: {
     participants: ['Upload API', 'Object store', 'Kafka', 'Event consumer'],
     messages: [
@@ -127,8 +128,7 @@ def tenant_event_key(event):
 
 
 def publish_file_event(kind, event):
-    # TODO: this starter keys by tenant, publishes before the store commits, and ships the original
-    # filename in the payload so consumers can label attachments.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = json.dumps(
         {
             "kind": kind,
@@ -222,8 +222,7 @@ function tenantEventKey(event: FileEvent): string {
 }
 
 export async function publishFileEvent(kind: string, event: FileEvent): Promise<void> {
-  // TODO: this starter keys by tenant, publishes before the store commits, and ships the original
-  // filename in the payload so consumers can label attachments.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: 'file.event',
     messages: [
@@ -312,8 +311,7 @@ func tenantEventKey(event FileEvent) []byte {
 }
 
 func publishFileEvent(ctx context.Context, kind string, event FileEvent) error {
-	// TODO: this starter keys by tenant, publishes before the store commits, and ships the original
-	// filename in the payload so consumers can label attachments.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	body, _ := json.Marshal(map[string]any{
 		"kind":     kind,
 		"file_id":  event.FileID,
@@ -398,8 +396,7 @@ object FileEvents {
   def tenantEventKey(event: FileEvent): String = event.tenant
 
   def publishFileEvent(kind: String, event: FileEvent): Unit =
-    // TODO: this starter keys by tenant, publishes before the store commits, and ships the original
-    // filename in the payload so consumers can label attachments.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     producer.send(
       new ProducerRecord[String, String](
         "file.event",
@@ -464,8 +461,7 @@ object FileEvents {
 std::string tenantEventKey(const FileEvent& event) { return event.tenant; }
 
 bool publishFileEvent(const std::string& kind, const FileEvent& event) {
-  // TODO: this starter keys by tenant, publishes before the store commits, and ships the original
-  // filename in the payload so consumers can label attachments.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   nlohmann::json body = {{"kind", kind}, {"filename", event.filename}, {"size", event.size}};
   const std::string text = body.dump();
   const std::string key = tenantEventKey(event);
@@ -534,9 +530,9 @@ void deleteFile(const std::string& file_id, const std::string& tenant, const std
     },
   },
   hints: [
-    'The partition key decides ordering. Key by the file id and every event for one file is appended to one partition in order; key by the tenant and the same file’s events interleave with other files.',
-    'Publish after the commit, not before. A consumer that reacts to "finalized" reads the object; if the event left the producer first, the consumer can race the commit and read a half-written object.',
-    'Treat the topic as a public, retained surface. Digests, sniffed types and sizes are safe to keep; the original filename is user text whose extension alone leaks what the tenant is storing.',
+    'The search index shows a file as readable while its download 404s, a consumer logs "deleted" before "finalized" for the same file, and the retained topic lists every tenant\'s original filenames.',
+    "The starter keys on tenant_event_key, so one file's events spread across partitions; finalize() produces before store.commit_multipart; the payload carries filename but no digest or sniffed type; the Producer uses default acks.",
+    'Key with file_event_key(event), call store.commit_multipart before publish, replace filename with digest and sniffed_mime beside size, and construct the Producer with acks=all and enable.idempotence=True.',
   ],
-  debrief: `The interviewer is testing whether you treat an event topic as part of the storage contract. The starter looks harmless because one tenant and one file never collide in a demo; under load the tenant key reorders a file's lifecycle and the pre-commit publish lets an index mark a file readable before the bytes exist. The fixes are ordering and content: key by the thing whose order matters, and keep user text out of the payload. Real systems add an outbox row so a broker outage cannot lose the event with the commit, a schema registry so a future producer cannot smuggle a filename back in, and a consumer that updates its index idempotently because \`acks=all\` gives you at-least-once, not exactly-once.`,
+  debrief: `The key is the file id because the partition key is the only ordering guarantee Kafka offers, and a file's lifecycle is the thing whose order consumers depend on. Publishing after the commit makes the event a statement about bytes that exist, which is the only statement a downstream index can safely act on. Keeping the payload to digest, sniffed type and size treats the topic as a retained, replicated surface where user text does not belong. The idempotent producer with acks=all removes broker-side duplicates and lost acknowledgements, but it still delivers at least once, so production consumers update their index idempotently, and many producers write an outbox row in the same transaction as the commit so a broker outage cannot lose the event.`,
 };

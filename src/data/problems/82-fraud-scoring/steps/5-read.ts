@@ -8,32 +8,29 @@ export const readStep: Step = {
   focus: ['reviewer', 'scorer', 'accounts', 'audit'],
   task: `## Task
 
-**Starting point.** The starter is working code: an analyst opens a case, sees
-the score, the signals and the velocity numbers, and everything works. It is also a card-data leak
-with a tenant-isolation hole behind it. Debug it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/cases/{id}\` for the review console: it looks the
+case up with \`cases.get(case_id)\`, answers a miss with 404, builds the body in \`case_view\` with
+the score, band, signals, velocity, \`card_number: record["pan"]\` and \`raw_features\`, and adds an
+unmasked \`pan\` when the caller's role header says \`admin\`. It serves the demo and hides four
+flaws.
 
-Implement \`GET /v1/cases/{id}\` for the review console.
+**Failure mode the checks target.** The lookup takes no tenant, so any authenticated caller can read
+any case by guessing an id, and the body it gets carries the full card number and the feature
+vector. The role gate is a header the client sets, which makes the extraction path feel supervised
+without supervising it. Each flaw alone looks like a small omission; together they are a
+cross-tenant card-data export.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header, and the case is read **scoped to
-  that tenant**: \`cases.get(tenant, case_id)\`. A case that belongs to another tenant is
-  indistinguishable from a case that does not exist: **404**, never 403 and never a partial body.
-- The response carries the score, the band, the signals, the velocity snapshot and **masked**
-  account identifiers: \`mask_card(pan)\` returns \`MASK_PREFIX\` plus the last four digits, so a
-  reviewer can match a case to a support call without ever holding a usable card number. Masking is
-  enforced in the response builder, not by a request parameter.
-- **Raw card data is absent from this response regardless of role.** No \`card_number\` key, no
-  \`pan\`, no raw feature vector — not for \`admin\`, not for \`reviewer\`, not for a service account.
+- The tenant comes from the authenticated \`X-Tenant-Id\` header and the case is read scoped to it:
+  \`cases.get(tenant, case_id)\`. A case that belongs to another tenant is indistinguishable from
+  one that does not exist: **404**, not 403 and not a partial body.
+- The response carries the score, the band, the signals, the velocity snapshot and a masked card
+  reference: \`mask_card(pan)\` returns \`MASK_PREFIX\` plus the last four digits, applied in the
+  response builder, not by a request parameter.
+- Raw card data is absent from this response regardless of role: no \`card_number\`, no \`pan\`, no
+  raw feature vector, for \`admin\` as much as for \`reviewer\`.
 - Raw card data is reachable only through \`audited_pan(actor, tenant, case_id)\`, a separate tool
   that declares a scope and writes an audit row (\`audit_log.record(actor, scope, case_id)\`) before
-  it returns the PAN. A role check inside the read handler is not that tool; it is the same leak
-  with a longer name.
-
-**Failure mode the checks target.** The starter returns \`record["pan"]\` and the raw feature vector in
-the case detail, and it looks up \`cases.get(case_id)\` with no tenant at all, so any authenticated
-caller can read any case by guessing an id. Then it gates unmasking on a role the caller sends in a
-header — \`if role == "admin"\` — which is not authorization, it is a suggestion to the client. The
-combination is what makes this step hard: each defect alone looks like a small omission, and together
-they are a cross-tenant card-data extraction path.`,
+  it returns the PAN.`,
   sequence: {
     participants: ['Review console', 'Fraud Scorer', 'Case store', 'Audit tool'],
     messages: [
@@ -87,7 +84,7 @@ they are a cross-tenant card-data extraction path.`,
       id: 'raw-pan-absent',
       title: 'No raw card data in the response, whatever the role',
       detail:
-        'The case detail never carries a full card number: the masked `card_ref` replaces it and no `card_number` field exists. The starter ships `card_number` and unmasked `pan` for anyone who claims the admin role.',
+        'The case detail carries no full card number: the masked `card_ref` replaces it and no `card_number` field exists. The starter ships `card_number` to everyone and an unmasked `pan` to anyone who claims the admin role.',
       match: {
         python: {all: [/mask_card\(/], none: [/card_number/]},
         typescript: {all: [/maskCard\(/], none: [/card_number/]},
@@ -100,7 +97,7 @@ they are a cross-tenant card-data extraction path.`,
       id: 'tenant-scope',
       title: 'A foreign case is 404',
       detail:
-        'The lookup is scoped with the caller’s tenant — `cases.get(tenant, case_id)` — and a miss is **404**, so a case id from another tenant is indistinguishable from an unknown one. The starter looks the case up by id alone, so any authenticated caller can read any case.',
+        "The lookup is scoped with the caller's tenant, `cases.get(tenant, case_id)`, and a miss is **404**, so a case id from another tenant is indistinguishable from an unknown one. The starter looks the case up by id alone, so any authenticated caller can read any case.",
       match: {
         python: {all: [/cases\.get\(tenant/, /\b404\b/]},
         typescript: {all: [/cases\.get\(tenant/, /\b404\b/]},
@@ -113,7 +110,7 @@ they are a cross-tenant card-data extraction path.`,
       id: 'audited-tool',
       title: 'Raw card data lives behind a separately audited tool',
       detail:
-        '`audited_pan(actor, tenant, case_id)` resolves the case for that tenant, writes an audit row with a declared scope, and only then returns the PAN. The starter instead branches on a caller-supplied role inside the read handler — `if role == "admin"` — which is a client-controlled bypass, not authorization.',
+        '`audited_pan(actor, tenant, case_id)` resolves the case for that tenant, writes an audit row with a declared scope, and only then returns the PAN. The starter instead branches on a caller-supplied role inside the read handler, `if role == "admin"`, which is a client-controlled bypass, not authorization.',
       match: {
         python: {all: [/def audited_pan\(/, /audit_log\.record\(/], none: [/role\s*==\s*["']admin["']/]},
         typescript: {all: [/function auditedPan\(/, /auditLog\.record\(/], none: [/role\s*===\s*['"]admin['"]/]},
@@ -157,8 +154,7 @@ def case_view(record: dict, case_id: str) -> dict:
 
 @app.get("/v1/cases/{case_id}")
 def read_case(case_id: str, role: str = Header(default="reviewer")) -> JSONResponse:
-    # TODO: the starter serves any case id across tenants, returns the full card number and the raw
-    # feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     record = cases.get(case_id)
     if record is None:
         return JSONResponse({"error": "case not found"}, status_code=404)
@@ -262,8 +258,7 @@ class CaseStore {
 const cases = new CaseStore();
 
 app.get('/v1/cases/:caseId', async (request, reply) => {
-  // TODO: the starter serves any case id across tenants, returns the full card number and the raw
-  // feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {caseId} = request.params as {caseId: string};
   const role = request.headers['x-reviewer-role'];
   const record = await cases.get(caseId);
@@ -391,8 +386,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readCase(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the starter serves any case id across tenants, returns the full card number and the raw
-	// feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	caseID := r.PathValue("case_id")
 	role := r.Header.Get("X-Reviewer-Role")
 	record, err := cases.Get(r.Context(), caseID)
@@ -556,8 +550,7 @@ object CasesApi {
   private def json(status: StatusCode, body: String): Route =
     complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
 
-  // TODO: the starter serves any case id across tenants, returns the full card number and the raw
-  // feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   val route: Route =
     path("v1" / "cases" / Segment) { caseId =>
       get {
@@ -686,8 +679,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/cases/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the starter serves any case id across tenants, returns the full card number and the raw
-    // feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string case_id = req.matches[1];
     const json record = cases.get(case_id);
     if (record.is_null()) {
@@ -800,10 +792,10 @@ int main() {
     },
   },
   hints: [
-    'Tenant scoping is a parameter, not a filter you remember to apply: `cases.get(tenant, case_id)` and a miss is 404. If the id alone is enough to fetch a case, then any authenticated caller who can guess an id can read another tenant’s customer.',
-    'Masking belongs in the response builder: `mask_card(pan)` returns `MASK_PREFIX` + the last four digits, and `case_view` is the only thing that builds a case body. Never branch on a request header to decide whether to unmask — a role the caller sends is data, not authorization.',
-    'Raw card data moves to a separate tool: `audited_pan(actor, tenant, case_id)` resolves the case for that tenant, records the actor and the `pan:read` scope, and only then returns the PAN. That is the difference between a leak and an auditable exception.',
+    "A reviewer from tenant A pastes a case id from tenant B's support ticket and gets a 200 with a full card number in it; with `role: admin` in the header the same body grows a `pan` field.",
+    '`cases.get(case_id)` has no tenant argument, `case_view` copies `record["pan"]` and `record["features"]` straight into the body, and the only guard on unmasking is a header the client wrote.',
+    'Read `X-Tenant-Id`, call `cases.get(tenant, case_id)` and 404 on a miss; in `case_view` emit `card_ref: mask_card(pan)` with `MASK_PREFIX` and drop `card_number`/`raw_features`; move the PAN to `audited_pan`, which calls `audit_log.record` first.',
   ],
-  debrief: `The last step checks authorization and data minimization together, because that is how the failure actually happens: a case detail that returns the full card number and a lookup that ignores the tenant produce a cross-tenant card-data path, and the role check in between makes it feel supervised. Three defects are checked: masking enforced in the response, no raw card data in the case body regardless of role, and a separately audited path for the rare legitimate need. Real systems add field-level redaction driven by a data-classification tag rather than a hand-written response shape, reason codes on every audited read, and a rate limit per reviewer so one curious account cannot enumerate the case table.
+  debrief: `Tenant scoping is a parameter of the lookup rather than a filter on the result because a filter is something a future caller forgets; a store method that cannot be called without a tenant cannot be bypassed by one. Masking lives in \`case_view\` for the same reason: there is one place that builds a case body, so there is one place the invariant has to hold. The role header was removed rather than hardened because a value the client sends is data, not authorization; the legitimate need for a PAN is met by a tool whose first line is an audit write, so the rare read leaves a trace. Production consoles drive redaction from a data-classification tag on each field, require a reason code on every audited read, and rate-limit case reads per reviewer so one curious account cannot enumerate the case table.
 `,
 };

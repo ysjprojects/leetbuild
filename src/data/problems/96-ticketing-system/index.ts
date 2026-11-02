@@ -15,56 +15,50 @@ import {stateStep} from './steps/state';
 export const ticketingSystemProblem: Problem = {
   id: 'ticketing-system',
   title: 'Ticketing System',
-  tagline: 'Support tickets with guarded transitions, scoped notes and no duplicate CRM writes.',
+  tagline: 'A support ticket backend: a transition table in front of the state, a Redis lease in front of the agent.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Ticketing System
 
-A ticketing system is the piece of a support platform that turns a customer's message into a
-tracked unit of work: who owns it, what state it is in, what has been said, and which of that the
-requester may see. The visible part is a ticket page; the parts that decide whether the platform is
-safe are the state machine, the assignment lease, the CRM sync, the event timeline, and the
-visibility rules on every read.
+A ticketing system turns a customer's message into a tracked unit of work: who owns it, what state
+it is in, what has been said, and which of that the requester may see. The visible part is a ticket
+page; the parts that decide whether the platform is safe are the state machine, the assignment
+lease, the CRM sync, the event timeline, and the visibility rules on every read.
 
 ## The real system
 
-Production ticket systems move tickets through validated states — open, pending, resolved, closed —
-with an allowed-transition table, so a customer cannot jump a ticket straight to closed and a
-support flow cannot skip a step. Agents take tickets through a lease, so one agent owns a ticket at
-a time and a released lease returns the ticket to the queue instead of stranding it. Notes sync to
-the CRM under the note id as an idempotency key, so a retry updates one record instead of
-duplicating an agent's reply. Every state, assignment and note event publishes to a topic keyed by
-ticket so a ticket's timeline stays ordered, carrying actor roles and transitions and never note
-bodies. And a read applies visibility: internal notes are for agents, requesters see the public
-thread, and pagination is cursor-stable so a busy ticket does not shift pages under a reader.
+Zendesk moves a ticket through New, Open, Pending, On-hold, Solved and Closed. Solved is the last
+state an agent sets by hand: an automation closes a solved ticket after a configured number of days
+(four by default), and a closed ticket cannot be reopened by the requester; a reply becomes a
+follow-up ticket that references the original. That is a transition table with a time window on one
+edge, the shape the first step asks for. Around it a support backend owns assignment (one agent per
+ticket, with a path back to the queue), a CRM sync that must not duplicate an agent's reply on
+retry, an ordered per-ticket event stream, and visibility rules that keep internal notes with the
+agents.
 
 ## What you build here
 
 One service, **ticketd**, with five pieces:
 
-1. \`POST /v1/tickets\`: requester-authenticated intake and guarded transitions. Creating a ticket
-   opens it; an update may only move it along the allowed-transition table, a non-agent may only
-   touch their own ticket, and a requester may only reopen a ticket closed within the window. An
-   illegal transition is \`409\` with the allowed set; a non-agent edit is \`403\`.
-2. A **Redis** assignment layer: \`SET NX EX\` leases so one agent owns a ticket at a time, a lease
-   release that returns the ticket to the queue, and unread counters per requester updated in the
-   same atomic unit as the message append.
-3. A **gRPC** CRM client: notes sync with a 3-second deadline and the note id as the idempotency
-   key, so a retry updates one CRM record; a schema rejection quarantines the note with a reason
-   instead of retrying forever; and a CRM failure never blocks the ticket UI.
-4. A **Kafka** event path: \`ticket.event\` keyed by ticket id so a ticket's timeline stays ordered,
-   carrying actor roles and state transitions and never note bodies or requester identities beyond
-   ids, published only after the ticket store commits.
+1. \`POST /v1/tickets\`: intake and guarded transitions. An update moves along the allowed-transition
+   table (\`409\` with the allowed set otherwise), a requester touches only their own ticket (\`403\`),
+   and a reopen is allowed only inside the window.
+2. A **Redis** assignment layer: \`SET NX EX\` leases so one agent owns a ticket at a time, a release
+   that returns the ticket to the queue, and unread counters updated atomically with the append.
+3. A **gRPC** CRM client: a 3-second deadline, the note id as the idempotency key, quarantine on a
+   schema rejection, and a CRM failure that does not block the ticket UI.
+4. A **Kafka** event path: \`ticket.event\` keyed by ticket id, carrying actor roles and transitions
+   but no note bodies, published only after the ticket store commits.
 5. \`GET /v1/tickets/{id}\`: a timeline that hides internal notes from requesters, includes them for
-   agents, and paginates by cursor so a busy ticket does not shift pages.
+   agents, and paginates by cursor.
 
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real support platform: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+it looks right. Your job in every step is the one you will have on a real support platform: debug it
+against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail
+on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,28 +8,26 @@ export const endpointStep: Step = {
   focus: ['client', 'api'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the ingest route,
-parses the batch and acknowledges it. It compiles, it serves the demo, and it hides three production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/metrics\`, parses a body of
+\`{"samples": [{"metric": "…", "labels": {…}, "timestamp": 1719…, "value": 1.0}]}\` from an
+\`X-Tenant-Id\` tenant and answers \`{"accepted": n}\`. It compiles, serves the demo and hides 4
+flaws.
 
-Implement \`POST /v1/metrics\` with body \`{"samples": [{"metric": "…", "labels": {…}, "timestamp": 1719…, "value": 1.0}]}\`.
+**Failure mode the checks target.** Labels are dimensions, so a label set the handler does not bound
+multiplies series until one tenant's cardinality fills the store. A year-old timestamp backfills a
+window that already rolled up, so the chart moves under a reader who has already looked. And a 200
+written before validation reports a rejected sample as accepted; the sender deletes its buffer and the
+datapoint is gone.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- A missing tenant is **401**.
 - A batch carries at most **500** samples; a larger batch is **400**.
 - Each sample's labels must come from the tenant's per-label allowlist, and the label set must fit
   the tenant's cardinality budget (**12** labels per sample). A sample that breaks either limit is
-  **422**, and the body must name the offending label.
+  **422**, and the body names the offending label.
 - Each sample's \`timestamp\` must be within **3600** seconds of now; anything outside the accepted
   skew is **400**.
-- Validation happens **before** the batch is acknowledged. Nothing in a batch may be accepted and
-  then silently dropped: if any sample fails, the whole batch is rejected with its reason.
-
-**Failure mode the checks target.** An unbounded label set is how one tenant's cardinality blows up
-the whole store: labels are dimensions, so the starter's "accept any label" path multiplies series
-without bound. Accepting a year-old timestamp backfills a window that has already rolled up, so the
-chart moves under a reader who has already looked. And acknowledging the batch before validating it
-means a rejected sample is reported as accepted — the sender deletes its buffer and the datapoint is
-gone forever.`,
+- Validation happens **before** the batch is acknowledged: if any sample fails, the whole batch is
+  rejected with its reason, so nothing is accepted and then silently dropped.`,
   sequence: {
     participants: ['Metrics Client', 'Metrics API', 'label budget'],
     messages: [
@@ -128,8 +126,7 @@ class Batch(BaseModel):
 
 @app.post("/v1/metrics")
 def ingest(batch: Batch, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
-    # sets and accepts timestamps up to a year old. Validate every sample first.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     return JSONResponse({"accepted": len(batch.samples)}, status_code=200)
 `,
       solution: `import time
@@ -198,8 +195,7 @@ interface Batch {
 }
 
 app.post('/v1/metrics', async (req: FastifyRequest, reply: FastifyReply) => {
-  // TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
-  // sets and accepts timestamps up to a year old. Validate every sample first.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const batch = req.body as Batch;
   return reply.code(200).send({accepted: batch.samples.length});
 });
@@ -267,8 +263,7 @@ type Batch struct {
 }
 
 func ingest(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
-	// sets and accepts timestamps up to a year old. Validate every sample first.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	var batch Batch
 	_ = json.NewDecoder(r.Body).Decode(&batch)
 	w.WriteHeader(http.StatusOK)
@@ -369,8 +364,7 @@ object Api {
   implicit val sampleFormat = jsonFormat4(Sample)
   implicit val batchFormat = jsonFormat1(Batch)
 
-  // TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
-  // sets and accepts timestamps up to a year old. Validate every sample first.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   val routes: Route = path("v1" / "metrics") {
     post {
       entity(as[Batch]) { batch =>
@@ -437,8 +431,7 @@ using json = nlohmann::json;
 
 int main() {
   httplib::Server svr;
-  // TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
-  // sets and accepts timestamps up to a year old. Validate every sample first.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   svr.Post("/v1/metrics", [](const httplib::Request& req, httplib::Response& res) {
     const json batch = json::parse(req.body);
     res.status = 200;
@@ -499,9 +492,9 @@ int main() {
     },
   },
   hints: [
-    'Validate every sample before you answer: a batch that is acknowledged and then dropped loses datapoints the sender has already forgotten.',
-    'The label set is an input, not a given. Check each label name against the tenant allowlist and the per-sample label budget, and name the offending label in the 422 body.',
-    'Timestamps are claims too. Compare each sample timestamp to now and reject anything outside the accepted skew — a backfilled window is a chart that lies after the fact.',
+    'A batch with a 13-label sample or a timestamp from last year returns 200 and the sender drops its buffer, yet the datapoint is missing from the chart and the series count keeps climbing.',
+    'The handler builds the 200 from `len(batch.samples)` before any field is inspected, so there is no path that can answer 400 or 422 for a bad sample.',
+    'Call `validate_batch` first: cap the batch at `MAX_BATCH_SAMPLES`, check each label against `LABEL_ALLOWLIST` and `MAX_LABELS_PER_SAMPLE` (422, naming the label), and reject timestamps beyond `MAX_SKEW_SECONDS` (400).',
   ],
-  debrief: `The interviewer is testing whether you can debug an ingest handler at the trust boundary. The starter reads fine because the demo sends one well-formed sample from one tenant. Three defects are being checked: cardinality (an unbounded label set is how one tenant blows up the store for everyone), freshness (an accepted year-old timestamp rewrites a window that has already rolled up), and honest acknowledgment (validating after the 200 means a rejected sample is reported as accepted and never retried). Real ingest paths add per-tenant cardinality budgets that are enforced as a running series count, a metric-name allowlist on top of the label allowlist, and a partial-success protocol only when the sender can actually retry the failed samples — never a silent drop.`,
+  debrief: `Every field of an ingest batch is a claim the handler has to check before it writes anything, which is why the fix runs the whole validation pass before the first byte of the response. Labels are dimensions: bounding them per sample and per tenant is what keeps one tenant's label explosion from becoming everyone's store. The skew check is a freshness contract with readers; a window that already rolled up must not move. Rejecting the whole batch, with the offending label named, gives the sender's retry loop something it can act on. Beyond this step, production ingest enforces cardinality as a running per-tenant series count rather than a per-sample budget, and offers partial success only where the sender can retry the failed samples individually.`,
 };

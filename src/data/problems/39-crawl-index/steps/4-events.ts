@@ -8,29 +8,25 @@ export const eventsStep: Step = {
   focus: ['crawler', 'kafka', 'indexer', 'index', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an event per crawled page and the
-indexer picks it up, so the demo shows pages appearing in search. Three contracts are broken. Find
-them, fix them, and prove the fix.
-
-Implement \`POST /v1/crawl/pages\` — the endpoint a crawl worker calls once it has fetched and stored
-a page — with body
+**Starting point.** The starter serves \`POST /v1/crawl/pages\`, the endpoint a crawl worker calls
+once it has fetched and stored a page, with body
 \`{"url": "https://blog.example.com/posts", "status": 200, "content_hash": "sha256:…", "body_ref": "s3://pages/…"}\`.
+It produces one \`crawl.page\` event, marks the page indexed, writes the index entry and answers
+\`{"accepted": true}\`. In the demo the indexer picks the event up and pages appear in search. It
+serves the demo and hides five flaws.
 
-- Publish **exactly one** \`crawl.page\` event per page with the **host** as the message key.
-  Partitioning by host is what keeps a host's history ordered: keyed by worker id, the same host's
-  pages arrive on different partitions and a re-crawl interleaves with the first crawl.
-- The payload carries **references, never the page**: \`url\`, \`host\`, \`status\`,
-  \`content_hash\` and \`body_ref\` (where the stored page lives). The starter inlines the fetched
-  markup “for convenience”, which copies every page into a retained, replicated topic.
-- **The index write confirms before the event is announced.** Write the entry first, then mark the
-  page indexed, then publish; a consumer that reads an event must always find the entry it points
-  at. The starter publishes first and marks the page indexed before the write returns, so a consumer
-  can read an index entry that is not there yet and a failed write still looks indexed.
+**Failure mode the checks target.** Each flaw is invisible while one worker crawls one host and the
+index never fails: a key that does not preserve per-host order, a payload that turns the topic into
+a copy of the crawl, and an announcement made before the index has confirmed the write.
 
-**Failure mode the checks target.** Worker-keyed events lose per-host order; an inlined body turns
-the topic into a copy of the crawl (and of every tenant's content); and announcing before the write
-confirms means the event is a promise the index has not made yet. Each of those is invisible in a
-demo where one worker crawls one host and the index never fails.`,
+- Publish **exactly one** \`crawl.page\` event per page with the **host** as the message key, so a
+  host's history stays on one partition and a re-crawl does not interleave with the first crawl.
+- The payload carries **references, not the page**: \`url\`, \`host\`, \`status\`,
+  \`content_hash\` and \`body_ref\` (where the stored page lives). No markup and no \`content\`
+  field.
+- **The index write confirms before the event is announced.** \`index.put\` first, then
+  \`mark_indexed\`, then publish; a consumer that reads an event must find the entry it points at,
+  and a failed write must not leave the page looking indexed.`,
   sequence: {
     participants: ['Crawl worker', 'Search index', 'crawl.page', 'Indexer'],
     messages: [
@@ -44,9 +40,9 @@ demo where one worker crawls one host and the index never fails.`,
     ],
   },
   hints: [
-    'The message key is the partition key. Take the host out of the URL once (`urlsplit(...).hostname`, `new URL(url).hostname`, `url.Parse(...).Hostname()`, `new URI(url).getHost`) and use it for both the event and the key — the key and the payload must not disagree about which host this page belongs to.',
-    'A reference is a pointer the consumer can resolve later: the URL, the content hash that proves which revision it is, and where the bytes live. Anything the consumer can derive by fetching the reference does not belong in the topic, which is why the starter’s inlined markup is both a leak and a retention cost.',
-    'Order the write and the announcement: `index.put(...)` first, then mark the page indexed, then `publish(...)`. If the publish fails after the write, the page is indexed but unannounced — recoverable by a sweep. If the publish happens first, the event is a promise the index has not made yet, and the consumer reads nothing.',
+    'Run two workers against one host and the indexer sees a re-crawl interleaved with the first crawl. The topic grows at the size of the pages, and a page whose index write failed looks indexed.',
+    'The handler keys the produce with `worker_id`, puts `body.html` into the event as `content` with no hash or reference, and calls `records.mark_indexed` and `index.put` only after the produce has flushed.',
+    'Key `producer.produce` by the host from `urlsplit(body.url).hostname`; send `url`, `host`, `status`, `content_hash`, `body_ref` and nothing else; call `index.put` first, then `records.mark_indexed`, then produce.',
   ],
   checks: [
     {
@@ -141,9 +137,7 @@ def page(
     worker_id: str = Header(alias="X-Worker-Id"),
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> dict:
-    # TODO: this starter keys the event by worker so one host's history scatters across partitions,
-    # inlines the fetched markup for convenience, and marks the page indexed before the index
-    # write confirms. Key by host, keep the payload to references, and index before you announce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {"url": body.url, "status": body.status, "content": body.html}
     producer.produce("crawl.page", key=worker_id, value=json.dumps(event))
     producer.flush()
@@ -223,9 +217,7 @@ async function publish(workerId: string, event: PageEvent): Promise<void> {
 }
 
 app.post('/v1/crawl/pages', async (request, reply) => {
-  // TODO: this starter keys the event by worker so one host's history scatters across partitions,
-  // inlines the fetched markup for convenience, and marks the page indexed before the index
-  // write confirms. Key by host, keep the payload to references, and index before you announce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const body = request.body as PageBody;
   const workerId = request.headers['x-worker-id'] as string;
   const event: PageEvent = {url: body.url, status: body.status, content: body.html};
@@ -320,9 +312,7 @@ func publish(ctx context.Context, workerID string, event PageEvent) error {
 }
 
 func RecordPage(ctx context.Context, body PageRequest, workerID string) error {
-	// TODO: this starter keys the event by worker so one host's history scatters across partitions,
-	// inlines the fetched markup for convenience, and marks the page indexed before the index
-	// write confirms. Key by host, keep the payload to references, and index before you announce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	if err := publish(ctx, workerID, PageEvent{URL: body.URL, Status: body.Status, Content: body.HTML}); err != nil {
 		return err
 	}
@@ -408,9 +398,7 @@ object PageEvents {
     producer.send(new ProducerRecord[String, String](PageTopic, workerId, event.toString))
 
   def recordPage(body: PageRequest, workerId: String): Unit = {
-    // TODO: this starter keys the event by worker so one host's history scatters across partitions,
-    // inlines the fetched markup for convenience, and marks the page indexed before the index
-    // write confirms. Key by host, keep the payload to references, and index before you announce.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     publish(workerId, PageEvent(body.url, body.status, body.html))
     records.markIndexed(body.url)
     index.put(body.url, body.contentHash)
@@ -467,9 +455,7 @@ void publish(const std::string& workerId, const std::string& payload) {
 }
 
 void recordPage(const std::string& url, int status, const std::string& contentHash, const std::string& markup) {
-  // TODO: this starter keys the event by worker so one host's history scatters across partitions,
-  // inlines the fetched markup for convenience, and marks the page indexed before the index
-  // write confirms. Key by host, keep the payload to references, and index before you announce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const json event = {{"url", url}, {"status", status}, {"content", markup}};
   publish(workerId, event.dump());
   records.markIndexed(url);
@@ -516,5 +502,5 @@ void recordPage(const std::string& url, int status, const std::string& content_h
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a publish path for ordering, leakage and honesty. The starter works in the demo because one worker crawls one host and the index never fails: the key looks arbitrary, the payload looks convenient, and the order of two statements looks irrelevant. Each is a production contract: the partition key is the ordering guarantee, the topic is a retention surface that must not hold tenant bytes, and the announcement is only true after the index has confirmed the write. Real crawlers go further: an outbox row when the broker rejects the produce, a schema registry so a future producer cannot smuggle page content into the event, and a compaction policy that keeps the latest hash per URL.`,
+  debrief: `The event is keyed by host, carries references, and goes out after the index confirms, because the property being protected is that a consumer can trust what it reads: the partition key is the per-host ordering guarantee, a reference points at bytes with their own retention and access control, and an announcement made after the write is a fact rather than a promise. The order of two statements matters for the same reason: a page marked indexed before \`index.put\` returns is a lie the next step's report will repeat. Production publish paths add an outbox row when the broker rejects the produce, a schema registry so a later producer cannot smuggle page content in, idempotent producers, and a compacted topic keeping the latest hash per URL.`,
 };

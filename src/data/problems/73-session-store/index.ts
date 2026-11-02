@@ -11,13 +11,13 @@ import {readStep} from './steps/5-read';
  * layer before it guards a platform. Rotation that mints a new id and retires the old one → Redis
  * records with a sliding TTL under a hard absolute cap and an atomic rotation → a gRPC validation
  * path with a short cache that fails closed on timeout → session events keyed by user carrying
- * hashes, never tokens, persisted before publish → a read endpoint whose last-seen is accurate,
+ * hashes, not tokens, persisted before publish → a read endpoint whose last-seen is accurate,
  * whose revoke-all is atomic and whose sessions are private.
  */
 export const sessionStoreProblem: Problem = {
   id: 'session-store',
   title: 'Session Store',
-  tagline: 'Session tokens that rotate, fail closed and never outlive their notice.',
+  tagline: 'Session ids that rotate at login and fail closed when the auth service is down.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,16 +31,19 @@ platform keeps about itself.
 
 ## The real system
 
-Production session layers issue an id at login and a new id at every privilege elevation, so a
-pre-login id can never become authenticated. They keep records in Redis under a sliding TTL so active
-users are not logged out, but under a hard absolute cap so a stolen token cannot live forever, and
-they write the replacement before retiring the original in one atomic step so a crash cannot leave
-two live sessions. They validate tokens against an auth service with a deadline and a short cache,
-and when that service is unavailable they deny the request rather than trusting a local copy. They
-publish one event per session change keyed by user so a user's history stays ordered, carrying a
-token hash and never the token, and they persist the session record before announcing it. And they
-show a user exactly what is live: device class, last-seen within a minute, rotation count, and one
-action that revokes every id atomically.
+Spring Security's session fixation protection changes the HTTP session id at the moment
+authentication succeeds (the default \`changeSessionId\` strategy), so an id a client held before
+login is not the id it holds after, and Spring Session keeps those sessions in Redis with an
+expiration that is refreshed on access. Session layers built along those lines issue a new id at
+every privilege elevation, keep records under a sliding TTL so active users are not logged out but
+under a hard absolute cap so a stolen token cannot live forever, and write the replacement before
+retiring the original in one atomic step so a crash cannot leave two live sessions. They validate
+tokens against an auth service with a deadline and a short cache, and when that service is
+unavailable they deny the request rather than trusting a local copy. They publish one event per
+session change keyed by user so a user's history stays ordered, carrying a token hash rather than
+the token, and they persist the session record before announcing it. And they show a user exactly
+what is live: device class, last-seen within a minute, rotation count, and one action that revokes
+every id atomically.
 
 ## What you build here
 
@@ -54,7 +57,7 @@ One service, **sessiond**, with five pieces:
    crash leaves exactly one live id.
 3. A **gRPC** auth client: a 150 ms deadline per validation, a short positive cache, a timeout that
    denies the request, a revocation that is visible within the cache window, and a rejection that is
-   terminal — never retried.
+   terminal rather than retried.
 4. A **Kafka** \`session.event\` path: events keyed by user id for per-user ordering, device class
    and a token hash in the payload, the raw token never published or logged, and the session record
    committed before the event is produced.

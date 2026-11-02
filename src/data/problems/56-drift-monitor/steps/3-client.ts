@@ -8,9 +8,14 @@ export const alertClientStep: Step = {
   focus: ['monitor', 'alerting', 'evaluator'],
   task: `## Task
 
-**Starting point.** The starter is working code: a threshold is crossed, an alert is raised and the
-on-call is paged. It hides three flaws, and the first one is why the page storm happened. Debug it,
-fix it, and prove the fix.
+**Starting point.** The starter's \`evaluate\` compares the distance with the threshold, builds a
+request with the monitor id, metric and distance, calls the alerting service once and logs any
+failure. It serves the demo and hides 5 flaws.
+
+**Failure mode the checks target.** An alert storm is a monitor that is technically correct and
+operationally useless; a call without a deadline takes the evaluator down with the alerting service;
+and a payload without counts turns every page into an argument about whether the number is even
+significant.
 
 When an evaluated window crosses the alert threshold, the monitor raises an alert over **gRPC**:
 
@@ -18,21 +23,13 @@ When an evaluated window crosses the alert threshold, the monitor raises an aler
   slow alerting service cannot pin the evaluator or the queue behind it.
 - The alert is **deduplicated per (monitor, window) with a cooldown**: the key
   \`alert:{monitor_id}:{window}\` is claimed with a **write-once** set carrying \`COOLDOWN_S = 300\`
-  seconds of expiry, and the claim happens **before** the call. The starter raises one alert per batch
-  tick above the threshold, which is 400 pages an hour from one monitor.
+  seconds of expiry, and the claim happens **before** the call. The key is per window, so two windows
+  of the same monitor can both alert: it throttles ticks, not drift.
 - The payload carries the **evidence**: the metric, the distance, the threshold, **both window
-  boundaries** and the **sample counts** on each side (\`sample_count\`, \`baseline_sample_count\`). The
-  starter sends the distance alone, so a responder cannot judge significance.
-- A failed call is **retried with backoff** (\`MAX_ATTEMPTS = 3\`, exponential from \`BACKOFF_MS\`),
-  never dropped silently: after the attempts are exhausted the claim is released and a
-  \`alert:pending:{monitor_id}\` marker records the alert for the next evaluation. The starter calls once
-  and logs the failure.
-
-**Failure mode the checks target.** An alert storm is a monitor that is technically correct and
-operationally useless; a call without a deadline takes the evaluator down with the alerting service;
-and a payload without counts turns every page into an argument about whether the number is even
-significant. The dedupe key is per (monitor, window), so two windows of the same monitor can both
-alert — it throttles ticks, not drift.`,
+  boundaries** and the **sample counts** on each side (\`sample_count\`, \`baseline_sample_count\`).
+- A failed call is **retried with backoff** (\`MAX_ATTEMPTS = 3\`, exponential from \`BACKOFF_MS\`), not
+  dropped: after the attempts are exhausted the claim is released and an
+  \`alert:pending:{monitor_id}\` marker records the alert for the next evaluation.`,
   sequence: {
     participants: ['Window evaluator', 'Drift Monitor', 'Redis', 'Alerting'],
     messages: [
@@ -60,7 +57,7 @@ alert — it throttles ticks, not drift.`,
       id: 'deadline',
       title: 'Every attempt carries a one-second deadline',
       detail:
-        'The call is created with a 1-second deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. The starter has none, so a stalled alerting service holds the evaluator open indefinitely.',
+        'The call is created with a 1-second deadline: `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. The starter has none, so a stalled alerting service holds the evaluator open indefinitely.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1\.0/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -147,9 +144,7 @@ def evaluate(
     window_end: int,
     counts: dict[str, int],
 ) -> bool:
-    # TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
-    # sends a payload without the sample counts, and drops the alert when the call fails. Fix all
-    # three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if distance < THRESHOLD:
         return False
     request = alerting_pb2.AlertRequest(monitor_id=monitor_id, metric=metric, distance=distance)
@@ -243,9 +238,7 @@ export async function evaluate(
   window_end: number,
   counts: Record<string, number>,
 ): Promise<boolean> {
-  // TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
-  // sends a payload without the sample counts, and drops the alert when the call fails. Fix all
-  // three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   if (distance < THRESHOLD) return false;
   const request: AlertRequest = {monitor_id: monitorId, metric, distance};
   try {
@@ -338,9 +331,7 @@ const threshold = 0.2
 var alerting pb.AlertingClient
 
 func evaluate(ctx context.Context, monitorID, metric string, distance float64, window int64, counts map[string]int64) bool {
-	// TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
-	// sends a payload without the sample counts, and drops the alert when the call fails. Fix all
-	// three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	if distance < threshold {
 		return false
 	}
@@ -455,9 +446,7 @@ object AlertClient {
       windowEnd: Long,
       counts: Map[String, Long],
   ): Boolean = {
-    // TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
-    // sends a payload without the sample counts, and drops the alert when the call fails. Fix all
-    // three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if (distance < Threshold) {
       return false
     }
@@ -555,9 +544,7 @@ bool evaluate(const std::string& monitorId,
               double distance,
               long window,
               const std::map<std::string, long>& counts) {
-  // TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
-  // sends a payload without the sample counts, and drops the alert when the call fails. Fix all
-  // three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   if (distance < kThreshold) return false;
   AlertRequest request;
   request.set_monitor_id(monitorId);
@@ -634,17 +621,17 @@ bool raiseAlert(const Monitor& monitor,
     },
   },
   hints: [
-    'Claim before you call: `SET alert:{monitor_id}:{window} 1 NX EX 300` returns nil when a cooldown is already running, and that nil is the whole storm fix. Do it first so two evaluator ticks racing on one window cannot both page.',
-    'A page without evidence gets argued about. Send the metric, the distance, the threshold, both boundaries and the counts on each side; `sample_count` vs `baseline_sample_count` is what lets a responder say "20 samples, ignore" or "20 000 samples, wake someone".',
-    'The retry loop is bounded and spaced: `MAX_ATTEMPTS = 3` with an exponential backoff, and it must not swallow the last failure. Release the dedupe claim and leave an `alert:pending:{monitor_id}` marker so the next evaluation picks the alert back up.',
+    'Symptom: one crossing pages the on-call every batch tick for an hour, each page shows a bare distance, and the night the alerting service hung the evaluator queue stopped draining.',
+    'Mechanism: `evaluate` goes straight from threshold comparison to `Raise` with no claim in Redis, no deadline on the call, a request built from three fields, and a single attempt whose failure is only logged.',
+    'Change: `SET alert:{monitor_id}:{window} NX EX COOLDOWN_S` before `Raise`, `timeout=DEADLINE_S` on every attempt, counts and both boundaries in the request, a `MAX_ATTEMPTS` loop with `BACKOFF_S` sleeps that leaves `alert:pending` on exhaustion.',
   ],
-  debrief: `This step is where a correct detector becomes a usable one. Three habits are being tested. First,
-deduplicate at the point of decision with a key that names the thing you are deduplicating —
-(monitor, window) — and claim it before the call, because a claim after the call still lets a race
-through. Second, put the evidence in the payload: distance, threshold, both boundaries and both sample
-counts, so the page is actionable instead of a debate. Third, treat the alerting service like any
-other dependency: a deadline, a bounded retry with backoff, and a durable marker when the retries run
-out, so an alert is delayed rather than lost. Real systems add alert grouping across monitors, a
-silence API for operators, per-severity cooldowns, and a synthetic canary alert that keeps the pager
-path honest.`,
+  debrief: `The dedupe claim goes before the call because it is the decision, not a record of it: a write-once
+key with the cooldown as its expiry turns "should this window page?" into one Redis round trip
+that two racing ticks cannot both win. Releasing the claim when the retries run out is the other
+half of the same idea; a claim that outlives a failed alert would suppress the retry that mattered.
+The deadline and the bounded backoff treat the alerting service like any other dependency: slow is
+tolerated for a second, then the evaluator moves on and the \`alert:pending\` marker carries the
+alert to the next evaluation. Production alerting adds grouping across monitors, an operator
+silence API, per-severity cooldowns and a synthetic canary alert that exercises the pager path,
+which this step leaves out.`,
 };

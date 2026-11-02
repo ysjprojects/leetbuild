@@ -8,32 +8,29 @@ export const eventsStep: Step = {
   focus: ['server', 'kafka', 'counter', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the impression pipeline: it
-builds a producer, serializes a payload and publishes to \`ads.impression\`. It hides three
-production flaws, all of which inflate the numbers an advertiser is billed for. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the impression pipeline: \`publish_impression_at_serve\` builds
+a JSON payload on the serve path, produces it to \`ads.impression\` keyed by \`user_hash\` with
+\`acks = 1\`, flushes, and only then increments \`render:{campaign_id}\`. It compiles and hides four
+flaws, all of which inflate the numbers an advertiser is billed for.
 
-Implement the pipeline the render beacon calls after an ad has actually been displayed.
+**Failure mode the checks target.** The starter publishes from the serve path, so it bills
+impressions for ads that never rendered. It keys by user, so a campaign's events land in every
+partition and a consumer sees them out of order. It dedupes nothing, so a retried beacon counts
+twice. And it acknowledges the produce before the counter is updated, so a crash between the two
+leaves events and counters disagreeing forever.
 
-- Impressions are counted and published **at render**, never when the ad is served: only
-  \`handle_render_beacon\` (the beacon handler) produces to \`ads.impression\`. A serve response that
-  was never displayed produces no impression and no event.
+The pipeline the render beacon calls after an ad has actually been displayed:
+
+- Impressions are counted and published **at render**: only \`handle_render_beacon\` produces to
+  \`ads.impression\`. A serve response that was never displayed produces no event.
 - The event is keyed by **campaign id** (\`key = campaign_id\`), so one campaign's delivery stream
-  stays in one partition and stays ordered. Keying by user scatters a single campaign across every
-  partition, and per-campaign ordering is lost.
+  stays in one partition and stays ordered.
 - Each beacon carries a \`beacon_id\`; the pipeline **dedupes** on it with a \`SET ... NX EX\` write
-  (\`DEDUPE_TTL_S\`) before it counts anything, so a retried or replayed beacon is counted once. The
-  event carries the \`beacon_id\` and its \`dedupe_key\`.
-- The pacing counter for the campaign **commits before the event is produced**: count first, publish
-  second. If the broker rejects the produce, write an **outbox** row for the payload instead of
-  dropping it, and configure the producer for \`acks = all\` (and idempotence) so a retried produce
-  cannot double-publish.
-
-**Failure mode the checks target.** The starter publishes from the serve path, so it bills impressions
-for ads that never rendered — the same ad fifty times, the advertiser paying for all of them. It
-keys by user, so a campaign's events land in every partition and a consumer sees them out of order.
-And it acknowledges the produce before the counter is updated: a crash between the two loses the
-count while the event survives, so events and counters disagree forever.`,
+  (\`DEDUPE_TTL_S\`) before it counts anything. The event carries the \`beacon_id\` and its
+  \`dedupe_key\`.
+- The pacing counter **commits before the event is produced**. If the broker rejects the produce,
+  write an **outbox** row instead of dropping it, and configure the producer for \`acks = all\` (and
+  idempotence) so a retried produce cannot double-publish.`,
   sequence: {
     participants: ['Client', 'Ad Server', 'ads.impression', 'pacing counters'],
     messages: [
@@ -148,9 +145,7 @@ def make_producer(bootstrap: str) -> KafkaProducer:
 
 
 def publish_impression_at_serve(producer, redis_client, campaign_id: str, user_hash: str, price_micros: int) -> None:
-    # TODO: this starter publishes when the ad is served rather than when it renders, keys the
-    # event by user so one campaign's stream scatters, dedupes nothing, and acknowledges before
-    # the pacing counter is updated. Fix all four flaws.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     payload = json.dumps({"campaign_id": campaign_id, "user_hash": user_hash, "price_micros": price_micros})
     producer.produce(TOPIC, key=user_hash, value=payload)
     producer.flush()
@@ -243,9 +238,7 @@ export async function publishImpressionAtServe(
   userHash: string,
   priceMicros: number,
 ): Promise<void> {
-  // TODO: this starter publishes when the ad is served rather than when it renders, keys the
-  // event by user so one campaign's stream scatters, dedupes nothing, and acknowledges before
-  // the pacing counter is updated. Fix all four flaws.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const payload = JSON.stringify({campaign_id: campaignId, user_hash: userHash, price_micros: priceMicros});
   await producer.send({topic: IMPRESSION_TOPIC, messages: [{key: userHash, value: payload}]});
   await redis.incr(renderCounterKey(campaignId));
@@ -348,9 +341,7 @@ type Beacon struct {
 func renderCounterKey(campaignID string) string { return "render:" + campaignID }
 
 func PublishImpressionAtServe(ctx context.Context, writer *kafka.Writer, rdb *redis.Client, beacon Beacon, priceMicros int64) error {
-	// TODO: this starter publishes when the ad is served rather than when it renders, keys the
-	// event by user so one campaign's stream scatters, dedupes nothing, and acknowledges before
-	// the pacing counter is updated. Fix all four flaws.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(map[string]any{
 		"campaign_id":  beacon.CampaignID,
 		"user_hash":    beacon.UserHash,
@@ -490,9 +481,7 @@ class ImpressionPipeline(producer: KafkaProducer[String, String], redis: Jedis) 
   import ImpressionEvents._
 
   def publishImpressionAtServe(beacon: Beacon, priceMicros: Long): Unit = {
-    // TODO: this starter publishes when the ad is served rather than when it renders, keys the
-    // event by user so one campaign's stream scatters, dedupes nothing, and acknowledges before
-    // the pacing counter is updated. Fix all four flaws.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"campaign_id":"\${beacon.campaign_id}","price_micros":$priceMicros}"""
     producer.send(new ProducerRecord[String, String](ImpressionTopic, beacon.user_hash, payload)).get()
     redis.incr(renderCounterKey(beacon.campaign_id))
@@ -573,9 +562,7 @@ class ImpressionPipeline {
   ImpressionPipeline(RdKafka::Producer* producer, sw::redis::Redis& redis) : producer_(producer), redis_(redis) {}
 
   void PublishImpressionAtServe(const std::string& campaignId, const std::string& userHash, long priceMicros) {
-    // TODO: this starter publishes when the ad is served rather than when it renders, keys the
-    // event by user so one campaign's stream scatters, dedupes nothing, and acknowledges before
-    // the pacing counter is updated. Fix all four flaws.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string payload = "{\\"campaign_id\\":\\"" + campaignId + "\\",\\"price_micros\\":" +
                                 std::to_string(priceMicros) + "}";
     producer_->produce(kImpressionTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
@@ -660,9 +647,9 @@ class ImpressionPipeline {
     },
   },
   hints: [
-    'Move the produce call to the beacon handler and leave the serve path alone. An impression is a fact about a display, and the only place that knows a display happened is the render beacon — anything else is a guess about intent.',
-    'Claim the beacon id first: `SET beacon:{beacon_id} 1 NX EX 86400`. If the write returns nothing, the beacon was already counted, so return before you touch the counter or the producer. Expire the key, or a long-lived page retried next week is silently dropped.',
-    'Order the two writes: count (Redis, the same counters the serve path reads) then publish (Kafka, keyed by campaign id). If the produce throws, hand the payload to the outbox and let a replay publish it later — the count is already committed, so a replay must not count again.',
+    "An advertiser's invoice shows more impressions than their analytics tag counted, a campaign's per-partition consumer sees deliveries out of order, and one slow page that retried its beacon was billed twice.",
+    'The producer is called from the serve path with `key=user_hash` and `acks: "1"`, then flushes, then increments the render counter. Nothing checks whether the ad was displayed or whether this beacon was already seen.',
+    'Produce only from `handle_render_beacon`: claim `BEACON_KEY_PREFIX + beacon_id` with `nx=True` and `DEDUPE_TTL_S`, call `commit_render_impression(campaign_id, ...)`, then `producer.produce(TOPIC, key=campaign_id, ...)` with `acks: "all"`; on rejection write an outbox row.',
   ],
-  debrief: `The interviewer is testing whether your event pipeline measures the product or the intent. The starter is what you get from writing the publisher where the data is convenient: the serve path has the campaign, the price and the user, so it publishes there — and every ad that is chosen but blocked, throttled or never rendered is billed. Keying by user is the second flaw and the subtler one: it looks harmless in a small topic, but it spreads one campaign's events over every partition, so a consumer that counts per campaign sees a shuffled stream. The third flaw is ordering: acknowledgement before the counter commit means a crash desynchronizes events and counters, and the reconciliation job you write next quarter will never agree with either. Real systems add a schema registry with a content contract (ids only), consumer-side idempotence keyed by beacon id, a lag alert on the impression topic, and an outbox replay that is itself deduped by the same key.`,
+  debrief: `The starter is what you get from writing the publisher where the data is convenient: the serve path has the campaign, the price and the user, so it publishes there, and every ad that is chosen but blocked, throttled or never rendered is billed. Keying by user looks harmless in a small topic, but it spreads one campaign's events over every partition, so a consumer that counts per campaign sees a shuffled stream. The last flaw is ordering: acknowledgement before the counter commit means a crash desynchronizes events and counters, and a reconciliation job can agree with neither. A production pipeline adds consumer-side idempotence keyed by the same beacon id, so an outbox replay that re-publishes an event is absorbed downstream instead of inflating the count a second time.`,
 };

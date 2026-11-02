@@ -8,46 +8,32 @@ export const stateStep: Step = {
   focus: ['recsvc', 'redis', 'features'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the cached vector,
-returns it on a hit, and on a miss asks the feature service once and writes the result back. It
-serves the demo, and it hides four production failures. Debug it like the owner of the ranking
-path, fix it, and prove the fix with the checks below.
+**Starting point.** The starter implements \`load_features(tenant, user)\`, the call the ranking path
+makes before it scores a request: it reads the cached vector, returns it on a hit, and on a miss
+asks the feature service and writes the result back. It serves the demo and hides five flaws.
 
-Implement \`load_features(tenant, user)\`, the call the ranking path makes before it scores a
-request:
+**Failure mode the checks target.** A wrong ranking served from another tenant's data, a stale
+vector that outlives every catalog change, a herd of identical feature-service calls at every
+expiry, empty rankings while the feature service restarts, and a key that stays wedged after one
+failed refresh.
 
-- The vector is cached **per \`(tenant, user)\`** under \`features:{tenant}:{user}\`. The starter keys by
-  the user id alone, so two tenants that happen to share a user id read each other's vector — a
-  wrong ranking for one of them, served by both. The endpoint's **401** on a missing tenant and its
-  **400** on a malformed body cannot see this: both requests are perfectly well-formed.
+- The vector is cached **per \`(tenant, user)\`** under \`features:{tenant}:{user}\`. A user id is only
+  unique inside a tenant; the endpoint's **401** and **400** cannot catch a collision because both
+  requests are well-formed.
 - The fresh copy is written with a **TTL of 300 s** (\`TTL_S = 300\`, passed to the client as
-  \`ex=\`/\`EX\`/\`Expire\`/\`setex\`), so a catalog change reaches the ranking within the TTL instead of
-  living in Redis until someone flushes it.
+  \`ex=\`/\`EX\`/\`Expire\`/\`setex\`), so a catalog change reaches the ranking within the TTL.
 - A miss is refreshed by **exactly one caller**: take
   \`SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S\` (5 s) before calling the feature service.
-  Every other caller **waits on the same published value** — sleep 50 ms, re-read
-  \`features:{tenant}:{user}\`, repeat until it appears or the lock TTL passes — instead of calling
-  the feature service itself. The starter calls the service on every miss, so one slow second there
-  becomes a thundering herd of identical calls.
+  Every other caller waits on the same published value: sleep 50 ms, re-read
+  \`features:{tenant}:{user}\`, repeat until it appears or the lock TTL passes.
 - Keep a **longer-lived stale copy** at \`features:stale:{tenant}:{user}\` (\`STALE_TTL_S = 86_400\`),
   written on every successful refresh. When the refresh fails, return that copy with \`stale=True\`
-  rather than empty features that would rank on nothing. A blip at the feature service is not the
-  API's **404** for something that does not exist — the vector exists, it is just old — so serve the
-  previous copy degraded instead of failing the request.
-- Release the lock in a \`finally\`/\`defer\`/scope guard — **on the failure path too** — and let a
-  follower that outlives the lock TTL take over the refresh. One failed refresh must not wedge the
-  key until the fresh copy expires.
+  rather than empty features; the vector exists, it is just old.
+- Release the lock in a \`finally\`/\`defer\`/scope guard, on the failure path too, and let a
+  follower that outlives the lock TTL take over the refresh.
 
 This step owns only the feature cache: the surface config cache (\`surface:{surface}:config\`, TTL
-5 s) and the request endpoint belong to the previous step.
-
-**Failure mode the checks target.** The tenant collision is the silent one: it fires only when two
-tenants share a user id, and then one tenant's ranking is computed from another tenant's data. The
-herd is the loud one: at every TTL expiry, all concurrent requests miss at once, so a feature
-service that takes 200 ms suddenly answers hundreds of identical calls and the ranking path's whole
-budget is gone. The missing TTL is the slow leak; the missing stale copy is why a restarted feature
-service turns into empty rankings; and a lock that is never released turns one failed refresh into a
-permanently stale key.`,
+5 s) and the request endpoint belong to other steps.`,
   sequence: {
     participants: ['Ranking path', 'Concurrent request', 'Redis', 'Feature service'],
     messages: [
@@ -184,9 +170,7 @@ features = FeatureService()
 
 
 def load_features(tenant: str, user: str) -> dict:
-    # TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
-    # feature service on every miss with no single-flight lock, and degrades to empty features
-    # when the refresh fails. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"features:{user}"
     cached = r.get(key)
     if cached is not None:
@@ -295,9 +279,7 @@ const featureService = {
 };
 
 export async function loadFeatures(tenant: string, user: string): Promise<{features: Features; stale: boolean}> {
-  // TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
-  // feature service on every miss with no single-flight lock, and degrades to empty features
-  // when the refresh fails. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`features:\${user}\`;
   const cached = await r.get(key);
   if (cached !== null) return {features: JSON.parse(cached) as Features, stale: false};
@@ -415,9 +397,7 @@ var features = featureService{}
 
 // loadFeatures: the ranking path's read of the per-(tenant, user) feature vector.
 func loadFeatures(ctx context.Context, tenant, user string) (FeatureVector, bool, error) {
-	// TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
-	// feature service on every miss with no single-flight lock, and degrades to empty features
-	// when the refresh fails. Fix all four.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := "features:" + user
 	if blob, err := rdb.Get(ctx, key).Bytes(); err == nil {
 		var vector FeatureVector
@@ -574,9 +554,7 @@ object FeatureCache {
 
   /** The ranking path's read of the per-(tenant, user) feature vector. */
   def loadFeatures(tenant: String, user: String): FeatureResult = {
-    // TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
-    // feature service on every miss with no single-flight lock, and degrades to empty features
-    // when the refresh fails. Fix all four.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = s"features:$user"
     Option(jedis.get(key)) match {
       case Some(blob) => FeatureResult(decode(blob), stale = false)
@@ -698,9 +676,7 @@ json fetchFeatures(const std::string& tenant, const std::string& user) {
 
 // loadFeatures: the ranking path's read of the per-(tenant, user) feature vector.
 FeatureResult loadFeatures(const std::string& tenant, const std::string& user) {
-  // TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
-  // feature service on every miss with no single-flight lock, and degrades to empty features
-  // when the refresh fails. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto key = "features:" + user;
   if (const auto cached = redis.get(key)) {
     FeatureResult fresh;
@@ -814,18 +790,19 @@ FeatureResult loadFeatures(const std::string& tenant, const std::string& user) {
     },
   },
   hints: [
-    'Elect one refresher before touching the feature service: `SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S` tells you whether you won. The winner does the work; every other caller sleeps and re-reads the fresh key, so a cold key costs one call no matter how many requests arrive together.',
-    'Write two copies on success: `features:{tenant}:{user}` with `TTL_S = 300` (what a hit reads, short because the catalog moves) and `features:stale:{tenant}:{user}` with a much longer TTL (what a failed refresh falls back to). The stale copy has to outlive the fresh one, otherwise the first failure after expiry has nothing to serve.',
-    'Release the lock on the way out of every branch — `finally`, `defer`, or a destructor — and let the `EX` cover a crashed leader. A follower whose wait runs past the lock TTL takes over the refresh instead of waiting forever, and it serves `stale=True` rather than empty features when the service is still down.',
+    'Operators see a feature-service graph with a spike of identical calls every five minutes, a tenant complaining that a user was ranked from data it does not own, and empty lists during a feature-service restart.',
+    'The key omits the tenant, the write has no expiry, every concurrent miss calls the service because nothing elects a refresher, and a failed refresh has no older copy to fall back to.',
+    'Key by `features:{tenant}:{user}`, `set` with `ex=TTL_S`, `SET lock NX EX LOCK_TTL_S` then poll on loss, write `features:stale:` with `STALE_TTL_S` on success and return it with `stale=True` on failure, delete the lock in `finally`.',
   ],
   debrief: `Cache-aside plus two additions that only matter under load and under failure. The lock is a
 per-key mutex: \`NX\` elects one refresher, \`EX\` makes a crashed one harmless, and the waiters read the
-value the winner publishes — the single-flight pattern, which turns "one key, N concurrent misses"
-into one feature-service call per TTL. The stale copy is the second half: the fresh key expires after
-300 s because a catalog change must become visible, but the previous value is still far better than
-none, so a longer-lived copy is kept and served marked degraded. The tenant in the key is not
-optional — a user id is only unique inside a tenant, and the endpoint's authentication has already
-promised it. Production caches add in-process single-flight so one machine never makes two calls for
-the same key, jittered TTLs so entries written together do not expire together, a lock token so a
-slow refresher cannot delete a successor's lock, and background revalidation so nobody waits at all.`,
+value the winner publishes, which turns "one key, N concurrent misses" into one feature-service call
+per TTL. The stale copy is the second half: the fresh key expires after 300 s because a catalog
+change must become visible, but the previous value is still far better than none, so a longer-lived
+copy is kept and served marked degraded. The tenant in the key is not optional: a user id is only
+unique inside a tenant, and the endpoint's authentication has already promised it.
+
+Production caches go further with in-process single-flight so one machine makes a single call per key,
+jittered TTLs so entries written together do not expire together, a lock token so a slow refresher
+cannot delete a successor's lock, and background revalidation so nobody waits at all.`,
 };

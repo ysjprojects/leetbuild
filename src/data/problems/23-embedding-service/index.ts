@@ -7,24 +7,51 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Embedding service — bounded batches, a version-aware vector cache, and an event that fires only
- * after every chunk is durable. Every step ships working code with a flaw that compiles
- * and demos well but fails under upgrade, concurrency or partial failure.
+ * Embedding service: bounded batches, a version-aware vector cache, and an event that fires only
+ * after every chunk is durable. Every step ships a starter that compiles and demos well but fails
+ * under upgrade, concurrency or partial failure.
  */
 export const embeddingServiceProblem: Problem = {
   id: 'embedding-service',
   title: 'Embedding Service',
-  tagline: 'Batch embeddings with a version-aware cache and a document-ready event.',
+  tagline: 'Batch embeddings behind a Redis vector cache keyed by model version.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
-  statement: `Build the embedding service behind retrieval. \`POST /v1/embeddings\` turns up to 256
-inputs into vectors for the authenticated tenant; \`GET /v1/embeddings/{content_hash}\` serves a
-cached vector without paying the model server twice. Cached vectors are namespaced by model version,
-so an upgrade can never serve the previous model's output. When every chunk of a document is stored,
-one \`embed.ready\` event is published keyed by the document id — and if the broker rejects it, the
-event goes to the outbox instead of being lost.`,
+  statement: `# Embedding Service
+
+Retrieval starts with vectors. One service turns text into them for every tenant, caches the result
+so the model server is paid once per input, and tells the indexer when a document is complete.
+
+## The real system
+
+OpenAI's \`POST /v1/embeddings\` takes up to 2048 inputs per request, caps each input at 8192 tokens
+and 300,000 tokens per request, and names the model in every response so a caller can tell which
+version produced a vector. Behind an endpoint like that sit a model server with deadlines and a
+fallback, a vector cache keyed by model version, and a pipeline that indexes documents once all of
+their chunks are embedded.
+
+## What you build here
+
+One service, **embedding**, in five steps:
+
+1. \`POST /v1/embeddings\` turns up to 256 inputs of at most 8 KiB into vectors for the authenticated
+   tenant, with an \`Idempotency-Key\` whose digest includes the model version.
+2. A **Redis vector cache** keyed by \`(tenant, model version, content hash)\`, written with one
+   \`SET NX EX\` so concurrent computes converge on one vector.
+3. A **model server call** with a 2-second deadline, two attempts, retries only on \`UNAVAILABLE\`,
+   and a fallback model whose vectors live in their own namespace.
+4. An **\`embed.ready\` event** keyed by document id, produced with \`acks=all\` after the cache write
+   commits, with an outbox row when the broker rejects it.
+5. \`GET /v1/embeddings/{content_hash}\`, which resolves the tenant first, reads the version-scoped
+   key and answers 404 on a miss.
+
+## Left out on purpose
+
+Tokenization and token-based pricing, the outbox relay, chunking of documents into inputs, and
+the retriever that consumes the vectors. Each step is one file with a starter that runs and a set of
+checks that say what must change.`,
   diagram: {
     nodes: [
       {id: 'client', label: 'Client', kind: 'client', x: 6, y: 50},

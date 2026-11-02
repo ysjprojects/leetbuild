@@ -8,32 +8,26 @@ export const summarizerReadStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the read route, loads the summary and
-returns it. It looks like a repository method, and it is a way to serve text that no longer matches
-the document it claims to describe — to the wrong tenant. Debug it like the service owner, fix it,
-and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/summaries/{summary_id}\`: it loads the record from
+\`store.get(summary_id)\`, answers **404** when there is none, logs the id and returns the stored
+summary as is. It compiles, it serves the demo, and it hides four flaws.
 
-Implement \`GET /v1/summaries/{summary_id}\`:
+**Failure mode the checks target.** The response carries no citations, so a reader has no way to check
+a claim against the document. The handler compares no hashes, so after an edit it serves a summary of
+text that no longer exists. And it loads by id alone, so any caller with a guessed or leaked id reads
+another tenant's document.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**, and the
-  id is resolved **within the tenant**. Another tenant's id is **404** — the same answer as an id
-  that does not exist, so the endpoint never confirms that someone else's summary exists, let alone
-  returns it.
-- Return the summary with **citations**: one entry per sentence of the summary carrying \`sentence\`,
-  \`chunk_index\`, \`char_start\`, \`char_end\` and the \`source_hash\` the pointer was written against.
-  Every pointer must resolve into the **named source hash** — that is what \`resolve_citation\` is for:
-  a citation whose \`source_hash\` differs from the summary's is not a pointer any more, and must not
-  be returned as if it pointed at the text it was written against.
-- An edit to the source moves it on: compare the summary's stored \`source_hash\` with the current one
-  (and each citation's \`chunk_hash\` with the current hash of that chunk). Citations into chunks that
-  changed are **stale**: mark them per citation, and report \`stale: true\` plus the invalidated
-  \`chunk_index\`es in \`stale_chunks\`. A stale summary must never be served as if it still described
-  the current text.
+Requirements:
 
-**Failure mode the checks target.** The starter returns the stored summary with no citations at all, so
-a reader has no way to check a claim against the document. It never compares hashes, so after an edit
-it serves a summary — and would serve citations — of text that no longer exists. And it loads by id
-alone, so any caller with a guessed or leaked summary id reads another tenant's document.`,
+- The tenant comes from \`X-Tenant-Id\` (**401** when missing) and the id is resolved within the
+  tenant. Another tenant's id is **404**, the same answer as a missing id, so the endpoint does not
+  confirm that someone else's summary exists.
+- Return \`citations\`: one entry per sentence carrying \`sentence\`, \`chunk_index\`, \`char_start\`,
+  \`char_end\` and the \`source_hash\` the pointer was written against. \`resolve_citation\` refuses a
+  pointer whose \`source_hash\` differs from the summary's.
+- Compare the stored \`source_hash\` with the current one, and each citation's \`chunk_hash\` with the
+  current hash of that chunk. Citations into changed chunks are marked stale per citation, and the
+  response reports \`stale: true\` plus the invalidated \`chunk_index\`es in \`stale_chunks\`.`,
   sequence: {
     participants: ['Reader', 'Summarizer', 'Summary store', 'Source index'],
     messages: [
@@ -133,8 +127,7 @@ store = SummaryStore()
 
 @app.get("/v1/summaries/{summary_id}")
 def read_summary(summary_id: str) -> JSONResponse:
-    # TODO: this starter returns the summary with no citations, serves it unchanged after the source
-    # was edited (it never compares hashes), and looks the id up without the tenant. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     summary = store.get(summary_id)
     if summary is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -229,7 +222,7 @@ def read_summary(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/summaries/{id}: flawed code that returns whatever it loads. */
+      starter: `/** GET /v1/summaries/{id}: the starter returns whatever it loads. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -250,8 +243,7 @@ const store = {
 };
 
 app.get('/v1/summaries/:summary_id', async (request, reply) => {
-  // TODO: this starter returns the summary with no citations, serves it unchanged after the source
-  // was edited (it never compares hashes), and looks the id up without the tenant. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {summary_id: summaryId} = request.params as {summary_id: string};
   const summary = await store.get(summaryId);
   if (summary === null) return reply.code(404).send({error: 'not found'});
@@ -361,9 +353,7 @@ func (unimplementedStore) Get(summaryID string) *Summary { panic("summary store 
 
 func handleReadSummary(store SummaryStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// TODO: this starter returns the summary with no citations, serves it unchanged after the
-		// source was edited (it never compares hashes), and looks the id up without the tenant.
-		// Fix all three.
+		// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 		summary := store.Get(r.PathValue("summary_id"))
 		if summary == nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
@@ -498,9 +488,7 @@ object SummaryReadApi extends DefaultJsonProtocol {
     val route =
       path("v1" / "summaries" / Segment) { summaryId =>
         get {
-          // TODO: this starter returns the summary with no citations, serves it unchanged after the
-          // source was edited (it never compares hashes), and looks the id up without the tenant.
-          // Fix all three.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           store.get(summaryId) match {
             case None        => complete(StatusCodes.NotFound, "not found")
             case Some(value) => complete(StatusCodes.OK, value.toJson.compactPrint)
@@ -621,8 +609,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/summaries/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter returns the summary with no citations, serves it unchanged after the source
-    // was edited (it never compares hashes), and looks the id up without the tenant. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     static SummaryStore& store = *static_cast<SummaryStore*>(nullptr);
     const json summary = store.get(req.matches[1]);
     if (summary.is_null()) {
@@ -747,19 +734,16 @@ int main() {
     },
   },
   hints: [
-    'Resolve the id inside the tenant, and answer the same `404` for "another tenant’s summary" and "no such summary". A `403` here is an oracle: it tells a caller that the id they guessed is real.',
-    'A citation is a claim about a specific text: `sentence`, `chunk_index`, `char_start`, `char_end` and the `source_hash` it was written against. Return the pointers, and let `resolve_citation` decide whether a pointer still points anywhere.',
-    'Staleness is a hash comparison, not a timestamp: compare the stored `source_hash` and each citation’s `chunk_hash` with the current ones, mark the changed chunks, and report `stale` plus `stale_chunks` so a reader knows exactly which claims moved.',
+    'A reader asks which paragraph a sentence came from; the response cannot say. After an author rewrites section 3, its old summary still reads as current. A leaked id works across tenants.',
+    '`read_summary` takes no tenant header and calls `store.get(summary_id)`, so the id is the whole lookup. The stored record carries `source_hash` and `citations` that the handler drops and compares against nothing.',
+    'Read `X-Tenant-Id` (401 if absent) and call `store.get(tenant, summary_id)`. Map each citation through `resolve_citation`; compare `source_hash` and `chunk_hash` with the current ones and fill `stale` and `stale_chunks`.',
   ],
-  debrief: `The interview question behind this step is whether a summary is a statement you can check. The starter
-answers no: it returns text with no way to find the sentences it compressed and no way to notice that
-the document changed underneath it. Citations are what make a summary auditable — sentence to chunk,
-with character offsets and the source hash the pointer was written against — and the hash is what
-makes them survive edits: an edit produces a new content hash, so the pointers into the chunks that
-changed are known to be stale and can be marked, re-summarized or hidden instead of silently
-misleading a reader. The tenant scoping is the security half of the same idea: a summary is derived
-from someone's document, so an id alone must never be enough to read it, and a foreign id must be
-indistinguishable from a missing one. Real systems add re-summarization jobs on stale summaries,
-citation de-duplication across versions, a signed pointer so a citation can be validated outside the
-service, and an audit log of who read which summary.`,
+  debrief: `Citations make a summary auditable: sentence to chunk, with character offsets and the hash the
+pointer was written against. The hash is also what lets them survive edits: an edit produces a new
+content hash, so pointers into the chunks that changed are known to be stale and get marked instead
+of quietly misleading a reader, and a timestamp could not say which chunks moved. Tenant scoping is
+the security half of the same idea: a summary is derived from someone's document, so an id alone is
+not enough to read it, and a foreign id answers like a missing one so the endpoint cannot be used to
+enumerate ids. Production services add a re-summarization job for stale summaries, and an audit log
+of who read which summary.`,
 };

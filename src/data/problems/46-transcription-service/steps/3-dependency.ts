@@ -8,11 +8,10 @@ export const transcriptionDependencyStep: Step = {
   focus: ['worker', 'asr', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: against a healthy provider it
-streams segments back and the demo transcribes. Every failure path is wrong, and two of them bill the
-provider for audio you already paid for. Debug it, fix it, and prove the fix.
-
-The provider exposes:
+**Starting point.** The starter's \`transcribe_chunk(job_id, audio_ref, chunk)\` opens one
+\`TranscribeChunk\` stream for the whole file, collects the segments, and on any gRPC error calls a
+helper that re-runs the file from byte zero in an unbounded loop. It compiles, it serves the demo,
+and it hides five flaws.
 
 \`\`\`proto
 service Asr {
@@ -22,37 +21,25 @@ message ChunkRequest { string job_id = 1; string audio_ref = 2; uint32 chunk_ind
 message Segment      { string text = 1; }
 \`\`\`
 
-Implement \`transcribe_chunk(job_id, audio_ref, chunk)\`, the call the chunk worker makes for one
-30-second span.
+**Failure mode the checks target.** The starter has no idea what a span is: it recovers one bad
+minute by re-running the file, retries bytes already known to be corrupt, and bounds neither the
+attempt count nor the time one stream may take. A demo whose audio is one perfect minute shows none
+of that; the bill shows all of it. Keep the shape: one request built from one chunk, one bounded
+loop around it, one terminal branch for the failure that cannot succeed.
 
-- **One stream per chunk, and the request names that span.** The \`ChunkRequest\` carries the
-  \`chunk_index\` and the chunk's own \`offset_ms\` beside the job and the audio reference. The starter
-  sends the file reference alone, so the provider cannot tell which minute it is being asked about —
-  and every retry is a whole-file job.
-- **Every attempt carries a 60-second deadline** (\`timeout=60\`, \`deadline: Date.now() + DEADLINE_MS\`,
-  a context with timeout, \`withDeadlineAfter\`, \`set_deadline\`). A minute of audio that has not
-  streamed back within a minute is not coming; without the bound, one wedged stream pins the worker
-  that owns the rest of the file.
-- **At most two attempts per chunk**, and a retry re-sends *this chunk's* request: same
-  \`chunk_index\`, same \`offset_ms\`, never a request for the file from byte zero. A flaky minute must
-  cost one extra chunk call, not two hours of provider time and a second bill for the whole file.
-- **A corrupt-audio rejection is terminal for that span.** \`INVALID_ARGUMENT\` whose details carry the
-  \`corrupt\` marker means the bytes themselves are bad, so no attempt can succeed: record the marker
-  for that chunk in Redis (\`HSET chunks:{job_id} {index} "corrupt"\`) and return instead of spending
-  the second attempt on it. The read path sees that marker as a failed span — which is what makes a
-  partial transcript honest.
+- **One stream per chunk.** The \`ChunkRequest\` carries \`chunk_index\` and the chunk's own
+  \`offset_ms\` beside the job and the audio reference.
+- **A 60-second deadline per attempt** (\`timeout=DEADLINE_S\`, \`deadline: Date.now() + DEADLINE_MS\`,
+  a context with timeout, \`withDeadlineAfter\`, \`set_deadline\`).
+- **At most two attempts per chunk**, each re-sending this chunk's request. No path reads the file
+  from its start.
+- **A corrupt-audio rejection is terminal for the span.** \`INVALID_ARGUMENT\` whose details carry
+  the \`corrupt\` marker records \`HSET chunks:{job_id} {index} "corrupt"\` and returns a terminal
+  result; the read path reports that span as failed.
 
 :::widget grpc-streams {"mode": "server"}
 
-:::widget deadline-retry {"base": 250, "deadline": 60000, "attempts": 2}
-
-**Failure mode the checks target.** All four defects are one sentence: the starter has no idea
-what a *span* is. It recovers one bad minute by re-running the file, it spends an attempt on bytes
-already known to be corrupt, it has no deadline so a stuck stream owns the worker, and its retry has
-no bound. None of that shows in the demo — the demo's audio is one perfect minute — and all of it
-shows in the bill: a two-hour file that restarts once is two transcriptions, and a corrupt chunk that
-retries forever is an unbounded one. Keep the shape: one request built from one chunk, one bounded
-loop around it, and one terminal branch for the failure that can never succeed.`,
+:::widget deadline-retry {"base": 250, "deadline": 60000, "attempts": 2}`,
   sequence: {
     participants: ['Chunk worker', 'ASR provider', 'Redis'],
     messages: [
@@ -75,9 +62,9 @@ loop around it, and one terminal branch for the failure that can never succeed.`
     ],
   },
   hints: [
-    'Two bounds, both on the call rather than around it: a 60-second deadline per attempt (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, a context with timeout, `withDeadlineAfter`, `set_deadline`) and a loop over `MAX_ATTEMPTS = 2`. The starter’s retry has neither, so one bad minute can hold a worker — and a provider — for as long as it likes.',
-    'The retry is the *same request*: build `ChunkRequest` once, outside the loop, from the chunk’s own `index` and `offset_ms`, and re-send it. Anything in the retry path that reads the file from its start turns a transient failure into a second bill for audio that was already transcribed.',
-    'Read the status code out of the error before the retryable test: `INVALID_ARGUMENT` with the `corrupt` marker in the details is a permanent property of those bytes. Record the marker for that chunk in the job’s chunk map and return — retrying it is the same bill twice, and the missing marker is what lets the read path call a broken transcript `done`.',
+    'Symptom: a two-hour file with one flaky minute was billed as three transcriptions, one worker has been stuck on the same chunk since yesterday, and a corrupt span shows thousands of provider calls.',
+    'Mechanism: the request names only the file, so a retry can only mean the whole file; `restart_from_start` loops `while True` with no deadline and treats `INVALID_ARGUMENT` like any other error.',
+    'Change: build one `ChunkRequest` with `chunk_index` and `offset_ms`, loop `range(MAX_ATTEMPTS)` (2) with `timeout=DEADLINE_S` (60), on `INVALID_ARGUMENT` + `CORRUPT_MARKER` call `record_terminal_marker` and return `terminal=True`; delete `restart_from_start`.',
   ],
   checks: [
     {
@@ -144,7 +131,7 @@ loop around it, and one terminal branch for the failure that can never succeed.`
       id: 'terminal-corrupt',
       title: 'A corrupt-audio rejection is terminal for the span',
       detail:
-        'The corrupt marker is a named constant, and `INVALID_ARGUMENT` carrying it records the marker for that chunk and returns a terminal result right there — it never reaches the retry in the loop. The starter retries the rejection forever, so a span that can never transcribe burns one provider call per iteration and never gets marked.',
+        'The corrupt marker is a named constant, and `INVALID_ARGUMENT` carrying it records the marker for that chunk and returns a terminal result right there, before the retry in the loop. The starter retries the rejection forever, so a span that cannot transcribe burns one provider call per iteration and is never marked.',
       match: {
         python: {
           all: [/CORRUPT_MARKER\s*=\s*["']corrupt["']/, /record_terminal_marker\(/],
@@ -234,10 +221,7 @@ def restart_from_start(job_id: str, audio_ref: str, chunk: Chunk) -> dict:
 
 
 def transcribe_chunk(job_id: str, audio_ref: str, chunk: Chunk) -> dict:
-    # TODO: the starter streams the whole file, restarts it from byte zero when a chunk fails, retries
-    # a corrupt-audio rejection forever, and sets neither a deadline nor an attempt bound. Send one
-    # request per chunk that names its index and offset, cap the attempts at two under a 60-second
-    # deadline, and make a corrupt rejection terminal for this span.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     try:
         stream = asr.TranscribeChunk(asr_pb2.ChunkRequest(job_id=job_id, audio_ref=audio_ref))
         segments = [segment.text for segment in stream]
@@ -324,7 +308,7 @@ def transcribe_chunk(job_id: str, audio_ref: str, chunk: Chunk) -> ChunkResult:
 `,
     },
     typescript: {
-      starter: `/** Chunk worker: flawed code that re-runs the whole file whenever a chunk fails. */
+      starter: `/** Chunk worker: the starter. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {Redis} from 'ioredis';
@@ -376,10 +360,7 @@ async function restartFromStart(jobId: string, audioRef: string, chunk: Chunk): 
 }
 
 export async function transcribeChunk(jobId: string, audioRef: string, chunk: Chunk): Promise<string[]> {
-  // TODO: the starter streams the whole file, restarts it from byte zero when a chunk fails, retries
-  // a corrupt-audio rejection forever, and sets neither a deadline nor an attempt bound. Send one
-  // request per chunk that names its index and offset, cap the attempts at two under a 60-second
-  // deadline, and make a corrupt rejection terminal for this span.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   try {
     return await collect(asr.TranscribeChunk({job_id: jobId, audio_ref: audioRef}));
   } catch {
@@ -537,10 +518,7 @@ func transcribeChunk(
 	jobID, audioRef string,
 	chunk Chunk,
 ) ([]string, error) {
-	// TODO: the starter streams the whole file, restarts it from byte zero when a chunk fails, retries
-	// a corrupt-audio rejection forever, and sets neither a deadline nor an attempt bound. Send one
-	// request per chunk that names its index and offset, cap the attempts at two under a 60-second
-	// deadline, and make a corrupt rejection terminal for this span.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	stream, err := client.TranscribeChunk(ctx, &pb.ChunkRequest{JobId: jobID, AudioRef: audioRef})
 	if err != nil {
 		return restartFromStart(ctx, client, rdb, jobID, audioRef, chunk)
@@ -680,10 +658,7 @@ object AsrClient {
   }
 
   def transcribeChunk(jobId: String, audioRef: String, chunk: Chunk): List[String] = {
-    // TODO: the starter streams the whole file, restarts it from byte zero when a chunk fails, retries
-    // a corrupt-audio rejection forever, and sets neither a deadline nor an attempt bound. Send one
-    // request per chunk that names its index and offset, cap the attempts at two under a 60-second
-    // deadline, and make a corrupt rejection terminal for this span.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     Try(asr.transcribeChunk(ChunkRequest(jobId, audioRef))) match {
       case Success(reply) => reply.segments.map(_.text).toList
       case Failure(_) => restartFromStart(jobId, audioRef, chunk)
@@ -798,10 +773,7 @@ std::vector<std::string> transcribe_chunk(
     const std::string& job_id,
     const std::string& audio_ref,
     const Chunk& chunk) {
-  // TODO: the starter streams the whole file, restarts it from byte zero when a chunk fails, retries
-  // a corrupt-audio rejection forever, and sets neither a deadline nor an attempt bound. Send one
-  // request per chunk that names its index and offset, cap the attempts at two under a 60-second
-  // deadline, and make a corrupt rejection terminal for this span.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   grpc::ClientContext ctx;
   ChunkRequest request;
   request.set_job_id(job_id);
@@ -893,19 +865,5 @@ ChunkResult transcribe_chunk(
 `,
     },
   },
-  debrief: `The interview question behind this step is one sentence: what does a retry re-run? Every
-answer the starter gives is wrong in the same direction, because "retry the transcription" is not a
-unit — a chunk is. A per-chunk request that carries its own \`chunk_index\` and \`offset_ms\` is what
-makes the retry cheap and the bill linear in failures instead of in file length; without that span
-identity, recovery can only mean "start over", which is exactly how one flaky minute re-runs two
-hours of audio. The attempt budget belongs to the chunk too: two attempts under a 60-second deadline
-bound the worst case to two minutes of provider time, and the deadline also bounds what a retry
-storm can do to a provider that is already failing. The subtle half is the terminal branch: a
-deadline or an \`UNAVAILABLE\` says *not now*, so another attempt is meaningful, while
-\`INVALID_ARGUMENT\` with the corrupt marker says *not ever*, and retrying it is the client arguing
-with the format. Recording that marker in the job's chunk map is what keeps a partial transcript
-honest — the read path can report the span as failed rather than quietly assembling a transcript
-with a hole in it. Real clients add jittered backoff between attempts, per-provider concurrency
-limits, a byte-level resume cursor inside a chunk for very long spans, and a cost metric per job so
-the re-billing this step prevents shows up on a dashboard before it shows up on an invoice.`,
+  debrief: `A retry re-runs a unit, and the fix's shape follows from choosing the chunk as that unit. A request that carries its own \`chunk_index\` and \`offset_ms\` makes a retry cost one chunk call, so the bill grows with failures instead of with file length. Two attempts under a 60-second deadline bound the worst case to two minutes of provider time per span. The terminal branch separates "not now" (a deadline, \`UNAVAILABLE\`) from "not ever" (\`INVALID_ARGUMENT\` with the corrupt marker), and recording that marker is what lets the read path report the span as failed instead of assembling a transcript with a hole. Production clients also add jittered backoff and a per-job cost metric, so re-billing shows on a dashboard before an invoice.`,
 };

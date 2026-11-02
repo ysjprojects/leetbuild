@@ -8,32 +8,28 @@ export const eventsStep: Step = {
   focus: ['harness', 'kafka', 'worker', 'redis'],
   task: `## Task
 
-The starter is working code: it publishes a result on the happy path and the
-consumer moves the counters, so the dashboard shows progress. Four production contracts are broken.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter implements \`publish_result\`, how a worker reports one scored
+sample, and \`consume\`, which folds those events into the run's counters. The producer is built
+with only \`bootstrap.servers\`; the handler logs the model output, puts \`output_text\` in the event,
+produces to \`eval.sample\` keyed by the worker id and flushes. The consumer commits the offset,
+then runs \`HINCRBY\` on \`evals:run:{run_id}\`. It compiles, serves the demo and hides 5 flaws.
 
-\`publish_result\` is how a worker reports one scored sample; the consumer folds those events into
-the run's counters.
+**Failure mode the checks target.** Keying by worker id scatters one run's samples across
+partitions; the bare producer duplicates a result on retry; the sample text is a leak retained with
+the topic; a rejected produce silently loses the sample; and commit-before-fold loses the counter
+update when the consumer crashes between the two, so the run reports fewer samples than it scored.
 
-- Publish **exactly one** \`eval.sample\` event per sample with the **run id as the message key** —
-  partitioning by run keeps one run's samples in order, which is what lets the progress counters be
-  reconciled against the sample list. The event **id is the sample id**; the payload carries
-  \`run_id\`, \`model_version\`, \`outcome\` and \`score\`.
-- **Never** put the sample text or the model output in the event, and never log it: the topic is
-  retained for days and replicated, so golden-set content and model output written there outlive the
-  dataset they came from.
-- The producer must be **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus hashed, stable keys), so a retried produce cannot duplicate a result.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the worker; a relay republishes outbox rows when the broker recovers.
-- The consumer folds the sample into the counters (\`HINCRBY evals:run:{run_id}\`) and **only then**
-  commits the offset. Commit first and a crash between the two loses the counter update forever,
-  because the offset already moved past the unprocessed record.
+Requirements:
 
-**Failure mode the checks target.** Keying by worker id scatters one run's samples across partitions;
-an unconfigured producer can duplicate on retry; the retained sample text is a data leak with a long
-tail; a failed produce silently loses the sample; and commit-before-process trades correctness for
-exactly-once *looking* code — the run then reports fewer samples than it scored.`,
+- Exactly one \`eval.sample\` event per sample with the **run id as the message key**, so one
+  run's samples stay in order. The event **id is the sample id**; the payload carries \`run_id\`,
+  \`model_version\`, \`outcome\` and \`score\`.
+- No sample text or model output in the event or in a log line.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
+  \`all\` plus hashed, stable keys).
+- When the broker rejects the produce (\`KafkaException\`), write the event to the **outbox** with
+  \`insert_outbox\` instead of dropping it.
+- The consumer runs \`HINCRBY evals:run:{run_id}\` first and commits the offset only afterwards.`,
   sequence: {
     participants: ['Eval worker', 'eval.sample', 'Progress consumer', 'Redis'],
     messages: [
@@ -47,9 +43,9 @@ exactly-once *looking* code — the run then reports fewer samples than it score
     ],
   },
   hints: [
-    'The message key is the partition key: `key=run_id`, `key: runId`, `Key: []byte(runID)`, `ProducerRecord("eval.sample", runId, …)`. Keyed by the worker id, one run’s samples land in different partitions and their order is no longer guaranteed.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, or required acks `all` with the hash balancer. It needs the same message key on every retry — which is the same fix as the run key.',
-    'The outbox is the durability half: wrap the produce and, when the broker rejects it, insert the event as an outbox row. In the consumer do the `HINCRBY` first and the `commit` second: a crash between them then replays the record instead of losing the counter update.',
+    'Symptom: after a broker restart a run stops short of its budget, the same sample id shows up twice in the topic, and a compliance scan finds golden-set text in `eval.sample` retained for seven days.',
+    'Mechanism: the partition key is the worker, not the run; the producer config is bare, so retries are not deduplicated; the produce result is ignored; and the offset moves before the counters do.',
+    'Fix: `Producer({…, "enable.idempotence": True, "acks": "all"})`, `key=body.run_id`, drop `output_text`, wrap produce in `except KafkaException` with `store.insert_outbox(...)`, and in `consume` run both `hincrby` calls before `consumer.commit(msg)`.',
   ],
   checks: [
     {
@@ -156,9 +152,7 @@ store = OutboxStore()
 
 @app.post("/v1/evals/samples")
 def publish_result(body: SampleResult, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: key by the run id instead of the worker id, configure the idempotent producer with
-    # acks=all, keep the sample text out of the event and the logs, write an outbox row when the
-    # broker rejects the produce, and fold the sample into the counters before committing.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     logger.info("sample tenant=%s output=%r", tenant, body.output_text)
     event = {
         "id": body.sample_id,
@@ -276,9 +270,7 @@ interface SampleResult {
 }
 
 app.post('/v1/evals/samples', async (request, reply) => {
-  // TODO: key by the run id instead of the worker id, configure the idempotent producer with
-  // acks=all, keep the sample text out of the event and the logs, write an outbox row when the
-  // broker rejects the produce, and fold the sample into the counters before committing.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const body = request.body as SampleResult;
   request.log.info({run_id: body.run_id, output: body.output_text}, 'sample scored');
   const event = {
@@ -403,9 +395,7 @@ type SampleResult struct {
 func publishResult(rw http.ResponseWriter, r *http.Request) {
 	body := SampleResult{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: key by the run id instead of the worker id, configure acks=all / idempotence, keep the
-	// sample text out of the event and the logs, write an outbox row when the broker rejects the
-	// produce, and fold the sample into the counters before committing.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	log.Printf("sample run=%s output=%q", body.RunID, body.OutputText)
 	event := map[string]any{"id": body.SampleID, "worker_id": body.WorkerID, "output_text": body.OutputText}
 	payload, _ := json.Marshal(event)
@@ -535,9 +525,7 @@ object Results {
   val jedis = new Jedis("redis", 6379)
 
   def publishResult(body: SampleResult, tenant: String): Unit = {
-    // TODO: key by the run id instead of the worker id, configure idempotence with acks=all, keep
-    // the sample text out of the event and the logs, write an outbox row when the broker rejects the
-    // produce, and fold the sample into the counters before committing the offset.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"id":"\${body.sample_id}","output_text":"\${body.output_text}"}"""
     producer.send(new ProducerRecord[String, String]("eval.sample", body.worker_id, payload))
   }
@@ -630,9 +618,7 @@ struct SampleResult {
 };
 
 void publishResult(RdKafka::Producer* producer, const SampleResult& result) {
-  // TODO: key by the run id instead of the worker id, configure idempotence with acks=all, keep the
-  // sample text out of the event and the logs, write an outbox row when the broker rejects the
-  // produce, and fold the sample into the counters before committing the offset.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto payload =
       json{{"id", result.sample_id}, {"output_text", result.output_text}}.dump();
   std::cerr << "sample run=" << result.run_id << " output=" << result.output_text << "\\n";
@@ -734,5 +720,5 @@ void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
 `,
     },
   },
-  debrief: `The interview question is ordering and durability on a topic you do not own. The partition key decides whether one run’s samples arrive in the order the counters reconcile against; the request id (or here the worker id) looks like a natural key and is the wrong one. The producer configuration decides whether a client retry duplicates a result, the payload decides whether golden-set content leaks into the retained topic, and the outbox decides whether a broker hiccup loses a scored sample. In the consumer the order of \`HINCRBY\` and \`commit\` decides whether a rebalance double-counts or loses the fold: process, then commit. Real pipelines add a schema registry so a future producer cannot smuggle text into the topic, per-run sequence numbers so late results are ignored, and a lag alarm on the consumer group.`,
+  debrief: `The fix has its shape because each contract lives in a different place: ordering is the message key, so it must be the run id and not whichever worker scored the sample; duplicate protection is producer configuration, not application code, which is why \`enable.idempotence\` and \`acks=all\` sit in the constructor; durability is the outbox row written only in the error branch; and the consumer's order of \`HINCRBY\` then \`commit\` turns a crash into a replay the step 2 dedupe key absorbs, instead of a lost fold. Keeping text out of the payload is the one fix with no runtime symptom. Production pipelines enforce the payload with a schema registry so a later producer cannot smuggle text back in, and alarm on consumer-group lag so a stalled fold is noticed before the release reads the counters.`,
 };

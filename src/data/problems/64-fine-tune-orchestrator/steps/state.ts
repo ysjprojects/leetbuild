@@ -8,35 +8,28 @@ export const stateStep: Step = {
   focus: ['redis', 'api'],
   task: `## Task
 
-**Starting point.** The starter is working code for the Redis layer behind the queue: it queues a
-job and lets a worker start it. It compiles, the happy path works, and it hides the flaw that
-oversubscribes a cluster. Debug it like the platform owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter is the Redis layer behind the queue: \`submit\` pushes the job id
+onto \`queue:{team}\`, \`start\` sets the job hash to \`running\`, and \`complete\` and \`cancel\`
+each \`INCRBY\` the pool by whatever amount the caller passes. It runs the happy path and hides five
+flaws.
 
-The fine-tune queue keeps each team's compute budget in a Redis pool keyed \`pool:{team}\` and each
-job's reservation in a hash keyed \`reservation:{job_id}\` with the fields \`reserved\`, \`spent\`
-and \`released\`.
+**Failure mode the checks target.** A queue that reserves nothing lets ten submissions pass the same
+balance check and all start, so the cluster is oversubscribed. A client-side read-then-write lets
+two workers see the same balance. And a completion callback delivered twice hands the same remainder
+back twice, so the pool grows and the next job over-commits it.
 
-- **Reserve at submission.** \`submit(team, job_id, amount)\` must take \`amount\` out of the team
-  pool *before* the job is queued, in one atomic script. If the pool cannot cover it, the submission
-  fails and nothing is queued.
-- **One atomic script per transition.** The reserve must be a single \`EVAL\` that reads the pool,
-  compares it with the amount, decrements it and stamps the reservation — never a client-side
-  read-then-write. The release must be a single \`EVAL\` too.
-- **A job cannot start unreserved.** \`start(team, job_id)\` must refuse to move a job to
-  \`running\` unless its reservation is still held.
-- **Release the remainder, exactly once.** \`complete(team, job_id, spent)\` records \`spent\` and
-  returns only the unused \`reserved - spent\` to the pool. The release sets a \`released\` flag in
-  the same script, so a retried completion callback releases nothing a second time.
-- **Cancellation frees the whole reservation.** \`cancel(team, job_id)\` frees the full reserved
-  amount, spent or not.
+Budget lives in \`pool:{team}\`; each reservation is a hash \`reservation:{job_id}\` with
+\`reserved\`, \`spent\` and \`released\`.
 
-**Failure mode the checks target.** A queue that reserves nothing until the worker starts lets ten
-submissions pass the same check and then all start, so the cluster is oversubscribed before anyone
-notices. A completion callback that runs twice — the normal case for an at-least-once delivery — hands
-the same remainder back twice, so the pool silently grows and the next job over-commits it. The
-client-side \`GET\`-then-\`DECRBY\` is the quiet one: two workers can read the same balance and both
-believe the pool can cover them.`,
+- **Reserve at submission.** \`submit(team, job_id, amount)\` takes \`amount\` out of the pool
+  before queuing; if the pool cannot cover it, nothing is queued.
+- **One atomic script per transition.** Reserve and release are each a single \`EVAL\`.
+- **A job cannot start unreserved.** \`start(team, job_id)\` refuses to move a job to \`running\`
+  unless \`reservation:{job_id}\` is still held.
+- **Release the remainder, exactly once.** \`complete(team, job_id, spent)\` returns
+  \`reserved - spent\` and sets \`released\` in the same script, so a retry releases nothing.
+- **Cancellation frees the whole reservation.** \`cancel(team, job_id)\` zeroes \`spent\` and
+  releases the full amount.`,
   sequence: {
     participants: ['Fine-tune API', 'Worker', 'Redis'],
     messages: [
@@ -126,24 +119,19 @@ client = redis.Redis(decode_responses=True)
 
 
 def submit(team: str, job_id: str, amount: int) -> None:
-    # TODO: reserve the compute budget from pool:{team} here, before the job is queued, so ten
-    # submissions cannot all pass the same check and oversubscribe the cluster.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     client.lpush(f"queue:{team}", job_id)
 
 
 def start(team: str, job_id: str) -> None:
-    # TODO: a job cannot start unless its reservation is still held in the team pool.
     client.hset(f"job:{job_id}", "status", "running")
 
 
 def complete(team: str, job_id: str, amount: int) -> None:
-    # TODO: release only the unused remainder, and make the release idempotent so a retried
-    # completion callback does not hand the same budget back twice.
     client.incrby(f"pool:{team}", amount)
 
 
 def cancel(team: str, job_id: str, amount: int) -> None:
-    # TODO: a cancelled job must free its full reservation, not an amount the caller passes.
     client.incrby(f"pool:{team}", amount)
 `,
       solution: `"""Redis-backed fine-tune queue with budget reservations."""
@@ -213,24 +201,19 @@ import {Redis} from 'ioredis';
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://redis:6379');
 
 async function submit(team: string, jobId: string, amount: number): Promise<void> {
-  // TODO: reserve the compute budget from pool:{team} here, before the job is queued, so ten
-  // submissions cannot all pass the same check and oversubscribe the cluster.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await redis.lpush(\`queue:\${team}\`, jobId);
 }
 
 async function start(team: string, jobId: string): Promise<void> {
-  // TODO: a job cannot start unless its reservation is still held in the team pool.
   await redis.hset(\`job:\${jobId}\`, 'status', 'running');
 }
 
 async function complete(team: string, jobId: string, amount: number): Promise<void> {
-  // TODO: release only the unused remainder, and make the release idempotent so a retried
-  // completion callback does not hand the same budget back twice.
   await redis.incrby(\`pool:\${team}\`, amount);
 }
 
 async function cancel(team: string, jobId: string, amount: number): Promise<void> {
-  // TODO: a cancelled job must free its full reservation, not an amount the caller passes.
   await redis.incrby(\`pool:\${team}\`, amount);
 }
 
@@ -306,24 +289,19 @@ var ctx = context.Background()
 var client = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func Submit(team, jobID string, amount int) error {
-	// TODO: reserve the compute budget from pool:team here, before the job is queued, so ten
-	// submissions cannot all pass the same check and oversubscribe the cluster.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	return client.LPush(ctx, "queue:"+team, jobID).Err()
 }
 
 func Start(team, jobID string) error {
-	// TODO: a job cannot start unless its reservation is still held in the team pool.
 	return client.HSet(ctx, "job:"+jobID, "status", "running").Err()
 }
 
 func Complete(team, jobID string, amount int) error {
-	// TODO: release only the unused remainder, and make the release idempotent so a retried
-	// completion callback does not hand the same budget back twice.
 	return client.IncrBy(ctx, "pool:"+team, int64(amount)).Err()
 }
 
 func Cancel(team, jobID string, amount int) error {
-	// TODO: a cancelled job must free its full reservation, not an amount the caller passes.
 	return client.IncrBy(ctx, "pool:"+team, int64(amount)).Err()
 }
 `,
@@ -403,24 +381,19 @@ object State {
   val client = new Jedis("redis", 6379)
 
   def submit(team: String, jobId: String, amount: Int): Unit = {
-    // TODO: reserve the compute budget from pool:team here, before the job is queued, so ten
-    // submissions cannot all pass the same check and oversubscribe the cluster.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     client.lpush(s"queue:$team", jobId)
   }
 
   def start(team: String, jobId: String): Unit = {
-    // TODO: a job cannot start unless its reservation is still held in the team pool.
     client.hset(s"job:$jobId", "status", "running")
   }
 
   def complete(team: String, jobId: String, amount: Int): Unit = {
-    // TODO: release only the unused remainder, and make the release idempotent so a retried
-    // completion callback does not hand the same budget back twice.
     client.incrBy(s"pool:$team", amount)
   }
 
   def cancel(team: String, jobId: String, amount: Int): Unit = {
-    // TODO: a cancelled job must free its full reservation, not an amount the caller passes.
     client.incrBy(s"pool:$team", amount)
   }
 }
@@ -502,24 +475,19 @@ object State {
 using sw::redis::Redis;
 
 void Submit(Redis& client, const std::string& team, const std::string& job_id, int amount) {
-  // TODO: reserve the compute budget from pool:team here, before the job is queued, so ten
-  // submissions cannot all pass the same check and oversubscribe the cluster.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   client.lpush("queue:" + team, job_id);
 }
 
 void Start(Redis& client, const std::string& team, const std::string& job_id) {
-  // TODO: a job cannot start unless its reservation is still held in the team pool.
   client.hset("job:" + job_id, "status", "running");
 }
 
 void Complete(Redis& client, const std::string& team, const std::string& job_id, int amount) {
-  // TODO: release only the unused remainder, and make the release idempotent so a retried
-  // completion callback does not hand the same budget back twice.
   client.incrby("pool:" + team, amount);
 }
 
 void Cancel(Redis& client, const std::string& team, const std::string& job_id, int amount) {
-  // TODO: a cancelled job must free its full reservation, not an amount the caller passes.
   client.incrby("pool:" + team, amount);
 }
 `,
@@ -583,9 +551,9 @@ long long Cancel(Redis& client, const std::string& team, const std::string& job_
     },
   },
   hints: [
-    'Reserve in the submission path: one `EVAL` that reads `pool:{team}`, compares it with the amount and stamps `reservation:{job_id}` — a submission the pool cannot cover must be refused before it is queued.',
-    'The completion callback is delivered at least once, so the release must be idempotent: set a `released` flag in the same script and return early when it is already set, or the remainder is handed back twice.',
-    'Cancellation frees the whole reservation: zero `spent` and run the same release script so the pool gets back everything that was held.',
+    "Ten jobs submitted against a pool that covers two all reach `running`, and after a worker's completion callback is redelivered the pool balance ends higher than it started.",
+    '`submit` never touches `pool:{team}`, `start` ignores `reservation:{job_id}`, and `complete`/`cancel` run an unconditional `INCRBY` with a caller-supplied amount: no comparison, no `released` flag.',
+    'Add `RESERVE_LUA`/`RELEASE_LUA` run via `eval`: reserve in `submit` before `lpush`, test `reserved is None` in `start`, `HGET released` and return early in the release script, and have `cancel` zero `spent`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a state layer against concurrency and delivery semantics. The starter reads fine because one worker starts one job. Four separate defects are being checked: the reservation must happen at submission so a job cannot be started without one; the reserve and release must each be one atomic script so two workers cannot both pass the same balance check; the release must return only the remainder and be idempotent against a redelivered completion; and cancellation must free the whole reservation. The quiet one is the redelivered callback — at-least-once delivery is normal, and a non-idempotent release turns it into free budget. Real systems also lease the reservation with a TTL so a worker that dies mid-job does not strand the pool.`,
+  debrief: `The fix has this shape because budget is a shared counter under concurrent writers with at-least-once callbacks, and the only place a compare-and-write can be made atomic is inside Redis itself. Reserving at submission turns "can we afford this" into a decision made once, before anything is queued; the \`released\` flag written in the same script turns a redelivered completion into a no-op instead of free budget; cancellation reusing the release path keeps one code path responsible for returning money to the pool. Production queues lease the reservation with a TTL so a worker that dies mid-job does not strand the pool, and reconcile the pool against the sum of open reservations on a schedule so drift is found before it is spent.`,
 };

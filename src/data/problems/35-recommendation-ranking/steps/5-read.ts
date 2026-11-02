@@ -8,45 +8,33 @@ export const readStep: Step = {
   focus: ['client', 'recsvc', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the surface row and answers \`200\` with a \`model_version\`. It compiles, it serves the demo, and it
-lets the caller name the version it is served — which makes the one read every other reader trusts
-the one read that can be pointed at a model nobody shipped. Debug it like the service owner, fix
-it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/surfaces/{surface}/config\`, the read every
+caller of the surface resolves before it ranks. It checks \`X-Tenant-Id\`, loads the surface row,
+keeps a copy in process memory, and answers \`200\` with \`{surface, model_version,
+fallback_policy, promoted_at}\`. It compiles, it serves the demo, and it hides four flaws.
 
-Implement \`GET /v1/surfaces/{surface}/config\`, the read every caller of the surface resolves before
-it ranks, so a rollout or a rollback is one switch instead of per-reader drift.
+**Failure mode the checks target.** A rollout or rollback that is supposed to be one switch. A
+caller is served a version the team never shipped, the operator flips the switch and ranking keeps
+serving the old version until the next deploy, and this read and the ranking call can each resolve
+a different version so an experiment report attributes an outcome to a model that was not served.
 
-- The body is \`{surface, model_version, fallback_policy}\` plus the promotion state
-  (\`promoted_at\`), served from the surface config in Redis under \`surface:{surface}:config\`.
+- The body is served from the surface config in Redis under \`surface:{surface}:config\`.
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`surface\` must match \`^[a-z0-9][a-z0-9_-]{1,31}$\`; anything else is **400**, rejected before
   Redis or the catalog is touched.
-- \`model_version\` comes from the surface config — never from a \`model_version\` query parameter.
-  The caller does not get to choose the version it is served; a version on the query string is
-  ignored, not honoured.
+- \`model_version\` comes from the surface config, not from a \`model_version\` query parameter. A
+  version on the query string is ignored, not honoured.
 - The served version must be a **promoted** one: the handler consults the promotion record for
-  \`(surface, version)\` and answers **404** when that version was never promoted. A version that
-  exists in the registry but never shipped has to be as unreadable as one that does not exist, and
-  the read must never promote anything on its own.
+  \`(surface, version)\` and answers **404** when that version was never promoted. The read does
+  not promote anything on its own.
 - An unknown surface is **404** too, before the promotion lookup.
 - The config is cached for **5 seconds** (\`CONFIG_TTL_S\`): long enough to absorb a burst, short
-  enough that a rollback is visible within seconds. A copy that lives until the process restarts
-  turns every rollback into a release train.
-- The version reported here is the assignment the ranking call plans against, resolved through the
-  same accessor (\`active_model_version(surface)\`), so this read and the next ranking call cannot
-  disagree about which model is live. An exposure is stamped from the rank result itself — the
-  version that actually produced the order — which is a different question from which version is
-  live.
-- Log the read with tenant, surface and version — nothing else.
-
-**Failure mode the checks target.** The starter echoes whatever \`model_version\` the query string
-names, so whoever reaches the endpoint is served a version that was never promoted and the only
-record of what a user actually saw points at a model the team never shipped. It also caches the
-surface row for the life of the process: the operator flips the switch, ranking keeps serving the
-old version, and the rollback takes effect at the next deploy — the moment nobody is watching. The
-drift is the quiet one: if this read and the ranking call each resolve the version themselves, an
-experiment report can attribute an outcome to a version that was never served.`,
+  enough that a rollback is visible within seconds.
+- The version reported here is resolved through the same accessor the ranking call uses
+  (\`active_model_version(surface)\`), so this read and the next ranking call cannot disagree about
+  which model is live. An exposure is stamped from the rank result itself, which is a different
+  question.
+- Log the read with tenant, surface and version, nothing else.`,
   sequence: {
     participants: ['Client', 'Recommendation API', 'Redis', 'catalog'],
     messages: [
@@ -140,7 +128,7 @@ experiment report can attribute an outcome to a version that was never served.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/surfaces/{surface}/config: flawed code that serves a stale switch."""
+      starter: `"""GET /v1/surfaces/{surface}/config: the starter."""
 import json
 import logging
 
@@ -161,9 +149,7 @@ def read_surface_config(
     tenant: str = Header(alias="X-Tenant-Id"),
     model_version: str | None = Query(default=None),
 ) -> dict:
-    # TODO: serve the version from the surface config instead of the query string, refuse a version
-    # that was never promoted, expire the cache in seconds rather than at the next deploy, and
-    # resolve the version through the same accessor the ranking call uses.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     config = config_cache.get(surface)
     if config is None:
         config = json.loads(r.get(f"surface:{surface}:config") or "{}")
@@ -246,7 +232,7 @@ def read_surface_config(surface: str, tenant: str | None = Header(default=None, 
 `,
     },
     typescript: {
-      starter: `/** GET /v1/surfaces/:surface/config: flawed code that serves a stale switch. */
+      starter: `/** GET /v1/surfaces/:surface/config: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -260,9 +246,7 @@ app.get('/v1/surfaces/:surface/config', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'] as string;
   const {surface} = request.params as {surface: string};
   const query = request.query as {model_version?: string};
-  // TODO: serve the version from the surface config instead of the query string, refuse a version
-  // that was never promoted, expire the cache in seconds rather than at the next deploy, and
-  // resolve the version through the same accessor the ranking call uses.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   let config = configCache.get(surface);
   if (config === undefined) {
     config = JSON.parse(
@@ -383,9 +367,7 @@ func readSurfaceConfig(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	tenant := r.Header.Get("X-Tenant-Id")
 	surface := r.PathValue("surface")
-	// TODO: serve the version from the surface config instead of the query string, refuse a version
-	// that was never promoted, expire the cache in seconds rather than at the next deploy, and
-	// resolve the version through the same accessor the ranking call uses.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	overridden := r.URL.Query().Get("model_version")
 	config, ok := configCache[surface]
 	if !ok {
@@ -565,9 +547,7 @@ object SurfaceApi {
     path("v1" / "surfaces" / Segment / "config") { surface =>
       get {
         parameter("model_version".?) { versionOpt =>
-          // TODO: serve the version from the surface config instead of the query string, refuse a
-          // version that was never promoted, expire the cache in seconds rather than at the next
-          // deploy, and resolve the version through the same accessor the ranking call uses.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val config = configCache.getOrElseUpdate(
             surface,
             configFormat.read(
@@ -699,9 +679,7 @@ int main() {
 
   svr.Get("/v1/surfaces/:surface/config", [&redis, &config_cache](const httplib::Request& req, httplib::Response& res) {
     const auto surface = req.path_params.at("surface");
-    // TODO: serve the version from the surface config instead of the query string, refuse a version
-    // that was never promoted, expire the cache in seconds rather than at the next deploy, and
-    // resolve the version through the same accessor the ranking call uses.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto overridden = req.has_param("model_version") ? req.get_param_value("model_version") : std::string();
     auto it = config_cache.find(surface);
     if (it == config_cache.end()) {
@@ -835,9 +813,11 @@ int main() {
     },
   },
   hints: [
-    'Serve the version, do not accept it: the response `model_version` is the one in `surface:{surface}:config`, so delete the query parameter the starter reads and answer with the config’s own version. A caller that names the version can be served a model that was never promoted.',
-    'Promotion is the second gate: call `promotions.get(surface, version)` for the version you are about to serve and answer **404** when the record is missing — the same answer an unknown surface gets, so a reader cannot tell a version that never shipped from one that does not exist. A read never promotes.',
-    'The TTL is the point of the endpoint: write the config back with `CONFIG_TTL_S = 5` (`setex` / `ex=CONFIG_TTL_S` / `EX` / `configTTLS*time.Second`) so a rollback lands within seconds, and have both this handler and the ranking call resolve through `active_model_version(surface)` so the two can never disagree.',
+    'An operator rolls back the home surface and the dashboard still shows the new version an hour later; meanwhile a tester with `?model_version=` in the URL was served a build that was never promoted.',
+    'The handler reads the query parameter first, caches the surface row in a process-level map with no expiry, and builds `model_version` from that row itself instead of asking the accessor the ranking call uses.',
+    'Delete the query parameter; call `promotions.get(surface, version)` and answer 404 when missing; write the row back with `ex=CONFIG_TTL_S` (5 s); set `version = active_model_version(surface)` and put it in the body.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read that other services trust. This endpoint looks like a lookup, but it is the assignment every reader resolves before it ranks: the ranking call, the offline comparison, the analytics job that stamps impressions with a version. That makes two things release-critical. First, the version must be a promoted one — an unpromoted version is a model nobody shipped, and serving it silently turns an experiment into an unexplained incident, so the read consults the promotion record and answers 404 exactly as it would for a surface that does not exist. Second, the version must be read live: a five-second TTL in Redis is the difference between a rollback that lands in seconds and a rollback that waits for the next deploy of every process that cached the row in memory. The third contract is the shared accessor. If the config read and the ranking call each resolve the version themselves, two reads of the same key can straddle a rollback and the response can carry a version the ranking never used; one accessor — \`active_model_version(surface)\` — makes that impossible and keeps the switch a single write. Real systems add an audit trail for promotions, staged percentages so a switch is not all-or-nothing, pushes (Pub/Sub or a watched key) so readers invalidate ahead of the TTL, per-tenant pins for the callers still mid-session, and an \`ETag\`/short \`Cache-Control\` on the response so well-behaved clients re-read instead of holding an assignment for hours. They also keep a last-known-good copy of the config so a Redis outage degrades to the previous assignment rather than to no answer at all.`,
+  debrief: `This endpoint looks like a lookup, but it is the assignment every reader resolves before it ranks: the ranking call, the offline comparison, the analytics job that stamps impressions. So the version must be a promoted one, because an unpromoted version is a model nobody shipped and the read answers 404 exactly as it would for a surface that does not exist. The version must be read live, because a five-second TTL in Redis is the difference between a rollback that lands in seconds and one that waits for the next deploy of every process holding the row in memory. And the version must come through one accessor, \`active_model_version(surface)\`, so two reads cannot straddle a rollback and disagree.
+
+Production systems keep an audit trail for promotions, roll out by staged percentage instead of all-or-nothing, push invalidations (Pub/Sub or a watched key) ahead of the TTL, and keep a last-known-good copy so a Redis outage degrades to the previous assignment rather than to no answer.`,
 };

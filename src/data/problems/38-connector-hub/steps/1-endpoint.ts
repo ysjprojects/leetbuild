@@ -8,35 +8,29 @@ export const endpointStep: Step = {
   focus: ['client', 'hub', 'db', 'oauth'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns a connector. It compiles, it serves the demo, and it hides four production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/connectors\` with body
-\`{"source_type": "github", "token_ref": "oauth/acme/github", "base_url": "https://api.github.com"}\`.
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`source_type\` is one of \`github\`, \`slack\`, \`stripe\`, \`notion\` (**400** otherwise). The
-  allowlist is what keeps a caller from pointing the platform at an arbitrary vendor.
-- \`token_ref\` is a non-empty reference to an OAuth token the platform already holds — never the
-  token itself — and is at most **512** bytes (**400** otherwise).
-- \`base_url\` is optional and, when supplied, **must match the registration the platform already
-  holds** for that \`source_type\`: scheme \`https\` and exactly the registered host
-  (\`api.github.com\`, \`slack.com\`, \`api.stripe.com\`, \`api.notion.com\`). A URL on another host
-  is **403**, and the decision happens **before any request is made** — no probe, no fetch, no
-  \`http.Get\`, no \`httplib::Client\` during registration.
-- The **token reference never leaves the server**: it is stored on the connector row and never
-  appears in the response body or in a log line. The response carries the connector id, source type,
-  host and status.
-- \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(tenant, key)\`
-  returns the **existing** connector with 200 instead of creating a second one.
+**Starting point.** The starter registers \`POST /v1/connectors\`, parses a body of
+\`{"source_type", "token_ref", "base_url"}\`, probes the supplied \`base_url\` with an HTTP GET,
+inserts a connector row and returns it. It compiles, serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** Trusting the caller's \`base_url\` turns registration into an
-SSRF probe: the starter fetches it "to validate it", so any tenant can make the platform issue an
-authenticated request to whatever host it names — the cloud metadata endpoint included. Echoing the
-token reference back means it lands in access logs, browser histories and support tickets, where it
-outlives the connector. The missing allowlist and the un-keyed registration are the loud ones: an
-arbitrary source type and a duplicate connector on every client retry.`,
+SSRF probe: the starter fetches it "to validate it", so any tenant can make the platform issue a
+request to whatever host it names, the cloud metadata endpoint included. Echoing the token
+reference back lands it in access logs, browser histories and support tickets, where it outlives
+the connector. The missing allowlist and the un-keyed registration are the loud ones: an arbitrary
+source type, and a duplicate connector on every client retry.
+
+- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- \`source_type\` is one of \`github\`, \`slack\`, \`stripe\`, \`notion\` (**400** otherwise).
+- \`token_ref\` is a non-empty reference to an OAuth token the platform already holds, not the
+  token itself, and is at most **512** bytes (**400** otherwise).
+- \`base_url\` is optional and, when supplied, must match the registration the platform already
+  holds for that \`source_type\`: scheme \`https\` and exactly the registered host
+  (\`api.github.com\`, \`slack.com\`, \`api.stripe.com\`, \`api.notion.com\`). Another host is
+  **403**, decided by string comparison before any request is made.
+- The token reference stays on the connector row and appears in no response body or log line. The
+  response carries the connector id, source type, host and status.
+- \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(tenant, key)\`
+  returns the **existing** connector with 200 instead of creating a second one.`,
   sequence: {
     participants: ['Operator', 'Connector Hub', 'connector store', 'registered hosts'],
     messages: [
@@ -178,9 +172,7 @@ def register(
     tenant: str = Header(alias="X-Tenant-Id"),
     idem_key: str = Header(alias="Idempotency-Key"),
 ) -> JSONResponse:
-    # TODO: this starter accepts any source type, never requires a tenant or an Idempotency-Key,
-    # fetches the caller-supplied base_url to "validate" it, and echoes token_ref back. Fix all
-    # four before this handler ships.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     probe = httpx.get(f"{body.base_url}/user", timeout=2.0)
     logger.info("registered tenant=%s source=%s token=%s", tenant, body.source_type, body.token_ref)
     return JSONResponse(
@@ -302,9 +294,7 @@ interface RegisterBody {
 }
 
 app.post('/v1/connectors', async (request, reply) => {
-  // TODO: this starter accepts any source type, requires neither a tenant nor an Idempotency-Key,
-  // fetches the caller-supplied base_url to "validate" it, and echoes token_ref back. Fix all
-  // four before this handler ships.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RegisterBody;
   const probe = await fetch(\`\${body.base_url}/user\`);
@@ -440,9 +430,7 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts any source type, requires neither a tenant nor an Idempotency-Key,
-	// fetches the caller-supplied base_url to "validate" it, and echoes the token back. Fix all
-	// four before this handler ships.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	probe, err := http.Get(body.BaseURL + "/user")
 	if err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "base_url unreachable"})
@@ -620,9 +608,7 @@ object ConnectorApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RegisterRequest]) { body =>
-            // TODO: this starter accepts any source type, requires neither a tenant nor an
-            // Idempotency-Key, fetches the caller-supplied base_url to "validate" it, and echoes
-            // tokenRef back. Fix all four before this handler ships.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val probe = Http().singleRequest(HttpRequest(uri = body.base_url.getOrElse("") + "/user"))
             system.log.info(s"registered tenant=$tenant source=\${body.source_type} token=\${body.token_ref}")
             complete(StatusCodes.Created, s"""{"token_ref":"\${body.token_ref}","probe":"$probe"}""")
@@ -756,9 +742,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts any source type, requires neither a tenant nor an Idempotency-Key,
-    // fetches the caller-supplied base_url to "validate" it, and echoes the token back. Fix all
-    // four before this handler ships.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto baseUrl = body.value("base_url", std::string());
     const auto tokenRef = body.value("token_ref", std::string());
     httplib::Client probe(baseUrl);
@@ -885,9 +869,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order: tenant, Idempotency-Key, source allowlist, token_ref shape, then the host check. Every one of them returns before any work, and the host check never needs a socket — `urlsplit(url).hostname` against `REGISTERED_HOSTS[source_type]` is the whole comparison.',
-    'The replay lookup is keyed by `(tenant, Idempotency-Key)` and happens before the connector is created; a hit returns the stored connector with 200. Storing the connector — not the request hash — is what lets a replay answer without re-validating or re-creating anything.',
-    'The response is a view, not the row: build the connector from ids and status, and filter `token_ref` out of anything you return or log. Log the tenant, the connector id and the source; a token reference in a log line is a credential leak with a retention policy attached.',
+    'Symptoms: a body with `source_type: "ftp"` and no tenant header registers fine, the response shows the `token_ref`, and a client that retries the POST ends up with two connectors.',
+    'The handler validates nothing before `httpx.get(base_url)`, so the platform makes a request to any host a caller names, and it inserts a fresh row on every call because nothing is keyed by `Idempotency-Key`.',
+    'Guard in cost order: tenant (401), `Idempotency-Key` (400), `ALLOWED_SOURCES`, `token_ref` size, then `urlsplit(url).hostname` against `REGISTERED_HOSTS` (403). Look up `(tenant, key)` in the store first; drop `token_ref` from the response and the log.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo posts a well-formed body with the vendor's canonical URL from one tenant and never retries. Four separate defects are being checked: authentication and the source allowlist (the caller names a source the platform supports, not an arbitrary one), URL validation that compares against a held registration instead of fetching the caller's URL, token hygiene (a reference that never appears in a response or a log), and idempotency keyed by tenant so a retry cannot create a second connector. The SSRF probe is the one interviewers press on: "validate this URL for me" is a request your service makes with its own network position, so the only safe validation is the one that needs no request at all. Real hubs add per-tenant registrations with operator approval, signed webhook secrets, egress allowlists at the network layer, and a token broker that never hands the raw token to the connector process.`,
+  debrief: `The fix has the shape of a funnel that does no work: every guard returns before a row is written, and the host check is a string comparison because the only safe URL validation is one that needs no request. The replay lookup stores the connector rather than a request hash, so a retry answers without re-validating or re-creating anything, and the response is a view built from ids and status so the token reference cannot drift into a sink by accident. Production hubs go further: per-tenant registrations approved by an operator, egress allowlists enforced at the network layer rather than in the handler, and a token broker that hands the connector process a short-lived credential instead of a reference it could resolve itself.`,
 };

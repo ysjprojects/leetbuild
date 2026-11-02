@@ -8,27 +8,26 @@ export const glossaryReadStep: Step = {
   focus: ['client', 'api', 'glossary'],
   task: `## Task
 
-**Starting point.** The starter is working code for the read endpoint: it resolves a locale,
-returns that glossary and caches the response. It compiles, the dashboard shows terms, and it hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter serves \`GET /v1/glossaries/{locale}\`: it looks the locale up in a
+module-level \`GLOSSARIES\` map, returns \`{"terms": [...]}\` and sets \`Cache-Control: max-age=3600\`.
+It compiles, the dashboard shows terms, and it hides four flaws.
 
-Implement \`GET /v1/glossaries/{locale}\` for the authenticated tenant.
+**Failure mode the checks target.** Tenant B opens the glossary page and sees tenant A's product
+names, because the map has no tenant dimension and nothing checks who owns the entry; a translator
+investigating a bad translation cannot say which glossary was live, because the response names no
+version; and after a term is corrected the old one keeps showing for an hour, because the response
+told every cache it could.
+
+Requirements:
 
 - The glossary is read **by tenant**: the lookup is \`(tenant, locale)\` at the tenant's active
-  version. A lookup that resolves to another tenant's glossary is **403** — a glossary is customer
+  version. A lookup that resolves to another tenant's glossary is **403**; a glossary is customer
   terminology, not a shared dictionary.
 - A missing \`X-Tenant-Id\` is **401**; a locale with no glossary for that tenant is **404**.
 - Every response carries the glossary's **version** and its **term count**, so a caller can pin the
-  exact glossary a translation used and a client can tell an empty glossary from a missing one.
+  exact glossary a translation used and tell an empty glossary from a missing one.
 - The response is cacheable for **at most one second** (\`Cache-Control: max-age=1\`), so a glossary
-  update is visible on the very next read.
-
-**Failure mode the checks target.** The starter serves a global map keyed by locale alone, so tenant B
-reads tenant A's terminology; it returns terms with no version, so a caller cannot pin what it saw
-and a translator cannot reproduce a translation; and it lets caches hold the response for an hour, so
-a corrected term takes an hour to appear. The version is the field candidates forget: without it the
-read is a snapshot nobody can name.`,
+  update is visible on the next read.`,
   sequence: {
     participants: ['Client', 'Translation API', 'Glossary store'],
     messages: [
@@ -124,9 +123,7 @@ GLOSSARIES = {
 
 @app.get("/v1/glossaries/{locale}")
 def read_glossary(locale: str) -> JSONResponse:
-    # TODO: this starter serves any tenant's glossary by locale, returns terms without the pinned
-    # glossary version, and lets caches hold the response past the next glossary update. Fix all
-    # three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     terms = GLOSSARIES.get(locale, [])
     logger.info("glossary locale=%s terms=%d", locale, len(terms))
     return JSONResponse({"terms": terms}, headers={"Cache-Control": "max-age=3600"})
@@ -191,7 +188,7 @@ def read_glossary(
 `,
     },
     typescript: {
-      starter: `/** The glossary read: a global locale map, no version, hour-long caching. */
+      starter: `/** GET /v1/glossaries/{locale}. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -202,9 +199,7 @@ const GLOSSARIES: Record<string, Term[]> = {
 };
 
 app.get('/v1/glossaries/:locale', async (request, reply) => {
-  // TODO: this starter serves any tenant's glossary by locale, returns terms without the pinned
-  // glossary version, and lets caches hold the response past the next glossary update. Fix all
-  // three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {locale} = request.params as {locale: string};
   const terms = GLOSSARIES[locale] ?? [];
   request.log.info({locale, terms: terms.length}, 'glossary read');
@@ -278,9 +273,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readGlossary(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves any tenant's glossary by locale, returns terms without the pinned
-	// glossary version, and lets caches hold the response past the next glossary update. Fix all
-	// three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	locale := r.PathValue("locale")
 	entry := glossaries[locale]
 	rw.Header().Set("Cache-Control", "max-age=3600")
@@ -393,9 +386,7 @@ object GlossaryRead {
   val route: Route =
     path("v1" / "glossaries" / Segment) { locale =>
       get {
-        // TODO: this starter serves any tenant's glossary by locale, returns terms without the pinned
-        // glossary version, and lets caches hold the response past the next glossary update.
-        // Fix all three.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         respondWithHeader(headers.CacheControl(DateTime.now, 3600.seconds)) {
           complete(StatusCodes.OK, glossaries.getOrElse(locale, GlossaryEntry(Nil)))
         }
@@ -485,9 +476,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/glossaries/([a-z-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves any tenant's glossary by locale, returns terms without the pinned
-    // glossary version, and lets caches hold the response past the next glossary update. Fix all
-    // three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto locale = req.matches[1];
     const auto& terms = locale == "fr" ? kFrenchGlossary : kEnglishGlossary;
     res.set_header("Cache-Control", "max-age=3600");
@@ -571,9 +560,9 @@ int main() {
     },
   },
   hints: [
-    "The tenant is the first dimension of the lookup, not a filter applied afterwards: `glossaryStore.get(tenant, locale)` at the tenant's active version. A shared `GLOSSARIES[locale]` map is a data leak with a friendly API.",
-    'Return the version with the terms. A caller that cannot name the glossary it read cannot pin it, reproduce a translation, or tell you which terms were live when a bug was reported — and an `ETag` on that version makes the cache correct instead of merely short.',
-    "Freshness is a product decision: `max-age=1` means a corrected term appears on the next read. The starter's hour is chosen for hit rate, and it makes the glossary look broken for the rest of the hour after every update.",
+    'Two tenants with a French glossary see the same terms on their glossary page, the page cannot say which version it is showing, and a corrected term takes an hour to appear.',
+    'The handler ignores `X-Tenant-Id`, reads `GLOSSARIES[locale]` from a map with no tenant dimension, returns bare `terms`, and sends `max-age=3600` so every cache keeps the stale response.',
+    'Require the tenant (401), read `glossary_store.get(tenant, locale)` (404 when missing), run `assert_glossary_owner` (403), return `version` and `term_count`, and set `max-age=` from `GLOSSARY_READ_TTL_SECONDS = 1`.',
   ],
-  debrief: `The interviewer is testing whether the read path is designed with the same care as the write path. Three defects are checked: the lookup key (a shared locale map serves one customer's terminology to another), the response shape (terms without a version cannot be pinned or reproduced), and the cache lifetime (an hour of staleness after every glossary update). The owner check is the subtle one: even a tenant-scoped key needs a guard, because the store is shared infrastructure and the endpoint is the place where a foreign entry must become a 403 rather than a silent answer. Real services add per-locale ETag revalidation, an audit row per read for terminology that is legally binding, and a diff endpoint so a translator can see what changed between versions.`,
+  debrief: `The tenant is the first dimension of the lookup rather than a filter applied afterwards, because a store keyed by locale alone has already leaked by the time a filter runs. The owner check stays even with a tenant-scoped key: the store is shared infrastructure, and the endpoint is the place where a foreign entry becomes a 403 instead of a silent answer. The version travels in the response because a glossary nobody can name cannot be pinned or reproduced when a translation is questioned. One second of cache is the freshness the product needs after a term correction. Production read paths add an \`ETag\` derived from the version so caches revalidate instead of expiring, an audit row per read where terminology is legally binding, and a diff between versions for translators.`,
 };

@@ -8,17 +8,15 @@ export const dependencyStep: Step = {
   focus: ['gateway', 'asr', 'tts'],
   task: `## Task
 
-**Starting point.** The starter is working code: it opens the TTS stream and plays the audio, so the demo speaks. It hides an unbounded retry and a replay bug. Find them, fix them, and prove the fix.
+**Starting point.** The starter is the speech client the gateway uses for one turn: it opens the \`Synthesize\` stream, retries on failure and plays the audio, so the demo speaks. It compiles and hides five flaws.
 
-Implement the speech client the gateway uses for one turn.
+**Failure mode the checks target.** A retry that restarts the stream at offset zero re-plays and re-bills audio the caller already heard; a retry loop with no bound turns one provider outage into a hot loop; and leaving the old stream running when a new one starts bills twice and can interleave two answers.
 
 - \`Recognize\` (ASR) and \`Synthesize\` (TTS) are streaming RPCs run under a **10-second idle deadline** per call: a stream that produces nothing for ten seconds is dead and must be abandoned.
-- Cancelling a stream must actually cancel it — \`cancel()\` / \`Cancel()\` / \`TryCancel()\` on the client side — and the resulting \`CANCELLED\` status is a normal stop, never an error to retry, so the provider stops billing for audio nobody will hear.
-- Starting a new stream cancels the previous one **first**: the order matters, one session must never keep two synthesizers alive.
-- When TTS fails **after** audio has been delivered, the retry resumes at the delivered token offset (\`resume_offset = delivered_tokens\`); it must never replay from zero, and if the server cannot resume, the client surfaces a clean error instead of replaying the first sentence.
-- Retries are bounded (\`MAX_ATTEMPTS\`) and only on \`UNAVAILABLE\`.
-
-**Failure mode the checks target.** A retry that restarts the stream at offset zero re-plays and re-bills audio the caller already heard; a retry loop with no bound turns one provider outage into a hot loop; and leaving the old stream running when a new one starts bills twice and can interleave two answers.`,
+- Cancelling a stream must actually cancel it (\`cancel()\` / \`Cancel()\` / \`TryCancel()\` on the client side) and the resulting \`CANCELLED\` status is a normal stop, not an error to retry, so the provider stops billing for audio nobody will hear.
+- Starting a new stream cancels the previous one **first**: the order matters, one session must not keep two synthesizers alive.
+- When TTS fails **after** audio has been delivered, the retry resumes at the delivered token offset (\`resume_offset = delivered_tokens\`); if the server cannot resume, the client surfaces a clean error instead of replaying the first sentence.
+- Retries are bounded (\`MAX_ATTEMPTS\`) and only on \`UNAVAILABLE\`.`,
   sequence: {
     participants: ['Voice Gateway', 'ASR', 'TTS'],
     messages: [
@@ -31,16 +29,16 @@ Implement the speech client the gateway uses for one turn.
     ],
   },
   hints: [
-    'the deadline belongs on the call context (`timeout=` / `deadline` / `context.WithTimeout`), not on the socket: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are the only statuses worth retrying, and a bound like `MAX_ATTEMPTS` stops the hot loop.',
-    '`resume_offset` is the number of tokens already delivered to the caller; the request carries it, so the server continues instead of restarting. Offset zero means the retry replays the whole sentence.',
-    'cancel before you start: keep a handle on the live stream, cancel it (and swallow `CANCELLED`) before opening the new one, so a barge-in cannot leave two synthesizers speaking.',
+    'During a provider blip the caller hears the first sentence of the answer twice, then the gateway pegs a CPU retrying; on barge-in the old answer keeps playing under the new one.',
+    'The retry loop re-sends the same request from offset zero, catches every status with no attempt limit, has no deadline on the call, and never cancels the handle of the stream it is replacing.',
+    'Put `IDLE_DEADLINE_S` on the call context, cancel the live stream (swallowing `CANCELLED`) before the new `Synthesize`, send `resume_offset = delivered_tokens`, and loop at most `MAX_ATTEMPTS` times on `UNAVAILABLE` only.',
   ],
   checks: [
     {
       id: 'deadline',
       title: 'Every speech call runs under a 10-second idle deadline',
       detail:
-        'The ASR and TTS calls carry a 10-second idle deadline on their context (`timeout=` / `deadline` / `context.WithTimeout`). The starter has no deadline, so a silent stream hangs a session forever.',
+        'The ASR and TTS calls carry a 10-second idle deadline on their context (`timeout=` / `deadline` / `context.WithTimeout`), so a silent stream cannot hang a session.',
       match: {
         python: {all: [/IDLE_DEADLINE_S/, /timeout=/]},
         typescript: {all: [/IDLE_DEADLINE_S/, /deadline/]},
@@ -53,7 +51,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'cancel',
       title: 'Cancelling a stream stops the work and the billing',
       detail:
-        'A cancelled stream is really cancelled (`cancel()` / `Cancel()` / `TryCancel()`) and the `CANCELLED` status is handled as a normal stop. The starter drops the handle and lets the provider keep synthesising audio nobody will hear.',
+        'A cancelled stream is really cancelled (`cancel()` / `Cancel()` / `TryCancel()`) and the `CANCELLED` status is handled as a normal stop, so the provider stops synthesising audio nobody will hear.',
       match: {
         python: {all: [/cancel\(\)/, /CancelledError/]},
         typescript: {all: [/cancel\(\)/, /CANCELLED/]},
@@ -66,7 +64,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'resume',
       title: 'A retried TTS resumes at the delivered token offset',
       detail:
-        'The retry request carries `resume_offset` (`resumeOffset` / `ResumeOffset`) set to the tokens already delivered, so the server continues instead of replaying. The starter re-sends the request from offset zero and the caller hears the first sentence twice.',
+        'The retry request carries `resume_offset` (`resumeOffset` / `ResumeOffset`) set to the tokens already delivered, so the server continues instead of replaying.',
       match: {
         python: {all: [/resume_offset/, /delivered_tokens/]},
         typescript: {all: [/resumeOffset/, /deliveredTokens/]},
@@ -79,7 +77,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'single-stream',
       title: 'A new stream cancels the previous one first',
       detail:
-        'In the source, the cancellation of the live stream comes before the new `Synthesize` call, so one session never has two synthesizers. The starter starts the new stream and leaves the old one running.',
+        'In the source, the cancellation of the live stream comes before the new `Synthesize` call, so one session never has two synthesizers.',
       match: {
         python: {order: [/\.cancel\(\)/, /\.Synthesize\(/]},
         typescript: {order: [/\.cancel\(\)/, /\.synthesize\(/]},
@@ -92,7 +90,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'bounded-retry',
       title: 'Retries are bounded and status-filtered',
       detail:
-        'Retries stop after `MAX_ATTEMPTS` (`maxAttempts` / `MaxAttempts` / `kMaxAttempts`) and only `UNAVAILABLE`/`Unavailable` is retried; `INVALID_ARGUMENT` fails immediately. The starter catches every error and loops forever.',
+        'Retries stop after `MAX_ATTEMPTS` (`maxAttempts` / `MaxAttempts` / `kMaxAttempts`) and only `UNAVAILABLE`/`Unavailable` is retried; `INVALID_ARGUMENT` fails immediately.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS/, /UNAVAILABLE/]},
@@ -124,10 +122,7 @@ class SpeechClient:
             yield partial
 
     async def synthesize(self, text: str):
-        # TODO: every retry restarts the stream at the beginning, so the caller hears the first
-        # sentence twice, and this retry loop has no bound, so one provider outage turns into a hot
-        # loop. Add the 10-second idle deadline, cancel the live stream before opening the new one,
-        # and resume at the delivered token offset.
+        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         while True:
             try:
                 call = tts.Synthesize(speech_pb2.SynthesizeRequest(text=text))
@@ -236,10 +231,7 @@ export class SpeechClient {
   private stream: grpc.ClientReadableStream<AudioChunk> | null = null;
 
   async *synthesize(text: string): AsyncGenerator<AudioChunk> {
-    // TODO: every retry restarts the stream at offset zero, so the caller hears the first sentence
-    // twice, and the loop has no bound, so one provider outage turns into a hot loop. Add the
-    // 10-second idle deadline, cancel the live stream before opening the new one, and resume at
-    // the delivered token offset.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for (;;) {
       try {
         const call = this.tts.synthesize({text}, new grpc.Metadata(), {});
@@ -343,10 +335,7 @@ type SpeechClient struct {
 }
 
 func (c *SpeechClient) Synthesize(ctx context.Context, text string, audio chan<- []byte) error {
-	// TODO: every retry restarts the stream at offset zero, so the caller hears the first sentence
-	// twice, and the loop has no bound, so one provider outage turns into a hot loop. Add the
-	// 10-second idle deadline, cancel the live stream before opening the new one, and resume at
-	// the delivered token offset.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
 		stream, err := c.tts.Synthesize(ctx, &pb.SynthesizeRequest{Text: text})
 		if err != nil {
@@ -461,10 +450,7 @@ object SpeechClient {
   val tts = TtsGrpc.blockingStub(channel)
 
   def synthesize(text: String, deliveredTokens: Int): Iterator[AudioChunk] = {
-    // TODO: every retry restarts the stream at offset zero, so the caller hears the first sentence
-    // twice, and the loop has no bound, so one provider outage turns into a hot loop. Add the
-    // 10-second idle deadline, cancel the live stream before opening the new one, and resume at
-    // the delivered token offset.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var done = false
     var chunks: Iterator[AudioChunk] = Iterator.empty
     while (!done) {
@@ -547,10 +533,7 @@ object SpeechClient {
 std::unique_ptr<Tts::Stub> tts;
 
 void synthesize(const std::string& text, const std::function<void(const std::string&)>& on_audio) {
-  // TODO: every retry restarts the stream at offset zero, so the caller hears the first sentence
-  // twice, and the loop has no bound, so one provider outage turns into a hot loop. Add the
-  // 10-second idle deadline, cancel the live stream before opening the new one, and resume at
-  // the delivered token offset.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     SynthesizeRequest request;
@@ -621,5 +604,5 @@ class SpeechClient {
 `,
     },
   },
-  debrief: `A streaming speech call is not a request you can retry for free: the client owns a session that keeps generating audio after the caller stopped listening, so two contracts have to be explicit. The idle deadline belongs on the call, because a stream that has gone silent is dead even though the socket is open — ten seconds without a chunk is the line between "the model is thinking" and "nobody will ever hear this answer", and without it one stuck provider pins a live call until the caller hangs up. Cancellation has to be real too: a handle that is dropped instead of cancelled leaves the provider synthesising, and because the new stream must cancel the old one before it opens, a barge-in can otherwise leave two synthesizers talking over each other and billing twice. Resuming at the delivered offset is what separates a retry from a replay: the offset is the tokens the caller already heard, so a retry after UNAVAILABLE continues the sentence, while a retry from zero re-plays and re-bills it — and a server that cannot resume must fail cleanly instead of falling back to the start. Production adds provider-side session ids that survive reconnects, usage reconciliation for the audio that was delivered before a failure, and jittered backoff so a provider outage does not become a hot loop.`,
+  debrief: `A streaming speech call is not a request you can retry for free: the client owns a session that keeps generating audio after the caller stopped listening. The idle deadline belongs on the call because a stream that has gone silent is dead even though the socket is open; ten seconds without a chunk is the line between "the model is thinking" and "nobody will hear this answer". Cancellation has to be real: a dropped handle leaves the provider synthesising, and cancelling the old stream before the new one opens is what keeps a barge-in from leaving two synthesizers talking. Resuming at the delivered offset separates a retry from a replay. Production clients also carry provider-side session ids across reconnects, reconcile usage for audio delivered before a failure, and add jittered backoff between attempts.`,
 };

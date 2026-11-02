@@ -8,36 +8,29 @@ export const dependencyStep: Step = {
   focus: ['hub', 'gateway', 'device'],
   task: `## Task
 
-**Starting point.** The starter is working code: it delivers to a healthy device, the gateway
-answers, the demo records a door unlocking, and nothing looks wrong. It hides three flaws. It
-retries an offline device every second until a reply looks like success, so a device that stays
-offline for days is poked forever; it carries no deadline and no attempt cap and never looks at the
-command’s validity window; and it reports the command delivered the moment the gateway accepts the
-enqueue. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`deliver(command)\` loops with \`while True\`: it calls
+\`gateway.Deliver\` with \`command_id\` and \`device_id\`, returns \`True\` when \`reply.accepted\` is
+set, swallows every \`grpc.RpcError\`, and sleeps one second between attempts. It compiles and
+hides five flaws.
 
-The hub reaches devices through a **device gateway** over gRPC. An online device gets the command
-pushed to it and answers with an acknowledgment; an offline device’s command waits in the gateway’s
-queue, but only until the command’s **validity window** closes — a door told to unlock at 09:00 must
-not unlock at 18:00.
+**Failure mode the checks target.** A device that stays offline for days is poked once a second for
+days; a gateway that accepts the connection and then says nothing holds the worker open; and a
+command the gateway merely queued is recorded as delivered, so a door that did not unlock looks
+like one that did.
 
-Implement \`deliver(command)\` for the hub’s gateway client:
+Requirements:
 
-- Every delivery attempt carries a **5-second deadline**. Without one, a gateway that accepts the
-  connection and then says nothing pins the hub’s delivery worker indefinitely.
-- The command carries its **validity window** (\`expires_at\`): send it to the gateway
-  (\`expires_at_ms\`) and stop attempting once it passes. When the window closes, the gateway’s queue
-  drops the command (\`EXPIRED\`) — the hub must not keep a fresh retry loop alive for it.
-- At most **3 attempts** per command, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retryable; every other status is returned to the caller immediately.
-- \`deliver\` returns \`True\` only when the **device acknowledged** the command
-  (\`DeliverReply.DELIVERED\`). A \`QUEUED\` reply means the gateway accepted the command into the
-  offline queue and nothing more.
-
-**Failure mode the checks target.** A retry loop with no window, no cap and no deadline turns one
-offline device into a permanent load on the gateway — hours or days of calls for a command that
-stopped being valid long ago — while a command that was only queued is recorded as delivered, so a
-door that never unlocked becomes indistinguishable from one that did. Neither failure is visible in a
-demo where the device is always online and acknowledges in milliseconds.`,
+- \`DEADLINE_S = 5\`: every \`Deliver\` call carries \`timeout=DEADLINE_S\`.
+- \`MAX_ATTEMPTS = 3\`: the loop runs while \`attempts < MAX_ATTEMPTS\` and
+  \`time.time() < command.expires_at\`. No \`while True\`, no \`time.sleep\`.
+- The request carries the window as \`expires_at_ms=int(command.expires_at * 1000)\`. The gateway
+  queues an offline device's command only until then and answers \`DeliverReply.EXPIRED\` after;
+  handle that as a final \`False\`.
+- \`RETRYABLE = {UNAVAILABLE, DEADLINE_EXCEEDED}\`: any other status code (\`not in RETRYABLE\`) is
+  raised to the caller at once.
+- Return \`True\` only on \`reply.status == gateway_pb2.DeliverReply.DELIVERED\`, the device's own
+  acknowledgment. Do not read \`reply.accepted\`; \`QUEUED\` means the gateway took the command and
+  nothing more.`,
   sequence: {
     participants: ['IoT Hub', 'Device Gateway', 'Device'],
     messages: [
@@ -65,9 +58,9 @@ demo where the device is always online and acknowledges in milliseconds.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the delivery call itself (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)`, `set_deadline`) — a channel option is not a per-call deadline. The starter carries none, so one silent gateway pins the hub’s worker for as long as it stays silent.',
-    'A command is only meaningful inside its window: put `expires_at_ms` on the request and make the retry loop’s condition `now < expires_at`. The gateway queues for an offline device only until that instant and then drops the command (`EXPIRED`), so a loop that ignores the window is spending gateway capacity on a command that can no longer run.',
-    '“Delivered” is the device’s acknowledgment: return `True` on `DELIVERED` and never on the gateway accepting the enqueue — the starter’s `accepted` shortcut records a door as unlocked that never was. Gate the loop on the retryable codes (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) with a `MAX_ATTEMPTS = 3` cap, so every other failure exits instead of spinning once a second.',
+    'A lock that lost its uplink on Friday shows every command as delivered in the operator console, and on Monday the gateway logs show the hub calling `Deliver` for it 250,000 times.',
+    '`while True` with `time.sleep(1)` has no exit except `reply.accepted`, which the gateway sets as soon as it enqueues, so an offline device both spins the loop and reports success.',
+    'Loop on `attempts < MAX_ATTEMPTS and time.time() < command.expires_at`, pass `timeout=DEADLINE_S`, return `True` only on `DeliverReply.DELIVERED`. The checks also cover `RETRYABLE`, `expires_at_ms` and `EXPIRED`.',
   ],
   checks: [
     {
@@ -200,9 +193,7 @@ class Command:
 
 
 def deliver(command) -> bool:
-    # TODO: the delivery carries no 5 s deadline, a reply that accepted the enqueue is reported
-    # as delivered although no device acknowledged anything, and an offline device is retried
-    # every second until it gives up: the command's validity window is never consulted.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = gateway.Deliver(
@@ -264,7 +255,7 @@ def deliver(command) -> bool:
 `,
     },
     typescript: {
-      starter: `/** Device gateway client: flawed code that retries an offline device forever. */
+      starter: `/** Device gateway client: delivers one command to a device through the gateway. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -295,9 +286,7 @@ export interface Command {
 }
 
 export function deliver(command: Command): Promise<boolean> {
-  // TODO: the call carries no 5 s deadline, the gateway accepting the enqueue is reported as
-  // delivered although no device acknowledged anything, and an offline device is retried every
-  // second forever: the command's validity window is never consulted.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const {promise, resolve} = Promise.withResolvers<boolean>();
   const attempt = (): void => {
     gateway.Deliver(
@@ -400,9 +389,7 @@ type Command struct {
 	ExpiresAt time.Time
 }
 
-// TODO: the attempts carry no 5 s deadline, a reply whose Accepted flag is set is reported as
-// delivered although no device acknowledged anything, and an offline device is retried once a
-// second forever: the command's validity window is never consulted.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func deliver(ctx context.Context, client pb.DeviceGatewayClient, command Command) (bool, error) {
 	for attempt := 0; ; attempt++ {
 		reply, err := client.Deliver(ctx, &pb.DeliverRequest{
@@ -478,9 +465,7 @@ object DeviceDelivery {
   val gateway =
     DeviceGatewayGrpc.blockingStub(ManagedChannelBuilder.forAddress("gateway", 50051).usePlaintext().build())
 
-  // TODO: the attempts carry no 5 s deadline, a reply whose accepted flag is set is reported as
-  // delivered although no device acknowledged anything, and an offline device is retried once a
-  // second forever: the command's validity window is never consulted.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def deliver(command: Command): Boolean = {
     var delivered = false
     while (!delivered) {
@@ -553,9 +538,7 @@ struct Command {
   std::chrono::system_clock::time_point expires_at;
 };
 
-// TODO: the attempts carry no 5 s deadline, a reply whose accepted flag is set is reported as
-// delivered although no device acknowledged anything, and an offline device is retried once a
-// second forever: the command's validity window is never consulted.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 bool deliver(DeviceGateway::Stub* gateway, const Command& command) {
   while (true) {
     grpc::ClientContext ctx;
@@ -624,5 +607,12 @@ bool deliver(DeviceGateway::Stub* gateway, const Command& command) {
 `,
     },
   },
-  debrief: `The interviewer is probing one question under many names: when is a command actually delivered, and what happens when it cannot be? The 5-second deadline bounds one attempt, \`MAX_ATTEMPTS\` plus the validity window bound the whole delivery, and the retryable set decides which failures are even worth another attempt. The window is what makes an offline device safe: the gateway queues only until it closes and then drops the command, so a hub that keeps retrying is doing work for a command that can no longer run. The acknowledgment is the correctness answer — the gateway accepting an enqueue means only that the queue took the command, and a door that never unlocked must never be recorded as unlocked. The starter looks fine because a device on a lab bench is always online and acknowledges in milliseconds. Real hubs add per-device backpressure, replay from an outbox when the gateway itself is unreachable, and a reconciliation sweep that expires stale commands the queue never delivered.`,
+  debrief: `Three bounds replace one open loop. The 5-second deadline bounds a single attempt, so a
+silent gateway costs at most five seconds of worker time. \`MAX_ATTEMPTS\` and \`expires_at\` bound
+the whole delivery, and the window is what matters for an offline device: the gateway's queue drops
+the command at that instant, so a hub-side retry after it is work for a command that cannot run.
+\`RETRYABLE\` keeps the loop from re-sending on a permanent failure such as \`NOT_FOUND\`.
+\`DELIVERED\` is the only success because only the device can confirm the side effect. This step has
+no answer for a gateway that is itself unreachable; a production hub parks the command in an outbox
+for a sweeper to re-drive, and expires queued commands on a schedule.`,
 };

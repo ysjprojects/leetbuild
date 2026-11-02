@@ -8,35 +8,26 @@ export const cacheDependencyStep: Step = {
   focus: ['cache', 'model'],
   task: `## Task
 
-**Starting point.** The starter is working code: on a miss it calls the model,
-catches the error, retries, and stores whatever comes back. It hides three flaws that all look like
-"resilience" and all end in one poisoned cache entry. Debug the miss path, fix it, and prove the fix.
+**Starting point.** The starter is the miss path: \`complete_and_cache\` calls the model over gRPC
+in a three-attempt loop, retries a \`content_filter\` reply, and stores whatever comes back,
+including the error branch. It serves the demo and hides five flaws.
 
-Implement the model call the fill path makes on a miss.
+**Failure mode the checks target.** The starter caches *a response* where it must cache *the
+completion the request asked for*. A sampled response, a truncated one, an error string and a refusal
+are all "a response", and all are permanently wrong under a key whose contract is "this exact prefix
+at this exact version".
 
-- **Every call carries a 3-second deadline.** A miss that hangs holds a request thread, a connection
-  and a client-side timeout budget; the deadline is what turns "the provider is slow" into a bounded
-  failure instead of an outage that spreads.
-- **Only a deterministic completion is cacheable.** The rule is \`temperature == 0\` **and** the reply
-  finished normally (\`finish_reason == "stop"\`). A sampled answer (\`temperature > 0\`) is different on
-  every call, so caching one sample hands that particular sample to every later caller for the whole
-  version lifetime. The starter stores every reply it gets.
-- **A transport error is returned uncached.** When the call fails — \`UNAVAILABLE\`,
-  \`DEADLINE_EXCEEDED\`, whatever it is — the miss path returns nothing to store. The starter writes
-  \`"upstream error"\` into the entry, so one provider blip becomes everyone's completion for six
-  hours, and no later request ever retries because the cache keeps answering.
-- **A content-policy refusal is terminal for that request.** Answer it with
-  \`{"status": "refused"}\` and store nothing: the refusal belongs to this prompt and this version, and
-  retrying it hammers the provider for an answer that policy already declined. The starter loops three
-  times over a \`content_filter\` reply.
-- **A cached answer is stored through the same conditional fill as any other**. Use the fill from the
-  state step (\`fill_if_absent\`), never a direct \`SET\`: the miss path must not be a second writer that
-  can clobber a newer value.
-
-**Failure mode the checks target.** All three flaws are the same mistake in different clothes: the
-starter caches *a response* where it must cache *the completion the request asked for*. A sampled
-response, an error string and a refusal are all "a response", and all three are permanently wrong once
-they are stored under a key whose whole contract is "this exact prefix at this exact version".`,
+- **Every call carries a 3-second deadline**, so "the provider is slow" is a bounded failure rather
+  than a held request thread.
+- **Only a deterministic completion is cacheable**: \`temperature == 0\` **and**
+  \`finish_reason == "stop"\`. Caching one sample hands it to every later caller for the version's
+  lifetime.
+- **A transport error is returned uncached.** On \`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\` or anything
+  else, return nothing to store; \`"upstream error"\` in the entry makes one blip everyone's answer
+  for six hours.
+- **A content-policy refusal is terminal.** Answer \`{"status": "refused"}\`, store nothing, do not
+  retry an answer policy already declined.
+- **A cached answer goes through \`fill_if_absent\`** from the state step, not a direct \`SET\`.`,
   sequence: {
     participants: ['Prompt Cache', 'Model server', 'Redis'],
     messages: [
@@ -69,9 +60,9 @@ they are stored under a key whose whole contract is "this exact prefix at this e
     ],
   },
   hints: [
-    'Put the deadline on the call, not on the whole handler: `timeout=3.0` / `deadline` / `WithTimeout` / `withDeadlineAfter` / `set_deadline`. One slow model call must fail as one slow request, and the deadline also bounds what a retry storm can do.',
-    'Write the cacheability decision as one boolean before the write: `temperature == 0 and finish_reason == "stop"`. Sampling and truncation are the two cases where the reply is tied to the call that produced it, and storing either under a shared key is how one caller’s sample becomes everyone’s answer.',
-    'Treat failure and refusal as decisions rather than events: the error branch returns nothing to store (so the next request tries again), and a `content_filter` reply is answered as `refused` and never retried. A refusal is policy, not a transient condition — retrying it is the client arguing with the policy.',
+    'After one provider blip, every caller of a popular prompt gets "upstream error" for six hours; a request with temperature 0.9 freezes one random sample as everyone\'s answer; a refused prompt costs three provider calls.',
+    'The loop calls `stub.Complete` with no deadline, `continue`s on `content_filter`, and reaches `fill_if_absent` from both the success path and the `except` branch, with no look at `temperature` or `finish_reason`.',
+    'Make one call with `timeout=3.0`; return `None` from the error branch; answer `content_filter` as `refused` without storing; store only when `temperature == 0 and finish_reason == "stop"`.',
   ],
   checks: [
     {
@@ -151,9 +142,7 @@ log = logging.getLogger("prompt-cache")
 
 
 async def complete_and_cache(stub, key: str, tenant: str, version: int, prefix: str, temperature: float) -> dict:
-    # TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
-    # every reply it gets — a sampled answer, a truncated answer and even the error path, so one
-    # provider blip is served to everyone for the rest of the version's lifetime.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     for attempt in range(3):
         try:
             request = CompletionRequest(prefix=prefix, version=version, temperature=temperature)
@@ -203,9 +192,7 @@ export async function completeAndCache(
   prefix: string,
   temperature: number,
 ): Promise<{status: string; completion: string | null}> {
-  // TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
-  // every reply it gets — a sampled answer, a truncated answer and even the error path, so one
-  // provider blip is served to everyone for the rest of the version's lifetime.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const reply = await client.Complete({prefix, version, temperature});
@@ -258,9 +245,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
-// every reply it gets — a sampled answer, a truncated answer and even the error path, so one
-// provider blip is served to everyone for the rest of the version's lifetime.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func completeAndCache(ctx context.Context, stub CompletionClient, key, tenant string, version int, prefix string, temperature float64) (*Result, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		reply, err := stub.Complete(ctx, &CompletionRequest{Prefix: prefix, Version: int32(version), Temperature: temperature})
@@ -322,9 +307,7 @@ func completeOrNone(ctx context.Context, stub CompletionClient, key, tenant stri
 import scala.concurrent.{ExecutionContext, Future}
 
 object MissPath {
-  // TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
-  // every reply it gets — a sampled answer, a truncated answer and even the error path, so one
-  // provider blip is served to everyone for the rest of the version's lifetime.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def completeAndCache(stub: CompletionServiceGrpc.CompletionServiceStub, jedis: Jedis, key: String, tenant: String,
                        version: Int, prefix: String, temperature: Double)(implicit ec: ExecutionContext): Future[Result] = {
     val request = CompletionRequest(prefix = prefix, version = version, temperature = temperature)
@@ -375,9 +358,7 @@ object MissPath {
 #include <iostream>
 #include <string>
 
-// TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
-// every reply it gets — a sampled answer, a truncated answer and even the error path, so one
-// provider blip is served to everyone for the rest of the version's lifetime.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 Result complete_and_cache(Completion::StubInterface* stub, sw::redis::Redis& cache, const std::string& key,
                           const std::string& tenant, int version, const std::string& prefix, double temperature) {
   CompletionRequest request;
@@ -428,5 +409,5 @@ std::optional<Result> complete_or_none(Completion::StubInterface* stub, sw::redi
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell "a response arrived" from "an answer is cacheable". The starter conflates them, and all three of its flaws are the same conflation: a sampled completion is one instance of a distribution, a truncated completion is one instance of a stream, and an error string is not a completion at all — yet each of them would be stored under a key that promises "this exact prefix, at this exact version, has this answer". The deadline is the other half of the same discipline: without it, a slow provider turns a cache miss into an unbounded wait, and the retry loop the starter writes makes it worse because a refusal is deterministic and will be refused again. What a real service adds is the observability that makes the policy visible — log the failure with the key and the gRPC code, expose a cacheable/uncached/refused counter beside the hit ratio — so on-call can tell a provider problem from a policy problem without reading a single completion.`,
+  debrief: `The fix is one explicit cacheability decision placed between the call and the write. A sampled completion is one instance of a distribution, a truncated completion is one instance of a stream, and an error string is not a completion at all, so none of them may be stored under a key that promises "this exact prefix, at this exact version, has this answer". The deadline belongs to the same discipline: without it a slow provider turns a cache miss into an unbounded wait, and the retry loop makes a deterministic refusal cost three calls instead of one. What a production service adds is a counter per outcome (cacheable, uncached, refused) beside the hit ratio, so on-call can tell a provider problem from a policy problem without reading a single completion.`,
 };

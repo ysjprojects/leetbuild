@@ -8,36 +8,33 @@ export const readCitationsStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it serves a citation, it is fast, and the demo
-always asks for the caller’s own answer. It hides three flaws — a cross-tenant read, a status that
-is guessed instead of read, and an answer whose status ignores its broken citations. Debug it, fix
-it, and prove the fix.
+**Starting point.** The starter serves the read side, \`GET /v1/citations/{citation_id}\` and
+\`GET /v1/answers/{answer_id}/citations\`: it looks the citation up by id, answers with a quote and
+a status, and reports an answer's status from its citation list. It compiles, it serves the demo,
+and it hides four flaws.
 
-Implement the read side, two endpoints:
+**Failure mode the checks target.** The read is where a citation's trustworthiness is finally
+shown to someone. A lookup that ignores the tenant turns the endpoint into a citation oracle for
+everyone; a status recomputed from document existence replaces a proof with a guess; a response
+without version and offsets cannot be checked against the bytes; and an answer status that ignores
+a broken citation makes the whole response look trustworthy while one of its spans no longer
+resolves.
 
 \`GET /v1/citations/{citation_id}\`:
 
 - The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the citation is returned for the
-  **owning tenant only**: a citation that belongs to another tenant is **404**, never 403 — a 403
-  confirms that the citation exists, which is itself information the caller may not have.
+  **owning tenant only**: a citation that belongs to another tenant is **404**, not 403, because a
+  403 confirms that the citation exists, which is itself information the caller may not have.
 - The response names the evidence in full: \`{"id", "document_id", "version", "start", "end",
-  "quote", "status", "reason"}\`. The starter returns a quote and a status but no version and no
-  offsets, so a reviewer cannot check the span against the bytes.
+  "quote", "status", "reason"}\`, so a reviewer can check the span against the bytes.
 
 \`GET /v1/answers/{answer_id}/citations\`:
 
 - The list is scoped by tenant in the lookup, not filtered after the fact.
-- The answer’s **status is the worst status among its citations**: \`broken\` beats \`pending\`
-  beats \`verified\`, and an answer with any broken citation reports **\`degraded\`**. The starter
-  reports the first citation’s status, so one broken citation in the middle is invisible.
-- **Statuses come from the stored verification**, never recomputed from “the document still
-  exists”. The starter answers \`valid\` for anything whose document resolves, which erases the
-  verification result this whole store exists to keep.
-
-**Failure mode the checks target.** Reading by id without the tenant predicate turns the endpoint
-into a citation oracle for every tenant; recomputing the status from document existence replaces a
-proof with a guess; and an answer status that ignores broken citations makes the whole response look
-trustworthy while one of its spans no longer resolves.`,
+- The answer's **status is the worst status among its citations**: \`broken\` beats \`pending\`
+  beats \`verified\`, and an answer with any broken citation reports **\`degraded\`**.
+- **Statuses come from the stored verification**, not recomputed from whether the document still
+  exists: the verification result is what this whole store exists to keep.`,
   sequence: {
     participants: ['Client', 'Citation API', 'citation store'],
     messages: [
@@ -56,9 +53,9 @@ trustworthy while one of its spans no longer resolves.`,
     ],
   },
   hints: [
-    'One code for two situations: look the citation up with the tenant in the predicate and answer **404** when there is no row. A separate 403 branch tells a caller that the citation exists and belongs to someone else, which is exactly the fact you are trying to keep from them.',
-    'The status is stored data, not something to derive: return `citation["status"]` as the verification recorded it. `"valid" if the document exists` is a guess that outlives the verification it replaces.',
-    'Rank the statuses explicitly (`broken > pending > verified`) and compute the answer’s status as the maximum over its citations, mapping a broken worst-case to `degraded`. Taking the first citation’s status — or the last one — makes the answer’s verdict depend on ordering instead of on its evidence.',
+    'A session from tenant A can read tenant B\u2019s citations by id; a citation the verifier marked broken shows as `valid`; an answer with a broken span in the middle of its list reports `verified`.',
+    'The starter calls `lookup(citation_id)` with no tenant, derives the status from `documents.exists`, omits `version`, `start` and `end` from the body, and copies the first citation\u2019s status onto the answer.',
+    'Look up with the tenant in the predicate and answer 404 on no row; return the stored `status` with `version`, `start`, `end`; add `STATUS_RANK` and `answer_status()` taking the maximum, mapping broken to `ANSWER_DEGRADED`.',
   ],
   checks: [
     {
@@ -158,9 +155,7 @@ app = FastAPI()
 
 @app.get("/v1/citations/{citation_id}")
 def read_citation(citation_id: str) -> JSONResponse:
-    # TODO: this starter serves any tenant, guesses the status from whether the document exists, and
-    # returns no version or offsets. Return the stored verification and the full span, and answer
-    # 404 for a citation that belongs to another tenant.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     citation = lookup(citation_id)
     return JSONResponse(
         {
@@ -270,7 +265,7 @@ def read_answer(
 `,
     },
     typescript: {
-      starter: `/** A read that serves any tenant and guesses the citation status. */
+      starter: `/** GET /v1/citations/{id}: the starter. */
 import Fastify from 'fastify';
 
 import {documents, db} from './store';
@@ -278,9 +273,7 @@ import {documents, db} from './store';
 export const app = Fastify();
 
 app.get('/v1/citations/:citation_id', async (request, reply) => {
-  // TODO: this starter serves any tenant, guesses the status from whether the document exists, and
-  // returns no version or offsets. Return the stored verification and the full span, and answer
-  // 404 for a citation that belongs to another tenant.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {citation_id} = request.params as {citation_id: string};
   const citation = await db.lookup(citation_id);
   return reply.code(200).send({
@@ -383,9 +376,7 @@ import (
 )
 
 func readCitation(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves any tenant, guesses the status from whether the document exists, and
-	// returns no version or offsets. Return the stored verification and the full span, and answer
-	// 404 for a citation that belongs to another tenant.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	citation, _ := store.Get(r.Context(), r.PathValue("citation_id"))
 	writeJSON(rw, http.StatusOK, map[string]any{
 		"id":     citation.ID,
@@ -547,9 +538,7 @@ object ReadApi {
     concat(
       path("v1" / "citations" / Segment) { citationId =>
         get {
-          // TODO: this starter serves any tenant, guesses the status from whether the document
-          // exists, and returns no version or offsets. Return the stored verification and the full
-          // span, and answer 404 for a citation that belongs to another tenant.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val citation = store.get(citationId)
           val status = if (documents.exists(citation.document_id)) "valid" else "broken"
           complete(StatusCodes.OK, s"""{"id":"$citationId","quote":"\${citation.quote}","status":"$status"}""")
@@ -692,9 +681,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/citations/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves any tenant, guesses the status from whether the document exists, and
-    // returns no version or offsets. Return the stored verification and the full span, and answer
-    // 404 for a citation that belongs to another tenant.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string citationId = req.matches[1];
     const auto citation = store.get(citationId);
     res.status = 200;
@@ -815,5 +802,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing two boundaries in one read: who may see a citation, and what the reader is told. The IDOR is the obvious one — a lookup by id without the tenant predicate turns any authenticated session into a reader of every tenant’s citations, and the fix is the 404 that refuses to confirm existence, not a post-fetch check. The status is the subtler one: \`valid if the document exists\` replaces the stored verification with a lookup, so a citation that could not be re-anchored reads as fine because the document is still there. And an answer’s status has to be the worst of its citations, ranked explicitly, with \`degraded\` for a broken one: any rule that takes the first (or the majority) makes the answer’s verdict depend on ordering instead of on the evidence. Real readers add per-citation reason codes in the response, a stable pagination cursor over citations, and a cached aggregate of answer statuses that is invalidated by verification events.`,
+  debrief: `The fix has its shape because a read answers two questions: who may see this citation, and what they are told about it. The tenant belongs in the lookup predicate, and a foreign id gets the 404 that refuses to confirm existence, not a 403 after the fetch. The status is returned as the verification stored it, because \`valid if the document exists\` lets a span that could not be re-anchored read as fine. Version and offsets ride along so a reviewer can check the quote against the bytes, and an answer's status is the explicit worst of its citations, \`degraded\` for a broken one, since taking the first makes the verdict depend on ordering. Production readers go further than this step did, with a pagination cursor over citations and a cached answer status invalidated by verification events.`,
 };

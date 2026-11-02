@@ -8,36 +8,24 @@ export const dependencyStep: Step = {
   focus: ['broker', 'capacity', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the capacity service,
-catches whatever comes back, and carries on. The demo shows a reservation because the demo service
-always answers. Debug it like the platform owner, fix it, and prove the fix.
+**Starting point.** The starter's \`confirm_capacity\` calls the capacity service's \`Confirm(team,
+window, resource_class, amount)\` RPC in a \`while True\` loop, catches every \`grpc.RpcError\` and
+calls again; the reserve handler then writes \`ledger.reserve(...)\` and answers **201**. It
+compiles and hides four flaws.
 
-Implement the capacity confirmation the reserve path makes before it writes the ledger:
+**Failure mode the checks target.** A capacity service that is slow or down pins the handler in an
+unbounded loop, a pool that answers \`RESOURCE_EXHAUSTED\` is retried as if it might fill up, and
+when a reply does arrive its \`source_version\` is dropped on the floor.
 
-- The broker confirms capacity over **gRPC** with the \`Confirm(team, window, resource_class,
-  amount)\` RPC. The reply carries the granted amount and a \`source_version\` — the capacity
-  service’s own generation counter — and that version is recorded with the reservation so a grant
-  can be traced back to the pool state it was made against.
-- Every attempt carries a **250 ms deadline**. The starter has none, so one slow capacity service
-  pins the handler and every request queued behind it.
-- A deadline or an unavailable service is **not** approval. It answers **503**
-  \`{"error": "TRY_AGAIN", "retriable": true}\` and **records no reservation** — the ledger is never
-  touched, so an uncertain answer cannot hold capacity. This is the flaw the checks target: the
-  starter proceeds with the reservation because the Redis check already passed, and the GPUs it
-  promised are already promised to someone else.
-- \`RESOURCE_EXHAUSTED\` is **not retried**. When the pool itself is empty, retrying cannot create
-  GPUs; the answer is **409** \`{"error": "capacity_exhausted"}\`, immediately. The starter retries a
-  quota-exhausted error until the deadline and turns a real shortage into a slow 503.
-- Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are worth retrying, and at most **2 attempts** per
-  reserve. The first confirmation that succeeds is the one recorded.
-
-**Failure mode the checks target.** Three proofs: a capacity timeout yields a 503 with **no**
-reservation recorded, an exhausted team is not retried at all, and a successful confirmation
-records the capacity source version alongside the reservation id.
-
-**What to keep.** The RPC and the call site are fine. The fix is the failure policy: a deadline, a
-bounded retry, a code-specific decision, and a ledger write that only happens after a confirmed
-grant.`,
+- Every attempt carries a \`DEADLINE_MS\` (250 ms) \`timeout=\`.
+- At most **2 attempts** per reserve. Only the codes in \`RETRIABLE\` (\`UNAVAILABLE\`,
+  \`DEADLINE_EXCEEDED\`) earn the second one.
+- \`RESOURCE_EXHAUSTED\` answers **409** \`{"error": "capacity_exhausted"}\` on the first reply.
+- When the attempts run out, raise \`CapacityUnavailable\`; the handler turns it into **503**
+  \`{"error": "TRY_AGAIN", "retriable": true}\` and does not touch the ledger. \`confirm_capacity\`
+  must run before \`ledger.reserve\`.
+- A successful confirmation's \`source_version\` is passed into the reservation so a grant can be
+  traced to the pool generation it was checked against.`,
   sequence: {
     participants: ['Quota Broker', 'Capacity service', 'Redis'],
     messages: [
@@ -140,7 +128,7 @@ grant.`,
   ],
   code: {
     python: {
-      starter: `"""Capacity confirmation: flawed code that fails open on a timeout."""
+      starter: `"""Capacity confirmation before the ledger write."""
 import grpc
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
@@ -170,11 +158,7 @@ ledger = Ledger()
 
 
 def confirm_capacity(team: str, window: str, resource_class: str, amount: int):
-    # TODO: this starter proceeds with the reservation when the capacity call fails, because the
-    # Redis check already passed, and it retries a quota-exhausted error until the deadline. Give
-    # every attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice,
-    # deny with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
-    # version when the confirmation succeeds.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             return capacity.Confirm(
@@ -284,7 +268,7 @@ def reserve(team: str, body: ReserveRequest, caller: str = Header(alias="X-Team-
 `,
     },
     typescript: {
-      starter: `/** Capacity confirmation: flawed code that fails open on a timeout. */
+      starter: `/** Capacity confirmation before the ledger write. */
 import Fastify from 'fastify';
 
 import {capacity} from './capacity';
@@ -298,11 +282,7 @@ interface ReserveBody {
 }
 
 async function confirmCapacity(team: string, window: string, resourceClass: string, amount: number) {
-  // TODO: this starter proceeds with the reservation when the capacity call fails, because the Redis
-  // check already passed, and it retries a quota-exhausted error until the deadline. Give every
-  // attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice, deny
-  // with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
-  // version when the confirmation succeeds.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       return await capacity.Confirm({team, window, resource_class: resourceClass, amount});
@@ -419,11 +399,7 @@ type reserveRequest struct {
 }
 
 func confirmCapacity(ctx context.Context, team, window, resourceClass string, amount int) (*capacitypb.ConfirmReply, error) {
-	// TODO: this starter proceeds with the reservation when the capacity call fails, because the Redis
-	// check already passed, and it retries a quota-exhausted error until the deadline. Give every
-	// attempt a 250 ms deadline, retry only Unavailable/DeadlineExceeded and at most twice, deny
-	// with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
-	// version when the confirmation succeeds.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := capacity.Confirm(ctx, &capacitypb.ConfirmRequest{
 			Team:          team,
@@ -578,11 +554,7 @@ object ClientApi {
   implicit val reserveFormat: RootJsonFormat[ReserveRequest] = jsonFormat3(ReserveRequest)
 
   def confirmCapacity(team: String, window: String, resourceClass: String, amount: Int): Future[ConfirmReply] = {
-    // TODO: this starter proceeds with the reservation when the capacity call fails, because the
-    // Redis check already passed, and it retries a quota-exhausted error until the deadline. Give
-    // every attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice,
-    // deny with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
-    // version when the confirmation succeeds.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     def attempt(): Future[ConfirmReply] =
       stub.confirm(ConfirmRequest(team, window, resourceClass, amount)).recoverWith { case _ => attempt() }
     attempt()
@@ -699,11 +671,7 @@ using json = nlohmann::json;
 std::unique_ptr<CapacityService::Stub> capacity;
 
 json confirm_capacity(const std::string& team, const std::string& window, const std::string& resource_class, int amount) {
-  // TODO: this starter proceeds with the reservation when the capacity call fails, because the Redis
-  // check already passed, and it retries a quota-exhausted error until the deadline. Give every
-  // attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice, deny
-  // with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
-  // version when the confirmation succeeds.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     ConfirmRequest request;
@@ -837,19 +805,16 @@ int main() {
     },
   },
   hints: [
-    'Bound both axes of the call: a 250 ms deadline per attempt and a cap of two attempts. Without them a slow or dead capacity service either blocks the handler or becomes a hot loop, and both look like a shortage to the caller.',
-    'Decide by status code, not by `except`. `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth one more try; `RESOURCE_EXHAUSTED` means the pool is empty, so answer 409 at once — retrying a shortage only delays the truth.',
-    'The confirm must come before the ledger write, and an uncertain answer must leave the ledger untouched: 503 `TRY_AGAIN` with no reservation recorded. When the confirmation does succeed, carry its `source_version` into the reservation so the grant is traceable to the pool generation it was checked against.',
+    'The capacity service is restarting. Every reserve request hangs, worker threads fill up, and the dashboard shows the broker at 100% CPU with zero responses.',
+    '`while True` plus `except grpc.RpcError: continue` is a hot loop with no deadline and no attempt cap. An empty pool (`RESOURCE_EXHAUSTED`) spins the same way as a dead one.',
+    'Give each `Confirm` `timeout=DEADLINE_MS / 1000`, allow two attempts, retry only codes in `RETRIABLE`, raise `CapacityUnavailable` to produce 503 `TRY_AGAIN` before `ledger.reserve`, and pass `grant.source_version` into the reservation.',
   ],
-  debrief: `The interview question behind this step is what to do when a dependency does not answer. The
-tempting answer — proceed, because the local check passed — is the one that produces double-booked
-GPUs, since the local check and the remote pool are different authorities and only the pool knows
-what is actually free. The correct policy has three parts: a per-attempt deadline so a slow service
-cannot pin the handler, a bounded retry over exactly the codes that can succeed on a second try, and
-a hard denial that leaves no trace on any other answer. Distinguishing \`RESOURCE_EXHAUSTED\` from
-\`UNAVAILABLE\` is the part candidates skip: one is the pool saying no, the other is the pool saying
-nothing, and only the second is worth retrying. Recording the confirmation’s source version closes
-the loop — when a grant is later disputed, the broker can name the pool generation it was made
-against. Real brokers add jittered backoff, a circuit breaker over the capacity service, and a
-reconciliation job that compares held reservations against the pool.`,
+  debrief: `When a dependency does not answer, the broker has to decide whose authority counts. Only the pool
+knows what is free, so an unanswered confirmation is a denial, not room. The policy has three parts:
+a per-attempt deadline so a slow service cannot pin the handler, a retry bounded to the codes that
+can succeed on a second try, and a 503 that leaves no ledger trace. \`RESOURCE_EXHAUSTED\` is the
+pool saying no and \`UNAVAILABLE\` is the pool saying nothing; only the second is worth a retry.
+Recording the source version lets a disputed grant name the pool generation it was made against.
+Production brokers add jitter to the retry, wrap the capacity client in a circuit breaker so a dead
+pool fails fast, and reconcile held reservations against the pool on a schedule.`,
 };

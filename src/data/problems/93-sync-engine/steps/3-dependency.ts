@@ -8,28 +8,28 @@ export const mergeClientStep: Step = {
   focus: ['sync', 'merger', 'revisions'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the merge service,
-returns a merged body on success and always returns *something* on failure, so the client never
-shows an error. Two of those three properties are wrong. Find them, fix them, and prove the fix.
+**Starting point.** The starter's \`three_way_merge\` builds a \`MergeRequest\`, calls the merge
+service in a \`while True\` loop with no deadline, returns the merged body on success and, when the
+call raises, returns whichever of local and remote has the later \`uploaded_at\`. It compiles, the
+demo merge succeeds, and it hides five flaws.
 
-Implement the three-way merge client that the push path uses for a document both devices edited:
+**Failure mode the checks target.** The merge service hangs and every push on the box stays open
+behind it. The service rejects three revisions as unmergeable and the client asks again, forever.
+When a call finally fails, the client picks the newer upload and the other edit vanishes while the
+user sees a synced document.
+
+Requirements:
 
 - The merge runs over gRPC as \`ThreeWayMerge(doc_id, base_revision, local_revision, remote_revision)\`
-  with a **2-second deadline** per attempt. A merge that has not answered in two seconds is a failed
-  merge, not a request to hold the push open.
-- At most **two attempts**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried: those are
-  the failures where trying again can produce a different answer.
-- **A rejection is terminal.** \`FAILED_PRECONDITION\` means the service has decided these three
-  revisions are not mergeable; retrying it forever burns the push worker and returns nothing.
-- **A failed merge marks the document conflicted** and retains **both** revisions — the local one
-  and the remote one — for the user to resolve. There is no winner.
-- **No failure path may overwrite either side** with a last-write-wins pick on upload time. Silently
-  choosing the newer upload is how a day of work disappears while the sync reports success.
-
-**Failure mode the checks target.** The starter has no deadline, so a hung merge service holds every
-push open; it retries every failure forever, including the rejections that are terminal by design;
-and when the call finally fails it resolves the conflict by comparing upload times, discarding the
-losing edit without telling anyone. The user sees a synced document; the other edit is gone.`,
+  with a **2-second deadline** per attempt (\`MERGE_DEADLINE_S\`). A merge that has not answered in
+  two seconds is a failed merge, not a request to hold the push open.
+- At most **two attempts** (\`MAX_MERGE_ATTEMPTS\`), and only \`UNAVAILABLE\` and
+  \`DEADLINE_EXCEEDED\` are retried: those are the failures where trying again can change the answer.
+- A rejection is terminal. \`FAILED_PRECONDITION\` (\`REJECTED\`) means the service has decided these
+  revisions are not mergeable; retrying it burns the push worker and returns nothing.
+- A failed merge marks the document conflicted (\`conflicted(...)\`) and retains both the local and
+  the remote revision for the user to resolve. There is no winner.
+- No failure path picks a side by upload time.`,
   sequence: {
     participants: ['Sync Engine', 'Merge service', 'revisions'],
     messages: [
@@ -51,7 +51,7 @@ losing edit without telling anyone. The user sees a synced document; the other e
       id: 'deadline',
       title: 'Every merge attempt carries a 2-second deadline',
       detail:
-        'The call is created with a 2 s deadline — `timeout=MERGE_DEADLINE_S`, `deadline: Date.now() + MERGE_DEADLINE_MS`, a context with timeout, `withDeadlineAfter` or `set_deadline`. The starter has no deadline, so one stuck merge holds the push open.',
+        'The call is created with a 2 s deadline: `timeout=MERGE_DEADLINE_S`, `deadline: Date.now() + MERGE_DEADLINE_MS`, a context with timeout, `withDeadlineAfter` or `set_deadline`. The starter has no deadline, so one stuck merge holds the push open.',
       match: {
         python: {all: [/MERGE_DEADLINE_S\s*=\s*2\.0/, /timeout=MERGE_DEADLINE_S/]},
         typescript: {all: [/MERGE_DEADLINE_MS\s*=\s*2000/, /deadline:\s*Date\.now\(\)\s*\+\s*MERGE_DEADLINE_MS/]},
@@ -112,7 +112,7 @@ losing edit without telling anyone. The user sees a synced document; the other e
       id: 'rejection-terminal',
       title: 'A merge rejection is terminal',
       detail:
-        '`FAILED_PRECONDITION` — the service’s "these revisions are not mergeable" — stops the retry loop instead of being retried. The starter treats every failure as retryable and loops forever on a rejection.',
+        '`FAILED_PRECONDITION`, the service’s "these revisions are not mergeable", stops the retry loop instead of being retried. The starter treats every failure as retryable and loops forever on a rejection.',
       match: {
         python: {all: [/REJECTED\s*=\s*grpc\.StatusCode\.FAILED_PRECONDITION/, /error\.code\(\)\s*==\s*REJECTED/]},
         typescript: {all: [/REJECTED\s*=\s*grpc\.status\.FAILED_PRECONDITION/, /code === REJECTED/]},
@@ -159,9 +159,7 @@ stub = merge_pb2_grpc.MergeServiceStub(grpc.insecure_channel("merger:9000"))
 
 
 def three_way_merge(doc_id: str, base: dict, local: dict, remote: dict) -> dict:
-    # TODO: call the merge service with a 2-second deadline, bound the attempts and retry only
-    # UNAVAILABLE / DEADLINE_EXCEEDED, treat a rejection as terminal, and stop resolving a failure
-    # by last-write-wins on upload time.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     request = merge_pb2.MergeRequest(
         doc_id=doc_id,
         base_revision=base["revision"],
@@ -266,9 +264,7 @@ function mergeOnce(docId: string, base: number, local: Revision, remote: Revisio
 }
 
 export async function threeWayMerge(docId: string, base: number, local: Revision, remote: Revision) {
-  // TODO: call the merge service with a 2-second deadline, bound the attempts and retry only
-  // UNAVAILABLE / DEADLINE_EXCEEDED, treat a rejection as terminal, and stop resolving a failure
-  // by last-write-wins on upload time.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const reply = await mergeOnce(docId, base, local, remote);
@@ -389,9 +385,7 @@ type MergeOutcome struct {
 }
 
 func threeWayMerge(ctx context.Context, docID string, base int64, local, remote Revision) MergeOutcome {
-	// TODO: call the merge service with a 2-second deadline, bound the attempts and retry only
-	// UNAVAILABLE / DEADLINE_EXCEEDED, treat a rejection as terminal, and stop resolving a failure
-	// by last-write-wins on upload time.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	request := &pb.MergeRequest{
 		DocId:          docID,
 		BaseRevision:   base,
@@ -508,9 +502,7 @@ object MergeClient {
     MergeServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("merger", 9000).usePlaintext().build())
 
   def threeWayMerge(docId: String, base: Long, local: Revision, remote: Revision): MergeOutcome = {
-    // TODO: call the merge service with a 2-second deadline, bound the attempts and retry only
-    // UNAVAILABLE / DEADLINE_EXCEEDED, treat a rejection as terminal, and stop resolving a failure
-    // by last-write-wins on upload time.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val request = MergeRequest(docId, base, local.revision, remote.revision)
     while (true) {
       try {
@@ -612,9 +604,7 @@ MergeOutcome threeWayMerge(
     long long base,
     const Revision& local,
     const Revision& remote) {
-  // TODO: call the merge service with a 2-second deadline, bound the attempts and retry only
-  // UNAVAILABLE / DEADLINE_EXCEEDED, treat a rejection as terminal, and stop resolving a failure
-  // by last-write-wins on upload time.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   MergeRequest request;
   request.set_doc_id(docId);
   request.set_base_revision(base);
@@ -706,9 +696,11 @@ MergeOutcome threeWayMerge(
     },
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `{deadline: Date.now() + …}`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`). Wrapping the call in a timeout changes nothing; the transport has to know the budget.',
-    'Retryability is a property of the status, not of "it threw". Capture the error, compare its code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, and stop the loop for `FAILED_PRECONDITION` — that code means the service already decided these revisions cannot be merged.',
-    "A conflict is a value, not an exception: build the conflicted record with both revisions in it, persist it, and return it to the caller. If you find yourself comparing two timestamps, you are about to delete a user's work — the timestamp is only useful for showing the user which edit is newer, never for choosing which one survives.",
+    'Two people edit one document; the merge service is down for a minute; both phones say "synced" and one of them has lost its paragraph. Meanwhile push latency on the box climbs to minutes.',
+    'The call has no deadline, so a hung merge holds the push. `while True` retries every `RpcError`, including a terminal `FAILED_PRECONDITION`. The `except` branch compares `uploaded_at` and returns a winner as "merged".',
+    'Call with `timeout=MERGE_DEADLINE_S`, loop `for attempt in range(MAX_MERGE_ATTEMPTS)`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, break on `REJECTED`, and on failure return `conflicted(doc_id, local, remote)`.',
   ],
-  debrief: `The interview question is "what does a merge failure mean?" The starter answers "somebody wins", because that keeps the happy path linear. But an infrastructure failure is not a merge decision: turning a timeout into last-write-wins converts a retryable dependency problem into permanent data loss, and it does so silently, with the sync reporting success. Three separate contracts are being checked. The deadline: an unbounded merge call holds a push worker and the device's connection for as long as the dependency is slow. The retry policy: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may succeed on a retry; \`FAILED_PRECONDITION\` is a decision, and a rejection loop burns the worker for nothing. The failure path: a conflicted document that carries both revisions is the only honest answer, and it is also what makes the user experience possible — show both, let a person choose or retype. Real systems add merge-service-side operation logs for text, a conflict inbox, and a policy for auto-merging the non-overlapping cases while still surfacing the overlapping ones.`,
+  debrief: `The fix separates two things the starter conflated: a transport failure and a merge decision. A deadline and a bounded retry handle the transport, and only the codes where a second attempt can change the answer are retried; \`FAILED_PRECONDITION\` is the service's verdict and asking again cannot change it. The failure path then becomes a value rather than a guess: a conflicted record carrying both revisions, persisted and returned, so a person can choose. Comparing upload times looked like resilience but turned a retryable outage into silent data loss with the sync reporting success.
+
+Production merge clients add a conflict inbox the user can see, an operation log on the merge service for text so non-overlapping edits merge automatically, and a circuit breaker so a dead merger fails fast instead of spending its two seconds on every document.`,
 };

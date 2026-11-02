@@ -8,38 +8,28 @@ export const eventsStep: Step = {
   focus: ['registry', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a
-\`tool.lifecycle\` event on every registration and promotion, and the demo timeline shows the catalog
-moving. Four production contracts are broken. Debug it like the platform owner, fix it, and prove
-the fix with the checks below.
+**Starting point.** The starter is \`publish_lifecycle(tool, version, side_effect, manifest)\`, the
+helper every register, validate, promote and revoke transition calls to announce itself on the
+**\`tool.lifecycle\`** topic. The demo timeline shows the catalog moving. It compiles and hides 5
+flaws.
 
-\`publish_lifecycle(tool, version, side_effect, manifest)\` is the helper every
-register → validate → promote → revoke transition calls to announce itself on the **\`tool.lifecycle\`**
-topic.
-
-- The record **key is the tool name**. The key is the partition key: keyed by tool, one tool’s
-  registered → validated → promoted → revoked history lands on one partition in order, which is the
-  only way a consumer can replay "promoted 4, revoked → 3" correctly. The starter keys by the owner
-  team, so two teams’ tools interleave and a tool’s own events lose their order.
-- The payload carries the **version**, the **side-effect class** and the **validator outcome** —
-  \`validated\` or \`rejected\`, taken from the sandbox verdict, never a hard-coded state. No sandbox
-  logs, no credentials, no raw schema dumps: the topic is retained for days and replicated, so
-  anything written there outlives the promotion that wrote it.
+- The record **key is the tool name**, so one tool's history lands on one partition in order and a
+  consumer can replay it.
+- The payload carries the **version**, the **side-effect class** and the **validator outcome**
+  (\`validated\` or \`rejected\`, from the sandbox verdict). No sandbox logs, no credentials: the
+  topic is retained for days and replicated.
 - **Validate before you publish.** The produce runs only after \`sandbox.validate(...)\` has returned
-  the verdict — and, for a validated version, after the promotion is recorded — so an event can
-  never announce a version, or a promotion, that the validator has not passed.
-- The producer is **idempotent with \`acks=all\`** (the stack’s equivalent: \`enable.idempotence\` +
-  \`acks\`, KafkaJS’s \`idempotent: true\`, or required acks \`all\` with a hash balancer), so a retry
-  of a produce cannot duplicate a record.
-- A version the verdict **rejects** still needs an auditable event: write it to the **outbox** row
-  a relay republishes, instead of announcing it as promoted. A produce the broker rejects lands in
-  the outbox too — a lifecycle event is never dropped.
+  and, for a validated version, after the promotion is recorded.
+- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS's
+  \`idempotent: true\`, or required acks \`all\` with a hash balancer).
+- A **rejected** version still needs an auditable event: write it to the **outbox** row a relay
+  republishes. A produce the broker refuses lands in the outbox too.
 
-**Failure mode the checks target.** The starter reads as complete because the happy path publishes
-something for every transition, but the key is the wrong field, the payload ships the sandbox log
-with a best-effort regex redaction that misses any credential in an unexpected shape, the event is
-produced before the verdict exists, and there is no outbox at all — so a rejected version and a
-broker outage both end as silence in the audit trail.`,
+**Failure mode the checks target.** The happy path publishes something for every transition, so the
+starter reads as complete, but the key is the owner team, the payload ships the sandbox log behind a
+best-effort regex redaction that misses any credential in an unexpected shape, the outcome is a
+hard-coded \`"promoted"\` produced before the verdict exists, and there is no outbox, so a rejected
+version and a broker outage both end as silence in the audit trail.`,
   sequence: {
     participants: ['Tool Registry', 'Sandbox', 'tool.lifecycle', 'Catalog DB', 'Consumer'],
     messages: [
@@ -78,9 +68,9 @@ broker outage both end as silence in the audit trail.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=tool`, `key: tool`, `[]byte(tool)`, `ProducerRecord(Topic, tool, …)`, `tool.data()` — the tool name, never the owner team. Keyed by the owner team, two teams share a partition and one tool’s registered → validated → promoted history stops being ordered.',
-    'The verdict is the event: call `sandbox.validate(...)` before the produce and copy `verdict.outcome` into the payload. A hard-coded `"promoted"` announces a version the sandbox has not passed, and `registry.promote(...)` must only run on a validated verdict.',
-    'The outbox is the durability half: write the event to the outbox when the verdict rejects the version and when the produce returns an error. The payload carries no sandbox logs and no credentials — there is nothing worth redacting, so delete the log field and its helper instead of sanitizing it.',
+    'Symptom: a consumer replaying the topic sees `payments.charge` revoked before it was promoted, finds an `api_key=` line inside an event, and has no record at all of the version the sandbox rejected last night.',
+    'Mechanism: the record is keyed by `manifest["owner"]`, the payload embeds the redacted sandbox log and a literal `"promoted"`, the produce happens before `sandbox.validate`, and the rejected and broker-error branches just return.',
+    'Fix: `key=tool`, validate first and copy `verdict.outcome` into the payload, promote only on `validated`, delete the log field and its redaction helper, and call `insert_outbox` for a rejection and for a produce error.',
   ],
   checks: [
     {
@@ -210,9 +200,7 @@ registry = ToolRegistry()
 
 
 def publish_lifecycle(tool: str, version: str, side_effect: str, manifest: dict) -> str:
-    # TODO: key by the tool name instead of the owner team, run the sandbox validation before
-    # publishing, keep the sandbox log out of the event, and write an outbox row when the verdict
-    # rejects the version or the broker rejects the produce.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "tool": tool,
         "version": version,
@@ -327,9 +315,7 @@ export async function publishLifecycle(
   sideEffect: string,
   manifest: Manifest,
 ): Promise<string> {
-  // TODO: key by the tool name instead of the owner team, run the sandbox validation before
-  // publishing, keep the sandbox log out of the event, and write an outbox row when the verdict
-  // rejects the version or the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event = {
     tool,
     version,
@@ -448,9 +434,7 @@ var (
 
 // PublishLifecycle announces one tool.lifecycle event for the candidate version.
 func PublishLifecycle(ctx context.Context, tool, version, sideEffect string, manifest Manifest) (string, error) {
-	// TODO: key by the tool name instead of the owner team, run the sandbox validation before
-	// publishing, keep the sandbox log out of the event, and write an outbox row when the verdict
-	// rejects the version or the broker rejects the produce.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"tool":        tool,
 		"version":     version,
@@ -591,9 +575,7 @@ object ToolLifecyclePublisher {
 
   private def redactCredentials(log: String): String = ApiKeyRe.replaceAllIn(log, "api_key=<redacted>")
 
-  // TODO: key by the tool name instead of the owner team, run the sandbox validation before
-  // publishing, keep the sandbox log out of the event, and write an outbox row when the verdict
-  // rejects the version or the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publishLifecycle(tool: String, version: String, sideEffect: String, manifest: Manifest): String = {
     val event = Map(
       "tool" -> tool,
@@ -722,9 +704,7 @@ std::string redactCredentials(const std::string& log) {
   return std::regex_replace(log, std::regex("api_key=sk-[A-Za-z0-9]+"), "api_key=<redacted>");
 }
 
-// TODO: key by the tool name instead of the owner team, run the sandbox validation before
-// publishing, keep the sandbox log out of the event, and write an outbox row when the verdict
-// rejects the version or the broker rejects the produce.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::string publishLifecycle(const std::string& tool, const std::string& version,
                              const std::string& sideEffect, const Manifest& manifest) {
   const json event = {
@@ -824,19 +804,12 @@ std::string publishLifecycle(const std::string& tool, const std::string& version
 `,
     },
   },
-  debrief: `The interviewer is probing two questions under many names: what is the ordering key, and
-what happens to the event that could not be published? The record key is an ordering contract: keyed
-by the tool name, one tool’s registered → validated → promoted → revoked history stays on one
-partition in order; keyed by the owner team, it interleaves with every other tool that team owns,
-and a consumer replaying the topic can no longer reconstruct what was live when. Publication order
-is a correctness contract: validate, record the promotion, then publish, so the topic can never
-announce a version the sandbox has not passed — the starter publishes first and validates afterwards,
-which turns the topic into a source of lies the moment a candidate fails. The payload is a retention
-contract: the topic holds every event on every replica for days, so the sandbox log behind a
-best-effort regex redaction is a leak waiting for a credential in an unexpected shape; the fix is to
-carry the verdict instead of the evidence. The outbox is the durability contract: a rejected version
-and a broker outage both end as a row a relay republishes, so the audit trail survives the broker
-being down. Real registries add a schema id and a compacted latest-version topic beside the
-append-only one, consumers that replay into a catalog projection, and a relay with its own retry
-budget for the outbox.`,
+  debrief: `The fix takes the shape of four contracts a topic has to honour. The key is an ordering
+contract: keyed by tool name, one tool's history stays on one partition in order. Publication order
+is a correctness contract: validate, record the promotion, then publish, so the topic cannot
+announce a version the sandbox has not passed. The payload is a retention contract: every event sits
+on every replica for days, so it carries the verdict rather than the evidence. The outbox is the
+durability contract: a rejection and a broker outage both end as a row a relay republishes.
+Production registries add a schema id on the record, a compacted latest-version topic beside the
+append-only one, and a relay with its own retry budget for the outbox.`,
 };

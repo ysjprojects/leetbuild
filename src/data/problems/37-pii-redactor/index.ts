@@ -7,73 +7,64 @@ import {auditEventsStep} from './steps/4-events';
 import {readRedactionStep} from './steps/5-read';
 
 /**
- * PII redactor: the course is not "call an NER model and replace some strings", it is the
- * debugging you owe a redaction service before it is trusted with customer text. Fail-closed HTTP →
- * tenant-scoped Redis patterns and an atomic budget → a gRPC detector with a bounded retry and a
- * deterministic regex fallback → content-free audit events with an outbox → an audit read that
- * returns spans, never text.
+ * PII redactor: the debugging you owe a redaction service before it is trusted with customer text.
+ * Fail-closed HTTP, tenant-scoped Redis patterns and an atomic budget, a gRPC detector with a
+ * bounded retry and a deterministic regex fallback, content-free audit events with an outbox, and
+ * an audit read that returns spans instead of text.
  */
 export const piiRedactorProblem: Problem = {
   id: 'pii-redactor',
   title: 'PII Redactor',
-  tagline: 'Redaction that fails closed, proves its spans, and never stores what it removed.',
+  tagline: 'A redactor that answers 503 when the detector is down and audits with offsets, not text.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# PII Redactor
 
-A redactor is the piece of an AI platform that stands between customer text and everything
-downstream of it, and the only thing that decides whether it works is what it does when it cannot
-answer. The visible part is a redacted string; the parts that decide whether the system is safe are
-the failure policy, the tenant boundary in every key, the fallback detector, and the audit trail
-that must never become a second copy of the data it removed.
+A redactor stands between customer text and everything downstream of it, and what decides whether
+it works is what it does when it cannot answer: the failure policy, the tenant boundary in every
+key, the fallback detector, and an audit trail that holds no copy of the data it removed.
 
 ## The real system
 
-Production redactors accept text up to a hard cap, validate the entity types the caller asks for,
-and resolve custom patterns per tenant, cached under a versioned key. They meter work before spending
-it, atomically, so an over-budget request never reaches the model. They call an NER model over gRPC
-under a short deadline, retry only the statuses worth retrying and only a bounded number of times,
-and when the model is unavailable they redact with a deterministic regex pass that is *marked* as
-degraded rather than quietly skipped. They publish an audit event per redaction that carries offsets
-and counts — never a removed value — and they write an outbox row when the broker refuses it. And
-they expose the audit record as spans, scoped to the tenant, so a caller can prove coverage without
-the system ever transferring text.
+Microsoft Presidio, the open source PII framework, splits the job into an analyzer and an
+anonymizer: the analyzer returns a \`RecognizerResult\` per finding with \`entity_type\`, \`start\`,
+\`end\` and \`score\`, and the anonymizer consumes those offsets to replace text. That split is the
+shape this course builds toward: offsets and counts are the durable record of a redaction, and the
+text is what passes through. A hosted redactor adds what Presidio leaves to the operator: a text
+cap, per-tenant patterns, a budget reserved before the model is called, a detector deadline with a
+regex fallback marked as degraded, and an audit trail of offsets rather than values.
 
 ## What you build here
 
 One service, the redactor, with five pieces:
 
 1. \`POST /v1/redact\`: authenticated tenant, a 256 KiB text cap, an entity whitelist, spans plus
-   per-type counts plus the pattern version in the response, and a detector failure that answers
-   **503** instead of falling back to the input.
+   per-type counts plus the pattern version, and a detector failure that answers **503**.
 2. A **Redis** pattern cache keyed by \`patterns:{tenant}:{pattern_id}:{version}\` and a per-tenant
-   hourly budget of 2 000 000 characters reserved by one atomic Lua \`EVAL\` before the detector runs,
+   hourly budget of 2 000 000 characters reserved by one Lua \`EVAL\` before the detector runs,
    answering \`429\` with \`Retry-After\` and \`X-RateLimit-Remaining\`.
 3. A **gRPC** detector client: a 600 ms deadline per attempt, at most two attempts, retries only on
-   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, and a deterministic regex fallback over the declared entity
-   types that runs for every text size and is marked \`source: "regex"\`.
+   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, and a regex fallback over the declared entity types that
+   runs for every text size and is marked \`source: "regex"\`.
 4. A **Kafka** audit path: one \`privacy.redacted\` event per redaction keyed by document id, a
-   content-free payload (spans, counts, pattern version), a durable idempotent producer, and an
-   outbox row when the produce is rejected.
+   content-free payload, a durable idempotent producer, and an outbox row when the produce is
+   rejected.
 5. \`GET /v1/documents/{id}/redaction\`: spans, entity types, pattern version and redacted length for
-   the owning tenant only — no text field of any kind, and a **404** for a missing or foreign
-   document rather than a 403.
+   the owning tenant only, no text field, and a **404** for a missing or foreign document.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
-failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+Every starter in this course compiles, serves the happy path and looks right. In every step you
+debug it against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks
 that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Model training and evaluation, entity taxonomy governance, per-language pattern packs, redaction
 quality metrics, document storage and retention policies, key management for encrypted documents,
-and reviewer workflows for false positives. The five pieces above are the ones that decide whether
-the redactor is correct, isolated and shippable.`,
+and reviewer workflows for false positives.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'redact · audit read', x: 8, y: 50},

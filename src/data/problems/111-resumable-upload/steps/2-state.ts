@@ -8,30 +8,26 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-The starter is working code: parts register and the happy path counts them, so
-the demo passes. The manifest hides three defects — a double count, a missing range check and a leak.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter keeps the part manifest in Redis: \`register_part(upload_id,
+part_number, size, checksum)\` does an \`RPUSH\` of \`"number:size:checksum"\` onto
+\`upload:{upload_id}:parts\`, and the happy path counts the entries. It serves the demo and hides
+five flaws.
 
-Implement the part manifest in Redis. Each part registers its number, size and checksum.
+**Failure mode the checks target.** \`RPUSH\` is not idempotent: a client that retries a part after a
+timeout appends it again, the byte counter grows past \`total_bytes\`, and finalize cannot reconcile.
+Nothing rejects a \`part_number\` of \`0\` or \`part_count + 1\`, and with no \`EXPIRE\` an abandoned
+upload keeps its parts in Redis until someone deletes them by hand.
 
 - The manifest key is \`upload:{upload_id}\`; the parts hash is \`upload:{upload_id}:parts\`; the byte
   counter is \`upload:{upload_id}:bytes\`.
-- Registration is **one atomic Lua \`EVAL\`**: it must reject a \`part_number\` outside
-  \`1..part_count\` (**out of range**), return \`0\` when the part is already present (idempotent — a
-  re-sent part must not change the byte count), and on a new part record \`size\` and \`checksum\` in
-  the hash and add \`size\` to the byte counter. A list append registers a re-sent part twice and
-  the completed manifest double-counts bytes.
-- The manifest, its parts and its byte counter must expire after **24 hours** (\`86400\` seconds),
-  set inside the same script. The starter's key never expires, so an abandoned upload's parts pin
-  memory forever.
+- Registration is **one atomic Lua \`EVAL\`**: it rejects a \`part_number\` outside
+  \`1..part_count\` (**out of range**), returns \`0\` when the part is already present (a re-sent
+  part must not change the byte count), and on a new part records \`size\` and \`checksum\` in the
+  hash and adds \`size\` to the byte counter.
+- The manifest, its parts and its byte counter expire after **24 hours** (\`86400\` seconds), set
+  inside the same script.
 - Registration is keyed by \`part_number\`, so the manifest has at most \`part_count\` entries and
-  \`bytes\` is the sum of the unique part sizes.
-
-**Failure mode the checks target.** \`RPUSH\` is not idempotent: a client that retries a part after a
-timeout appends it again, the byte counter grows past \`total_bytes\`, and finalize never reconciles.
-Nothing rejects a \`part_number\` of \`0\` or \`part_count + 1\`, so a buggy client can write entries the
-object store will never have. And with no \`EXPIRE\`, an upload that is never completed keeps its
-parts in Redis until someone deletes them by hand.`,
+  \`bytes\` is the sum of the unique part sizes.`,
   sequence: {
     participants: ['Upload API', 'Redis', 'Object store'],
     messages: [
@@ -43,9 +39,9 @@ parts in Redis until someone deletes them by hand.`,
     ],
   },
   hints: [
-    'The whole registration is one script: `HEXISTS` the parts hash, return `0` if the number is already there, otherwise `HSET` the part and `INCRBY` the byte counter. Doing `HGET` then `HSET` from the client leaves a window where a retry writes the same part twice.',
-    'The range guard is part of the same script: `if part_number < 1 or part_number > part_count then return redis.error_reply(...) end`. A number outside the declared count is a client bug you want to surface, not an entry the object store will never have.',
-    'Set the expiry inside the script on every key the manifest owns — the parts hash and the byte counter as well as the manifest itself — so an abandoned upload releases all of its memory at once. `EXPIRE key 86400` on the first write is enough if the script runs on every part.',
+    'An uploader on a flaky link retries part 7 twice; the byte counter ends above `total_bytes`, finalize refuses to assemble, and the keys of uploads nobody finished are still in Redis a week later.',
+    'A list append cannot tell a new part from a repeat, the client-side check-then-write leaves a window between the read and the write, and no key ever receives a TTL.',
+    'Replace the `rpush` with one `eval` of `REGISTER_PART_SCRIPT`: range-check `part_number` against `part_count`, `HEXISTS` then `HSET` the parts hash, `INCRBY` the byte counter, `EXPIRE` all three keys with `MANIFEST_TTL_S`.',
   ],
   checks: [
     {
@@ -122,8 +118,7 @@ redis_client = redis.Redis()
 
 
 def register_part(upload_id: str, part_number: int, size: int, checksum: str) -> None:
-    # TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
-    # and the completed manifest double-counts bytes; the manifest key never expires either.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"upload:{{upload_id}}:parts"
     redis_client.rpush(key, f"{part_number}:{size}:{checksum}")
 `,
@@ -175,8 +170,7 @@ export async function registerPart(
   size: number,
   checksum: string,
 ): Promise<void> {
-  // TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
-  // and the completed manifest double-counts bytes; the manifest key never expires either.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`upload:\${uploadId}:parts\`;
   await redis.rpush(key, \`\${partNumber}:\${size}:\${checksum}\`);
 }
@@ -243,8 +237,7 @@ import (
 var rdb = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
 func RegisterPart(ctx context.Context, uploadID string, partNumber int, size int64, checksum string) error {
-	// TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
-	// and the completed manifest double-counts bytes; the manifest key never expires either.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("upload:%s:parts", uploadID)
 	return rdb.RPush(ctx, key, fmt.Sprintf("%d:%d:%s", partNumber, size, checksum)).Err()
 }
@@ -301,8 +294,7 @@ import redis.clients.jedis.Jedis
 
 object PartManifest {
   def registerPart(jedis: Jedis, uploadId: String, partNumber: Long, size: Long, checksum: String): Unit = {
-    // TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
-    // and the completed manifest double-counts bytes; the manifest key never expires either.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = s"upload:$uploadId:parts"
     jedis.rpush(key, s"$partNumber:$size:$checksum")
   }
@@ -366,8 +358,7 @@ bool RegisterPart(
     long long partNumber,
     long long size,
     const std::string& checksum) {
-  // TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
-  // and the completed manifest double-counts bytes; the manifest key never expires either.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto key = "upload:" + uploadId + ":parts";
   redis.rpush(key, std::to_string(partNumber) + ":" + std::to_string(size) + ":" + checksum);
   return true;
@@ -420,5 +411,5 @@ bool RegisterPart(
 `,
     },
   },
-  debrief: `The manifest is the single source of truth for what has actually arrived, so it must be written exactly once per part and never grow without bound. The starter's \`RPUSH\` looks harmless — a list is a natural place for parts — but a list cannot deduplicate, so a client that retries a part after a timeout inflates the byte count and the manifest disagrees with the object store. The range guard catches client bugs at the edge instead of storing entries the object store will never have. And the 24-hour TTL is what keeps an abandoned upload from pinning memory: without it, the parts hash of a client that gave up lives until an operator deletes it. Production manifests also keep the object store's ETag beside the checksum and a per-part \`stored_at\`, so finalize can reconcile against the store rather than trusting the client's list.`,
+  debrief: `The fix is one Lua script because the property it protects is that the manifest is written exactly once per part and agrees with the object store. A single \`EVAL\` makes the existence check, the hash write and the byte increment one atomic step, so a retried part cannot slip in between a read and a write from the client side. The range guard surfaces a client bug at the edge instead of storing entries the store will never have, and the TTL set inside the same script means an abandoned upload releases its hash, counter and manifest together. Production manifests keep the object store's ETag beside the checksum and a per-part \`stored_at\`, so finalize can reconcile against the store rather than trusting the client's list.`,
 };

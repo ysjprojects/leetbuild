@@ -8,31 +8,30 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, decodes
-the body and returns an inference id. It compiles, it serves the demo, and it hides three production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/inferences\` with body
+\`{"image": "tenants/acme/images/9f2c…c41.jpg", "task": "classify"}\`, reads \`X-Tenant-Id\` as a
+label, hands \`body.image\` to \`fetch_object\` and returns an inference id with the byte count. It
+serves the demo and hides four flaws.
 
-Implement \`POST /v1/inferences\` with body
-\`{"image": "tenants/acme/images/9f2c…c41.jpg", "task": "classify"}\`.
+**Failure mode the checks target.** The starter dereferences whatever string the caller sends, so a
+crafted reference is a server-side request forgery probe against every bucket the service can reach.
+It accepts any task name, so an unknown task fails at the model router instead of the boundary. And
+it keys nothing: every client retry re-runs inference on the same bytes and bills the tenant twice.
+
+Requirements:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`image\` is a **storage key, never a URL**. Reject anything with a scheme (\`http://\`,
-  \`https://\`, \`s3://\`, \`gs://\`), anything with a \`..\` segment, and any key that does not start
-  with the tenant's prefix \`tenants/{tenant}/images/\` with **403 — before the object is fetched**.
-  The endpoint is not a proxy: a caller must never be able to make the service dereference a key in
-  another tenant's bucket, an internal bucket, or the metadata service.
+- \`image\` is a **storage key, not a URL**. Reject anything with a scheme (\`http://\`, \`https://\`,
+  \`s3://\`, \`gs://\`), anything with a \`..\` segment, and any key that does not start with the
+  tenant's prefix \`tenants/{tenant}/images/\` with **403, before the object is fetched**. A caller
+  must not be able to make the service dereference a key in another tenant's bucket, an internal
+  bucket, or the metadata service.
 - \`task\` is one of \`classify\`, \`detect\`, \`embed\`; anything else is **400**.
 - \`Idempotency-Key\` is required (**400** when missing). The storage key ends with the image's
   **content hash** (\`…/<sha256>.jpg\`), so the digest is known before the fetch: read and write the
   inference store under \`(tenant, content_hash)\`, and a replay with the same key returns the
   **stored inference** with 200 instead of running the model a second time.
-- Log the decision with tenant, task and digest — never the caller's raw reference.
-
-**Failure mode the checks target.** The starter hands the caller's string straight to the fetch helper,
-so a crafted reference is a server-side request forgery probe against every bucket the service can
-reach. It accepts any task name, so an unknown task reaches the model router and fails there instead
-of at the boundary. And it keys nothing: every client retry re-runs inference on the same bytes, which
-bills the tenant twice for one image.`,
+- Log the decision with tenant, task and digest, not the caller's raw reference.`,
   sequence: {
     participants: ['Client', 'Vision API', 'Inference store', 'Object store'],
     messages: [
@@ -141,8 +140,7 @@ store = InferenceStore()
 
 @app.post("/v1/inferences")
 def create_inference(body: InferenceRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
-    # and collapses nothing — every retry runs the model again. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     payload = fetch_object(body.image)
     return JSONResponse(
         {"id": "inf-1", "tenant": tenant, "task": body.task, "bytes": len(payload)},
@@ -245,8 +243,7 @@ interface InferenceBody {
 }
 
 app.post('/v1/inferences', async (request, reply) => {
-  // TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
-  // and collapses nothing — every retry runs the model again. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as InferenceBody;
   const payload = await fetchObject(body.image);
@@ -346,8 +343,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createInference(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
-	// and collapses nothing — every retry runs the model again. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	var body InferenceRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -517,8 +513,7 @@ object VisionApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[InferenceRequest]) { body =>
-            // TODO: this starter dereferences whatever object URL the caller sends, accepts any task
-            // name, and collapses nothing — every retry runs the model again.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val payload = fetchObject(body.image)
             complete(
               StatusCodes.OK,
@@ -624,8 +619,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/inferences", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
-    // and collapses nothing — every retry runs the model again. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
@@ -741,16 +735,16 @@ std::string fetchObject(const std::string& key) { return key; }
     },
   },
   hints: [
-    'Order the guards by cost: tenant, Idempotency-Key, task, key scope, then the store lookup. Every one of them returns before the object store or the model is touched, so a malformed request cannot make the service read anything.',
-    "The scope check is a prefix test on the tenant's own key space — `tenants/{tenant}/images/` — plus a refusal of any scheme or `..` segment. It is not a deny-list of internal hostnames: a deny-list loses to the next URL form you did not think of.",
-    'The digest is already in the key (`…/<sha256>.jpg`), which is what lets the idempotency lookup happen before the fetch: `store.get(tenant, content_hash)` on a replay answers with the first inference and never re-reads the object.',
+    'Post `{"image": "s3://internal-models/weights.bin"}` with any task name and no `Idempotency-Key`: the starter fetches the object and answers 200, and posting it again fetches it again.',
+    'Nothing stands between the decoded body and `fetch_object`: the tenant header is only echoed, the task is only copied into the response, and the store is constructed but neither read nor written.',
+    'Return 401 without the header, 400 for a missing `Idempotency-Key` or a task outside `ALLOWED_TASKS`, 403 for a scheme, `..` or a key outside `TENANT_PREFIX`, then `store.get`/`store.put` on `(tenant, content_hash)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The
-starter reads fine because the demo posts one well-formed key from one tenant and never retries. Three
-separate defects are being checked: authentication (the tenant is never optional), a scoped key
-contract (the caller names a key inside its own prefix, never a URL the service dereferences), and
-idempotency keyed by the content hash so a retry cannot bill the same bytes twice. The subtle one is
-the ordering: the 403 has to land before the fetch, and a deny-list of "internal" hosts is not a
-scope. Real vision services add short-lived presigned uploads, a per-tenant byte quota, a media type
-check on the object, and a signed digest so a caller cannot claim a hash its bytes do not produce.`,
+  debrief: `The guards sit in cost order and every one of them returns before the object store or the
+model is touched, which is why the 403 has to land before the fetch: once the bytes are read, the
+forgery already happened. The scope test is a prefix check on the tenant's own key space plus a
+refusal of schemes and \`..\`, not a deny-list of internal hostnames, because a deny-list loses to the
+next URL form nobody thought of. Keying idempotency by the content hash in the key is what lets the
+replay answer before the fetch. Production services also issue short-lived presigned uploads, enforce
+a per-tenant byte quota, sniff the media type of the object, and sign the digest so a caller cannot
+claim a hash its bytes do not produce.`,
 };

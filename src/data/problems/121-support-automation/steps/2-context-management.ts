@@ -8,37 +8,27 @@ export const contextManagementStep: Step = {
   focus: ['workflow', 'redis', 'llm'],
   task: `## Task
 
-**Starting point.** The starter is working code for the Runtime Context
-Manager: it appends turns and tool outcomes to Redis, loads the user's data and fetches help
-articles, and the assembled context reaches the model, so the demo answers correctly. It hides
-five production flaws. Debug it like the owner of the context store, fix it, and prove the fix.
+**Starting point.** The starter is the Runtime Context Manager: \`append\` pushes turns and tool
+outcomes onto one global Redis list, and \`assemble\` filters that list by conversation, loads the
+whole user record, fetches help articles and writes them into the history. It serves the demo and
+hides 5 flaws.
 
-Implement the context store the Chain of Thought workflow reads before every \`Reason\` call and
-writes after every tool outcome:
+**Failure mode the checks target.** The global key is a cost problem (every assembly reads every
+conversation) and an isolation problem (tenants share one list); no trim and no TTL let the list
+outgrow the model's window and outlive the conversation by years; loading every field puts
+undeclared data into the prompt; and writing retrieved articles into the history makes every later
+turn answer from an article that matched an earlier question.
 
-- Runtime context lives under \`ctx:{tenant}:{conversation}\` — one list per conversation, scoped
-  by tenant. A shared key makes every conversation read every other conversation's items and lets
-  one tenant's context reach another tenant's prompt.
-- The list holds at most **40** items (\`MAX_CONTEXT_ITEMS\`): append with \`RPUSH\`, keep the
-  newest 40 with \`LTRIM\`, and refresh the **24-hour** TTL (\`CONTEXT_TTL_S = 86_400\`) with
-  \`EXPIRE\` — all three in one \`MULTI\`/pipeline so a crash between them cannot leave an
-  unbounded or immortal key.
+- Runtime context lives under \`ctx:{tenant}:{conversation}\`, one list per conversation.
+- The list holds at most **40** items (\`MAX_CONTEXT_ITEMS\`): \`RPUSH\`, \`LTRIM\` to the newest
+  40, and \`EXPIRE\` refreshing the **24-hour** TTL (\`CONTEXT_TTL_S = 86_400\`), all three in
+  one \`MULTI\`/pipeline.
 - **Static context** is what the product declares: \`STATIC_CONTEXT\` names the fields
-  (\`customer_name\`, \`user_role\`, \`current_trip\`) and the loader fetches only those. The
-  starter loads the whole user record — every field, including the ones no prompt should ever
-  contain.
-- **Dynamic context** comes from named retrievers in \`DYNAMIC_RETRIEVERS\` (\`help_articles\`),
-  fetched per turn for the current question and cached under
+  (\`customer_name\`, \`user_role\`, \`current_trip\`) and the loader fetches only those.
+- **Dynamic context** comes from the retrievers named in \`DYNAMIC_RETRIEVERS\`
+  (\`help_articles\`), fetched per turn and cached under
   \`ctx:{tenant}:{conversation}:retr:{name}\` for **5 minutes** (\`RETRIEVER_TTL_S = 300\`) with
-  \`SETEX\`. Retrieved articles are never appended to the conversation list: they belong to one
-  question, not to the history.
-
-**Failure mode the checks target.** The global key is both a cost problem (every assembly reads
-every conversation) and an isolation problem (tenants share one list); the missing TTL and trim
-make the list grow until the prompt no longer fits the model's window and the key outlives the
-conversation by years; loading every field puts data the product never declared into the prompt;
-and writing retrieved articles into the history makes every later turn answer from an article that
-matched an earlier question.`,
+  \`SETEX\`. Retrieved articles are returned beside the history, not appended to it.`,
   sequence: {
     participants: ['CoT workflow', 'Context store', 'Redis', 'Data sources'],
     messages: [
@@ -157,14 +147,11 @@ sources = Sources()
 
 
 def append(tenant: str, conversation: str, item: dict) -> None:
-    # TODO: key by tenant and conversation, bound the list to 40 items, refresh a 24 h TTL, and do
-    # the three writes in one transaction.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     r.rpush("context", json.dumps({"conversation": conversation, **item}))
 
 
 def assemble(tenant: str, conversation: str, user_id: str, question: str) -> dict:
-    # TODO: load only the declared static context, cache the retriever for 5 minutes, and keep
-    # retrieved articles out of the conversation history.
     history = [json.loads(raw) for raw in r.lrange("context", 0, -1)]
     history = [item for item in history if item["conversation"] == conversation]
     static = sources.load_all(user_id)
@@ -241,7 +228,7 @@ def assemble(tenant: str, conversation: str, user_id: str, question: str) -> dic
 `,
     },
     typescript: {
-      starter: `/** Context store: flawed code that keeps every conversation in one list. */
+      starter: `/** Context store: appends runtime context to Redis and assembles the prompt context. */
 import {Redis} from 'ioredis';
 
 import {sources} from './sources';
@@ -254,14 +241,11 @@ export interface ContextItem {
 }
 
 export async function append(tenant: string, conversation: string, item: ContextItem): Promise<void> {
-  // TODO: key by tenant and conversation, bound the list to 40 items, refresh a 24 h TTL, and do
-  // the three writes in one transaction.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await r.rpush('context', JSON.stringify({conversation, ...item}));
 }
 
 export async function assemble(tenant: string, conversation: string, userId: string, question: string) {
-  // TODO: load only the declared static context, cache the retriever for 5 minutes, and keep
-  // retrieved articles out of the conversation history.
   const raw = await r.lrange('context', 0, -1);
   const history = raw
     .map(line => JSON.parse(line) as ContextItem & {conversation: string})
@@ -367,16 +351,13 @@ type Assembled struct {
 	Dynamic map[string][]map[string]any \`json:"dynamic"\`
 }
 
-// TODO: key by tenant and conversation, bound the list to 40 items, refresh a 24 h TTL, and do
-// the three writes in one transaction.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func Append(ctx context.Context, tenant, conversation string, item map[string]any) error {
 	item["conversation"] = conversation
 	payload, _ := json.Marshal(item)
 	return rdb.RPush(ctx, "context", payload).Err()
 }
 
-// TODO: load only the declared static context, cache the retriever for 5 minutes, and keep
-// retrieved articles out of the conversation history.
 func Assemble(ctx context.Context, tenant, conversation, userID, question string) (*Assembled, error) {
 	raw, err := rdb.LRange(ctx, "context", 0, -1).Result()
 	if err != nil {
@@ -545,15 +526,12 @@ final case class Assembled(history: Vector[JsObject], static: Map[String, JsValu
 object ContextStore {
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key by tenant and conversation, bound the list to 40 items, refresh a 24 h TTL, and do
-  // the three writes in one transaction.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def append(tenant: String, conversation: String, item: JsObject): Unit = {
     val tagged = JsObject(item.fields + ("conversation" -> JsString(conversation)))
     jedis.rpush("context", tagged.compactPrint)
   }
 
-  // TODO: load only the declared static context, cache the retriever for 5 minutes, and keep
-  // retrieved articles out of the conversation history.
   def assemble(tenant: String, conversation: String, userId: String, question: String): Assembled = {
     val history = jedis
       .lrange("context", 0, -1)
@@ -661,15 +639,12 @@ struct Sources {
 Sources sources;
 sw::redis::Redis redis("tcp://redis:6379");
 
-// TODO: key by tenant and conversation, bound the list to 40 items, refresh a 24 h TTL, and do
-// the three writes in one transaction.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void append(const std::string& tenant, const std::string& conversation, json item) {
   item["conversation"] = conversation;
   redis.rpush("context", item.dump());
 }
 
-// TODO: load only the declared static context, cache the retriever for 5 minutes, and keep
-// retrieved articles out of the conversation history.
 json assemble(const std::string& tenant, const std::string& conversation, const std::string& userId, const std::string& question) {
   std::vector<std::string> raw;
   redis.lrange("context", 0, -1, std::back_inserter(raw));
@@ -757,9 +732,9 @@ json assemble(const std::string& tenant, const std::string& conversation, const 
     },
   },
   hints: [
-    'Start with the key: `ctx:{tenant}:{conversation}` built from the turn’s tenant and conversation, used by both `append` and `assemble`. Once each conversation has its own list, the client-side filter disappears and so does the cross-tenant read.',
-    'Append is three commands that belong together: `RPUSH`, `LTRIM key -40 -1`, `EXPIRE key 86400`. Put them in one `MULTI`/pipeline so a crash after the push cannot leave the list unbounded or without a TTL; refreshing the expiry on every write is what makes the TTL "a day after the last turn".',
-    'Static context is a declared tuple passed to `load`; dynamic context is a declared tuple of retriever names, each answered from `ctx:…:retr:{name}` with `SETEX 300` on a miss. Return the dynamic result alongside the history — never `RPUSH` it, or an article that matched one question becomes permanent context for every later one.',
+    'A guest in tenant B gets an answer mentioning tenant A’s trip; a long conversation slows with every turn until the prompt is too large; a help article from turn 1 keeps steering turn 20.',
+    'Both functions use one `context` key and filter in the client; nothing trims or expires it; `load_all` returns every user field; and the retriever result is pushed onto the same list as real turns.',
+    'Key by `ctx:{tenant}:{conversation}`; pipeline `RPUSH`, `LTRIM -40 -1`, `EXPIRE 86400`; call `load` with `STATIC_CONTEXT`; cache each `DYNAMIC_RETRIEVERS` result under `…:retr:{name}` via `SETEX 300` and return it beside the history.',
   ],
-  debrief: `The interview question behind this step is what the model is allowed to see, and for how long. The starter answers "everything, forever": a global list, no trim, no expiry, the full user record, and retrieved articles promoted to permanent history. Each of those passes a demo and fails in production — the global key as a tenant-isolation bug and a read-amplification bug at once, the unbounded list as a prompt that eventually exceeds the model's window and bills for every stale item on every iteration, the undeclared fields as data the product never asked to put in a prompt, and the persisted retrieval as a slow drift toward answering yesterday's question. The post's split is the fix: a product declares its static context and names its retrievers, the Context Loader fetches exactly that, and the Runtime Context Manager keeps a bounded, expiring runtime context per LLM call. Real platforms add a token budget per assembly (drop the oldest items until the prompt fits), point-in-time retrieval for offline evaluation, and per-field redaction before anything reaches the model.`,
+  debrief: `The fix answers two questions the starter left open: what the model may see, and for how long. One list per tenant and conversation makes isolation a property of the key, not of a filter somebody has to remember. Trim and expiry belong in the same transaction as the push, because a crash between them leaves a key that is unbounded or immortal, and refreshing the TTL on every write is what makes it "a day after the last turn". Declared static context and named retrievers are the post's split: the loader fetches exactly what the product asked for, and retrieval stays attached to the question that produced it. Production platforms also budget assembly by tokens, keep point-in-time context for offline evaluation, and redact fields before they reach the model.`,
 };

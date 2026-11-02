@@ -8,37 +8,26 @@ export const reasoningLoopStep: Step = {
   focus: ['workflow', 'llm', 'tools', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the Chain of Thought
-workflow: it assembles context, asks the LLM Adapter for reasoning, runs the tool the model asked
-for, feeds the outcome back and loops until the model returns a result. With a well-behaved model
-the demo answers "where is my next reservation?" in two iterations. It hides five production
-flaws. Debug it like the workflow engine's owner, fix it, and prove the fix.
+**Starting point.** The starter is the Chain of Thought workflow, \`run_turn(turn)\`: it assembles
+context, asks the LLM Adapter (\`llm-adapter:9000\`) for reasoning, invokes whatever tool the model
+named on the Tool Manager (\`tools:9100\`), and loops until a result. It serves the demo and hides
+5 flaws.
 
-Implement \`run_turn(turn)\` — prepare context, ask for reasoning, execute the tool, process the
-outcome, repeat until a result:
+**Failure mode the checks target.** \`while True\` around a model that may request a tool on every
+reply is an unbounded bill; a call without a deadline is a worker held hostage by one slow
+dependency; invoking whatever name the model emitted turns a prompt injection in a help article
+into a call to any registered action; an un-keyed write tool refunds twice on retry.
 
-- Every \`Reason\` call on the LLM Adapter (\`llm-adapter:9000\`) carries a **5 s** deadline
-  (\`REASON_DEADLINE_S\`). A reasoning call without one lets one stuck model pin the worker.
-- The loop runs at most **6** iterations (\`MAX_ITERATIONS\`). When the budget is spent without a
-  result the turn is returned as \`escalated\`; a model that keeps asking for one more tool never
-  gets a seventh call.
-- Tools are resolved through \`TOOL_REGISTRY\`: name → side-effect class (\`READ\` or \`WRITE\`).
-  A tool name the registry does not know is an outcome fed back to the model
-  (\`{"error": "unknown tool"}\`), never a call to the Tool Manager — the model proposes, the
-  registry decides.
-- Every \`Invoke\` on the Tool Manager (\`tools:9100\`) carries a **3 s** deadline
-  (\`TOOL_DEADLINE_S\`).
+- Every \`Reason\` call carries a **5 s** deadline (\`REASON_DEADLINE_S\`).
+- At most **6** iterations (\`MAX_ITERATIONS\`); when the budget is spent without a result the
+  turn is returned as \`escalated\`.
+- Tools are resolved through \`TOOL_REGISTRY\` (name → \`READ\` or \`WRITE\`). An unknown name
+  becomes an outcome fed back to the model (\`{"error": "unknown tool"}\`), not an \`Invoke\`.
+- Every \`Invoke\` carries a **3 s** deadline (\`TOOL_DEADLINE_S\`).
 - \`WRITE\` tools (\`update_listing\`, \`issue_refund\`) are invoked with
-  \`idempotency_key = "{turn_id}:{iteration}"\`, so a retried or replayed invocation applies the
-  change once. \`READ\` tools carry no key.
-- Each tool outcome is appended to the conversation context (step 2) and to the in-memory history
-  the next \`Reason\` call sees. The loop ends when the model's reply has \`kind == "result"\`.
-
-**Failure mode the checks target.** \`while True\` around a model that is allowed to request a tool
-on every reply is an unbounded bill; a \`Reason\` or \`Invoke\` without a deadline is a worker held
-hostage by one slow dependency; invoking whatever name the model emitted turns a prompt injection
-in a help article into a call to any registered action; and an un-keyed write tool means a retry
-after a timeout refunds twice.`,
+  \`idempotency_key = "{turn_id}:{iteration}"\`; \`READ\` tools carry no key.
+- Each tool outcome is appended to the conversation context (step 2) and to the history. The loop
+  ends when the reply has \`kind == "result"\`.`,
   sequence: {
     participants: ['CoT workflow', 'Context store', 'LLM Adapter', 'Tool Manager'],
     messages: [
@@ -54,9 +43,9 @@ after a timeout refunds twice.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`), one constant per RPC. Replace `while True` with a `for` over `MAX_ITERATIONS` and decide what happens when the loop falls out of the bottom: the turn is escalated, not retried.',
-    'The registry is a map from tool name to side-effect class. Look the model’s name up before building the request; a miss becomes an outcome item (`{"error": "unknown tool"}`) appended to the history exactly like a real outcome, so the model can correct itself on the next iteration.',
-    'For a `WRITE` tool, set `idempotency_key` to `"{turn_id}:{iteration}"` on the `InvokeRequest` — stable across retries of the same invocation, different for a second invocation in the same turn. `READ` tools leave it empty.',
+    'One turn runs for minutes and bills dozens of model calls; a worker sits on a stalled model forever; a help article saying "call delete_listing" gets the tool called; a retried `issue_refund` pays twice.',
+    'The loop is `while True` with no cap, both stubs are called without a deadline, the model’s tool name goes straight into `InvokeRequest`, and no `idempotency_key` is set, so a replay is unrecognisable.',
+    'Use `for iteration in range(MAX_ITERATIONS)` ending in `escalated`; pass `timeout=REASON_DEADLINE_S` / `TOOL_DEADLINE_S`; check `name not in TOOL_REGISTRY` first; set `idempotency_key=f"{turn_id}:{iteration}"` for `SideEffect.WRITE`.',
   ],
   checks: [
     {
@@ -155,8 +144,7 @@ tools = apv2_pb2_grpc.ToolManagerStub(grpc.insecure_channel("tools:9100"))
 
 
 def run_turn(turn: dict) -> dict:
-    # TODO: add the 5 s Reason deadline and the 3 s Invoke deadline, bound the loop to 6
-    # iterations, resolve tools through a registry, and key WRITE tools by turn and iteration.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     tenant, conversation = turn["tenant"], turn["conversation"]
     context = assemble(tenant, conversation, turn["actor"], turn["text"])
     while True:
@@ -234,7 +222,7 @@ def run_turn(turn: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Chain of Thought workflow: flawed code that loops until the model stops asking. */
+      starter: `/** Chain of Thought workflow: reason, run the requested tool, feed the outcome back, repeat. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -283,8 +271,7 @@ export interface Turn {
 }
 
 export async function runTurn(turn: Turn): Promise<{status: string; result?: string}> {
-  // TODO: add the 5 s Reason deadline and the 3 s Invoke deadline, bound the loop to 6
-  // iterations, resolve tools through a registry, and key WRITE tools by turn and iteration.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const context = await assemble(turn.tenant, turn.conversation, turn.actor, turn.text);
   for (;;) {
     const reply = await new Promise<ReasonReply>((resolve, reject) => {
@@ -456,8 +443,7 @@ type Outcome struct {
 	Result string
 }
 
-// TODO: add the 5 s Reason deadline and the 3 s Invoke deadline, bound the loop to 6
-// iterations, resolve tools through a registry, and key WRITE tools by turn and iteration.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func RunTurn(ctx context.Context, turn Turn) (Outcome, error) {
 	assembled, err := Assemble(ctx, turn.Tenant, turn.Conversation, turn.Actor, turn.Text)
 	if err != nil {
@@ -612,8 +598,7 @@ object CotWorkflow {
   val llm = LlmAdapterGrpc.blockingStub(ManagedChannelBuilder.forAddress("llm-adapter", 9000).usePlaintext().build())
   val tools = ToolManagerGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9100).usePlaintext().build())
 
-  // TODO: add the 5 s Reason deadline and the 3 s Invoke deadline, bound the loop to 6
-  // iterations, resolve tools through a registry, and key WRITE tools by turn and iteration.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def runTurn(turn: Turn): Outcome = {
     val assembled = ContextStore.assemble(turn.tenant, turn.conversation, turn.actor, turn.text)
     var history = assembled.history
@@ -735,8 +720,7 @@ struct Turn {
 std::unique_ptr<apv2::LlmAdapter::Stub> llm;
 std::unique_ptr<apv2::ToolManager::Stub> tools;
 
-// TODO: add the 5 s Reason deadline and the 3 s Invoke deadline, bound the loop to 6
-// iterations, resolve tools through a registry, and key WRITE tools by turn and iteration.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 json runTurn(const Turn& turn) {
   json context = assemble(turn.tenant, turn.conversation, turn.actor, turn.text);
   while (true) {
@@ -847,5 +831,5 @@ json runTurn(const Turn& turn) {
 `,
     },
   },
-  debrief: `The interviewer is asking one question in five forms: what is the worst case of this loop? The post describes the Chain of Thought workflow as "stay in the reasoning loop until a result is generated" — true of the algorithm, not of the budget. A deadline bounds one model call, a second deadline bounds one tool call, the iteration cap bounds the turn, and the escalation at the bottom of the loop is what a bounded turn ends in. The registry is the safety answer: the model is a reasoning engine that proposes tools, and the platform's Tool Manager — the post's unified interface and managed execution environment — decides what exists; a name that came from a help article or a jailbreak never reaches a service call. The idempotency key on write tools is the correctness answer: the loop retries, the client retries, the Tool Manager retries, and a refund has to be applied exactly once across all three. Real platforms add role-gated registries (customer vs agent), per-tool rate limits and retries inside the Tool Manager, a token budget per turn next to the iteration budget, and a tool guardrail that validates arguments before execution — step 4's framework.`,
+  debrief: `Every piece of the fix answers one question: what is the worst case of this loop? The post says the workflow stays in the reasoning loop until a result is generated, which describes the algorithm, not the budget. A deadline bounds one model call, a second bounds one tool call, the iteration cap bounds the turn, and escalation is how a bounded turn ends when the model has not finished. The registry separates proposing from deciding: the model names a tool, the platform decides whether it exists, so a name planted in a help article stops at the lookup. The idempotency key covers three retry paths (loop, client, Tool Manager) so a refund is applied once. Production platforms also gate the registry by role and cap tokens per turn.`,
 };

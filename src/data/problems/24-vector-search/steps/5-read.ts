@@ -8,32 +8,28 @@ export const readStep: Step = {
   focus: ['client', 'search', 'index', 'cache'],
   task: `## Task
 
-**Starting point.** The starter is working code: the read endpoint returns
-neighbors for a document id and the response carries an index version. It compiles, the demo shows a
-plausible list, and three things are wrong with it. Find them, fix them, and prove the fix with the
-checks below.
-
-Implement \`GET /v1/documents/{document_id}/neighbors?k=10\`.
-
-- The lookup is **tenant-scoped**: the document is fetched as \`(authenticated tenant, document id)\`,
-  and a document that belongs to another tenant is **404** — not 403, not an empty list. A global id
-  namespace with a tenant-less lookup is a cross-tenant read, and an existence oracle for everyone
-  else's documents is a leak of its own.
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and never from a query parameter or the
-  body.
-- \`k\` is capped at **20** neighbors; \`k > 20\` is **400**, not a silent clamp. The starter caps
-  nothing, so one caller can ask for the whole neighborhood of a document.
-- The response is labeled with **the index version the results came from**. Neighbors are often
-  served from a cached snapshot, so \`index_version\` is the version on the snapshot the hits were
-  read from — never \`"the latest"\`. The starter stamps the current version onto results an older
-  snapshot produced, which is exactly the bug that makes a rollback look like it did nothing.
-- The document is resolved before the neighbor query, and the neighbor query is started with the
-  tenant and, when the document carries one, the version the document was indexed at.
+**Starting point.** The starter serves \`GET /v1/documents/{document_id}/neighbors?k=10\`: it
+fetches the document by id alone (404 when missing), asks the index for \`k\` neighbors of that id,
+and stamps \`LATEST_INDEX_VERSION\` onto the response. The demo shows a plausible list. It
+compiles and hides four flaws.
 
 **Failure mode the checks target.** A tenant-less lookup serves another tenant's document; an
 uncapped \`k\` turns one request into a full index scan on the read path; and a version label that is
 the latest version rather than the one that produced the results makes every cached answer
-untrustworthy — you cannot reproduce, explain or roll back a ranking you cannot date.`,
+untrustworthy, because you cannot reproduce, explain or roll back a ranking you cannot date.
+
+- The lookup is **tenant-scoped**: the document is fetched as \`(authenticated tenant, document id)\`,
+  and a document that belongs to another tenant is **404**, not 403 and not an empty list. A global
+  id namespace with a tenant-less lookup is a cross-tenant read, and an existence oracle for everyone
+  else's documents is a leak of its own.
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent), not from a query parameter or the
+  body.
+- \`k\` is capped at **20** neighbors; \`k > 20\` is **400**, not a silent clamp.
+- The response is labeled with **the index version the results came from**. Neighbors are often
+  served from a cached snapshot, so \`index_version\` is the version on the snapshot the hits were
+  read from (\`snapshot.index_version\`), not a live-version constant.
+- The document is resolved before the neighbor query, and the neighbor query is started with the
+  tenant and, when the document carries one, the version the document was indexed at.`,
   sequence: {
     participants: ['Client', 'Search API', 'Document store', 'Index shards'],
     messages: [
@@ -47,9 +43,9 @@ untrustworthy — you cannot reproduce, explain or roll back a ranking you canno
     ],
   },
   hints: [
-    'Ownership is part of the key: `documents.get(tenant, document_id)` and a `None`/`null`/`nil` result is a 404. Looking up by id alone means the endpoint answers for documents the tenant cannot see — and the difference between 404 and 403 already tells an attacker which ids exist.',
-    'The version you report is not the version that is live, it is the version that produced these hits. Return it with the hits (`snapshot.indexVersion`) instead of stamping a live-version constant onto the response; a cached snapshot served an older one and the label has to say so.',
-    "Order matters for both correctness and cost: resolve the document, then validate `k`, then query neighbors with the tenant and the document's pinned version. Validating first keeps a hostile request from touching the index at all.",
+    "Tenant B asks for the neighbors of one of tenant A's document ids and gets them. After a rollback, every neighbors response still says the rolled-back version produced it.",
+    '`documents.get(document_id)` has no tenant in the key, `k` flows to `index.neighbors` unchecked, and the response field is the constant `LATEST_INDEX_VERSION` rather than anything the index returned.',
+    'Read `X-Tenant-Id` (401), reject `k > MAX_NEIGHBORS` (20) with 400, call `documents.get(tenant, document_id)` then `index.neighbors(tenant, …)`, and report `snapshot.index_version` from the returned snapshot.',
   ],
   checks: [
     {
@@ -146,8 +142,7 @@ index = NeighborIndex()
 
 @app.get("/v1/documents/{document_id}/neighbors")
 def neighbors(document_id: str, k: int = 10) -> JSONResponse:
-    # TODO: this starter looks the document up by id alone, caps nothing, and labels the results
-    # with the latest index version even when a cached snapshot served them. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     document = documents.get(document_id)
     if document is None:
         return JSONResponse({"error": "document not found"}, status_code=404)
@@ -246,8 +241,7 @@ export const app = Fastify();
 const LATEST_INDEX_VERSION = 'idx-42';
 
 app.get('/v1/documents/:documentId/neighbors', async (request, reply) => {
-  // TODO: this starter looks the document up by id alone, caps nothing, and labels the results with
-  // the latest index version even when a cached snapshot served them. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {documentId} = request.params as {documentId?: string};
   const k = Number((request.query as {k?: string}).k ?? 10);
   const document = await documents.get(documentId ?? '');
@@ -353,8 +347,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func neighbors(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter looks the document up by id alone, caps nothing, and labels the results
-	// with the latest index version even when a cached snapshot served them. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	documentID := r.PathValue("documentId")
 	k, _ := strconv.Atoi(r.URL.Query().Get("k"))
 	document, err := documents.Get(r.Context(), documentID)
@@ -518,9 +511,7 @@ object ReadApi {
     path("v1" / "documents" / Segment / "neighbors") { documentId =>
       get {
         parameter("k".as[Int].withDefault(10)) { k =>
-          // TODO: this starter looks the document up by id alone, caps nothing, and labels the
-          // results with the latest index version even when a cached snapshot served them.
-          // Fix all three.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           documents.get(documentId) match {
             case None =>
               complete(StatusCodes.NotFound, """{"error":"document not found"}""")
@@ -641,8 +632,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/documents/([^/]+)/neighbors", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter looks the document up by id alone, caps nothing, and labels the results
-    // with the latest index version even when a cached snapshot served them. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string documentId = req.matches[1];
     const int k = req.has_param("k") ? std::stoi(req.get_param_value("k")) : 10;
     const auto document = documents.get(documentId);
@@ -739,17 +729,15 @@ int main() {
 `,
     },
   },
-  debrief: `The read path is where a search service tells the truth about what it just served. Three
-defects, each with a different flavour. Ownership: the starter keys the document store by id, so an id
-namespace that is global becomes a cross-tenant read, and the 404-versus-403 distinction is the only
-thing that keeps the endpoint from doubling as an existence oracle. Cap: \`k\` is a cost control, not a
-formatting preference — an uncapped \`k\` on the neighbor read can walk a document's whole
-neighborhood, and returning 400 instead of clamping keeps the caller's request and the response
-consistent. Provenance: the version has to come from the thing that produced the hits. Neighbors are
-routinely served from a cached snapshot, so stamping the live version onto stale results makes the
-ranking unreproducible and makes a rollback look ineffective — the exact bug this endpoint exists to
-prevent. Real services add a per-tenant document ACL check inside the store, a snapshot age in the
-response so a client can decide to refresh, and a query log that stores the fingerprint and the
-served version so a bad ranking can be replayed without keeping anyone's content.
+  debrief: `The read path is where a search service tells the truth about what it just served, and
+each part of the fix guards a different kind of truth. Ownership belongs in the lookup key because
+an id namespace that is global becomes a cross-tenant read, and answering 404 rather than 403 keeps
+the endpoint from doubling as an existence oracle. The cap is a cost control: an uncapped \`k\` can
+walk a document's whole neighborhood, and 400 instead of clamping keeps request and response
+consistent. Provenance has to come from the thing that produced the hits, since neighbors are
+routinely served from a cached snapshot and stamping the live version onto stale results makes a
+rollback look ineffective. Production read paths add a snapshot age to the response so a client can
+decide to refresh, and a query log of fingerprint plus served version so a bad ranking can be
+replayed without keeping anyone's content.
 `,
 };

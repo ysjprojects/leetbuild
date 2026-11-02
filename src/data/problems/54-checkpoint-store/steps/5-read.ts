@@ -8,31 +8,24 @@ export const readCheckpointStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks up the run's newest
-checkpoint and answers \`200\` with a signed URL, so the demo resumes. It serves a checkpoint that was
-never committed, exposes any run to any tenant, and hands out a link that never expires. Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`GET /v1/runs/{run_id}/checkpoints/latest\`:
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when missing). The run must
-  belong to that tenant: a **foreign run is 404**, never 403 — a 403 confirms the run exists and
-  turns the endpoint into an oracle for another tenant's run ids.
-- The latest **committed** checkpoint is the one whose commit marker exists
-  (\`latest_committed\`). The starter returns the highest step even when the commit never completed, so
-  a resumed run can load a checkpoint that is not durable.
-- A checkpoint whose background **verification has not passed** is refused (**409**) rather than
-  served with a warning: an unverified checkpoint is the corrupted-chunk case that a resume cannot
-  detect on its own.
-- The response carries the run id, the **step number**, the verification status, the **last verified
-  chunk** boundary and a **signed URL that expires in 15 minutes** (\`SIGNED_URL_TTL_S\`), with the
-  expiry reported to the caller. A URL that never expires is a permanent capability on every
-  checkpoint ever written.
-- A run with no committed checkpoint is **404** — "not yet" must not look like "here it is".
+**Starting point.** The starter serves \`GET /v1/runs/{run_id}/checkpoints/latest\`: it reads
+\`X-Tenant-Id\`, calls \`store.latest_step(run_id)\` (the newest row, committed or not), and answers
+\`200\` with the run id, the step and a \`signed_url\` that has no expiry. It compiles, resumes the
+demo, and hides five flaws.
 
 **Failure mode the checks target.** Visibility is the whole contract of a read endpoint: a checkpoint
 that is not committed is not a checkpoint, a checkpoint that failed verification is not safe to
 resume from, a run that belongs to someone else does not exist for you, and a signed URL without an
-expiry is a credential with no end.`,
+expiry is a credential with no end.
+
+- The tenant comes from \`X-Tenant-Id\` (**401** when missing). The run must belong to that tenant
+  (\`run_owner\`): a **foreign run is 404**, not 403, because a 403 confirms the run exists.
+- The latest **committed** checkpoint is the one whose commit marker exists
+  (\`latest_committed\`); a run with none is **404**.
+- A checkpoint whose **verification has not passed** (\`VERIFIED_STATE\`) is refused with **409**.
+- The response carries the run id, the **step number**, the verification status, the **last
+  verified chunk** (\`last_verified_chunk\`) and a **signed URL that expires in 15 minutes**
+  (\`SIGNED_URL_TTL_S\`), with the expiry reported as \`expires_in_s\`.`,
   sequence: {
     participants: ['Training job', 'Checkpoint API', 'Redis'],
     messages: [
@@ -146,9 +139,7 @@ def signed_url(run_id: str, step: int) -> str:
 
 @app.get("/v1/runs/{run_id}/checkpoints/latest")
 def latest(run_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter returns the highest step even when the commit never completed, serves any run
-    # id to any tenant, and hands out a signed URL that never expires. Gate on the commit marker,
-    # scope the run to the tenant with a 404, refuse an unverified checkpoint, and expire the URL.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     checkpoint = store.latest_step(run_id)
     return {"run_id": run_id, "step": checkpoint["step"], "url": signed_url(run_id, checkpoint["step"])}
 `,
@@ -203,7 +194,7 @@ def latest(run_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/runs/:runId/checkpoints/latest: flawed code with no gates. */
+      starter: `/** GET /v1/runs/:runId/checkpoints/latest: no gates. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -216,9 +207,7 @@ interface Checkpoint {
 }
 
 app.get('/v1/runs/:runId/checkpoints/latest', async (request, reply) => {
-  // TODO: this starter returns the highest step even when the commit never completed, serves any run
-  // id to any tenant, and hands out a signed URL that never expires. Gate on the commit marker,
-  // scope the run to the tenant with a 404, refuse an unverified checkpoint, and expire the URL.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const {runId} = request.params as {runId: string};
   const checkpoint: Checkpoint = {
@@ -291,9 +280,7 @@ func signedURL(runID string, step int) (string, error) { return "", nil }
 func latest(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	runID := r.PathValue("runId")
-	// TODO: this starter returns the highest step even when the commit never completed, serves any run
-	// id to any tenant, and hands out a signed URL that never expires. Gate on the commit marker,
-	// scope the run to the tenant with a 404, refuse an unverified checkpoint, and expire the URL.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	step, _ := latestStep(r.Context(), runID)
 	url, _ := signedURL(runID, step)
 	writeJSON(rw, http.StatusOK, map[string]any{"run_id": runID, "step": step, "url": url})
@@ -412,10 +399,7 @@ object Read {
     path("v1" / "runs" / Segment / "checkpoints" / "latest") { runId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter returns the highest step even when the commit never completed, serves
-          // any run id to any tenant, and hands out a signed URL that never expires. Gate on the
-          // commit marker, scope the run to the tenant with a 404, refuse an unverified checkpoint,
-          // and expire the URL.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val step = latestStep(runId)
           complete(StatusCodes.OK, s"""{"run_id":"$runId","step":$step,"url":"\${signedUrl(runId, step)}"}""")
         }
@@ -504,9 +488,7 @@ int main() {
   svr.Get(R"(/v1/runs/([^/]+)/checkpoints/latest)", [](const httplib::Request& req, httplib::Response& res) {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto runId = pathParam(req.path, "checkpoints");
-    // TODO: this starter returns the highest step even when the commit never completed, serves any run
-    // id to any tenant, and hands out a signed URL that never expires. Gate on the commit marker,
-    // scope the run to the tenant with a 404, refuse an unverified checkpoint, and expire the URL.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const int step = LatestStep(runId);
     res.status = 200;
     res.set_content(json{{"run_id", runId}, {"step", step}, {"url", SignedUrl(runId, step)}}.dump(),
@@ -590,9 +572,9 @@ int main() {
     },
   },
   hints: [
-    'Start from the marker, not from the newest row: `latest_committed(run_id)` is the only lookup whose answer a resume can trust, and when it returns nothing the honest reply is 404. The starter’s `latest_step` is exactly the query that hands out a checkpoint whose commit never completed.',
-    'Tenant scoping and existence are the same response. Compare the run’s owner with the header and answer 404 for a foreign run — a 403 tells the caller the run id is real, which is a leak of its own.',
-    'Refuse an unverified checkpoint (409) instead of serving it with a warning, and sign the URL with a 15-minute TTL, reporting the expiry in the response. A pre-signed URL without an expiry is a permanent capability, and the last verified chunk boundary is what the resumed job needs so it re-sends one chunk instead of the whole checkpoint.',
+    'A job resumes from a step whose upload died halfway, a tenant can read any run id it guesses, and a link pasted into a ticket months ago still downloads the weights.',
+    'The handler takes the newest row regardless of marker or verification state, compares nothing against the tenant header, and `signed_url` is minted without a TTL or a resume boundary.',
+    'Check `run_owner(run_id) != tenant` and answer 404; use `latest_committed`; refuse a state other than `VERIFIED_STATE` with 409; sign with `SIGNED_URL_TTL_S`, return `expires_in_s` and `last_verified_chunk`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read path for the promises it makes. The starter is a convenience endpoint: whatever the store has, keyed by whatever the caller sent, behind a link that works forever. The real endpoint has four gates and each one is a promise — the commit marker (it is durable), the verification state (it is not corrupt), the tenant check (it is yours), and the URL expiry (this access is temporary). Real stores add range requests so a resume fetches only the chunks after the last verified boundary, a monotonic epoch to reject a resume from a superseded checkpoint, an audit record of who read which checkpoint, and a URL that is scoped to that one object rather than to the bucket.`,
+  debrief: `The starter is a convenience endpoint: whatever the store has, keyed by whatever the caller sent, behind a link that works forever. The fixed endpoint has four gates and each one is a promise: the commit marker (it is durable), the verification state (it is not corrupt), the tenant check (it is yours), and the URL expiry (this access is temporary). The 404 for a foreign run keeps the run id space opaque by giving "missing" and "not yours" the same status. The last verified chunk is in the response so a resume re-sends one chunk, not a whole checkpoint. Production stores add range requests for the chunks after that boundary, a monotonic epoch to reject a resume from a superseded checkpoint, and an audit record of who read which checkpoint.`,
 };

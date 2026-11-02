@@ -8,32 +8,30 @@ export const dependencyStep: Step = {
   focus: ['queue', 'enforcement', 'items'],
   task: `## Task
 
-**Starting point.** The starter calls the enforcement service and, when the call times out, decides
-the item itself. It also retries a rejection. On the demo the service always answers, so nobody
-notices — until an enforcement outage silently approves a spam wave. Debug it, fix it, and prove the
-fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/review/items/{item_id}/resolve\`: it calls the
+enforcement service's \`AutoResolve\` RPC with no deadline inside a three-attempt loop, returns
+\`auto_resolved\` with the grant id on success, returns \`auto_resolved\` with an \`implicit\` grant
+when the call times out and \`confidence\` exceeds \`CONFIDENCE_THRESHOLD\` (0.5), and falls through
+to \`auto_resolved\` with a \`fallback\` grant after three failures. It compiles, serves the demo and
+hides 5 flaws.
 
-Implement \`POST /v1/review/items/{item_id}/resolve\` over the **gRPC** enforcement client:
+**Failure mode the checks target.** An enforcement outage during a spam wave: every call times out,
+every item above 0.5 confidence clears itself, nothing records why, and a category the policy has
+refused gets called three times per resolution.
 
 - **Only the safe class auto-resolves.** \`SAFE_CATEGORIES\` is \`spam_duplicate\` and
   \`known_safe_false_positive\`. Every other category requires explicit reviewer confirmation
-  (**409** \`needs_confirmation\` until the reviewer confirms), never an auto-resolve.
-- **The call has a 1-second deadline.** Pass it on the RPC (\`timeout\` in Python,
-  \`deadline\` in grpc-js, \`context.WithTimeout\` in Go, a deadline in the Scala/C++ client
-  context). An enforcement call must never hang a reviewer's request.
+  (**409** \`needs_confirmation\` until the reviewer confirms).
+- **The call has a 1-second deadline** (\`ENFORCEMENT_DEADLINE\`), passed on the RPC as
+  \`timeout\` in Python, \`deadline\` in grpc-js, \`context.WithTimeout\` in Go, a deadline on the
+  Scala/C++ client context.
 - **A timeout escalates, it does not resolve.** \`DEADLINE_EXCEEDED\` returns
-  \`{"outcome": "escalated"}\` (**202**) — the item stays with a human. A timeout is *not* approval.
+  \`{"outcome": "escalated"}\` (**202**); the item stays with a human.
 - **A policy rejection is terminal.** \`PERMISSION_DENIED\` means the platform will not clear this
-  category; escalate and **stop**. Do not retry it — a retry loop hammers the same category and
-  turns one rejection into a denial-of-service on the enforcement service.
+  category; escalate and stop. No retry loop.
 - **Every auto-resolve records a grant.** \`record_grant(tenant, item_id, category, grant_id)\`
-  writes an audit row tying the auto-resolve to the enforcement service's grant, so the decision can
-  be explained months later. No grant, no auto-resolve.
-
-**Failure mode the checks target.** Two defects. The starter treats a timeout as approval for anything
-above 0.5 confidence, so an enforcement outage becomes a silent self-approval loop that clears
-exactly the items nobody could verify. And it retries \`PERMISSION_DENIED\`, so a category the policy
-has refused gets hammered three times per resolution.`,
+  writes an audit row tying the auto-resolve to the enforcement service's grant. No grant, no
+  auto-resolve.`,
   sequence: {
     participants: ['Reviewer', 'Review Queue', 'Enforcement', 'Item store'],
     messages: [
@@ -137,8 +135,7 @@ def resolve(
     body: ResolveBody,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
-    # times out, and it retries a policy rejection, so one category gets hammered. Fix both.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for attempt in range(3):
         try:
             response = stub.AutoResolve(
@@ -245,8 +242,7 @@ interface ResolveBody {
 }
 
 app.post('/v1/review/items/:item_id/resolve', async (request, reply) => {
-  // TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
-  // times out, and it retries a policy rejection, so one category gets hammered. Fix both.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const body = request.body as ResolveBody;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const response = await callEnforcement(body.category).catch(() => null);
@@ -356,8 +352,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func resolve(rw http.ResponseWriter, r *http.Request) {
 	var body ResolveBody
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
-	// times out, and it retries a policy rejection, so one category gets hammered. Fix both.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 3; attempt++ {
 		resp, err := enforcementClient.AutoResolve(context.Background(), &ResolveRequest{Category: body.Category})
 		if err == nil {
@@ -479,8 +474,7 @@ object Client {
   val ConfidenceThreshold: Double = 0.5
 
   def resolve(tenant: String, itemId: String, category: String, confidence: Double): Future[String] = {
-    // TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
-    // times out, and it retries a policy rejection, so one category gets hammered. Fix both.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for (attempt <- 1 to 3) {
       try {
         val resp = enforcement.autoResolve(tenant, itemId, category)
@@ -593,8 +587,7 @@ int main() {
   httplib::Server svr;
   svr.Post("/v1/review/items/([^/]+)/resolve", [](const httplib::Request& req, httplib::Response& res) {
     auto body = json::parse(req.body);
-    // TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
-    // times out, and it retries a policy rejection, so one category gets hammered. Fix both.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for (int attempt = 0; attempt < 3; ++attempt) {
       grpc::ClientContext context;
       AutoResolveResponse response;
@@ -681,9 +674,9 @@ int main() {
     },
   },
   hints: [
-    'The safe class is a *set of categories*, not a confidence score. Gate auto-resolve on `SAFE_CATEGORIES` and send everything else to a human with a `needs_confirmation` response.',
-    'A deadline is what stops an enforcement outage from becoming a review outage. Pass the 1-second deadline on the RPC, and treat `DEADLINE_EXCEEDED` as "escalate to a human" — a timeout is not approval.',
-    'A policy rejection is an answer, not a transient error. Handle `PERMISSION_DENIED` once, escalate, and never retry it — and only auto-resolve after the enforcement service returned a grant you recorded.',
+    'Symptoms: during an enforcement outage the queue drains itself, the audit table has grant ids reading `implicit` and `fallback`, and the enforcement service sees three calls per rejected item.',
+    "The handler never gates on what the category is, only on the model's confidence; every RPC error falls into `continue`, so `PERMISSION_DENIED` is retried, and no path ends with a human.",
+    'Gate on `SAFE_CATEGORIES`, pass `ENFORCEMENT_DEADLINE` as `timeout=`, map `DEADLINE_EXCEEDED` and `PERMISSION_DENIED` to an escalated outcome without a retry loop, and call `record_grant` before returning `auto_resolved`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a dependency call at the most dangerous seam in an AI platform: the place where the system decides an item does not need a human. Three defects are being checked. First, the class: auto-resolution must be gated on a named safe set — spam duplicates and known-safe false positives — never on a confidence threshold, because confidence measures the model's self-assessment, not whether a category is safe to clear unattended. Second, the timeout: a 1-second deadline keeps a reviewer's request bounded, and a timeout must escalate, because treating a timeout as approval turns an enforcement outage into a silent self-approval loop. Third, the rejection: PERMISSION_DENIED is terminal — retrying it hammers the policy that already said no. The subtle point candidates miss is the grant: without a recorded grant id, an auto-resolve months later cannot be explained to an auditor. Real platforms add per-tenant safe-category overrides, a circuit breaker around enforcement, and a hard cap on how many items may auto-resolve per minute.`,
+  debrief: `The fix narrows the one place the system decides an item needs no human. The gate is a named set of categories rather than a confidence threshold because confidence is the model's self-assessment, not evidence that a category is safe to clear unattended. The deadline bounds the reviewer's request, and a timeout escalates because an absent answer is not an approval; the starter turned every outage into a self-approval loop over exactly the items nobody could verify. A rejection is terminal because the policy already answered; retrying it only loads the service that said no. The grant row is what lets an auto-resolve be explained to an auditor months later. Production platforms go further: per-tenant safe-category overrides, a circuit breaker around enforcement, and a cap on auto-resolves per minute.`,
 };

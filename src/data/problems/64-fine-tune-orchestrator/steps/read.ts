@@ -8,28 +8,25 @@ export const readStep: Step = {
   focus: ['readapi', 'eval', 'checkpoints'],
   task: `## Task
 
-**Starting point.** The starter is working code for the read handler: it looks up a job and returns
-its status. It compiles, it answers the dashboard, and it reports a job as successful the moment the
-trainer exits zero — even when the eval gate failed. Debug it like the model owner, fix it, and
-prove the fix with the checks below.
-
-Implement \`GET /v1/finetune/jobs/{job_id}\`.
-
-- The team comes from the authenticated \`X-Team-Id\` header. A job that belongs to another team is
-  **404** — not 403 — so a foreign id cannot even be confirmed to exist.
-- The response carries the job \`id\`, the \`status\`, and \`trained\` (the trainer exited zero).
-- **The eval gate is part of the answer.** Report the eval result and compute \`promotable\`: a run
-  that finished with exit code zero but whose eval gate did not pass is **trained but not
-  promotable**. Never report \`completed\` as a success on its own.
-- **Reconcile the budget.** Report \`budget.reserved\`, \`budget.spent\` and \`budget.remaining\`,
-  where \`spent = reserved - remaining\`, so the numbers add up with what the Redis layer released.
-- Include the **checkpoint lineage** so the run can be reproduced and its restarts explained.
-- Log the read with team and job id — never the hyperparameter block.
+**Starting point.** The starter serves \`GET /v1/finetune/jobs/{job_id}\`: it loads the job by id
+for whoever asks, answers 404 only when the id is unknown, and returns \`id\`, a \`status\` derived
+from the exit code alone, \`exit_code\` and \`budget_spent\`. It answers the dashboard and hides
+four flaws.
 
 **Failure mode the checks target.** Reporting success on exit code zero hides the eval gate, so a
-model that failed its golden set reaches a registry as a promotable artifact. Hiding the spent budget
-means nobody can reconcile the reservation with what the trainer actually used. And a read handler
-that serves any team's jobs leaks every tenant's runs to anyone who can guess an id.`,
+model that failed its golden set reaches the registry as a promotable artifact. Returning only the
+spent figure means nobody can reconcile the reservation with what the trainer used. And a handler
+that serves any team's jobs leaks every tenant's runs to anyone who can guess an id.
+
+- The team comes from \`X-Team-Id\`. Another team's job is **404**, not 403, so a foreign id cannot
+  be confirmed to exist.
+- The response carries \`id\`, \`status\`, and \`trained\` (the trainer exited zero).
+- **The eval gate is part of the answer.** Report the eval result and compute \`promotable\`: exit
+  code zero without a passing eval is trained but not promotable.
+- **Reconcile the budget.** Report \`budget.reserved\`, \`budget.spent\` and \`budget.remaining\`,
+  with \`spent = reserved - remaining\`.
+- Include the checkpoint lineage so restarts can be explained.
+- Log team and job id, not the hyperparameter block.`,
   sequence: {
     participants: ['Client', 'Job read API', 'Checkpoint store', 'Eval gate'],
     messages: [
@@ -123,8 +120,7 @@ logger = logging.getLogger("finetune.read")
 
 @app.get("/v1/finetune/jobs/{job_id}")
 async def read_job(job_id: str, x_team_id: str = Header(...)) -> JSONResponse:
-    # TODO: serve only the caller's team (404 otherwise), report the eval gate and whether the run
-    # is promotable, and reconcile the spent budget with the reservation.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     job = jobs.get(job_id)
     if job is None:
         return JSONResponse({"detail": "job not found"}, status_code=404)
@@ -185,8 +181,7 @@ import Fastify from 'fastify';
 export const app = Fastify();
 
 app.get('/v1/finetune/jobs/:jobId', async (request, reply) => {
-  // TODO: serve only the caller's team (404 otherwise), report the eval gate and whether the run
-  // is promotable, and reconcile the spent budget with the reservation.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {jobId} = request.params as {jobId: string};
   const job = jobs.get(jobId);
   if (job === undefined) return reply.code(404).send({detail: 'job not found'});
@@ -234,8 +229,7 @@ import (
 
 func Register(mux *http.ServeMux, jobs *JobStore) {
 	mux.HandleFunc("GET /v1/finetune/jobs/", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: serve only the caller's team (404 otherwise), report the eval gate and whether the
-		// run is promotable, and reconcile the spent budget with the reservation.
+		// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 		jobID := strings.TrimPrefix(r.URL.Path, "/v1/finetune/jobs/")
 		job, ok := jobs.Get(jobID)
 		if !ok {
@@ -297,8 +291,7 @@ import org.apache.pekko.http.scaladsl.server.Route
 object Read {
   val route: Route = path("v1" / "finetune" / "jobs" / Segment) { jobId =>
     get {
-      // TODO: serve only the caller's team (404 otherwise), report the eval gate and whether the
-      // run is promotable, and reconcile the spent budget with the reservation.
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
       jobs.get(jobId) match {
         case Some(job) =>
           val status = if (job.exitCode == 0) "completed" else "failed"
@@ -345,8 +338,7 @@ using json = nlohmann::json;
 
 void RegisterRead(httplib::Server& svr, JobStore* jobs) {
   svr.Get(R"(/v1/finetune/jobs/([^/]+))", [jobs](const httplib::Request& req, httplib::Response& res) {
-    // TODO: serve only the caller's team (404 otherwise), report the eval gate and whether the run
-    // is promotable, and reconcile the spent budget with the reservation.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string job_id = req.matches[1];
     auto job = jobs->Get(job_id);
     if (!job.has_value()) {
@@ -401,9 +393,9 @@ void RegisterRead(httplib::Server& svr, JobStore* jobs) {
     },
   },
   hints: [
-    'Serve only the caller’s team: answer **404** when the job belongs to someone else, so a foreign id cannot even be confirmed to exist.',
-    'The eval gate belongs in the answer: report its result and compute `promotable` from exit code zero **and** a passing eval — a run that finished but failed its golden set is trained, not promotable.',
-    'Reconcile the budget in the response: `reserved`, `spent` and `remaining`, so the numbers agree with what the Redis layer released.',
+    "A run whose eval failed shows up on the dashboard as `completed` and gets promoted, and a job id pasted from another team's Slack channel returns that team's run in full.",
+    '`read_job` never compares `job["team"]` with `x_team_id`, derives `status` from `exit_code` alone, and returns `budget_spent` with no reservation or remainder to check it against.',
+    'Answer 404 when `job["team"] != x_team_id`; add `eval: {passed}` and set `promotable` only when `exit_code == 0` and `passed`; return `budget` with `reserved`, `spent` and `remaining`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read path against trust and honesty. The starter reads fine because the dashboard only ever asks for its own jobs and only ever shows finished ones. Four separate defects are being checked: the team scoping (404, not 403, for a foreign job), the eval gate that must be reported rather than hidden, the \`promotable\` computation that must combine the exit code with the eval result, and the budget reconciliation against the reservation. The quiet one is exit-zero-as-success: a trainer can exit zero on a run whose eval failed, and a registry that promotes on exit code alone ships a model nobody validated. Real systems also expose the checkpoint lineage so a run can be reproduced and its restarts explained.`,
+  debrief: `The fix has this shape because the read path is where every other decision in the platform becomes visible, and a promotion pipeline will believe whatever it says. Scoping by team with a 404 keeps a job id from being an oracle for other tenants; carrying the eval result and deriving \`promotable\` from exit code and eval together makes "finished" and "safe to ship" two different words; reporting reserved, spent and remaining lets a reader check the budget against what Redis released instead of trusting a single number. Production read paths also expose the checkpoint lineage with the resume ids each restart used, and version the eval result so a re-run of the golden set after a promotion cannot silently flip a past verdict.`,
 };

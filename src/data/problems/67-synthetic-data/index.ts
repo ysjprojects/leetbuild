@@ -16,7 +16,7 @@ import {readStep} from './steps/5-read';
 export const syntheticDataProblem: Problem = {
   id: 'synthetic-data',
   title: 'Synthetic Data',
-  tagline: 'Generate training data from seeds with diversity, dedupe and honest provenance.',
+  tagline: 'Expand licensed seeds into a scored, per-entity corpus with a digest behind every record.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -26,24 +26,24 @@ export const syntheticDataProblem: Problem = {
 A synthetic data service is the piece of an AI platform that turns a small set of licensed seed
 records into a corpus big enough to train on. The visible part is a row count in a dashboard; the
 parts that decide whether the corpus is worth anything are the seed funnel, the diversity windows,
-the judge that scores each record, the events that carry provenance, and the report a reviewer reads
-before the set ships.
+the judge that scores each record, the events that carry provenance, and the report a data reviewer
+reads before the set ships.
 
 ## The real system
 
-Production generators refuse to expand a seed they cannot account for: the seed dataset must be
-registered, its version pinned, and its license must permit derivative work — otherwise the
-derivatives are unlicensed the moment they exist. A generation cap belongs to the service, not to
-the client that happens to be holding the connection open. Diversity is measured per seed entity
-inside the cap: a recipe that regenerates one prolific entity a thousand times is a collapsed
-dataset, not a large one, so repeats are throttled per window and the coverage that survives is
-reported per entity rather than as a total. Every generated record passes a judge before admission,
-under a deadline, and a judge that times out parks the record as unscored instead of quietly
-admitting it, because an unscored record is a label with no evidence behind it. Admitted records are
-published keyed by recipe so one recipe's admissions stay ordered, carrying seed digests and judge
-scores rather than the generated content, and the record is persisted before its admission is
-announced. Finally the report is traceable: every admitted record resolves back to the digest of the
-seed it came from, coverage is broken down per entity, and a reviewer sees foreign jobs as missing.
+NVIDIA's NeMo Curator ships the generation pipelines used to build Nemotron-4 340B, a model whose
+supervised fine-tuning data was 98% synthetic. Every generated conversation is sent to a reward
+model that returns separate helpfulness, correctness, coherence, complexity and verbosity scores,
+and the pipeline filters on those scores before the row reaches training; a list the model fails
+to return in the requested shape raises a conversion error instead of being accepted short. The
+service in this course applies the same discipline earlier in the funnel: a seed is expanded only
+if its registered license permits derivatives, the record cap belongs to the service rather than
+to the client holding the connection, repeats of one seed entity are throttled per window so a
+prolific entity cannot fill the quota, and a judge call that times out parks the record as
+unscored. Admitted records are published keyed by recipe so one recipe's history stays ordered,
+carrying seed digests and judge scores rather than text, and the record is persisted before the
+event announces it. The report resolves every admitted record to the digest of its seed, breaks
+coverage down per entity, and answers a foreign job id with 404.
 
 ## What you build here
 
@@ -69,8 +69,8 @@ One service, **synthd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real data pipeline: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
+fail on the starter and pass on your version.
 
 ## Left out on purpose
 

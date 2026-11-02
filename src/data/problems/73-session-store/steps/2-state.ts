@@ -8,27 +8,27 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it writes a session record to Redis and
-removes the old one when a session is rotated. It compiles, it serves the demo, and it hides three
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`rotate_session\` writes a session record to Redis under
+\`session:{id}\` with a one-hour TTL set at write time, then deletes the old key in a second command.
+The record holds the raw token and no creation time. It compiles and hides 5 flaws.
 
-Implement the session record for \`sessiond\` in Redis under the key \`session:{id}\`.
+**Failure mode the checks target.** Two separate commands are not a rotation: \`SET new\` then \`DEL old\` is a
+window in which both ids authenticate, and a crash inside it leaves a session nobody can revoke. A TTL set
+once at login is not a sliding timeout, and with no \`created_at\` there is no hard cap, so a stolen token lives
+until someone remembers to delete it. Storing the raw token turns a Redis dump into a credential leak.
+
+Requirements:
 
 - **Sliding idle timeout.** Every successful use refreshes the key's TTL to \`SLIDING_TTL_S\` (15 minutes),
   so an active session is not logged out.
 - **Hard absolute cap.** The record carries \`created_at\`; a session older than \`ABSOLUTE_TTL_S\`
-  (30 days) is dead no matter how often it is used. The sliding refresh must never extend past the cap.
+  (30 days) is dead no matter how often it is used. The sliding refresh must not extend past the cap.
 - **Atomic rotation.** Rotating to a new id writes the replacement and retires the old id in **one atomic
-  step** (one Lua \`EVAL\` or one \`MULTI\`/\`EXEC\`), so a crash between the two writes can never leave two live
+  step** (one Lua \`EVAL\` or one \`MULTI\`/\`EXEC\`), so a crash between the two writes cannot leave two live
   ids for one user.
 - **No raw token in Redis.** The record stores \`token_hash\` (a SHA-256 of the token), never the token
   itself; the token stays only in the client's cookie.
-- The record is JSON with \`user_id\`, \`device_class\`, \`token_hash\`, \`created_at\` and \`rotation\`.
-
-**Failure mode the checks target.** Two separate commands are not a rotation: \`SET new\` then \`DEL old\` is a
-window in which both ids authenticate, and a crash inside it leaves a session nobody can revoke. A TTL set
-once at login is not a sliding timeout, and with no \`created_at\` there is no hard cap — a stolen token lives
-until someone remembers to delete it. Storing the raw token turns a Redis dump into a credential leak.`,
+- The record is JSON with \`user_id\`, \`device_class\`, \`token_hash\`, \`created_at\` and \`rotation\`.`,
   sequence: {
     participants: ['Client', 'Session API', 'Session Store'],
     messages: [
@@ -41,9 +41,9 @@ until someone remembers to delete it. Storing the raw token turns a Redis dump i
     ],
   },
   hints: [
-    'A session that never expires is a session an attacker can use forever. Which time bound may use extend, and which one must use never move?',
-    'Two commands are not one rotation. Reach for the Redis primitive that runs the write and the delete as a single step, so a crash cannot land between them.',
-    'The record has to be enough to enforce the cap without a second key: keep the creation time in the value and compare against it on every touch.',
+    'A user who logged in a month ago and clicks once an hour is still signed in; after a crash mid-rotation, two of their ids both authenticate; a Redis dump exposes live tokens.',
+    'The starter sets one TTL at write time and nothing refreshes it, keeps no `created_at` to cap against, runs `SET` and `DEL` as two round trips, and stores `token` verbatim.',
+    'Add `SLIDING_TTL_S` and `ABSOLUTE_TTL_S`, store `created_at` and a `sha256` `token_hash`, run `SET new_key` plus `DEL old_key` in one Lua `EVAL`, and `expire` on each touch after the age check.',
   ],
   checks: [
     {
@@ -125,8 +125,7 @@ TTL_S = 60 * 60
 
 
 async def rotate_session(old_id: str | None, user_id: str, device_class: str, token: str) -> str:
-    # TODO: the replacement is written and the old id removed in separate commands, so a crash
-    # leaves two live sessions; there is no hard cap and the token is stored raw.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     new_id = f"{user_id}-{int(time.time())}"
     record = json.dumps(
         {
@@ -200,8 +199,7 @@ import Redis from 'ioredis';
 const redis = new Redis();
 const TTL_S = 60 * 60;
 
-// TODO: the replacement is written and the old id removed in separate commands, so a crash leaves
-// two live sessions; there is no hard cap and the token is stored raw.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 export async function rotateSession(
   oldId: string | null,
   userId: string,
@@ -306,8 +304,7 @@ type SessionRecord struct {
 }
 
 func RotateSession(ctx context.Context, rdb *redis.Client, oldID, userID, deviceClass, token string) (string, error) {
-	// TODO: the replacement is written and the old id removed in separate commands, so a crash
-	// leaves two live sessions; there is no hard cap and the token is stored raw.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	newID := userID + "-" + time.Now().Format("20060102150405")
 	rec := SessionRecord{UserID: userID, DeviceClass: deviceClass, Token: token}
 	payload, err := json.Marshal(rec)
@@ -419,8 +416,7 @@ object SessionState {
 
   case class SessionRecord(userId: String, deviceClass: String, token: String, rotation: Int)
 
-  // TODO: the replacement is written and the old id removed in separate commands, so a crash leaves
-  // two live sessions; there is no hard cap and the token is stored raw.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def rotateSession(redis: Jedis, oldId: Option[String], userId: String, deviceClass: String, token: String): String = {
     val newId = s"$userId-\${Instant.now().getEpochSecond}"
     val record = SessionRecord(userId, deviceClass, token, 0)
@@ -503,8 +499,7 @@ namespace session {
 
 constexpr long kTtlS = 60 * 60;
 
-// TODO: the replacement is written and the old id removed in separate commands, so a crash leaves
-// two live sessions; there is no hard cap and the token is stored raw.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::string rotate_session(RedisClient& redis, const std::string& old_id, const std::string& user_id,
                            const std::string& device_class, const std::string& token) {
   const std::string new_id = user_id + "-" + std::to_string(std::time(nullptr));
@@ -583,5 +578,5 @@ bool touch_session(RedisClient& redis, const std::string& session_id, json& out)
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a state layer for the failure modes that only appear under concurrency or time. Three defects are being checked: a rotation spread across two commands is not atomic, so a crash between them leaves two live ids; a TTL set once at login is not a sliding idle timeout and, without a creation time, there is no hard cap on how long a stolen token lives; and a raw token in Redis turns a cache dump into a credential leak. The habits to name out loud are: keep the record self-describing enough to enforce the cap without a second read, push the write-and-retire into one atomic step, and hash anything secret before it touches storage. Real session stores add a rotation counter in the value, a short-lived tombstone for the retired id so an in-flight request is not broken, and per-key monitoring so an unusually long-lived session pages on-call.`,
+  debrief: `The fix has this shape because every failure in this step lives in a gap: the gap between two Redis commands, the gap between a TTL set once and the use that should refresh it, and the gap between a record and the credential it stores. A Lua script closes the first by making write-and-retire one server-side step. A \`created_at\` in the value closes the second, because the key's TTL can only express one bound and the cap has to come from the record itself. A SHA-256 closes the third, since a hash is enough to match a cookie and useless to replay. Production session stores also sweep expired records in the background so they do not linger until touched, and keep the retired id as a short tombstone so a request already in flight on it fails with a clear reason.`,
 };

@@ -17,7 +17,8 @@ import {readStatsStep} from './steps/5-read';
 export const rerankerServiceProblem: Problem = {
   id: 'reranker-service',
   title: 'Reranking Service',
-  tagline: 'Reorder candidate passages for relevance with a bounded budget and honest scores.',
+  tagline:
+    'Reorder retrieved passages under a candidate cap, a pair-keyed score cache and an unscored marker for failed batches.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -25,29 +26,29 @@ export const rerankerServiceProblem: Problem = {
   statement: `# Reranking Service
 
 A reranking service is the piece of an AI platform that takes the passages a retriever already
-returned and puts them in the order a reader — or a generator — should see them. The visible part is
-a list of scores; the parts that decide whether the product is honest are the caps on what one
-request may ask for, what a score means when the model never saw the whole passage, what happens
-when a batch of the model call fails, what the event stream carries, and whether the numbers on the
+returned and puts them in the order a reader or a generator should see them. The visible part is a
+list of scores; the parts that decide whether the product can be trusted are the caps on what one
+request may ask for, what a score means when the model saw only part of a passage, what happens when
+a batch of the model call fails, what the event stream carries, and whether the numbers on the
 dashboard can separate a real regression from silent degradation.
 
 ## The real system
 
-Production rerankers receive a query and a bounded set of candidates from a retrieval layer, and
-they enforce that bound before the model call: a query over its cap or a candidate count over its
-cap is rejected, and a passage over its per-passage cap is clipped *visibly*, never silently. A
-score that describes a clipped passage is not the score of the full passage, so truncation is
-reported per passage and the caller can decide whether to re-fetch or accept a degraded comparison.
-Scores are cached per (query fingerprint, passage hash, model version), because a score is only
-meaningful for a query-passage pair under a specific model; caching by passage alone serves one
-query's scores to every other query and never notices a model version bump. The model runs over
-gRPC in bounded batches under a deadline, and when a batch fails the service falls back to the
-original retrieval order for exactly those passages and marks them **unscored** — a neutral score
-would make an infrastructure failure indistinguishable from genuine mid-tier relevance. Outcomes are
-published keyed by query fingerprint so a query's events stay ordered, carrying candidate counts,
-latency and a score histogram and never the query or passage text. And the read side reports hit
-ratio, unscored share and latency percentiles *per model version*, with latency measured at the
-queue and model boundaries rather than from a client's clock.
+Hosted rerankers put the request budget in the API contract. Cohere's Rerank endpoint truncates
+every document to \`max_tokens_per_doc\` (4096 tokens by default) and documents that more than about
+1,000 documents per request should be split across calls; the caller learns the budget up front
+rather than discovering it as a timeout. A score that describes a clipped passage is not the score
+of the full passage, so this course reports truncation per passage and lets the caller decide whether
+to re-fetch or accept a degraded comparison. Scores are cached per (query fingerprint, passage hash,
+model version), because a score is only meaningful for a query-passage pair under a specific model;
+caching by passage alone serves one query's scores to every other query and misses a model version
+bump. The model runs over gRPC in bounded batches under a deadline, and when a batch fails the
+service falls back to the original retrieval order for exactly those passages and marks them
+**unscored**; a neutral score would make an infrastructure failure indistinguishable from mid-tier
+relevance. Outcomes are published keyed by query fingerprint so a query's events stay ordered,
+carrying candidate counts, latency and a score histogram but not the query or passage text. The read
+side reports hit ratio, unscored share and latency percentiles *per model version*, with latency
+measured at the queue and model boundaries rather than from a client's clock.
 
 ## What you build here
 
@@ -63,7 +64,7 @@ One service, **rerankd**, with five pieces:
    batch returning unscored markers that keep the original retrieval order, a malformed batch
    treated as terminal, and the remaining batches still completing.
 4. A **Kafka** \`rerank.done\` path keyed by query fingerprint, carrying candidate counts, latency
-   and a score histogram — never the query or passage text — with an idempotent producer and an
+   and a score histogram, without the query or passage text, with an idempotent producer and an
    outbox row when the produce fails.
 5. \`GET /v1/rerank/cache/stats\`: hit ratio, unscored batch share and latency percentiles per model
    version, plus the share of requests that used fallback order.
@@ -80,7 +81,7 @@ checks that fail on the starter and pass on your version.
 Model training and fine-tuning, embedding generation and vector index choice, cross-encoder
 architecture details, passage chunking strategies, per-tenant relevance tuning, online A/B
 infrastructure, and the retrieval layer itself. The five pieces above are the ones that decide
-whether a reranked list is correct, honest and shippable.`,
+whether a reranked list is correct and shippable.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'rerank · stats', x: 8, y: 50},

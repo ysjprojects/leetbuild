@@ -16,7 +16,8 @@ import {stateStep} from './steps/state';
 export const autocompleteServiceProblem: Problem = {
   id: 'autocomplete-service',
   title: 'Autocomplete',
-  tagline: 'Typeahead suggestions that are capped, tenant-safe and honest about trends.',
+  tagline:
+    'Typeahead suggestions behind a bounded prefix and a tenant-scoped cache, with a floor before anything trends.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,16 +32,18 @@ boundary, the cache, the failure fallback, the event pipeline and the trending r
 
 ## The real system
 
-Production autocomplete receives prefixes from many tenants on every keystroke. It normalizes the
-prefix before it does anything else, because \`Café\` and \`cafe\` are the same search, and it bounds
-the prefix so a long string cannot be used to walk the whole index. It caches top suggestions per
-\`(tenant, prefix)\` with a TTL and a per-tenant cap, so a flood of prefixes costs the flooder and not
-everyone. It calls the suggester under a short deadline and serves a curated fallback list, marked as
-fallback, when the suggester is slow — a typeahead that waits is worse than one that degrades. It
-publishes impression and selection events keyed by tenant, carrying a prefix hash rather than the raw
-text, and it never drops an event when the broker hiccups. And it computes trends as aggregates with
-an occurrence floor and a sensitive-category filter, so one search never becomes a trend and no trend
-entry points back at the person who searched.
+Algolia's Query Suggestions product builds its suggestion index from popular searches, and the
+configuration is mostly thresholds: a query must have produced at least \`minHits\` results (default
+5) and be at least \`minLetters\` long (default 4) to enter the index, and an \`exclude\` list keeps
+named terms out whatever their popularity. That is the same shape as this course's trending read: a
+floor, a bound and a filter, applied before anything reaches the dropdown. The rest of a production
+autocomplete follows the same pattern. The prefix is normalized before anything else, because
+\`Café\` and \`cafe\` are the same search, and bounded so a long string cannot walk the whole index.
+Top suggestions are cached per \`(tenant, prefix)\` with a TTL and a per-tenant cap, so a flood of
+prefixes costs the flooder and not everyone. The suggester is called under a short deadline, and a
+curated fallback list, marked as fallback, is served when it is slow. Impression and selection
+events are keyed by tenant and carry a prefix hash rather than the raw text, and a broker hiccup
+lands the event in an outbox rather than on the floor.
 
 ## What you build here
 
@@ -60,11 +63,11 @@ One service, **suggestd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with a flaw. It compiles, it serves the happy path — one
-tenant, English prefixes, a healthy suggester — and it looks right. Your job in every step is the
-job you will have on a real search feature: debug it against the failure modes, name the subtle
-one, fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and
-pass on your version.
+Every starter in this course is working code with flaws. It compiles, it serves the happy path (one
+tenant, English prefixes, a healthy suggester) and it looks right. Your job in every step is the job
+you will have on a real search feature: debug it against the failure modes, find the subtle one,
+fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass
+on your version.
 
 ## Left out on purpose
 

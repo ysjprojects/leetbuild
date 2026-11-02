@@ -8,16 +8,14 @@ export const dependencyStep: Step = {
   focus: ['api', 'suggester', 'fallback'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the suggester over gRPC and returns its
-terms. It compiles, it works when the suggester is healthy, and it hides three production flaws.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement the suggester call behind \`GET /v1/autocomplete\`.
+**Starting point.** The starter calls the suggester over gRPC with a two-second timeout, retries
+three times inside the request, and returns the suggester's terms or an empty list. It compiles,
+it works when the suggester is healthy, and it hides 5 flaws.
 
 - The suggester is called with a **150 ms deadline** (\`DEADLINE_MS = 150\`). A typeahead that waits
   longer than that is worse than no suggestion.
 - When the call fails or the deadline fires, the response serves the **static curated fallback
-  list** — never an empty list. The UI must keep suggesting while the suggester is slow.
+  list**, not an empty list. The UI must keep suggesting while the suggester is slow.
 - The fallback response is **marked as fallback** (\`"source": "fallback"\`, against \`"suggester"\`
   on the normal path) so the client and the metrics can tell a degraded answer from a real one.
 - **Retries are dropped, not run inline.** A retry inside the user's request adds latency on top of
@@ -26,11 +24,12 @@ Implement the suggester call behind \`GET /v1/autocomplete\`.
 - The fallback list is **versioned** (\`FALLBACK_LIST_VERSION\`) so a bad list can be rolled back by
   changing one value rather than shipping new code.
 
-**Failure mode the checks target.** Returning nothing on timeout is the quiet one: the suggester is
-slow for ten seconds during a deploy and the search box looks broken, so users type the term in full
-and the product loses its reason to exist. Retrying inline compounds the outage — the suggester is
-already slow, and now every request multiplies the load. The unversioned fallback list is the third:
-when the curated list itself is wrong there is no value to roll back.`,
+**Failure mode the checks target.** Returning nothing on timeout is the visible part: the suggester
+is slow for ten seconds during a deploy and the search box looks broken, so users type the term in
+full and the product loses its reason to exist. Retrying inline compounds the outage, because the
+suggester is already slow and now every request multiplies the load. The unversioned, unmarked
+fallback is the subtle part: when the curated list itself is wrong there is no value to roll back,
+and nobody can tell a degraded answer from a real one.`,
   sequence: {
     participants: ['Autocomplete API', 'Suggester', 'Fallback list'],
     messages: [
@@ -115,8 +114,7 @@ when the curated list itself is wrong there is no value to roll back.`,
 
 
 def suggest(stub, tenant: str, prefix: str):
-    # TODO: this starter returns nothing when the suggester times out, retries three times inside
-    # the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     request = SuggestRequest(tenant=tenant, prefix=prefix)
     for attempt in range(3):
         try:
@@ -152,8 +150,7 @@ def suggest(stub, tenant: str, prefix: str):
       starter: `import * as grpc from '@grpc/grpc-js';
 
 export function suggest(client: SuggesterClient, tenant: string, prefix: string): Promise<string[]> {
-  // TODO: this starter returns nothing when the suggester times out, retries three times inside
-  // the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const request = {tenant, prefix};
   return new Promise(resolve => {
     let attempt = 0;
@@ -214,8 +211,7 @@ import (
 )
 
 func Suggest(ctx context.Context, client SuggesterClient, tenant, prefix string) (Result, error) {
-	// TODO: this starter returns nothing when the suggester times out, retries three times inside
-	// the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 3; attempt++ {
 		response, err := client.Suggest(ctx, &SuggestRequest{Tenant: tenant, Prefix: prefix})
 		if err == nil {
@@ -263,8 +259,7 @@ func Suggest(ctx context.Context, client SuggesterClient, tenant, prefix string)
 
 object Client {
   def suggest(stub: SuggesterGrpc.SuggesterStub, tenant: String, prefix: String)(implicit ec: ExecutionContext): Future[Result] = {
-    // TODO: this starter returns nothing when the suggester times out, retries three times inside
-    // the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val request = SuggestRequest(tenant = tenant, prefix = prefix)
     def run(remaining: Int): Future[Result] = {
       if (remaining == 0) Future.successful(Result(suggestions = List.empty))
@@ -308,8 +303,7 @@ object Client {
 #include <grpcpp/grpcpp.h>
 
 Result Suggest(Suggester::Stub& stub, const std::string& tenant, const std::string& prefix) {
-  // TODO: this starter returns nothing when the suggester times out, retries three times inside
-  // the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   SuggestRequest request;
   request.set_tenant(tenant);
   request.set_prefix(prefix);
@@ -359,9 +353,9 @@ Result Suggest(Suggester::Stub& stub, const std::string& tenant, const std::stri
     },
   },
   hints: [
-    "A typeahead has no time budget for a retry. Set the deadline to 150 ms on the call, attempt it once, and let the fallback answer — the retry belongs in the analytics pipeline, not in the user's request.",
-    'The fallback is not "empty with a flag"; it is a real, curated list of terms, marked so the client and the dashboard can tell a degraded answer from a real one. Return the list and the marker together.',
-    'Version the fallback list and return the version in the response. When the curated list itself is wrong, a rollback is then one value change instead of a deploy.',
+    'During a suggester deploy the dropdown goes blank for six seconds per keystroke, and the suggester dashboard shows three times the normal request rate.',
+    'The loop calls with a two-second timeout and retries up to three times inside the request; on the last failure it returns an empty list with nothing to say it was degraded.',
+    'Call once with DEADLINE_MS = 150, count a failure in RETRIES_DROPPED, and return FALLBACK_SUGGESTIONS with "source": "fallback" and FALLBACK_LIST_VERSION; the healthy path says "source": "suggester".',
   ],
-  debrief: `The interviewer is testing whether you can debug a dependency client at the availability boundary. The starter reads fine because the suggester is healthy in the demo. Three defects are being checked. Returning nothing on timeout turns a slow suggester into a broken search box, so users type the whole term and the product loses its reason to exist. Retrying inline is worse than useless during an outage: the suggester is already slow, and every request multiplies the load on it. The unversioned fallback list is the subtle one — the list itself becomes a thing that can regress, and without a version there is nothing to roll back. Real clients also add a breaker so a down suggester is not called at all, a cached copy of the fallback list in memory so a config-service outage cannot empty it, and a metric on the fallback rate so degradation is visible.`,
+  debrief: `The shape of the fix is one attempt, a short deadline, and a real answer on failure. A 150 ms deadline fits inside a keystroke, so a slow suggester costs the user nothing visible. Dropping the retry instead of running it inline keeps a slow suggester from becoming a down one: during an outage every inline retry is extra load on the thing already struggling, and the dropped counter keeps that decision visible. The fallback is a curated list, not an empty array, because a typeahead that degrades is still a typeahead; the marker lets the client tell the two apart, and the version makes a bad list a one-value rollback. Production clients add a breaker so a down suggester is not called at all, an in-memory copy of the fallback list, and an alert on the fallback rate.`,
 };

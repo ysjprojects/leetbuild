@@ -8,47 +8,30 @@ export const endpointStep: Step = {
   focus: ['requester', 'agent', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers \`POST /v1/tickets\`,
-reads the requester header, and stores whatever the caller sends. It compiles, it serves the demo, and
-it hides five production flaws. Debug it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter registers \`POST /v1/tickets\` for intake and updates: it reads
+\`X-Requester-Id\`, creates a ticket from a body without an \`id\`, and for a body with an \`id\`
+loads the ticket and writes the caller's \`state\` string onto it. It compiles, serves the demo, and
+hides 4 flaws.
 
-Implement \`POST /v1/tickets\` — one route for intake and for updates.
+**Failure mode the checks target.** Copying \`state\` from the body makes the state machine a string
+field, so a customer closes their own ticket in one call. No ownership check makes the route "edit
+any ticket by id". A reopen with no window lets a year-old ticket walk back into the queue. Logging
+the subject and body ships customer content into every log sink.
 
-- The requester comes from the \`X-Requester-Id\` header; a missing id is **401**.
-- The actor role comes from the \`X-Actor-Role\` header (\`requester\` | \`agent\`); an absent or
-  unknown role is **403**.
-- A request **without** an \`id\` creates a ticket: the subject is required (**400** when empty), the
-  ticket records the caller as its \`requester_id\`, and its state is **\`open\`** — the caller never
-  picks the initial state.
-- A request **with** an \`id\` updates that ticket (unknown id → **404**). The requested \`state\` must
-  be one of \`open\`, \`pending\`, \`resolved\`, \`closed\` (**400** otherwise) and must be in the ticket's
-  allowed set. Keep that set as a table named \`ALLOWED_TRANSITIONS\` (or the local spelling —
-  \`allowedTransitions\` / \`AllowedTransitions\` / \`kAllowedTransitions\`) instead of an \`if\` per state:
+Requirements:
 
-  - \`open\` → \`pending\`, \`resolved\`
-  - \`pending\` → \`resolved\`, \`open\`
-  - \`resolved\` → \`closed\`, \`open\`
-  - \`closed\` → \`open\` (reopen only; see the window below)
-
-  An illegal transition is **409** and the body carries the states the ticket may move to right now,
-  e.g. \`{"error": "illegal transition", "from": "open", "allowed": ["pending", "resolved"]}\`. Never copy
-  the caller's string onto the ticket: \`state\` is a state of the machine, not a free-form string.
-- Actor scope: an \`agent\` may update any ticket; a \`requester\` may update only a ticket whose
-  \`requester_id\` is their own — anyone else's ticket is **403**.
-- Reopening — \`closed\` → \`open\` — is allowed only while the ticket was closed recently. Keep the
-  window in a named constant in seconds (\`7 * 24 * 3600\`; \`REOPEN_WINDOW_SECONDS\`, or the local
-  spelling such as \`reopenWindowSeconds\` / \`ReopenWindowSeconds\` / \`kReopenWindowSeconds\`), record
-  when the ticket entered \`closed\`, and refuse a stale reopen with **409** and an empty \`allowed\` set.
-  Clear that timestamp when the ticket leaves \`closed\`.
-- Log **ids and states only** — never the subject and never the body text.
-
-**Failure mode the checks target.** Copying \`state\` from the request body turns the state machine
-into a string field, so a customer closes their own ticket in one call and support loses the signal
-that the ticket was ever worked. A missing ownership check turns \`POST /v1/tickets\` into "edit any
-ticket by id" for every authenticated caller. A reopen with no window lets a year-old closed ticket
-walk back into the queue with no trace of why. And the subject and body of a support ticket are
-customer content: logging them ships a customer's message into every log sink on every write.`,
+- Missing \`X-Requester-Id\` is **401**; \`X-Actor-Role\` not \`requester\` | \`agent\` is **403**.
+- Create: subject required (**400**), \`requester_id\` is the caller, state is always \`open\`.
+- Update (unknown id **404**): \`state\` must be a known state (**400**) and in the table
+  \`ALLOWED_TRANSITIONS\` (\`allowedTransitions\` / \`AllowedTransitions\` / \`kAllowedTransitions\`):
+  \`open\` → \`pending\`, \`resolved\`; \`pending\` → \`resolved\`, \`open\`; \`resolved\` → \`closed\`,
+  \`open\`; \`closed\` → \`open\`. An illegal move is **409** with \`{"error": "illegal transition",
+  "from": …, "allowed": […]}\`.
+- An \`agent\` updates any ticket; a \`requester\` only their own \`requester_id\` (**403**).
+- Reopen only while \`closed_at\` is within \`REOPEN_WINDOW_SECONDS\` (\`7 * 24 * 3600\`; or
+  \`reopenWindowSeconds\`); a stale reopen is **409** with an empty \`allowed\`. Clear \`closed_at\`
+  when the ticket leaves \`closed\`.
+- Log ids and states only, not the subject or body text.`,
   sequence: {
     participants: ['Requester', 'Agent', 'Ticket API', 'Ticket store'],
     messages: [
@@ -172,9 +155,7 @@ def tickets(
     body: TicketBody,
     requester_id: str = Header(alias="X-Requester-Id"),
 ) -> JSONResponse:
-    # TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
-    # table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-    # the body text. Fix all five before this serves a real tenant.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if body.id is None:
         ticket = {
             "id": str(uuid.uuid4()),
@@ -331,9 +312,7 @@ interface Ticket {
 }
 
 app.post('/v1/tickets', async (request, reply) => {
-  // TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
-  // table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-  // the body text. Fix all five before this serves a real tenant.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const requesterId = request.headers['x-requester-id'] as string;
   const body = request.body as TicketBody;
 
@@ -500,9 +479,7 @@ func tickets(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
-	// table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-	// the body text. Fix all five before this serves a real tenant.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	if in.ID == "" {
 		state := in.State
 		if state == "" {
@@ -703,9 +680,7 @@ object TicketApi {
       post {
         headerValueByName("X-Requester-Id") { requesterId =>
           entity(as[TicketRequest]) { req =>
-            // TODO: this starter copies the caller's state string onto the ticket, has no
-            // allowed-transition table, lets any caller edit any ticket by id, has no reopen
-            // window, and logs the subject and the body text. Fix all five.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             req.id match {
               case None =>
                 val ticket =
@@ -870,9 +845,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
-    // table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-    // the body text. Fix all five before this serves a real tenant.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if (!body.contains("id")) {
       json ticket = {
           {"id", uuidString()},
@@ -1026,13 +999,11 @@ int main() {
     },
   },
   hints: [
-    'Guard order: requester header (401), role header (403), then the body. Every guard is cheap and returns before the store is touched, and a missing role never falls back to `agent`.',
-    'Make the machine data: `ALLOWED_TRANSITIONS[from]` is the set of legal `to` states, the handler compares the requested state against that set, answers **409** with `allowed` when it is missing, and stores the state the table approved — never the string the caller sent.',
-    'Ownership is a field on the ticket, not a header: `requester` means `ticket.requester_id == X-Requester-Id`. The reopen window reads the ticket’s own `closed_at` against the clock, so a stale `closed` ticket refuses `open` with an empty allowed set.',
+    'Outside the demo: a customer sends `"state": "closed"` and the ticket closes, a caller sends another requester’s ticket id and it updates, and the log sink fills with ticket subjects and bodies.',
+    'The starter copies `body.state` onto the ticket, never reads `X-Actor-Role` or compares `requester_id`, stores no `closed_at`, and logs `subject` and `body` on create: every rule the task lists is simply absent.',
+    'Add `ALLOWED_TRANSITIONS[from]` and answer **409** with `allowed` on a miss; require `ticket.requester_id == X-Requester-Id` for requesters (**403**); store `closed_at` and refuse a reopen older than `REOPEN_WINDOW_SECONDS`; log ids and states only.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler against a state machine instead of against a schema. The starter is believable because the demo only ever creates tickets and sets \`open\`; the flaws appear the moment a caller sends \`closed\`, sends someone else's ticket id, or returns to a ticket that was closed last year. Four debugging habits are being checked: transitions are data, not strings copied from the body (so the state machine lives in one table the handler consults, and the 409 answers with the legal moves); authorization is per record, not per session (the role header says what kind of actor you are, the ticket says whether it is yours); time-bound rules need both a clock and a stored timestamp, so reopening has an expiry the handler can evaluate; and support content is customer content, so logs carry ids and states only.
+  debrief: `The fix has the shape of a state machine, not a schema: the legal moves live in one table the handler consults, so the 409 can answer with the moves allowed from here, and the stored state is the one the table approved rather than the string the caller sent. Ownership is a comparison between the ticket's \`requester_id\` and the caller's header, because the role header only says what kind of actor you are. The reopen rule needs a clock and a stored \`closed_at\`, because "recently closed" is a fact about the ticket. And the log line carries ids and states, since a subject or body is customer content.
 
-What candidates miss is usually the last two. They guard the transition table but treat reopen as just another edge, so nothing ages out and a closed ticket can be resurrected forever. And they add a \`log.info\` with the subject while debugging the create path, which then ships the customer's message into every log sink on every write — the one line in the diff that a security review will catch and the demo never will.
-
-Real systems go one step further: the table and the window move into a single \`transition(ticket, to, actor, now)\` function shared by the HTTP handler, the queue consumer and the admin console, so no entry point can skip the rule, and the handler answers \`allowed\` from that same function instead of re-deriving it.`,
+Production systems move the table and the window into a single \`transition(ticket, to, actor, now)\` function shared by the HTTP handler, the queue consumer and the admin console, so no entry point can skip the rule.`,
 };

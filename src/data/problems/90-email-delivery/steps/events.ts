@@ -8,28 +8,25 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces one event per send
-and the demo consumer reads it, so the happy path looks fine. It hides three flaws that only show up
-once a recipient's events matter. Find them, fix them, and prove the fix.
+**Starting point.** The starter's \`publish(event_type, campaign_key, message_id, recipient)\`
+produces one record to \`email.event\` keyed by the campaign id, with the raw address in the value
+as \`recipient_email\`. \`handle_send\` publishes \`accepted\` and then calls \`relay.send\`. It
+compiles and hides five flaws.
 
-Implement the \`email.event\` producer used by the send and complaint paths:
+**Failure mode the checks target.** One recipient's events spread across partitions, so a consumer
+can see \`bounced\` before the \`accepted\` it follows; a message the relay rejects a moment later has
+already been reported as accepted; every consumer and third-party sink receives the plain address;
+and the topic holds a single event type, so it cannot serve as a lifecycle record.
 
-- Every event goes to the topic \`email.event\` **keyed by the recipient hash**
-  (\`sha256(recipient)\`), so all of one recipient's events land in one partition and their lifecycle
-  stays ordered. The starter keys by campaign, so a recipient's events are spread across partitions and
-  a \`bounced\` can overtake an \`accepted\`.
-- The \`accepted\` event is published **after the relay confirms** the send. The starter publishes
-  \`accepted\` as soon as the request is queued, so a message the relay later rejects is reported as
-  accepted.
-- The payload carries the **message id and the bounce category**, never a full address: the recipient
-  appears only as its hash (the record key). The starter puts the raw address in the payload, which then
-  reaches every consumer and every third-party sink.
-- The lifecycle is complete: **queued**, **accepted**, **bounced** and **complained** are all produced
-  for the topic to be a real audit trail. The starter only produces \`accepted\`.
+Requirements:
 
-**Failure mode the checks target.** Keying by campaign breaks per-recipient ordering; publishing
-\`accepted\` before the relay confirms reports a message as accepted that may never leave; and a raw
-address in the payload leaks the recipient to every downstream reader.`,
+- Add \`def recipient_hash(recipient)\` returning \`sha256(recipient)\` and produce with
+  \`key=recipient_key\`; no campaign key anywhere in the module.
+- \`handle_send\` calls \`relay.send\` first and \`publish("accepted", ...)\` only after it returns.
+- The value carries \`message_id\` and \`category\` plus the recipient only as
+  \`recipient_hash(...)\`; the \`recipient_email\` field goes away.
+- The module produces all four types: \`"queued"\`, \`"accepted"\`, \`"bounced"\` and
+  \`"complained"\`.`,
   sequence: {
     participants: ['Email API', 'Relay', 'Kafka', 'Event consumer'],
     messages: [
@@ -116,8 +113,7 @@ TOPIC = "email.event"
 
 
 def publish(event_type: str, campaign_key: str, message_id: str, recipient: str) -> None:
-    # TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
-    # raw recipient address in the payload that reaches third parties.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     producer.send(
         TOPIC,
         key=campaign_key,
@@ -176,8 +172,7 @@ export async function publish(
   messageId: string,
   recipient: string,
 ): Promise<void> {
-  // TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
-  // raw recipient address in the payload that reaches third parties.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: TOPIC,
     messages: [
@@ -252,8 +247,7 @@ type Producer interface {
 }
 
 func Publish(ctx context.Context, producer Producer, eventType, campaignKey, messageID, recipient string) error {
-	// TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
-	// raw recipient address in the payload that reaches third parties.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]string{
 		"event_type":      eventType,
 		"recipient_email": recipient,
@@ -332,8 +326,7 @@ object Events {
   val Topic = "email.event"
 
   def publish(eventType: String, campaignKey: String, messageId: String, recipient: String): Unit = {
-    // TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
-    // raw recipient address in the payload that reaches third parties.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val payload = Map(
       "event_type" -> eventType,
       "recipient_email" -> recipient,
@@ -403,8 +396,7 @@ const std::string kTopic = "email.event";
 
 void publish(Producer& producer, const std::string& event_type, const std::string& campaign_key,
              const std::string& message_id, const std::string& recipient) {
-  // TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
-  // raw recipient address in the payload that reaches third parties.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const json payload = json{{"event_type", event_type}, {"recipient_email", recipient}, {"message_id", message_id}};
   producer.send(kTopic, campaign_key, payload.dump());
 }
@@ -455,9 +447,9 @@ void handleComplaint(Producer& producer, const std::string& recipient, const std
     },
   },
   hints: [
-    'The record key decides ordering: `sha256(recipient)` puts every event for one recipient in one partition. A campaign key spreads them, so a `bounced` can land before the `accepted` it follows.',
-    'The `accepted` event belongs after the relay returns. Publishing it while the message is only queued reports a delivery the relay may never make.',
-    'The payload is read by every consumer: keep the recipient as its hash and carry `message_id` and `category`. A raw address in the value leaks the recipient to each downstream sink.',
+    'The lifecycle consumer shows a recipient as accepted after it recorded their bounce, and a data-protection audit found plain addresses in the analytics sink fed from `email.event`.',
+    'The record key is the campaign id, so two events for one recipient land on different partitions and are consumed in either order, and the value serialises `recipient_email` as given.',
+    'Key with `recipient_hash(recipient)` (`sha256`), pass it as `recipient_key`, and replace `recipient_email` with the hash plus `message_id` and `category`. The other checks cover publish order and the four event types.',
   ],
-  debrief: `The interviewer is testing whether you can debug an event producer for ordering and privacy. The starter reads fine because the demo consumer just counts events. Three defects are being checked: a campaign key that breaks per-recipient ordering, an \`accepted\` event published before the relay confirms, and a raw address in the payload. The fix keys by the recipient hash, publishes \`accepted\` only after acceptance, and keeps the value to ids and categories. Real pipelines add an idempotent producer with \`acks=all\`, a schema registry, and a consumer that commits its offset after processing.`,
+  debrief: `The fix rests on how Kafka orders records: only within a partition, and the partition is chosen by the key. Keying by the recipient hash puts one recipient's whole lifecycle on one partition, so a consumer sees queued, accepted and bounced in the order they happened; a campaign key gives the campaign that property instead, which nobody needs. Publishing \`accepted\` after \`relay.send\` returns makes the event mean what it says. Hashing the address in key and value keeps personal data off the topic, so retention and downstream access need not treat it as such. Production pipelines also turn on the idempotent producer with \`acks=all\` so a broker retry cannot duplicate an event, register the payload schema, and commit consumer offsets only after the lifecycle write succeeds.`,
 };

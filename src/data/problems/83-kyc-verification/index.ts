@@ -17,7 +17,7 @@ import {stateStep} from './steps/state';
 export const kycVerificationProblem: Problem = {
   id: 'kyc-verification',
   title: 'KYC Verification',
-  tagline: 'Identity verification with attempts bounded, vendors decided once and documents scoped.',
+  tagline: 'Identity verification where the service owns the verdict and document links expire.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -32,16 +32,18 @@ hands out document access.
 
 ## The real system
 
-Production verification services receive submissions from many tenants, bind every document
-reference to the tenant that owns it, and bound how many times one applicant may try before a human
-takes over. They keep one active case per applicant so two submissions cannot race into two
-parallel reviews. They call the vendor under a deadline, and — because identity is a legal decision
-— they treat a timeout or a vendor error as "a human must look", never as "approved". They publish a
-decision event keyed by the applicant so that applicant's history stays ordered, and they carry
-document *digests* rather than document images, names or numbers into a topic that is retained and
-replicated. And when the app asks for the status, they return the decision and the reason codes the
-customer is allowed to see, plus a document link that expires, instead of a permanent URL that
-survives every screenshot and share.
+Stripe Identity models each check as a \`VerificationSession\` whose status moves asynchronously:
+the integrator receives an \`identity.verification_session.verified\` or
+\`identity.verification_session.requires_input\` webhook when processing completes, and on a
+failure reads \`last_error.code\` (values like \`document_expired\`,
+\`document_type_not_supported\`, \`selfie_face_mismatch\`) to react programmatically, with a
+separate \`last_error.reason\` text meant for the user. That split between a machine code and a
+customer-facing message, and a status that the caller reads rather than sets, is the shape this
+course builds. Production verification services also bind every document reference to the tenant
+that owns it, bound how many times one applicant may try before a human takes over, keep one active
+case per applicant, call the vendor under a deadline and treat a timeout as "a human must look",
+publish a decision event keyed by the applicant carrying document digests rather than images, and
+hand out document links that expire.
 
 ## What you build here
 
@@ -49,7 +51,7 @@ One service, **kycd**, with five pieces:
 
 1. \`POST /v1/verifications\`: an authenticated tenant, an applicant reference, document references
    from tenant storage and a document type from an allowlist. The caller submits; the service
-   decides — a \`status\` field in the body is ignored and the case opens \`pending\`. Attempts per
+   decides: a \`status\` field in the body is ignored and the case opens \`pending\`. Attempts per
    applicant are bounded, and a non-tenant document reference is refused **before** anything is
    fetched.
 2. A **Redis** state layer: the attempt bucket and the single active case per applicant, both moved
@@ -59,20 +61,20 @@ One service, **kycd**, with five pieces:
    the case to **manual review** marked \`degraded\`; a rejection is terminal and carries the vendor's
    reason. No path from a vendor failure to \`approved\` without a human.
 4. A **Kafka** decision path: one \`kyc.decided\` event per decision, keyed by the applicant reference
-   so their history stays ordered, carrying the decision, the reasons and document digests — never
-   document images, names or numbers — published only **after** the decision record commits.
+   so their history stays ordered, carrying the decision, the reasons and document digests (no
+   document images, names or numbers), published only **after** the decision record commits.
 5. \`GET /v1/applicants/{id}/status\`: the decision, the reason codes and whether the case is
    \`degraded\` or awaiting a human. A foreign applicant is **404**, refusal reasons are the
    customer-facing set, and document images are reachable only through a short-lived signed link.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real KYC feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version. The subtle ones here are the failures
-that keep conversion up — approving on a timeout, letting a caller set the verdict, handing out a
-URL that never expires — because each of them looks like a feature until the regulator asks.
+Every starter in this course compiles, serves the happy path, and looks right. Your job in every
+step is the job you will have on a real KYC feature: debug it against the failure modes, name the
+subtle one, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
+starter and pass on your version. The subtle flaws here are the ones that keep conversion up,
+approving on a timeout, letting a caller set the verdict, handing out a URL that does not expire,
+because each of them looks like a feature until the regulator asks.
 
 ## Left out on purpose
 

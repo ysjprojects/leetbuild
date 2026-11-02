@@ -8,10 +8,10 @@ export const dependencyStep: Step = {
   focus: ['api', 'warehouse'],
   task: `## Task
 
-**Starting point.** The starter is working code: it writes a partition, retries
-when the warehouse is slow, and returns a row count. It appends a fresh statement on every retry, so
-the demo load is fast and the retried load is wrong. Debug it like the service owner, fix it, and
-prove the fix.
+**Starting point.** The starter's \`write_partition\` builds an \`INSERT … SELECT\` for the target,
+sends it through the gRPC \`Warehouse\` stub, adds the reply's row count to a running total, and on
+any exception loops back and sends again. It serves the demo, where the first attempt succeeds, and
+hides 5 flaws.
 
 Implement the warehouse client that writes one partition of a manifest over gRPC.
 
@@ -24,10 +24,10 @@ Implement the warehouse client that writes one partition of a manifest over gRPC
 - Retry **only** the statuses that mean "try again": \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, at
   most \`MAX_ATTEMPTS\` (3) attempts with a growing backoff.
 - \`PERMISSION_DENIED\` is **terminal**: stop the load and raise a visible reason
-  (\`LoadFailed\`) — a credential problem never fixes itself by retrying, and the operator needs to
+  (\`LoadFailed\`) — a credential problem does not fix itself by retrying, and the operator needs to
   see which target and partition were refused.
 - The row count returned is the **warehouse's** count for the successful attempt
-  (\`reply.rows_written\`), **assigned** — never accumulated across attempts. Adding every attempt's
+  (\`reply.rows_written\`), **assigned**, not accumulated across attempts. Adding every attempt's
   count is how a single day of orders is reported as two.
 
 **Failure mode the checks target.** A fresh append on retry duplicates rows in the warehouse and the
@@ -52,9 +52,9 @@ burns the retry budget on a request that can never succeed.`,
     ],
   },
   hints: [
-    'Write the statement before the loop, once. The key is `(manifest id, partition id)` inside the statement, so the retry re-sends the *same* statement — that is the whole idempotence of a merge: the warehouse deletes the partition’s rows and inserts them again.',
-    'Classify the error inside a `try`/`catch`: `UNUNAVAILABLE`/`DEADLINE_EXCEEDED` may retry (bounded by `MAX_ATTEMPTS`) with a backoff, `PERMISSION_DENIED` never does — it must surface the target and the partition so on-call can fix the grant.',
-    'Return the reply’s count, do not sum it. `total += reply.rows_written` inside the retry loop counts the failed attempt as well; assign `rows_written = reply.rows_written` only on the successful attempt, and the number reconciles against the warehouse however many times you retried.',
+    "Symptom: after a warehouse blip, Tuesday's orders appear twice in the table while the load report says the right number of rows was written. A revoked grant leaves a worker spinning at 100% CPU.",
+    'Mechanism: the statement is an append, so the retry inserts the rows again; `rows_written +=` counts the failed attempt too; `except Exception: continue` retries everything with no deadline, bound or sleep.',
+    'Fix: build one `MERGE … ON t.manifest_id AND t.partition_id` statement, call `stub.Write(request, timeout=DEADLINE_S)`, retry only `RETRYABLE_STATUSES` up to `MAX_ATTEMPTS` with `time.sleep`, raise `LoadFailed` otherwise, assign `rows_written`.',
   ],
   checks: [
     {
@@ -132,9 +132,7 @@ from warehouse_pb2_grpc import WarehouseStub
 
 
 def write_partition(stub: WarehouseStub, target: str, manifest_id: str, partition_id: str, transform_sql: str, mode: str) -> int:
-    # TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
-    # retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-    # total. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     statement = f"INSERT INTO {target} SELECT * FROM ({transform_sql}) AS s"
     request = WritePartitionRequest(target=target, partition_id=partition_id, statement=statement)
     rows_written = 0
@@ -236,9 +234,7 @@ export async function writePartition(
   transformSql: string,
   mode: string,
 ): Promise<number> {
-  // TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
-  // retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-  // total. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   let rowsWritten = 0;
   for (;;) {
     const statement = \`INSERT INTO \${target} SELECT * FROM (\${transformSql}) AS s\`;
@@ -388,9 +384,7 @@ import (
 
 // WritePartition writes one partition of a manifest and returns the rows it wrote.
 func WritePartition(ctx context.Context, client pb.WarehouseClient, target, manifestID, partitionID, transformSQL, mode, token string) (int64, error) {
-	// TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
-	// retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-	// total. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	statement := fmt.Sprintf("INSERT INTO %s SELECT * FROM (%s) AS s", target, transformSQL)
 	request := &pb.WritePartitionRequest{Target: target, PartitionId: partitionID, Statement: statement}
 	rowsWritten := int64(0)
@@ -493,9 +487,7 @@ import loader.warehouse.{WarehouseGrpc, WritePartitionRequest}
 object WarehouseWriter {
   def writePartition(stub: WarehouseGrpc.WarehouseBlockingStub, target: String, manifestId: String, partitionId: String,
                      transformSql: String, mode: String): Long = {
-    // TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
-    // retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-    // total. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var rowsWritten = 0L
     var done = false
     while (!done) {
@@ -584,9 +576,7 @@ object WarehouseWriter {
 // Writes one partition of a manifest and returns the rows it wrote.
 long writePartition(warehouse::Warehouse::Stub* stub, const std::string& target, const std::string& manifestId,
                     const std::string& partitionId, const std::string& transformSql, const std::string& mode) {
-  // TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
-  // retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-  // total. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   long rowsWritten = 0;
   for (;;) {
     grpc::ClientContext ctx;
@@ -678,13 +668,13 @@ long writePartition(warehouse::Warehouse::Stub* stub, const std::string& target,
 `,
     },
   },
-  debrief: `The interviewer is testing retry semantics, which is where data platforms lose data quietly. The
-starter's retry looks careful — it re-sends a statement and reports a total — but the statement is an
-append, so attempt two writes the partition's rows a second time, and the total is accumulated from
-every attempt, so the inflated number looks like success. The fix is three coupled decisions: the
-statement is built once and keyed by (manifest id, partition id) so the warehouse itself dedupes the
-retry; only UNAVAILABLE and DEADLINE_EXCEEDED are retryable, and PERMISSION_DENIED surfaces a reason
-that names the target; and the count reported is the warehouse's count for the attempt that succeeded.
-The deadline is what makes the retry reachable at all — without it a stalled write never becomes
-DEADLINE_EXCEEDED, it just holds the worker.`,
+  debrief: `The fix couples three decisions that only work together. The statement is built once and keyed by
+(manifest id, partition id), so the warehouse itself dedupes the retry and the second attempt replaces
+the first instead of stacking on it. The error is classified before the loop decides anything: only
+UNAVAILABLE and DEADLINE_EXCEEDED earn another bounded, spaced attempt, and PERMISSION_DENIED surfaces
+a reason that names the target. The count is the warehouse's count for the attempt that succeeded,
+assigned rather than summed. The deadline is what makes any of this reachable: without it a stalled
+write holds the worker instead of becoming DEADLINE_EXCEEDED. Production clients add jittered backoff,
+a circuit breaker per warehouse endpoint, and a per-statement token so the warehouse can reject an
+attempt the loader did not know it had already made.`,
 };

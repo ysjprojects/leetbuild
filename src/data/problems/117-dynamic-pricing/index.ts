@@ -7,77 +7,66 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Dynamic pricing: the course is not "serve a model's price suggestion", it is
- * the debugging you owe a pricing service before it moves money. A guarded publish endpoint
- * at the trust boundary → one atomic Redis headroom reservation per sku window → a demand-model
- * call with a 700 ms deadline that falls back to the last approved price → sku-keyed price.changed
- * events with an outbox, published only after the store commits → a storefront read that shows
- * published prices, with experiment candidates behind an operator scope.
+ * Dynamic pricing: the debugging you owe a pricing service before it moves money. A guarded
+ * publish endpoint at the trust boundary → one atomic Redis headroom reservation per sku window →
+ * a demand-model call with a 700 ms deadline that falls back to the last approved price →
+ * sku-keyed price.changed events with an outbox, published only after the store commits → a
+ * storefront read that shows published prices, with experiment candidates behind an operator scope.
  */
 export const dynamicPricingProblem: Problem = {
   id: 'dynamic-pricing',
   title: 'Dynamic Pricing',
-  tagline: 'Prices that move within guardrails, never publish stale model output and explain themselves.',
+  tagline:
+    'Prices that move inside a per-window budget, with a floor, a ceiling and an audit event behind each change.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Dynamic Pricing
 
-A dynamic pricing service is the piece of a marketplace that lets a model move money. The model
-suggests a price; the platform decides whether that suggestion may be published, how far the price
-may travel inside a window, what the storefront charges while the model is broken, and how anyone
-later reconstructs why a number changed. The visible part is a number on a product page. The parts
-that decide whether the platform is safe are the guardrail evaluation, the atomic headroom
-accounting, the fallback when the model goes silent, and the audit chain behind every publish.
+A dynamic pricing service lets a model move money. The model suggests a price; the platform decides
+whether it may be published, how far a price may travel inside a window, what the storefront
+charges while the model is broken, and how anyone later reconstructs why a number changed.
 
 ## The real system
 
-Production pricing services receive price updates from several places at once: a demand model, a
-competitor feed, a category manager's override, a promotions calendar. Every one of them is a
-proposal, not a fact. The service enforces a recipe around each proposal — an absolute floor and
-ceiling so a bug can never sell at zero or at a thousand times cost, and a per-window change limit
-so a burst of proposals cannot compound into a 400 percent move. The headroom that limits allow is
-shared state, so the accounting has to be atomic and the window has to expire on schedule; ten
-updates that each look small against yesterday's price are ten updates that must not all pass.
-Model output is untrusted in a second way: the model has a deadline, and when it misses it the
-service must not present its last suggestion as a fresh computation. Finally, every published
-change is an auditable event keyed by the thing whose price moved, carrying both prices, the
-headroom it consumed and the reason — written after the price is durable, and never lost when the
-broker is down.
+Amazon's Automate Pricing tool is this service as a product: a seller attaches a rule to a SKU,
+sets a minimum price and an optional maximum price per SKU, and the rule reprices inside those
+limits while a 30-day history records each change. Any platform that takes proposals from a demand
+model, a competitor feed or a category manager needs the same bounds. A floor and ceiling stop a
+bug from selling at zero; a per-window change limit stops a burst of proposals from compounding,
+and the headroom it allows is shared state, so the accounting has to be atomic and the window has
+to expire. The model has a deadline, and when it misses it the service must not present its last
+suggestion as a fresh computation. Every published change is an event keyed by the sku, carrying
+both prices, the headroom consumed and the reason, written after the price is durable and kept in
+an outbox when the broker is down.
 
 ## What you build here
 
 One service, **priced**, with five pieces:
 
-1. \`POST /v1/prices\`: a validated proposal — a sku that exists, a target price, a reason — that
-   is rejected with the computed bound when it would move the price past the per-window limit, and
-   with the floor or ceiling when it lands outside them. An unknown sku is \`404\`, never a new row.
-2. A **Redis** guard: one hash per sku per hour window, read, checked and incremented inside a
-   single Lua \`EVAL\` that sets the window's expiry on first write, so concurrent updates share the
-   same headroom and the published price stays traceable to the update that consumed it.
-3. A **gRPC** demand client: a 700 ms deadline per call, a constraint rejection that is terminal,
-   and a timeout path that republishes the last approved price with a stale marker instead of
-   serving the model's last suggestion as if it were computed now.
-4. A **Kafka** audit chain: one \`price.changed\` event per publish, keyed by sku so a sku's history
-   stays ordered, produced only after the price store commits, carrying old and new price, the
-   headroom consumed, the source and the reason, with an outbox row when the broker rejects it.
+1. \`POST /v1/prices\`: a validated proposal (an existing sku, a target price, a reason), rejected
+   with the computed bound past the per-window limit and with the floor or ceiling outside them.
+2. A **Redis** guard: one hash per sku per hour window, read, checked and incremented inside one
+   Lua \`EVAL\` that sets the expiry on first write, so concurrent updates share the same headroom.
+3. A **gRPC** demand client: a 700 ms deadline per call, a terminal constraint rejection, and a
+   timeout path that republishes the last approved price with a stale marker.
+4. A **Kafka** audit chain: one \`price.changed\` event per publish, keyed by sku, produced after
+   the price store commits, with an outbox row when the broker rejects it.
 5. \`GET /v1/prices/{sku}\`: the price the storefront charges, with its source, timestamp and
    guardrail state, and experiment candidates visible only to operators holding a preview scope.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real pricing feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, it serves the happy path, and it looks
+right. In every step you debug it against the failure modes, fix it, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Demand forecasting itself, elasticity estimation, catalog and merchandising systems, competitor
-feed ingestion, tax and currency conversion, promotions calendars, the storefront's own price cache,
-and the analyst UI. The five pieces above are the ones that decide whether a pricing platform is
-correct, honest about its sources and shippable.`,
+Demand forecasting, elasticity estimation, catalog and merchandising systems, competitor feed
+ingestion, tax and currency conversion, promotions calendars, the storefront's own price cache, and
+the analyst UI.`,
   diagram: {
     nodes: [
       {id: 'storefront', kind: 'client', label: 'Storefront', sub: 'GET /v1/prices/{sku}', x: 6, y: 28},

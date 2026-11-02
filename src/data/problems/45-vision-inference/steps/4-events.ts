@@ -8,31 +8,31 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'consumer', 'outbox'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an event per
-inference and the analytics pipeline is happy for a week. The key, the payload and the failure path
-are all wrong. Find them, fix them, and prove the fix.
+**Starting point.** The starter's \`complete_inference\` builds an event with tenant, task,
+latency, confidence, the storage key and the presigned URL, produces it to \`vision.inference\` with
+\`key=tenant\` from a producer built with only \`bootstrap.servers\`, and polls once. It serves the
+demo and hides four flaws.
 
-Implement the event path for completed inferences on \`vision.inference\`:
+**Failure mode the checks target.** Keyed by tenant, one model version's events scatter across the
+topic and nobody can answer "how did vision-large-3.1.0 behave on Tuesday?". The presigned URL sits
+in a retained, replicated log long after it expired everywhere else. With the default \`acks=1\` and
+no idempotence a retry duplicates an event. And a rejected produce is dropped, so every broker hiccup
+removes an inference from the counters.
+
+Requirements for the event path on \`vision.inference\`:
 
 - Exactly one event per completed inference, **keyed by the model version**
-  (\`key = event["model_version"]\`, a \`Hash\`/hash partitioner). Every version's quality stream then
-  stays ordered inside one partition; keying by tenant scatters a version's signals across the topic
-  and per-version metrics arrive out of order.
+  (\`key = event["model_version"]\`, a \`Hash\`/hash partitioner), so each version's quality stream
+  stays ordered inside one partition.
 - The payload carries the **task**, the **latency**, a **confidence summary** and the **digest** of
-  the storage key. It carries **no image bytes and no URLs** — a presigned URL published to a
-  retained, replicated topic is a standing grant of access that outlives the request, the tenant and
-  the retention window.
+  the storage key, and **no image bytes and no URLs**: a presigned URL in a retained topic is a
+  standing grant of access that outlives the request, the tenant and the retention window.
 - The producer is configured once, idempotently, with \`acks=all\`; not per request.
-- When the broker rejects the produce, write an **outbox row** and let a relay retry it. Dropping
-  the event loses a completed inference from quality accounting; blocking the inference on the
-  broker couples the GPU's latency to Kafka's.
+- When the broker rejects the produce, write an **outbox row** and let a relay retry it. Dropping the
+  event loses a completed inference from quality accounting; blocking on the broker couples the GPU's
+  latency to Kafka's.
 - The consumer updates the per-version counter and **commits after** it, so a crash replays rather
-  than skips.
-
-**Failure mode the checks target.** The starter keys by tenant so no one can answer "how did
-vision-large-3.1.0 behave on Tuesdays?"; it publishes the presigned URL because "the training
-pipeline needs to fetch the image"; and it skips the outbox, so every broker hiccup silently loses an
-inference from the counters.`,
+  than skips.`,
   sequence: {
     participants: ['Inference worker', 'Kafka', 'Quality consumer', 'Outbox relay'],
     messages: [
@@ -67,7 +67,7 @@ inference from the counters.`,
       id: 'payload-shape',
       title: 'Carries task, latency and a confidence summary',
       detail:
-        'The event carries the task, the latency and the confidence summary — the fields the quality pipeline aggregates per model version.',
+        'The event carries the task, the latency and the confidence summary: the fields the quality pipeline aggregates per model version.',
       match: {
         python: {all: [/task/, /latency/, /confidence/]},
         typescript: {all: [/task/, /latency/, /confidence/]},
@@ -78,7 +78,7 @@ inference from the counters.`,
     },
     {
       id: 'no-bytes-no-urls',
-      title: 'Ships digests, never bytes or URLs',
+      title: 'Ships digests, not bytes or URLs',
       detail:
         "The payload carries the storage key's digest and no presigned URL, no base64 blob and no image bytes. The starter publishes the presigned URL so the training pipeline can fetch it.",
       match: {
@@ -106,7 +106,7 @@ inference from the counters.`,
       id: 'outbox',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce writes an outbox row and the relay retries it — the event is never dropped, and the inference is never blocked on the broker. The starter has no outbox at all.',
+        'A rejected produce writes an outbox row and the relay retries it, so the event is not dropped and the inference is not blocked on the broker. The starter has no outbox at all.',
       match: {
         python: {all: [/outbox/, /Outbox/], order: [/producer\.produce\(/, /outbox/]},
         typescript: {all: [/outbox/, /Outbox/], order: [/\.send\(/, /outbox/]},
@@ -135,9 +135,7 @@ def complete_inference(
     storage_key: str,
     presigned_url: str,
 ) -> None:
-    # TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
-    # of the image, configures no idempotence, and skips the outbox when the broker rejects the
-    # produce. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {
         "tenant": tenant,
         "task": task,
@@ -230,9 +228,7 @@ export async function completeInference(
   storageKey: string,
   presignedUrl: string,
 ): Promise<void> {
-  // TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
-  // of the image, configures no idempotence, and skips the outbox when the broker rejects the
-  // produce. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   await producer.connect();
   await producer.send({
     topic: TOPIC,
@@ -320,9 +316,7 @@ type InferenceEvent struct {
 }
 
 func completeInference(ctx context.Context, event InferenceEvent) error {
-	// TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
-	// of the image, configures no idempotence, and skips the outbox when the broker rejects the
-	// produce. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -427,9 +421,7 @@ object InferenceEvents {
   )
 
   def completeInference(event: InferenceEvent, payload: String): Unit = {
-    // TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
-    // of the image, configures no idempotence, and skips the outbox when the broker rejects the
-    // produce. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     producer.send(new ProducerRecord[String, String](Topic, event.tenant, payload))
   }
 }
@@ -510,9 +502,7 @@ struct InferenceEvent {
 };
 
 void completeInference(const InferenceEvent& event, const std::string& payload) {
-  // TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
-  // of the image, configures no idempotence, and skips the outbox when the broker rejects the
-  // produce. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   producer->produce(kVisionInferenceTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                     const_cast<char*>(payload.data()), payload.size(), event.tenant.c_str(), event.tenant.size(), 0,
                     nullptr);
@@ -572,16 +562,17 @@ void consume(const std::vector<InferenceEvent>& events, Counter& counter) {
     },
   },
   hints: [
-    "The key is the ordering contract: `vision.inference` is keyed by `model_version`, so one version's stream lands in one partition and its quality counters are applied in order. An event with no version field cannot be keyed correctly, so provenance is part of the key decision.",
-    "Audit the payload against the topic's lifetime, not the request's: a presigned URL survives in the log long after it expires everywhere else, and base64 bytes blow the message size limit. The digest is what the training pipeline actually needs — the labels and the model version, plus a way to find the object.",
-    'The outbox is the difference between "we lost an event" and "the relay will publish it shortly": write the row when the produce fails and return; never retry the produce inline, and never let the broker\'s latency become the GPU\'s latency.',
+    "Consume the topic: one version's events land in several partitions out of order, every record carries a presigned URL, and a broker restart leaves the per-version counters short with no error logged.",
+    "`key=tenant` decides the partition, so the version has no ordering; the event dict copies `presigned_url` straight in; the `Producer` config sets no `acks`; and `produce()` raising is nobody's problem.",
+    'Key by `event["model_version"]`, replace `url` with the storage key digest, build the `Producer` once with `"acks": "all"` and `enable.idempotence`, and write an `Outbox` row in the `except` around `producer.produce(`.',
   ],
-  debrief: `The interviewer is testing whether you treat the event stream as a product with a contract. Three
-defects are being checked: the partition key (per-version ordering is impossible once a version's
-events scatter by tenant), the payload (a URL or bytes in a retained topic is a leak or a size
-incident), and the failure path (an event lost to a broker hiccup is a silently missing row in every
-quality dashboard). The deeper point is that a completed inference is already durable — the write
-happened — so the event is a *notification*, and notifications belong in an outbox that can retry.
-Real pipelines add a schema registry with a compatibility check, a tombstone/compaction policy for
-late corrections, and sampling when the event volume outruns the topic's budget.`,
+  debrief: `The partition key is the ordering contract: one version's stream in one partition is
+what lets its quality counters apply in order, so an event with no version field cannot be keyed
+correctly and provenance is part of the key decision. The payload is audited against the topic's
+lifetime rather than the request's, which is why a URL that is harmless in a response is a leak in a
+log. And the outbox exists because a completed inference is already durable: the event is a
+notification, and a notification can wait for a relay but must not block the GPU on the broker.
+Production pipelines put a schema registry with a compatibility check in front of the topic, run a
+compaction or tombstone policy for late corrections, and sample when event volume outruns the topic's
+budget.`,
 };

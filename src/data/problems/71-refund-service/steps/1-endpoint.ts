@@ -8,38 +8,29 @@ export const refundEndpointStep: Step = {
   focus: ['client', 'api', 'ledger', 'records', 'psp'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the payment's refundable balance and returns a refund. It compiles, it returns a body the console
-renders, and it hides four production flaws. Debug it like the payments engineer on call, fix it,
-and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/refunds\` with body
+\`{"payment_id": "pay_8d1", "amount_minor": 2500, "reason_code": "damaged"}\`, reads the tenant
+header, logs the request and answers **200** with a \`PENDING\` refund for whatever amount and
+payment the client named. It compiles and hides four flaws.
 
-Implement \`POST /v1/refunds\` with body
-\`{"payment_id": "pay_8d1", "amount_minor": 2500, "reason_code": "damaged"}\`.
+**Failure mode the checks target.** The handler trusts the body: no balance check, so a payment
+can refund more than it collected; no \`Idempotency-Key\`, so every client retry is a second refund;
+no ownership check, so any tenant can refund another tenant's charge; and no \`remaining_minor\`
+in the response.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**. A
-  payment that belongs to another tenant answers **404** — the same answer as one that does not
-  exist, so a foreign payment id is never distinguishable from a missing one.
-- \`amount_minor\` is an integer of at least **1** (**400** otherwise) and \`reason_code\` is one of
-  \`damaged\`, \`not_received\`, \`duplicate\`, \`goodwill\` (**400** otherwise).
-- The refundable balance is \`paid_minor - refunded_minor\` for that payment. An amount **above the
-  remaining balance is 422**, and the refusal carries the remaining balance. A refund may never take
-  more than the customer paid, no matter how the client sequences its requests.
-- \`Idempotency-Key\` is required (**400** when missing) and the refund is stored under
-  \`(tenant, key)\`: a replay returns the first refund with the same \`refund_id\` instead of
-  refunding a second time.
-- The amount is claimed through the ledger's **atomic check-and-add** (the next step builds it),
-  never by reading a balance here. Two concurrent partial refunds that together exceed the balance
-  must leave exactly one accepted.
-- A partial refund must **leave the reduced balance visible immediately**: the response carries the
-  new \`remaining_minor\`, so the merchant support tool shows the same number finance will see.
-- Log the decision with tenant, payment and amount; never the reason text, card data or customer
-  name.
+Requirements:
 
-**Failure mode the checks target.** Reading the balance and then refunding is check-then-act: two
-concurrent requests both see the same remaining balance and both refund, so one payment pays out
-twice. Ignoring \`Idempotency-Key\` turns every client retry into a second refund — the exact bug the
-mock interview opens with. And trusting the path's payment id lets any authenticated tenant refund
-someone else's charge.`,
+- Tenant from \`X-Tenant-Id\` (**401** when missing). A payment owned by another tenant answers
+  **404**, the same as a missing one.
+- \`amount_minor\` is an integer of at least **1** and \`reason_code\` is one of \`damaged\`,
+  \`not_received\`, \`duplicate\`, \`goodwill\` (**400** otherwise).
+- An amount above \`paid_minor - refunded_minor\` is **422** with the remaining balance in the body.
+  The amount is claimed through the ledger's atomic check-and-add with \`paid_minor\` as the cap,
+  not by reading a balance here, so two concurrent partial refunds leave exactly one accepted.
+- \`Idempotency-Key\` is required (**400** when missing); the refund is stored under
+  \`(tenant, key)\` and a replay returns the first refund with the same \`refund_id\`.
+- The accepted response carries the new \`remaining_minor\`.
+- Log tenant, payment and amount; never the reason text, card data or customer name.`,
   sequence: {
     participants: ['Client', 'Refund API', 'Redis ledger', 'refund records'],
     messages: [
@@ -167,9 +158,7 @@ refunds = RefundStore()
 
 @app.post("/v1/refunds")
 def create_refund(body: RefundRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
-    # it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-    # concurrent requests refund the same payment twice. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     logger.info("refund tenant=%s payment=%s amount=%d", tenant, body.payment_id, body.amount_minor)
     return JSONResponse(
         {
@@ -302,9 +291,7 @@ interface RefundBody {
 }
 
 app.post('/v1/refunds', async (request, reply) => {
-  // TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
-  // it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-  // concurrent requests refund the same payment twice. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RefundBody;
   request.log.info({tenant, payment_id: body.payment_id, amount_minor: body.amount_minor}, 'refund accepted');
@@ -428,9 +415,7 @@ func createRefund(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	body := RefundRequest{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
-	// it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-	// concurrent requests refund the same payment twice. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	log.Printf("refund tenant=%s payment=%s amount=%d", tenant, body.PaymentID, body.AmountMinor)
 	writeJSON(rw, http.StatusOK, map[string]any{
 		"payment_id":   body.PaymentID,
@@ -605,9 +590,7 @@ object Api {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RefundRequest]) { body =>
-            // TODO: this starter refunds whatever the client asks for. It reads the balance and never
-            // checks it, ignores Idempotency-Key, never proves the payment belongs to the tenant,
-            // and lets two concurrent requests refund the same payment twice. Fix all four.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             system.log.info(s"refund tenant=$tenant payment=\${body.payment_id} amount=\${body.amount_minor}")
             complete(
               StatusCodes.OK,
@@ -747,9 +730,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
-    // it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-    // concurrent requests refund the same payment twice. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     std::cerr << "refund tenant=" << tenant << " payment=" << body.value("payment_id", std::string()) << "\\n";
     res.status = 200;
     res.set_content(
@@ -879,9 +860,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guards by cost and by authority: tenant (**401**), `Idempotency-Key` (**400**), amount and reason code (**400**), then the payment row and its owner (**404**). A guard that runs after the ledger has been touched is a guard that can leave the balance wrong.',
-    'The cap belongs to the payment, not to the request: pass `paid_minor` into the ledger call as the cap and answer **422** — not 400, not 200 — when the atomic check-and-add refuses. Reading the balance here and comparing it is check-then-act: two concurrent requests both see room that only one of them can spend.',
-    'The replay lookup is `(tenant, key)` → the stored refund, resolved **before** anything is claimed, and the refund is written under the same key immediately after the claim. Return the stored body unchanged on a replay, so one client intent keeps one `refund_id`.',
+    'Symptom: a merchant clicks "Refund" twice on a flaky connection and the customer is credited twice; a second merchant can refund a payment it does not own; the response shows no balance.',
+    'Mechanism: the handler acts on the body alone. It reads no `Idempotency-Key`, loads no payment row to compare owners, and computes nothing from `paid_minor` before answering 200.',
+    'Change: guard in order (401 tenant, 400 key and fields, 404 owner), look up `refunds.get(tenant, key)`, claim through the ledger with `paid_minor` as cap (422 on refusal), `refunds.put`, return `remaining_minor`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary and at the money boundary. The starter reads fine because the demo posts well-formed requests from one tenant with one refund. Four defects are being checked: authentication and payment ownership (tenant always required, a foreign payment is 404), input validation (cheap rejections before any ledger work), the lifetime cap (an amount above the remaining balance is 422, decided by the atomic claim rather than by a read), and idempotency keyed by \`(tenant, key)\` so a retry returns the first refund instead of paying twice. The response shape is the fifth: a partial refund must show the reduced balance immediately, because the support tool and finance reconcile against the same number. Real refund services add a refund window (only within N days of capture), per-reason approval limits, and a manual-approval queue above an amount threshold.`,
+  debrief: `The guards are ordered by cost and authority: the tenant and the key come from headers, the fields from the body, and only then is the payment row loaded and its owner compared. The ownership failure is 404 rather than 403 so a foreign id is indistinguishable from a missing one. The cap is not decided here: the handler passes \`paid_minor\` into the ledger's atomic claim and turns a refusal into 422, because a balance read in the handler is check-then-act and two concurrent requests would both see room for one. The idempotency lookup runs before the claim and the write right after it, so one client intent keeps one \`refund_id\`. Production endpoints also enforce a refund window after capture and route large amounts to manual approval.`,
 };

@@ -48,33 +48,25 @@ export const endpointStep: Step = {
   },
   task: `## Task
 
-**Starting point.** You are the AI platform engineer on call. A tenant complained that a thumbs-down
-they left on a bad answer vanished from the dashboard, while a support macro that posts an empty
-rating has been quietly counting as neutral. The handler below registers the route and
-writes a row, so it looks finished — but it trusts the caller for the request id, keeps an unbounded
-comment, and turns silence into a \`0\`.
+**Starting point.** \`api\` registers \`POST /v1/feedback\`, reads \`X-Tenant-Id\`, builds a row
+from the body (\`request_id\`, \`rating\`, \`comment\`), writes it to the feedback store, logs it and
+answers \`201\`. It serves the demo and hides four flaws.
 
-Debug \`api\` before you trust the dashboard, then fix it so the row it writes can only describe a
-request this tenant really served.
+**Failure mode the checks target.** A row that points at a request this tenant did not serve, a
+missing rating stored as \`0\`, a comment with no size limit, and comment text in the log line.
 
-- The handler must read the tenant from the \`X-Tenant-Id\` header and reject a request without one
-  before it touches the body.
-- A \`request_id\` is only valid if this tenant actually served it; an unknown or foreign request id is
-  \`404\`, not a row that points at nothing.
-- \`rating\` is mandatory and must be exactly \`-1\`, \`0\` or \`1\`. A body without a rating is \`400\`; it must
-  never be stored as a default \`0\`, because silence is not satisfaction.
-- \`comment\` is optional but its UTF-8 length is capped at \`2 * 1024\` bytes; anything larger is \`413\`.
-- The comment text must never reach the logs — the log line carries the tenant, the request id and the
-  rating only.
-
-**Failure mode the checks target.** A rating that references a request the tenant never served is an
-attribution bug wearing a validation costume, and a defaulted \`0\` inflates the denominator of every
-satisfaction score downstream. The checks below pin the request id to a served request, require an
-explicit rating, cap the comment, and keep the comment out of the log line.`,
+- A \`request_id\` is valid only if \`served_requests.get(tenant, request_id)\` finds it; a miss is
+  \`404\`.
+- \`rating\` is mandatory and must be in \`ALLOWED_RATINGS = {-1, 0, 1}\`; a body without one is
+  \`400\`, not a default \`0\`.
+- \`comment\` is optional; its UTF-8 length is capped at \`MAX_COMMENT_BYTES = 2 * 1024\`, and anything
+  larger is \`413\`.
+- The log line carries the tenant, request id and rating only; the comment text stays out of every
+  log call.`,
   hints: [
-    'The tenant is the scope of everything: read `X-Tenant-Id` first and return `401` before parsing the body. A `request_id` is only meaningful inside that tenant.',
-    'Look up `(tenant, request_id)` in the served-requests store. A miss is `404`. A rating that is absent, non-integer, or outside `-1/0/1` is `400` — make the allowed set an explicit constant so the check can see it.',
-    'Measure the comment in bytes, not characters: `len(comment.encode("utf-8"))` (or `Buffer.byteLength`) against `2 * 1024`, and answer `413`. Keep the comment out of the logger call entirely.',
+    'A thumbs-down on a known answer shows up on no dashboard, while a support macro that posts an empty body keeps counting as neutral.',
+    'The handler copies `body.request_id` into the row without asking the served-requests store, and the pydantic default `rating: int = 0` fills in silence.',
+    'Look up `served_requests.get(tenant, request_id)` (miss is `404`), make `rating` required and checked against `ALLOWED_RATINGS`. The remaining checks cover the comment cap and the log line.',
   ],
   checks: [
     {
@@ -180,8 +172,7 @@ feedback = FeedbackStore()
 
 @app.post("/v1/feedback")
 def submit(body: FeedbackRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
-    # and turns a missing rating into 0 so silence counts as neutral. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     record = {
         "feedback_id": str(uuid.uuid4()),
         "tenant": tenant,
@@ -260,7 +251,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/feedback: flawed code that trusts the caller's request id. */
+      starter: `/** POST /v1/feedback: stores a rating for a request id. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -294,8 +285,7 @@ export const servedRequests = new ServedRequestsStore();
 export const feedback = new FeedbackStore();
 
 app.post('/v1/feedback', async (request, reply) => {
-  // TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
-  // and turns a missing rating into 0 so silence counts as neutral. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as FeedbackBody;
   const record = {
@@ -435,8 +425,7 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
-	// and turns a missing rating into 0 so silence counts as neutral. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	record := map[string]any{
 		"feedback_id": uuid.NewString(),
 		"tenant":      tenant,
@@ -592,8 +581,7 @@ object FeedbackApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[FeedbackRequest]) { body =>
-            // TODO: this starter stores whatever request id the caller sends, keeps an unbounded
-            // comment, and turns a missing rating into 0 so silence counts as neutral.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val rating = body.rating.getOrElse(0)
             val record =
               s"""{"feedback_id":"\${UUID.randomUUID()}","tenant":"$tenant","request_id":"\${body.request_id}","rating":$rating}"""
@@ -710,8 +698,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
-    // and turns a missing rating into 0 so silence counts as neutral. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const json record = {
         {"feedback_id", uuidString()},
         {"tenant", tenant},
@@ -819,14 +806,13 @@ int main() {
 `,
     },
   },
-  debrief: `The rating is only meaningful when it is pinned to a request the tenant really served: the
-served-requests lookup is what turns "a thumbs-down" into "a thumbs-down on *that* answer", and the
-\`404\` is what stops a caller from inventing an id to stuff the dashboard. Making \`rating\` mandatory
-removes the silent \`0\` that would otherwise inflate every satisfaction denominator, and the byte cap
-on the comment keeps one row from dominating storage and the event pipeline. Keeping the comment out of
-the log line matters because logs are retained longer and read by more people than the feedback table.
+  debrief: `The served-requests lookup is what turns "a thumbs-down" into "a thumbs-down on that
+answer", and the \`404\` stops a caller from inventing ids to stuff the dashboard. A mandatory
+\`rating\` removes the silent \`0\` that would inflate every satisfaction denominator, and the byte cap
+keeps one row from dominating storage and the event pipeline. The comment stays out of the log line
+because logs are retained longer and read by more people than the feedback table.
 
-Real systems add a signed request id (or an HMAC) so a client cannot forge one even if it guesses the
-format, and they write the rating and the served-request check in the same transaction so a request
-cannot be evicted between the lookup and the insert.`,
+Production collectors go further: the request id is signed (an HMAC over tenant and id) so a client
+cannot forge one even after guessing the format, and the served-request check and the insert run in
+one transaction so the request cannot be evicted between lookup and write.`,
 };

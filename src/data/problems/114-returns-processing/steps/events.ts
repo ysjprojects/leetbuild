@@ -8,35 +8,24 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: every state change publishes a
-\`returns.event\` record and the refund consumer updates the return, so one customer returning one
-damaged item looks right in the demo. Debug it like the service owner, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter publishes one \`returns.event\` record per state change
+(\`requested\`, \`received\`, \`graded\`, \`refunded\`) keyed by \`customer_id\`, with the photo's
+CDN URL in the payload, and its consumer commits the offset, then runs
+\`UPDATE returns SET state, refund_cents\`. It compiles, serves the demo, and hides 5 flaws.
 
-Implement the returns event pipeline: \`requested\`, \`received\`, \`graded\` and \`refunded\` each
-publish one record to \`returns.event\`.
+**Failure mode the checks target.** Support opens a return whose timeline reads \`refunded\` before
+\`graded\`; a refund event that the broker refused is gone after a restart; a return stays
+\`requested\` after the money left; a week-old event still opens the customer's photo.
 
-- The record key is the **return id**, never the customer: one return's whole history must land in
-  one partition so the refund consumer sees \`requested → received → graded → refunded\` in order. A
-  customer-keyed record interleaves every return that customer ever opened.
-- The payload carries \`state\`, \`grade\` and \`refund_cents\` (the amount refunded, in cents) plus
-  \`occurred_at\`, and the photo reference leaves the service only as a **short-lived signed URL**
-  — or not at all. A CDN link that stays valid for a week is a permanent handle to the customer's
-  evidence and outlives every retention policy.
-- The producer is idempotent and waits for all in-sync replicas (\`acks=all\`): a leader failover
-  must not lose an acknowledged refund, and a retried produce must not publish the same event twice.
-- When the broker **refuses** the record — a synchronous produce error or an asynchronous delivery
-  failure — write an **outbox** row carrying the return id, the state and the payload, so the relay
-  republishes it. Logging the failure drops the event; raising loses a request the customer already
-  saw accepted.
-- The refund consumer writes the new state (\`UPDATE returns SET state, refund_cents\`) **before** it
-  commits the offset. Commit first and a crash between the two leaves the return saying
-  \`requested\` while the money has already left.
-
-**Failure mode the checks target.** The starter keys every record by the customer, so one return's
-history is interleaved with that customer's other returns across partitions; it puts the photo's
-week-long CDN URL in the payload; it logs a refused produce instead of persisting it; and it commits
-the consumer's offset before the state write.`,
+- The record key is the **return id**: one return's whole history lands in one partition so the
+  consumer sees \`requested → received → graded → refunded\` in order.
+- The payload carries \`state\`, \`grade\`, \`refund_cents\` and \`occurred_at\`; the photo reference
+  leaves the service only as a **short-lived signed URL**, or not at all.
+- The producer is idempotent and waits for all in-sync replicas (\`acks=all\`).
+- When the broker **refuses** the record, whether a synchronous produce error or an asynchronous
+  delivery failure, write an **outbox** row carrying the return id, the state and the payload so
+  the relay republishes it.
+- The consumer writes the new state **before** it commits the offset.`,
   sequence: {
     participants: ['Returns API', 'returns.event', 'Refund consumer', 'returns · db'],
     messages: [
@@ -188,8 +177,7 @@ db = ReturnsDb()
 def build_event(
     return_id: str, customer_id: str, state: str, grade: str, refund_cents: int, photo_ref: str | None
 ) -> dict:
-    # TODO: key the record by return_id, and hand out a short-lived signed reference instead of a
-    # TODO: week-long CDN URL for the customer's photo
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "return_id": return_id,
         "customer_id": customer_id,
@@ -216,7 +204,6 @@ def publish_return_event(
     refund_cents: int = 0,
     photo_ref: str | None = None,
 ) -> None:
-    # TODO: acks=all + idempotence, and persist the record to the outbox when the broker refuses it
     payload = json.dumps(build_event(return_id, customer_id, state, grade, refund_cents, photo_ref))
     producer.produce(TOPIC, key=customer_id, value=payload, on_delivery=_failed)
     producer.poll(0)
@@ -236,7 +223,6 @@ def run_refund_consumer() -> None:
         record = consumer.poll(1.0)
         if record is None or record.error():
             continue
-        # TODO: the state write belongs before this commit, never after
         consumer.commit(record, asynchronous=False)
         event = json.loads(record.value())
         db.execute(
@@ -401,7 +387,7 @@ class ReturnsDb {
 export const db = new ReturnsDb();
 
 export function buildEvent(input: EventInput): ReturnEvent {
-  // TODO: key the record by the return id, and make the photo reference a short-lived signed URL
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   return {
     return_id: input.returnId,
     customer_id: input.customerId,
@@ -417,7 +403,6 @@ export function buildEvent(input: EventInput): ReturnEvent {
 }
 
 export async function publishReturnEvent(input: EventInput): Promise<void> {
-  // TODO: acks=all + idempotence, and persist the record to the outbox when the broker refuses it
   const payload = JSON.stringify(buildEvent(input));
   await connect();
   try {
@@ -435,7 +420,6 @@ export async function runRefundConsumer(): Promise<void> {
     autoCommit: false,
     eachMessage: async ({topic, partition, message}: EachMessagePayload) => {
       const event = JSON.parse(message.value?.toString() ?? '{}') as ReturnEvent;
-      // TODO: the state write belongs before this commit, never after
       await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
       await db.execute('UPDATE returns SET state = $1, refund_cents = $2 WHERE id = $3', [
         event.state,
@@ -593,8 +577,7 @@ var (
 )
 
 func buildEvent(returnID, customerID, state, grade string, refundCents int64, photoRef string) returnEvent {
-	// TODO: key the record by return_id, and hand out a short-lived signed reference instead of a
-	// TODO: week-long CDN URL for the customer's photo
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	event := returnEvent{
 		ReturnID:    returnID,
 		CustomerID:  customerID,
@@ -610,7 +593,6 @@ func buildEvent(returnID, customerID, state, grade string, refundCents int64, ph
 }
 
 func publishReturnEvent(ctx context.Context, event returnEvent) error {
-	// TODO: acks=all + idempotence, and persist the record to the outbox when the broker refuses it
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -632,7 +614,6 @@ func runRefundConsumer(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		// TODO: the state write belongs before this commit, never after
 		if err := reader.CommitMessages(ctx, msg); err != nil {
 			return err
 		}
@@ -815,8 +796,7 @@ object ReturnEvents {
       refundCents: Long,
       photoRef: Option[String]
   ): ReturnEvent =
-    // TODO: key the record by return_id, and hand out a short-lived signed reference instead of a
-    // TODO: week-long CDN URL for the customer's photo
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     ReturnEvent(
       return_id = returnId,
       customer_id = customerId,
@@ -828,7 +808,6 @@ object ReturnEvents {
     )
 
   def publishReturnEvent(event: ReturnEvent): Unit = {
-    // TODO: acks=all + idempotence, and write the refused record to the outbox
     try {
       producer.send(new ProducerRecord[String, String](Topic, event.customer_id, event.toJson.compactPrint))
     } catch {
@@ -847,7 +826,6 @@ object ReturnEvents {
     while (true) {
       val records = consumer.poll(java.time.Duration.ofMillis(500))
       records.forEach { record =>
-        // TODO: the state write belongs before this commit, never after
         consumer.commitSync()
         val event = record.value().parseJson.convertTo[ReturnEvent]
         ReturnsDb.execute(
@@ -976,14 +954,12 @@ static ReturnsDb db;
 static rd_kafka_t* make_producer(char* errstr, std::size_t errlen) {
   rd_kafka_conf_t* conf = rd_kafka_conf_new();
   rd_kafka_conf_set(conf, "bootstrap.servers", "kafka:9092", errstr, errlen);
-  // TODO: enable.idempotence=true and acks=all, with a delivery report that feeds the outbox
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   return rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, errlen);
 }
 
 static json build_event(const std::string& return_id, const std::string& customer_id, const std::string& state,
                         const std::string& grade, long long refund_cents, const std::string& photo_ref) {
-  // TODO: key the record by return_id, and hand out a short-lived signed reference instead of a
-  // TODO: week-long CDN URL for the customer's photo
   json event;
   event["return_id"] = return_id;
   event["customer_id"] = customer_id;
@@ -1021,7 +997,6 @@ static void run_refund_consumer(rd_kafka_t* consumer, sw::redis::Redis& redis) {
       rd_kafka_message_destroy(msg);
       continue;
     }
-    // TODO: the state write belongs before this commit, never after
     rd_kafka_commit(consumer, nullptr, 0);
     const auto event = json::parse(std::string(static_cast<const char*>(msg->payload), msg->len));
     const std::string return_id = event["return_id"].get<std::string>();
@@ -1131,9 +1106,9 @@ static void run_refund_consumer(rd_kafka_t* consumer, sw::redis::Redis& redis) {
     },
   },
   hints: [
-    'The partition key is a routing decision, not an identity: use `return_id` so one return’s `requested → received → graded → refunded` history lands in a single partition and is read in order. The customer is a property of the order, not of the event’s position in the log.',
-    'Pay attention to the payload as a privacy surface: it must carry what the refund path needs (`state`, `grade`, `refund_cents`) and must not carry a durable handle to the photo. Put the signed reference — with a short TTL — in the event, or leave the photo out of it entirely.',
-    'Two orders to fix. On the producer: `acks=all` with idempotence, then a refusal — a synchronous produce error, an asynchronous delivery report with an error, a full buffer — becomes an outbox row instead of a log line. On the consumer: the state write (db row and cache) happens before `commit`; the committed offset is the only thing that says “done”, so it moves last.',
+    'A customer with two open returns sees the second one graded before the first was received, and after a broker blip one refund never shows up in the returns table.',
+    'The key is `customer_id`, so two returns share a partition order with each other. The producer runs with default acks, a refusal only reaches the log, and the consumer commits before its UPDATE.',
+    'Key by `return_id`, sign the photo reference with a short TTL, set `acks=all` with idempotence, write an outbox row on every produce failure, and move `commit` after the `UPDATE`.',
   ],
-  debrief: `The interview signal is delivery semantics per entity. The key decides ordering: one return’s history must be read in the order it happened, so the record is keyed by the return id and the customer is not part of the event at all. \`acks=all\` plus an idempotent producer decides durability — a leader failover cannot lose an acknowledged refund and a retry cannot publish it twice. The outbox decides availability: a refused produce that only reaches the log is a refund that silently disappears, and throwing loses a request the customer already saw accepted. And the position of the commit decides whether the state and the offset can disagree: with the write first, a crash after it replays the event and overwrites the same row, which is why the update is idempotent by construction. Real systems add a relay that sweeps the outbox with \`FOR UPDATE SKIP LOCKED\`, dedupe on the event id at the consumer, and a reconciliation job that compares the refunds ledger against the returns table.`,
+  debrief: `Each fix answers one question about delivery. The key decides ordering, so it is the entity whose history must read in sequence: the return, not the customer. \`acks=all\` with an idempotent producer decides durability: a leader failover cannot drop an acknowledged refund and a retry cannot publish it twice. The outbox decides what happens when the broker says no: the row survives the process and a relay republishes it, where a log line is a refund that disappears. The commit position decides whether state and offset can disagree: with the write first, a crash replays the event onto the same row, which is why the update is idempotent by construction. What this step leaves out: the relay itself, sweeping the outbox with \`FOR UPDATE SKIP LOCKED\`, and consumer-side dedupe on an event id.`,
 };

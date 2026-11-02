@@ -8,32 +8,30 @@ export const dependencyStep: Step = {
   focus: ['search', 'shards'],
   task: `## Task
 
-**Starting point.** The starter is working code: with every shard healthy it
-returns the union of the shard replies and the demo ranks well. Three failure modes are hidden in it.
-Find them, fix them, and prove the fix with the checks below.
+**Starting point.** The starter fans \`POST /v1/search\` out to every target in
+\`SHARD_TARGETS\` over gRPC with \`asyncio.gather\`, concatenates whatever comes back and answers
+200. \`query_shard\` calls \`stub.Search\` with no timeout, sleeps 50 ms and retries on any
+\`AioRpcError\`, and returns \`[]\` on any other exception. With every shard healthy the demo ranks
+well. It compiles and hides five flaws.
 
-The search fans a query out to the index shards over gRPC.
+**Failure mode the checks target.** Waiting for the slowest shard makes one hot shard's latency the
+service's latency. Catching a shard error into an empty list is the subtle one: the ranking looks
+plausible, the recall is gone, and nothing in the response says so. Unbounded retries on top of an
+unbounded wait means a partial shard outage becomes a full outage under load.
 
 - Every shard call carries a **400 ms deadline** (\`timeout\`, \`deadline:\`, \`WithTimeout\`,
   \`withDeadlineAfter\`, \`set_deadline\`). A shard that has not answered by then is a *missing*
   answer, not a slow one: the call is abandoned and the query proceeds.
 - Retries are **bounded**: at most **2 attempts** per shard and a **150 ms retry budget** measured
-  from the first attempt. The starter retries timeouts forever, which turns one stuck shard into a
-  request that never returns and a client that cancels by timing out at the edge.
-- A shard reply set must reach a **quorum** — a majority of the configured shards
+  from the first attempt.
+- A shard reply set must reach a **quorum**, a majority of the configured shards
   (\`shard_count // 2 + 1\`). Below quorum the search answers **503** with the answered and required
-  counts and \`partial: true\`; it must never answer 200 with a silently incomplete list.
-- A failing or timing-out shard counts as a **failure** (\`failures += 1\`), never as an empty hit
-  list. The starter maps a rejected shard call to \`[]\`, so a dead shard looks exactly like a shard
-  with nothing to return.
-- Above quorum, the response reports \`partial\` — \`true\` when any shard failed — alongside
+  counts and \`partial: true\`, not 200 with a silently incomplete list.
+- A failing or timing-out shard counts as a **failure** (\`failures += 1\`), not as an empty hit
+  list.
+- Above quorum, the response reports \`partial\` (\`true\` when any shard failed) alongside
   \`shards.answered\` and \`shards.required\`, so a client can tell a degraded answer from a complete
-  one.
-
-**Failure mode the checks target.** Waiting for the slowest shard makes one hot shard's latency the
-service's latency. Catching a shard error into an empty list is the quiet one: the ranking looks
-plausible, the recall is gone, and nothing in the response says so. Unbounded retries on top of an
-unbounded wait means a partial shard outage becomes a full outage under load.`,
+  one.`,
   sequence: {
     participants: ['Search API', 'Index shard 0', 'Index shard 1', 'Index shard 2'],
     messages: [
@@ -57,9 +55,9 @@ unbounded wait means a partial shard outage becomes a full outage under load.`,
     ],
   },
   hints: [
-    'A deadline is per attempt, not per request: build a fresh context (or set a fresh deadline on the call) for every shard attempt, and pass the request context down so a client cancel stops the fan-out too.',
-    'The retry budget is the second bound and it is wall-clock: record the time before the first attempt and break out of the retry loop when the budget is gone or the attempt count hits the cap. `while true` plus a `sleep` is how a stuck shard becomes a stuck request.',
-    'Keep failures and hits in two separate accumulators: `failures` counts shards that did not answer (including the ones you deliberately dropped), and it is what decides the quorum, the 503 and the `partial` flag. Mapping an error to `[]` destroys that information at the exact moment it is needed.',
+    'One shard restarts and every search hangs until the client gives up; one shard crashes and searches return 200 with a third of the corpus missing and nothing in the body saying so.',
+    '`stub.Search` has no deadline and `while True` retries every `AioRpcError` with no cap; the other `except` returns `[]`, so `scatter_gather` cannot tell a dead shard from an empty one.',
+    'Pass `timeout=SHARD_DEADLINE_S`, loop on `attempt` up to `MAX_ATTEMPTS` inside `RETRY_BUDGET_MS`, gather with `return_exceptions=True`, count `failures += 1`, 503 below `quorum_size()`, and return `partial` with answered/required.',
   ],
   checks: [
     {
@@ -158,9 +156,7 @@ class SearchQuery(BaseModel):
 async def query_shard(target: str, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
     stub = shards_pb2_grpc.IndexShardStub(channels[target])
     request = shards_pb2.SearchRequest(tenant=tenant, query=query, k=k, index_version=version)
-    # TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
-    # forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-    # never ends. Fix all three before this fan-out takes traffic.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = await stub.Search(request)
@@ -324,9 +320,7 @@ function callShard(client: grpc.Client, request: ShardRequest): Promise<{hits?: 
 }
 
 async function queryShard(target: string, client: grpc.Client, request: ShardRequest): Promise<Hit[]> {
-  // TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
-  // forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-  // never ends. Fix all three before this fan-out takes traffic.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   while (true) {
     try {
       const reply = await callShard(client, request);
@@ -488,9 +482,7 @@ func shardClient(target string) shards.IndexShardClient {
 }
 
 func queryShard(ctx context.Context, target string, request *shards.SearchRequest) []Hit {
-	// TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
-	// forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-	// never ends. Fix all three before this fan-out takes traffic.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := shardClient(target).Search(ctx, request)
 		if err == nil {
@@ -686,9 +678,7 @@ object SearchApi {
     IndexShardGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
 
   def queryShard(stub: IndexShardGrpc.IndexShardBlockingStub, request: SearchRequest): List[Hit] = {
-    // TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
-    // forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-    // never ends. Fix all three before this fan-out takes traffic.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while (true) {
       try {
         val reply = stub.search(request)
@@ -863,9 +853,7 @@ std::unique_ptr<shards::IndexShard::Stub> shardStub(const std::string& target) {
 }
 
 ShardOutcome queryShard(const std::string& target, const shards::SearchRequest& request) {
-  // TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
-  // forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-  // never ends. Fix all three before this fan-out takes traffic.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   auto stub = shardStub(target);
   while (true) {
     grpc::ClientContext context;
@@ -1026,17 +1014,14 @@ int main() {
 `,
     },
   },
-  debrief: `A scatter-gather is where a search service's tail latency and its honesty both live. The starter's
-three defects are the three questions an interviewer asks in order. First, is the wait bounded?
-Without a per-attempt deadline the service inherits the slowest shard's latency, so one hot shard
-becomes an outage. Second, is the answer complete? A quorum turns "some shards replied" into a
-decidable question, and the 503 is the honest answer when the majority did not — a 200 with a short
-list is a lie that the ranking makes plausible. Third, do retries have a budget? Retrying a timeout
-without a bound multiplies load exactly when the shard is already struggling, which is how a partial
-outage becomes a total one. The subtle bug is the exception handler that maps a shard error to an
-empty list: it destroys the failure signal that the quorum and the \`partial\` flag depend on. Real
-services add hedged requests against the second-fastest shard, per-shard circuit breakers, and a
-merging strategy (score normalization, dedupe by document id, tie-break by shard) so a partial answer
-still ranks correctly.
+  debrief: `A scatter-gather is where a search service's tail latency and its completeness both live,
+and the fix is three bounds plus one piece of bookkeeping. The deadline is per attempt so the service
+stops inheriting the slowest shard's latency; the attempt cap and the wall-clock budget keep a retry
+from multiplying load on a shard that is already struggling. The bookkeeping is \`failures\`: a
+quorum, the 503 and the \`partial\` flag all derive from it, which is why mapping an error to \`[]\`
+is the damaging change, it destroys the signal at the moment it is needed. Production fan-outs go
+further with hedged requests to the second-fastest replica, per-shard circuit breakers, and a merge
+step (score normalization, dedupe by document id, tie-break by shard) so a partial answer still ranks
+correctly.
 `,
 };

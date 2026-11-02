@@ -17,7 +17,7 @@ export const copilotContextProblem: Problem = {
   id: 'copilot-context',
   title: 'Completion Context',
   tagline:
-    "GitHub Copilot's prompt path: a 6,000-character window, neighboring-tab snippets, fill-in-the-middle under a keystroke deadline, and acceptance telemetry without the code — debugged like production.",
+    "GitHub Copilot's prompt path: a 6,000-character window, neighboring-tab snippets cached per session, fill-in-the-middle under a 300 ms keystroke deadline, and acceptance telemetry that carries sizes instead of code.",
   difficulty: 'easy',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -99,7 +99,7 @@ One service, **completiond**, with four pieces:
    **1 MiB** refused with **413**, the prefix trimmed to its last **3,500** characters and the
    suffix to its first **1,000** so that, with the snippets, the prompt fits **6,000**, a fresh
    \`request_id\` and the editor's \`token\` echoed on every reply, and a log line that carries ids
-   and sizes, never code.
+   and sizes without the code.
 2. The **neighboring-tabs cache** in Redis: each open tab under \`tabs:{session}:{path}\` with a
    **600 s** TTL, snippets scored by Jaccard set similarity of identifiers against the last **60**
    lines before the cursor, included at the very low bar of **0.05** with the best match kept even
@@ -108,7 +108,7 @@ One service, **completiond**, with four pieces:
    **300 ms** deadline, at most **2** attempts and only on \`UNAVAILABLE\`, **3** candidates
    requested and at most 3 shown after empty, truncated and duplicate ones are dropped.
 4. The **Kafka** telemetry path: \`completion.shown\` and \`completion.accepted\` keyed by session
-   with \`request_id\`, \`language\`, \`candidate_len\` and \`latency_ms\` and never the code, an
+   with \`request_id\`, \`language\`, \`candidate_len\` and \`latency_ms\` and without the code, an
    idempotent producer with \`acks=all\`, and a consumer that updates
    \`HINCRBY acceptance:{language}\` before it commits.
 

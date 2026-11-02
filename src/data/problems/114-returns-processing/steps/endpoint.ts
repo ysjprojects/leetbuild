@@ -8,34 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it parses the body, looks up
-the order line, and registers the return. It compiles, it serves the demo, and it approves returns
-that policy says are closed. Debug it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter serves \`POST /v1/returns\` with body
+\`{"order_line_id": "…", "quantity": 1, "reason_code": "damaged", "photo_ref": "…"}\`: it parses the
+body, loads the order line, returns **404** for an unknown line, and registers the return with the
+quantity the caller sent. It compiles, serves the demo, and hides 4 flaws.
 
-Implement \`POST /v1/returns\` with body
-\`{"order_line_id": "…", "quantity": 1, "reason_code": "damaged", "photo_ref": "…"}\`.
+**Failure mode the checks target.** A customer whose window closed weeks ago gets a refund because
+the body said the return was eligible; a line ordered once is returned three times; "it was late"
+becomes a refund with no photo and a reason code nobody defined.
 
-- The order line is loaded server-side; an unknown line is **404**. Eligibility is **computed**
-  from the line's \`delivered_at\` and its \`policy_window\` — a \`standard\` line closes **30** days
-  after delivery and an \`extended\` line closes **60** days after delivery.
-- A return requested after the window closes is **422**, and the body must carry the dates:
-  \`delivered_at\` and \`window_ends\`.
-- \`quantity\` is an integer from **1** up to what remains returnable for the line: the ordered
-  quantity minus every quantity earlier returns already consumed. Anything above that — or below
-  1 — is **409** with \`remaining\` in the body. A second return must never take the line past its
-  ordered quantity.
+- Eligibility is **computed** from the line's \`delivered_at\` and its \`policy_window\`: a
+  \`standard\` line closes **30** days after delivery, an \`extended\` line **60** days after.
+- A return requested after the window closes is **422** with \`delivered_at\` and \`window_ends\`
+  in the body.
+- \`quantity\` is an integer from **1** up to what remains returnable: the ordered quantity minus
+  every quantity earlier returns already consumed. Anything outside that range is **409** with
+  \`remaining\` in the body.
 - \`reason_code\` must be one of \`damaged\`, \`wrong_item\`, \`not_as_described\`, \`late_delivery\`,
   \`changed_mind\` (**400** otherwise). The first three require a \`photo_ref\`; a claim without
   evidence is **400**.
-- A caller-supplied eligibility flag in the body is **ignored**. The starter approves when the body
-  says the customer promised the return was late; the server decides eligibility, never the client.
-- The registration is logged with the tenant, the line and the quantity — never the photo reference.
-
-**Failure mode the checks target.** The starter trusts a body flag the client controls, so a closed
-line is reopened by a sentence. It never subtracts earlier returns, so the same line is returned
-three times over. It never reads the policy window, so "it was late" becomes a refund. And it never
-validates the reason code or its evidence.`,
+- A caller-supplied eligibility flag in the body is **ignored**; the server decides eligibility.
+- The registration is logged with the tenant, the line and the quantity, not the photo reference.`,
   sequence: {
     participants: ['Customer', 'Returns API', 'orders · returns'],
     messages: [
@@ -174,8 +167,7 @@ store = ReturnsStore()
 
 @app.post("/v1/returns")
 def create_return(body: ReturnRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: the starter trusts the caller's eligible flag, never checks the policy window, never
-    # subtracts what earlier returns already consumed, and does not validate the reason code.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     line = store.line(body.order_line_id)
     if line is None:
         raise HTTPException(status_code=404, detail="unknown order line")
@@ -266,7 +258,7 @@ def create_return(body: ReturnRequest, tenant: str = Header(alias="X-Tenant-Id")
 `,
     },
     typescript: {
-      starter: `/** POST /v1/returns: flawed code that trusts the caller's eligibility flag. */
+      starter: `/** POST /v1/returns: the returns-creation handler. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -295,8 +287,7 @@ const store = {
 };
 
 app.post('/v1/returns', async (request, reply) => {
-  // TODO: the starter trusts the caller's eligible flag, never checks the policy window, never
-  // subtracts what earlier returns already consumed, and does not validate the reason code.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const body = request.body as ReturnBody;
   const line = await store.line(body.order_line_id);
   if (line === null) return reply.code(404).send({error: 'unknown order line'});
@@ -430,8 +421,7 @@ func createReturn(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: the starter trusts the caller's Eligible flag, never checks the policy window, never
-	// subtracts what earlier returns already consumed, and does not validate the reason code.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	line, err := store.Line(r.Context(), body.OrderLineID)
 	if err != nil {
 		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "internal"})
@@ -623,8 +613,7 @@ object ReturnApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ReturnRequest]) { body =>
-            // TODO: the starter trusts the caller's eligible flag, never checks the policy window,
-            // never subtracts what earlier returns already consumed, and does not validate the reason code.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             store.line(body.order_line_id) match {
               case None =>
                 complete(StatusCodes.NotFound, """{"error":"unknown order line"}""")
@@ -752,8 +741,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: the starter trusts the caller's eligible flag, never checks the policy window, never
-    // subtracts what earlier returns already consumed, and does not validate the reason code.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto orderLineId = body.value("order_line_id", std::string());
     const auto line = store.line(orderLineId);
     if (!line) {
@@ -871,9 +859,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guards in cost order — unknown line, reason code, evidence, window, remaining — and return before anything is registered. Eligibility is arithmetic on `delivered_at` and the policy window, so a closed line can never be reopened by anything the caller says.',
-    'The quantity you compare against is not the ordered quantity: it is the ordered quantity minus every quantity earlier returns already consumed. Compute `remaining` from the store and reject anything above it with **409**, so a line can never be returned past its ordered quantity.',
-    'The body may carry a flag named `eligible` or anything like it — ignore it. If you find yourself reading a request field to decide eligibility, the client is deciding policy. The only inputs are the line, the window, and the quantities already returned.',
+    'Support sees refunds on orders delivered months ago, lines returned more often than they were ordered, and damage claims with no photo attached.',
+    'The handler copies `eligible` and `quantity` from the body into the registration. Nothing compares the request date with `delivered_at`, nothing sums earlier returns, and the reason string is stored unchecked.',
+    'Before registering: compute `window_ends` from `delivered_at` plus 30 or 60 days (422 past it), compute `remaining` from the store (409 above it), validate `reason_code` and `photo_ref` (400), and drop the body flag.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends a well-formed request from one customer whose order just shipped. Three defects are being checked: computed eligibility (a policy window over \`delivered_at\`, not a caller assertion), cumulative quantities (what remains after earlier returns, not the ordered quantity), and validated evidence (an allowed reason code, and a photo for the damage reasons). The quiet one is the body flag: letting a client assert eligibility turns every return into a formality. Real services add per-region windows from config, a reasons table with evidence requirements, and a reconciliation job that compares registered returns against the ledger.`,
+  debrief: `The fix moves every decision that affects money onto inputs the server owns: the delivered date and policy window from the line, the remaining quantity from the store, the reason code from a fixed set. The guards run in cost order, cheapest first, and all of them return before anything is registered, so a rejected request leaves no row behind. The 422 carries the window dates so the customer sees why, and the 409 carries \`remaining\` so a partial return can be retried correctly. What this step leaves out: policy windows per region and category loaded from configuration rather than two constants, a reasons table that records which codes require evidence, and a reconciliation job that compares registered returns against the order ledger to catch drift.`,
 };

@@ -8,29 +8,27 @@ export const shadowReadStep: Step = {
   focus: ['client', 'shadow', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it loads a config's samples, computes a delta and
-returns a verdict. It compiles and the demo shows a winner. The flaw is that it celebrates. Debug
-it, fix it, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/shadow/configs/{id}/report\`: it loads the config's
+paired deltas by id alone, averages them, answers \`candidate_better\` whenever the mean is
+positive, and returns \`{config_id, delta, verdict}\`. It compiles, the demo shows a winner, and it
+hides four flaws.
 
-Implement \`GET /v1/shadow/configs/{id}/report\`, the endpoint that turns paired samples into a
-usable answer.
+**Failure mode the checks target.** A measurement turned into a decision it cannot support. The
+starter declares a winner from **12 pairs** because the delta is positive; it hides the sample
+count, returns no interval and no window; and it serves **any config to any caller**, so one tenant
+can read another's experiment.
+
+Requirements:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - The report returns the **paired score delta** together with the **sample count**, a **confidence
   interval** (\`ci_low\`, \`ci_high\`) and the **exact traffic window** (\`window_start\`,
-  \`window_end\`) the samples were collected over. A delta without its sample count and window is not
-  a result.
-- Below **500 paired samples** the verdict is \`inconclusive\`, no matter how positive the delta
-  looks. Interval and threshold together are what stop a twelve-sample fluke from shipping a model.
-- A config that belongs to another tenant is **404**, never 403 — a shadow report must not confirm
+  \`window_end\`) the samples were collected over.
+- Below **500 paired samples** the verdict is \`inconclusive\`, however positive the delta looks.
+- A config that belongs to another tenant is **404**, not 403: a shadow report must not confirm
   that someone else's experiment exists.
-- Never return the raw samples or any request content; the report is counts, deltas, an interval and
-  a window.
-
-**Failure mode the checks target.** The starter declares a winner from **12 pairs** because the delta
-is positive; it **hides the sample count** and returns no interval; and it serves **any config to any
-caller**, so one tenant can read another's experiment. Each of those turns a measurement into a
-decision it cannot support.`,
+- Do not return the raw samples or any request content; the report is counts, deltas, an interval
+  and a window.`,
   sequence: {
     participants: ['Client', 'Shadow Service', 'report store'],
     messages: [
@@ -133,8 +131,7 @@ def shadow_report(
     id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
-    # sample count and the interval, and serves any config to any caller. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     report = store.load(id)
     deltas = report["deltas"]
     delta = sum(deltas) / len(deltas)
@@ -218,8 +215,7 @@ import {reportStore} from './store';
 export const app = Fastify();
 
 app.get<{Params: {id: string}}>('/v1/shadow/configs/:id/report', async (request, reply) => {
-  // TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
-  // sample count and the interval, and serves any config to any caller. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {id} = request.params;
   const report = await reportStore.load(id);
   const delta = report.deltas.reduce((sum: number, d: number) => sum + d, 0) / report.deltas.length;
@@ -299,8 +295,7 @@ func (s *ReportStore) Load(configID string) (map[string]any, error) {
 var reportStore = &ReportStore{}
 
 func shadowReport(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
-	// sample count and the interval, and serves any config to any caller. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	configID := r.PathValue("id")
 	report, _ := reportStore.Load(configID)
 	verdict := "inconclusive"
@@ -419,8 +414,7 @@ object ShadowReport {
   val route: Route =
     path("v1" / "shadow" / "configs" / Segment / "report") { configId =>
       get {
-        // TODO: the starter declares a winner from twelve pairs because the delta is positive, hides
-        // the sample count and the interval, and serves any config to any caller. Fix all three.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         val report = reportStore.load(configId)
         val verdict = if (report.delta > 0) "candidate_better" else "inconclusive"
         complete(StatusCodes.OK, "{\\"config_id\\":\\"" + configId + "\\",\\"verdict\\":\\"" + verdict + "\\"}")
@@ -524,8 +518,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/shadow/configs/(\\d+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
-    // sample count and the interval, and serves any config to any caller. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto configId = req.matches[1].str();
     const auto report = reportStore.load(configId);
     const std::string verdict = report.delta > 0 ? "candidate_better" : "inconclusive";
@@ -620,9 +613,9 @@ int main() {
     },
   },
   hints: [
-    'A delta is not a result without its sample count and its window: return `sample_count`, `window_start` and `window_end` next to the delta. Then the threshold is a one-line comparison: `sample_count < 500` ⇒ `inconclusive`, whatever the delta says.',
-    'The interval is what makes the delta readable: `ci_low` and `ci_high` around the paired mean (`z * sqrt(variance / n)`). A winner is only a winner when the interval excludes zero — and only above the sample threshold.',
-    'Scope the load by tenant and answer **404** for anything that is not theirs — the same answer as a config that never existed. A 403 confirms the config exists, which is itself a leak between customers.',
+    "Symptom: a config with a dozen samples reports `candidate_better` with a bare `delta` of 0.03, nobody can say over which hours it was measured, and a tenant who guesses another tenant's config id gets their report back.",
+    'Mechanism: `verdict = "candidate_better" if delta > 0` has no sample threshold, the response body has no count, interval or window, and `store.load(id)` ignores the `tenant` header the handler already receives.',
+    'Change: `MIN_PAIRED_SAMPLES = 500` with `inconclusive` below it; add `sample_count`, `ci_low`/`ci_high` (`Z_95 * sqrt(variance / n)`), `window_start`/`window_end`; load by `(tenant, id)` and answer `status_code=404` when it is not theirs.',
   ],
-  debrief: `The interviewer is testing whether you can keep a measurement from becoming an unsupported decision. Four defects are being checked. The threshold: twelve pairs and a positive delta is noise, and the endpoint must say \`inconclusive\` rather than crown a winner — a shadow that ships a model on a fluke is worse than no shadow. The interval: a delta without a confidence interval cannot be judged, so \`ci_low\`/\`ci_high\` travel with it. The window: a delta is only meaningful for the period and traffic mix it came from, so \`window_start\`/\`window_end\` are part of the answer. The scope: load the config for the authenticated tenant and return 404 for anything else, because a 403 confirms a foreign experiment exists. Real reports add the metric breakdown, the share actually observed versus configured, and a guard on the experiment’s own runtime before it is allowed to conclude anything.`,
+  debrief: `The fix keeps a measurement from becoming an unsupported decision. Twelve pairs and a positive delta is noise, so the endpoint says \`inconclusive\` rather than crown a winner; a shadow that ships a model on a fluke is worse than no shadow. A delta without a confidence interval cannot be judged, so \`ci_low\`/\`ci_high\` travel with it, and a delta is only meaningful for the period and traffic mix it came from, so \`window_start\`/\`window_end\` are part of the answer. Loading by tenant and answering 404 for anything else closes the cross-tenant read, since a 403 would confirm a foreign experiment exists. Production reports go further: a per-metric breakdown, the share actually observed against the share configured, and a minimum experiment runtime before any verdict is allowed.`,
 };

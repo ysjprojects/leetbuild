@@ -8,32 +8,28 @@ export const readStep: Step = {
   focus: ['console', 'queue', 'items'],
   task: `## Task
 
-**Starting point.** The starter serves a queue summary from a cached counter. On the demo the counter
-matches the store. After a batch of lease expiries it does not — items the sweeper returned are in the
-store but not in the cache — and the operator staffing the queue acts on the wrong number. Debug it,
-fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/review/queues/{priority}\`: it reads the tenant
+header, looks the priority up in an in-process \`depth_cache\` dict and returns \`priority\`,
+\`depth\` and a constant \`sla_breaches: 0\`. It compiles, serves the demo and hides 5 flaws.
 
-Implement \`GET /v1/review/queues/{priority}\` for the operator console:
+**Failure mode the checks target.** After a batch of lease expiries the sweeper returns items to the
+store that the cache does not count, so the operator staffing the queue under-counts exactly when it
+is under stress; nobody sees how long the oldest item has waited or how much work is stuck assigned;
+and one tenant can read another's review backlog.
 
 - **Depth per priority, from the item store.** \`queue_depth(tenant, priority)\` counts the items
-  actually queued — including the ones the lease-expiry sweeper returned — by asking the item store
-  (\`store.count(tenant, priority, "queued")\`), never a cached counter that goes stale when a lease
+  actually queued, including the ones the lease-expiry sweeper returned, by asking the item store
+  (\`store.count(tenant, priority, "queued")\`) rather than a counter that goes stale when a lease
   expires.
 - **Oldest age, always reported.** \`oldest_age(tenant, priority)\` returns the age in seconds of the
-  oldest queued item, or \`null\` when the queue is empty. It must be present in the response every
-  time — never hidden, never omitted, never \`-1\`.
+  oldest queued item, or \`null\` when the queue is empty. It is present in the response every time,
+  not omitted and not \`-1\`.
 - **SLA breach count.** The response carries \`breach_count\`: how many items in this queue have
   breached their SLA, so an operator can see the queue degrading before reviewers notice.
 - **Assignment state distribution.** The response carries \`assignment_states\`: how many items are
   \`queued\`, \`assigned\` and \`breached\`, so an operator can see whether work is stuck assigned.
-- **Tenant scope.** A queue belongs to one tenant. The caller's \`X-Tenant-Id\` owns it; asking for
-  another tenant's queue (\`?tenant=…\` different from the header) is **403**, never that tenant's
-  data. A missing header is **401**.
-
-**Failure mode the checks target.** Three defects. The starter reads depth from a cached counter that
-misses items returned by lease expiry, so the operator under-counts exactly when the queue is under
-stress. It hides the oldest age, so nobody sees the item that has been waiting longest. And it serves
-any tenant's queue, so one tenant can read another's review backlog.`,
+- **Tenant scope.** The caller's \`X-Tenant-Id\` owns the queue; asking for another tenant's queue
+  (\`?tenant=…\` different from the header) is **403**. A missing header is **401**.`,
   sequence: {
     participants: ['Operator', 'Review Queue', 'Item store'],
     messages: [
@@ -130,8 +126,7 @@ def read_queue(
     priority: str,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter computes depth from a cached counter that misses items returned by lease
-    # expiry, hides the oldest age and serves any tenant's queues. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     return JSONResponse(
         {
             "priority": priority,
@@ -193,8 +188,7 @@ export const app = Fastify();
 const depthCache: Record<string, number> = {p1: 12, p2: 40, p3: 3};
 
 app.get('/v1/review/queues/:priority', async (request, reply) => {
-  // TODO: this starter computes depth from a cached counter that misses items returned by lease
-  // expiry, hides the oldest age and serves any tenant's queues. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const priority = request.params['priority'];
   return reply.code(200).send({priority, depth: depthCache[priority] ?? 0, sla_breaches: 0});
 });
@@ -252,8 +246,7 @@ var depthCache = map[string]int{"p1": 12, "p2": 40, "p3": 3}
 
 func readQueue(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
-	// TODO: this starter computes depth from a cached counter that misses items returned by lease
-	// expiry, hides the oldest age and serves any tenant's queues. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	priority := r.PathValue("priority")
 	body := map[string]any{
 		"priority":     priority,
@@ -346,8 +339,7 @@ object Api {
   def route: Route =
     path("v1" / "review" / "queues" / Segment) { priority =>
       get {
-        // TODO: this starter computes depth from a cached counter that misses items returned by
-        // lease expiry, hides the oldest age and serves any tenant's queues. Fix all three.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         headerValueByName("X-Tenant-Id") { _ =>
           val body = s"""{"priority":"$priority","depth":\${DepthCache.getOrElse(priority, 0)},"sla_breaches":0}"""
           complete(StatusCodes.OK, body)
@@ -407,8 +399,7 @@ const std::map<std::string, int> depth_cache = {{"p1", 12}, {"p2", 40}, {"p3", 3
 int main() {
   httplib::Server svr;
   svr.Get("/v1/review/queues/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter computes depth from a cached counter that misses items returned by lease
-    // expiry, hides the oldest age and serves any tenant's queues. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     auto priority = req.matches[1].str();
     auto it = depth_cache.find(priority);
     json body = {
@@ -476,9 +467,9 @@ int main() {
     },
   },
   hints: [
-    'Depth is a fact about the item store, not a cached number. Count the queued items per priority on read, so the items the sweeper returned after a lease expiry are included instead of lost.',
-    'The oldest age is what tells an operator where the pain is. Always return it — the age of the oldest queued item, or `null` when the queue is empty — never hide it behind a placeholder.',
-    'A queue belongs to one tenant. The `X-Tenant-Id` owns it; a request naming a different tenant’s queue is 403, and the breach count and assignment distribution come from the same store as the depth.',
+    "Symptoms: after the sweeper runs, the console shows 12 queued while reviewers see 30; breaches read 0 during an incident; a tenant pastes another tenant's id into `?tenant=` and gets numbers back.",
+    'Nothing in the handler touches the item store: depth is a dict literal, breaches are a constant, there is no age and no state breakdown, and the tenant header is read but compared to nothing.',
+    'Add `queue_depth` over `store.count(tenant, priority, "queued")`, `oldest_age` returning seconds or `null`, `breach_count` and `assignment_states` from the same store, and return 403 when `?tenant=` differs from the header.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read path, which is where operators make staffing decisions. Three defects are being checked. First, the source of truth: a cached depth counter goes stale exactly when lease expiry returns items to the queue, so the operator under-counts when the queue is most stressed — count from the item store on read. Second, the oldest age: it is the single most actionable number on the page and the starter hides it, so nobody sees the item that has been waiting longest. Third, the tenant scope: a queue read must be scoped to the caller's tenant, or one tenant can read another's review backlog — a cross-tenant leak that looks like a convenience feature in the starter. The subtle point candidates miss is that depth, breach count and assignment distribution must all come from the same store and the same read, or the operator sees a summary that disagrees with itself. Real consoles add per-priority SLA targets beside the age, a trend of depth over time, and a drill-down that lists the items behind each number.`,
+  debrief: `Every number on this page is a fact about the item store, so every number is read from it in one pass; a cached counter goes stale at the exact moment lease expiry returns items, which is when the operator most needs the real figure. The oldest age is the single most actionable value on the page, which is why it is always present rather than hidden behind a placeholder. Depth, breach count and assignment distribution come from the same read so the summary cannot disagree with itself. Tenant scope is enforced on a read path because a summary of another tenant's backlog is still a leak. Production consoles go further: per-priority SLA targets beside the age, a depth trend over time, and a drill-down that lists the items behind each number.`,
 };

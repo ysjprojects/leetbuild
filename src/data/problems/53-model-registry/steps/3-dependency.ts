@@ -8,38 +8,24 @@ export const dependencyStep: Step = {
   focus: ['registry', 'serving', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: the probe connects, the
-call returns and the pool gets traffic, so the demo promotes. It compiles, and it treats a
-connection and a timeout as proof of two different things. Debug it like the service owner, fix it,
-and prove the fix with the checks below.
+**Starting point.** \`promote_with_probe(pool, name, version, digest, percent)\` calls
+\`probe.Probe(ProbeRequest(pool, expected_digest))\` over gRPC with no timeout, ignores the reply,
+calls \`serving.set_traffic(pool, name, version, percent)\` and returns \`{"promoted": true}\`.
+It compiles and hides four flaws.
 
-Implement the serving probe that must pass before a pool's traffic increases:
+**Failure mode the checks target.** A pool that loaded the wrong artifact, or that did not answer
+at all, receives production traffic because the probe reply was not read and the call had no
+deadline.
 
-- Promotion first warms the target pool over **gRPC** (\`ServingProbe.Probe(pool, expected_digest)\`).
-  Every attempt carries a **10-second deadline** (\`PROBE_DEADLINE_MS = 10_000\`); the starter has
-  none, so one slow pool pins the promotion worker indefinitely.
-- At most **two attempts** per pool. Retry only \`UNAVAILABLE\`; every other status fails fast. The
-  starter retries nothing and bounds nothing.
-- The probe reply carries the digest the pool **actually loaded** (\`loaded_digest\`). Promotion may
-  increase traffic **only when it equals the registered digest**; any difference returns
-  \`{"promoted": false, "reason": "digest_mismatch"}\` and leaves traffic on the previous version.
-  The starter never looks at the loaded digest, so a pool serving stale bytes is promoted.
-- A probe **timeout is a blocked promotion**, not a reason to proceed: return
-  \`{"promoted": false, "reason": "probe_timeout"}\`. The starter promotes anyway "to keep the
-  pipeline moving", which is how a version with the wrong artifact reaches half the fleet.
-- Any other probe failure returns \`{"promoted": false, "reason": "probe_failed"}\` with the same
-  property: **traffic does not move**. Only after a verified digest does the code call
-  \`serving.set_traffic(pool, name, version, percent)\`.
-
-**Failure mode the checks target.** A timeout must block rather than proceed, a loaded digest that
-differs from the registered one must block, and a failure must leave the previous version serving
-100% with a reason an operator can read. The starter passes the serial happy path and fails all three
-at the moment they are the only thing standing between a bad artifact and production traffic.
-
-## What to keep
-
-The probe call shape and the traffic-shifting call are fine. The fix is the deadline, the bounded
-retry, the digest comparison and the no-move-on-failure rule.`,
+- Every probe attempt carries \`PROBE_DEADLINE_MS = 10_000\` (\`timeout=\` on the stub call). At
+  most two attempts per pool; retry only \`UNAVAILABLE\`.
+- The reply's \`loaded_digest\` must equal the registered digest. A difference returns
+  \`{"promoted": false, "reason": "digest_mismatch"}\`.
+- \`DEADLINE_EXCEEDED\` returns \`{"promoted": false, "reason": "probe_timeout"}\`; any other
+  status returns \`"reason": "probe_failed"\`.
+- \`serving.set_traffic\` is called only after the digest comparison passed, so on every failure
+  path the previous version keeps 100% and the operator sees the reason.
+- The probe request shape and the traffic call stay as they are.`,
   sequence: {
     participants: ['Registry promotion', 'Serving pool'],
     messages: [
@@ -154,10 +140,7 @@ serving = ServingPool()
 
 
 def promote_with_probe(pool: str, name: str, version: str, digest: str, percent: int) -> dict:
-    # TODO: the starter promotes as soon as the probe call returns, never checks the digest the pool
-    # loaded, gives the probe no deadline, and on a timeout promotes anyway to keep the pipeline
-    # moving. Verify loaded_digest against the registered digest, block on a timeout with a visible
-    # reason, and only then move traffic.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     probe.Probe(serving_pb2.ProbeRequest(pool=pool, expected_digest=digest))
     serving.set_traffic(pool, name, version, percent)
     return {"promoted": True, "pool": pool, "version": version}
@@ -214,7 +197,7 @@ def promote_with_probe(pool: str, name: str, version: str, digest: str, percent:
 `,
     },
     typescript: {
-      starter: `/** Promote: flawed code that promotes when the probe call returns. */
+      starter: `/** Promote: probes the pool, then shifts traffic. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -249,10 +232,7 @@ export async function promoteWithProbe(
   digest: string,
   percent: number,
 ): Promise<{promoted: boolean; reason?: string}> {
-  // TODO: the starter promotes as soon as the probe call returns, never checks the digest the pool
-  // loaded, gives the probe no deadline, and on a timeout promotes anyway to keep the pipeline
-  // moving. Verify loadedDigest against the registered digest, block on a timeout with a visible
-  // reason, and only then move traffic.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   await new Promise<void>((resolve, reject) => {
     probe.Probe({pool, expected_digest: digest}, error => (error ? reject(error) : resolve()));
   });
@@ -352,10 +332,7 @@ func (s *ServingPool) SetTraffic(ctx context.Context, pool, name, version string
 var serving = &ServingPool{}
 
 func PromoteWithProbe(ctx context.Context, pool, name, version, digest string, percent int) map[string]any {
-	// TODO: the starter promotes as soon as the probe call returns, never checks the digest the pool
-	// loaded, gives the probe no deadline, and on a timeout promotes anyway to keep the pipeline
-	// moving. Verify LoadedDigest against the registered digest, block on a timeout with a visible
-	// reason, and only then move traffic.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	conn, _ := grpc.DialContext(ctx, "serving-"+pool+":9000", grpc.WithInsecure())
 	client := NewServingProbeClient(conn)
 	_, _ = client.Probe(ctx, &ProbeRequest{Pool: pool, ExpectedDigest: digest})
@@ -441,10 +418,7 @@ object Promotion {
   val serving = new ServingPool
 
   def promoteWithProbe(pool: String, name: String, version: String, digest: String, percent: Int): Map[String, Any] = {
-    // TODO: the starter promotes as soon as the probe call returns, never checks the digest the pool
-    // loaded, gives the probe no deadline, and on a timeout promotes anyway to keep the pipeline
-    // moving. Verify loadedDigest against the registered digest, block on a timeout with a visible
-    // reason, and only then move traffic.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     probe.probe(ProbeRequest(pool = pool, expectedDigest = digest))
     serving.setTraffic(pool, name, version, percent)
     Map("promoted" -> true, "pool" -> pool, "version" -> version)
@@ -525,10 +499,7 @@ std::unique_ptr<ServingProbe::Stub> stub;
 
 json promote_with_probe(const std::string& pool, const std::string& name, const std::string& version,
                         const std::string& digest, int percent) {
-  // TODO: the starter promotes as soon as the probe call returns, never checks the digest the pool
-  // loaded, gives the probe no deadline, and on a timeout promotes anyway to keep the pipeline
-  // moving. Verify loaded_digest against the registered digest, block on a timeout with a visible
-  // reason, and only then move traffic.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   grpc::ClientContext ctx;
   ProbeRequest request;
   request.set_pool(pool);
@@ -599,9 +570,9 @@ json promote_with_probe(const std::string& pool, const std::string& name, const 
     },
   },
   hints: [
-    'A connection is not a proof. The probe must return the digest the pool *loaded* — `loaded_digest` — and promotion may proceed only when it equals the registered digest; anything else is `digest_mismatch` and traffic stays where it is.',
-    'Bound both axes: a deadline per attempt (`withDeadlineAfter(10_000, MILLISECONDS)`, `context.WithTimeout`, `{deadline: Date.now() + PROBE_DEADLINE_MS}`) and a cap on attempts, retrying only `UNAVAILABLE`. A pool that never answers must fail the promotion, not stall the worker or get a free pass.',
-    'On every failure path, return before the traffic call. A timeout is `probe_timeout`, a mismatch is `digest_mismatch`, a repeated `UNAVAILABLE` is `probe_failed` — and in all three the previous version keeps 100% and the reason is visible to the operator.',
+    "A pool still serving last week's artifact got promoted to 100% and the dashboard shows `promoted: true`. On another day the promotion worker hung for forty minutes on one pool.",
+    'The reply of `probe.Probe` is discarded, so the loaded digest is never compared, and the call has no timeout, so a silent pool blocks the worker instead of failing the promotion.',
+    'Call `Probe` with `timeout=PROBE_DEADLINE_MS / 1000`, two attempts on `UNAVAILABLE`; map `DEADLINE_EXCEEDED` to `probe_timeout`, `loaded_digest != digest` to `digest_mismatch`, else `probe_failed`; call `set_traffic` after the comparison only.',
   ],
-  debrief: `The interview question behind this step is what counts as proof before traffic moves. A TCP connection proves a listener exists; it says nothing about which artifact that listener loaded. The starter promotes on the weaker signal and, worse, treats a timeout as a reason to proceed — the exact moment when you know the least. The fix is a deadline so "no answer" stays a bounded failure, a digest comparison so the pool has to prove which bytes it holds, and a return before the traffic call so a failed probe leaves the previous version serving with a readable reason. Real platforms add a cache-warm step that verifies the artifact checksum after load, a gradual 1%-then-100% ramp, and automatic rollback when the promoted version's error rate crosses a threshold.`,
+  debrief: `The comparison sits between the probe and the traffic call because that is the only point where the registry knows both digests: the one it registered and the one the pool reports it loaded. A deadline makes "no answer" a bounded, named failure, and returning before set_traffic makes every failure leave the previous version serving. Production serving platforms layer more on this gate. KServe's canary rollout tracks the last revision that reached 100%, routes only \`canaryTrafficPercent\` to the new revision, refuses to route to a revision that is not ready, and on rollback pins all traffic to the previous good revision while it is still loaded.`,
 };

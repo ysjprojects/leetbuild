@@ -8,12 +8,18 @@ export const stateStep: Step = {
   focus: ['synth', 'redis', 'generator'],
   task: `## Task
 
-**Starting point.** The starter is working code: every generated record moves a
-counter and the dashboard shows the corpus growing. It measures the wrong thing, it lets one seed
-entity collapse the set, and its keys live forever. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter's \`record_generated\` requires a \`seed_digest\`, reads a
+\`records\` field from \`synth:total:{job_id}\` with \`HGET\`, increments it in a second call, stores
+the last entity id, and returns \`{"admitted": true, "total": n}\`. It compiles, serves the demo and
+hides 5 flaws.
 
-Implement \`record_generated\`, the call a generator worker makes for each record it produces from a
-seed entity:
+**Failure mode the checks target.** Diversity collapse: a recipe asked for ten thousand records can
+satisfy the count with one prolific entity, and no gate based on totals notices. The client-side
+read-modify-write loses increments under concurrency, and the missing TTL keeps every generation
+attempt in Redis for months.
+
+\`record_generated\` is the call a generator worker makes for each record it produces from a seed
+entity:
 
 - Coverage lives in Redis as a **hash per job**: \`synth:cov:{job_id}\`, whose fields are entity ids
   and whose values are how many records of that entity were admitted. The report reads this hash,
@@ -23,21 +29,13 @@ seed entity:
   \`WINDOW_S = 60\`. The window bucket in the key is what makes the throttle reset on schedule.
 - At most \`ENTITY_LIMIT = 5\` records of the same entity are admitted inside one window. Beyond
   that the record is **throttled**: nothing is admitted, nothing is counted, and the caller is told
-  \`throttled: true\`. A throttled attempt must **not** consume the job's record cap — the cap counts
-  records the corpus actually keeps.
-- The counting, the limit comparison and the expiry happen in **one atomic Lua \`EVAL\`**. The starter
-  reads the counter and writes it back as two client calls, so two workers landing together both
-  observe a count of 4 and admit a sixth record.
+  \`throttled: true\`. A throttled attempt must **not** consume the job's record cap.
+- The counting, the limit comparison and the expiry happen in **one atomic Lua \`EVAL\`**, so two
+  workers landing together cannot both observe a count of 4 and admit a sixth record.
 - Both keys expire: the windowed key with **\`EXPIRE\` set to \`WINDOW_S\`** inside the script, the
-  job's coverage hash with \`JOB_TTL_S = 86400\`. The starter sets no TTL anywhere, so every finished
-  job's keys accumulate forever.
+  job's coverage hash with \`JOB_TTL_S = 86400\`.
 - Return \`{"admitted": bool, "throttled": bool, "coverage": {entity_id: count, …}}\`, where
-  \`coverage\` is the job's per-entity breakdown — not a single total.
-
-**Failure mode the checks target.** The subtle one is the diversity collapse: a recipe asked for ten
-thousand records can satisfy the count with one prolific entity, and no quality gate based on totals
-notices. The client-side read-modify-write is the loud one under concurrency, and the missing TTL is
-the silent one that keeps every generation attempt in Redis for months.`,
+  \`coverage\` is the job's per-entity breakdown, not a single total.`,
   sequence: {
     participants: ['Generator worker', 'Second worker', 'Redis'],
     messages: [
@@ -52,9 +50,9 @@ the silent one that keeps every generation attempt in Redis for months.`,
     ],
   },
   hints: [
-    'Everything that decides the result has to run inside the script: read nothing on the client, because the client read is where the race lives. A single `EVAL` can `INCR` the windowed key, compare it with the limit, and only then `HINCRBY` the job coverage.',
-    'Two keys, not one: the windowed per-entity counter carries the window in its name (so the next window starts from zero without anyone resetting anything) and gets `EXPIRE … WINDOW_S`; the job coverage hash is the thing the report reads, and it gets the job’s TTL.',
-    'Return the coverage map from the same call. If the counter only ever moves a `total`, a recipe that regenerates one seed entity a thousand times passes every quality check you can write — and the throttled attempt must not bump the admitted counter it was denied.',
+    'A job asked for ten thousand records reports ten thousand, the dashboard looks healthy, and the trained model has seen one seed entity over and over. Under two workers the total sometimes lands one short.',
+    'One hash field per job cannot say which entity a record came from, and `HGET` followed by `HINCRBY` is two round trips, so two workers read the same count. No key carries a window or a TTL.',
+    'Put `INCR` on `synth:cov:{job}:{entity}:{window}`, the `ENTITY_LIMIT` compare, `EXPIRE WINDOW_S` and the `HINCRBY` on the job hash into `COVERAGE_LUA`, run it with `.eval(`, and return `hgetall(` as `coverage`.',
   ],
   checks: [
     {
@@ -140,10 +138,7 @@ class GeneratedRecord(BaseModel):
 
 
 def record_generated(record: GeneratedRecord) -> dict:
-    # TODO: the dashboard this feeds moves one total per job, so a recipe that regenerates a single
-    # seed entity a thousand times still looks like a growing corpus. The total is read with a
-    # client-side HGET and written back in a second call, so two workers landing together lose an
-    # increment, and nothing here dies: no per-entity key, no time window, no TTL, no early cutoff.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if not record.seed_digest:
         raise HTTPException(status_code=400, detail="seed_digest is required")
     total_key = f"synth:total:{record.job_id}"
@@ -213,7 +208,7 @@ def record_generated(record: GeneratedRecord) -> dict:
 `,
     },
     typescript: {
-      starter: `/** recordGenerated: flawed code that moves one total per job. */
+      starter: `/** recordGenerated: move the job counter for one generated record. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -230,10 +225,7 @@ interface GenerationResult {
 }
 
 export async function recordGenerated(record: GeneratedRecord): Promise<GenerationResult> {
-  // TODO: the dashboard this feeds moves one total per job, so a recipe that regenerates a single
-  // seed entity a thousand times still looks like a growing corpus. The total is read with a
-  // client HGET and written back in a second call, so two workers landing together lose an
-  // increment, and nothing here dies: no per-entity key, no time window, no TTL, no early cutoff.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const totalKey = \`synth:total:\${record.job_id}\`;
   const total = Number((await r.hget(totalKey, 'records')) ?? 0);
   await r.hincrby(totalKey, 'records', 1);
@@ -327,10 +319,7 @@ type GenerationResult struct {
 }
 
 func recordGenerated(ctx context.Context, record GeneratedRecord) (GenerationResult, error) {
-	// TODO: the dashboard this feeds moves one total per job, so a recipe that regenerates a single
-	// seed entity a thousand times still looks like a growing corpus. The total is read with a
-	// client HGet and written back in a second call, so two workers landing together lose an
-	// increment, and nothing here dies: no per-entity key, no time window, no TTL, no early cutoff.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	totalKey := fmt.Sprintf("synth:total:%s", record.JobID)
 	total, _ := rdb.HGet(ctx, totalKey, "records").Int64()
 	rdb.HIncrBy(ctx, totalKey, "records", 1)
@@ -428,10 +417,7 @@ object GenerationStore {
   val r = new Jedis("redis", 6379)
 
   def recordGenerated(record: GeneratedRecord): GenerationResult = {
-    // TODO: the dashboard this feeds moves one total per job, so a recipe that regenerates a single
-    // seed entity a thousand times still looks like a growing corpus. The total is read with a
-    // client HGET and written back in a second call, so two workers landing together lose an
-    // increment, and nothing here dies: no per-entity key, no time window, no TTL, no early cutoff.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val totalKey = s"synth:total:\${record.job_id}"
     val total = Option(r.hget(totalKey, "records")).map(_.toLong).getOrElse(0L)
     r.hincrBy(totalKey, "records", 1)
@@ -516,10 +502,7 @@ struct GenerationResult {
 };
 
 GenerationResult recordGenerated(sw::redis::Redis& redis, const GeneratedRecord& record) {
-  // TODO: the dashboard this feeds moves one total per job, so a recipe that regenerates a single
-  // seed entity a thousand times still looks like a growing corpus. The total is read with a
-  // client HGET and written back in a second call, so two workers landing together lose an
-  // increment, and nothing here dies: no per-entity key, no time window, no TTL, no early cutoff.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto totalKey = "synth:total:" + record.job_id;
   auto raw = redis.hget(totalKey, "records");
   const long long total = raw ? std::stoll(*raw) : 0;
@@ -592,5 +575,5 @@ GenerationResult recordGenerated(sw::redis::Redis& redis, const GeneratedRecord&
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can see that a counter is a design decision. Counting records answers "did the job run", not "is the corpus usable"; a synthetic set that is 1000 copies of one seed entity passes every total-based gate and teaches a model nothing new. Three defects are checked: the client-side read-modify-write (lost increments under concurrency), the missing window key and TTL (throttle that never resets and keys that never die), and the total-only result. The subtle one is the interaction between the throttle and the cap: a throttled attempt has to leave the admitted count alone, otherwise the cap is consumed by records the corpus never kept. Real systems also track a diversity metric over entity *types* and shuffle the seed order so the cap is spent across entities rather than down the list.`,
+  debrief: `The fix moves the decision into Redis because the decision is a read followed by a write on the same value, and only a script can make those two steps one. The window number lives in the key rather than in a reset job so a new window starts from zero by construction, and the \`EXPIRE\` sits inside the same script so no key can be created without its TTL. Keeping the throttled attempt out of both the windowed counter and the job hash is what keeps the cap for records the corpus kept. A production ledger would also report diversity over entity *types*, not just ids, and shuffle the seed order so the cap is spent across entities instead of down the list.`,
 };

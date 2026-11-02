@@ -8,36 +8,30 @@ export const experimentStateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it hashes a unit, looks at the
-experiment's split, and serves a variant. It works for one experiment whose split never moves. Read
-it like the service owner, name the subtle defect, fix it, and prove the fix with the checks below.
+**Starting point.** The starter hashes a unit with the experiment's salt, compares the bucket with
+the first weight of the split, caches the variant under \`assign:{unit}\` and serves it. It works for
+one 50/50 experiment whose split never moves. It serves the demo and hides 4 flaws.
 
-An assignment is a pure function of **(experiment id, assignment unit, frozen salt)** — change any
-one of the three and the bucket is no longer this unit's bucket. Implement the assignment cache:
+**Failure mode the checks target.** A unit sees two variants in one session after a split or salt is
+edited, one experiment's cached row answers another experiment's request, and stopping an experiment
+flips everyone to control instead of serving the assignment already written.
+
+An assignment is a pure function of **(experiment id, assignment unit, frozen salt)**. Implement the
+assignment cache:
 
 - Compute the bucket exactly as \`int(sha256(f"{experiment.id}:{unit}:{experiment.salt}").hexdigest()[:8], 16) % 100\`
-  (same shape in every language) and use the experiment's **frozen salt** — never a mutable or
-  live-edited salt. The salt is pinned when the experiment starts, so a later edit is a new version,
-  not a live mutation.
-- Key the cached assignment by \`exp:{experiment_id}:assign:{unit}\` (mirror per language). A key that
-  names only the unit leaks one experiment's assignment into another experiment's request.
+  (same shape in every language) with the experiment's **frozen salt**.
+- Key the cached assignment by \`exp:{experiment_id}:assign:{unit}\` (mirror per language).
 - Write the assignment with a conditional write (\`SET NX\` / \`setnx\`-style) so a concurrent request
   cannot overwrite an existing assignment. The cached value is the variant key.
 - Read the cache **first**; only a miss computes the bucket. A row created by the frozen hash stays
   the same for the experiment's whole life, even if the split or the salt is later edited.
-- A new unit still fills the **frozen** split — buckets \`0–49\` → \`control\`, \`50–99\` → \`treatment\` —
-  by walking its cumulative weights. The frozen split is what decides the variant.
-- A \`stopped\` or disabled experiment serves the **last cached assignment** instead of flipping
-  everyone to control: if the assignment exists, return it even when the experiment is not running.
-  Only a unit with no assignment on a stopped experiment is refused (**409** / \`None\`).
-- New assignments get a TTL (\`exp:{id}:assign:{unit}\` with \`EX\`/\`ex=\` of the experiment's remaining
-  life, or 30 days) so an abandoned unit does not keep a dead row forever.
-
-**Failure mode the checks target.** The starter recomputes the bucket from the experiment's *current*
-weights and salt on every request (the cache read, when it happens at all, comes after the hash), so
-a user can see two variants in one session when the split is edited; the key omits the experiment id,
-so quotas collide across experiments; and a stopped experiment returns control for everyone instead
-of the assignment already written.`,
+- A new unit fills the **frozen** split (buckets \`0–49\` → \`control\`, \`50–99\` → \`treatment\`) by
+  walking its cumulative weights.
+- A \`stopped\` or disabled experiment serves the **last cached assignment**; only a unit with no
+  assignment on a stopped experiment is refused (**409** / \`None\`).
+- New assignments get a TTL (\`EX\`/\`ex=\` of the experiment's remaining life, or 30 days) so an
+  abandoned unit does not keep a dead row forever.`,
   sequence: {
     participants: ['Experiment API', 'Redis', 'Experiment store'],
     messages: [
@@ -61,9 +55,9 @@ of the assignment already written.`,
     ],
   },
   hints: [
-    'The cache key is the contract. If it does not name the experiment *and* the unit, it is not a key for an assignment — it is a key for a unit.',
-    'Read the cache before you hash. If you compute the bucket first, every request does the work the cache exists to avoid, and a stopped experiment has no cached row to return.',
-    'The split is frozen: walk its cumulative weights. A single threshold on the first weight breaks as soon as the split is not 50/50.',
+    'A user reports seeing the treatment page on Monday and the control page on Tuesday after an operator adjusted the split; a second experiment on the same site shows the same pattern.',
+    'The bucket is hashed from the unit and the live salt before the cache is read, the key is `assign:{unit}` with no experiment id, and the stopped branch returns control unconditionally.',
+    'Read `exp:{experiment.id}:assign:{unit}` first and return it (even when stopped); on a miss hash `experiment.id:unit:salt`, walk the cumulative split, and `SET NX` the variant with a TTL.',
   ],
   checks: [
     {
@@ -167,9 +161,7 @@ class Experiment(BaseModel):
 
 
 def bucket_for(experiment: Experiment, unit: str) -> int:
-    # TODO: this starter recomputes the bucket from the current split and salt on every request,
-    # keys by unit alone so quotas collide across experiments, and returns control for everyone
-    # when the experiment is stopped.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     raw = hashlib.sha256(f"{unit}:{experiment.salt}".encode()).hexdigest()[:8]
     return int(raw, 16) % 100
 
@@ -246,9 +238,7 @@ interface Experiment {
 }
 
 function bucketFor(experiment: Experiment, unit: string): number {
-  // TODO: this starter recomputes the bucket from the current split and salt on every request,
-  // keys by unit alone so quotas collide across experiments, and returns control for everyone
-  // when the experiment is stopped.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const digest = createHash('sha256').update(\`\${unit}:\${experiment.salt}\`).digest('hex').slice(0, 8);
   return parseInt(digest, 16) % 100;
 }
@@ -335,9 +325,7 @@ type Experiment struct {
 }
 
 func bucketHash(unit string, salt string) int {
-	// TODO: this starter recomputes the bucket from the current split and salt on every request,
-	// keys by unit alone so quotas collide across experiments, and returns control for everyone
-	// when the experiment is stopped.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	sum := sha256.Sum256([]byte(unit + ":" + salt))
 	raw := hex.EncodeToString(sum[:])[:8]
 	parsed, _ := strconv.ParseInt(raw, 16, 64)
@@ -435,9 +423,7 @@ object AssignmentStore {
   private val jedis = new Jedis("redis", 6379)
 
   def bucketHash(unit: String, salt: String): Int = {
-    // TODO: this starter recomputes the bucket from the current split and salt on every request,
-    // keys by unit alone so quotas collide across experiments, and returns control for everyone
-    // when the experiment is stopped.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val digest = MessageDigest.getInstance("SHA-256").digest(s"$unit:$salt".getBytes("UTF-8"))
     val raw = digest.map("%02x".format(_)).mkString.take(8)
     Integer.parseInt(raw, 16) % 100
@@ -522,9 +508,7 @@ std::string digest(const std::string& value) {
 }
 
 int bucketHash(const std::string& unit, const std::string& salt) {
-  // TODO: this starter recomputes the bucket from the current split and salt on every request,
-  // keys by unit alone so quotas collide across experiments, and returns control for everyone
-  // when the experiment is stopped.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const std::string value = unit + ":" + salt;
   return std::stoi(digest(value), nullptr, 16) % 100;
 }
@@ -595,16 +579,14 @@ std::string assign(sw::redis::Redis& redis, const Experiment& experiment, const 
 `,
     },
   },
-  debrief: `The interview question behind this step is determinism: an assignment must be a pure function of an
-experiment id, an assignment unit and a salt that is frozen at launch. The starter reads fine because
-the demo edits no split and stops no experiment. Three defects are being checked: a hash that omits
-the experiment id or uses a live salt (so a split edit moves a user from treatment to control), a key
-that names only the unit (so one experiment's quota answers another's request), and a stopped
-experiment that flips everyone to control instead of returning the row it already wrote. Reading the
-cache before hashing is the operational half — the hash exists to decide a row once, and a stopped
-experiment can only serve a row that was decided before it stopped. The conditional write closes the
-race between two concurrent first requests for the same unit. Real systems add a version field to
-the value so a row written under an old split can be detected, and they keep the assignment TTL at
-least as long as the analysis window so a unit that returns after the experiment ends still gets its
-original variant.`,
+  debrief: `The fix reads the cache before it hashes because the hash exists to decide a row once; once the
+row is written, nothing about the current split or salt may change it, which is also why a stopped
+experiment can serve the row it wrote before it stopped. The key names the experiment and the unit
+because the assignment belongs to that pair, not to the unit. Hashing the experiment id with the
+frozen salt makes two experiments on the same site independent instead of correlated, and the
+conditional write closes the race between two concurrent first requests for the same unit.
+
+Production systems add a version field to the cached value so a row written under an old design can
+be detected, and keep the assignment TTL at least as long as the analysis window so a unit that
+returns after the experiment ends still gets its original variant.`,
 };

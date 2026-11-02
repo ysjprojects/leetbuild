@@ -16,7 +16,8 @@ import {stateStep} from './steps/state';
 export const mapsRoutingProblem: Problem = {
   id: 'maps-routing',
   title: 'Maps Routing',
-  tagline: 'Routes that cache by geography, degrade honestly and never trust coordinates.',
+  tagline:
+    'Route requests validated at the door, cached by coordinate cell and traffic epoch, read back with their provenance.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,18 +32,18 @@ the provenance of every route the read path returns.
 
 ## The real system
 
-Production routing services serve many tenants — ride-hailing fleets, delivery apps, consumer
-navigation — and they treat every field a client sends as a claim: a coordinate that must be finite
-and on the planet, a waypoint list the solver can actually chew through in time, and an
-origin-destination pair that must fall inside the coverage the tenant pays for. They cache by
-rounded coordinate cells under a traffic epoch, because two drivers starting forty metres apart
-want the same route, and a route computed in the morning jam must never be served after it. They
-call the solver under a deadline, and when the solver cannot answer they return the best honest
-estimate they can produce — clearly marked as an estimate — instead of quietly replaying an old
-route as current. They publish route telemetry keyed by map region and carrying coarse cells, not
-exact endpoints, because the first and last hundred metres of a trip are where someone lives. And
-the read path returns provenance — which epoch, which engine version, whether the geometry was
-degraded — because a route without its age is a route nobody can trust.
+Production routing services serve many tenants (ride-hailing fleets, delivery apps, consumer
+navigation) and treat every field a client sends as a claim. OSRM, the open-source router behind
+many of them, answers a request its solver cannot place with a distinct code instead of a guess:
+\`NoSegment\` when a coordinate cannot snap to any street, \`TooBig\` when the request exceeds the
+server's configured coordinate limit, and \`NoRoute\` when no road connects the points. Every OSRM
+response also carries a \`data_version\` timestamp naming the map extract it was computed from.
+This course's pieces are the service-side counterparts of those ideas: a coverage check and a
+waypoint cap in front of the solver, a traffic epoch that plays the role of \`data_version\` for
+the cache and the read path, a \`NO_ROUTE\` answer that is terminal, and a degraded marker so a
+straight-line estimate is not mistaken for a road route. Route telemetry is keyed by map region
+and carries coarse cells rather than exact endpoints, because the first and last hundred metres
+of a trip are where someone lives.
 
 ## What you build here
 
@@ -50,9 +51,9 @@ One service, **mapsd**, with five pieces:
 
 1. \`POST /v1/routes\`: an authenticated tenant, an origin, a destination and up to 25 waypoints,
    every coordinate finite and within range, the pair checked against the tenant's map coverage,
-   and a \`422\` before a poisoned request ever reaches the solver.
+   and a \`422\` before a poisoned request reaches the solver.
 2. A **Redis** route cache: keys built from rounded coordinate cells, the travel mode and a traffic
-   epoch that bumps every five minutes and appears in the response, so an entry is never confused
+   epoch that bumps every five minutes and appears in the response, so an entry is not confused
    with a fresher traffic state.
 3. A **gRPC** engine client: a 1.5-second deadline per call, a no-route answer treated as terminal,
    and a timeout answered with a straight-line estimate clearly marked as degraded.
@@ -60,15 +61,14 @@ One service, **mapsd**, with five pieces:
    distance, epoch and a coordinate-cell hash instead of exact endpoints, with an outbox row when
    the produce is rejected.
 5. \`GET /v1/routes/{id}\`: tenant-scoped, the geometry with the epoch it was actually computed
-   under, the engine version and the degraded marker if any, never restamped with the current epoch
-   and never a substitute for a fresh computation.
+   under, the engine version and the degraded marker if any, never restamped with the current epoch.
 
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 

@@ -7,75 +7,65 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * IoT hub: the course is not "accept a command from a device", it is the debugging you owe a
- * device-management layer before it unlocks a door twice. Commands that carry their identity, a
- * validity window and an acknowledgment → a Redis shadow whose desired and reported documents keep
- * independent versions → gRPC delivery to the device gateway with a deadline and
- * queue-only-until-expiry semantics → command events keyed by device with an outbox → a shadow read
- * that shows desired, reported and their divergence instead of a merged blur.
+ * IoT hub: the debugging a device-management layer needs before it unlocks a door twice. Commands
+ * that carry an idempotency id, a validity window and an acknowledgment, a Redis shadow whose
+ * desired and reported documents keep independent versions, gRPC delivery to the device gateway
+ * with a deadline and queue-only-until-expiry semantics, command events keyed by device with an
+ * outbox, and a shadow read that shows desired, reported and their divergence.
  */
 export const iotHubProblem: Problem = {
   id: 'iot-hub',
   title: 'IoT Hub',
-  tagline: 'Device shadows that reconcile desired and reported state without losing either.',
+  tagline: 'A device shadow that shows where the device is behind, fed by commands that execute once.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# IoT Hub
 
-An IoT hub is the piece of a fleet platform that stands between operators and the devices in the
-field. It accepts commands and promises each one runs once, keeps a **device shadow** so desired and
-reported state can disagree without either being lost, delivers commands to a device gateway that
-may be offline for days, and publishes a command history the fleet team can audit. The visible part
-is a device turning on; the parts that decide whether the platform is safe are the command's
-identity, the shadow's versions, the delivery deadline and the event key.
+An IoT hub stands between operators and the devices in the field. It accepts commands and runs each
+one once, keeps a **device shadow** so desired and reported state can disagree without either being
+lost, delivers commands to a device gateway that may be offline for days, and publishes a command
+history the fleet team can audit.
 
 ## The real system
 
-Production hubs receive commands from operators and automations, attach each one an identity and a
-validity window, and enforce a per-device rate so one integration cannot flood a device with work.
-They keep a shadow document with a **desired** side written by operators and a **reported** side
-written by the device, each with its own version, so a device that comes back online with an old
-configuration cannot silently erase an operator's change — the hub flags the divergence instead.
-They deliver commands through a gateway under a deadline, queue for an offline device only until the
-command's window runs out, and require the device's acknowledgment before calling a command
-delivered. They publish command events keyed by device so one device's history stays ordered, carry
-ids and outcomes but never payload secrets like a door code, and write an outbox row when the broker
-rejects the produce so history is never lost. And they answer a shadow read with both documents, both
-versions and the explicit list of fields where reported is behind desired — never one merged blur.
+AWS IoT Core's Device Shadow service stores a JSON document with separate \`desired\` and
+\`reported\` sections, publishes a \`/delta\` document listing the fields where the two differ, and
+rejects an update whose \`version\` does not match the latest one it holds, so a stale writer cannot
+overwrite a newer document. This course keeps the same shape: two documents, two counters, a
+divergence list computed from the documents, and a report that is not newer changes nothing. On the
+command side, production hubs attach an identity and a validity window to every command, deliver
+through a gateway under a deadline, and require the device's acknowledgment before calling a command
+delivered. Command events are keyed by device so one device's history stays ordered and carry ids
+and outcomes rather than payload secrets.
 
 ## What you build here
 
 One service, **iothub**, with five pieces:
 
 1. \`POST /v1/devices/{id}/commands\`: a per-device idempotency id so a replay executes once, a
-   validity window so a stale command is discarded unexecuted, an expected acknowledgment, and a
-   per-device command rate limit.
-2. A **Redis** shadow: desired and reported documents with **independent versions**, a reported
-   update that merges by version so a stale report cannot clobber newer desired state, and a
-   reconciliation that converges on the desired document.
-3. A **gRPC** device gateway: a 5-second deadline per delivery, an offline device whose commands
-   queue only until their validity window, and "delivered" that means the device acknowledged, not
-   that the gateway accepted an enqueue.
+   validity window, an expected acknowledgment, and a per-device command rate limit.
+2. A **Redis** shadow: desired and reported documents with independent versions, a reported update
+   that merges by version, and a reconciliation that converges on the desired document.
+3. A **gRPC** device gateway client: a 5-second deadline per delivery, an offline queue that lasts
+   only until the validity window, and "delivered" meaning the device acknowledged.
 4. A **Kafka** command event path: one \`iot.command\` event keyed by device id, ids and outcomes
    without payload secrets, an idempotent producer with \`acks=all\`, and an outbox row when the
    produce fails.
-5. \`GET /v1/devices/{id}/shadow\`: desired and reported documents, both versions, an explicit
-   divergence list, and **404** for a device the caller does not own.
+5. \`GET /v1/devices/{id}/shadow\`: both documents, both versions, a divergence list, and **404**
+   for a device the caller does not own.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real IoT feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter in this course compiles and serves the happy path. In each step you debug it against
+the failure modes the task names, fix it, and prove the fix with checks that fail on the starter and
+pass on your version.
 
 ## Left out on purpose
 
 Device provisioning and certificates, firmware updates, MQTT and CoAP transports, command payload
 schemas per device model, time-series telemetry storage, multi-region device routing, and operator
-RBAC. The five pieces above are the ones that decide whether the hub is correct, isolated and
-shippable.`,
+RBAC.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Operator', sub: 'HTTPS', x: 0, y: 50},

@@ -8,28 +8,28 @@ export const stateStep: Step = {
   focus: ['engine', 'redis', 'worker'],
   task: `## Task
 
-**Starting point.** The starter is working code: the worker reads the run's
-cursor, runs the step, writes the checkpoint back, and the single-worker demo advances run after
-run. It hides a lost update, a value that grows with the payload and a key that never dies. Debug it like the engine owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`advance\` reads the run's cursor from a JSON string at
+\`run:{run_id}:checkpoint\`, compares it on the client, and \`SET\`s a new JSON value holding the
+cursor and the whole step output. \`work\` runs the effect, then calls \`advance\`. It compiles and
+hides five flaws.
 
-Implement the run's checkpoint in Redis.
+**Failure mode the checks target.** Two workers, the original and a duplicate the scheduler started
+after a lost heartbeat, both read the cursor, both run the effect, and both write the checkpoint;
+each believes it advanced the run. The value grows with every payload serialized into it, nothing
+records which steps ran, and an abandoned run keeps its key forever.
+
+Requirements:
 
 - The run state is one hash, \`run:{run_id}:checkpoint\`, holding \`current_step\`, \`output_ref\`,
   \`completed\` (the ordered list of finished step names) and \`updated_at\`.
-- \`advance(run_id, from_step, to_step, output_ref, now) -> bool\` is **one Lua \`EVAL\`**: it reads
-  \`current_step\`, writes the new step, the reference, the extended \`completed\` trail and the time,
-  refreshes the expiry, and returns **1 only when the stored value still equals \`from_step\`**;
-  otherwise it returns **0 and writes nothing at all**.
-- The step's output is stored by the blob store (\`blobs.put(output) -> ref\`) and only
-  \`output_ref\` reaches Redis. The checkpoint is a pointer, never the payload.
-- \`CHECKPOINT_TTL_S\` is seven days and the advance refreshes it, so a run that stops moving
-  releases its key instead of leaving one behind per abandoned run.
-
-**Failure mode the checks target.** Two workers — the original and a duplicate the scheduler started
-after a lost heartbeat — both read \`current_step\`, both run the step's effect, and both write the
-checkpoint, so the run advances past a step whose effect never ran, and a retried step's replacement
-re-advances a run that already moved on. The value also grows with every payload the starter serializes
-into it, and an abandoned run keeps its key forever.`,
+- \`advance(run_id, from_step, to_step, output_ref, now) -> bool\` is **one Lua \`EVAL\`**: it
+  \`HGET\`s \`current_step\`; \`if current == ARGV[1]\` it \`HSET\`s the new step, the reference, the
+  extended \`completed\` trail and the time, refreshes the expiry with \`EXPIRE\`, and returns 1;
+  otherwise it writes nothing and \`return 0\`.
+- The step output goes to the blob store (\`blobs.put(output) -> ref\`) and only \`output_ref\`
+  reaches Redis.
+- \`CHECKPOINT_TTL_S\` is seven days and every advance refreshes it, so a run that stops moving
+  releases its key.`,
   sequence: {
     participants: ['Worker', 'Run checkpoint (Redis)', 'blob store'],
     messages: [
@@ -152,10 +152,7 @@ def checkpoint_key(run_id: str) -> str:
 
 
 def advance(run_id: str, to_step: str, output: dict, cursor: int) -> bool:
-    # TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
-    # plain write, serializes the whole step output into the value instead of a reference, keeps
-    # only a cursor with no completed list, and never expires the key. A duplicate worker therefore
-    # advances the run twice and one effect is lost from the record.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     stored = r.get(checkpoint_key(run_id))
     current = json.loads(stored)["cursor"] if stored else 0
     if current >= cursor:
@@ -261,7 +258,7 @@ def checkpoint(run_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Run checkpoint: flawed code that overwrites the run state from client memory. */
+      starter: `/** Run checkpoint: the worker advances a run's cursor in Redis after each step. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -296,10 +293,7 @@ export async function advance(
   output: Record<string, unknown>,
   cursor: number,
 ): Promise<boolean> {
-  // TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
-  // plain write, serializes the whole step output into the value instead of a reference, keeps
-  // only a cursor with no completed list, and never expires the key. A duplicate worker therefore
-  // advances the run twice and one effect is lost from the record.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const stored = await r.get(checkpointKey(runId));
   const current = stored === null ? 0 : (JSON.parse(stored) as {cursor: number}).cursor;
   if (current >= cursor) return false;
@@ -458,10 +452,7 @@ func checkpointKey(runID string) string {
 // advance moves the run forward: read the cursor, compare it with the one the worker believes it
 // holds, then write the new value back.
 func advance(ctx context.Context, runID string, toStep string, output map[string]any, cursor int) bool {
-	// TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
-	// plain write, serializes the whole step output into the value instead of a reference, keeps
-	// only a cursor with no completed list, and never expires the key. A duplicate worker therefore
-	// advances the run twice and one effect is lost from the record.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := checkpointKey(runID)
 	raw, _ := rdb.Get(ctx, key).Result()
 	current := 0
@@ -653,10 +644,7 @@ object Checkpoint {
 
   def key(runId: String): String = s"run:$runId:checkpoint"
 
-  // TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
-  // plain write, serializes the whole step output into the value instead of a reference, keeps
-  // only a cursor with no completed list, and never expires the key. A duplicate worker therefore
-  // advances the run twice and one effect is lost from the record.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def advance(runId: String, toStep: String, output: String, cursor: Int): Boolean = {
     val stored = Option(jedis.get(key(runId))).flatMap(_.toIntOption).getOrElse(0)
     if (stored >= cursor) {
@@ -816,10 +804,7 @@ std::string checkpointKey(const std::string& runId) {
 // holds, then write the new value back.
 bool advance(Redis& redis, const std::string& runId, const std::string& toStep, const std::string& output,
              long long cursor) {
-  // TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
-  // plain write, serializes the whole step output into the value instead of a reference, keeps only
-  // a cursor with no completed list, and never expires the key. A duplicate worker therefore
-  // advances the run twice and one effect is lost from the record.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto stored = redis.get(checkpointKey(runId));
   long long current = 0;
   if (stored) {
@@ -930,9 +915,9 @@ int main() {
     },
   },
   hints: [
-    'The whole decision belongs on the server. One script reads `current_step`, compares it with the step the worker advanced from, and only then writes the new step, the reference and the trail. A read in the client followed by a write in the client is a lost update the moment a second worker holds the same idea.',
-    'The script returns an integer verdict: `1` when it moved the run, `0` when someone else already did. That verdict is what the worker records — the loser learns it lost instead of silently overwriting the winner, and the run keeps one entry per step rather than one per worker.',
-    'Two things must stay out of the value: the payload (store it with `blobs.put` and keep only the reference) and immortality (set the expiry from `CHECKPOINT_TTL_S` inside the same script, so the key dies with a run that stopped moving).',
+    'Symptom: after a worker restart two workers pick up the same run, both report success, and the run record shows one step fewer than the effects that actually happened.',
+    'Mechanism: `advance` reads the cursor with `GET`, compares it on the client, then `SET`s a JSON blob holding the whole output. Two readers see the same cursor and both write.',
+    'Fix: one `r.eval` script: `HGET current_step`, `if current == ARGV[1]` then `HSET` step, `output_ref` (from `blobs.put`), `completed`, `EXPIRE CHECKPOINT_TTL_S`, else `return 0`.',
   ],
-  debrief: `The interview question behind this step is whether you can tell "I wrote the checkpoint" from "I was the worker that owned the checkpoint". Every advance is a compare-and-swap on the step the worker advanced from, and one Lua script makes the read, the compare and the write a single server-side step, so a duplicate worker that read the same value loses instead of advancing a run past an effect that never ran. Putting the effect *before* the swap is what makes the ordering safe: the output is already in the blob store when the script decides, so a worker that loses leaves a harmless orphan blob rather than a missing effect. The value holds a reference, not the payload, because Redis is a coordination layer with a memory budget and step outputs are unbounded; the completed trail is the cheap audit that says which steps really ran, and the TTL — refreshed on every advance, not only at creation — is what keeps abandoned runs from leaking a key each. In production the same shape carries a lease (owner and expiry) so a stalled run can be taken over, a monotonic attempt counter so an old worker cannot advance a newer attempt, the definition version pinned beside the step, and a checkpoint write that is published as an event so the read model does not have to poll the hash.`,
+  debrief: `The advance is a compare-and-swap on the step the worker advanced from, and one Lua script makes the read, the compare and the write a single server-side operation, so a duplicate worker that read the same value loses instead of moving the run past an effect that did not run. Running the effect before the swap is what makes that safe: the output is already in the blob store when the script decides, so a loser leaves an orphan blob, not a missing effect. The value carries a reference because step outputs are unbounded and Redis has a memory budget; the TTL refreshed on every advance keeps abandoned runs from leaking keys. Production checkpoints also carry a lease owner and expiry so a stalled run can be taken over.`,
 };

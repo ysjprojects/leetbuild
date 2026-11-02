@@ -8,35 +8,27 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks up a match and returns it. It compiles,
-the happy path renders a lobby, and it hides three flaws — two of which the players notice before
-you do. Debug it, fix it, and prove the fix.
+**Starting point.** The starter registers \`GET /v1/matches/{id}\`, reads \`X-Player-Id\`, loads
+the match from the store, lists the players whose join flag is set, and answers with the match id,
+the server id and a \`state\` of \`in_game\` when a server id exists and \`allocating\` otherwise.
+It compiles, the happy path renders a lobby, and it hides 4 flaws.
 
-Implement \`GET /v1/matches/{id}\`:
+**Failure mode the checks target.** With pending players filtered out, a lobby cannot say "waiting
+for 2 of 5", and a client that was dropped cannot see that it is still expected. \`in_game\` tells
+every client to hide the lobby and render a game, and it is wrong for as long as the slowest client
+is connecting. And a read that skips membership hands rosters, ratings and server addresses to
+anyone who can guess a match id.
 
-- The caller is authenticated by \`X-Player-Id\` (**401** when absent) and the read is **scoped to
-  participants**: a player who is not on the roster gets **403**, not the match. The starter lets any
-  player read any match, which leaks rosters, ratings and server addresses.
-- The response carries the **roster**, the **server assignment**, each player's **join state** and
-  the **state machine position**. Join state is **per-player truth**: \`joined\` for a player whose
-  client has confirmed, \`pending\` for one who has not. The starter filters the pending players out of
-  the response entirely, so a client cannot tell the difference between "not in this match" and
-  "still connecting".
-- The state machine position must follow the joins, not the allocation: a match is \`joining\` while
-  any participant is \`pending\`, \`in_game\` only once **every** participant has joined, and
-  \`abandoned\` if it ended without starting. The starter reports \`in_game\` the moment allocation
-  succeeds, so the client renders a game that has not begun.
-- A claimed ticket that has not joined is shown **as such**: \`pending\` in the roster and reflected
-  in the state machine. Hiding it is what makes the read lie.
-- The read touches only the match the caller belongs to: look the match up, then check membership
-  before you build the response.
-
-**Failure mode the checks target.** The per-player join state is the one players feel: with pending
-players hidden, a lobby cannot say "waiting for 2 of 5", and a client that was dropped has no way to
-see that it is still expected. The state machine is the one that corrupts the UI: "in_game" tells
-every client to hide the lobby and start rendering a game, and it is wrong for as long as the
-slowest client is connecting. The participant scope is the security one: an unauthenticated-by-membership
-read hands out other players' data to anyone who can guess a match id.`,
+- The caller is authenticated by \`X-Player-Id\` (**401** when absent) and the read is **scoped
+  to participants**: a player who is not on the roster gets **403**. Look the match up, then
+  check membership before building the response.
+- The response carries the **roster**, the **server assignment**, each player's **join state**
+  and the **state machine position**.
+- Join state is per player: \`joined\` for a player whose client has confirmed, \`pending\` for one
+  who has not. The roster lists **every** participant, pending ones included.
+- The state machine follows the joins, not the allocation: \`joining\` while any participant is
+  \`pending\`, \`in_game\` only once **every** participant has joined, \`abandoned\` if the match
+  ended without starting.`,
   sequence: {
     participants: ['Game client', 'Matchmaking API', 'Match store'],
     messages: [
@@ -126,7 +118,7 @@ read hands out other players' data to anyone who can guess a match id.`,
   ],
   code: {
     python: {
-      starter: `"""Match read: flawed code that reports in-game as soon as allocation succeeds."""
+      starter: `"""Match read: the match as the caller sees it."""
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 
@@ -147,9 +139,7 @@ def read_match(
     match_id: str,
     player: str = Header(default="", alias="X-Player-Id"),
 ) -> JSONResponse:
-    # TODO: this starter reports in-game as soon as allocation succeeds, hides every player whose join is
-    # still pending, and lets any player read any match. Report the state machine position derived from
-    # the joins, show the per-player join state including pending, and scope the read to participants.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     match = store.get(match_id)
     players = [pid for pid, joined in match["joined"].items() if joined]
     return JSONResponse(
@@ -215,7 +205,7 @@ def read_match(
 `,
     },
     typescript: {
-      starter: `/** Match read: flawed code that reports in-game as soon as allocation succeeds. */
+      starter: `/** Match read: the match as the caller sees it. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -227,9 +217,7 @@ interface MatchRow {
 }
 
 app.get('/v1/matches/:matchId', async (request, reply) => {
-  // TODO: this starter reports in-game as soon as allocation succeeds, hides every player whose join is
-  // still pending, and lets any player read any match. Report the state machine position derived from
-  // the joins, show the per-player join state including pending, and scope the read to participants.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {matchId} = request.params as {matchId: string};
   const match = (await store.get(matchId)) as MatchRow;
   const players = match.players.filter(pid => match.joined[pid]);
@@ -307,10 +295,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readMatch(rw http.ResponseWriter, req *http.Request) {
-	// TODO: this starter reports in-game as soon as allocation succeeds, hides every player whose join
-	// is still pending, and lets any player read any match. Report the state machine position derived
-	// from the joins, show the per-player join state including pending, and scope the read to
-	// participants.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	match, _ := store.Get(req.Context(), req.PathValue("matchID"))
 	players := make([]string, 0, len(match.Players))
 	for _, pid := range match.Players {
@@ -427,10 +412,7 @@ object MatchReadApi {
     path("v1" / "matches" / Segment) { matchId =>
       get {
         headerValueByName("X-Player-Id") { _ =>
-          // TODO: this starter reports in-game as soon as allocation succeeds, hides every player whose
-          // join is still pending, and lets any player read any match. Report the state machine
-          // position derived from the joins, show the per-player join state including pending, and
-          // scope the read to participants.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val players = store.joinedPlayers(matchId)
           val playersJson = players.map(pid => s"""{"player_id":"$pid"}""").mkString(",")
           complete(
@@ -513,10 +495,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/matches/:matchId", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reports in-game as soon as allocation succeeds, hides every player whose join
-    // is still pending, and lets any player read any match. Report the state machine position derived
-    // from the joins, show the per-player join state including pending, and scope the read to
-    // participants.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto matchId = req.path_params.at("matchId");
     const auto match = store.get(matchId);
     std::vector<std::string> players;
@@ -610,9 +589,9 @@ int main() {
     },
   },
   hints: [
-    'Look up the match, then check membership before you build anything: `player in participants` (or `contains`) and **403** when it fails. A read that is not scoped to the caller is a data leak with a friendly name.',
-    'Join state is per player, so the shape is a map from player id to `joined`/`pending`, with `pending` as the default for anyone the store has not heard from yet. Build the roster from **all** participants, not from the ones who already joined — the pending ones are exactly what the lobby needs to render.',
-    "The state machine is a function of the joins, not of the allocation: `joining` while any participant is `pending`, `in_game` only when all of them are `joined`, and `abandoned` when the match ended without starting. Reporting `in_game` from `server_id` is the starter's bug — the server exists long before the players are in it.",
+    'A player sees the game screen while teammates are still loading, a lobby shows 3 of 5 names with no hint that 2 more are coming, and any player can open any match id.',
+    'The response filters on the joined flag and derives `state` from `server_id`, so pending players vanish and allocation looks like play. Nothing compares the caller to the roster.',
+    'After the lookup, **403** unless the caller is in `participants`. Build `roster` from every participant with `join_state` `joined`/`pending`, and set `state_machine` to `joining`, `in_game` (all joined) or `abandoned`.',
   ],
-  debrief: `The interviewer is testing whether the read is a projection of the truth rather than a convenience. Three things are being checked. Scope: a match read is participant-scoped, because the roster, the ratings in it and the server address belong to the players in the match. Per-player truth: join state is a property of each player, so a claimed-but-not-joined ticket is shown as pending and the client can render "waiting for 2 of 5" instead of an empty lobby. And the state machine: it has to be derived from the joins, because "in_game" is the event that tells every client to stop waiting — deriving it from the allocation makes the UI lie for exactly as long as the slowest client takes to connect. The starter gets all three wrong in a plausible way: each of \`state = server_id ? "in_game" : "allocating"\`, filtering the roster to joined players, and skipping the membership check is a line of code that reads fine. Real match reads expose a monotonic \`revision\` so clients can drop stale responses, a \`retry_after\` hint per pending player, and a compacted match-state topic so a reconnecting client can resync without polling this endpoint.`,
+  debrief: `The read is a projection of what is true for the caller, not a convenience view of the row. Membership is checked after the lookup and before anything is built, because the roster, its ratings and the server address belong to the players in the match. Join state is a property of each player, so a claimed-but-not-joined ticket shows as pending and the lobby can render "waiting for 2 of 5". The state machine derives from the joins because \`in_game\` is what tells every client to stop waiting; the server exists long before the players are in it. Production match reads add a monotonic \`revision\` so clients drop stale responses, and a compacted match-state topic so a reconnecting client can resync without polling this endpoint.`,
 };

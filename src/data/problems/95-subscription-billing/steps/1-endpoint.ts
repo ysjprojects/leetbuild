@@ -8,36 +8,32 @@ export const changePlanStep: Step = {
   focus: ['client', 'billing', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns an invoice schedule. It compiles, it serves the demo, and it hides three
-production flaws. Debug it like the billing owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/subscriptions\`, parses a body of
+\`{"subscription_id", "plan", "effective_date", "proration_policy"}\`, loads the subscription, splits
+the period at the effective date and returns an invoice schedule with a total. It compiles, it serves
+the demo, and it hides four flaws.
 
-Implement the plan change on \`POST /v1/subscriptions\` with body
-\`{"subscription_id": "…", "plan": "…", "effective_date": "now", "proration_policy": "actual_days"}\`.
+**Failure mode the checks target.** Each flaw survives a demo: the demo changes plans on the first of
+the month (so a fixed 30-day divisor looks right), it charges one plan (so a double-billed day is
+invisible), and it sends a well-formed request from its own tenant (so an endpoint that denies
+nothing looks permissive rather than unsafe).
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**, and a
-  subscription that belongs to another tenant is **404**, never someone else's schedule.
+  subscription that belongs to another tenant is **404**, not someone else's schedule.
 - \`plan\` must exist in the plan catalogue (**400** otherwise).
-- \`proration_policy\` must be one the platform implements — today only \`actual_days\` (**400**
+- \`proration_policy\` must be one the platform implements, today only \`actual_days\` (**400**
   otherwise). A caller may not pick a policy that has no arithmetic behind it.
 - \`effective_date\` is either the literal \`now\` or the subscription's next period boundary (an
   ISO-8601 date, \`next_period_start\`). Any other date is **400**: the platform prorates over a
-  period it can identify, never over a guess.
+  period it can identify, not over a guess.
 - Proration runs over the **actual** days of the period: \`period_days = (period_end - period_start).days\`
   and a line's amount is \`round(price_cents * days / period_days)\`. A thirty-day month is not a
   month: it over-bills February's slice and under-bills a 31-day one.
 - The switch day is charged **exactly once**: the old plan's line covers \`[period_start, change_at)\`
   and the new plan's line covers \`[change_at, period_end)\`, so \`old_days + new_days == period_days\`.
-  Charging the old plan for the full period *and* the new plan from the change day on bills that day
-  twice.
 - The response states the resulting invoice schedule:
   \`{"subscription_id", "effective_at", "proration_policy", "invoice_schedule": [{"period_start", "period_end", "lines": [{"plan", "days", "amount_cents"}]}], "total_cents"}\`.
-- Log the change with tenant, subscription and plan — never card or processor data.
-
-**Failure mode the checks target.** Every one of these bugs survives a demo: the demo changes plans
-on the first of the month (so a fixed 30-day divisor looks right), it charges one plan (so the
-double-billed day is invisible), and it sends a well-formed request from its own tenant (so an
-endpoint that denies nothing looks permissive rather than unsafe).`,
+- Log the change with tenant, subscription and plan, no card or processor data.`,
   sequence: {
     participants: ['Client', 'Billing Service', 'billing db'],
     messages: [
@@ -179,9 +175,7 @@ def change_day(value: str) -> int:
 
 @app.post("/v1/subscriptions")
 def change_plan(body: PlanChange) -> dict:
-    # TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
-    # the whole period and the new plan from the change day on, so the switch day is billed twice,
-    # and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     subscription = store.load(body.subscription_id)
     day = change_day(body.effective_date)
     old_cents = PLANS[subscription["plan"]]
@@ -305,7 +299,7 @@ def change_plan(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/subscriptions: flawed code of the plan-change handler. */
+      starter: `/** POST /v1/subscriptions: the plan-change starter. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -342,9 +336,7 @@ function changeDay(value: string): number {
 }
 
 app.post('/v1/subscriptions', async (request, reply) => {
-  // TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
-  // the whole period and the new plan from the change day on, so the switch day is billed twice,
-  // and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as PlanChange;
   const subscription = (await store.load(body.subscription_id)) as Subscription;
   const day = changeDay(body.effective_date);
@@ -539,9 +531,7 @@ func changeDay(value string) int {
 }
 
 func changePlan(rw http.ResponseWriter, r *http.Request) {
-	// TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
-	// the whole period and the new plan from the change day on, so the switch day is billed twice,
-	// and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	var body PlanChange
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -760,10 +750,7 @@ object SubscriptionApi {
     path("v1" / "subscriptions") {
       post {
         entity(as[PlanChange]) { body =>
-          // TODO: flawed code. It prorates over a thirty-day month, charges the old plan
-          // for the whole period and the new plan from the change day on, so the switch day is billed
-          // twice, and it denies nothing: no tenant check, no plan check, no effective-date or
-          // policy check.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val subscription = store.load(body.subscription_id)
           val day = changeDay(body.effective_date)
           val oldCents = Plans(subscription.plan)
@@ -907,9 +894,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/subscriptions", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
-    // the whole period and the new plan from the change day on, so the switch day is billed twice,
-    // and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -1076,9 +1061,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant (401), plan in the catalogue (400), proration policy the platform implements (400), subscription that belongs to this tenant (404), then the effective date (400 when it is neither `now` nor the next boundary). Every one of them returns before any arithmetic.',
-    'The period length is data, not a constant: `period_days = (period_end - period_start).days` and a line costs `round(price_cents * days / period_days)`. A thirty-day month over-bills a February slice and under-bills a 31-day one, and nothing about the demo looks wrong until a real month is billed.',
-    'Model the change as a half-open split of the period: the old plan covers `[period_start, change_at)` and the new plan `[change_at, period_end)`. Then `old_days + new_days == period_days` holds by construction, and the switch day belongs to exactly one line. Assert it, so a future edit cannot silently reintroduce the double charge.',
+    'A customer who switched plans on the 31st was billed both plans for that day, a February invoice came out higher than March for the same plan, and support can preview any subscription id without being its tenant.',
+    'A fixed 30-day divisor, an old-plan line that spans the whole period, and a handler with no guard clauses: every input reaches the arithmetic and the arithmetic is wrong for any month that is not 30 days.',
+    'Guard first: tenant (401), plan and policy (400), foreign subscription (404), effective date `now` or `next_period_start` (400). Then `period_days = (period_end - period_start).days`, old plan `[period_start, change_at)`, new plan `[change_at, period_end)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug billing arithmetic. Four defects are being checked: authentication and tenancy at the boundary (a schedule is another tenant's data), validation of the effective date and the proration policy (a change the platform cannot compute must be refused, not approximated), the divisor (the actual days of the period, never 30), and the exclusive split of the period (the switch day is charged once, by one plan). The second one is what candidates miss: an endpoint that denies nothing looks friendlier than it is, because every unvalidated input ends up multiplied by a price. Real billing systems add a rounding policy per currency, credit notes instead of negative lines, an idempotency key on the change request itself, an audit record of the plan version used for each line, and a scheduled job that recomputes and compares rather than trusting the handler's arithmetic.`,
+  debrief: `The fix is guards followed by interval arithmetic because every unvalidated input ends up multiplied by a price: a tenant that is not checked, a policy with no arithmetic behind it and a date the platform cannot place all turn into money. The divisor is read from the period's own bounds, and the half-open split makes \`old_days + new_days == period_days\` true by construction, so the switch day belongs to exactly one line. Production billing goes further than this step: a rounding policy per currency, credit notes instead of negative lines, an idempotency key on the change request itself, and an audit record of the plan version behind each line, with a scheduled job that recomputes the schedule and compares rather than trusting the handler's arithmetic.`,
 };

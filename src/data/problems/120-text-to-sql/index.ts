@@ -20,7 +20,7 @@ export const textToSqlProblem: Problem = {
   id: 'text-to-sql',
   title: 'Text-to-SQL',
   tagline:
-    "Uber's QueryGPT: intent and table agents behind a guarded endpoint, pruned schemas under deadlines, generated SQL that never runs as-is.",
+    "Uber's QueryGPT: intent and table agents behind a guarded endpoint, with a run guard between generated SQL and the warehouse.",
   difficulty: 'medium',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -38,26 +38,18 @@ export const textToSqlProblem: Problem = {
   ],
   statement: `# Text-to-SQL
 
-An operations manager types "number of trips completed by Teslas in Seattle yesterday" into a box
-and expects a query that runs against the right tables in a warehouse with hundreds of thousands of
-datasets. A model can write that query in seconds. Whether it names a table that exists, filters on
-the partition column, and runs without scanning a year of data is decided by the service around
-the model — and that service is what you debug here.
+An operations manager types "trips completed by Teslas in Seattle yesterday" into a box. A model
+writes the SQL in seconds; whether it names a real table, filters on the partition column and is
+safe to run is decided by the service around the model, and that service is what you debug here.
 
 ## The real system
 
-Uber's **QueryGPT** turns natural-language questions into SQL for engineers, operations managers
-and data scientists, against a data platform that handles about 1.2 million interactive queries a
-month. The first version was a plain RAG: embed the question, nearest-neighbour search over table
-schemas and SQL samples, put the top three tables and seven samples into a prompt with custom
-instructions, get back SQL and an explanation. It worked on seven tables and degraded as more were
-onboarded, because a question like "trips completed yesterday in Seattle" does not embed anywhere
-near a \`CREATE TABLE\` statement. The production design decomposes the problem into small
-classifier calls: an **intent agent** maps the question to one or more **workspaces** — curated sets
-of tables and samples per business domain — a **table agent** picks tables that the user **ACKs or
-edits**, a **column prune agent** drops the columns a wide table does not need so the schemas fit
-the model's context, and only then does generation run. An evaluation set of real questions with
-verified intents, tables and golden SQL tracks every change.
+Uber's **QueryGPT** answers natural-language questions with SQL against a warehouse of hundreds of
+thousands of datasets. The first version was plain RAG over schemas and SQL samples and degraded as
+tables were onboarded. The production design decomposes the job: an **intent agent** maps the
+question to **workspaces** (curated tables and samples per domain, with user-created custom
+workspaces beside the system ones), a **table agent** proposes tables the user **ACKs or edits**,
+a **column prune agent** shrinks wide schemas to fit the context, and only then does generation run.
 
 ## From the source
 
@@ -82,41 +74,29 @@ evaluation signals themselves.
 
 ## What you build here
 
-One service, **querygen**, with five pieces:
+One service, **querygen**, in five steps:
 
-1. \`POST /v1/queries\`: authenticated user, a question capped at 2000 characters, a workspace from
-   the system allow-list or from the intent agent and checked against the same list, an
-   \`Idempotency-Key\`, and a **202** that proposes tables for the user's ACK without generating
-   SQL yet.
-2. A **Redis** layer: the table decision cached under \`decision:{workspace}:{sha256(normalised
-   question)}\` for 24 hours, a budget of 50 queries per user per hour reserved by one atomic Lua
-   \`EVAL\` before the first agent call, and the pending ACK under \`pending:{query_id}\` for ten
-   minutes.
-3. A **gRPC** agent chain: \`Intent\`, \`PickTables\`, \`PruneColumns\` at 10 s and \`Generate\` at
-   30 s, two attempts on \`UNAVAILABLE\` only, pruning when the schemas estimate above 24 000
-   tokens, and the model's \`{sql, explanation}\` parsed defensively.
-4. \`POST /v1/queries/{id}/run\`: one \`SELECT\`, tables ⊆ the ACKed list, a \`datestr\` partition
-   filter, \`LIMIT 1000\` injected, a 60-second statement timeout, **422** when any guard fails, and
-   \`has_output\` in the response.
-5. A **Kafka** path: one \`query.feedback\` event per query keyed by user with the evaluation
-   signals — workspace, tables proposed and ACKed, run success, has-output, rating — from an
-   idempotent producer, and an \`eval\` consumer that computes table overlap and success rates
-   into \`eval:{workspace}\` before it commits.
+1. \`POST /v1/queries\`: authenticated, capped question, workspace checked against the allow-list,
+   \`Idempotency-Key\`, **202** with proposed tables and no SQL yet.
+2. **Redis**: decisions keyed by workspace and normalised question with a TTL, a per-user budget
+   reserved by one Lua \`EVAL\` before the agents, pending ACKs that expire.
+3. **gRPC** agents under deadlines, bounded retries, pruning over a token budget, output parsed
+   defensively.
+4. \`POST /v1/queries/{id}/run\`: one \`SELECT\` over ACKed tables with a \`datestr\` filter,
+   \`LIMIT 1000\`, a statement timeout, and \`has_output\` in the response.
+5. **Kafka**: one \`query.feedback\` event per query keyed by user with the evaluation signals, and
+   an \`eval\` consumer that writes \`eval:{workspace}\` before it commits.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real AI feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Every starter compiles and serves the happy path. Your job in every step is to debug it against
+the failure modes, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-The embeddings and vector search behind the table agent, custom workspace authoring, the prompt
-enhancer, the chat mode for iterating on a query, the validation agent that repairs hallucinated
-columns, the LLM judge against golden SQL, and warehouse authorisation per table. The five pieces
-above are the ones that decide whether generated SQL is safe to run and whether anyone can tell
-which agent got it wrong.`,
+Embeddings behind the table agent, custom workspace authoring, the prompt enhancer, chat mode, the
+validation agent that repairs hallucinated columns, the LLM judge, and per-table warehouse
+authorisation.`,
   diagram: {
     nodes: [
       {id: 'analyst', kind: 'client', label: 'Query editor', sub: 'ask · ACK · run · rate', x: 6, y: 50},

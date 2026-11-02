@@ -8,34 +8,25 @@ export const skuIntakeStep: Step = {
   focus: ['feed', 'upserted', 'catalogd', 'taxonomy'],
   task: `## Task
 
-**Starting point.** The starter is working code: it subscribes to the topic,
-parses each record, skips SKUs it has seen and enqueues an extraction job. It compiles, it moves
-records in the demo, and it hides five production flaws. Debug it like the owner of the catalog
-pipeline, fix it, and prove the fix with the checks below.
+**Starting point.** The starter subscribes to \`sku.upserted\` with auto-commit on, commits the
+offset as soon as it has polled, parses each record without validation, skips SKUs whose id is in
+an in-memory \`seen\` set, and produces the extraction job on \`sku.extract\` without a key. It
+compiles, it moves records in the demo, and it hides 5 flaws.
 
-Implement the intake consumer for \`sku.upserted\`. Each record is keyed by merchant and carries
-\`{"merchant": "safeway", "sku_id": "sfw-1023", "title": "…", "description": "…", "images": ["…"]}\`.
+**Failure mode the checks target.** Auto-commit and an early commit look correct in a demo where
+nothing crashes; in production they drop SKUs silently. The in-memory "seen" set is the subtle one:
+it re-extracts every SKU after a restart and skips every genuine update before one.
 
-- Consume in group **\`catalog-enrichment\`** with **auto-commit disabled**; the offset is committed
-  by your code, after the work.
-- **Validate** before anything else: \`merchant\`, \`sku_id\` and a non-blank \`title\` are
-  required; the title is at most **4 KiB** (\`MAX_TITLE_BYTES = 4096\`), the description at most
-  **16 KiB**, and at most **8** image refs. A malformed record — including unparseable JSON — is
-  produced to **\`sku.upserted.dlq\`** with a \`reason\` header and its offset committed, so one bad
-  record neither crashes the group nor disappears.
-- **Dedupe by content**, not by id: hash the canonical \`(merchant, title, description, sorted
-  images)\` with **SHA-256** and compare it with the hash stored for the SKU (\`store.last_hash\`).
-  A merchant re-sends its whole feed nightly; an unchanged SKU must not cost an extraction, and a
-  changed one must not be skipped because its id was "seen".
-- **Enqueue** the job on \`sku.extract\` with the **merchant as the message key**, so all of one
-  merchant's SKUs — and every version of one SKU — stay ordered in one partition.
-- **Commit after the enqueue** (and after the hash is stored). Commit first and a crash between the
-  commit and the enqueue loses the SKU until the merchant's next full feed.
+Records carry \`{"merchant", "sku_id", "title", "description", "images"}\`.
 
-**Failure mode the checks target.** A consumer with auto-commit and an early commit looks correct
-in a demo where nothing crashes; in production it drops SKUs silently. The in-memory "seen" set is
-the subtle one: it re-extracts every SKU after a restart and skips every genuine update before
-one — the opposite of what the catalog needs in both directions.`,
+- Consume in group **\`catalog-enrichment\`** with **auto-commit disabled**.
+- **Validate** first: \`merchant\`, \`sku_id\` and a non-blank \`title\` required; title at most
+  **4 KiB** (\`MAX_TITLE_BYTES = 4096\`), description at most **16 KiB**, at most **8** image refs.
+  A malformed record goes to **\`sku.upserted.dlq\`** with a \`reason\` header and is committed.
+- **Dedupe by content**: **SHA-256** the canonical \`(merchant, title, description, sorted images)\`
+  and compare with \`store.last_hash\`; store the new hash after the enqueue.
+- **Enqueue** on \`sku.extract\` with the **merchant as the message key**.
+- **Commit after the enqueue** and the hash store.`,
   sequence: {
     participants: ['sku.upserted', 'catalogd', 'sku store', 'sku.extract'],
     messages: [
@@ -50,9 +41,9 @@ one — the opposite of what the catalog needs in both directions.`,
     ],
   },
   hints: [
-    'Turn auto-commit off in the consumer configuration (`enable.auto.commit`, `autoCommit: false`, `FetchMessage` instead of `ReadMessage`) and move the commit to the last line of the loop body. Everything the record needs — validation, dead-letter, hash, enqueue, hash store — happens before it.',
-    'The dedupe key is a hash of the content, not the id: build a canonical JSON of merchant, title, description and the sorted image refs, SHA-256 it, and compare with `store.last_hash(sku_id)`. Store the new hash only after the enqueue succeeded, so a crash in between replays the record instead of losing it.',
-    'Validation has two outcomes and both commit: a good record is enqueued with `key=merchant`; a bad one is produced to `sku.upserted.dlq` with a `reason` header. Neither raises out of the loop — a poison record that crashes the consumer stalls the whole merchant partition.',
+    'A merchant re-sends its full feed and every SKU is extracted again; a title changes and nothing happens; a restart loses a batch and one bad record stops the whole merchant partition.',
+    'The offset moves on a timer and before the enqueue, so a crash loses records; the `seen` set lives in memory and keys on the id, so it forgets on restart and ignores changed content.',
+    'Disable auto-commit and commit at the end of the loop body; validate and dead-letter to `sku.upserted.dlq`; SHA-256 the content and compare with `store.last_hash`; produce with `key=merchant`.',
   ],
   checks: [
     {
@@ -156,8 +147,7 @@ seen: set[str] = set()
 
 
 def consume() -> None:
-    # TODO: this starter auto-commits and commits before the enqueue, trusts every record, dedupes
-    # by an in-memory set of ids, and produces the job without a key. Fix all five.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     consumer.subscribe([TOPIC])
     while True:
         msg = consumer.poll(1.0)
@@ -302,7 +292,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** sku.upserted intake: flawed code that commits early and dedupes by id. */
+      starter: `/** sku.upserted intake consumer. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'sku.upserted';
@@ -331,8 +321,7 @@ const jobs = new ExtractQueue();
 const seen = new Set<string>();
 
 export async function consume(): Promise<void> {
-  // TODO: this starter commits before the enqueue, trusts every record, dedupes by an in-memory set
-  // of ids, and produces the job without a key. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const consumer = kafka.consumer({groupId: GROUP});
   await consumer.connect();
   await consumer.subscribe({topic: TOPIC});
@@ -508,8 +497,7 @@ var (
 	seen = map[string]bool{}
 )
 
-// TODO: this starter auto-commits on read, trusts every record, dedupes by an in-memory set of ids,
-// and produces the job without a key. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func consume(ctx context.Context) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{"kafka:9092"},
@@ -750,8 +738,7 @@ object SkuIntake {
 
   val seen = scala.collection.mutable.Set.empty[String]
 
-  // TODO: this starter auto-commits and commits before the enqueue, trusts every record, dedupes by
-  // an in-memory set of ids, and produces the job without a key. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def consume(): Unit = {
     val props = new Properties()
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
@@ -944,8 +931,7 @@ struct ExtractQueue {
 ExtractQueue jobs;
 std::set<std::string> seen;
 
-// TODO: this starter auto-commits and commits before the enqueue, trusts every record, dedupes by
-// an in-memory set of ids, and produces the job without a key. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void consume() {
   std::string err;
   std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
@@ -1109,5 +1095,5 @@ int main() { consume(); }
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a consumer for the three contracts a queue gives you only if you keep them: at-least-once (commit after the work, auto-commit off), ordering (the merchant key puts every version of a SKU in one partition) and poison-record isolation (a dead-letter topic with a reason instead of a crash or a silent skip). The content hash is the catalog-specific one: the source describes merchants whose feeds arrive in every format, re-sent in full, so identity-based dedupe is wrong twice — it forgets on restart and ignores real changes — and only a hash of the content, stored durably, tells an unchanged SKU from an updated one. The caps are cost control before cost: a 4 KiB title bounds the prompt that step 2 will build from it. Real intakes add schema registry validation, per-merchant lag alerts, and a replay tool for the dead-letter topic.`,
+  debrief: `The fix keeps the three contracts a queue only gives you if you keep them: at-least-once (commit after the work, auto-commit off), ordering (the merchant key puts every version of a SKU in one partition) and poison-record isolation (a dead-letter topic with a reason instead of a crash). The content hash is the catalog-specific part: merchant feeds are re-sent in full, so identity-based dedupe is wrong twice, forgetting on restart and ignoring real changes, and only a durable hash of the content tells an unchanged SKU from an updated one. The caps are cost control before cost: a 4 KiB title bounds the prompt step 2 builds from it. This step does not validate against a schema registry, alert on per-merchant lag, or replay the dead-letter topic.`,
 };

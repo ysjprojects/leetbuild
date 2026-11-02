@@ -8,36 +8,27 @@ export const eventsStep: Step = {
   focus: ['meter', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-The starter is working code: it publishes the usage and the consumer moves the
-ledger, so finance sees rows appear. Four production contracts are broken. Find them, fix them, and
-prove the fix.
+**Starting point.** The starter serves \`POST /v1/usage/events\`, which hands a metered request to
+billing: it reads \`X-Tenant-Id\` and \`Idempotency-Key\`, logs the completion text, builds an event
+with id, model, \`output_text\` and \`cost_micros\`, produces it to \`billing.usage\` keyed by model
+from a default producer, flushes and answers accepted. The ledger writes one charge per event. It
+compiles, serves the demo and hides five flaws.
 
-\`publish_usage\` is how the meter hands a metered request to billing; the ledger consumes
-\`billing.usage\` and writes one charge per event.
+**Failure mode the checks target.** One tenant's charges are spread across partitions in whatever
+order the broker chose. A producer retry becomes a second charge, because the ledger has no key to
+dedupe on and the producer is not idempotent. Tenant text sits in a retained, replicated topic and
+in the logs. During a broker outage the handler still reports success, and the spend it accepted
+appears on no invoice.
 
-- Publish exactly one \`billing.usage\` event per report with the **tenant id as the message key**.
-  Partitioning by tenant is what keeps one tenant's ledger ordered and lets a downstream consumer
-  replay a tenant's events without interleaving another's. The starter keys by **model**, so one
-  tenant's charges are spread across partitions and their order is whatever the broker chose.
-- The event **carries the \`Idempotency-Key\`** it was metered under, alongside \`usage_id\`,
-  \`tenant_id\`, \`model\`, \`input_tokens\`, \`output_tokens\` and \`cost_micros\`. Downstream billing
-  dedupes on that key: without it, a producer retry — which an idempotent producer is allowed to
-  make — becomes a second charge for the same tokens.
-- **Never** put the prompt or the completion text in the event, and never log it. The topic is
-  retained and replicated; text written there outlives the request, the tenant and the retention
-  policy. Counts and ids are all billing needs.
-- The producer must be **idempotent with \`acks=all\`** — \`enable.idempotence\` plus \`acks\` in the
-  Python/Java/C++ clients, \`idempotent: true\` with \`acks: -1\` in KafkaJS, required acks \`all\`
-  with the hash balancer in Go.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the request: a relay republishes outbox rows when the broker recovers, so an outage costs
-  latency, not revenue. The starter ignores the produce result and reports success either way.
-
-**Failure mode the checks target.** Keying by model scatters one tenant's ledger for no reason;
-omitting the idempotency key makes every produce retry a potential double charge; the completion
-text is a data leak with a long tail; and silently dropping a rejected produce means the meter
-reports spend that no invoice will ever contain — the failure is invisible until the reconciliation
-runs, weeks later.`,
+- Publish one \`billing.usage\` event per report with the **tenant id as the message key**.
+- The event carries the \`idempotency_key\` it was metered under, alongside \`usage_id\`,
+  \`tenant_id\`, \`model\`, \`input_tokens\`, \`output_tokens\` and \`cost_micros\`.
+- No prompt or completion text in the event or the logs.
+- The producer is idempotent with \`acks=all\` (\`enable.idempotence\` plus \`acks\`;
+  \`idempotent: true\` with \`acks: -1\` in KafkaJS; required acks \`all\` with the hash balancer in
+  Go).
+- When the broker rejects the produce, write the event to the outbox (\`insert_outbox\`) instead of
+  dropping it; a relay republishes outbox rows when the broker recovers.`,
   sequence: {
     participants: ['Cost Meter', 'billing.usage', 'Billing ledger', 'outbox'],
     messages: [
@@ -155,10 +146,7 @@ def publish_usage(
     tenant: str = Header(alias="X-Tenant-Id"),
     idem_key: str = Header(alias="Idempotency-Key"),
 ) -> dict:
-    # TODO: key the event by the tenant instead of the model, embed the Idempotency-Key so
-    # downstream billing can dedupe, configure the idempotent producer with acks=all, keep the
-    # completion text out of the event and the logs, and write an outbox row when the broker
-    # rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     logger.info("usage topic tenant=%s output=%r", tenant, body.output_text)
     event = {
         "id": body.usage_id,
@@ -247,10 +235,7 @@ interface UsageEvent {
 }
 
 app.post('/v1/usage/events', async (request, reply) => {
-  // TODO: key the event by the tenant instead of the model, embed the Idempotency-Key so
-  // downstream billing can dedupe, configure the idempotent producer with acks=all, keep the
-  // completion text out of the event and the logs, and write an outbox row when the broker
-  // rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const body = request.body as UsageEvent;
   const tenant = request.headers['x-tenant-id'] as string;
   request.log.info({tenant, output: body.output_text}, 'usage metered');
@@ -336,10 +321,7 @@ var store = &OutboxStore{}
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "billing.usage"}
 
 func publishUsage(ctx context.Context, tenant string, idemKey string, body UsageEvent) error {
-	// TODO: key the event by the tenant instead of the model, embed the Idempotency-Key so
-	// downstream billing can dedupe, configure the idempotent producer with acks=all, keep the
-	// completion text out of the event and the logs, and write an outbox row when the broker
-	// rejects the produce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	log.Printf("usage topic tenant=%s output=%q", tenant, body.OutputText)
 	payload, _ := json.Marshal(map[string]any{
 		"id":          body.UsageID,
@@ -430,10 +412,7 @@ object UsageEvents {
   val store = OutboxStore.open()
 
   def publishUsage(tenant: String, idemKey: String, body: UsageEvent): Unit = {
-    // TODO: key the event by the tenant instead of the model, embed the Idempotency-Key so
-    // downstream billing can dedupe, configure the idempotent producer with acks=all, keep the
-    // completion text out of the event and the logs, and write an outbox row when the broker
-    // rejects the produce.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     println(s"usage topic tenant=$tenant output=\${body.output_text}")
     val event = s"""{"id":"\${body.usage_id}","model":"\${body.model}","cost_micros":\${body.cost_micros},"output_text":"\${body.output_text}"}"""
     producer.send(new ProducerRecord[String, String]("billing.usage", body.model, event))
@@ -504,10 +483,7 @@ struct OutboxStore {
 OutboxStore store;
 
 void publishUsage(const std::string& tenant, const std::string& idemKey, const UsageEvent& body) {
-  // TODO: key the event by the tenant instead of the model, embed the Idempotency-Key so
-  // downstream billing can dedupe, configure the idempotent producer with acks=all, keep the
-  // completion text out of the event and the logs, and write an outbox row when the broker
-  // rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   std::cerr << "usage topic tenant=" << tenant << " output=" << body.output_text << "\\n";
   const json event = {
       {"id", body.usage_id},
@@ -578,9 +554,9 @@ void publishUsage(const std::string& tenant, const std::string& idemKey, const U
     },
   },
   hints: [
-    'The message key is the partition key, so it belongs to the ledger that has to stay ordered: the tenant. `key=tenant`, `key: tenant`, `Key: []byte(tenant)`, `ProducerRecord("billing.usage", tenant, …)`. A model key means two tenants that share a model also share a partition.',
-    'Idempotence is configuration, and it holds per key: `enable.idempotence` + `acks=all`, KafkaJS’s `idempotent: true` + `acks: -1`, required acks `all` with the hash balancer. Combine it with the embedded `idempotency_key` and a producer retry becomes one charge downstream.',
-    'Wrap the produce: on rejection write the event to the outbox (same tenant key), and let the request succeed. A dropped produce is revenue that never appears on an invoice, and nothing in the happy path will tell you.',
+    'Reconciliation finds a tenant charged twice for one request after a broker hiccup, and an hour of spend from the outage window missing from every invoice.',
+    'A default producer retries without idempotence and the event has no `idempotency_key`, so the ledger cannot collapse the duplicate; the produce result is ignored, so a rejection is silently a success.',
+    'Configure `enable.idempotence` with `acks=all`, produce with `key=tenant` and `idempotency_key` in the payload, drop `output_text` from the event and the log, and call `insert_outbox` on `KafkaException`.',
   ],
-  debrief: `The interviewer is testing whether you can hand work to the billing path without losing or duplicating it. Four contracts are in play: the key decides ordering and therefore what the ledger can reconcile; the embedded idempotency key decides whether a retry is one charge or two; the producer configuration decides whether duplicates can exist at all; and the outbox decides whether a broker outage is latency or missing revenue. The content rule is the one that outlives the course: a usage event needs ids, counts and cost — the completion text on a retained, replicated topic is a data-protection incident waiting for a subpoena. Real meters add a schema registry so a future producer cannot smuggle a field in, a partition count chosen for the tenant distribution, and a relay that drains outbox rows with the same idempotency key.`,
+  debrief: `Each part of the fix answers one question about the billing path. The key decides ordering, and therefore what the ledger can reconcile per tenant. The embedded idempotency key decides whether a retry is one charge or two, and the producer configuration decides whether the broker can see duplicates at all. The outbox decides whether an outage costs latency or revenue. The content rule outlives this course: a usage event needs ids, counts and cost, and completion text on a retained, replicated topic is a data-protection incident waiting to happen. Production meters register the event schema so a future producer cannot smuggle a text field in, and run the outbox relay with the same tenant key so a replayed row lands in the same partition.`,
 };

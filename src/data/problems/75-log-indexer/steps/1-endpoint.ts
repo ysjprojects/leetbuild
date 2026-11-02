@@ -8,32 +8,25 @@ export const endpointStep: Step = {
   focus: ['agent', 'api', 'registry'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the JSON body and appends the record to the buffer. It compiles, it ships a log line into the index,
-and it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with
-the checks below. One of the flaws is the quiet one: the record is cut to 16 KiB and nothing in the
-response says so.
+**Starting point.** The starter serves \`POST /v1/logs\`: it reads \`X-Tenant-Id\`, parses the JSON
+body (\`service\`, \`timestamp\`, \`level\`, \`message\`), slices \`message\` to 16 KiB and appends the
+record under whatever \`service\` string arrived. It compiles, it ships a log line, and it hides four
+flaws.
 
-Implement \`POST /v1/logs\` with body
-\`{"service": "checkout", "timestamp": "2026-05-04T10:15:00Z", "level": "error", "message": "…"}\`.
+- Missing \`X-Tenant-Id\` is **401**.
+- A record over **1 MiB** (\`1 << 20\` bytes), measured **before** parsing or buffering, is **413**.
+- \`service\` must appear in the tenant's registry; otherwise **400** with an error naming the registry.
+- \`level\` is one of \`debug\`, \`info\`, \`warn\`, \`error\`, \`fatal\`, and \`timestamp\` is RFC 3339
+  within a **5-minute** skew; **400** otherwise.
+- The retained \`message\` is at most **16 KiB** (\`16 << 10\` bytes). A cut message is reported:
+  \`truncated: true\` plus \`original_bytes\` and \`stored_bytes\`.
+- Validation runs **before** the append; a rejected record does not reach the buffer.
+- Log tenant, service and byte counts, never the message text.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The record is at most **1 MiB** (\`1 << 20\` bytes) of UTF-8, measured **before** the body is parsed
-  or buffered; a larger record is **413** and is never buffered.
-- \`service\` is a non-empty string that must appear in the tenant's registry; an unregistered service
-  is **400** with an error that names the registry. A typo must not create an invisible pipeline.
-- \`level\` is one of \`debug\`, \`info\`, \`warn\`, \`error\`, \`fatal\` (**400** otherwise), and
-  \`timestamp\` is RFC 3339 within an accepted skew of **5 minutes** (**400** otherwise).
-- The retained \`message\` is at most **16 KiB** (\`16 << 10\` bytes). When a longer message is cut,
-  the response must say so — \`truncated: true\` plus \`original_bytes\` and \`stored_bytes\` — so a
-  consumer can tell a complete stack trace from a mangled one.
-- Validation runs **before** the append: an oversized or unregistered record never reaches the buffer.
-- Log tenant, service and byte counts — never the message text.
-
-**Failure mode the checks target.** The starter accepts any \`service\` string, so one typo starts a
-second, empty pipeline nobody watches; it slices the message at 16 KiB with no marker, so the index
-holds stack traces with their last frames missing while every counter reports success; and it buffers
-first and validates never, so a 40 MiB record is resident in memory before anything rejects it.`,
+**Failure mode the checks target.** Any \`service\` string is accepted, so one typo starts an empty
+pipeline nobody watches; the message is cut at 16 KiB with no marker, so stack traces lose their
+last frames while every counter reports success; there is no record cap; and the append runs before
+any check, so a 40 MiB record is in memory before anything could reject it.`,
   sequence: {
     participants: ['Log agent', 'Ingest API', 'service registry', 'Redis buffer'],
     messages: [
@@ -134,8 +127,7 @@ buffer = BufferStore()
 
 @app.post("/v1/logs")
 async def ingest(request: Request, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter accepts any service name, cuts the message at 16 KiB without saying so, and
-    # buffers the record before validating it. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     payload = await request.json()
     message = payload.get("message", "")[: 16 * 1024]
     record = {"service": payload.get("service"), "timestamp": payload.get("timestamp"), "message": message}
@@ -250,8 +242,7 @@ export const buffer: BufferStore = {
 };
 
 app.post('/v1/logs', async (request, reply) => {
-  // TODO: this starter accepts any service name, cuts the message at 16 KiB with no marker, and
-  // buffers the record before validating it. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as {service?: string; timestamp?: string; message?: string};
   const record = {
@@ -375,8 +366,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 func ingest(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
-	// TODO: this starter accepts any service name, cuts the message at 16 KiB without saying so, and
-	// buffers the record before validating it. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	message, _ := body["message"].(string)
@@ -546,8 +536,7 @@ object Api {
     path("v1" / "logs") {
       post {
         entity(as[LogRecord]) { body =>
-          // TODO: this starter accepts any service name, cuts the message at 16 KiB without saying
-          // so, and buffers the record before validating it. Fix all three.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val tenant = "unknown-tenant"
           val key = buffer.append(tenant, body.service, body.copy(message = body.message.take(16 * 1024)))
           complete(StatusCodes.Accepted, s"""{"accepted":true,"buffer":"$key"}""")
@@ -666,8 +655,7 @@ int main() {
 
   svr.Post("/v1/logs", [](const httplib::Request& req, httplib::Response& res) {
     const auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: this starter accepts any service name, cuts the message at 16 KiB without saying so, and
-    // buffers the record before validating it. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
     auto message = body.value("message", std::string());
@@ -796,9 +784,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order: tenant, declared record size, JSON shape, service membership, level, timestamp skew — and only then the message. Every guard returns before a byte is buffered, so the ingest tier can never hold a record it will reject.',
-    "The registry is the trust boundary for names. Look the service up in the tenant's registry and answer **400** with an error that names the registry, so an operator reading the agent's log line can see that a typo, not a pipeline, was created.",
-    'Truncation is a fact you must report, not hide: keep 16 KiB, then compare the stored byte count with the original one and return `truncated`, `original_bytes` and `stored_bytes`. A consumer that cannot see the marker will treat a mangled stack trace as complete.',
+    'A 20 KiB stack trace comes back `accepted: true` and the index shows it ending mid-frame; `service: "chekout"` is accepted as well, and a 40 MiB record sits in memory before any answer.',
+    'The handler slices `message` to 16 KiB before building the record and nothing compares the lengths; the service id is passed straight to the buffer; the append runs before any check could fail.',
+    'Guard in cost order before `buffer.append`: tenant (401), declared size against `MAX_RECORD_BYTES` (413), registry membership, level and skew (400). Keep `MAX_MESSAGE_BYTES`, then return `truncated`, `original_bytes`, `stored_bytes`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo ships small, well-formed records from one correctly spelled service. Three defects are being checked: names that are not validated against the tenant's registry (one typo, one invisible pipeline), a size cap enforced after the record is already in memory, and a silent truncation that makes the index overclaim completeness. The subtle one is truncation, because nothing in the response or the counter changes when it happens — the record looks indexed and the frames are gone. Real ingest tiers add per-tenant byte quotas, sampling hints on the record, a hash of the original message for dedupe, and a rejection counter exported per reason so an agent shipping garbage is visible before a customer notices.`,
+  debrief: `The fix is a chain of guard clauses ordered by cost, each returning before a byte reaches the buffer: the cheap header and declared-size checks first, the registry lookup and timestamp parse after, the append last. That order is what makes the 413 meaningful; a cap checked after parsing has already paid for the parse. The truncation marker has its shape because the consumer, not the indexer, decides what a cut stack trace means, so the response carries both byte counts instead of a boolean alone. Production ingest tiers go further: per-tenant byte quotas, a hash of the original message so duplicates of a cut line can be joined later, and a rejection counter exported per reason so an agent shipping garbage is visible before a customer notices.`,
 };

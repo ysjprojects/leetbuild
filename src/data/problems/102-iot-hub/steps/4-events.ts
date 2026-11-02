@@ -8,38 +8,27 @@ export const eventsStep: Step = {
   focus: ['hub', 'broker', 'audit', 'outbox'],
   task: `## Task
 
-**Starting point.** The starter is working code: a command is accepted, an event lands in
-\`iot.command\`, and the audit consumer writes a history row, so the demo looks right. Three
-production contracts are broken — the message key, what the event is allowed to contain, and what
-happens when the broker refuses the produce — and the starter records only the first of a command's
-four transitions.
+**Starting point.** The starter's \`POST /v1/devices/{id}/commands\` logs the request, builds an
+event \`{id, fleet, door_code, outcome: "accepted"}\`, produces it to \`iot.command\` with
+\`key=body.fleet\` from a \`Producer\` configured with only \`bootstrap.servers\`, and flushes. The
+\`fleet-audit\` consumer appends a history row and commits. It compiles and hides five flaws.
 
-\`POST /v1/devices/{id}/commands\` accepts a command from an operator. Everything the hub does to that
-command afterwards is published to \`iot.command\`, and that topic is the only history the fleet team
-has.
+**Failure mode the checks target.** Every device in a fleet shares one partition, so a device's
+history interleaves with its neighbours. The door code sits in a retained, replicated topic and in
+the log. A produce retry can duplicate a transition, a rejected produce drops the command from
+history, and nothing after \`accepted\` is ever recorded.
 
-- Publish with the **device id as the message key** — partition by device keeps one device's command
-  history in the order it happened. Key by the fleet and every device in that fleet interleaves
-  through one partition; key by the command id and the transitions do not even stay together.
-- Publish **every** transition: \`accepted\`, \`delivered\`, \`acknowledged\`, \`expired\`. Each event
-  carries the **command id** and the outcome, so the audit can tie a transition back to the command
-  that produced it.
-- The event must not carry the command's payload, and nothing may log it either: a door code written
-  into a retained, replicated topic is a key that outlives the command that used it.
-- The producer must be **idempotent with \`acks=all\`** — \`enable.idempotence\` with \`acks\`,
-  KafkaJS's \`idempotent: true\` with \`acks: -1\`, kafka-go's \`RequireAll\` with a hash balancer — so a
-  produce retry cannot duplicate a transition in the history.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the caller; a relay republishes outbox rows when the broker recovers.
-- The fleet-audit consumer appends the history row and **only then** commits the offset; a crash
-  between the two replays the event instead of losing the transition. Keep that order.
+Requirements:
 
-**Failure mode the checks target.** Keying by fleet merges every device of a fleet into one
-partition, so a device's history is no longer the order it happened. The door code copied into the
-event is a secret with the topic's retention. Publishing only \`accepted\` leaves a command that was
-delivered, acknowledged or expired invisible to the audit. An unconfigured producer can duplicate a
-transition on a retry, and a rejected produce with no outbox row drops the command out of history
-altogether.`,
+- Produce with \`key=device\` and carry \`command_id\` in the event.
+- Publish all four transitions, \`accepted\`, \`delivered\`, \`acknowledged\`, \`expired\`, each with
+  the command id and the outcome, from wherever they happen.
+- No door code, secret or payload field in the event or in any log line; ids and outcomes only.
+- Producer config: \`enable.idempotence\` with \`acks: "all"\` (KafkaJS \`idempotent: true\` with
+  \`acks: -1\`; kafka-go \`RequireAll\` with a \`Hash\` balancer).
+- Wrap the produce: on \`KafkaException\` call \`outbox.insert_outbox(device, event)\` so a relay can
+  republish when the broker recovers.
+- The audit consumer appends the history row and only then commits the offset; keep that order.`,
   sequence: {
     participants: ['IoT Hub', 'iot.command', 'Fleet Audit', 'Outbox'],
     messages: [
@@ -57,9 +46,9 @@ altogether.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=device` (or `key: device`, `Key: []byte(device)`, `ProducerRecord("iot.command", device, …)`, the key argument of `produce`). The starter keys by fleet, so two devices that share a fleet interleave their transitions in one partition.',
-    'The event needs the command id and the outcome — nothing the device sent. A door code is payload: it must not go into the event or into a log line, because the topic retains and replicates whatever you write into it.',
-    'Idempotence is producer configuration plus a stable key (`enable.idempotence=true` with `acks=all`, `idempotent: true`, `RequireAll` with a hash balancer), and durability is the outbox: wrap the produce and insert an outbox row when the broker rejects it. Emit the four transitions from wherever they happen, expiry sweeper included.',
+    'The fleet team asks why lock 7 shows `delivered` before `accepted` in its history, and why the history for lock 9 ends at `accepted` although the door opened.',
+    '`key=body.fleet` puts every device of a fleet in one partition, so order holds per fleet, not per device; and `accept` is the only place anything is produced.',
+    'Produce with `key=device` and an event of `command_id`, `device_id`, `outcome`, from one `publish` used by all four transitions. The checks also cover `enable.idempotence`, `acks`, `insert_outbox` and the door code.',
   ],
   checks: [
     {
@@ -162,10 +151,7 @@ history = CommandHistory()
 
 @app.post("/v1/devices/{device_id}/commands")
 def accept(device_id: str, body: CommandBody) -> dict:
-    # TODO: key by the device id instead of the fleet, publish every transition (accepted,
-    # delivered, acknowledged, expired) with the command id and its outcome, keep the door code out
-    # of the event and the logs, configure the idempotent producer with acks=all, and write an
-    # outbox row when the broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     logger.info("command device=%s fleet=%s door_code=%s", device_id, body.fleet, body.door_code)
     event = {"id": body.command_id, "fleet": body.fleet, "door_code": body.door_code, "outcome": "accepted"}
     payload = json.dumps(event)
@@ -271,7 +257,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** iot.command: flawed code that keys by fleet and copies the door code into the event. */
+      starter: `/** iot.command: publishes command events for the fleet audit. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -296,10 +282,7 @@ interface CommandBody {
 }
 
 app.post('/v1/devices/:deviceId/commands', async (request, reply) => {
-  // TODO: key by the device id instead of the fleet, publish every transition (accepted, delivered,
-  // acknowledged, expired) with the command id and its outcome, keep the door code out of the event
-  // and the logs, configure the idempotent producer with acks=-1, and write an outbox row when the
-  // broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const deviceId = (request.params as {deviceId: string}).deviceId;
   const body = request.body as CommandBody;
   request.log.info({device: deviceId, fleet: body.fleet, door_code: body.door_code}, 'command');
@@ -444,10 +427,7 @@ func accept(rw http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("id")
 	body := CommandBody{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: key by the device id instead of the fleet, publish every transition (accepted,
-	// delivered, acknowledged, expired) with the command id and its outcome, keep the door code out
-	// of the event and the logs, configure the writer with acks=all and a hash balancer, and write
-	// an outbox row when the broker rejects the write.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	log.Printf("command device=%s fleet=%s door_code=%s", deviceID, body.Fleet, body.DoorCode)
 	event := map[string]any{"id": body.CommandID, "fleet": body.Fleet, "door_code": body.DoorCode, "outcome": "accepted"}
 	value, _ := json.Marshal(event)
@@ -589,10 +569,7 @@ object CommandEvents {
   private val log = Logger.getLogger("iothub")
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: key by the device id instead of the fleet, publish every transition (accepted, delivered,
-  // acknowledged, expired) with the command id and its outcome, keep the door code out of the event
-  // and the logs, configure the idempotent producer with acks=all, and write an outbox row when the
-  // broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def accepted(device: String, commandId: String, fleet: String, doorCode: String): Unit = {
     log.info(s"command device=$device fleet=$fleet door_code=$doorCode")
     val event = Map("id" -> commandId, "fleet" -> fleet, "door_code" -> doorCode, "outcome" -> "accepted").toJson.compactPrint
@@ -711,10 +688,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: key by the device id instead of the fleet, publish every transition (accepted, delivered,
-// acknowledged, expired) with the command id and its outcome, keep the door code out of the event
-// and the logs, configure the idempotent producer with acks=all, and write an outbox row when the
-// broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void accepted(const std::string& device, const std::string& commandId, const std::string& fleet, const std::string& doorCode) {
   std::cerr << "command device=" << device << " fleet=" << fleet << " door_code=" << doorCode << "\\n";
   const json event = {{"id", commandId}, {"fleet", fleet}, {"door_code", doorCode}, {"outcome", "accepted"}};
@@ -823,16 +797,13 @@ void consumeHistory(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking four things a Kafka snippet like this gets wrong. First, the
-message key is an ordering contract: partition by device and one device's history arrives in the
-order it happened, key by fleet and every device under that fleet interleaves in one partition.
-Second, the event is a public artifact: ids and outcomes are all the fleet audit needs, and a door
-code written into a retained, replicated topic is a secret with the retention period of the topic.
-Third, a lifecycle is more than its first event — \`accepted\` alone shows a command that arrived and
-then vanished, so delivery, acknowledgment and expiry each need their own event. Fourth,
-exactly-once *looking* code is not exactly-once: idempotence with \`acks=all\` keeps a retry from
-duplicating a transition, and when the produce is rejected the durable path is an outbox row a relay
-republishes — a broker is not a database. Real platforms add a schema registry for the event
-contract, per-device partition quotas, a dead-letter topic for events the audit consumer cannot
-apply, and compaction so the history keeps the last outcome of every command.`,
+  debrief: `The message key is an ordering contract, which is why the fix keys by device: Kafka orders
+within a partition, and the audit needs one device's transitions in sequence, not one fleet's. The
+event shrinks to \`command_id\`, \`device_id\` and \`outcome\` because the topic retains and
+replicates whatever it is given, so a door code written there has the topic's retention.
+\`enable.idempotence\` with \`acks=all\` lets the producer retry a transient broker error without a
+duplicate transition, and the outbox row in the \`KafkaException\` branch is the durable path when
+the broker refuses outright. One \`publish\` serving all four transitions keeps the audit from ending
+at \`accepted\`. A production platform also registers the event shape in a schema registry and
+compacts the topic so the last outcome per command survives retention.`,
 };

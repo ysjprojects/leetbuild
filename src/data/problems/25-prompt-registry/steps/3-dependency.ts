@@ -8,29 +8,25 @@ export const dependencyStep: Step = {
   focus: ['registry', 'eval'],
   task: `## Task
 
-The starter is working code: when the eval service is healthy it returns a
-verdict and the promotion goes through, so the demo ships. Every failure path promotes anyway. Find
-them, fix them, and prove the fix.
-
-Implement the eval gate the promotion path calls before it moves any pointer:
-
-- Every call to \`EvalService.Evaluate\` carries a **3-second** deadline. No deadline means one sick
-  eval service pins the promotion worker indefinitely.
-- At most **\`MAX_ATTEMPTS = 3\`** attempts, and only \`UNAVAILABLE\` / \`DEADLINE_EXCEEDED\` are
-  retryable. Any other status is a hard stop.
-- A **timeout or any RPC error blocks the promotion** — it is never an informal pass. An eval that
-  did not answer is not a green light.
-- A completed **\`failed\` verdict is terminal**: it blocks, and it is never retried until the eval
-  run expires in the hope of a better answer.
-- The gate is keyed by the version’s **content hash**, so a changed version needs a **fresh** eval;
-  a result may only be reused for the exact hash it was computed for, and only for seconds.
-- The promotion records the **eval id** it was gated on, so a year later the audit can say which run
-  justified the release.
+**Starting point.** The starter's \`eval_gate(name, version, content_hash)\` calls
+\`EvalService.Evaluate\` with no deadline, treats any RPC error as a pass, retries a \`failed\`
+verdict until the run expires, caches the result for a day and promotes without recording the run.
+With a healthy eval service the promotion goes through. It compiles, serves the demo and hides five
+flaws.
 
 **Failure mode the checks target.** Treating an error as consent is the whole bug: the starter
 \`except\`s the RPC failure and promotes, so a deadline turns into a release. Caching a failed eval
-for a day is the same decision made twice, and retrying a rejection converts a measured "no" into
-enough attempts to get lucky.`,
+for a day repeats that decision, and retrying a rejection converts a measured "no" into enough
+attempts to get lucky.
+
+- Every call to \`EvalService.Evaluate\` carries a **3-second** deadline.
+- At most **\`MAX_ATTEMPTS = 3\`** attempts, and only \`UNAVAILABLE\` / \`DEADLINE_EXCEEDED\` are
+  retryable. Any other status is a hard stop.
+- A **timeout or any RPC error blocks the promotion**.
+- A completed **\`failed\` verdict is terminal**: it blocks and is not retried.
+- The gate is keyed by the version's **content hash**, so a changed version needs a **fresh** eval;
+  a result may only be reused for the exact hash it was computed for, and only for seconds.
+- The promotion records the **eval id** it was gated on, so the audit can name the run.`,
   sequence: {
     participants: ['Prompt Registry', 'Eval service', 'Promotion store'],
     messages: [
@@ -173,9 +169,7 @@ store = PromotionStore()
 
 
 def eval_gate(name: str, version: int, content_hash: str) -> bool:
-    # TODO: the call has no deadline, an error is treated as a pass, a failed verdict is retried
-    # until the run expires and its result is cached for a day. Make a timeout block, make a
-    # failure terminal, bound the retries to the retryable codes, and keep the eval id.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     try:
         eval_stub.Evaluate(
             eval_pb2.EvaluateRequest(name=name, version=version, content_hash=content_hash)
@@ -278,9 +272,7 @@ const loaded = grpc.loadPackageDefinition(protoLoader.loadSync('eval.proto')) as
 const evalService = new loaded.evals.EvalService('eval:9000', grpc.credentials.createInsecure());
 
 export function evalGate(name: string, version: number, contentHash: string): boolean {
-  // TODO: the call has no deadline, an error is treated as a pass, a failed verdict is retried
-  // until the run expires and its result is cached for a day. Make a timeout block, make a failure
-  // terminal, bound the retries to the retryable codes, and keep the eval id.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   try {
     evalService.Evaluate({name, version, content_hash: contentHash}, new grpc.Metadata(), {});
     return true;
@@ -392,9 +384,7 @@ func (s *PromotionStore) Promote(ctx context.Context, name string, version int, 
 
 var store = &PromotionStore{}
 
-// TODO: the call has no deadline, an error is treated as a pass, a failed verdict is retried until
-// the run expires and its result is cached for a day. Make a timeout block, make a failure
-// terminal, bound the retries to the retryable codes, and keep the eval id.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func evalGate(ctx context.Context, client pb.EvalServiceClient, name string, version int, contentHash string) bool {
 	if _, err := client.Evaluate(ctx, &pb.EvaluateRequest{Name: name, Version: int32(version), ContentHash: contentHash}); err != nil {
 		return true
@@ -493,9 +483,7 @@ object EvalGate {
   val EvalCacheTtlS = 86400 // keep the eval result around for a day
   val stub = EvalServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("eval", 9000).usePlaintext().build())
 
-  // TODO: the call has no deadline, an error is treated as a pass, a failed verdict is retried
-  // until the run expires and its result is cached for a day. Make a timeout block, make a failure
-  // terminal, bound the retries to the retryable codes, and keep the eval id.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def evalGate(name: String, version: Int, contentHash: String): Boolean = {
     try {
       stub.evaluate(EvaluateRequest(name = name, version = version, content_hash = contentHash))
@@ -575,9 +563,7 @@ object EvalGate {
 
 constexpr int kEvalCacheTtlS = 86400;  // keep the eval result around for a day
 
-// TODO: the call has no deadline, an error is treated as a pass, a failed verdict is retried until
-// the run expires and its result is cached for a day. Make a timeout block, make a failure
-// terminal, bound the retries to the retryable codes, and keep the eval id.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 bool eval_gate(EvalService::Stub* stub, const std::string& name, int version, const std::string& content_hash) {
   grpc::ClientContext ctx;
   EvaluateRequest request;
@@ -669,9 +655,9 @@ std::pair<std::string, std::string> promote(
     },
   },
   hints: [
-    'A deadline is an argument on the call itself: `timeout=`, `deadline: Date.now() + …`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. Bounding the attempts is separate: a `for attempt < MAX_ATTEMPTS` loop, never `while True`.',
-    'Sort the failures before you react to them. Compare the status against `UNAVAILABLE` / `DEADLINE_EXCEEDED` and retry only those; everything else — and every successful reply with `passed: false` — returns the blocking decision immediately.',
-    'The gate’s identity is the content hash, not the name: keying the cache (and the eval request) by the hash is what forces a fresh evaluation when the version’s bytes change. Record the eval id on the promotion so the audit can name the run that justified it.',
+    'The eval service goes down for an afternoon and every promotion queued that afternoon ships; a prompt that failed its eval is live the next morning with no run id on the audit row.',
+    'The gate catches the RPC error and returns true, has no deadline or attempt bound, keeps retrying a `passed: false` verdict, and caches whatever it got for a day under the prompt name.',
+    'Pass a 3 s deadline on `Evaluate`, loop `for attempt < MAX_ATTEMPTS` retrying only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, return false on error or `passed: false`, key the short cache by `content_hash`, and pass `eval_id` to `promote`.',
   ],
-  debrief: `The interview question is what an unavailable dependency means for a release decision. There are two honest answers — block, or fall back to a smaller unit of change — and "promote anyway" is not one of them, because an eval that never ran cannot be evidence. The rest of the step is about the difference between a transport failure and a verdict: transport failures are retryable, a completed failure is information and retrying it is just waiting for a coin flip. Keying the whole gate on the content hash closes the last loop: a version whose bytes changed is a version that has never been evaluated. Real gates add per-slice scores, a minimum sample count, jittered backoff between attempts, and an eval budget so a gate cannot be retried into a denial of service.`,
+  debrief: `The fix blocks on an unavailable evaluator because an eval that never ran cannot be evidence; the only alternatives are to block or to fall back to a smaller unit of change, and "promote anyway" is not one of them. The rest of the step separates a transport failure from a verdict: transport failures are retryable, a completed failure is information and retrying it is waiting for a coin flip. Keying the whole gate on the content hash closes the last loop: a version whose bytes changed is a version that has not been evaluated. Production gates go further with per-slice scores and a minimum sample count, jittered backoff between attempts, and an eval budget so a gate cannot be retried into a denial of service.`,
 };

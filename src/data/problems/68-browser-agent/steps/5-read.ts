@@ -8,35 +8,15 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store', 'redis', 'artifact'],
   task: `## Task
 
-**Starting point.** The starter is working code: the session it was asked for
-comes back and the replay renders in the demo, so the read endpoint looks finished. It serves the
-trace to any caller, hands out every typed value the agent typed into the page, and returns a
-screenshot URL that never expires. Debug it like the owner of the Session API, fix it, and prove the
-fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/browser/sessions/{id}\`: it loads the session by id, copies every step of the input log (\`typed_values\` and \`html\` included) into the response, and returns a permanent public bucket URL for the screenshot. It serves the demo and hides four flaws.
 
-Implement \`GET /v1/browser/sessions/{id}\`, the read half of the Session API and the endpoint a
-client polls to replay a session.
+**Failure mode the checks target.** Scope: the write path authenticated, the read path only looked up an id, so any caller can replay any session. Redaction: typed values and page content in the replay make a status endpoint a copy of the data redaction protects. Expiry: a permanent screenshot URL is a read credential for life. Shape: the input log is unbounded and the budget is not read from the enforced state.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- The session's **owning tenant** is compared with the caller's: a session that belongs to another
-  tenant answers **404**, exactly like a session id that does not exist — never **403**, never the
-  body. The starter serves whichever session id it is given.
-- The response is the **step trace** in \`step_index\` order, bounded to the last \`TRACE_LIMIT\`
-  steps, plus the **budget outcome** (\`budget_remaining\`, \`budget_exhausted\`) read from the same
-  Redis session state the state step maintains (\`HGET\`/\`HGETALL\` on \`session:{id}\`). The starter
-  returns the whole \`input_log\` and asks Redis for nothing.
-- Typed values appear **only as redacted field names**: each step carries \`redacted_fields\`, produced
-  by the shared \`redact(...)\` helper, and the response never contains a typed input value or the
-  captured page content. The starter ships \`typed_values\` and \`html\`.
-- The final screenshot reference is **signed** with an expiry of at most **15 minutes**
-  (\`SCREENSHOT_TTL_S = 900\`), re-signed on every request — never a permanent public bucket URL.
-
-**Failure mode the checks target.** Three contracts in one handler. Scope, because the read path is
-where tenant isolation is usually lost: the write path authenticated and the read path only looked up
-an id. Redaction, because a replay that returns typed values and page content turns a status endpoint
-into a copy of the very data redaction exists to protect. And expiry, because a permanent screenshot
-URL is a read credential for the lifetime of the object — it leaks through logs, shared links and
-error reports and never stops working.`,
+- Tenant from the \`X-Tenant-Id\` header; missing is **401**.
+- The session's **owning tenant** is compared with the caller's: a foreign session answers **404**, exactly like a missing id.
+- The response is the **step trace** in \`step_index\` order, bounded to the last \`TRACE_LIMIT\` steps, plus \`budget_remaining\` and \`budget_exhausted\` read with \`HGETALL\` from the \`session:{id}\` hash.
+- Each step carries \`redacted_fields\` from the shared \`redact(...)\` helper; no typed value and no page content in the response.
+- The screenshot reference is **signed** with an expiry of at most **15 minutes** (\`SCREENSHOT_TTL_S = 900\`), re-signed per request, with \`expires_at\` in the body.`,
   sequence: {
     participants: ['Client', 'Session API', 'Session state', 'Trace store', 'Screenshot store'],
     messages: [
@@ -175,10 +155,7 @@ trace = TraceStore()
 
 @app.get("/v1/browser/sessions/{session_id}")
 def read_session(session_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter serves whichever session id it is given, replays the whole input log with the
-    # typed values and the captured page content, and returns a permanent screenshot URL. Fix all
-    # three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
-    # with an expiry.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     session = sessions.load(session_id)
     steps = [
         {
@@ -307,10 +284,7 @@ const sessions = new SessionStore();
 const trace = new TraceStore();
 
 app.get('/v1/browser/sessions/:sessionId', async (request, reply) => {
-  // TODO: this starter serves whichever session id it is given, replays the whole input log with the
-  // typed values and the captured page content, and returns a permanent screenshot URL. Fix all
-  // three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
-  // with an expiry.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {sessionId} = request.params as {sessionId: string};
   const session = await sessions.load(sessionId);
   const steps = await trace.all(sessionId);
@@ -458,10 +432,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readSession(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves whichever session id it is given, replays the whole input log with the
-	// typed values and the captured page content, and returns a permanent screenshot URL. Fix all
-	// three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
-	// with an expiry.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	sessionID := r.PathValue("session_id")
 	session, _ := sessions.Load(sessionID)
 	steps, _ := trace.All(sessionID)
@@ -653,10 +624,7 @@ object Read {
   val route: Route =
     path("v1" / "browser" / "sessions" / Segment) { sessionId =>
       get {
-        // TODO: this starter serves whichever session id it is given, replays the whole input log with
-        // the typed values and the captured page content, and returns a permanent screenshot URL.
-        // Fix all three: scope the read to the caller's tenant, replay field names only, and sign
-        // the screenshot with an expiry.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val session = SessionStore.load(sessionId)
         val steps = TraceStore.all(sessionId)
         complete(
@@ -796,10 +764,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/browser/sessions/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves whichever session id it is given, replays the whole input log with the
-    // typed values and the captured page content, and returns a permanent screenshot URL. Fix all
-    // three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
-    // with an expiry.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto sessionId = req.matches[1].str();
     const auto session = sessions.load(sessionId);
     res.status = 200;
@@ -937,9 +902,9 @@ int main() {
     },
   },
   hints: [
-    'Authorize the read like a write: load `session:{id}` from Redis, compare its owning tenant with the authenticated `X-Tenant-Id`, and answer **401** when the header is missing and the same **404** for "no such session" and "someone else\'s". A different status or body for the two turns the endpoint into an oracle for which session ids exist.',
-    'The replay is the dangerous payload: return `redacted_fields` per step — the names the shared `redact(...)` helper kept — and nothing else from the input. Shipping `typed_values` or the captured `html` "for debugging" is exactly what the redaction boundary exists to stop, and a status endpoint must not become a second copy of the customer\'s data.',
-    'Read the budget outcome from the same hash the worker writes (`HGETALL session:{id}` → `budget_remaining`, `budget_exhausted`) so the read cannot disagree with enforcement, bound the trace with a server constant (`TRACE_LIMIT`), and mint the screenshot reference with a signer that stamps `expires_at = now + SCREENSHOT_TTL_S` (900 s) on every request. A public bucket URL is a permanent credential.',
+    "Any caller who guesses a session id can replay another tenant's session, the replay shows the password the agent typed and the full page, and a screenshot link pasted in a ticket works forever.",
+    'read_session loads the session without comparing its owner to X-Tenant-Id, copies typed_values and html out of trace.all(), reads nothing from Redis, and builds a public bucket URL by string formatting.',
+    'Compare owner != tenant and answer 404; emit redacted_fields via redact() and drop typed_values and html; HGETALL session:{id} for budget_remaining and budget_exhausted, bound by TRACE_LIMIT; signer.sign(..., SCREENSHOT_TTL_S = 900) with expires_at.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read path with the same suspicion as a write path. The starter looks fine because the demo asks for a session it owns, replays two steps, and shows a screenshot. Three defects are being checked. Scope comes first — the read path is where tenant isolation is usually lost, because the write path authenticated and the read path only looked up an id, so the tenant in \`X-Tenant-Id\` has to own the session and a foreign session must be indistinguishable from a missing one: same \`404\`, same body, no timing hint. Redaction is second, and it is the one that outlives the incident: a replay that returns the typed values and the captured page turns a convenience endpoint into a copy of the data the pipeline redacts, and it is the same leak whether it ships in the body or in the logs. Expiry is third — a screenshot URL with no signature and no expiry is a read credential for the life of the object, and it spreads through links, logs and error reports where nothing can revoke it. The shape check is the fourth contract: the trace ordered by \`step_index\` and bounded by a server constant, with the budget outcome read from the same Redis state enforcement writes, so the number a client sees is the number that stops the next step. Real platforms add ETag or sequence-based long polling so a poller gets a cheap 304, a separate export endpoint for a full trace, and an audit record of who read whose session.`,
+  debrief: `The fix treats the read path with the same suspicion as the write path, because that is where tenant isolation usually goes missing: the write authenticated, the read only looked up an id. Comparing the owning tenant and answering the same \`404\` for foreign and missing sessions keeps the endpoint from becoming an oracle for which ids exist. Reusing the pipeline's \`redact(...)\` helper keeps the replay from becoming a second copy of data the events step already scrubbed, and a signed reference with \`expires_at\` turns a permanent bucket URL into a credential that stops working on its own. Reading the budget from the hash enforcement writes means the client sees the number that stops the next step. Production platforms usually add an audit record of who replayed whose session.`,
 };

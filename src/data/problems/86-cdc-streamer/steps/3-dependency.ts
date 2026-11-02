@@ -8,41 +8,31 @@ export const slotReadStep: Step = {
   focus: ['replicator', 'pg', 'redis', 'sink'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads batches from the slot,
-applies them to the sink and keeps the lag chart flat by moving the cursor on after anything that
-fails. It compiles, it serves the demo, and it hides the flaw that costs a tenant its changes.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`run\` loop reads batches from the slot over gRPC with no
+deadline, applies each batch to the sink, and moves the cursor to the batch's last LSN whether the
+apply succeeded or not. It compiles, it serves the demo, and it hides 5 flaws.
 
-Replication slots are read over gRPC with a 5-second deadline, and a batch that fails is retried
-from its first LSN with the same batch id; no batch is ever skipped to keep up. The starter drops a
-failed batch and advances the cursor to avoid back-pressure, so a database blip silently loses
-tenant changes, and it retries a slot-lost error forever. The fix must prove a failed batch is
-retried from its first LSN until it succeeds or the subscription halts, a slot loss surfaces as a
-page-worthy state, and back-pressure applies at the sink instead of dropped batches.
+**Failure mode the checks target.** A confirmed LSN is a promise that everything up to it is
+downstream. Moving it past a batch that failed turns at-least-once delivery into loss that no
+metric shows: the lag chart stays flat while the tenant's changes are gone, and a lost slot keeps
+discarding the segments the stream still needs while the reader retries it forever.
 
-- \`ReadSlot\` is called with a **5-second deadline**: \`timeout=DEADLINE_S\` with \`DEADLINE_S = 5\`
+- \`ReadSlot\` is called with a 5-second deadline: \`timeout=DEADLINE_S\` with \`DEADLINE_S = 5\`
   in Python, \`deadline: Date.now() + DEADLINE_MS\` with \`DEADLINE_MS = 5000\` in TypeScript,
   \`readSlotTimeout = 5 * time.Second\` with \`context.WithTimeout\` in Go,
   \`withDeadlineAfter(DeadlineSeconds.seconds)\` with \`DeadlineSeconds = 5\` in Scala, and
   \`set_deadline(\` with \`kDeadlineMs = 5000\` in C++.
-- A failed batch is retried **from its first LSN with the same batch id**
+- A failed batch is retried from its first LSN with the same batch id
   (\`batch_id\`/\`batchId\`/\`batchID\`, \`first_lsn\`/\`firstLsn\`/\`firstLSN\`), bounded by
-  \`MAX_BATCH_RETRIES\`/\`maxBatchRetries\`/\`MaxBatchRetries\`/\`kMaxBatchRetries\` = **5**, and never
+  \`MAX_BATCH_RETRIES\`/\`maxBatchRetries\`/\`MaxBatchRetries\`/\`kMaxBatchRetries\` = 5, and not
   dropped or jumped over.
-- When the attempts are exhausted the subscription **HALTS** (\`HALTED\`/\`StateHalted\`/\`Halted\`,
+- When the attempts are exhausted the subscription halts (\`HALTED\`/\`StateHalted\`/\`Halted\`,
   \`halt(\`) instead of moving the cursor.
-- An **inactive or lost slot** surfaces as a page-worthy state
+- An inactive or lost slot surfaces as a page-worthy state
   (\`SLOT_LOST\`/\`SlotLost\`/\`kSlotLost\` plus \`page_oncall\`/\`pageOncall\` and
-  \`CRITICAL\`/\`SeverityCritical\`/\`Critical\`/\`kCritical\`) rather than being retried forever.
-- The sink applies each batch **before** the cursor is confirmed, so back-pressure lands on the
-  sink (\`sink.apply_batch(...)\` or \`sink.applyBatch(...)\` then \`confirm(...)\`).
-
-**Failure mode the checks target.** The starter drops a failed batch and advances the cursor to avoid
-back-pressure, so a database blip silently loses tenant changes, and it retries a slot-lost error
-forever. The quiet one is the cursor itself: a confirmed LSN is a promise that everything up to it
-is durably downstream, so moving it past a batch that never applied turns at-least-once delivery
-into loss that no metric shows — the lag chart stays flat while the tenant's changes are gone, and
-the slot keeps discarding the segments the stream still needs.`,
+  \`CRITICAL\`/\`SeverityCritical\`/\`Critical\`/\`kCritical\`) rather than being retried.
+- The sink applies each batch before the cursor is confirmed, so back-pressure lands on the sink
+  (\`sink.apply_batch(...)\` or \`sink.applyBatch(...)\` then \`confirm(...)\`).`,
   sequence: {
     participants: ['Replicator', 'Slot reader', 'pg slot', 'sink', 'oncall'],
     messages: [
@@ -156,9 +146,7 @@ slots = slots_pb2_grpc.SlotReaderStub(channel)
 
 
 def run(subscription: str, slot: str, sink, start_lsn: int) -> None:
-    # TODO: read each batch with a 5 s deadline, retry a batch that failed from its first LSN with
-    # the same batch id instead of dropping it and moving the cursor on, page on a lost slot, and
-    # let the sink apply the batch before the cursor is confirmed.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     cursor = start_lsn
     while True:
         reply = slots.ReadSlot(slots_pb2.ReadSlotRequest(slot=slot, from_lsn=cursor))
@@ -348,9 +336,7 @@ function read(slot: string, fromLsn: string): Promise<SlotReply> {
 }
 
 export async function run(subscription: string, slot: string, sink: Sink, startLsn: string): Promise<void> {
-  // TODO: add the 5 s deadline, retry a failed batch from its first LSN with the same batch id
-  // instead of dropping it and moving the cursor on, page on a lost slot, and let the sink apply
-  // the batch before the cursor is confirmed.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   let cursor = startLsn;
   for (;;) {
     const reply = await read(slot, cursor);
@@ -522,9 +508,7 @@ type Sink interface {
 	ApplyBatch(ctx context.Context, batch *pb.SlotBatch) error
 }
 
-// TODO: add the 5 s deadline, retry a failed batch from its first LSN with the same batch id
-// instead of dropping it and moving the cursor on, page on a lost slot, and let the sink apply the
-// batch before the cursor is confirmed.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func run(
 	ctx context.Context,
 	reader pb.SlotReaderClient,
@@ -716,9 +700,7 @@ object SlotReader {
     def applyBatch(batch: SlotBatch): Unit
   }
 
-  // TODO: read each batch with a 5 s deadline, retry a batch that failed from its first LSN with
-  // the same batch id instead of dropping it and moving the cursor on, page on a lost slot, and let
-  // the sink apply the batch before the cursor is confirmed.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def run(subscription: String, slot: String, sink: Sink, startLsn: Long): Unit = {
     var cursor = startLsn
     while (true) {
@@ -857,9 +839,7 @@ object SlotReader {
 #include <iostream>
 #include <string>
 
-// TODO: add the 5 s deadline, retry a failed batch from its first LSN with the same batch id
-// instead of dropping it and moving the cursor on, page on a lost slot, and let the sink apply the
-// batch before the cursor is confirmed.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void run(
     SlotReader::Stub* reader,
     const std::string& subscription,
@@ -999,9 +979,9 @@ std::string run(
     },
   },
   hints: [
-    'A deadline is a property of the call, not of the retry around it: `timeout=DEADLINE_S` on `ReadSlot`, `deadline: Date.now() + DEADLINE_MS` in the call options, `context.WithTimeout(ctx, readSlotTimeout)` before the RPC, `withDeadlineAfter(DeadlineSeconds, ...)`, `ctx.set_deadline(... + milliseconds(kDeadlineMs))`. Without one, a slot that stalls pins the replicator for the life of the process.',
-    'The retry loop is around the batch, not around the read: keep `batch_id` and `first_lsn` fixed across attempts, loop `for attempt in range(MAX_BATCH_RETRIES)` (or `attempt < MAX_BATCH_RETRIES`), and when the attempts run out call `halt(` and return `HALTED`. Advancing the cursor past a batch that never applied is how a tenant loses changes while the dashboard stays green.',
-    'An inactive slot is not a transient error: page it (`pageOncall(CRITICAL, SLOT_LOST, ...)`) and stop, because the source will discard the segments the stream still needs. And order the write side as `sink.apply_batch(...)` (or `sink.applyBatch(...)`) then `confirm(...)`: the cursor is a promise that everything below it is downstream, so it moves only after the sink took the batch — back-pressure belongs to the sink, not to a dropped batch.',
+    'A warehouse blip at 03:00 shows as one warning line and a flat lag chart; a week later the tenant asks where 400 orders went. A dropped slot logs "retrying" forever and pages nobody.',
+    'The starter catches the apply error, logs "moving on" and sets `cursor = reply.last_lsn` anyway, so the failed batch is confirmed as delivered; the slot-inactive branch just `continue`s.',
+    'Add `timeout=DEADLINE_S` to `ReadSlot`; retry the batch `MAX_BATCH_RETRIES` times from `first_lsn` with the same `batch_id`, then `halt(...)`; `page_oncall(CRITICAL, SLOT_LOST)` and stop; `sink.apply_batch(...)` before `confirm(...)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a replication reader that owns the cursor. The starter reads fine because the demo's sink never fails and its slot never dies: every happy path is correct and every failure path silently destroys data. Five defects are being checked. The deadline bounds one read, so a stalled slot cannot pin the worker. The same-batch retry is the delivery rule: a batch that failed is retried from its first LSN under the same batch id and the batch id is what makes the sink's re-apply idempotent. The halt is the one candidates get wrong under pressure — when the attempts run out the subscription stops in a named state, because moving the cursor is the same as deleting the changes it passed. Slot loss is the operational defect: an inactive slot is permanent and page-worthy, since the source keeps discarding segments while nothing reads, and an infinite retry loop is how a data-loss incident stays invisible. The last one is ordering: the sink applies the batch before the cursor is confirmed, so back-pressure slows the reader instead of costing the tenant rows. Real replicators add jittered backoff between attempts, a per-subscription lag budget, an alert on the distance between the confirmed LSN and the slot's retention, and an operator-approved quarantine path for a batch that can never apply.`,
+  debrief: `Each fix follows from what the cursor promises. The deadline bounds one read so a stalled slot cannot pin the worker. The retry keeps \`batch_id\` and \`first_lsn\` fixed across attempts because the batch id is what lets the sink treat a re-apply as a duplicate rather than a new write. When the attempts run out the subscription halts in a named state, since moving the cursor past the batch is the same as deleting the changes it contained. A lost slot is permanent: the source discards segments while nothing reads, so it is a page, not a retry loop. And the sink applies before the cursor confirms, so back-pressure slows the reader instead of costing rows. Production replicators add jittered backoff between attempts, an alert on the distance between the confirmed LSN and the slot's retention, and an operator-approved quarantine path for a batch that can never apply.`,
 };

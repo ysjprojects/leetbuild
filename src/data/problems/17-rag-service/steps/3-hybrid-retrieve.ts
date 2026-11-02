@@ -8,27 +8,24 @@ export const hybridRetrieveStep: Step = {
   focus: ['client', 'api', 'redis', 'embed'],
   task: `## Task
 
-**Starting point.** The starter is working code: it compiles and passes the
-happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
-flaw, fix it, and prove the fix with the checks below.
-
-Implement \`retrieve(tenant, query, k)\`. It returns \`{"chunks": [...], "citations": [...]}\` for the
-answer step.
-
-- **Lexical candidates** come from the tenant's own Redis sorted set, \`rag:lex:{tenant}\`. **Vector
-  candidates** come from the vector index, filtered by tenant before ranking. A global index makes
-  one tenant's documents answer another tenant's question.
-- Merge the two ranked lists with **reciprocal rank fusion** (\`1 / (60 + rank)\`, rank starting at
-  1) and dedupe by \`chunk_id\`. A chunk that appears in both lists keeps one fused score.
-- Cap \`k\` at **20**; a caller may ask for fewer, never for more.
-- Every citation carries \`doc_id\`, \`chunk_id\`, \`start\` and \`end\` — the offsets are what lets the UI
-  highlight the supporting span and what the answer step later validates quotes against.
-- Cache the final result under \`rag:q:{tenant}:{sha256(query)}\` for **60 seconds**. A cache key
-  without the tenant is a cross-tenant leak even when the retrieval logic is scoped.
+**Starting point.** The starter implements \`retrieve(tenant, query, k)\`, returning
+\`{"chunks": [...], "citations": [...]}\` for the answer step. It reads a lexical sorted set and a
+vector index, merges the two lists in order, takes the first \`k\`, and caches the result under a
+query-hash key. It compiles and hides 5 flaws.
 
 **Failure mode the checks target.** The starter searches a global lexical set and a global vector
-index, then returns the model's chunk ids with no offsets. The demo passes because there is one
-tenant and one document; the second tenant gets the first tenant's data.
+index, then returns chunk ids with no offsets. The demo passes because there is one tenant and one
+document; the second tenant gets the first tenant's data.
+
+- **Lexical candidates** come from the tenant's own Redis sorted set, \`rag:lex:{tenant}\`. **Vector
+  candidates** come from the vector index, filtered by tenant before ranking.
+- Merge the two ranked lists with **reciprocal rank fusion** (\`1 / (60 + rank)\`, rank starting at
+  1) and dedupe by \`chunk_id\`. A chunk that appears in both lists keeps one fused score.
+- Cap \`k\` at **20**; a caller may ask for fewer, not for more.
+- Every citation carries \`doc_id\`, \`chunk_id\`, \`start\` and \`end\`: the offsets let the UI
+  highlight the supporting span and let the answer step validate quotes against it.
+- Cache the final result under \`rag:q:{tenant}:{sha256(query)}\` for **60 seconds**. A cache key
+  without the tenant is a cross-tenant leak even when the retrieval logic is scoped.
 
 :::widget cache-aside {}
 
@@ -162,8 +159,7 @@ def retrieve(tenant: str, query: str, k: int = 10) -> dict:
             seen.add(hit["chunk_id"])
             merged.append(hit)
 
-    # TODO: global lexical set, no tenant filter on vectors, no citation offsets,
-    # no k cap and a five-minute cache key without the tenant.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     result = {
         "chunks": [hit["text"] for hit in merged[:k]],
         "citations": [{"doc_id": hit["doc_id"], "chunk_id": hit["chunk_id"]} for hit in merged[:k]],
@@ -262,8 +258,7 @@ export async function retrieve(tenant: string, query: string, k = 10): Promise<R
     merged.push(hit);
   }
 
-  // TODO: a global lexical set, no tenant filter on vectors, no citation offsets,
-  // no k cap and a five-minute cache key without the tenant.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const result: Retrieval = {
     chunks: merged.slice(0, k).map(hit => hit.text),
     citations: merged.slice(0, k).map(hit => ({doc_id: hit.doc_id, chunk_id: hit.chunk_id})),
@@ -404,7 +399,7 @@ func retrieve(ctx context.Context, tenant, query string, k int) (Result, error) 
 		}
 	}
 
-	// TODO: global index, no tenant filter, no offsets, no k cap, five-minute tenant-less cache.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	out := Result{}
 	for i := 0; i < k && i < len(merged); i++ {
 		out.Chunks = append(out.Chunks, merged[i].Text)
@@ -535,7 +530,7 @@ object Retrieve {
         val lexical = redis.zrevrange("rag:lex", 0, 19).asScala.toSeq.map(parseHit)
         val vectorHits = VECTORS.search(embedQuery(query), MaxK)
         val merged = (lexical ++ vectorHits).distinctBy(_.chunkId)
-        // TODO: global index, no tenant filter, no offsets, no k cap, five-minute tenant-less cache.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         val citations = merged.take(k).map(hit => Citation(hit.docId, hit.chunkId))
         val result = render(merged.take(k), citations)
         redis.setex(cacheKey, 300, result)
@@ -619,7 +614,7 @@ std::string retrieve(const std::string& tenant, const std::string& query, int k)
     if (seen.insert(hit.chunkId).second) merged.push_back(hit);
   }
 
-  // TODO: global index, no tenant filter, no offsets, no k cap, five-minute tenant-less cache.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   json chunks = json::array();
   json citations = json::array();
   const auto limit = merged.size() < static_cast<std::size_t>(k) ? merged.size() : static_cast<std::size_t>(k);
@@ -692,9 +687,11 @@ std::string retrieve(const std::string& tenant, const std::string& query, int k)
     },
   },
   hints: [
-    'Read the lexical set with `ZREVRANGE rag:lex:{tenant}`; the tenant belongs in the key, not in a filter after the fact.',
-    'Filter the vector hits by `tenant` before you build the ranking. Then rank both lists from 1 and add `1/(60+rank)` into a map keyed by chunk id.',
-    'Build citations from the stored chunk metadata, not from the model. `start` and `end` come from the chunk row; the answer step will re-check every quote against that span.',
+    "A support agent at tenant B opens a citation and reads tenant A's contract. The UI cannot highlight the span because the citation carries no offsets.",
+    'The lexical set `rag:lex` and the vector search have no tenant in them, and the cache key is only the query hash, so two tenants share one cached answer. Nothing caps k.',
+    'Read `rag:lex:{tenant}`, filter vector hits by tenant, fuse with 1/(60+rank) per chunk id, cap k at 20, copy start/end from the chunk row, cache under `rag:q:{tenant}:…` for 60 s.',
   ],
-  debrief: `The interviewer is testing whether you treat retrieval as a multi-tenant data path, not as a similarity demo. The starter’s flaw is not the missing RRF; it is the global index and the tenant-less cache key, which turn a correctness bug into a data leak. The second signal is citation geometry: returning chunk ids alone pushes the verification problem into the answer step, where a model can invent a source. RRF is deliberate because the two retrievers have incomparable scores; rank-based fusion needs no calibration and rewards chunks both retrievers agree on. Real systems add a per-tenant allowlist at the index layer, filter inside the vector query rather than after it, version the cache by index generation, and log which retriever contributed each citation for offline recall analysis.`,
+  debrief: `The tenant goes into the index key, the vector filter and the cache key because each is a separate path to another tenant's data; scoping only the retrieval logic leaves the cache leaking the same answer to everyone who asks the same question. Filtering before ranking matters because a global top-20 can fill every slot with one tenant's chunks and leave another with nothing. RRF is used because the two retrievers produce incomparable scores; rank-based fusion needs no calibration and rewards chunks both retrievers agree on. Offsets travel with the citation so the answer step can verify a quote against a span instead of trusting a model.
+
+This step did not version the cache by index generation, so a re-ingest can serve stale results for up to 60 seconds, and did not record which retriever contributed each citation for recall analysis.`,
 };

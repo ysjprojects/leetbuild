@@ -8,29 +8,25 @@ export const stateStep: Step = {
   focus: ['registry', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the registry state module: it
-keeps a latest-version pointer, records an audit entry, and moves consumer pins. It runs against a
-local Redis, it serves the demo, and it hides three production flaws. Debug it like the owner of the
-pointer every training run reads, fix it, and prove the fix.
-
-Implement \`POST /v1/datasets/{dataset}/promote\` over the dataset state below.
-
-- \`latest_key(dataset)\` is the pointer training reads. It is **durable**: nothing ever sets a TTL on
-  it, because a quiet week must not silently reset a dataset to "no version".
-- \`promote(dataset, version, validator)\` swaps the pointer **and appends the audit record in one
-  atomic unit** (one \`EVAL\`/\`MULTI\`) and returns the previous version. The starter does \`GET\`,
-  \`SET\`, \`RPUSH\` and the pin rewrite as separate commands, so a promotion racing a purge leaves
-  consumers pointing at purged bytes.
-- \`pin(dataset, consumer, version)\` pins one consumer to a concrete version. A promotion must
-  **never move a pin**: consumers that pinned a version keep reading that version.
-- \`purge(dataset, version)\` refuses to delete a version any consumer still pins (\`VersionPinned\`).
-- \`latest(dataset)\` **fails closed**: a missing pointer raises \`LatestVersionMissing\` rather than
-  returning an empty string that would look like an unversioned dataset.
+**Starting point.** The starter serves \`POST /v1/datasets/{dataset}/promote\` with body
+\`{"version": "2026-02", "validator": "validator-7"}\`. Its \`promote\` runs \`GET\`, \`SET\`,
+\`EXPIRE\`, \`RPUSH\` and a rewrite of every consumer pin as separate Redis commands, and \`latest\`
+returns \`""\` when the pointer is absent. It runs against a local Redis, it serves the demo, and it
+hides four flaws.
 
 **Failure mode the checks target.** Two writes that must be one are a race: between the \`SET\` of the
 pointer and the pin rewrite, a purge sees pins it is about to move and deletes bytes a consumer is
-still reading. The expiring pointer is quieter — the dataset does not break loudly, it just stops
-having a latest version after an idle period, and training silently starts from nothing.`,
+still reading. The expiring pointer is quieter: after an idle period the dataset simply has no latest
+version, and training silently starts from nothing.
+
+- \`latest_key(dataset)\` is **durable**: nothing sets a TTL on it.
+- \`promote(dataset, version, validator)\` swaps the pointer **and appends the audit record in one
+  atomic unit** (one \`EVAL\`/\`MULTI\`) and returns the previous version.
+- \`pin(dataset, consumer, version)\` pins one consumer to a concrete version. A promotion must
+  **not move a pin**.
+- \`purge(dataset, version)\` refuses to delete a version any consumer still pins (\`VersionPinned\`).
+- \`latest(dataset)\` **fails closed**: a missing pointer raises \`LatestVersionMissing\` rather than
+  returning an empty string that looks like an unversioned dataset.`,
   sequence: {
     participants: ['Registry API', 'Registry state', 'Redis'],
     messages: [
@@ -143,9 +139,7 @@ def pins_key(dataset: str) -> str:
 
 
 def promote(dataset: str, version: str, validator: str) -> str:
-    # TODO: this starter writes the pointer, the audit record and the consumer pins in separate
-    # commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-    # expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     previous = redis.get(latest_key(dataset))
     redis.set(latest_key(dataset), version)
     redis.expire(latest_key(dataset), POINTER_TTL_S)
@@ -285,9 +279,7 @@ function pinsKey(dataset: string): string {
 }
 
 async function promote(dataset: string, version: string, validator: string): Promise<string> {
-  // TODO: this starter writes the pointer, the audit record and the consumer pins in separate
-  // commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-  // expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const previous = await redis.get(latestKey(dataset));
   await redis.set(latestKey(dataset), version);
   await redis.expire(latestKey(dataset), POINTER_TTL_S);
@@ -406,9 +398,7 @@ func auditKey(dataset string) string  { return "ds:" + dataset + ":audit" }
 func pinsKey(dataset string) string   { return "ds:" + dataset + ":pins" }
 
 func promote(ctx context.Context, rdb *redis.Client, dataset, version, validator string) (string, error) {
-	// TODO: this starter writes the pointer, the audit record and the consumer pins in separate
-	// commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-	// expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	previous, err := rdb.Get(ctx, latestKey(dataset)).Result()
 	if err != nil && err != redis.Nil {
 		return "", err
@@ -587,9 +577,7 @@ object DatasetStateApi {
   def pinsKey(dataset: String): String = s"ds:$dataset:pins"
 
   def promote(dataset: String, version: String, validator: String): Option[String] = {
-    // TODO: this starter writes the pointer, the audit record and the consumer pins in separate
-    // commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-    // expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val previous = Option(jedis.get(latestKey(dataset)))
     jedis.set(latestKey(dataset), version)
     jedis.expire(latestKey(dataset), PointerTtlSeconds)
@@ -715,9 +703,7 @@ std::string pinsKey(const std::string& dataset) { return "ds:" + dataset + ":pin
 
 static std::optional<std::string> promote(redis::Redis& rdb, const std::string& dataset, const std::string& version,
                                          const std::string& validator) {
-  // TODO: this starter writes the pointer, the audit record and the consumer pins in separate
-  // commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-  // expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const auto previous = rdb.get(latestKey(dataset));
   rdb.set(latestKey(dataset), version);
   rdb.expire(latestKey(dataset), kPointerTtlSeconds);
@@ -836,9 +822,9 @@ int main() {
     },
   },
   hints: [
-    'One write, not four. Read the old pointer, `SET` the new one and `RPUSH` the audit entry inside a single Lua script, so no other client can observe the pointer swapped before the audit row exists.',
-    'The pointer key has no expiry. Consumers move because they read the pointer, not because you rewrite their pins: a promotion that edits `pins` is moving a consumer that explicitly asked to stay put.',
-    'A purge is only safe for a version nobody pins. `hvals(pins)` then `VersionPinned` is the guard; a read with no pointer is not an empty string, it is `LatestVersionMissing`, because an unversioned view is worse than an error.',
+    'A consumer pinned to `2026-01` starts training on `2026-02` after a promote. A dataset nobody touched for an hour reports latest version `""`, and the job happily trains on it.',
+    '`promote` issues `GET`, `SET`, `EXPIRE`, `RPUSH` and a pin rewrite as five independent commands, so a purge can land between them; the TTL erases the pointer; `latest` turns a missing key into an empty string.',
+    'Move the pointer swap and audit append into `_PROMOTE_LUA` run via `redis.eval`, drop the `expire` on `latest_key`, leave pins untouched, add `purge` that raises `VersionPinned`, and raise `LatestVersionMissing` on `None`.',
   ],
-  debrief: `The interviewer is watching how you reason about Redis as a multi-writer store. The starter looks correct because the happy path has one writer and no purge. Three defects are checked: the promotion is not atomic (four commands where one script belongs, so a purge can interleave), the pointer expires (an idle dataset silently loses its latest version), and a read of a missing pointer returns an empty string, which callers treat as a version. Pins are the fourth idea, expressed through \`purge\` refusing a pinned version: a consumer pin is a lease, and leases are released by the consumer, never by a promotion. Real registries add a promotion token so a stale writer cannot promote over a newer one, a monotonic generation counter in the audit record, and lag-aware reads so a replica cannot serve an older pointer than the client already saw.`,
+  debrief: `Promotion is one script because the pointer, the audit row and the pins are read by different parties who each assume the others are consistent: a purge that runs between two of the starter's commands deletes bytes a pinned consumer is still reading. A pin is a lease the consumer releases, so promotion leaves it alone, and a pointer with no TTL means a quiet dataset stays versioned. Failing closed on a missing pointer turns a silent "train on nothing" into an error someone sees. Production registries extend this with a promotion token so a stale writer cannot overwrite a newer promotion, a monotonic generation in the audit record, and lag-aware reads so a replica cannot serve an older pointer than the client already saw.`,
 };

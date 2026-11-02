@@ -8,30 +8,26 @@ export const dependencyStep: Step = {
   focus: ['crawler', 'fetcher', 'hosts'],
   task: `## Task
 
-**Starting point.** The starter is working code: against a healthy host it fetches pages and stores
-them, so the demo crawls. Every failure path is wrong. Find them, fix them, and prove the fix.
+**Starting point.** The starter is \`fetch_one(job_id, host, queue, records)\`: it peeks at the
+host's queue head, calls the **Fetcher** gRPC service in a loop, stores the page on success and
+returns its \`body_ref\`. Against a healthy host it fetches pages and stores them, so the demo
+crawls. It serves the demo and hides five flaws.
 
-Implement \`fetch_one(job_id, host, queue, records)\` — one URL of one host, fetched through the
-**Fetcher** gRPC service:
+**Failure mode the checks target.** The failure paths of a remote call. A call without a deadline
+lets a stuck host pin a worker; an unbounded retry turns a permission error into a hot loop; a URL
+left at the queue head lets one dead host stall every host behind it; and an ignored
+\`Retry-After\` answers a polite 429 by knocking harder.
 
-- Every attempt carries a **5-second deadline**. A call without one lets one stuck host pin a crawl
-  worker until its process restarts.
-- At most **3 attempts per URL**, and only transport failures that are worth retrying are retried:
-  \`UNAVAILABLE\` (5xx) and \`DEADLINE_EXCEEDED\` (timeout). Everything else is handled once.
-- **403 and 404 are never retried.** A 403 is recorded as **permanently refused**
-  (\`mark_refused(url, "robots")\`) and a 404 as **gone**; the starter treats a 403 as “the page must
-  exist” and spins on it forever.
-- A **429** reschedules the whole host: call \`records.throttle(job_id, host, reply.retry_after_s, attempt)\`
-  so the host's next fetch waits out \`Retry-After\` with exponential backoff, and put the URL back
-  without counting the 429 as an attempt against it. The starter ignores \`Retry-After\` entirely.
-- The URL **leaves the queue before the fetch** (\`queue.take(...)\`) and is only returned to the
-  tail through \`queue.requeue(..., attempts)\` when a retry is still allowed. Peeking at the head
-  and fetching it in place means one dead host holds the shard's head forever.
-
-**Failure mode the checks target.** An unbounded retry loop turns a permission error into a hot loop;
-treating 403 as transient means a robots-disallowed URL is fetched thousands of times; keeping the
-URL at the head means a host that is down stalls every other host behind it in the same shard; and
-ignoring \`Retry-After\` means the crawler answers a polite 429 by knocking harder.`,
+- Every attempt carries a **5-second deadline**.
+- At most **3 attempts per URL**; only \`UNAVAILABLE\` (5xx) and \`DEADLINE_EXCEEDED\` (timeout)
+  are retried.
+- **403 and 404 are terminal.** A 403 is recorded as permanently refused
+  (\`mark_refused(url, "robots")\`) and a 404 as gone.
+- A **429** reschedules the whole host: \`records.throttle(job_id, host, reply.retry_after_s, attempt)\`
+  makes the host wait out \`Retry-After\` with exponential backoff, and the URL goes back without
+  counting the 429 as an attempt.
+- The URL **leaves the queue before the fetch** (\`queue.take(...)\`) and returns to the tail only
+  through \`queue.requeue(..., attempts)\` while a retry is still allowed.`,
   sequence: {
     participants: ['Crawl service', 'Fetcher', 'Web host', 'Redis frontier'],
     messages: [
@@ -60,9 +56,9 @@ ignoring \`Retry-After\` means the crawler answers a polite 429 by knocking hard
     ],
   },
   hints: [
-    'A gRPC deadline is an argument on the RPC (`timeout=`, `deadline: Date.now() + …`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Two different clocks are in play: the 5-second deadline bounds one attempt, while the attempt budget bounds the URL.',
-    'Retryability is a property of the failure, not of “it threw”: transport codes `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retryable, an HTTP status in the reply is data. That split is why 403/404 must be read out of `reply.status` and turned into terminal records (`mark_refused`, `mark_gone`) instead of being thrown back into the retry loop.',
-    'Take the URL before the network call and hand it back only through `requeue` with an incremented attempt count. The queue is the crawl’s only source of truth about what is left to do, so a URL that is neither taken nor dropped is a URL the shard can never get past.',
+    'One host goes down and a crawl worker stops making progress for every other host in its shard. A page behind `Disallow` shows up thousands of times in the fetcher log.',
+    'The loop peeks with `queue.head`, calls `fetcher.Fetch` with no deadline, `continue`s on 403 and on every exception, and ignores a 429 reply, so the URL stays at the head and the loop has no exit.',
+    'Use `queue.take` first, pass `timeout=DEADLINE_S`, loop to `MAX_ATTEMPTS` retrying only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, call `mark_refused` on 403 and `mark_gone` on 404, and on 429 call `records.throttle` then `requeue`.',
   ],
   checks: [
     {
@@ -169,10 +165,7 @@ fetcher = fetcher_pb2_grpc.FetcherStub(channel)
 
 def fetch_one(job_id: str, host: str, queue, records) -> str | None:
     """Fetch one URL for the host and store the page, or return the next one later."""
-    # TODO: add the 5-second deadline, bound the attempts to 3 and retry only UNAVAILABLE and
-    # DEADLINE_EXCEEDED, record a 403 as permanently refused instead of retrying the page that
-    # "must exist", take the URL off the queue before fetching so a dead host cannot block the
-    # shard, and honour a 429 Retry-After for the whole host.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     url = queue.head(job_id, host)
     if url is None:
         return None
@@ -278,10 +271,7 @@ export interface PageRecords {
 }
 
 export async function fetchOne(jobId: string, host: string, queue: Frontier, records: PageRecords): Promise<string | null> {
-  // TODO: add the 5-second deadline, bound the attempts to 3 and retry only UNAVAILABLE and
-  // DEADLINE_EXCEEDED, record a 403 as permanently refused instead of retrying the page that
-  // "must exist", take the URL off the queue before fetching so a dead host cannot block the
-  // shard, and honour a 429 Retry-After for the whole host.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const url = await queue.head(jobId, host);
   if (url === null) return null;
   for (;;) {
@@ -410,10 +400,7 @@ type PageRecords interface {
 }
 
 func FetchOne(ctx context.Context, jobID, host string, queue Frontier, records PageRecords) (string, error) {
-	// TODO: add the 5-second deadline, bound the attempts to 3 and retry only UNAVAILABLE and
-	// DEADLINE_EXCEEDED, record a 403 as permanently refused instead of retrying the page that
-	// "must exist", take the URL off the queue before fetching so a dead host cannot block the
-	// shard, and honour a 429 Retry-After for the whole host.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	url, ok, err := queue.Head(ctx, jobID, host)
 	if err != nil || !ok {
 		return "", err
@@ -512,10 +499,7 @@ func FetchOne(ctx context.Context, jobID, host string, queue Frontier, records P
 object FetchClient {
   val fetcher = FetcherGrpc.blockingStub(ManagedChannelBuilder.forAddress("fetcher", 9000).usePlaintext().build())
 
-  // TODO: add the 5-second deadline, bound the attempts to 3 and retry only UNAVAILABLE and
-  // DEADLINE_EXCEEDED, record a 403 as permanently refused instead of retrying the page that
-  // "must exist", take the URL off the queue before fetching so a dead host cannot block the
-  // shard, and honour a 429 Retry-After for the whole host.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def fetchOne(jobId: String, host: String, queue: Frontier, records: PageRecords): Option[String] = {
     val url = queue.head(jobId, host).getOrElse(return None)
     var done = false
@@ -598,10 +582,7 @@ object FetchClient {
 std::unique_ptr<Fetcher::Stub> fetcher = Fetcher::NewStub(grpc::CreateChannel("fetcher:9000", grpc::InsecureChannelCredentials()));
 
 std::optional<std::string> fetchOne(const std::string& jobId, const std::string& host, Frontier& queue, PageRecords& records) {
-  // TODO: add the 5-second deadline, bound the attempts to 3 and retry only UNAVAILABLE and
-  // DEADLINE_EXCEEDED, record a 403 as permanently refused instead of retrying the page that
-  // "must exist", take the URL off the queue before fetching so a dead host cannot block the
-  // shard, and honour a 429 Retry-After for the whole host.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto url = queue.head(jobId, host);
   if (!url) return std::nullopt;
   while (true) {
@@ -669,5 +650,5 @@ std::optional<std::string> fetchOne(const std::string& jobId, const std::string&
 `,
     },
   },
-  debrief: `The interviewer is testing the failure policy of a remote call, which is where crawlers die in production. The starter looks fine against a healthy host: it fetches, it stores, it moves on. Four defects are being checked: the missing deadline (one stuck host pins a worker), the unbounded retry loop (a permission error becomes a hot loop), the head-of-queue fetch (one dead host blocks every other host in the shard), and the ignored \`Retry-After\` (a polite 429 is answered with another request). Real crawlers add a per-host concurrency cap, a global request-rate governor across workers, and a dead-letter record so an operator can see what was dropped after the attempt budget ran out.`,
+  debrief: `The fix separates two budgets and two kinds of failure, because the property it protects is that no single URL and no single host can consume more than its share of a worker's time. The 5-second deadline bounds one attempt; \`MAX_ATTEMPTS\` bounds the URL; transport codes are retryable while an HTTP status in the reply is a decision the site already made, which is why 403 and 404 become records and 429 becomes a host-level pause. Taking the URL before the call keeps the queue truthful about what is left. Production fetch loops also cap concurrent connections per host, govern request rate across workers, bound redirect chains, and write a dead-letter record when the attempt budget runs out so an operator can see what was dropped.`,
 };

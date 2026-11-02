@@ -16,70 +16,60 @@ import {readStep} from './steps/5-read';
 export const toolRegistryProblem: Problem = {
   id: 'tool-registry',
   title: 'Tool Registry',
-  tagline: 'A curated catalog of agent tools with side-effect classes and pinned versions.',
+  tagline: 'A catalog of agent tools with side-effect classes, sandbox verdicts and pinned versions.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Tool Registry
 
-A tool registry is the piece of an AI platform that decides which tools exist, what each one is
-allowed to do, and which version an agent is actually calling. The visible part is a lookup; the
-parts that decide whether the platform is safe are who may register a tool, whether an unvalidated
-version can go live, whether an agent mid-plan can be flipped onto a different definition, and
-whether the record of all of that is complete and secret-free.
+A tool registry decides which tools exist, what each one is allowed to do, and which version an
+agent is actually calling. The visible part is a lookup; the parts that decide whether the platform
+is safe are who may register a tool, whether an unvalidated version can go live, whether an agent
+mid-plan can be flipped onto a different definition, and whether the record of all of that is
+complete and secret-free.
 
 ## The real system
 
-Production registries treat a tool definition like a release: registration is a privileged change
-with an owner, the schema is checked as JSON Schema before it is stored, and the version is minted
-from the content so the same definition can never silently replace an existing one. The active
-catalog lives in Redis behind a single version pointer, so a promotion is one atomic swap and an
-agent that pinned a version at the start of a run keeps resolving against that version for the whole
-run — a rollback moves the pointer back and the next resolution lands on the previous catalog. No
-candidate version goes live on hope: it is exercised in a sandbox over gRPC under a short deadline,
-with credentials scoped to the sandbox, and a timeout, an error or a rejection keeps the previous
-version active with the reason recorded. Every register, validate, promote and revoke publishes a
-\`tool.lifecycle\` event keyed by tool name, so one tool's history stays ordered, carrying the version,
-the side-effect class and the validator outcome — never sandbox logs, never credentials — and a
-rejection writes an outbox row rather than losing the record. Resolution is where the platform's
-promises are enforced: the caller gets the version its pin and allowlist entitle it to, and nothing
-about the owner's internal wiring.
+The Model Context Protocol, the tool interface Claude Desktop, Cursor and other agent hosts speak,
+shows what a catalog carries. A server answers \`tools/list\` with each tool's name and an
+\`inputSchema\` in JSON Schema, and may attach annotations such as \`readOnlyHint\` and
+\`destructiveHint\` that say whether a call only reads or may destroy something; the spec tells
+clients to treat those hints as untrusted unless the server is. A server that declares
+\`listChanged\` sends \`notifications/tools/list_changed\` when its tool set moves, so hosts re-list
+instead of calling a definition that no longer exists. A registry is the trusted side of that
+contract: it decides who may register, validates the schema before storing it, mints the version
+from the content, exercises a candidate in a sandbox before it goes live, keeps a run on the version
+it started with, and records every transition with the verdict rather than the sandbox output.
 
 ## What you build here
 
 One service, **toolsd**, with five pieces:
 
-1. \`POST /v1/tools\`: registration restricted to the platform reviewer role (\`403\` otherwise), a name
-   and a schema that is validated as JSON Schema (\`422\` with the failing pointer), a side-effect class
-   of \`read\`, \`write\` or \`irreversible\`, an owner team, and a server-minted immutable version —
-   re-registering an existing version is \`409\`.
-2. A **Redis** catalog: the active version behind one pointer written by a single atomic script, the
-   catalog snapshot read in one round trip, a per-tenant pin that survives a promotion for the run,
-   and a promotion guard that refuses a candidate with no passing validation.
-3. A **gRPC** sandbox client: a 10-second deadline, sandbox-scoped credentials that never touch the
-   production provider, a failure or timeout that keeps the previous version with a visible reason,
-   and a schema rejection that is terminal until the version changes.
-4. A **Kafka** lifecycle path: \`tool.lifecycle\` keyed by tool name, the version, side-effect class and
-   validator outcome in the payload, an idempotent producer with \`acks=all\`, publish-after-validation,
-   and an outbox row on rejection.
-5. \`GET /v1/tools/{name}\`: resolution against the caller's catalog pin and allowlist — the pinned
-   version when the caller pinned one, a **404** for a tool outside the allowlist, and no internal
-   endpoint, credential or owner-only field in the response.
+1. \`POST /v1/tools\`: registration restricted to the platform reviewer role (\`403\`), a schema
+   validated as JSON Schema (\`422\` with the failing pointer), a side-effect class of \`read\`,
+   \`write\` or \`irreversible\`, and a server-minted immutable version (\`409\` on reuse).
+2. A **Redis** catalog: one hash per version behind one pointer swap, a per-run pin that survives a
+   promotion, a one-write rollback, and a guard that refuses an unvalidated candidate.
+3. A **gRPC** sandbox client: a 10-second deadline, a sandbox-scoped credential, a timeout that
+   keeps the previous version with a recorded reason, and a terminal schema rejection.
+4. A **Kafka** lifecycle path: \`tool.lifecycle\` keyed by tool name, carrying version, side-effect
+   class and validator outcome, an idempotent producer with \`acks=all\`, and an outbox row on
+   rejection.
+5. \`GET /v1/tools/{name}\`: resolution against the caller's catalog pin and allowlist, a **404**
+   outside the allowlist, and no internal endpoint or credential in the response.
 
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+it looks right. Your job in every step is to debug it against the failure modes, fix it, optimize
+what is wasteful, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Tool authoring UIs, schema-diff review workflows, per-tenant catalog forks, marketplace curation,
-tool call metering and billing, sandbox container provisioning, signing and supply-chain attestation
-of tool images, and revocation propagation to already-running runs. The five pieces above are the
-ones that decide whether the registry is correct, isolated and shippable.`,
+tool call metering, sandbox container provisioning, signing of tool images, and revocation
+propagation to already-running runs.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Agent runtime', sub: 'register · resolve', x: 8, y: 50},

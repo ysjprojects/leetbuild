@@ -8,29 +8,26 @@ export const shadowEventsStep: Step = {
   focus: ['shadow', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a comparison event on the happy path,
-so the analytics team sees data arriving. It compiles and the demo works. The contract it breaks is
-the one that makes the topic safe and the comparison correct. Debug it, fix it, and prove the fix.
+**Starting point.** The starter publishes one event per shadowed request to \`shadow.sample\`:
+\`publish\` serialises the user id, the prompt and both completions, produces with the user id as the
+key on a producer created with default settings, flushes, and ignores the result. It compiles, the
+demo delivers events to the analytics team, and it hides four flaws.
 
-Implement the path that publishes one **paired evaluation** per shadowed request.
+**Failure mode the checks target.** A topic that is a second copy of production data and a
+comparison that is not paired. The starter copies the prompt and both completions into a retained,
+replicated topic; it keys by **user**, so one config's samples scatter across partitions and lose
+pairing order; its producer is not idempotent, so a retried produce double-counts; and it has **no
+outbox**, so a broker hiccup silently loses samples.
 
-- Publish exactly one \`shadow.sample\` event per paired evaluation, **keyed by the config id** —
-  partition by config keeps each experiment's samples in order, which is what makes a paired
-  comparison meaningful.
+Requirements:
+
+- Publish exactly one \`shadow.sample\` event per paired evaluation, **keyed by the config id**.
 - The payload carries **both versions**, **both scores**, a **request fingerprint** and the traffic
-  window. It carries **no prompt and no completion text**: the topic is retained and replicated, so
-  user content written there outlives every retention policy the request path has.
-- The producer is **idempotent with \`acks=all\`** (the stack's equivalent: \`enable.idempotence\` plus
-  \`acks: all\`, KafkaJS \`idempotent: true\` with \`acks: -1\`, or \`kafka.RequireAll\` with a hash
-  balancer), so a retried produce cannot duplicate a sample.
-- When the broker **rejects** the produce mid-experiment, write an **outbox row** (\`insertOutbox\`)
-  instead of dropping the sample or failing the request; a relay republishes outbox rows when the
-  broker recovers.
-
-**Failure mode the checks target.** The starter publishes the **full prompt and both completions** so
-analysts can review by hand — a data leak with a long tail into a retained topic; it keys by **user**,
-so one config's samples scatter across partitions and lose their pairing order; and it has **no
-outbox**, so a broker hiccup silently loses the comparisons the experiment depends on.`,
+  window, and **no prompt or completion text**.
+- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` plus \`acks: all\`, KafkaJS
+  \`idempotent: true\` with \`acks: -1\`, or \`kafka.RequireAll\` with a hash balancer).
+- When the broker **rejects** the produce, write an **outbox row** (\`insertOutbox\`) instead of
+  dropping the sample or failing the request; a relay republishes it when the broker recovers.`,
   sequence: {
     participants: ['Shadow Service', 'shadow.sample', 'outbox', 'Comparison consumer'],
     messages: [
@@ -72,7 +69,7 @@ outbox**, so a broker hiccup silently loses the comparisons the experiment depen
       id: 'no-content',
       title: 'No prompt or completion text in the payload',
       detail:
-        'The payload carries both versions, both scores and a request fingerprint — never the prompt or a completion. The starter copies the prompt and both completions into a retained, replicated topic.',
+        'The payload carries both versions, both scores and a request fingerprint, not the prompt or a completion. The starter copies the prompt and both completions into a retained, replicated topic.',
       match: {
         python: {none: [/\bprompt\b/i, /\bcompletion/i], all: [/fingerprint/i]},
         typescript: {none: [/\bprompt\b/i, /\bcompletion/i], all: [/fingerprint/i]},
@@ -98,7 +95,7 @@ outbox**, so a broker hiccup silently loses the comparisons the experiment depen
       id: 'idempotent',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is idempotent with `acks=all` — `enable.idempotence` + `acks`, KafkaJS `idempotent: true` + `acks: -1`, or `RequiredAcks: kafka.RequireAll` with a hash balancer. A retried produce must not duplicate a sample.',
+        'The producer is idempotent with `acks=all`: `enable.idempotence` + `acks`, KafkaJS `idempotent: true` + `acks: -1`, or `RequiredAcks: kafka.RequireAll` with a hash balancer. A retried produce must not duplicate a sample.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -123,8 +120,7 @@ class ShadowPublisher:
         self.producer = producer
 
     def publish(self, config_id: str, pair: dict) -> None:
-        # TODO: the starter keys by user so one config's samples scatter, publishes the prompt and
-        # both completions so analysts can review, and has no outbox for a rejected produce.
+        # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         payload = json.dumps(
             {
                 "user_id": pair["user_id"],
@@ -191,8 +187,7 @@ export class ShadowPublisher {
   constructor(private readonly producer: Producer) {}
 
   async publish(configId: string, pair: Record<string, unknown>): Promise<void> {
-    // TODO: the starter keys by user so one config's samples scatter, publishes the prompt and both
-    // completions so analysts can review, and has no outbox for a rejected produce.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const payload = JSON.stringify({
       config_id: configId,
       user_id: pair.user_id,
@@ -279,8 +274,7 @@ func NewShadowPublisher(brokers []string) *ShadowPublisher {
 }
 
 func (p *ShadowPublisher) Publish(ctx context.Context, configID string, pair map[string]any) error {
-	// TODO: the starter keys by user so one config's samples scatter, publishes the prompt and both
-	// completions so analysts can review, and has no outbox for a rejected produce.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{
 		"user_id":               pair["user_id"],
 		"prompt":                pair["prompt"],
@@ -365,8 +359,7 @@ final class ShadowPublisher(producer: KafkaProducer[String, String]) {
   import ShadowPublisher._
 
   def publish(configId: String, pair: Map[String, String]): Unit = {
-    // TODO: the starter keys by user so one config's samples scatter, publishes the prompt and both
-    // completions so analysts can review, and has no outbox for a rejected produce.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val payload =
       "user=" + pair("user_id") + " prompt=" + pair("prompt") + " completion=" + pair("completion")
     producer.send(new ProducerRecord[String, String](ShadowTopic, pair("user_id"), payload))
@@ -431,8 +424,7 @@ class ShadowPublisher {
 
   void publish(const std::string& configId, const std::string& userId, const std::string& prompt,
                const std::string& completion) {
-    // TODO: the starter keys by user so one config's samples scatter, publishes the prompt and the
-    // completion so analysts can review, and has no outbox for a rejected produce.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string payload =
         "{\\"user_id\\":\\"" + userId + "\\",\\"prompt\\":\\"" + prompt + "\\",\\"completion\\":\\"" + completion + "\\"}";
     producer_->produce(kShadowTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
@@ -498,9 +490,9 @@ class ShadowPublisher {
     },
   },
   hints: [
-    'The message key is the partition key: `key=config_id` (or `Key: []byte(configID)`, `key: configId`, a `ProducerRecord(topic, configId, …)`). Keyed by user, one config’s samples land in different partitions and their pairing order is no longer guaranteed.',
-    'Idempotence is producer configuration: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or `RequiredAcks: kafka.RequireAll` with a hash balancer. It needs the same message key on every retry, which is the same fix as the config key.',
-    'The payload is the experiment’s contract: both versions, both scores and a request fingerprint. If the payload can name the user or carry the text, the comparison is correct but the topic is a copy of the data the redactor removed. The outbox is the durability half: wrap the produce and insert a row when the broker rejects it.',
+    "Symptom: one config's report shows candidate and production scores that do not line up by request, a privacy audit finds full prompts in `shadow.sample`, and a broker restart leaves a gap nobody can recover.",
+    'Mechanism: `produce(..., key=pair["user_id"])` scatters one config across partitions; the payload is built from `prompt` and both completions; the producer has no idempotence config; and the result of `produce` is thrown away.',
+    'Change: `PRODUCER_CONFIG = {"enable.idempotence": True, "acks": "all"}`, a `build_event` with versions, scores, `fingerprint` and window, `key=config_id`, and `insert_outbox(...)` inside `except KafkaException`.',
   ],
-  debrief: `The interviewer is testing whether you can keep a shadow’s analytics from becoming a second copy of production data, and whether the comparison is statistically usable. Four defects are being checked. The key: partition by config keeps one experiment’s samples ordered so pairing is meaningful; keyed by user they scatter. The payload: a retained, replicated topic is the wrong place for prompts and completions, so the payload carries versions, scores and a fingerprint — an id, not content. The producer: idempotence with \`acks=all\` is what stops a retried produce from double-counting a sample, and it depends on the same stable key. The outbox: a broker rejection mid-experiment must not silently lose the samples the report will be computed from. Real pipelines add a schema registry so a future producer cannot smuggle content into the topic.`,
+  debrief: `The fix keeps a shadow's analytics from becoming a second copy of production data while making the comparison usable. Partitioning by config keeps one experiment's samples ordered so pairing is meaningful; keyed by user they scatter. A retained, replicated topic is the wrong place for prompts and completions, so the payload carries versions, scores and a fingerprint: an id, not content. Idempotence with \`acks=all\` stops a retried produce from double-counting a sample, and it depends on the same stable key. The outbox is the durability half: a broker rejection mid-experiment must not lose the samples the report is computed from. Production pipelines also enforce a schema on the topic so a future producer cannot smuggle content into it, and drain the outbox from a separate relay with a lag alert.`,
 };

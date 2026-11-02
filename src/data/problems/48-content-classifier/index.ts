@@ -17,34 +17,31 @@ import {readStep} from './steps/5-read';
 export const contentClassifierProblem: Problem = {
   id: 'content-classifier',
   title: 'Content Classifier',
-  tagline: 'Taxonomy-bound classification with calibrated fallbacks and per-tenant metrics.',
+  tagline: 'Labels bound to a versioned taxonomy, with a keyword fallback that carries its provenance.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Content Classifier
 
-A content classifier is the piece of an AI platform that turns a document into labels other systems
-act on: routing, moderation queues, billing categories, retrieval filters. The visible part is a
-list of label strings in a response; the parts that decide whether the platform is safe are the
-binding between those strings and a tenant's taxonomy, the cache and counters around it, the failure
-policy of the model call, the event that reports what happened, and the version record that makes
-yesterday's decision explainable today.
+A content classifier turns a document into labels other systems act on: routing, moderation queues,
+billing categories, retrieval filters. The visible part is a list of label strings; the parts that
+decide whether the platform is safe are the binding between those strings and a tenant's taxonomy,
+the cache around it, the failure policy of the model call, the event that reports what happened,
+and the version record that makes yesterday's decision explainable today.
 
 ## The real system
 
-Production classifiers never return whatever the model produced. A model is a language model: asked
-for a category that does not exist it will happily invent a plausible one, and a downstream router
-that trusts the string will silently drop the document into a category nobody defined. So the labels
-are bound to a versioned taxonomy the tenant owns, the model's output is intersected with it, and
-anything invented goes to a review bucket with the unknowns recorded. Taxonomies are read through a
-tenant-scoped cache with a TTL, because they are tenant data and they change; counters live in
-windowed keys so a per-tenant view exists without an unbounded keyspace. The model call has a
-deadline, retries only what is retryable, treats a refusal as an answer, and falls back to something
-deterministic that carries its provenance and is counted separately. Each classification publishes
-one event keyed by tenant, carrying a hash of the text rather than the text itself. And every result
-names the taxonomy version it used, because immutability is the only thing that keeps an audit trail
-honest.
+Google's Cloud Natural Language API exposes \`documents:classifyText\`, which returns categories from
+a fixed taxonomy with a confidence per category, and the caller pins that taxonomy with
+\`classificationModelOptions.v2Model.contentCategoriesVersion\` (\`V1\` or \`V2\`): the label set is
+versioned, and a response only means something against the version that produced it. A platform
+that routes on labels needs the same discipline one level down. A language model asked for a
+category that does not exist will invent a plausible one, so its labels are intersected with the
+tenant's versioned taxonomy and anything invented goes to review. The model call has a deadline,
+retries only what is retryable, treats a refusal as an answer, and falls back to a rules pass that
+carries its provenance. Each classification publishes one event keyed by tenant with a hash of the
+text, and every result names the taxonomy version it used.
 
 ## What you build here
 
@@ -52,31 +49,29 @@ One service, **classifierd**, with five pieces:
 
 1. \`POST /v1/classify\`: authenticated tenant, \`Content-Type: text/*\` only, text capped at 64 KiB
    and rejected when empty after normalization, labels bound to the tenant's taxonomy version
-   (invented labels route to review) and a taxonomy the tenant does not own answering \`404\`.
+   (invented labels route to review), a taxonomy the tenant does not own answering \`404\`.
 2. A **Redis** layer: taxonomy definitions cached per \`(tenant, taxonomy_id, version)\` for ten
-   minutes, written as a full replacement rather than a field patch, and per-tenant counters in
-   hourly keys that expire with their window.
+   minutes as a full replacement, and per-tenant counters in hourly keys that expire with their
+   window.
 3. A **gRPC** model client: a 700 ms deadline, at most three attempts, a terminal refusal, a
    deterministic keyword fallback with provenance, and a fallback counter so an outage is visible.
 4. A **Kafka** path: one \`classify.result\` event per classification keyed by tenant, carrying the
-   request id, taxonomy version, labels, provenance and a text hash — never the text — with an
+   request id, taxonomy version, labels, provenance and a text hash in place of the text, with an
    idempotent producer and a consumer that updates counters before it commits.
 5. \`GET /v1/taxonomies/{id}\`: an immutable version with its changelog, scoped to the tenant, and a
    classification record that names the exact version it used.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter in this course compiles, serves the happy path, and looks right. In each step you
+debug it against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Taxonomy authoring UIs, label suggestion from human review, multi-label confidence calibration,
 per-label precision/recall reporting, active learning loops, embedding-based zero-shot fallback,
-regional model routing, and billing for classification volume. The five pieces above are the ones
-that decide whether the classifier is correct, isolated and explainable.`,
+regional model routing, and billing for classification volume.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'classify · taxonomies', x: 8, y: 50},

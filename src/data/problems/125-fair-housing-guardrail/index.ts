@@ -9,17 +9,18 @@ import {auditEventsStep} from './steps/5-audit-events';
 
 /**
  * Zillow's Fair Housing guardrail, rebuilt as the service a real-estate assistant calls before and
- * after the model: authenticated, capped, version-pinned guard endpoints → a stop list, a fast
+ * after the model: authenticated, capped, version-pinned guard endpoints; a stop list, a fast
  * classifier under a deadline and an LLM judge for the uncertain band, tuned for recall and failing
- * closed → policy, decisions and strikes cached per version in Redis with an atomic publish → the
- * steer-away path that never returns blocked text, regenerates once under the FHA instructions and
- * escalates repeat offenders → an append-only audit trail on Kafka that carries hashes, never text.
+ * closed; policy, decisions and strikes cached per version in Redis with an atomic publish; the
+ * steer-away path that returns a fixed fallback instead of blocked text, regenerates once under the
+ * FHA instructions and escalates repeat offenders; an append-only audit trail on Kafka that carries
+ * text hashes.
  */
 export const fairHousingGuardrailProblem: Problem = {
   id: 'fair-housing-guardrail',
   title: 'Fair Housing Guardrail',
   tagline:
-    "Zillow's Fair Housing guardrail for an LLM assistant: stop list, classifier and judge tuned for recall, versioned policy, a steer-away reply and an audit trail.",
+    "Zillow's Fair Housing guardrail for an LLM assistant: a stop list, a recall-tuned classifier with an LLM judge for the uncertain band, versioned policy in Redis, a fixed fallback instead of blocked text, and a hashed audit trail on Kafka.",
   difficulty: 'hard',
   concepts: ['http', 'grpc', 'redis', 'kafka'],
   tag: 'ai-systems',
@@ -45,87 +46,49 @@ export const fairHousingGuardrailProblem: Problem = {
   statement: `# Fair Housing Guardrail
 
 A user types "what is a good neighborhood for Latino families in Seattle" into a real-estate
-assistant. A licensed agent is trained to decline that question; a general-purpose model will answer
-it, and in a real-estate transaction that answer is steering under the Fair Housing Act. You own
-**fhguard**, the service the assistant calls before the model sees the question and again before the
-answer reaches the user. The visible part is a refusal message. The parts that decide whether the
-company can put its name on the assistant are the tiers that make the decision, how they are tuned,
-what happens when they are down, what the user gets instead of the blocked text, and the record that
-proves what was decided under which policy.
+assistant. A licensed agent declines that question; a general-purpose model answers it, and that
+answer is steering under the Fair Housing Act. You own **fhguard**, the service the assistant calls
+before the model sees the question and again before the answer reaches the user: the tiers that
+decide, how they are tuned, what happens when they are down, and the record of what was decided
+under which policy.
 
 ## The real system
 
-Zillow built an LLM Fair Housing Guardrail for its conversational real-estate experience and later
-open-sourced the classifier behind it. The guardrail is a standalone service with a lexical stop
-list and a fine-tuned BERT sequence classifier behind one API, integrated twice around the model: as
-a pre-processing step that classifies the user input before the LLM sees it, and as a
-post-processing step that reviews the LLM output before it is displayed, with a predefined message
-shown instead of flagged output. The prompt carries fair-housing instructions as a third layer. The
-service is tuned for recall — a non-compliant answer that slips through is a legal violation, a
-compliant query that is refused is a worse product — and it is refreshed from user feedback and
-periodic human review of sampled decisions, which fix the stop list and feed harder training examples
-to the classifier.
+Zillow built an LLM Fair Housing Guardrail for its conversational real-estate experience and
+open-sourced the classifier as \`zillow/fair-housing-guardrail\`. The library runs text through a
+customizable stop list and a fine-tuned BERT-base binary classifier with a sigmoid output and a
+configurable threshold (default 0.5), and ships a RoBERTa-large multi-class variant that names the
+protected class, such as \`non-compliant-age\`. Zillow runs it on the user input and on the model
+output, shows a predefined message instead of flagged output, and pairs it with fair-housing
+instructions in the prompt.
 
 ## From the source
 
-*Navigating Fair Housing Guardrails in LLMs* explains why a generic LLM is dangerous in this domain:
-the FHA, ECOA and state laws protect race/color, national origin, sex (including sexual orientation
-and gender identity), familial status, religion, disability, age, marital status, source of income,
-criminal background and military status, and an agent who considers those characteristics when
-recommending a home or a neighborhood is steering. Its three worked queries anchor this course: a
-neighborhood search by racial makeup (non-compliant), apartments that "do not accept Section 8"
-(non-compliant, source of income), and homes with accessible features (compliant, even though it
-names a protected class). The post compares three strategies. Prompt instructions are easy and
-achieve high recall but refuse all three queries. A stop list is deterministic and right for the
-worst phrases but blind to context — "Indian" would also block Indian Wells, CA. A fine-tuned
-classifier is fast and has a sensitivity that can be tuned toward recall; training it on
-sentence-level labelled model responses as well as queries lifted precision, most at a recall around
-0.6. The deployed system combines all three: one service with stop list and classifier, an API used
-on the input and on the output, and the FHA instructions in the prompt. This course takes the tier
-order, the recall-first tuning, the double integration, the predefined replacement message and the
-feedback loop from that post. The LLM judge for the uncertain band, the concrete thresholds, the
-deadlines and the policy versioning are this course's engineering choices around the post's design.
-The press release *Zillow providing open-source technology…* adds the contract: the classifier flags
-noncompliance in the input or the output and leaves the intervention to the developer — which is
-exactly the part you build here.
+*Navigating Fair Housing Guardrails in LLMs* gives three worked queries: a neighborhood search by
+racial makeup (non-compliant), apartments that "do not accept Section 8" (non-compliant, source of
+income), and homes with accessible features (compliant). The course takes the tier order, the
+recall-first tuning, the double integration and the replacement message from the post; the LLM
+judge, the thresholds, the deadlines and the policy versioning are this course's choices.
 
 ## What you build here
 
-One service, **fhguard**, with five pieces:
-
-1. \`POST /v1/guard/input\` and \`POST /v1/guard/output\`: an \`X-Api-Key\` caller (**401** without),
-   an \`X-Policy-Version\` pinned by the conversation (**400** without), \`text\` of at most **8 KiB**
-   (**413**), a validated \`conversation_id\`, and a response of \`{allowed, reasons, tier,
-   policy_version}\`. No caller flag can skip the guard; the text is never logged.
-2. The **gRPC** tiers: the policy's stop list first, then \`Classifier.Classify\` under a **250 ms**
-   deadline, blocking at a score of **0.35** and allowing below **0.15**; the band in between goes to
-   \`Judge.Judge\` under **2 s**. Any tier error fails **closed** with reason \`guard_unavailable\`.
-3. **Redis**: the policy under \`fh:policy:{version}\` with a one-hour TTL and a publish that writes
-   the version and swaps \`fh:policy:active\` in one transaction; decisions under
-   \`fh:decision:{version}:{sha256}\` for a day so a retry never re-judges; strikes under
-   \`fh:strikes:{conversation_id}\` that expire after a day.
-4. \`POST /v1/turn\`, the steer-away path: the question is guarded before the model is called; a
-   blocked answer is regenerated **once** with the FHA instructions and checked again; what the user
-   gets is a compliant answer or the predefined fallback — never the blocked text; the third strike in
-   a day escalates the conversation to human review.
-5. **Kafka**: one \`fairhousing.audit\` event per decision keyed by conversation — decision, tier,
-   score, reasons, policy version and a text hash, never the text — from an idempotent producer with
-   an outbox, consumed into an append-only audit store before the offset commit.
-
-## The debugging habit
-
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real AI feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+1. \`POST /v1/guard/input\` and \`/output\`: \`X-Api-Key\` (**401**), \`X-Policy-Version\`
+   (**400**), \`text\` of at most **8 KiB** (**413**), \`{allowed, reasons, tier, policy_version}\`.
+   No skip flag; the text stays out of the log.
+2. The **gRPC** tiers: stop list, \`Classify\` under **250 ms**, block at **0.35**, allow below
+   **0.15**, the band to \`Judge\` under **2 s**; any error fails closed.
+3. **Redis**: \`fh:policy:{version}\` with a TTL and a transactional publish that swaps
+   \`fh:policy:active\`; decisions under \`fh:decision:{version}:{sha256}\`; strikes that expire.
+4. \`POST /v1/turn\`: guard the question first, regenerate a blocked answer **once** under the FHA
+   instructions and recheck it, return the fallback instead of blocked text, escalate the third
+   strike to human review.
+5. **Kafka**: one \`fairhousing.audit\` event per decision keyed by conversation, carrying a text
+   hash, from an idempotent producer with an outbox, appended before the offset commit.
 
 ## Left out on purpose
 
-Training and evaluating the classifier, the labelled dataset and its augmentation, the multi-class
-model, the review tooling humans use, the assistant's own retrieval and tools, multi-region
-deployment, and the legal review of the stop list itself. The five pieces above are the ones that
-decide whether the guardrail is correct, tuned the right way round, safe when its dependencies fail,
-and auditable.`,
+Training the classifier, the labelled dataset, the review tooling, the assistant's own retrieval,
+and the legal review of the stop list itself.`,
   diagram: {
     nodes: [
       {

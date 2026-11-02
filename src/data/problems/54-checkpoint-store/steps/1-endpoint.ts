@@ -8,34 +8,24 @@ export const checkpointEndpointStep: Step = {
   focus: ['client', 'api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, decodes
-the chunk and answers \`200\`. It compiles, it serves a single well-behaved uploader, and it hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter registers \`POST /v1/checkpoints\` with body
+\`{"index": 0, "data": "…"}\` (\`data\` is base64), reads \`X-Tenant-Id\` and \`X-Upload-Id\`, decodes
+the chunk, pushes it onto a Redis list, adds its length to a byte counter and answers \`200\` with
+\`complete\` set from the caller's \`total_bytes\`. It compiles, serves one uploader, and hides five
+flaws.
 
-Implement \`POST /v1/checkpoints\` with body \`{"index": 0, "data": "…"}\` (\`data\` is base64).
+**Failure mode the checks target.** Applying chunks as they arrive reorders the weights silently:
+the resume succeeds and the model is wrong. Appending a redelivered chunk duplicates a slice, and a
+caller-declared size lets an upload that lost its last chunk claim to be complete.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when missing) and the upload
-  id from \`X-Upload-Id\` (**400** when missing). The upload id is the idempotency key for the whole
-  upload: a retry of a chunk belongs to the same upload, it never forks a second checkpoint.
-- A chunk may hold at most **8 MiB** (\`1 << 23\` bytes) of decoded payload; a larger chunk is
-  **413**.
-- Chunk indexes are monotonically increasing: a chunk is accepted only at the index that follows the
-  chunks already stored for that upload. A chunk that arrives before its predecessor is **409**, not
-  a reason to apply it out of order.
-- A chunk is stored **at its index** — a hash field per index, never an append — so a redelivered
-  chunk overwrites its own position.
-- Every chunk is digested with **sha256** and the digest is persisted next to it. A replay of the
-  same \`(index, bytes)\` is byte-identical and idempotent: it returns the same state and stores
-  nothing new. A replay of the same index with *different* bytes is **409** — a chunk that changes
-  under the same index is a corrupt upload, not a retry.
-- Completeness is derived from the **stored chunk set** (\`len(stored chunks)\`), never from a
-  caller-supplied \`total_bytes\`. An incomplete upload can never be reported as complete.
-
-**Failure mode the checks target.** Applying chunks as they arrive reorders the weights silently —
-the resume succeeds and the model is wrong. Appending on a redelivered chunk duplicates a slice of
-the checkpoint. And a caller-declared size lets an upload that lost its last chunk claim to be
-complete, which is the state a resume trusts most.`,
+- Tenant from \`X-Tenant-Id\` (**401** when missing), upload id from \`X-Upload-Id\` (**400** when
+  missing); the upload id is the idempotency key.
+- A chunk holds at most **8 MiB** (\`1 << 23\` bytes) decoded; larger is **413**.
+- A chunk is accepted only at the index that follows the chunks already stored; earlier is **409**.
+- A chunk is stored **at its index**, a hash field per index rather than an append.
+- Every chunk is digested with **sha256** and the digest persisted next to it. A replay of the same
+  \`(index, bytes)\` stores nothing new; the same index with *different* bytes is **409**.
+- Completeness is derived from the **stored chunk set** (\`HLEN\`), never from \`total_bytes\`.`,
   sequence: {
     participants: ['Training job', 'Checkpoint API', 'Redis'],
     messages: [
@@ -138,10 +128,7 @@ def put_chunk(
     tenant: str = Header(alias="X-Tenant-Id"),
     upload_id: str = Header(alias="X-Upload-Id"),
 ) -> dict:
-    # TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
-    # time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
-    # the expected index, store it at that index with its digest, and derive completeness from the
-    # stored chunk set.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = base64.b64decode(body.data)
     r.rpush(f"chunks:{upload_id}", payload)
     received = int(r.get(f"received:{upload_id}") or 0) + len(payload)
@@ -203,7 +190,7 @@ def put_chunk(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/checkpoints: flawed code that applies chunks as they arrive. */
+      starter: `/** POST /v1/checkpoints: applies chunks as they arrive. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -217,10 +204,7 @@ interface ChunkBody {
 }
 
 app.post('/v1/checkpoints', async (request, reply) => {
-  // TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
-  // time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
-  // the expected index, store it at that index with its digest, and derive completeness from the
-  // stored chunk set.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const uploadId = request.headers['x-upload-id'] as string;
   const body = request.body as ChunkBody;
@@ -314,10 +298,7 @@ func putChunk(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
-	// time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
-	// the expected index, store it at that index with its digest, and derive completeness from the
-	// stored chunk set.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, err := base64.StdEncoding.DecodeString(body.Data)
 	if err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid base64"})
@@ -461,10 +442,7 @@ object Api {
         headerValueByName("X-Tenant-Id") { tenant =>
           headerValueByName("X-Upload-Id") { uploadId =>
             entity(as[ChunkRequest]) { body =>
-              // TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a
-              // second time, and reports the upload complete from the caller's totalBytes. Accept a
-              // chunk only at the expected index, store it at that index with its digest, and derive
-              // completeness from the stored chunk set.
+              // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
               val payload = java.util.Base64.getDecoder.decode(body.data)
               jedis.rpush(s"chunks:$uploadId", new String(payload))
               val received = jedis.incrBy(s"received:$uploadId", payload.length.toLong)
@@ -590,10 +568,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
-    // time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
-    // the expected index, store it at that index with its digest, and derive completeness from the
-    // stored chunk set.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const auto payload = base64Decode(body.value("data", std::string()));
     r.rpush("chunks:" + uploadId, payload);
     const auto received = r.incrby("received:" + uploadId, static_cast<long long>(payload.size()));
@@ -699,9 +674,9 @@ int main() {
     },
   },
   hints: [
-    'The next expected index is not a counter you keep in the request: it is `HLEN(chunks:{upload_id})`, the number of chunks already stored for that upload. Compare the incoming index against it and reject with 409 before writing anything — a chunk that arrives early would otherwise be applied out of order.',
-    'Store each chunk as its own hash field keyed by the index (`HSET chunks:{upload_id} {index} payload`), the way the object store will read it back. Appending to a list is what turns a redelivered chunk into a duplicated slice of the weights.',
-    'The digest is what makes a replay safe: compute `sha256` of the decoded bytes, keep it next to the chunk, and compare it when the index already exists. Same bytes → 200 and nothing written; different bytes → 409, because a chunk rewriting an index is corruption rather than a retry. And completeness comes from `HLEN`, never from the size the caller declares.',
+    'Replay one chunk twice, or send chunk 3 before chunk 2: the upload still answers 200, and the resumed model loads weights in the wrong order or with a duplicated slice.',
+    'The starter pushes every payload onto a list and sums byte counts, so position is arrival order, a retry lands twice, and `total_bytes` from the caller decides completeness.',
+    'Compare `index` against `HLEN(chunks:{upload_id})` and reject with 409; `HSET` the chunk at its index with its sha256 under `digests:{upload_id}`; derive `complete` from `HLEN`, not `total_bytes`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an upload handler at the point where a distributed write becomes a durable object. The starter looks fine because one well-behaved client sends chunks in order exactly once. What it breaks is the retry contract: chunk indexes are the only thing that ties a stream of requests to one checkpoint, a replay has to be idempotent by construction (store at the index, compare the digest), and completeness must be a property of the stored set rather than of a number the caller sent. Real stores add per-chunk checksums returned by the object store, a manifest written last, resumable upload negotiation, and a chunk-level rate limit per upload so one client cannot saturate the store.`,
+  debrief: `The fix moves every decision from the request to the stored state. Chunk indexes are the only thing that ties a stream of requests to one checkpoint, so the next expected index is the count of chunks already stored, a replay is idempotent by construction (store at the index, compare the digest), and completeness is a property of the stored set rather than a number the caller sent. The 8 MiB cap bounds what one request can push into Redis before any of that logic runs. Production stores go further: the object store returns its own per-chunk checksum, a manifest is written last so a reader sees one atomic object, and a per-upload rate limit keeps one client from saturating the store.`,
 };

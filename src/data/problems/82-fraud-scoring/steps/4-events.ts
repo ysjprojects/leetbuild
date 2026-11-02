@@ -8,35 +8,29 @@ export const eventsStep: Step = {
   focus: ['scorer', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event on the
-happy path and the consumer moves a counter, so the demo shows numbers going up. Four production
-contracts are broken, one of them a data leak with a long tail. Find them, fix them, and prove the
-fix with the checks below.
+**Starting point.** The starter publishes one \`fraud.scored\` event per decision and consumes those
+events into the alerting counters: \`publish_scored\` builds an event with the transaction id, the
+account reference, the raw score and \`raw_features\`, sends it with \`key=device_id\` through a
+default \`KafkaProducer\`, and \`consume\` commits the offset and then does \`HINCRBY\` on
+\`alerts:{account_ref}\`. It serves the demo and hides five flaws.
 
-Publish one \`fraud.scored\` event per decision and consume those events into the alerting counters.
+**Failure mode the checks target.** Keying by device id scatters an account's history across
+partitions and makes the "same account, three cities, ten minutes" query unanswerable. Publishing
+\`raw_features\` puts a person's signals into a retained, replicated topic that outlives every
+retention policy the request path has. A default producer duplicates on retry, the raw score alone
+cannot separate an outage from a decline, and commit-before-process turns one crash into a
+permanently lost alert.
 
-- The message key is the **account reference** (\`key=account_ref\`, \`key: accountRef\`,
-  \`Key: []byte(accountRef)\`, \`ProducerRecord(Topic, accountRef, …)\`). The key is the partition key,
-  so keying by account keeps one account's decisions ordered — which is the only way an analyst can
-  read a burst in the order it happened. The starter keys by device id, so the same account's history
-  arrives interleaved with every other account on that device.
-- The event id is the **transaction id**, and the payload carries the **band**, the **fallback
-  marker**, the **feature digest** and the model version. Compute the digest with
-  \`feature_digest(features)\` — a hash over the canonical feature JSON — because the topic is
-  retained for days and replicated: a digest proves which vector scored a decision without shipping
-  a person's signals, and never a card number, into that topic.
-- The producer is **idempotent with \`acks=all\`** (KafkaJS \`idempotent: true\` + \`acks: -1\`, the
-  broker's \`enable.idempotence\` + \`acks=all\`, or required acks \`all\` with hashed routing), so a
-  produce retry cannot duplicate a record and double-count an alert.
-- The consumer updates the Redis counters (\`HINCRBY alerts:{account_ref}\`) and **only then** commits
-  the offset. Commit first and one crash between the two loses the counter update forever, because
-  the offset has already moved past the record.
-
-**Failure mode the checks target.** Keying by device id scatters an account's history and makes the
-"same account, three cities, ten minutes" query unanswerable. Publishing \`raw_features\` for the
-review team is the quiet one: the review team needed the digest, not the vector, and the vector is
-now replicated and outliving every retention policy the request path has. An unconfigured producer
-duplicates on retry, and commit-before-process turns one crash into a permanently lost alert.`,
+- The message key is the account reference (\`key=account_ref\`, \`key: accountRef\`,
+  \`Key: []byte(accountRef)\`, \`ProducerRecord(Topic, accountRef, …)\`), so one account's decisions
+  stay ordered.
+- The event id is the transaction id, and the payload carries the band, the fallback marker, the
+  model version and the digest from \`feature_digest(features)\`, a sha256 over the canonical feature
+  JSON. No raw features, no card numbers.
+- The producer is idempotent with \`acks=all\` (KafkaJS \`idempotent: true\` + \`acks: -1\`, the
+  broker's \`enable.idempotence\` + \`acks=all\`, or required acks \`all\` with hashed routing).
+- The consumer updates the Redis counters (\`HINCRBY alerts:{account_ref}\`) and only then commits
+  the offset.`,
   sequence: {
     participants: ['Fraud Scorer', 'fraud.scored', 'Alerting consumer', 'Redis'],
     messages: [
@@ -66,7 +60,7 @@ duplicates on retry, and commit-before-process turns one crash into a permanentl
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is idempotent and requires all acknowledgements — `enable.idempotence` with `acks=all`, KafkaJS `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. A retry of a produce must not duplicate the record, or one alert becomes two.',
+        'The producer is idempotent and requires all acknowledgements: `enable.idempotence` with `acks=all`, KafkaJS `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. The starter constructs the producer with defaults, so a retried produce can duplicate the record and one alert becomes two.',
       match: {
         python: {all: [/enable_idempotence/, /acks\s*=\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -77,9 +71,9 @@ duplicates on retry, and commit-before-process turns one crash into a permanentl
     },
     {
       id: 'digest-not-features',
-      title: 'The payload carries a feature digest, never the features',
+      title: 'The payload carries a feature digest, not the features',
       detail:
-        '`feature_digest(features)` hashes the canonical feature vector (sha256) and the payload carries only that digest. The starter publishes `raw_features` into a retained, replicated topic, which is the leak the review team never asked for.',
+        '`feature_digest(features)` hashes the canonical feature vector (sha256) and the payload carries only that digest. The starter publishes `raw_features` into a retained, replicated topic, which is a leak the alerting consumer has no use for.',
       match: {
         python: {all: [/hashlib\.sha256/, /feature_digest/], none: [/raw_features/]},
         typescript: {all: [/createHash\(\s*'sha256'\)/, /feature_digest/], none: [/raw_features/]},
@@ -105,7 +99,7 @@ duplicates on retry, and commit-before-process turns one crash into a permanentl
       id: 'counters-before-commit',
       title: 'Counters move before the offset is committed',
       detail:
-        'The consumer does `HINCRBY` and only then commits the offset, so a crash between the two replays the record instead of losing the counter update. The starter commits first — the one order that turns a crash into a permanently missing alert.',
+        'The consumer does `HINCRBY` and only then commits the offset, so a crash between the two replays the record instead of losing the counter update. The starter commits first, the one order that turns a crash into a permanently missing alert.',
       match: {
         python: {order: [/hincrby\(/, /commit\(/]},
         typescript: {order: [/hincrby\(/, /commitOffsets\(/]},
@@ -135,8 +129,7 @@ producer = KafkaProducer(
 
 
 def publish_scored(verdict: dict, account_ref: str, device_id: str, features: dict) -> None:
-    # TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
-    # commits the consumer offset before the alerting counters move. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "id": verdict["transaction_id"],
         "account_ref": account_ref,
@@ -230,8 +223,7 @@ export async function publishScored(
   deviceId: string,
   features: Record<string, unknown>,
 ): Promise<void> {
-  // TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
-  // commits the consumer offset before the alerting counters move. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event: ScoredEvent = {
     id: verdict.transaction_id,
     account_ref: accountRef,
@@ -358,8 +350,7 @@ type ScoredEvent struct {
 	RawFeatures map[string]any \`json:"raw_features"\`
 }
 
-// TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
-// commits the consumer offset before the alerting counters move. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func publishScored(ctx context.Context, verdict ScoredVerdict, accountRef, deviceID string, features map[string]any) error {
 	event := ScoredEvent{ID: verdict.TransactionID, AccountRef: accountRef, Score: verdict.Score, RawFeatures: features}
 	payload, err := json.Marshal(event)
@@ -505,8 +496,7 @@ object ScoredEvents {
 
   case class ScoredVerdict(transactionId: String, score: Double, band: String, fallback: Boolean, modelVersion: String)
 
-  // TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
-  // commits the consumer offset before the alerting counters move. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publishScored(verdict: ScoredVerdict, accountRef: String, deviceId: String, features: Map[String, Any]): Unit = {
     val rawFeatures = JsObject(features.map { case (key, value) => key -> JsString(String.valueOf(value)) })
     val event = JsObject(
@@ -611,8 +601,7 @@ struct ScoredVerdict {
   double score = 0.0;
 };
 
-// TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
-// commits the consumer offset before the alerting counters move. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 static void publishScored(RdKafka::Producer* producer, const json& verdict, const std::string& account_ref,
                           const std::string& device_id, const json& features, RdKafka::Topic* topic) {
   const json event = {
@@ -715,10 +704,10 @@ static void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
     },
   },
   hints: [
-    'The message key is the partition key: `key=account_ref`, `key: accountRef`, `Key: []byte(accountRef)`, `ProducerRecord(Topic, accountRef, …)`. Keyed by the device, one account’s decisions land in different partitions and the analyst’s timeline is no longer a timeline.',
-    'Idempotence is producer configuration, not application logic: `enable_idempotence=True` with `acks="all"`, KafkaJS `idempotent: true` with `acks: -1`, required acks `all` with a hash balancer. It only works if the key is stable across retries, which is the same fix as the account key.',
-    'The payload is a summary, not the evidence: `band`, `fallback`, `feature_digest(features)` and the model version. The digest is what lets a reviewer prove which vector produced a decision six months later without the vector itself ever entering a replicated topic — and in the consumer, `HINCRBY` first, `commit` second.',
+    "An analyst pulls one account's decisions and gets them out of order, with the feature vector attached to each; after a consumer restart the alert counter for a burst is one short.",
+    '`key=device_id` spreads one account across partitions, the event carries `raw_features` and `score` but no `band`/`fallback`, the producer has no idempotence, and `consume` calls `commit()` before `hincrby`.',
+    'Send with `key=account_ref`; build the payload from `band`, `fallback`, the model version and `feature_digest(features)` via `hashlib.sha256`; set `enable_idempotence=True, acks="all"`; in `consume`, `hincrby` first, then `commit()`.',
   ],
-  debrief: `Four defects are checked here, and only one of them looks like a bug in a demo. Keying by device id destroys per-account ordering, which is the property the whole consumer exists to provide. Publishing the feature vector is the leak the review team never needed: a digest answers the same question without a person's signals living in a topic for a week. An unconfigured producer duplicates records on retry, so a burst alert fires twice and an analyst learns to distrust the counter. And commit-before-process is the classic Kafka mistake: it looks exactly like the correct code until one crash, after which the offset has moved and the counter update is gone for good. Real pipelines add a schema registry so a future producer cannot smuggle fields into the topic, a dead-letter topic for records the consumer cannot parse, and a replay tool that rebuilds the counters from the digest without re-scoring anything.
+  debrief: `The key is the account reference because the key is the partition, and the partition is the only ordering Kafka gives you: an account's burst is readable as a timeline only if every decision for it lands in one place. The payload is a digest rather than the vector because the topic is retained and replicated while the request path is not; a sha256 over the canonical JSON still proves which vector produced a decision. Idempotence lives in producer configuration because a retry is the client library's decision, not the application's. And \`HINCRBY\` before \`commit\` trades a possible double count after a crash, visible and bounded, for a lost one that nothing can detect. Production pipelines add a schema registry so a future producer cannot reintroduce a raw field, a dead-letter topic for unparseable records, and a replay tool that rebuilds the counters from the topic.
 `,
 };

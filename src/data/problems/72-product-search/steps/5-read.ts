@@ -8,31 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'read', 'catalog', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks the product up, caches
-it in a process dictionary, and returns the price. It compiles, it answers the demo, and it hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter registers \`GET /v1/products/{id}\`, looks the product up in a
+process-level dictionary keyed by product id, fetches it from the catalog on a miss, stores it for
+the life of the process, and answers with the id, the price and \`price_version: "latest"\`. It
+compiles, it answers the demo, and it hides four flaws.
 
-Implement \`GET /v1/products/{id}\` with the authenticated \`X-Tenant-Id\` header.
+**Failure mode the checks target.** A read path is where staleness becomes a lie. The starter's
+cache has no version and no expiry, so it serves whatever it saw first; its \`price_version\` is a
+constant, so a caller that trusts the version trusts nothing; and it is keyed by product id alone, so
+a cross-tenant read is one id away. The fix ties the response to the document it actually returns:
+the document's version, the snapshot's version, and a five-minute bound past which the read fails
+loudly instead of serving a price the catalog has moved past.
 
-- The document is read through the catalog snapshot for the **caller's tenant** (\`snapshot(tenant, id)\`),
-  and a product that is not in that tenant's catalog is **404**. The starter ignores the tenant and
-  serves any product id from a shared process cache.
+- The document is read through the catalog snapshot for the **caller's tenant**
+  (\`snapshot(tenant, id)\`), and a product that is not in that tenant's catalog is **404**.
 - The response reports the document's **own** price version (\`price_version\` / \`priceVersion\`), not
-  a constant. The starter answers \`price_version: "latest"\` while the price it returns may be old —
-  the version must describe the value beside it.
+  a constant: the version must describe the value beside it.
 - The document carries its **index version** and its index timestamp; the response is refused
   (**409**) when the snapshot is more than **5 minutes** behind (\`MAX_INDEX_LAG_MS = 300000\`,
-  \`snapshot_ms - index_ms > MAX_INDEX_LAG_MS\`). The starter caches until the process restarts and has
-  no bound at all, so a price change may never appear.
-- Log the refusal, not the price history: a stale document is an operations signal.
-
-**Failure mode the checks target.** A read path is where staleness becomes a lie. The starter's cache
-has no version and no expiry, so it serves whatever it saw first; its \`price_version\` is a constant,
-so a caller that trusts the version trusts nothing; and it is keyed by product id alone, so a
-cross-tenant read is one id away. The fix ties the response to the document it actually returns:
-the document's version, the snapshot's version, and a five-minute bound past which the read fails
-loudly instead of serving a price the catalog has moved past.`,
+  \`snapshot_ms - index_ms > MAX_INDEX_LAG_MS\`).
+- Log the refusal, not the price history: a stale document is an operations signal.`,
   sequence: {
     participants: ['Client', 'Product read', 'Redis', 'Catalog'],
     messages: [
@@ -138,8 +133,7 @@ def read_product(
     product_id: str,
     tenant: str = Header(default="", alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter serves the document from a process-lifetime cache, reports the latest price
-    # version while the price is stale, and returns any tenant's product by id. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     document = CACHE.get(product_id)
     if document is None:
         document = catalog.fetch(tenant, product_id)
@@ -201,7 +195,7 @@ def read_product(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/products/:id: flawed code with a process-lifetime cache. */
+      starter: `/** GET /v1/products/:id: the starter. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -219,8 +213,7 @@ const catalog: Catalog = {
 };
 
 app.get('/v1/products/:id', async (request, reply) => {
-  // TODO: this starter serves the document from a process-lifetime cache, reports the latest price
-  // version while the price is stale, and returns any tenant's product by id. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const {id} = request.params as {id: string};
   let document = CACHE[id];
@@ -287,8 +280,7 @@ func catalogFetch(tenant, id string) map[string]any {
 }
 
 func readProduct(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves the document from a process-lifetime cache, reports the latest price
-	// version while the price is stale, and returns any tenant's product by id. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	id := r.PathValue("id")
 	document, ok := productCache[id]
@@ -395,8 +387,7 @@ object ProductRead {
     path("v1" / "products" / Segment) { productId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter serves the document from a process-lifetime cache, reports the latest
-          // price version while the price is stale, and returns any tenant's product by id.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val document = cache.getOrElseUpdate(productId, catalogFetch(tenant, productId))
           complete(StatusCodes.OK, s"""{"id":"\${document("id")}","price":\${document("price")},"price_version":"latest"}""")
         }
@@ -477,8 +468,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/products/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves the document from a process-lifetime cache, reports the latest price
-    // version while the price is stale, and returns any tenant's product by id. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const std::string id = req.matches[1];
     auto it = productCache.find(id);
@@ -558,9 +548,9 @@ int main() {
     },
   },
   hints: [
-    'Key the read by `(tenant, product id)`, not by product id: `snapshot(tenant, id)` returning `None`/`null` is what makes a foreign id a **404** instead of a cache hit. A process dictionary keyed by id alone is a cross-tenant read with extra steps.',
-    'Return the version that belongs to the value: the document you load carries `price_version` and `index_version`, so echo those. A constant like `"latest"` is worse than no version — it is a claim the service cannot back.',
-    'The staleness rule is a comparison, not a TTL: `snapshot_ms - index_ms > 300000` (five minutes) is a **409**, and it is computed against the snapshot you just read, so a document from a lagging replica cannot slip through just because it is in cache.',
+    'A merchant updates a price and the storefront keeps showing the old one until a deploy; the response says `price_version: "latest"` the whole time; a shopper on tenant B can fetch tenant A\'s product by id.',
+    'The process dictionary is keyed by product id with no tenant, no version and no expiry, and the handler writes a constant where the version belongs, so nothing in the response can be checked against the catalog.',
+    "Read `snapshot(tenant, id)` and answer 404 on `None`; echo the document's `price_version` and `index_version`; refuse with 409 when `snapshot_ms - index_ms > MAX_INDEX_LAG_MS` (300000) and log it as stale.",
   ],
-  debrief: `The interviewer is testing the read path, where a cache that is merely fast becomes a correctness bug. Three defects are being checked: the tenant in the lookup (a product id alone is not a key), the price version reported next to the price (a constant version misleads every caller that trusts it), and the five-minute index-lag bound (without it, "the price changed" is not something the service can ever observe). The subtle one is the third: candidates add a TTL and call it freshness, but the caller is told a version, and a version that trails the catalog by an unbounded amount is a factual error. Real reads add an ETag or \`If-None-Match\` on the version, a per-tenant catalog snapshot id, and a fallback that reads through to the primaries when the replica lag crosses the bound.`,
+  debrief: `The read path is where a cache that is merely fast turns into a correctness bug. The fix puts the tenant in the lookup because a product id alone is not a key, reports the version that belongs to the price it returns, and compares the document's index timestamp with the snapshot it just read. That comparison is the part people replace with a TTL: a TTL bounds how long an entry lives, but the caller is told a version, and a version that trails the catalog by an unbounded amount is a factual error no TTL can prevent. Production reads also expose the version as an ETag so a client can send \`If-None-Match\`, carry a per-tenant snapshot id, and read through to the primary when the local snapshot is too far behind to answer.`,
 };

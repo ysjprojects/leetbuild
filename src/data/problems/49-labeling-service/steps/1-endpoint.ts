@@ -8,38 +8,28 @@ export const taskEndpointStep: Step = {
   focus: ['client', 'service', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and answers \`201\` with a fresh task id. It compiles, the demo posts a handful of items
-under one spec and never retries, and it queues exactly what the caller sent — so the cohort that
-reaches the reviewers is not the cohort anyone agreed to pay for. Debug it like the service owner,
-fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/tasks\` with body
+\`{"items": ["…", …], "spec_version": "2024-05-01", "reviewers": 3}\` (an item is the raw
+payload string), reads the tenant from \`X-Tenant-Id\`, mints a task id, hands every item to
+\`assign\` and answers \`201\` with the task id, \`reviewers\` and \`accepted\`. It serves the demo
+and hides 4 flaws.
 
-Implement \`POST /v1/tasks\` with body
-\`{"items": ["…", …], "spec_version": "2024-05-01", "reviewers": 3}\` — an item is the raw item
-payload string in this exercise.
+**Failure mode the checks target.** The demo posts five items under one spec and does not retry.
+Real clients retry, overlap batches and send any size, so the cohort that reaches the reviewers is
+not the one anyone agreed to pay for.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). The created task is stored under
-  \`(tenant, key)\` and a replay of the same create returns the stored task with **200** instead of
-  creating a second one.
-- \`spec_version\` is required and must be a non-empty string (missing or blank → **400**). The task
-  record is **pinned** to it, so reviewers never see "whatever spec is current".
-- \`items\` is a non-empty list of at most \`MAX_BATCH_ITEMS = 200\` non-empty strings (**400**
-  otherwise). An unbounded batch lets one request enqueue a million items.
-- \`reviewers\` is an integer from \`MIN_REVIEWERS = 1\` to \`MAX_REVIEWERS = 5\` (**400**
-  otherwise).
-- Dedup by content hash: \`content_hash(item)\` is the sha256 hex of the item's UTF-8 bytes. Items
-  whose hash already exists under the same spec (in the store) and items that repeat inside the
-  batch are dropped from the batch and counted in the response's \`deduped\`; when nothing new
-  remains the answer is **409** \`{"error": "no_new_items"}\`. Dedup happens **before** assignment.
-- **201** response: \`{"task_id", "spec_version", "reviewers", "accepted", "deduped"}\`.
-
-**Failure mode the checks target.** The starter computes no content hash, so a retried or overlapping
-batch queues the same item twice — a second payment for the same answer; it never reads or stores
-\`spec_version\`, so the labels a reviewer submits get compared against whatever taxonomy is current
-weeks later; it accepts unbounded batches and any reviewer count, so one fat request is an unbounded
-cohort; and it ignores \`Idempotency-Key\`, so the retry every client does creates a competing cohort
-over the same items.`,
+- Missing \`X-Tenant-Id\` is **401**.
+- \`Idempotency-Key\` is required (**400** when missing). The task is stored under \`(tenant, key)\`
+  and a replay returns the stored task with **200**.
+- \`spec_version\` is required and non-blank (**400** otherwise); the task record is **pinned** to
+  it.
+- \`items\` is 1..\`MAX_BATCH_ITEMS = 200\` non-empty strings; \`reviewers\` is
+  \`MIN_REVIEWERS = 1\`..\`MAX_REVIEWERS = 5\` (**400** otherwise).
+- Dedup by content hash: \`content_hash(item)\` is the sha256 hex of the UTF-8 bytes. Items whose
+  hash the store already holds under the same spec, and repeats inside the batch, are dropped and
+  counted in \`deduped\`; when nothing new remains answer **409** \`{"error": "no_new_items"}\`.
+  Dedup happens **before** assignment.
+- **201** response: \`{"task_id", "spec_version", "reviewers", "accepted", "deduped"}\`.`,
   sequence: {
     participants: ['Client', 'labeld', 'task store'],
     messages: [
@@ -97,7 +87,7 @@ over the same items.`,
       id: 'spec-pinned',
       title: 'Requires and pins the label spec version',
       detail:
-        'A create without a non-blank `spec_version` is **400**, and the stored task record carries the version it was created under so every reviewer answers the same frozen question. The starter never reads the field and never pins it, so the cohort silently follows whatever spec is current.',
+        'A create without a non-blank `spec_version` is **400**, and the stored task record carries the version it was created under so every reviewer answers the same frozen question. The starter neither reads the field nor pins it, so the cohort silently follows whatever spec is current.',
       match: {
         python: {
           all: [/spec_version/, /status_code\s*=\s*400/, /"spec_version":\s*body\.spec_version/],
@@ -207,9 +197,7 @@ def assign(tenant: str, task_id: str, items: list[str]) -> None:
 
 @app.post("/v1/tasks")
 def create_task(body: TaskRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter accepts unbounded batches and any reviewer count, never reads or stores
-    # spec_version (so reviewers see the current spec), computes no content hash (so a retry
-    # re-queues every item), and ignores Idempotency-Key entirely.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     task_id = str(uuid.uuid4())
     assign(tenant, task_id, body.items)
     return {"task_id": task_id, "reviewers": body.reviewers, "accepted": len(body.items)}
@@ -332,9 +320,7 @@ async function assign(tenant: string, taskId: string, items: string[]): Promise<
 }
 
 app.post('/v1/tasks', async (request, reply) => {
-  // TODO: this starter accepts unbounded batches and any reviewer count, never reads or stores
-  // spec_version (so reviewers see the current spec), computes no content hash (so a retry
-  // re-queues every item), and ignores Idempotency-Key entirely.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as TaskBody;
   const taskId = randomUUID();
@@ -483,9 +469,7 @@ func createTask(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts unbounded batches and any reviewer count, never reads or stores
-	// SpecVersion (so reviewers see the current spec), computes no content hash (so a retry
-	// re-queues every item), and ignores Idempotency-Key entirely.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	taskID := uuid.NewString()
 	assign(tenant, taskID, body.Items)
 	writeJSON(rw, http.StatusCreated, map[string]any{
@@ -667,9 +651,7 @@ object LabelApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[TaskRequest]) { body =>
-            // TODO: this starter accepts unbounded batches and any reviewer count, never reads or
-            // stores spec_version (so reviewers see the current spec), computes no content hash
-            // (so a retry re-queues every item), and ignores Idempotency-Key entirely.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val taskId = UUID.randomUUID().toString
             assign(tenant, taskId, body.items)
             complete(
@@ -808,9 +790,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts unbounded batches and any reviewer count, never reads or stores
-    // spec_version (so reviewers see the current spec), computes no content hash (so a retry
-    // re-queues every item), and ignores Idempotency-Key entirely.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto taskId = uuidString();
     assign(tenant, taskId, body.value("items", json::array()));
     res.status = 201;
@@ -946,9 +926,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guards in cost order: tenant (**401**), `Idempotency-Key` (**400**), `spec_version`, `items`, `reviewers`. Every one of them returns before the store is touched, so a rejected create leaves no half-built task behind — and the `(tenant, key)` lookup happens before a new task id is minted.',
-    'The dedupe set is seeded from the store for that `spec_version` and extended while you walk the items, so a hash that repeats inside the batch is dropped too; every drop is counted in `deduped`. When nothing is left, answer **409 `{"error": "no_new_items"}`** rather than a **201** with `accepted: 0`: an empty task is a task no reviewer can ever finish, and it hides a double-submitted batch.',
-    'Pinning is one field on the task record: store the `spec_version` the caller sent and answer with it. A task that resolves "the current spec" at assignment time silently re-labels work that was already paid for under the taxonomy in force when it was created — the labels are comparable only within one spec version.',
+    'A client that times out and retries its create sees two task ids, and the same five items show up twice in the queue; a batch of 10,000 items is accepted without a word.',
+    'The handler reads only `items` and `reviewers`: nothing hashes an item, nothing looks at `Idempotency-Key` or `spec_version`, and nothing compares a count against a named limit before `assign` runs.',
+    'Guard in cost order (tenant 401, key 400, spec and bounds 400), look up `(tenant, key)` before minting an id, hash items against `seen_hashes` and the batch, answer 409 `no_new_items` when nothing remains, store `spec_version`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, where a wrong acceptance is expensive rather than slow. The starter reads fine because the demo posts five items under one spec, asks for three reviewers and never retries. Four defects are being checked: the spec pin (a labeling task is a promise about *which* question is being asked, so the version is stored with the task, never resolved later — this is the field that makes the agreement math in step 5 meaningful), the caps (a cheap rejection before an expensive cohort exists), content dedupe (the item's bytes are the identity of the label, so hashing them under the spec is what stops paying twice for one answer), and idempotency keyed by tenant so the retry every client does cannot create a competing cohort over the same items. Real labeling services add a request fingerprint so two different batches under one key are rejected instead of silently replaying the first, per-tenant quotas, and a queue whose depth is reported back — the next step of this course hands these items to reviewers with a lease instead of a flag.`,
+  debrief: `The guards run before the store is touched so a rejected create leaves no half-built task behind, and the \`(tenant, key)\` lookup precedes the id mint so a replay cannot race its original. Content hashing under the spec makes the item's bytes the identity of a label: the same bytes under another spec are a different question and are queued again, while a repeat under the same spec would be a second payment for one answer. The spec pin is one stored field, but it is what makes the agreement math in step 5 meaningful. Production services also fingerprint the request body so two different batches under one key are rejected rather than replayed, and enforce per-tenant quotas.`,
 };

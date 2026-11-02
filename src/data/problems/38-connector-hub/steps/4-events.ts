@@ -8,36 +8,29 @@ export const eventsStep: Step = {
   focus: ['hub', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an event on the happy path and the
-consumer moves the cursor, so a sync looks observable. Four production contracts are broken. Find
-them, fix them, and prove the fix.
+**Starting point.** The starter's \`POST /v1/connectors/sync-events\` logs the tenant, the access
+token and a record sample, builds an event with the connector id, cursor, token and sample, produces
+it to \`connector.sync\` keyed by \`vendor_id\` on a producer with default settings, and flushes. The
+consumer in the same file commits the offset, then sets \`connector:{connector_id}:cursor\`. It
+compiles, serves the demo and hides 4 flaws.
 
-\`publish_event\` is how a sync worker reports one page; the consumer in the same file folds those
-events forward.
+**Failure mode the checks target.** The vendor key is the ordering bug; the unconfigured producer
+is the duplication bug; the token and the record sample in a retained, replicated topic are a leak
+with a long tail; and commit-before-write trades correctness for code that looks exactly-once. Only
+the leak is visible on a read-through; the rest wait for a replay, a rebalance or a broker hiccup.
 
-- Publish **exactly one** \`connector.sync\` event per page and per run with the **connector id as
-  the message key** — partitioning by connector keeps one connector's run log in order, which is
-  what lets an operator read a sync back. Keyed by vendor, one connector's events scatter across
-  partitions and their order is gone.
-- The payload carries ids, counts, the cursor position and an error **code**: \`connector_id\`,
-  \`cursor\`, \`pages\`, \`records\`, \`error_code\`. It must **never** carry the access token or a
-  record's contents, and neither may a log line: the topic is retained for days and replicated, so
-  whatever it carries outlives the sync, the connector and the tenant's deletion request.
-- The producer must be **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus hashed, stable keys), so a retried produce cannot duplicate a page event.
-- When the broker rejects the produce, write the event to the **outbox** (\`store.insert_outbox\`)
-  instead of dropping it or failing the worker; a relay republishes outbox rows when the broker
-  recovers.
-- The consumer **advances the cursor first and commits the offset second**
-  (\`set connector:{connector_id}:cursor\` then \`commit\`). Commit first and a crash between the two
-  loses the cursor advance forever, so the next run re-fetches and re-applies a page the platform
-  believed was committed.
-
-**Failure mode the checks target.** The vendor key is the ordering bug; the unconfigured producer is
-the duplication bug; the token and the record sample in the retained topic are a leak with a long
-tail; a failed produce silently loses a page; and commit-before-process trades correctness for
-exactly-once *looking* code. Only the leak is visible to a security reviewer — the other four are
-invisible until a replay, a rebalance or a broker hiccup.`,
+- Publish exactly one \`connector.sync\` event per page and per run with the **connector id as the
+  message key**, so one connector's run log stays in one partition and in order.
+- The payload carries \`connector_id\`, \`cursor\`, \`pages\`, \`records\`, \`error_code\`. Neither
+  the payload nor a log line carries the access token or a record's contents: whatever the topic
+  holds outlives the sync, the connector and the tenant's deletion request.
+- The producer is idempotent with \`acks=all\` (or the stack's equivalent: required acks \`all\`
+  plus hashed, stable keys), so a retried produce cannot duplicate a page event.
+- When the broker rejects the produce, write the event to the outbox (\`store.insert_outbox\`)
+  instead of dropping it or failing the worker; a relay republishes outbox rows later.
+- The consumer advances the cursor first and commits the offset second. Commit first and a crash
+  between the two loses the cursor advance, so the next run re-applies a page the platform believed
+  was committed.`,
   sequence: {
     participants: ['Sync worker', 'connector.sync', 'Sync consumer', 'Redis'],
     messages: [
@@ -154,9 +147,7 @@ store = OutboxStore()
 
 @app.post("/v1/connectors/sync-events")
 def publish_event(body: PageEvent, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: key by the connector id instead of the vendor, configure the idempotent producer with
-    # acks=all, keep the token and the record sample out of the event and the logs, write an outbox
-    # row when the broker rejects the produce, and advance the cursor before committing the offset.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     logger.info("sync tenant=%s token=%s sample=%r", tenant, body.access_token, body.payload_sample)
     event = {
         "connector_id": body.connector_id,
@@ -280,9 +271,7 @@ export const store = {
 };
 
 app.post('/v1/connectors/sync-events', async (request, reply) => {
-  // TODO: key by the connector id instead of the vendor, configure the idempotent producer with
-  // acks=all, keep the token and the record sample out of the event and the logs, write an outbox
-  // row when the broker rejects the produce, and advance the cursor before committing the offset.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const body = request.body as PageEvent;
   request.log.info({connector_id: body.connector_id, sample: body.payload_sample}, 'page synced');
   const event = {
@@ -405,9 +394,7 @@ type PageEvent struct {
 func publishEvent(rw http.ResponseWriter, r *http.Request) {
 	body := PageEvent{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: key by the connector id instead of the vendor, configure acks=all / idempotence, keep the
-	// token and the record sample out of the event and the logs, write an outbox row when the broker
-	// rejects the produce, and advance the cursor before committing the offset.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	log.Printf("sync connector=%s token=%s sample=%q", body.ConnectorID, body.AccessToken, body.PayloadSample)
 	event := map[string]any{
 		"connector_id":   body.ConnectorID,
@@ -543,9 +530,7 @@ object SyncEvents {
   val jedis = new Jedis("redis", 6379)
 
   def publishEvent(body: PageEvent, tenant: String): Unit = {
-    // TODO: key by the connector id instead of the vendor, configure idempotence with acks=all,
-    // keep the token and the record sample out of the event and the logs, write an outbox row when
-    // the broker rejects the produce, and advance the cursor before committing the offset.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val payload =
       s"""{"connector_id":"\${body.connector_id}","accessToken":"\${body.accessToken}","payloadSample":"\${body.payloadSample}"}"""
     producer.send(new ProducerRecord[String, String]("connector.sync", body.vendor_id, payload))
@@ -639,9 +624,7 @@ struct PageEvent {
 };
 
 void publishEvent(RdKafka::Producer* producer, const PageEvent& event) {
-  // TODO: key by the connector id instead of the vendor, configure idempotence with acks=all, keep
-  // the token and the record sample out of the event and the logs, write an outbox row when the
-  // broker rejects the produce, and advance the cursor before committing the offset.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const auto payload = json{{"connector_id", event.connector_id},
                             {"access_token", event.access_token},
                             {"payload_sample", event.payload_sample}}
@@ -743,9 +726,9 @@ void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
     },
   },
   hints: [
-    'The message key is the partition key: `key=connector_id`, `key: connectorId`, `Key: []byte(connectorID)`, `ProducerRecord("connector.sync", connectorId, …)`, `connectorId.c_str()`. Keyed by vendor, one connector\'s pages land in different partitions and the run log an operator reads is interleaved with someone else\'s.',
-    "Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS's `idempotent: true`, or required acks `all` with the hash balancer. It needs the same message key on every retry — which is the same fix as the connector key.",
-    'The payload is a schema: ids, counts, the cursor and an error *code*. The outbox is the durability half — wrap the produce and insert an outbox row when the broker rejects it. In the consumer write the cursor first and commit second: a crash between them then replays the event instead of losing the cursor advance.',
+    "Symptoms: an operator reading one connector's run log sees pages out of order; a security scan of the topic finds OAuth tokens; after a rebalance a page is fetched and applied a second time.",
+    "The key is `body.vendor_id`, so one connector's events spread over partitions. The producer has no `enable.idempotence`, the event and the log line copy `access_token` and `payload_sample`, and `consumer.commit` runs before the cursor `r.set`.",
+    'Produce with `key=connector_id` on a producer configured `enable.idempotence: True, acks: all`; build the event from ids, counts, cursor and `error_code` only, and log the same; swap the consumer so `r.set(connector:…)` precedes `consumer.commit(msg)`.',
   ],
-  debrief: `The interview question is ordering and durability on a topic you do not own. The partition key decides whether one connector's page events arrive in the order its run log is read in; the vendor id looks like a natural key and is the wrong one. The producer configuration decides whether a client retry duplicates a page event, the payload decides whether a token and a customer record leak into a retained topic (a security finding, not a style nit), and the outbox decides whether a broker hiccup loses a page. In the consumer the order of the cursor write and the offset commit decides whether a rebalance replays a page or loses a cursor advance: write the cursor, then commit. Real pipelines add a schema registry so a future producer cannot smuggle content into the topic, per-connector sequence numbers so late events are ignored, and a lag alarm on the consumer group.`,
+  debrief: `Each fix is a placement decision rather than new logic. The connector id is the key because the partition is the unit of ordering, and the thing an operator reads back is one connector's run. Idempotence lives in producer configuration because the retry that duplicates a page happens inside the client library, below any application check. The payload is a schema of ids, counts and codes because a retained, replicated topic is the hardest place to delete a secret from. And the consumer writes the cursor before it commits because a replayed page is recoverable while a lost cursor advance is not. Production pipelines add a schema registry so a future producer cannot smuggle record contents into the topic, per-connector sequence numbers so a late event is ignored rather than applied, and a consumer-group lag alarm wired to the health endpoint.`,
 };

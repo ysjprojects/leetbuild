@@ -8,36 +8,27 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an event for every
-partition it materializes. The event is unorderable, it describes a plan instead of a result, and it
-can announce a write that never committed. Find the flaws, fix them, and prove the fix with the checks
-below.
-
-Implement the \`feature.event\` producer behind the materialization worker:
-
-- Events go to the **\`feature.event\`** topic **keyed by the feature name**, so every event for one
-  feature lands in one partition and a consumer reads its lineage in order. The starter keys by entity,
-  which scatters one feature across partitions and lets a consumer see partition 7 before partition 2.
-- The payload carries **version, partition range and row counts**:
-  \`{feature, version, partition_start, partition_end, rows}\`. The event is the lineage record other
-  services hang scheduling, backfills and alerts on.
-- The producer uses **\`acks=all\`**, so an acknowledged produce is replicated rather than buffered on
-  one broker.
-- Publish **after the partition commits**. The starter sends the event before it has written anything, so
-  a crash between the two leaves a consumer that believes a partition exists when it does not. Commit
-  the partition, then publish.
-- The row count is measured **after the write**, from the rows that were actually written. The starter
-  reports the planner's estimate, so the count is a promise the worker never checks.
-- When the broker rejects the produce, the event goes to an **outbox** instead, so a broker outage
-  delays lineage rather than losing it.
+**Starting point.** The starter's \`materialize\` sends one \`feature.event\` keyed by entity, carrying
+the planner's row count, before it scans, writes and commits the partitions. It compiles and hides
+five flaws.
 
 **Failure mode the checks target.** Per-feature ordering, publish-after-commit, and counts that
 describe what was written.
 
+- Events go to **\`feature.event\`** **keyed by the feature name**, so one feature's lineage lands in
+  one partition and reads in order. The starter keys by entity and scatters it.
+- The payload is \`{feature, version, partition_start, partition_end, rows}\`.
+- The producer uses **\`acks=all\`**. The starter leaves the acknowledgement level at its default.
+- Publish **after the partition commits**. The starter sends first, so a crash between the two leaves a
+  consumer believing a partition exists when it does not.
+- The row count comes from the rows **actually written**. The starter reports the planner's estimate.
+- When the broker rejects the produce, the event goes to an **outbox**, so an outage delays lineage
+  rather than losing it. The starter has no failure path.
+
 ## What to keep
 
-The topic, the worker loop and the payload shape are fine. The fix is the message key, the
-acknowledgement level, the order of the two writes, the source of the count, and the failure path.`,
+The topic, the worker loop and the payload shape are fine. The fix is the key, the acknowledgement
+level, the order of the two writes, the source of the count, and the failure path.`,
   sequence: {
     participants: ['Materialization worker', 'Offline store', 'Kafka', 'Outbox'],
     messages: [
@@ -150,9 +141,7 @@ def materialize(
     partition_end: int,
     planned_rows: int,
 ) -> None:
-    # TODO: key the event by feature name instead of entity, publish only after the partition
-    # commits, report the rows the write actually produced instead of the plan, and park the event
-    # in an outbox when the broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {"feature": feature, "version": version, "rows": planned_rows}
     producer.send(TOPIC, key=entity.encode(), value=json.dumps(event).encode())
     for partition in range(partition_start, partition_end + 1):
@@ -215,9 +204,7 @@ export async function materialize(
   partitionEnd: number,
   plannedRows: number,
 ): Promise<void> {
-  // TODO: key the event by feature name instead of entity, publish only after the partition commits,
-  // report the rows the write actually produced instead of the plan, and park the event in an outbox
-  // when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {feature, version, rows: plannedRows};
   void producer.send({topic: TOPIC, messages: [{key: entity, value: JSON.stringify(event)}]});
   for (let partition = partitionStart; partition <= partitionEnd; partition++) {
@@ -299,9 +286,7 @@ func materialize(
 	partitionStart int,
 	partitionEnd int,
 	plannedRows int) {
-	// TODO: key the event by feature name instead of entity, publish only after the partition
-	// commits, report the rows the write actually produced instead of the plan, and park the event
-	// in an outbox when the broker rejects the produce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{"feature": feature, "version": version, "rows": plannedRows})
 	producer.Input() <- &sarama.ProducerMessage{
 		Topic: topic,
@@ -398,9 +383,7 @@ object FeatureEvents {
       partitionStart: Int,
       partitionEnd: Int,
       plannedRows: Int): Unit = {
-    // TODO: key the event by feature name instead of entity, publish only after the partition
-    // commits, report the rows the write actually produced instead of the plan, and park the event
-    // in an outbox when the broker rejects the produce.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val event = s"""{"feature":"$feature","version":$version,"rows":$plannedRows}"""
     producer.send(new ProducerRecord[String, String](Topic, entity, event))
     for (partition <- partitionStart to partitionEnd) {
@@ -465,9 +448,7 @@ void materialize(
     int partition_start,
     int partition_end,
     int planned_rows) {
-  // TODO: key the event by feature name instead of entity, publish only after the partition commits,
-  // report the rows the write actually produced instead of the plan, and park the event in an outbox
-  // when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto event = json{{"feature", feature}, {"version", version}, {"rows", planned_rows}}.dump();
   cppkafka::MessageBuilder builder(kTopic);
   builder.key(entity);
@@ -528,9 +509,9 @@ std::vector<int> materialize(
     },
   },
   hints: [
-    'The message key decides the partition, and Kafka only orders within a partition. `key = feature name` keeps one feature’s lineage in one ordered log; keying by entity spreads the same feature across partitions and reorders it for every consumer.',
-    'The event is a claim about what exists. Commit the partition first, then publish, so a crash between the two leaves a missing event (replayable) rather than a materialized event for a partition that was never written. And take the row count from the rows you just wrote — a planner’s estimate is a number nobody checks.',
-    'Do not answer before the broker does: `acks=all` plus a wait on the delivery report makes the publish real. When the produce is rejected, park the same payload in an outbox and let a replay drain it; dropping it loses lineage that no other system can reconstruct.',
+    'A consumer sees the event for partition 7 before partition 2, a crashed worker leaves an event for a partition that was never written, and the rows count disagrees with what the store holds.',
+    'producer.send runs before the loop that writes and commits, keyed by entity so one feature spans many partitions; rows is planned_rows, acks is the default, and a KafkaError has no handler.',
+    'Construct the producer with acks=ACKS_ALL; loop, write, commit_partition and count len(rows); then producer.send keyed by feature; on KafkaError rpush the same payload to an outbox list.',
   ],
-  debrief: `The interview question behind this step is what a topic is: an append-only, retained, replicated log ordered per partition. Everything else follows from that. The key is the ordering knob, so it has to be the thing whose ordering the consumer depends on — here the feature, not the entity. The publish has to happen after the durable write, because an event is a statement about state, and a statement published before the state exists is a lie that outlives the bug. The row count has to come from execution rather than planning, otherwise the log disagrees with the store and the disagreement is undetectable. And the outbox is the difference between a broker outage that delays lineage and one that loses it. Real pipelines add schema enforcement on the topic, a consumer that writes idempotently, and lineage events for definition changes as well as materializations.`,
+  debrief: `The fix follows from what a topic is: an append-only, replicated log ordered per partition. The key is the ordering knob, so it has to be the thing whose ordering the consumer depends on, here the feature rather than the entity. The publish happens after the durable write because an event is a statement about state, and a statement published before the state exists is a lie that outlives the bug. The row count comes from execution rather than planning, otherwise the log disagrees with the store and nobody can tell. The outbox is the difference between an outage that delays lineage and one that loses it. Production pipelines also enforce a schema on the topic through a registry, so a producer cannot change the event shape under its consumers.`,
 };

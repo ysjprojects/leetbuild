@@ -8,30 +8,28 @@ export const dependencyStep: Step = {
   focus: ['ingest', 'vision', 'objects', 'indexer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it asks the vision service for a
-caption and gets one on the happy path, so the demo looks complete. It hides a missing deadline, an
-error handler that cannot tell a refusal from an outage, and a placeholder that poisons the index.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter's \`caption_asset(channel, asset_id, mime)\` calls the vision
+service's \`Caption\` with no deadline, catches every exception, substitutes the caption
+\`"an image"\` and returns \`embedding_kind: "text_image"\` either way. It serves the demo and hides
+five flaws.
 
-Implement the vision client ingest uses when the request carried no caption.
+**Failure mode the checks target.** A stalled vision service holds an ingest worker for as long as
+the socket lives; a single \`except\` turns a content-policy refusal into a retry that cannot
+succeed; an outage is indexed as if the image had been captioned; the placeholder matches every
+query that contains "image"; and nothing marks the asset for a backfill, so recovery has no list
+to work from.
 
-- \`Caption\` is called over gRPC with a **3-second deadline** (\`VISION_DEADLINE_S\` /
-  \`VISION_DEADLINE_MS\` / \`visionDeadline\`). A call without a deadline is a hung ingest worker.
-- \`PERMISSION_DENIED\` means the vision service refused the asset under its content policy. That is a
-  decision, not a failure: raise \`ContentPolicyError\` (\`POLICY_REJECTED\`) so the asset fails with a
-  reason and no retry, and never index it text-only behind the caller's back.
-- \`DEADLINE_EXCEEDED\` and \`UNAVAILABLE\` mean the outage: index the asset with **text-only**
-  embeddings (\`text_only\`) and \`caption: null\` instead of blocking or retrying forever.
-- Mark the degraded result: \`degraded: true\` and \`caption_source: "unsupported"\` (vs
-  \`"generated"\`), so a backfill can find every asset captioned later.
-- Whatever happens, the literal caption **"an image"** never enters the index: a placeholder matches
-  every query, so one vision outage turns into hundreds of poisoned retrievals.
+The vision client ingest uses when the request carried no caption:
 
-**Failure mode the checks target.** The starter's \`except\`/\`catch\` is the whole failure policy, and by
-returning a placeholder it converts an outage into silently wrong search results — the worst possible
-outcome, because nothing alerts and nothing can be re-run. The second bug is the policy rejection:
-swallowing it retries a request that will never succeed, and indexing that asset text-only hides a
-moderation decision inside a caption failure.`,
+- \`Caption\` is called with a **3-second deadline** (\`VISION_DEADLINE_S\` / \`VISION_DEADLINE_MS\` /
+  \`visionDeadline\`), passed as the gRPC deadline.
+- \`PERMISSION_DENIED\` is a decision, not a failure: raise \`ContentPolicyError\`
+  (\`POLICY_REJECTED\`) so the asset fails with a reason and no retry.
+- \`DEADLINE_EXCEEDED\` and \`UNAVAILABLE\` are the outage: index with **text-only** embeddings
+  (\`text_only\`) and \`caption: null\` instead of blocking or retrying.
+- Mark the degraded result with \`degraded: true\` and \`caption_source: "unsupported"\` (vs
+  \`"generated"\`), so a backfill can find every asset to caption later.
+- The literal caption **"an image"** does not enter the index on any path.`,
   sequence: {
     participants: ['Ingest API', 'Vision service', 'Indexer'],
     messages: [
@@ -44,9 +42,9 @@ moderation decision inside a caption failure.`,
     ],
   },
   hints: [
-    'Three outcomes, three branches: success → `text_image` with the caption; deadline or unavailable → `text_only` with `caption: null` and `degraded: true`; policy rejection → raise, and let the caller fail the asset. A catch-all collapses the middle two into one wrong answer.',
-    'The deadline belongs on the call, not around it: pass it as the gRPC deadline (`timeout=` in Python, `deadline` in Node, `context.WithTimeout` in Go, `withDeadlineAfter` in Java, `set_deadline` on the client context in C++). Then a hung vision service costs 3 seconds, not a worker.',
-    '`caption: null` plus `degraded: true` is the contract the backfill reads. A caption string of "an image" is indistinguishable from a real caption downstream, so it is indexed, embedded and returned as if a human had written it.',
+    'After a vision outage one tenant\'s search returns the same uncaptioned screenshots for every query containing "image", and an asset moderation refused is searchable. No alert fired; the index just got worse.',
+    "The starter's `except Exception` is the whole failure policy: a hung call has no deadline to end it, and `PERMISSION_DENIED`, `DEADLINE_EXCEEDED` and `UNAVAILABLE` all become the same placeholder caption.",
+    'Pass `timeout=VISION_DEADLINE_S` (3) on the call; map `PERMISSION_DENIED` to `ContentPolicyError`, `DEADLINE_EXCEEDED`/`UNAVAILABLE` to `caption = None`, `EMBEDDING_TEXT_ONLY`, `degraded: True`, `caption_source: "unsupported"`.',
   ],
   checks: [
     {
@@ -126,9 +124,7 @@ import vision_pb2_grpc
 
 
 def caption_asset(channel: grpc.Channel, asset_id: str, mime: str) -> dict:
-    # TODO: this starter calls without a deadline, swallows every vision error — a content-policy
-    # rejection included — and substitutes the literal string "an image" as the caption, so an
-    # outage becomes hundreds of quietly wrong search results.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     stub = vision_pb2_grpc.VisionStub(channel)
     request = vision_pb2.CaptionRequest(asset_id=asset_id, mime=mime)
     try:
@@ -204,9 +200,7 @@ interface Captioning {
 
 export async function captionAsset(assetId: string, mime: string): Promise<Captioning> {
   try {
-    // TODO: this starter calls without a deadline, swallows every vision error — a content-policy
-    // rejection included — and substitutes the literal string "an image" as the caption, so an
-    // outage becomes hundreds of quietly wrong search results.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const reply = await visionClient.Caption({asset_id: assetId, mime});
     return {caption: reply.caption, embedding_kind: 'text_image'};
   } catch {
@@ -282,9 +276,7 @@ type Captioning struct {
 }
 
 func CaptionAsset(ctx context.Context, client visionpb.VisionClient, assetID, mime string) Captioning {
-	// TODO: this starter calls without a deadline, swallows every vision error — a content-policy
-	// rejection included — and substitutes the literal string "an image" as the caption, so an
-	// outage becomes hundreds of quietly wrong search results.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	reply, err := client.Caption(ctx, &visionpb.CaptionRequest{AssetId: assetID, Mime: mime})
 	if err != nil {
 		return Captioning{Caption: "an image", EmbeddingKind: "text_image"}
@@ -349,9 +341,7 @@ final case class Captioning(caption: Option[String], embeddingKind: String)
 
 object Client {
   def captionAsset(channel: ManagedChannel, assetId: String, mime: String): Captioning = {
-    // TODO: this starter calls without a deadline, swallows every vision error — a content-policy
-    // rejection included — and substitutes the literal string "an image" as the caption, so an
-    // outage becomes hundreds of quietly wrong search results.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     try {
       val reply = VisionGrpc.blockingStub(channel).caption(CaptionRequest(assetId, mime))
       Captioning(Some(reply.caption), "text_image")
@@ -404,9 +394,7 @@ struct Captioning {
 };
 
 Captioning caption_asset(const std::string& asset_id, const std::string& mime) {
-  // TODO: this starter calls without a deadline, swallows every vision error — a content-policy
-  // rejection included — and substitutes the literal string "an image" as the caption, so an
-  // outage becomes hundreds of quietly wrong search results.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   vision::CaptionRequest request;
   request.set_asset_id(asset_id);
   request.set_mime(mime);
@@ -462,16 +450,12 @@ Captioning caption_asset(const std::string& asset_id, const std::string& mime) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell a dependency failure from a dependency decision. A
-vision call has three outcomes, not two, and the starter collapses them: success, an outage it can
-absorb, and a refusal it must not absorb. Absorbing a refusal silently indexes content moderation
-refused, and retrying it wastes a queue.
-
-The placeholder is the failure that does not look like one. Nothing crashes, no alert fires, and the
-index fills with a caption that matches every query that contains the word "image" — the demo still
-passes because the placeholder *is* a string. The fix is a null caption plus a degraded flag, which
-is also what makes the recovery path possible: a nightly job lists caption_source "unsupported"
-assets and re-captions them once the service is healthy. Real systems add a per-tenant circuit
-breaker on the vision service, a counter of degraded assets as an SLO input, and a caption budget so
-one tenant's backlog cannot starve another's ingests.`,
+  debrief: `A vision call has three outcomes, not two: success, an outage the pipeline can absorb, and a
+refusal it must not absorb. The starter collapses them into one \`except\`, so a moderation decision
+is indexed and a request that cannot succeed is retried. The placeholder is the failure that does
+not look like one: nothing crashes, no alert fires, and the index fills with a caption that matches
+every query with the word "image". A null caption plus a degraded flag makes recovery possible,
+because a nightly job can list \`caption_source: "unsupported"\` assets and re-caption them once
+the service is healthy. Production clients put a circuit breaker in front of the vision service so
+an outage stops costing 3 seconds per asset.`,
 };

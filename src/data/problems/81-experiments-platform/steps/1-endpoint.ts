@@ -14,39 +14,31 @@ export const experimentEndpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers both routes,
-creates experiments, and its 201 looks right for a 50/50 split. It hides the four defects that turn
-an experiment into an anecdote — read it like the platform owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter registers \`POST /v1/experiments\` and \`PATCH /v1/experiments/{id}\`,
+creates experiments from a body like
+\`{"variants": [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}], "unit": "user", "min_sample": 10000}\`,
+and its 201 looks right for a 50/50 split. It serves the demo and hides 4 flaws.
 
-Implement \`POST /v1/experiments\` with body
-\`{"variants": [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}], "unit": "user", "min_sample": 10000}\`.
+**Failure mode the checks target.** A design that was not approved runs anyway: an unbalanced split
+is reweighted instead of rejected, a misspelt unit randomizes the wrong entity, a one-variant
+experiment is created, and a \`PATCH\` moves users between variants mid-flight so every downstream
+number is contaminated.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing or empty tenant is **401**.
 - At least **2** variants, with distinct non-empty \`key\`s; anything else is **400**.
 - Every \`weight\` is a non-negative integer and the weights must sum to **exactly 100**: 99 or 101 is
-  **400**. Never normalize — a silently reweighted split is a different experiment than the one the
-  operator approved, and every assignment that follows is bucketed against numbers nobody signed off.
-- \`unit\` is one of \`user\`, \`session\`, \`account\`; anything else is **400**. The unit decides which
-  entity is randomized, so a typo is a different experiment, not a detail.
-- \`min_sample\` is an integer \`>= 1\` (**400** otherwise) and is pinned together with the rest of the
-  design.
-- The \`salt\` is pinned at creation: take the caller's if one is supplied, otherwise generate it
-  server-side (never derive it from the split, or editing the split re-buckets every user).
+  **400**. Do not normalize; a reweighted split is a different experiment than the one the operator
+  approved.
+- \`unit\` is one of \`user\`, \`session\`, \`account\`; anything else is **400**.
+- \`min_sample\` is an integer \`>= 1\` (**400** otherwise) and is pinned with the rest of the design.
+- The \`salt\` is pinned at creation: the caller's if supplied, otherwise generated server-side, and not
+  derived from the split.
 - Answer **201** echoing the experiment id, \`version\` starting at **1**, the \`salt\`, the pinned
   split exactly as validated, and \`status: "running"\`.
-- \`PATCH /v1/experiments/{id}\` may only touch cosmetic fields (\`name\`, \`description\`). A patch that
-  carries \`variants\` (any \`weight\`), \`unit\`, \`min_sample\` or \`salt\` is **409** with
-  \`{"error": "…frozen…", "required": "new version"}\` — the live experiment is never mutated; a
-  design change is a new version.
-- Log the creation with the tenant and the experiment id; never log the request body wholesale.
-
-**Failure mode the checks target.** The starter accepts any split and normalizes it
-(\`sum(...) or 1\` reweighting), so a design that sums to 99 or 101 is silently turned into a
-different experiment instead of rejected; it accepts any \`unit\` string, so a typo randomizes a
-different entity than the report assumes; it never looks at the variant count, so a one-variant
-"experiment" runs; and its \`PATCH\` overwrites \`weights\` and \`unit\` in place with no version check,
-so one edit moves users between variants mid-flight and every downstream number is contaminated.`,
+- \`PATCH /v1/experiments/{id}\` may only touch \`name\` and \`description\`. A patch that carries
+  \`variants\`, \`unit\`, \`min_sample\` or \`salt\` is **409** with
+  \`{"error": "…frozen…", "required": "new version"}\`: a design change is a new version.
+- Log the creation with the tenant and the experiment id, not the request body.`,
   sequence: {
     participants: ['Operator', 'Experiment API', 'experiment store'],
     messages: [
@@ -145,7 +137,7 @@ so one edit moves users between variants mid-flight and every downstream number 
     },
     {
       id: 'split-exact',
-      title: 'Weights must sum to exactly 100 — rejected, never normalized',
+      title: 'Weights must sum to exactly 100 and are rejected, not normalized',
       detail:
         'The weights are validated as non-negative integers whose sum is compared against `SPLIT_TOTAL` (100) and a split that sums to 99 or 101 answers **400**. The starter divides by `sum(...) or 1` instead, so an unapproved split is silently reweighted and the experiment that runs is not the experiment that was asked for.',
       match: {
@@ -190,7 +182,7 @@ so one edit moves users between variants mid-flight and every downstream number 
       id: 'unit-frozen',
       title: 'Unit is restricted to the allowed set and frozen after launch',
       detail:
-        'Create validates `unit` against the allowed set (**400**), and the update path treats a `unit` in the patch body as a design change (**409**). The starter takes any string as the unit and overwrites it in place on `PATCH`, so a typo silently re-randomizes a different entity than the one the analysis assumes.',
+        'Create validates `unit` against the allowed set (**400**), and the update path treats a `unit` in the `PATCH` body as a design change (**409**). The starter takes any string as the unit and overwrites it in place on `PATCH`, so a typo silently re-randomizes a different entity than the one the analysis assumes.',
       match: {
         python: {
           all: [
@@ -315,8 +307,7 @@ def split_shares(variants: list[Variant]) -> list[dict]:
     return [{"key": variant.key, "weight": round(variant.weight * 100 / total, 2)} for variant in variants]
 
 
-# TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
-# the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
+# TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
 
 @app.post("/v1/experiments")
@@ -536,8 +527,7 @@ interface Experiment extends ExperimentDesign {
 
 const experiments = new Map<string, Experiment>();
 
-// TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
-// the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
 app.post('/v1/experiments', async (request, reply) => {
   const body = request.body as ExperimentDesign;
@@ -775,8 +765,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
-// the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
 func createExperiment(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -1113,8 +1102,7 @@ object ExperimentApi {
 
   val experiments = scala.collection.mutable.Map.empty[String, Experiment]
 
-  // TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
-  // the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
   val route: Route =
     path("v1" / "experiments") {
@@ -1336,8 +1324,7 @@ std::string new_id() {
   return "exp-" + std::to_string(++counter);
 }
 
-// TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
-// the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 
 int main() {
   httplib::Server svr;
@@ -1549,25 +1536,18 @@ int main() {
     },
   },
   hints: [
-    'Validate the design as one funnel before the store is touched: `len(variants) >= MIN_VARIANTS` (2) with distinct non-empty keys, every `weight` a non-negative integer whose sum equals `SPLIT_TOTAL` (100), `unit` in the allowed set, `min_sample` an integer `>= 1` — each violation a 400. A split that sums to 99 or 101 is a client mistake; reweighting it silently changes the experiment the operator approved.',
-    'Pin the design at insert: the row carries `version` = 1, the split exactly as validated, and the salt sampled once server-side (a caller-supplied salt is taken as-is). Nothing on the create path may normalize, and the log line names the tenant and the id only — never the body.',
-    'The `PATCH` path may write only `name`/`description`. If the body carries `variants`, `unit`, `min_sample` or `salt`, answer 409 with `{"error": SPLIT_FROZEN, "required": REQUIRED_NEW_VERSION}`: a new version is a new experiment document copied forward, not an edit of the live one.',
+    'An operator submits a 60/41 split and gets a 201; a week later the report shows a split nobody approved, and a `PATCH` to the weights moved users between arms overnight.',
+    'The create path divides each weight by `sum(...) or 1`, takes any `unit` string, skips the variant count, and `PATCH` writes `weights` and `unit` straight onto the running row.',
+    'Add `validate_variants`, `validate_split` (sum must equal `SPLIT_TOTAL`, each a 400) and `validate_unit`; in `PATCH`, answer 409 with `SPLIT_FROZEN` and `required: REQUIRED_NEW_VERSION` when a design field is present.',
   ],
-  debrief: `The interviewer is testing whether you understand that an experiment's design is a document, not a
-setting. The starter reads fine because the demo sends a clean 50/50 split and never patches it; the
-flaws only surface when a human edits the thing.
+  debrief: `The fix has the shape of a funnel in front of the store: the design is validated as a whole, pinned
+once with a server-side salt, and the update route refuses to touch anything that affects bucketing.
+A split that sums to 99 is rejected rather than reweighted because the read side later checks the
+sample ratio against the design that was approved; a normalized split would make that check lie.
+A design change answers 409 and asks for a new version because the number being analysed only
+means something if the design that was analysed is the design that ran.
 
-Three defects are being checked. Exactness: a split that sums to 99 or 101 must be rejected, because
-normalizing it silently changes the design — and later, when the read side checks sample ratio
-mismatch, the honest 400 is what keeps a reweighted experiment from being reported as if it had run
-as planned. Freezing: the salt and the unit and the minimum sample are pinned at creation, so the
-bucket function is a pure function of (experiment, unit, salt) for the life of the experiment; a
-typed-in unit or a re-derived salt moves users between variants and contaminates every number that
-follows. Versioning: a design change is a 409 that asks for a new version, never a live mutation —
-that single rule is what makes the analysis of the running experiment trustworthy, because the
-design that was analysed is still the design that ran.
-
-Real platforms go further: designs are immutable rows with a parent link, the salt is generated from
-a server-side secret rather than the split, every version is audited, and an operator who wants more
-traffic to a variant does it through ramping (step 3) rather than editing the split.`,
+Production platforms go further: designs are immutable rows with a parent link, the salt is
+generated from a server-side secret, every version is audited, and an operator who wants more
+traffic on a variant ramps it (step 3) instead of editing the split.`,
 };

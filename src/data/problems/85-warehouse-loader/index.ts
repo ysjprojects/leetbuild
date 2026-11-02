@@ -16,7 +16,7 @@ import {readStep} from './steps/5-read';
 export const warehouseLoaderProblem: Problem = {
   id: 'warehouse-loader',
   title: 'Warehouse Loader',
-  tagline: 'Load data into the warehouse exactly once per manifest, with reconciled counts.',
+  tagline: 'Load a manifest into the warehouse once, commit partitions atomically, and report counts that reconcile.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -29,21 +29,26 @@ write semantics, the event stream, and the report a finance team reads before cl
 
 ## The real system
 
-Production loaders accept a **manifest** — source dataset version, target table, load mode and
-transform — and treat it as the unit of work: one manifest, one load, no matter how many times the
-client retries, the pod restarts, or the scheduler fires twice. They validate the manifest before
-doing anything expensive: the caller may name a *registered* transform, never ship SQL that runs in
-the warehouse under the loader's credentials, and may never write into another tenant's schema.
+Snowflake's \`COPY INTO <table>\` keeps **load metadata** per table: for every staged file it records the
+file name, ETag, row counts and any load errors, and a later \`COPY\` of the same file is skipped
+unless \`FORCE = TRUE\` is set, so a retried load of an already-loaded file does not duplicate its rows.
+That metadata expires after 64 days, which is why re-loading old files is a deliberate choice rather
+than an accident.
 
-They track progress partition by partition, and they commit the manifest's completion flag in the
-same atomic step as the final partition, so a downstream reader can never observe a load that is
-"done" while partitions are still missing. They write partitions over gRPC under a deadline, and a
-retried partition **replaces itself** by \`(manifest id, partition id)\` rather than appending a
-second copy of the same rows. They publish load events keyed by the **target table**, so a table's
-stream stays ordered, carrying the counts that the warehouse actually wrote — and when the broker
-rejects a produce, the event goes to an outbox instead of vanishing. And they report counts that
-reconcile: source rows read, rows written, rows rejected with reasons, and the table's current
-freshness.
+Loaders built on the same idea accept a **manifest** (source dataset version, target table, load mode
+and transform) and treat it as the unit of work: one manifest, one load, no matter how many times
+the client retries, the pod restarts or the scheduler fires twice. They validate the manifest before
+doing anything expensive: the caller names a *registered* transform rather than shipping SQL that
+runs under the loader's credentials, and the target lives in the tenant's own schema.
+
+They track progress partition by partition and commit the manifest's completion flag in the same
+atomic step as the final partition, so a downstream reader cannot observe a load that is "done"
+while partitions are missing. They write partitions over gRPC under a deadline, and a retried
+partition **replaces itself** by \`(manifest id, partition id)\` rather than appending a second copy
+of the same rows. They publish load events keyed by the **target table**, so a table's stream stays
+ordered, carrying the counts the warehouse actually wrote; when the broker rejects a produce, the
+event goes to an outbox instead of vanishing. And they report counts that reconcile: source rows
+read, rows written, rows rejected with reasons, and the table's current freshness.
 
 ## What you build here
 
@@ -67,17 +72,17 @@ One service, **loaderd**, with five pieces:
 
 ## The debugging habit
 
-Every starter in this course is working code with a flaw: it compiles, it loads the happy path, and
+Every starter in this course is working code with flaws: it compiles, it loads the happy path, and
 it looks right. Your job in every step is the job you will have on a real data platform: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+against the failure modes, fix them, optimize what is wasteful, and prove the fix with checks that
+fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 File formats and writers (Parquet, ORC), schema evolution and column type reconciliation, compaction
 and clustering, historical backfills, cluster autoscaling, orchestration and scheduling, data catalog
 internals, and row-level security policy authoring. The five pieces above are the ones that decide
-whether a load is correct, isolated and honest.`,
+whether a load is correct and isolated and whether its report can be trusted.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Loader client', sub: 'manifest · report', x: 6, y: 50},

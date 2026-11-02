@@ -8,16 +8,14 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces a \`suggest.event\` for every
-impression and selection. It compiles, the topic fills in the demo, and it hides three production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement the suggestion event producer behind \`GET /v1/autocomplete\`.
+**Starting point.** The starter produces a \`suggest.event\` for every impression and selection
+behind \`GET /v1/autocomplete\`, keyed by the prefix, with a default-configured producer and a
+\`try/except\` around the send. It compiles, the topic fills in the demo, and it hides 5 flaws.
 
 - Events publish to the **\`suggest.event\`** topic, **keyed by tenant**, so every event for one tenant
   lands on one partition and stays ordered. Impression and selection events for the same session
   arrive in the order they happened.
-- The payload carries a **prefix hash**, a position and a latency in milliseconds — **never the raw
+- The payload carries a **prefix hash**, a position and a latency in milliseconds, **not the raw
   prefix text**. A prefix can be a person's name typed into a search box; hashing it keyed by tenant
   keeps the event joinable without storing the name.
 - **No event is lost during a broker hiccup.** A produce failure writes the event to the outbox so it
@@ -28,9 +26,9 @@ Implement the suggestion event producer behind \`GET /v1/autocomplete\`.
 
 **Failure mode the checks target.** Keying by prefix scatters one tenant's events across partitions,
 so ordering is gone and per-session sequences look shuffled. Publishing the raw prefix text ships a
-possible name into a retained, replicated topic — the exact place a search term should never be. The
-subtle one is the swallowed produce failure: the starter catches the exception, logs it and moves on,
-so during a broker hiccup the metrics silently lose the events the product makes decisions on.`,
+possible name into a retained, replicated topic, the one place a search term should not land. The
+subtle part is the swallowed produce failure: the starter catches the exception, logs it and moves
+on, so during a broker hiccup the metrics silently lose the events the product makes decisions on.`,
   sequence: {
     participants: ['Autocomplete API', 'suggest.event', 'Event consumer'],
     messages: [
@@ -63,9 +61,9 @@ so during a broker hiccup the metrics silently lose the events the product makes
     },
     {
       id: 'prefix-hash',
-      title: 'Carries a prefix hash, never the raw prefix',
+      title: 'Carries a prefix hash, not the raw prefix',
       detail:
-        'The payload carries `prefix_hash`, a hash of `(tenant, prefix)`, and never the raw prefix text. The starter publishes the raw prefix "for relevance tuning".',
+        'The payload carries `prefix_hash`, a hash of `(tenant, prefix)`, and not the raw prefix text. The starter publishes the raw prefix "for relevance tuning".',
       match: {
         python: {all: [/prefix_hash/, /sha256/], none: [/"prefix"\s*:\s*prefix\b/]},
         typescript: {all: [/prefixHash/, /createHash/], none: [/prefix:\s*prefix\b/]},
@@ -122,8 +120,7 @@ TOPIC = "suggest.event"
 
 
 def publish(producer, tenant: str, prefix: str, position: int, latency_ms: int) -> None:
-    # TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
-    # the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = json.dumps({"prefix": prefix, "position": position, "latency_ms": latency_ms})
     try:
         producer.produce(topic=TOPIC, key=prefix, value=payload)
@@ -188,8 +185,7 @@ export async function publish(
   position: number,
   latency_ms: number,
 ): Promise<void> {
-  // TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
-  // the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   try {
     await producer.send({
       topic: TOPIC,
@@ -258,8 +254,7 @@ import (
 const topic = "suggest.event"
 
 func Publish(ctx context.Context, writer *kafka.Writer, tenant, prefix string, position, latencyMs int) error {
-	// TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
-	// the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(map[string]any{"prefix": prefix, "position": position, "latency_ms": latencyMs})
 	if err != nil {
 		return err
@@ -332,8 +327,7 @@ object Events {
   val Topic = "suggest.event"
 
   def publish(producer: KafkaProducer[String, String], tenant: String, prefix: String, position: Int, latencyMs: Int): Unit = {
-    // TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
-    // the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"prefix":"$prefix","position":$position,"latency_ms":$latencyMs}"""
     try {
       producer.send(new ProducerRecord[String, String](Topic, prefix, payload))
@@ -386,8 +380,7 @@ object Events {
 const std::string kTopic = "suggest.event";
 
 void publish(RdKafka::Producer& producer, const std::string& tenant, const std::string& prefix, int position, int latencyMs) {
-  // TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
-  // the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string payload = "{\\"prefix\\":\\"" + prefix + "\\",\\"position\\":" + std::to_string(position) +
                               ",\\"latency_ms\\":" + std::to_string(latencyMs) + "}";
   const auto result = producer.produce(kTopic, RdKafka::PartitionAny, RdKafka::Producer::RK_MSG_COPY,
@@ -429,9 +422,9 @@ void publish(RdKafka::Producer& producer, const std::string& tenant, const std::
     },
   },
   hints: [
-    'The key is the ordering guarantee: `(tenant)` puts every event for one tenant on one partition. The prefix is not a key — it is user text, and it belongs in the payload only as a hash.',
-    'Hash the prefix keyed by tenant so the same name from two tenants is not one joinable hash, and never log or publish the raw text. The event carries the hash, the position and the latency; that is enough for relevance tuning.',
-    'Do not swallow a produce failure. Write the event to the outbox and let the replay publish it with the same key; keep the producer idempotent with `acks=all` so the replay cannot double-count.',
+    "A consumer sees one session's selection before its impression, a search for a surname is readable in the topic, and the event count dips during every broker restart.",
+    'The send uses the prefix as the key and the raw text in the payload, the producer runs with default acks, and the except branch only logs.',
+    'Key by tenant, put sha256(tenant + prefix) in the payload as prefix_hash with position and latency_ms, enable idempotence with acks=all, and write an outbox row in the except branch.',
   ],
-  debrief: `The interviewer is testing whether you can debug an analytics producer at the privacy boundary. The starter reads fine because the demo has one tenant and a healthy broker. Three defects are being checked. Keying by prefix scatters a tenant's events across partitions, so ordering — the thing the topic is for — is gone. Publishing the raw prefix ships user text into a retained, replicated topic, which is where a search term must never be; the fix is a tenant-keyed hash that stays joinable without the text. The subtle one is the swallowed produce failure: the starter catches the exception and logs it, so during a broker hiccup the events that the product's trend decisions depend on are silently missing. Real pipelines add an outbox with a replayer, a schema registry so a future producer cannot smuggle content into the topic, and a metric on outbox depth so a hiccup is visible.`,
+  debrief: `The key is the tenant because the key is the ordering guarantee: everything for one tenant lands on one partition and arrives in the order it happened, which the prefix as a key cannot give. The hash is keyed by tenant so the same name typed in two tenants does not become one joinable value, and the payload stays useful for relevance tuning without ever holding the text. The outbox row on failure, together with an idempotent producer and acks=all, is what makes "no event is lost" and "no event is doubled" true at the same time: the replay publishes with the same key, and the broker dedupes the retry. Production pipelines add a replayer with its own metrics, a schema registry so a future producer cannot smuggle content into the topic, and an outbox-depth alert so a hiccup is visible.`,
 };

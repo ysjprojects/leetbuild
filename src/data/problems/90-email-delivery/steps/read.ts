@@ -8,27 +8,24 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks up a message and
-answers, so the demo works. It hides three flaws that make the answer a lie. Find them, fix them, and
-prove the fix.
+**Starting point.** The starter serves \`GET /v1/messages/{id}\`: it calls \`store.get(id)\`, ignores
+the record and the caller's \`X-Tenant-Id\`, and answers \`{"message_id", "state": "sent"}\` with 200
+for every id. It compiles and hides four flaws.
 
-Implement \`GET /v1/messages/{id}\`, the status read for one message:
+**Failure mode the checks target.** A message still sitting in the retry queue is reported to the
+customer as sent; a bounced message shows no category, so an operator cannot separate a dead address
+from a full mailbox; any tenant can read any other tenant's message by guessing an id; and the
+retries that happened are invisible.
 
-- The read returns the **relay state**, the **bounce category**, the **suppression status** and the
-  **attempt timeline** for the message.
-- A message with **no confirmed relay outcome is \`unknown\`**, never \`sent\`:
-  \`state = "sent"\` requires \`relay_accepted\`; a bounced message reports \`"bounced"\`; anything else is
-  \`"unknown"\`. The starter reports \`sent\` as soon as the message is queued.
-- A **bounced message always carries its \`bounce_category\`**. The starter hides the category, so an
-  operator cannot tell a hard bounce from a soft one.
-- The read is **scoped to the caller**: the message id must belong to the authenticated tenant, and a
-  foreign id is **404**. The starter returns any message id to any caller.
-- The response includes the **attempt timeline** (\`attempts\`) so the retries and their outcomes are
-  visible.
+Requirements:
 
-**Failure mode the checks target.** Reporting \`sent\` for a queued message tells the customer the mail
-left when it may still be sitting in a retry queue; a hidden bounce category makes triage impossible;
-and an unscoped read lets any tenant read any other tenant's message by guessing an id.`,
+- \`state\` is \`"sent"\` only when \`record.relay_accepted\` is set, \`"bounced"\` when the record
+  bounced, and \`"unknown"\` otherwise.
+- The response always carries \`bounce_category\` (empty when there is no bounce).
+- The read compares \`record.tenant\` with the authenticated caller and answers **404** on a
+  mismatch or a missing record.
+- The response includes the suppression status and the \`attempts\` timeline, so each retry and its
+  outcome is visible.`,
   sequence: {
     participants: ['Client', 'Email API', 'Message store', 'Suppression store'],
     messages: [
@@ -136,8 +133,7 @@ store = MessageStore()
 
 @app.get("/v1/messages/{id}")
 def read_message(id: str) -> JSONResponse:
-    # TODO: this starter reports sent when queued, hides the bounce category, and returns any message
-    # id to any caller without checking the tenant or the attempt timeline.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     record = store.get(id)
     return JSONResponse({"message_id": id, "state": "sent"}, status_code=200)
 `,
@@ -209,8 +205,7 @@ const store: MessageStore = {
 };
 
 app.get('/v1/messages/:id', async (request, reply) => {
-  // TODO: this starter reports sent when queued, hides the bounce category, and returns any message
-  // id to any caller without checking the tenant or the attempt timeline.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const record = await store.get(id);
   return reply.code(200).send({message_id: id, state: 'sent'});
@@ -276,8 +271,7 @@ type MessageStore interface {
 
 func Register(mux *http.ServeMux, store MessageStore) {
 	mux.HandleFunc("GET /v1/messages/{id}", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: this starter reports sent when queued, hides the bounce category, and returns any
-		// message id to any caller without checking the tenant or the attempt timeline.
+		// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 		id := r.PathValue("id")
 		_, _ = store.Get(id)
 		w.Header().Set("Content-Type", "application/json")
@@ -349,8 +343,7 @@ object Read {
   def routes(store: MessageStore): Route =
     path("v1" / "messages" / Segment) { id =>
       get {
-        // TODO: this starter reports sent when queued, hides the bounce category, and returns any
-        // message id to any caller without checking the tenant or the attempt timeline.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         complete(StatusCodes.OK, s"""{"message_id":"$id","state":"sent"}""")
       }
     }
@@ -420,8 +413,7 @@ class MessageStore {
 
 void Register(httplib::Server& svr, MessageStore& store) {
   svr.Get("/v1/messages/{id}", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reports sent when queued, hides the bounce category, and returns any message
-    // id to any caller without checking the tenant or the attempt timeline.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string id = req.path_params.at("id");
     store.get(id);
     res.status = 200;
@@ -488,9 +480,9 @@ void Register(httplib::Server& svr, MessageStore& store) {
     },
   },
   hints: [
-    'The state is derived from the record, not assumed: `sent` requires a confirmed relay acceptance, `bounced` needs the bounce, and anything without a confirmed outcome is `unknown`.',
-    'A bounced message without its `bounce_category` cannot be triaged. Return the category alongside the state so a hard bounce is distinguishable from a soft one.',
-    'A message id is not a capability: scope the read to the authenticated tenant and answer **404** when the record belongs to someone else, so an id from another tenant reveals nothing.',
+    "Support sees every message as `sent`, including ones whose recipient complained about not receiving them, and a tenant reported seeing another company's message ids resolve.",
+    'The handler builds its response from the id alone: `store.get(id)` is called but `record` is unused, so neither the relay outcome nor the owning tenant affects the answer.',
+    'Derive `state` from `record.relay_accepted` and the bounce flag with `"unknown"` as the fallback, and answer 404 when `record.tenant` differs from the caller. The other checks cover `bounce_category` and `attempts`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read path for honesty and isolation. The starter reads fine because the demo reads back the message it just wrote. Three defects are being checked: a queued message reported as sent, a hidden bounce category, and an unscoped read that returns any message id. The fix derives the state from the record, always returns the category, and scopes by tenant with a 404. Real status reads add the attempt timeline, a signed pagination cursor, and an audit entry for every access to another tenant's message.`,
+  debrief: `The fix makes the read a function of the stored record. \`sent\` is derived from \`relay_accepted\` because that flag is the only evidence the message left; a queued or timed-out message has no such evidence and is reported as \`unknown\`, which is what the customer needs to know before resending. The tenant comparison answers 404 rather than 403 so a guessed id reveals nothing about whether it exists. The category and the attempt list travel together because an operator triaging a bounce needs both the verdict and the retries behind it. Production status reads also page the timeline with a signed cursor when attempts grow long, write an audit entry for every cross-tenant miss, and push the same record through webhooks so clients do not poll.`,
 };

@@ -17,7 +17,7 @@ import {readStep} from './steps/5-read';
 export const mediaTranscoderProblem: Problem = {
   id: 'media-transcoder',
   title: 'Media Transcoder',
-  tagline: 'Segment-based transcoding that resumes, never double-encodes and reports real progress.',
+  tagline: 'Segment-based transcoding with content-keyed dedupe, leased claims and a gapless manifest.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,54 +31,50 @@ reports nothing at all.
 
 ## The real system
 
-Production transcoders never encode a file in one process. They split the source into fixed-length
-segments, hand each segment to a worker, and track completion per \`(job, segment index)\` so a
-redelivered message is skipped and a worker that dies mid-segment has its segment retaken after a
-lease. They dedupe by content: the same source hash at the same preset must return the existing job
-rather than burning the cluster twice. They resolve the encoder command from a preset definition,
-never from a caller-supplied argument list, because passing caller arguments into an encoder is a
-shell injection surface. They call workers over gRPC with a deadline scaled to the segment's
-length, bound the attempts per segment, and separate a corrupt input (terminal — the job fails with
-the offending index) from worker loss (retryable — only that segment is retried). They publish
-\`transcode.event\` keyed by job id so a job's progress stream stays ordered, carry segment index
-ranges and outcomes rather than whole-file polling data, never embed output URLs with permanent
-access, and only announce completion after the manifest is final. And they answer reads from the
-manifest, not from a guessed duration.
+AWS Elemental MediaConvert exposes this split directly: a job's \`AccelerationSettings\` carries an
+\`AccelerationMode\`, and with \`ENABLED\` the service fails a job whose input or settings cannot be
+split for parallel encoding, while \`PREFERRED\` falls back to a single-process encode. That is the
+same decision this course makes at submit time: reject what the pipeline cannot do before a worker
+has spent a minute on it. Production transcoders split the source into fixed-length segments, hand
+each to a worker, and track completion per \`(job, segment index)\` so a redelivered message is
+skipped and a crashed worker's segment is retaken after a lease. They dedupe by content hash and
+preset, resolve the encoder command from a server-side preset definition rather than a caller
+argument list, call workers with a deadline scaled to the segment's length, and separate corrupt
+input (terminal, with the offending index) from worker loss (retryable, that segment only). They
+publish events keyed by job id with segment ranges, announce completion only after the manifest is
+final, and answer reads from the manifest, not from a guessed duration.
 
 ## What you build here
 
 One service, **transcoderd**, with five pieces:
 
-1. \`POST /v1/transcodes\`: a validated source object (uri, 64-hex sha256, duration), a preset id and
-   an output target, keyed idempotently by \`(source sha256, preset id)\` so the same pair never
-   encodes twice. The preset definitions live server-side; caller-supplied encoder arguments are
-   accepted and ignored, and an unknown or malformed preset id is \`404\`.
-2. A **Redis** segment tracker: one atomic claim per \`(job, segment index)\` with a lease, so a
-   redelivered segment is skipped while a crashed worker's segment is retaken once the lease
-   expires, and completion is recorded only after the encode returns. The manifest covers every
-   expected index with no gaps.
-3. A **gRPC** worker client: a deadline scaled to the segment's length, at most two attempts per
-   segment, \`INVALID_ARGUMENT\` (corrupt media) treated as terminal and \`UNAVAILABLE\` (worker
-   loss) as retryable for that segment only, and a job failure that names the segment index.
-4. A **Kafka** event path: \`transcode.event\` keyed by job id, segment index ranges and outcomes,
-   an idempotent producer with \`acks=all\`, the completion event published only after the manifest
-   is final, and signed short-lived references instead of permanent output URLs.
-5. \`GET /v1/transcodes/{id}\`: progress computed from the manifest — completed segment count,
-   failed segment indices, renditions with durations, and \`done\` only when the manifest covers
-   every expected segment. A job owned by another tenant is \`404\`.
+1. \`POST /v1/transcodes\`: a validated source (uri, 64-hex sha256, duration), a preset id and an
+   output target, keyed idempotently by \`(source sha256, preset id)\`. Preset definitions live
+   server-side; caller encoder arguments are accepted and ignored; an unknown preset is \`404\`.
+2. A **Redis** segment tracker: one atomic claim per \`(job, segment index)\` with a lease, a
+   redelivery skip, completion recorded only after the encode returns, and a manifest that covers
+   every expected index.
+3. A **gRPC** worker client: a deadline scaled to segment length, at most two attempts per segment,
+   \`INVALID_ARGUMENT\` terminal and \`UNAVAILABLE\` retryable for that segment only, and a failure
+   that names the segment index.
+4. A **Kafka** event path: \`transcode.event\` keyed by job id, segment ranges and outcomes, an
+   idempotent producer with \`acks=all\`, completion published after the manifest is final, and
+   signed short-lived references instead of permanent output URLs.
+5. \`GET /v1/transcodes/{id}\`: progress from the manifest (completed count, failed indices,
+   renditions with durations), \`done\` only when nothing is missing, \`404\` for another tenant's job.
 
 ## The debugging habit
 
-Every starter in this course is working code with a flaw. It compiles, it serves the happy path on a
-short file, and it looks right. Your job in every step is the job you will have on a real media
-pipeline: debug it against the failure modes, name the subtle one, fix it, optimize what is
-wasteful, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter in this course serves the happy path on a short file and looks right. Your job in
+every step is the job you will have on a real media pipeline: debug it against the failure modes,
+fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass
+on your version.
 
 ## Left out on purpose
 
 Per-codec rate control tuning, GPU scheduling, DRM packaging, multi-region output replication,
 player-side ABR ladders, watermarking and thumbnail extraction. The five pieces above are the ones
-that decide whether a transcode is correct, resumable and honest about its progress.`,
+that decide whether a transcode is correct and resumable.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'submit · poll', x: 8, y: 50},

@@ -8,29 +8,26 @@ export const dependencyStep: Step = {
   focus: ['api', 'handlers', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: every handler answers on the first attempt in
-the demo, so the submission looks delivered. The retry path hides two flaws that only appear when a
-handler is slow or down. Debug it, fix it, and prove the fix.
+**Starting point.** The starter fans an accepted submission out to three gRPC handlers, \`webhook\`,
+\`crm\` and \`queue\`, retrying each up to three times with a freshly minted idempotency key, no
+deadline, and one \`delivered\` flag set when the first handler answers. It compiles, it serves the
+demo, and it hides 5 flaws.
 
-Implement the delivery fan-out that runs after a submission is accepted. Each accepted submission is
-handed to three downstream handlers — \`webhook\`, \`crm\`, \`queue\` — over gRPC:
+**Failure mode the checks target.** A slow or down handler: the retry creates a second CRM lead for
+the same submission, a hung webhook holds the request open, and the retry job cannot tell which
+handlers still need a replay.
+
+Requirements:
 
 - Every call carries the submission id as the **idempotency key**, and the key for one
-  \`(submission, handler)\` pair is **stable across retries**. A retry that mints a fresh key lets a
-  CRM create a second lead for the same submission.
-- Every call runs under a **3-second deadline**. A handler that hangs must not hold the request
-  open; the deadline ends the attempt and the outcome is recorded as failed.
-- The response records **per-handler outcomes** — which handler succeeded and which failed — rather
-  than one aggregate flag. The starter sets \`delivered\` as soon as the first handler succeeds, so a
-  submission where two of three handlers failed still reads as delivered.
-- The submission is **partial** when some handlers failed and all of them succeeded otherwise. A
-  partially delivered submission must be **replayable per handler**: re-running the failed handlers
-  re-invokes only those, under the same keys, and never re-invokes a handler that already succeeded.
-
-**Failure mode the checks target.** A fresh idempotency key per attempt turns at-least-once delivery
-into duplicate records downstream; a single \`delivered\` flag hides which handlers still need a
-replay, so the retry job either re-runs everything — double-charging the handlers that worked — or
-gives up on the ones that failed.`,
+  \`(submission, handler)\` pair is **stable across retries**.
+- Every call runs under a **3-second deadline**; the deadline ends the attempt and the outcome is
+  recorded as failed.
+- The response records **per-handler outcomes**, which handler succeeded and which failed, rather
+  than one aggregate flag.
+- The submission is **partial** when some handlers failed and **delivered** only when all of them
+  succeeded. A partially delivered submission is **replayable per handler**: re-running it
+  re-invokes only the failed handlers, under the same keys, and leaves the succeeded ones alone.`,
   sequence: {
     participants: ['Form API', 'Handler client', 'Webhook', 'CRM'],
     messages: [
@@ -56,9 +53,9 @@ gives up on the ones that failed.`,
     ],
   },
   hints: [
-    'An idempotency key is a promise to the downstream service: "this is the same logical operation". Derive it from the submission id and the handler name, not from the attempt, so the retry sends the key the CRM already saw. A random key per attempt is indistinguishable from a brand-new submission.',
-    'Do not collapse three calls into one flag. Keep an outcome per handler and derive the submission status from them — `delivered` only when every handler succeeded, `partial` when some failed. The replay job then has a list of which handlers to retry.',
-    'The replay must skip handlers that already succeeded. Filter on the recorded outcome and call only the failures, under their original keys; the succeeded handlers are never called again.',
+    'The CRM shows two leads for one form submission, both created a few seconds apart. The submission itself reads `delivered`, yet the queue handler shows nothing for it.',
+    'Each attempt calls `uuid` for a new key, so the CRM cannot recognise the retry; `delivered` is set on the first success, with no record of which handler failed and no deadline to end a hung call.',
+    'Send `submission_id` plus the handler name as `idempotency-key`, call with `timeout=DEADLINE_S`, collect a `HandlerOutcome` per handler into `outcomes`, derive `partial`, and have `replay_failed` skip `succeeded`.',
   ],
   checks: [
     {
@@ -153,10 +150,7 @@ class Submission(BaseModel):
 
 
 def deliver(submission_id: str, handler: str) -> bool:
-    # TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries
-    # gets two leads, and it marks the submission delivered as soon as the first handler succeeds
-    # even when the others failed — there is no per-handler outcome and no replay of just the
-    # failed ones.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for _ in range(3):
         key = str(uuid.uuid4())
         request = handlers_pb2.DeliverRequest(submission_id=submission_id)
@@ -261,9 +255,7 @@ const deliverCall = promisify(client.deliver.bind(client)) as (
 const submissions: Record<string, string> = {};
 
 async function deliver(submissionId: string, handler: string): Promise<boolean> {
-  // TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
-  // two leads, and it marks the submission delivered as soon as the first handler succeeds even
-  // when the others failed — there is no per-handler outcome and no replay of just the failed ones.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const key = randomUUID();
     try {
@@ -355,9 +347,7 @@ import (
 var handlers = []string{"webhook", "crm", "queue"}
 
 func deliver(ctx context.Context, conn *grpc.ClientConn, submissionID, handler string) bool {
-	// TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
-	// two leads, and it marks the submission delivered as soon as the first handler succeeds even
-	// when the others failed — there is no per-handler outcome and no replay of just the failed ones.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	client := handlerspb.NewHandlerClient(conn)
 	for attempt := 0; attempt < 3; attempt++ {
 		key := uuid.NewString()
@@ -471,9 +461,7 @@ object Client {
   val Handlers = Seq("webhook", "crm", "queue")
 
   def deliver(submissionId: String, handler: String): Future[Boolean] = {
-    // TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
-    // two leads, and it marks the submission delivered as soon as the first handler succeeds even
-    // when the others failed — there is no per-handler outcome and no replay of just the failed ones.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = UUID.randomUUID().toString
     HandlerClient.deliver(submissionId, metadata = Map("idempotency-key" -> key)).map(_ => true)
   }
@@ -539,9 +527,7 @@ std::string FreshIdempotencyKey() {
 }
 
 bool DeliverOne(HandlerClient& client, const std::string& submissionId, const std::string& handler) {
-  // TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
-  // two leads, and it marks the submission delivered as soon as the first handler succeeds even
-  // when the others failed — there is no per-handler outcome and no replay of just the failed ones.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (int attempt = 0; attempt < 3; ++attempt) {
     grpc::ClientContext ctx;
     ctx.AddMetadata("idempotency-key", FreshIdempotencyKey());
@@ -623,5 +609,5 @@ void RegisterRoutes(httplib::Server& svr, HandlerClient& client) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you know what an idempotency key is for. It exists so that a retry is not a second operation: the key for one \`(submission, handler)\` pair must be the same on every attempt, so the CRM recognises the replay instead of creating a second lead. The second flaw is aggregation — a single \`delivered\` flag destroys the information the retry job needs. Recording an outcome per handler makes partial delivery visible and lets the replay re-invoke only the failures, under their original keys, so a handler that already succeeded is never called twice. The 3-second deadline is what keeps a hung webhook from holding the request open and blocking the retry that would otherwise never start. Real systems add per-handler backoff and jitter, a durable outcome table so a replay survives a process restart, and a dead-letter path for a handler that keeps failing.`,
+  debrief: `An idempotency key exists so that a retry is not a second operation: the key for one \`(submission, handler)\` pair has to be the same on every attempt, so the CRM recognises the replay instead of creating a second lead. The other shape in the fix is keeping the information a retry job needs. A single \`delivered\` flag destroys it; an outcome per handler makes partial delivery visible and lets the replay re-invoke only the failures, under their original keys, so a handler that already succeeded is not called twice. The 3-second deadline keeps a hung webhook from holding the request open and blocking the retry that would otherwise not start. What this step did not do: per-handler backoff with jitter, a durable outcome table so a replay survives a process restart, and a dead-letter path for a handler that keeps failing.`,
 };

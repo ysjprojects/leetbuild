@@ -16,7 +16,7 @@ import {stateStep} from './steps/state';
 export const usageMeteringProblem: Problem = {
   id: 'usage-metering',
   title: 'Usage Metering',
-  tagline: 'API usage counted once per request, capped by plan and reconciled with billing.',
+  tagline: 'API usage counted once per request id, flagged at the plan cap, closed to billing under one id.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -29,27 +29,29 @@ of the window, the idempotency of the close, and the authorization on the read.
 
 ## The real system
 
-Production metering sits on the hot path of every API call, but it is not allowed to be on the
-critical path of correctness for the request itself. A retrying gateway re-sends the same report
-several times; the meter counts the *request id* once. A plan has a cap per hour; the meter writes an
-overage flag and never refuses traffic, because a metering outage must not become an availability
-outage. The counters live per account per hour, incremented atomically with their expiry so a crash
-between "answer the caller" and "increment the counter" cannot lose the last minute of usage. Billing
-is closed per (account, period) under a close id derived from the period, so a retry after a timeout
-carries the same id and billing can dedupe — a close id minted per attempt is a double bill. Analytics
-receives rollup events keyed by the account so an account's usage stays ordered, carrying counters and
-cap state but never request payloads or endpoint arguments. And the read returns the number the meter
-is enforcing, with the cap state and the last reconciled close id, to the account it belongs to and to
-nobody else.
+OpenMeter, the open-source metering service behind Kong's metering and billing product, ingests
+usage as CloudEvents and deduplicates them by \`id\` plus \`source\`: a producer that retries after a
+network error re-sends the same id, and the meter processes it once. Aggregation is by \`subject\`,
+the customer, over fixed time windows, which is the same shape this course asks for with
+\`(account, request_id)\` as the dedupe key and \`usage:{account}:{hour}\` as the window. The rest of
+the shape follows from where the number ends up. Metering sits on the hot path of every API call but
+must not gate it: past the plan cap the meter writes an overage flag and keeps counting, because a
+metering outage that becomes a \`429\` storm is an availability outage. Counters increment with their
+expiry in one atomic step so a crash cannot strand the last minute of usage. Billing is closed per
+(account, period) under a close id derived from the period, so a retry after a timeout carries the
+same id and billing can dedupe; a close id minted per attempt is a double bill. Analytics receives
+rollup events keyed by the account so an account's usage stays ordered, carrying counters and cap
+state but no request payloads. And the read returns the number the meter is enforcing, with the cap
+state and the last reconciled close id, to the account it belongs to and nobody else.
 
 ## What you build here
 
 One service, **meterd**, with five pieces:
 
-1. \`POST /v1/usage\`: a validated report — request id, account, route and units — deduped by request
-   id, capped per request, and stored with the reporting gateway so it can be reconciled.
+1. \`POST /v1/usage\`: a validated report, with request id, account, route and units, deduped by
+   request id, capped per request, and stored with the reporting gateway so it can be reconciled.
 2. A **Redis** window layer: \`usage:{account}:{hour}\`, incremented and expired by one atomic Lua
-   script that also writes the usage record and the overage flag, and never blocks.
+   script that also writes the usage record and the overage flag, and does not block.
 3. A **gRPC** billing client: a five-second deadline on \`ClosePeriod\`, a close id derived from the
    period, a timeout that leaves the period open, and a reply reconciled against the Redis counters.
 4. A **Kafka** \`usage.rollup\` topic: events keyed by account, carrying the period, the units and the
@@ -61,15 +63,15 @@ One service, **meterd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real metering feature: debug
-it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+it against the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that
+fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Plan and pricing management, invoice rendering, tax, multi-currency, gateway fleet management, the
 tokenizer that decides what a "unit" means per provider, and the historical warehouse. The five pieces
-above are the ones that decide whether the number is counted once, capped honestly, closed idempotently
-and read by the right caller.`,
+above are the ones that decide whether the number is counted once, capped as a flag, closed
+idempotently and read by the right caller.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Gateway', sub: 'report · read', x: 8, y: 50},

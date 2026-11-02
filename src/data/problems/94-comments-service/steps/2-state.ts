@@ -8,39 +8,31 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it writes the comment, bumps a
-counter and pushes the thread onto a trending set. It compiles, the counters look right in a demo,
-and it hides two production flaws. Debug it like the service owner, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter inserts the comment, then runs a separate \`INCR\` on
+\`thread_count:{thread_id}\`, a \`ZINCRBY\` on one shared \`trending:threads\` set, and reads the hot
+list from that same set. It compiles, the counters look right in a demo, and it hides five flaws.
 
-Implement the counter and cache side of a comment write.
+**Failure mode the checks target.** A crash after the insert and before the \`INCR\` leaves the
+thread one comment short for good, with no path to repair it; the hot-thread set has no tenant and no
+expiry, so one tenant's trending thread surfaces on another tenant's homepage and a quiet tenant's
+scores accumulate forever.
 
 - Every comment write commits its counters **in the same atomic step as the insert**: one Lua script
   (\`COMMIT_COMMENT_LUA\`) bumps the thread counter, bumps the parent's reply counter when the
-  comment is a reply, and touches the tenant's hot-thread set, all inside the transaction that
-  inserts the comment. A crash between "insert" and "bump" is exactly what must not exist: the UI
-  would show fewer comments than the store holds, forever.
+  comment is a reply, and touches the tenant's hot-thread set, inside the transaction that inserts
+  the comment.
 - The thread counter key is \`thread:{tenant}:{thread_id}:count\`, incremented with \`INCR\` from
-  inside the script. The tenant is part of the key: two tenants with the same thread id are two
-  different threads.
+  inside the script. Two tenants with the same thread id are two different threads.
 - The reply counter key is \`thread:{tenant}:{thread_id}:replies:{parent_id}\`, bumped only when
   the comment has a parent (pass an empty key otherwise).
 - The hot-thread set is tenant-scoped: \`hot:{tenant}\`, a sorted set where a new comment adds one
   to the thread's score (\`ZINCRBY\`), with an expiry of \`HOT_TTL_S\` seconds refreshed on the
-  atomic path. A tenant's trending list may never show another tenant's threads.
+  atomic path.
 - The read of the hot list returns only the **first page** (\`HOT_PAGE_SIZE\` members, highest score
-  first) — a trending list is a page, not the whole set.
+  first).
 - \`recount_thread(tenant, thread_id)\` recomputes the counter from the durable store
-  (\`count_for_thread\`) and \`SET\`s the Redis key. This is the reconciliation path after a lost
-  script or a restored backup: the counter must be derivable from the comments, so the store — not
-  Redis — is the source of truth.
-
-**Failure mode the checks target.** The starter increments the thread counter with a **separate
-command after the write**, so the two can disagree: crash after the insert and before the
-\`INCR\` and the thread silently loses a comment that is really there. And its hot-thread key omits
-the tenant (\`trending:threads\`), so one tenant's trending thread surfaces on another tenant's
-homepage — a cross-tenant read that the cache key, not the query, decided. Both flaws pass every
-single-threaded test.`,
+  (\`count_for_thread\`) and \`SET\`s the Redis key: the reconciliation path after a lost script or a
+  restored backup. The store, not Redis, is the source of truth.`,
   sequence: {
     participants: ['Comments API', 'Redis', 'comment store'],
     messages: [
@@ -106,7 +98,7 @@ single-threaded test.`,
       id: 'recount',
       title: 'Recounts the counter from the durable store',
       detail:
-        '`recount_thread` counts the comments in the store (`count_for_thread`) and `SET`s the Redis counter to that value — the reconciliation path that proves the counter is derived state, not the truth.',
+        '`recount_thread` counts the comments in the store (`count_for_thread`) and `SET`s the Redis counter to that value: the reconciliation path that makes the counter derived state rather than the truth.',
       match: {
         python: {all: [/def recount_thread\(/, /count_for_thread\(/, /\.set\(/]},
         typescript: {all: [/export async function recountThread\(/, /countForThread\(/, /\.set\(/]},
@@ -159,8 +151,7 @@ store = CommentStore()
 
 @app.post("/v1/comments")
 def create_comment(body: CommentRequest, tenant: str = Header(default="", alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter increments the thread counter with a separate command after the write, so a
-    # crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     comment = {"thread_id": body.thread_id, "parent_id": body.parent_id, "text": body.text}
     store.insert(comment)
     r.incr(f"thread_count:{body.thread_id}")
@@ -284,8 +275,7 @@ interface CommentBody {
 }
 
 app.post('/v1/comments', async (request, reply) => {
-  // TODO: this starter increments the thread counter with a separate command after the write, so a
-  // crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as CommentBody;
   const comment = {thread_id: body.thread_id, parent_id: body.parent_id ?? null, text: body.text};
@@ -417,8 +407,7 @@ func createComment(rw http.ResponseWriter, r *http.Request) {
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	// TODO: this starter increments the thread counter with a separate command after the write, so a
-	// crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	_ = store.Insert(r.Context(), &comment)
 	rdb.Incr(r.Context(), "thread_count:"+comment.ThreadID)
 	rdb.ZIncrBy(r.Context(), "trending:threads", 1, comment.ThreadID)
@@ -565,8 +554,7 @@ object CommentState {
   val jedis = new Jedis("redis", 6379)
   val store = CommentStore.open()
 
-  // TODO: this starter increments the thread counter with a separate command after the write, so a
-  // crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def createComment(tenant: String, comment: Comment): Long = {
     store.insert(comment)
     val count = jedis.incr(s"thread_count:\${comment.thread_id}")
@@ -660,8 +648,7 @@ struct Comment {
 
 CommentStore store;
 
-// TODO: this starter increments the thread counter with a separate command after the write, so a
-// crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 long long createComment(sw::redis::Redis& redis, const std::string& tenant, const Comment& comment) {
   store.insert(comment);
   redis.incr("thread_count:" + comment.threadId);
@@ -754,9 +741,9 @@ static std::vector<std::string> hotThreads(sw::redis::Redis& redis, const std::s
     },
   },
   hints: [
-    'One script, three keys, one transaction: bump `thread:{tenant}:{thread_id}:count`, bump the parent’s reply key when there is a parent, and `ZINCRBY` the tenant’s hot set with its `EXPIRE`. The insert belongs to the same commit — a separate `INCR` after the write is the flaw, not a stylistic choice.',
-    'Tenant first in every key. `thread:{tenant}:{thread_id}:count` and `hot:{tenant}` are what make two tenants with colliding thread ids strangers. A shared `trending:threads` key serves one tenant’s list to everyone.',
-    'Redis is derived state: `recount_thread` counts rows in the store with `count_for_thread` and `SET`s the counter. Write that reconciliation before you need it, and read the hot list as a page (`ZREVRANGE 0..HOT_PAGE_SIZE - 1`) so a big tenant’s zset never becomes the response.',
+    'Kill the process between `store.insert` and `r.incr` and the thread count stays one short for good. Open the trending list as tenant B and thread ids from tenant A are on it.',
+    'Two commands are two failure points; only one of them is inside the transaction. And `trending:threads` has no tenant in its name and no `EXPIRE`, so every tenant reads one set that only grows.',
+    'Move the `INCR`, the parent `INCR` and `ZINCRBY` plus `EXPIRE HOT_TTL_S` into `COMMIT_COMMENT_LUA` run by `r.eval` next to the insert; key by `thread:{tenant}:{thread_id}:count` and `hot:{tenant}`; add `recount_thread` with `count_for_thread` and `set`.',
   ],
-  debrief: `The interview question behind this step is "what can disagree, and for how long?". A counter that is incremented in a second command can disagree with the store forever, because nothing else knows the comment exists — the only repair is a recount from the durable side, which is why the reconciliation path is part of the feature and not an ops script. The cache key is the second question: Redis does not have a notion of tenancy, so a key that forgets the tenant turns a cache into a cross-tenant leak that no query can prevent, because the query never runs. Real services add a hot-thread decay (scores that fade with time instead of growing forever), per-tenant cache budgets, and a sharded counter for threads with millions of comments, where a single hot key would be the bottleneck.`,
+  debrief: `The fix is one Lua script that moves every counter mutation into the same commit as the insert, because the question behind the step is "what can disagree, and for how long?". A counter incremented in a second command can disagree with the store forever, since nothing else knows the comment exists; the only repair is a recount from the durable side, which is why \`recount_thread\` is part of the feature rather than an ops script. The tenant belongs in every key because Redis has no notion of tenancy: a key that forgets it turns a cache into a cross-tenant leak that no query can prevent, because the query never runs. Production services go further with hot-thread decay, so scores fade instead of growing, and sharded counters for threads with millions of comments, where one key becomes a hotspot.`,
 };

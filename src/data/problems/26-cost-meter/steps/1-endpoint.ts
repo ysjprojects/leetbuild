@@ -8,33 +8,25 @@ export const endpointStep: Step = {
   focus: ['client', 'meter', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it accepts a usage report,
-parses the body and answers **202**. It compiles, it serves the demo, and it hides three production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/usage\` with body
+\`{"model": "…", "input_tokens": 1200, "output_tokens": 300}\`: it reads \`X-Tenant-Id\`, hands the
+row to a background task and answers **202** with the token total. It compiles, serves the demo and
+hides four flaws.
 
-Implement \`POST /v1/usage\` with body \`{"model": "…", "input_tokens": 1200, "output_tokens": 300}\`.
+**Failure mode the checks target.** A tenant retries a timed-out report and is billed twice, because
+the starter ignores \`Idempotency-Key\`. A restart between the response and the background write
+drops a billable row. A body with a negative count subtracts spend that was never spent, and a
+request without a tenant header is recorded under an empty tenant.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**.
 - \`model\` is a non-empty string (**400** otherwise).
 - \`input_tokens\` and \`output_tokens\` are integers from **0** to **1 000 000**
-  (\`MAX_TOKENS_PER_REPORT\`); a negative count is **400**, because a negative report subtracts spend
-  that was never spent.
-- \`Idempotency-Key\` is required (**400** when missing). The row is stored under
-  \`(tenant, key)\`: a replay returns the stored row with **200** and must not write a second one,
-  so a client retry is never billed twice.
-- The write is **durable before the response leaves**: the row is put in the store, and only then
-  does the handler answer **202** with the stored row. A version that answers first and writes in a
-  background task loses the whole report when the process dies in between — the tenant spent tokens
-  the meter never recorded.
-- Log the decision with tenant, model and the usage id — this endpoint is on the hot path of every
-  completion, so its write ordering and its key are the two things on-call will ask about.
-
-**Failure mode the checks target.** The starter records usage *after* sending the response, so a crash
-between the two silently drops a billable event; it accepts negative token counts, so a malformed
-client can erase spend; and it has no idempotency at all, so an ordinary retry — every HTTP client
-library retries a 202 that times out — bills the same request twice. The ordering flaw is the quiet
-one: nothing in the code looks wrong, because \`reply.send()\` followed by \`await store.put()\` reads
-exactly like a fast happy path.`,
+  (\`MAX_TOKENS_PER_REPORT\`); anything else is **400**.
+- \`Idempotency-Key\` is required (**400** when missing). The row is stored under \`(tenant, key)\`:
+  a replay returns the stored row with **200** and writes nothing.
+- The write is durable before the response: \`store.put()\` runs, and only then does the handler
+  answer **202** with the stored row.
+- Log tenant, model and usage id for every accepted report.`,
   sequence: {
     participants: ['Client', 'Cost Meter', 'usage store'],
     messages: [
@@ -146,8 +138,7 @@ def report_usage(
     background: BackgroundTasks,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter records the usage after the response is sent, accepts negative token counts,
-    # and ignores Idempotency-Key so a client retry bills the same request twice.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     background.add_task(store.insert, tenant, body.model, body.input_tokens, body.output_tokens)
     logger.info("usage tenant=%s model=%s", tenant, body.model)
     return JSONResponse(
@@ -237,8 +228,7 @@ async function insertUsage(tenant: string, body: UsageReport): Promise<void> {
 }
 
 app.post('/v1/usage', async (request, reply) => {
-  // TODO: this starter records the usage after the response has left the process, accepts negative
-  // token counts, and ignores Idempotency-Key so a client retry bills the same request twice.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as UsageReport;
   reply.code(202).send({accepted: true, tokens: body.input_tokens + body.output_tokens});
@@ -350,8 +340,7 @@ func reportUsage(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter records the usage after the response has left, accepts negative token
-	// counts, and ignores Idempotency-Key so a client retry bills the same request twice.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	writeJSON(rw, http.StatusAccepted, map[string]any{
 		"accepted": true,
 		"tokens":   body.InputTokens + body.OutputTokens,
@@ -488,8 +477,7 @@ object UsageApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[UsageReport]) { body =>
-            // TODO: this starter records the usage after the response is committed, accepts negative
-            // token counts, and ignores Idempotency-Key so a client retry bills the same request twice.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val respond = complete(
               StatusCodes.Accepted,
               s"""{"accepted":true,"tokens":\${body.input_tokens + body.output_tokens}}"""
@@ -599,8 +587,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter records the usage after the response has left, accepts negative token
-    // counts, and ignores Idempotency-Key so a client retry bills the same request twice.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto model = body.value("model", std::string());
     const int inputTokens = body.value("input_tokens", 0);
     const int outputTokens = body.value("output_tokens", 0);
@@ -691,9 +678,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant, Idempotency-Key, model, token range. Every one of them returns before the store is touched, so a malformed report can never leave a row behind.',
-    'The idempotency lookup and the write share one key, `(tenant, idem_key)`, and the lookup happens before the write. Store the whole row — a replay then answers 200 with the same `usage_id` instead of minting a second one.',
-    'The response is the last statement of the handler. If you need the write to look fast, make the *store* fast (or batch it) — never move it behind the response, because a crash in that window accepts tokens nothing will ever bill.',
+    'Finance sees one request billed twice after a client timeout, and a deploy during peak drops rows the gateway logs say were accepted.',
+    '`background.add_task` runs after the response is written, so a crash in that gap loses the row; with no lookup on `Idempotency-Key`, a retry is simply a second row.',
+    'Guard tenant, key, model and token range; `store.get()` under `(tenant, key)` and answer 200 with the stored row; otherwise `store.put()` and answer 202 from the same handler.',
   ],
-  debrief: `The interviewer is testing whether you can debug a write path on the money path. The starter reads fine because the demo posts well-formed reports and never retries. Three defects are being checked, in increasing subtlety: the token range (a negative count erases spend; an uncapped one corrupts the ledger), idempotency keyed by tenant (every HTTP client retries, and without the key the retry bills twice), and write-then-respond ordering (the row must be durable before the caller is told it was accepted). The ordering one is what separates candidates: \`send()\` then \`await put()\` is a two-line difference from the correct version and a silent revenue leak under a rolling deploy. Real meters add a monotonic usage id from the store for exactly-once reconciliation, a per-tenant cap on reports per minute, and a reconcile job that compares stored rows against the provider's own usage export.`,
+  debrief: `The handler's shape is guards, lookup, write, response, in that order, because each stage must be settled before the next is worth doing: a malformed report must not reach the store, a replay must not reach the write, and the caller must not hear 202 until the row exists. Moving the write behind the response buys latency with revenue; the way to make it fast is a faster store, not a reordered handler. Production meters go further than this step: the store issues a monotonic usage id so a reconcile job can compare recorded rows against the provider's own usage export, and a per-tenant cap on reports per minute keeps a misbehaving client from flooding the hot path.`,
 };

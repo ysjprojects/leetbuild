@@ -8,42 +8,28 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the create route,
-parses the rule into the parts it recognizes, logs the create and answers 200 with the body it
-received. It compiles, it serves the demo with a weekly standup rule, and it hides four production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/events\` (body: \`calendar_id\`, \`title\`,
+\`rrule\`, \`dtstart\`, \`dtend\`, \`timezone\`), keeps the rule parts it recognizes, logs the create
+and answers 200 with the body it received. It compiles, serves the demo with a weekly standup
+rule, and hides four flaws.
 
-Implement \`POST /v1/events\` with body
-\`{"calendar_id": "cal_7", "title": "Standup", "rrule": "FREQ=WEEKLY;BYDAY=MO;COUNT=6", "dtstart": "2026-03-02T09:00:00-08:00", "dtend": "2026-03-02T09:15:00-08:00", "timezone": "America/Los_Angeles"}\`.
+**Failure mode the checks target.** \`FREQ=SECONDLY\` with no \`UNTIL\` and no \`COUNT\` is a legal
+iCalendar rule, so the starter stores it and hands the expander a rule that does not return.
+Dropped parts such as \`BYSECOND=30\` mean the stored rule is not the rule the user wrote. Naked
+local datetimes break across a DST boundary, and echoing the request body hides that no
+\`event_id\` and no \`revision\` were assigned.
 
-- The rule is parsed as \`KEY=VALUE\` parts separated by \`;\`, at most \`MAX_RRULE_LENGTH\` (512)
-  characters. Every part's key must be in \`SUPPORTED_RRULE_PARTS\` (\`FREQ\`, \`INTERVAL\`, \`COUNT\`,
-  \`UNTIL\`, \`BYDAY\`, \`BYMONTHDAY\`, \`BYMONTH\`, \`WKST\`) and carry a non-empty value; a part with no
-  \`=\`, an empty value, or a key outside that set is **422** with the \`UNSUPPORTED_RRULE_PART\`
-  error code — the rule is refused, never trimmed to the parts the service happens to know.
-- Termination is required. \`FREQ\` must be present and must not be one of \`UNBOUNDED_FREQUENCIES\`
-  (\`SECONDLY\`, \`MINUTELY\`, \`HOURLY\`), and the rule must carry an end: \`UNTIL\`, or a \`COUNT\`
-  between **1** and \`MAX_COUNT\` (5000). Any rule that can expand forever is **422** before the
-  store is touched.
-- Every datetime carries its timezone. \`dtstart\`, \`dtend\` and any \`UNTIL\` must be ISO-8601 with
-  an explicit offset (a trailing \`Z\` or \`+HH:MM\`); a naive local wall-clock string is **422**
-  with the \`MISSING_TZ\` error code. \`timezone\` is required as well and must name a zone the
-  runtime actually knows, not just a non-empty string.
-- \`calendar_id\` and \`title\` are required non-empty strings, \`title\` at most \`MAX_TITLE_LENGTH\`
-  (200) characters; a malformed body is **400**. A missing tenant is **401**.
-- A valid rule is stored with the \`revision\` the store assigns (1 on create) and the response is
-  **201** \`{"event_id", "revision", "calendar_id"}\` — the identity the store created, never the
-  request body echoed back.
-- Log the create with tenant, calendar id and revision — not the title and not the rule text.
-
-**Failure mode the checks target.** One unvalidated rule is an unbounded expansion:
-\`FREQ=SECONDLY\` with no \`UNTIL\` and no \`COUNT\` is a legal iCalendar rule, so the starter stores it
-and hands the expander something that never returns — the create request finishes in milliseconds,
-the worker it poisoned never does. The silently dropped parts are the quieter half: \`BYSECOND=30\`
-or \`BYWEEKNO=12\` disappearing from the stored rule means the event the user wrote is not the event
-the service expands, and nobody notices until a meeting lands on the wrong day. Naked local
-datetimes fail the same way across a DST boundary, and answering with the request body hides that no
-\`event_id\` and no \`revision\` were ever assigned — the token every later step invalidates on.`,
+- The rule is \`KEY=VALUE\` parts separated by \`;\`, at most \`MAX_RRULE_LENGTH\` (512) characters.
+  Every key must be in \`SUPPORTED_RRULE_PARTS\` with a non-empty value; anything else is **422**
+  \`UNSUPPORTED_RRULE_PART\`, refused rather than trimmed.
+- \`FREQ\` must be present and not in \`UNBOUNDED_FREQUENCIES\`, and the rule must carry \`UNTIL\` or
+  a \`COUNT\` between **1** and \`MAX_COUNT\` (5000); otherwise **422** before the store is touched.
+- \`dtstart\`, \`dtend\` and any \`UNTIL\` must carry an explicit offset (\`TZ_SUFFIX_RE\`); a naive
+  string is **422** \`MISSING_TZ\`. \`timezone\` must name a zone the runtime knows.
+- \`calendar_id\` and \`title\` are required, \`title\` at most \`MAX_TITLE_LENGTH\` (200); a malformed
+  body is **400**, a missing tenant **401**.
+- Store the event and respond **201** \`{"event_id", "revision", "calendar_id"}\` from the stored
+  event. Log tenant, calendar id and revision, not the title or the rule text.`,
   sequence: {
     participants: ['Calendar client', 'Calendar API', 'Postgres'],
     messages: [
@@ -219,9 +205,7 @@ store = EventStore()
 
 @app.post("/v1/events")
 def create_event(body: EventRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter accepts FREQ=SECONDLY with no UNTIL and no COUNT, keeps only the RRULE parts
-    # it recognizes instead of rejecting the rest, passes dtstart/dtend/timezone through as naked
-    # local strings, and echoes the request body instead of creating the event. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     recognized = {"FREQ", "INTERVAL", "COUNT", "UNTIL"}
     chunks = [chunk.split("=", 1) for chunk in body.rrule.split(";") if "=" in chunk]
     rule = ";".join(f"{key}={value}" for key, value in chunks if key in recognized)
@@ -333,7 +317,7 @@ def create_event(body: EventRequest, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** POST /v1/events: flawed code that answers with whatever the caller sent. */
+      starter: `/** POST /v1/events: create handler for calendard. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -350,9 +334,7 @@ interface EventBody {
 const RECOGNIZED_PARTS = new Set(['FREQ', 'INTERVAL', 'COUNT', 'UNTIL']);
 
 app.post('/v1/events', async (request, reply) => {
-  // TODO: this starter accepts FREQ=SECONDLY with no UNTIL and no COUNT, keeps only the RRULE parts
-  // it recognizes instead of rejecting the rest, passes dtstart/dtend/timezone through as naked
-  // local strings, and echoes the request body instead of creating the event. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as EventBody;
   const kept: string[] = [];
@@ -526,9 +508,7 @@ func createEvent(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts FREQ=SECONDLY with no UNTIL and no COUNT, keeps only the RRULE parts
-	// it recognizes instead of rejecting the rest, passes dtstart/dtend/timezone through as naked
-	// local strings, and echoes the request body instead of creating the event. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	recognized := map[string]bool{"FREQ": true, "INTERVAL": true, "COUNT": true, "UNTIL": true}
 	kept := make([]string, 0, 4)
 	for _, chunk := range strings.Split(body.RRule, ";") {
@@ -746,10 +726,7 @@ object EventApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[EventRequest]) { body =>
-            // TODO: this starter accepts FREQ=SECONDLY with no UNTIL and no COUNT, keeps only the
-            // RRULE parts it recognizes instead of rejecting the rest, passes dtstart/dtend/
-            // timezone through as naked local strings, and echoes the request body instead of
-            // creating the event. Fix all four.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val kept = body.rrule.split(";").filter(chunk => RecognizedParts.contains(chunk.takeWhile(_ != '=')))
             system.log.info(s"event created tenant=$tenant calendar=\${body.calendar_id}")
             complete(StatusCodes.OK, body)
@@ -912,9 +889,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts FREQ=SECONDLY with no UNTIL and no COUNT, keeps only the RRULE parts
-    // it recognizes instead of rejecting the rest, passes dtstart/dtend/timezone through as naked
-    // local strings, and echoes the request body instead of creating the event. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::set<std::string> recognized = {"FREQ", "INTERVAL", "COUNT", "UNTIL"};
     const auto raw = body.value("rrule", std::string());
     std::string kept;
@@ -1102,9 +1077,9 @@ int main() {
     },
   },
   hints: [
-    'Parse, do not filter. Walk the rule chunk by chunk and refuse any `KEY=VALUE` whose key is not in `SUPPORTED_RRULE_PARTS` (or that has no `=`, or an empty value) with **422** `UNSUPPORTED_RRULE_PART`. A whitelist makes "supported parts" a contract a future part joins deliberately, instead of a filter that quietly rewrites the user’s rule.',
-    'Termination has two halves. The frequency must be one that can end at all — `FREQ` not in `UNBOUNDED_FREQUENCIES` — and the rule must carry an end: `UNTIL`, or a `COUNT` between 1 and `MAX_COUNT`. `FREQ=WEEKLY` alone is as infinite as `FREQ=SECONDLY`, and the cap is what stops `COUNT=1000000` from pinning an expander.',
-    'Timezones are part of the parse, not a display concern: `dtstart`, `dtend` and `UNTIL` each have to carry an explicit offset or `Z`, and a bare wall-clock string is **422** `MISSING_TZ`. Answer with what the store assigned — `event_id` and `revision` — never with the request body; the revision is the token the later steps invalidate on.',
+    'A user posts `FREQ=SECONDLY` with no end and gets a 200 with their own body back; an hour later the expansion worker is still running and no event_id exists anywhere.',
+    'The starter only reads the four parts it knows, checks nothing about FREQ or an end, trusts naked datetimes, and returns the request instead of calling the store.',
+    'Whitelist every key against `SUPPORTED_RRULE_PARTS`, require `UNTIL` or a capped `COUNT` with a bounded `FREQ`, enforce `TZ_SUFFIX_RE`, then answer 201 with `store.create_event` output.',
   ],
-  debrief: `The interviewer is testing the create path of a calendar, which is where one rule can cost the fleet: a validated rule is a promise that expansion terminates, and every part you silently drop is a promise the service breaks later. Four defects are being checked. Termination is two conditions, not one — a frequency that can end and an explicit end — with a \`COUNT\` cap so that "bounded" is still a budget the expander can pay. The part whitelist is the second: unknown parts are a **422**, never a filter, because the rule the user wrote has to be the rule that expands; a dropped \`BYSECOND\` moves a meeting and nobody finds out for a week. Timezones are the third: \`dtstart\`, \`dtend\` and \`UNTIL\` are instants, so a naive local string cannot survive a DST boundary and is refused rather than stored. The fourth is the quiet one the starter's echo hides: the response has to carry the \`event_id\` and \`revision\` the store assigned, because that revision is what the cache, the notifier and the change stream invalidate against. Real services go further with a full RFC 5545 grammar, an expansion horizon for open-ended rules, and the original rule text kept beside the normalized one.`,
+  debrief: `Termination is two conditions, a frequency that can end and an explicit end, with a \`COUNT\` cap so "bounded" is still a budget the expander can pay. The part whitelist is a contract rather than a filter: unknown parts are a **422** because the rule the user wrote has to be the rule that expands, and a dropped \`BYSECOND\` moves a meeting without anyone noticing. Timezones belong to the parse because \`dtstart\`, \`dtend\` and \`UNTIL\` are instants, not wall-clock strings. The response carries the \`event_id\` and \`revision\` the store assigned because the cache, the notifier and the change stream key on that revision. Production calendars go further with a full RFC 5545 grammar, an expansion horizon for open-ended rules, and the original rule text kept beside the normalized form.`,
 };

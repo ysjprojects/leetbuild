@@ -18,65 +18,54 @@ import {readStep} from './steps/5-read';
 export const crawlIndexProblem: Problem = {
   id: 'crawl-index',
   title: 'Crawl & Index',
-  tagline: 'Polite crawling with a durable frontier and an index whose freshness is provable.',
+  tagline: 'A per-host frontier in Redis, a fetcher with a failure policy, and a crawl report an operator can act on.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Crawl & Index
 
-A crawler is the piece of a search or AI platform that turns the open web into a corpus you own: it
-decides which URLs are worth fetching and which are not, paces itself so it is not a denial of
-service attack with a user agent, survives hosts that fail, and keeps a report an operator can
-believe. The visible part is a search result; the parts that decide whether the crawl is allowed to
-keep running are the admission policy, the frontier, the failure policy and the freshness report.
+A crawler turns the open web into a corpus you own: it decides which URLs are worth fetching, paces
+itself so it is not a denial of service with a user agent, survives hosts that fail, and keeps a
+report an operator can believe.
 
 ## The real system
 
-Production crawlers register a target only after they have checked the scheme, resolved the host
-against an allowlist and read the host's \`robots.txt\`, because a crawler that will fetch anything
-is an SSRF with a queue in front of it. They keep the frontier per host, so a slow host cannot back
-up the whole crawl, and they pace each host with a token bucket refilled at the rate that host
-tolerates — refilled and spent in one atomic step, because two workers reading the same bucket is
-how a crawl ends up at double the agreed rate. They fetch under a deadline, retry only the failures
-that deserve it, treat \`403\` as a decision from the site rather than a transient error, and back a
-whole host off when it answers \`429\`. They publish one event per page with the host as the key, so a
-host's history stays ordered, and they carry a reference to the stored page instead of the page
-itself, because a topic is retained and replicated and the web is somebody else's content. And they
-report coverage that an operator can defend: live counts, the age of the oldest pending URL, and an
-explicit stall flag.
+Production crawlers register a target only after checking the scheme, the allowlist and the host's
+\`robots.txt\`, because a crawler that will fetch anything is an SSRF with a queue in front of it.
+They keep the frontier per host and pace each host separately. Scrapy assigns every request to a
+download slot keyed by the URL's domain, and its AutoThrottle extension adjusts each slot's delay
+from that host's measured latency, with the rule that a non-200 response may raise the delay but may
+not lower it: errors mean slow down. They fetch under a deadline, retry only the failures that
+deserve it, treat \`403\` as a decision from the site, and back a whole host off on \`429\`. They
+publish one event per page keyed by host, carrying a reference to the stored page rather than the
+page, because a topic is retained and replicated. And they report coverage an operator can defend:
+live counts, the oldest pending age, and a stall flag.
 
 ## What you build here
 
 One service, **crawld**, with five pieces:
 
-1. \`POST /v1/crawl/targets\`: authenticated and idempotent registration of a seed URL, with the
-   scheme checked, the host resolved against an allowlist, internal addresses refused before any
-   fetch, and the host's robots rules read before the target is accepted.
-2. A **Redis frontier**: one queue per host (\`frontier:{job_id}:{host}\`), one token bucket per host
-   updated at the host's \`rate_per_minute\` inside a single atomic Lua \`EVAL\`, and a host-level
-   not-before timestamp so a \`429\` slows the whole host down instead of one URL.
-3. A **gRPC** fetcher call: a 5-second deadline per attempt, at most three attempts, retries only on
-   \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, a \`403\` recorded as permanently refused, a \`404\` as
-   gone, and the URL off the queue before the network call so one dead host cannot block a shard.
-4. A **Kafka** \`crawl.page\` event: keyed by host, carrying \`url\`, \`status\`, \`content_hash\` and
-   \`body_ref\` and never the markup, published only after the index write has confirmed.
-5. \`GET /v1/crawl/jobs/{job_id}\`: \`fetched\`, \`refused\`, \`pending\` and \`indexed\` counts read
-   from the live frontier, the oldest pending URL's age, a coverage number that excludes refused
-   pages, and a \`stalled\` flag.
+1. \`POST /v1/crawl/targets\`: idempotent seed registration with scheme, allowlist and internal
+   addresses checked before any fetch and robots rules read before acceptance.
+2. A **Redis frontier**: one queue and one token bucket per host, refilled inside one atomic Lua
+   \`EVAL\`, plus a host-level not-before timestamp for \`429\`.
+3. A **gRPC** fetcher call: 5-second deadline, at most three attempts, retries only on
+   \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, \`403\` recorded as refused, URL off the queue first.
+4. A **Kafka** \`crawl.page\` event: keyed by host, carrying \`content_hash\` and \`body_ref\`
+   without the markup, published after the index write confirms.
+5. \`GET /v1/crawl/jobs/{job_id}\`: live counts, the oldest pending URL's age, coverage that
+   excludes refused pages, and a \`stalled\` flag.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter here is working code with flaws: it compiles, serves the happy path, and looks right.
+In each step you debug it, fix it, and prove the fix with checks that fail on the starter.
 
 ## Left out on purpose
 
-Distributed frontier sharding and leases, link extraction and URL normalisation, DNS pinning and TLS
+Frontier sharding and leases, link extraction and URL normalisation, DNS pinning and TLS
 verification, duplicate detection across revisions, index sharding and ranking, crawl budget
-allocation between targets, and the operator UI. The five pieces above are the ones that decide
-whether the crawler is polite, isolated and defensible.`,
+allocation between targets, and the operator UI.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Operator', sub: 'targets · job reports', x: 8, y: 50},

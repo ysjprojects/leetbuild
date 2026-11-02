@@ -8,32 +8,27 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'output'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds a small JSON object and produces it, so
-the dashboard shows events. It hides four flaws that only matter once a job is long, or once a
-customer reads their own topic. Debug it, fix it, and prove the fix with the checks below.
-
-Implement the event path on topic \`transcode.event\`:
-
-- Every event is **keyed by the job id**, so one job's events land on one partition and stay ordered.
-  The starter keys by worker, so a job's events interleave with every other job that worker touched and
-  the consumer sees "segment 40 done" before "segment 39 done".
-- An event carries a **segment index range** — \`segment_start\`, \`segment_end\` and \`outcome\` —
-  rather than a single blob or a whole-file duration. A range is what lets the consumer update
-  progress counters and show which part of the file finished.
-- The completion event is **published after the manifest is finalized**
-  (\`finalize_manifest(job_id, manifest)\` writes the row, then the produce runs). Publishing first
-  means a consumer can announce a finished job that a reader cannot yet describe.
-- Output references are **signed and short-lived** (\`SIGNED_URL_TTL_S = 900\`, an
-  \`expires_at\`/\`expiresAt\`/\`ExpiresAt\` on every reference). The starter embeds a permanent output
-  URL that is retained and replicated with the topic for everyone who can read it, forever.
-- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\`,
-  \`idempotent: true\` + \`acks: -1\`, \`RequireAll\` + a hash balancer), so a retried produce does
-  not duplicate a record.
+**Starting point.** The starter is the event path on topic \`transcode.event\`: \`publish_segment\`
+and \`publish_completion\` build a small JSON object with a bare segment index and the output URL,
+produce it keyed by \`worker_id\`, and \`finalize_manifest\` runs afterwards. It serves the demo and
+hides five flaws.
 
 **Failure mode the checks target.** A worker-keyed topic scrambles per-job ordering and makes the
-consumer's progress counters wrong; publishing completion before the manifest is final is how a job
-briefly reports done and then 404s on its own output; and a permanent output URL in a retained topic
-is an access leak that survives every deletion of the video behind it.`,
+consumer's progress counters wrong; publishing completion before the manifest is final is how a
+job briefly reports done and then 404s on its own output; a permanent output URL in a retained
+topic is an access leak that survives every deletion of the video behind it; and a producer with
+no idempotence duplicates the record a consumer counts.
+
+- Every event is **keyed by the job id**, so one job's events land on one partition and stay
+  ordered.
+- An event carries a **segment index range**, \`segment_start\`, \`segment_end\` and \`outcome\`,
+  rather than a single index or a whole-file blob.
+- The completion event is **published after the manifest is finalized**
+  (\`finalize_manifest(job_id, manifest)\` writes the row, then the produce runs).
+- Output references are **signed and short-lived** (\`SIGNED_URL_TTL_S = 900\`, an
+  \`expires_at\`/\`expiresAt\`/\`ExpiresAt\` on every reference).
+- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\`,
+  \`idempotent: true\` + \`acks: -1\`, \`RequireAll\` + a hash balancer).`,
   sequence: {
     participants: ['Transcoder API', 'transcode.event', 'Event consumer', 'Output store'],
     messages: [
@@ -143,9 +138,7 @@ manifests: dict = {}
 
 
 def publish_segment(job_id: str, worker_id: str, index: int, output_url: str) -> None:
-    # TODO: this starter keys events by worker, publishes completion before the manifest is final,
-    # embeds a permanent output URL, carries no segment range, and configures neither idempotence
-    # nor acks. Fix all five.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {"job_id": job_id, "worker_id": worker_id, "segment": index, "output_url": output_url}
     producer.produce(TOPIC, key=worker_id, value=json.dumps(event))
 
@@ -234,9 +227,7 @@ export async function publishSegment(
   index: number,
   outputUrl: string,
 ): Promise<void> {
-  // TODO: this starter keys events by worker, publishes completion before the manifest is final,
-  // embeds a permanent output URL, carries no segment range, and configures neither idempotence
-  // nor acks. Fix all five.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {job_id: jobId, worker_id: workerId, segment: index, output_url: outputUrl};
   await producer.send({topic: TOPIC, messages: [{key: workerId, value: JSON.stringify(event)}]});
 }
@@ -340,9 +331,7 @@ var producer = &kafka.Writer{
 }
 
 func publishSegment(ctx context.Context, jobID, workerID string, index int, outputURL string) error {
-	// TODO: this starter keys events by worker, publishes completion before the manifest is final,
-	// embeds a permanent output URL, carries no segment range, and configures neither idempotence
-	// nor acks. Fix all five.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	value, err := json.Marshal(map[string]any{
 		"job_id":     jobID,
 		"worker_id":  workerID,
@@ -459,9 +448,7 @@ object Events {
   props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: this starter keys events by worker, publishes completion before the manifest is final,
-  // embeds a permanent output URL, carries no segment range, and configures neither idempotence
-  // nor acks. Fix all five.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publishSegment(jobId: String, workerId: String, index: Int, outputUrl: String): Unit = {
     val event = s"""{"job_id":"$jobId","worker_id":"$workerId","segment":$index,"output_url":"$outputUrl"}"""
     producer.send(new ProducerRecord(Topic, workerId, event))
@@ -549,9 +536,7 @@ class EventProducer {
     delete conf;
   }
 
-  // TODO: this starter keys events by worker, publishes completion before the manifest is final,
-  // embeds a permanent output URL, carries no segment range, and configures neither idempotence
-  // nor acks. Fix all five.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   void publishSegment(const std::string& job_id, const std::string& worker_id, int index,
                       const std::string& output_url) {
     const std::string event = "{\\"job_id\\":\\"" + job_id + "\\",\\"worker_id\\":\\"" + worker_id +
@@ -659,9 +644,9 @@ class EventProducer {
     },
   },
   hints: [
-    'The partition key is the ordering contract: key every event by `job_id`. With a worker key, one job’s events scatter across partitions and the consumer counts a range before the previous one — progress goes backwards.',
-    'Finalize the manifest before the completion produce, and carry `segment_start`/`segment_end`/`outcome` on every event. Publishing first lets a consumer announce a finished job that the read endpoint still cannot describe, which is exactly the bug the dashboard never reproduces locally.',
-    'Never put a permanent output URL in a topic: it is retained, replicated and readable by every consumer. Put a signed reference with an `expires_at` in the payload, and configure the producer with `enable.idempotence` and `acks=all` so a retried produce cannot duplicate the completion announcement.',
+    'The customer dashboard shows progress going backwards, a job flashes "done" and then its output 404s, and a security audit finds last year\'s renditions still reachable through URLs sitting in the topic.',
+    'Both produces use `key=worker_id`, so one job spreads across partitions; `publish_completion` runs before `finalize_manifest`; the payload carries a bare `segment` and the raw `output_url`; the producer has no config.',
+    'Key by `job_id`, send `segment_start`/`segment_end`/`outcome`, call `finalize_manifest` before the completion produce, replace the URL with `sign_url` plus `expires_at`, and configure `enable.idempotence` with `acks=all`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an event path as a contract with consumers you do not own. The starter is fine on a single-worker demo with one listener. Four defects are being checked: the key (job id, so one job’s events stay on one partition and ordered — a worker key interleaves every job the worker touched), publish-after-manifest (a completion event that outruns the manifest row makes the job briefly look done and unreadable), signed short-lived references (a permanent URL in a retained, replicated topic is an access grant that survives the video it points at), and idempotent acks (a retried produce must not duplicate the record a consumer counts). Ranged events are what let the consumer update progress counters without asking the API for the whole manifest. Real platforms add a schema registry with a compatibility policy, a consumer group per downstream, and an outbox for produces that fail while the broker is away.`,
+  debrief: `The fix treats the topic as a contract with consumers you do not own. The key is the ordering guarantee: Kafka orders within a partition only, so one job's events must share one. Publish-after-manifest is a write ordering rule: the row a reader will fetch has to exist before the announcement that it exists. Ranges let a consumer keep its own counters without calling the API, and the signed reference with \`expires_at\` means the retained, replicated log holds a grant that dies in fifteen minutes rather than outliving the video. Idempotence with \`acks=all\` closes the last gap, a broker retry that would double-count a segment. What this step did not do: a production topic carries a registered schema with a compatibility policy, so adding \`outcome\` cannot break a consumer deployed last month.`,
 };

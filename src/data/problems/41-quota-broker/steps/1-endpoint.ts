@@ -8,36 +8,24 @@ export const endpointStep: Step = {
   focus: ['client', 'broker', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the team’s remaining quota, answers
-\`ok\`, and the demo shows four GPUs granted. It compiles, it serves the happy path, and it hands
-the same capacity to every caller that asks before the first one finishes. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/quotas/{team}/reserve\` taking
+\`{"window": "2026-10-21T14:00Z", "resource_class": "gpu-a100", "amount": 4}\`, reads
+\`ledger.quota\` and \`ledger.reserved\` for the path team, answers \`409 quota_exhausted\` when the
+amount does not fit and otherwise \`200 {"status": "ok"}\`. It compiles and hides four flaws.
 
-Implement \`POST /v1/quotas/{team}/reserve\` with body
-\`{"window": "2026-10-21T14:00Z", "resource_class": "gpu-a100", "amount": 4}\`.
+**Failure mode the checks target.** Two callers that both pass the \`quota - reserved\` comparison
+before either writes both receive the last GPU, and nothing is written at all. The handler also
+trusts the path team and accepts any class string.
 
-- The team comes from the authenticated \`X-Team-Id\` header; a missing team is **401**. The team in
-  the path is a claim, not a proof: when it differs from the authenticated team answer **403**, so
-  one team can never reserve against another team’s window.
-- \`window\` is a non-empty string of the form \`YYYY-MM-DDTHH:MMZ\`; anything else is **400**. The
-  window is the unit of accounting — reservations belong to one, and the cap is per window.
-- \`resource_class\` must be one of the declared classes (\`gpu-a100\`, \`gpu-h100\`, \`tpu-v5\`).
-  An unknown class is **400**: the broker cannot enforce a quota for a resource it has never heard
-  of, and the starter happily accepts any string.
-- \`amount\` is an integer from **1** to **64**; anything else is **400**.
-- The reservation is **recorded in the ledger atomically** and the response is **201** with
-  \`{"reservation_id", "team", "window", "resource_class", "amount"}\`. The reservation id is the
-  only handle that can release or consume the capacity: a caller that never receives one cannot be
-  holding anything, and a consume without a recorded id must fail.
-
-**Failure mode the checks target.** The starter computes \`quota - reserved\` from two separate reads
-and then answers without writing anything down, so two concurrent callers both pass the check and
-both receive the last GPU. It also lets a caller name any resource class and reserve against any
-team, which turns a quota system into a suggestion.
-
-**What to keep.** The path, the request body and the \`409\` for a request that does not fit are
-fine. The fix is validation plus persistence: reject the cheap cases first, then record the
-reservation in one atomic ledger call before answering.`,
+- The team comes from the \`X-Team-Id\` header; missing is **401**, and a path team that differs
+  from it is **403**.
+- \`window\` must match \`WINDOW_RE\` (\`YYYY-MM-DDTHH:MMZ\`), else **400**.
+- \`resource_class\` must be in \`RESOURCE_CLASSES\` (\`gpu-a100\`, \`gpu-h100\`, \`tpu-v5\`), else
+  **400**.
+- \`amount\` is an integer from 1 to \`MAX_RESERVE_AMOUNT\` (64), else **400**.
+- Record the reservation through one \`ledger.reserve(...)\` call and answer **201** with
+  \`{"reservation_id", "team", "window", "resource_class", "amount"}\`. Keep the **409** when the
+  ledger reports the window is full.`,
   sequence: {
     participants: ['Client', 'Quota Broker', 'Capacity service', 'Redis'],
     messages: [
@@ -139,7 +127,7 @@ reservation in one atomic ledger call before answering.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/quotas/{team}/reserve: flawed code that answers without recording."""
+      starter: `"""POST /v1/quotas/{team}/reserve: the reservation endpoint."""
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -168,10 +156,7 @@ ledger = Ledger()
 
 @app.post("/v1/quotas/{team}/reserve")
 def reserve(team: str, body: ReserveRequest, caller: str = Header(alias="X-Team-Id")) -> JSONResponse:
-    # TODO: this starter checks the remaining quota, answers ok and never records the reservation, so
-    # two concurrent callers both receive capacity that exists once. Fix it: validate the window,
-    # the resource class and the amount, scope the path team to the authenticated team, and record
-    # the reservation (returning the id that later releases or consumes it).
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     remaining = ledger.quota(team, body.window) - ledger.reserved(team, body.window)
     if body.amount > remaining:
         return JSONResponse({"error": "quota_exhausted"}, status_code=409)
@@ -248,7 +233,7 @@ def reserve(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/quotas/:team/reserve: flawed code that answers without recording. */
+      starter: `/** POST /v1/quotas/:team/reserve: the reservation endpoint. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -273,10 +258,7 @@ const ledger = new Ledger();
 app.post('/v1/quotas/:team/reserve', async (request, reply) => {
   const {team} = request.params as {team: string};
   const body = request.body as ReserveBody;
-  // TODO: this starter checks the remaining quota, answers ok and never records the reservation, so
-  // two concurrent callers both receive capacity that exists once. Fix it: validate the window,
-  // the resource class and the amount, scope the path team to the authenticated team, and record
-  // the reservation (returning the id that later releases or consumes it).
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const remaining = (await ledger.quota(team, body.window)) - (await ledger.reserved(team, body.window));
   if (body.amount > remaining) return reply.code(409).send({error: 'quota_exhausted'});
   return reply.code(200).send({status: 'ok', amount: body.amount});
@@ -379,10 +361,7 @@ func reserve(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, 409, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter checks the remaining quota, answers ok and never records the reservation, so
-	// two concurrent callers both receive capacity that exists once. Fix it: validate the window,
-	// the resource class and the amount, scope the path team to the authenticated team, and record
-	// the reservation (returning the id that later releases or consumes it).
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	remaining := ledger.Quota(team, body.Window) - ledger.Reserved(team, body.Window)
 	if body.Amount > remaining {
 		writeJSON(rw, 409, map[string]string{"error": "quota_exhausted"})
@@ -511,11 +490,7 @@ object Api {
     path("v1" / "quotas" / Segment / "reserve") { team =>
       post {
         entity(as[ReserveRequest]) { body =>
-          // TODO: this starter checks the remaining quota, answers ok and never records the
-          // reservation, so two concurrent callers both receive capacity that exists once. Fix
-          // it: validate the window, the resource class and the amount, scope the path team to the
-          // authenticated team, and record the reservation (returning the id that later releases
-          // or consumes it).
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val remaining = Ledger.quota(team, body.window) - Ledger.reserved(team, body.window)
           if (body.amount > remaining) complete(StatusCodes.Conflict, """{"error":"quota_exhausted"}""")
           else complete(StatusCodes.OK, s"""{"status":"ok","amount":\${body.amount}}""")
@@ -621,10 +596,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter checks the remaining quota, answers ok and never records the reservation, so
-    // two concurrent callers both receive capacity that exists once. Fix it: validate the
-    // window, the resource class and the amount, scope the path team to the authenticated team,
-    // and record the reservation (returning the id that later releases or consumes it).
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto window = body.value("window", std::string());
     const int amount = body.value("amount", 0);
     const int remaining = ledger.quota(team, window) - ledger.reserved(team, window);
@@ -727,17 +699,16 @@ int main() {
     },
   },
   hints: [
-    'Write the guards first, in cost order: authenticated team, path team, window shape, resource class, amount range. Every one of them answers before any capacity is promised, so a malformed request can never reach the ledger.',
-    'A reservation that is not written down does not exist. The read-compare-answer pattern is the double-booking bug: two callers both compute `limit - reserved` before either writes. One atomic ledger call takes the units and returns the reservation id; the response is that id, never the result of an arithmetic check.',
-    'The path team is a claim and the resource class is a claim. Compare the path team with the authenticated one — **403** on a mismatch, **401** when it is absent — and check the class against an explicit whitelist, because a quota you cannot name is a quota you cannot enforce.',
+    'Load test: two clients each ask for the last four GPUs in the same window at the same moment and both get `200 ok`. A later consume with no reservation id finds nothing to consume.',
+    'The handler reads `quota` and `reserved` in two calls, compares, and answers. Nothing increments `reserved`, so every caller sees the same remaining value and the comparison always passes.',
+    'Replace the comparison with one `ledger.reserve(team, window, resource_class, amount)` call and return its `reservation_id` with **201**. The other three checks are guards: `X-Team-Id` (401/403), `WINDOW_RE`, `RESOURCE_CLASSES`, `MAX_RESERVE_AMOUNT`.',
   ],
-  debrief: `The interview question behind this step is whether a reservation is a decision or a record. The
-starter decides and forgets, which is exactly the shape of every oversell bug: the check and the write
-are two operations, and the window between them is where the second caller wins. The fix is not a
-lock in the handler, it is making the ledger own the decision — one call that reads the window,
-compares and records, so there is no observable state in which capacity was granted but not held.
-The second half is the trust boundary: the team in the path and the class in the body are claims,
-and a broker that accepts them both will happily reserve another team's GPUs for a resource nobody
-enforces. Real brokers add per-team limits from config, a maximum hold time per reservation, and an
-audit record for every grant and release.`,
+  debrief: `A reservation has to be a record, not a decision. The starter's check and its answer are two
+operations with nothing written between them, so the second caller wins the race. The fix moves
+the decision into the ledger: one call that reads, compares and records, so there is no state in
+which capacity was granted but not held. The guards sit in front of that call, cheapest first,
+because the path team and the body class are claims, and a broker that accepts them reserves one
+team's GPUs for a resource it does not track. Production brokers load per-team limits from
+configuration, give each reservation a maximum hold time so an abandoned grant returns to the
+pool, and write an audit record for every grant and release.`,
 };

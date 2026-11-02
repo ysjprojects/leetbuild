@@ -8,27 +8,26 @@ export const rerankStateStep: Step = {
   focus: ['api', 'redis', 'reranker'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads a cache, computes a miss and writes it
-back. It works for one query and one model build, and it quietly serves the wrong answer everywhere
-else. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter caches reranker scores in Redis: \`cached_scores\` walks the
+candidates, does a \`GET\` on \`rerank:score:{passage_hash}\`, calls the model on a miss, writes the
+score back with \`SET\` and returns the scores in candidate order. It serves the demo and hides 5
+flaws.
 
-A score is a function of **(query, passage, model version)** — change any one of the three and the
-cached number is no longer the score of this comparison. Implement the score cache:
+**Failure mode the checks target.** A score is a function of **(query, passage, model version)**;
+change any one of the three and the cached number is no longer the score of this comparison. The
+starter's key names only the passage, so the first query to score a passage decides what every later
+query sees, and a new model build keeps serving the old build's numbers for as long as Redis holds
+them. Its one-key-at-a-time loop also turns a 200-candidate request into 200 round trips.
 
-- Key every entry by \`rerank:score:{query_fingerprint}:{passage_hash}:{model_version}\`.
-- A 32-hex digest of the UTF-8 bytes is a good fingerprint for both the query and the passage.
-- Set a **30-minute TTL** (\`30 * 60\` seconds) when an entry is first written, because a score is
-  only fresh relative to the model build that produced it.
-- Read the whole batch at once (\`MGET\`) and recompute only the entries whose value is missing — a
+Requirements:
+
+- Key every entry by \`rerank:score:{query_fingerprint}:{passage_hash}:{model_version}\`; a 32-hex
+  digest of the UTF-8 bytes serves as fingerprint for both the query and the passage.
+- Write with a **30-minute TTL** (\`30 * 60\` seconds).
+- Read the whole batch with one \`MGET\` and recompute only the entries whose value is missing; a
   miss on **either half** of the pair is a miss.
-- Write the recomputed entries back with the TTL, and return scores in the caller's candidate order.
-- A model version bump must produce a different key, so the same pair gets a fresh score instead of
-  the previous build's number.
-
-**Failure mode the checks target.** The starter keys by passage hash alone, so the first query to
-score a passage populates an entry every other query then receives; it never puts the model version
-in the key, so a new build silently reuses old numbers; and it writes without a TTL, so a score
-outlives the model that made it.`,
+- Write the recomputed entries back with the TTL and return scores in the caller's candidate order.
+- A model version bump must produce a different key, so the same pair gets a fresh score.`,
   sequence: {
     participants: ['Rerank API', 'Redis', 'Reranker model'],
     messages: [
@@ -121,8 +120,7 @@ def passage_hash(text: str) -> str:
 
 
 def score_key(text: str) -> str:
-    # TODO: this starter keys by the passage hash alone, so one query's scores are served for every
-    # other query, and it never distinguishes model versions. It also writes with no TTL.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     return "rerank:score:" + passage_hash(text)
 
 
@@ -195,8 +193,7 @@ function passageHash(text: string): string {
 }
 
 function scoreKey(text: string): string {
-  // TODO: this starter keys by the passage hash alone, so one query's scores are served for every
-  // other query, and it never distinguishes model versions. It also writes with no TTL.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   return 'rerank:score:' + passageHash(text);
 }
 
@@ -297,8 +294,7 @@ func passageHash(text string) string {
 }
 
 func scoreKey(text string) string {
-	// TODO: this starter keys by the passage hash alone, so one query's scores are served for every
-	// other query, and it never distinguishes model versions. It also writes with no TTL.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	return "rerank:score:" + passageHash(text)
 }
 
@@ -429,8 +425,7 @@ object ScoreCache {
     MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString.take(32)
 
   def scoreKey(text: String): String =
-    // TODO: this starter keys by the passage hash alone, so one query's scores are served for every
-    // other query, and it never distinguishes model versions. It also writes with no TTL.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     "rerank:score:" + passageHash(text)
 
   def scoreOne(query: String, text: String, modelVersion: String): Double = 0.0
@@ -518,8 +513,7 @@ std::string digest(const std::string& value) {
 std::string passageHash(const std::string& text) { return digest(text); }
 
 std::string scoreKey(const std::string& text) {
-  // TODO: this starter keys by the passage hash alone, so one query's scores are served for every
-  // other query, and it never distinguishes model versions. It also writes with no TTL.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   return "rerank:score:" + passageHash(text);
 }
 
@@ -618,16 +612,16 @@ std::vector<double> cachedScores(const std::string& query, const std::vector<Can
     },
   },
   hints: [
-    'The cache key is the contract. If it does not name the query, the passage and the model version, it is not a key for a score — it is a key for a passage.',
-    'Read the batch with one `MGET` and keep the nil positions; only those entries need the model. Writing with `EX` makes the entry expire even if a later step forgets to invalidate it.',
-    'A version bump should be invisible to the caller: the same pair under a new version simply misses and recomputes, because the version is part of the key rather than a field beside it.',
+    'After a model upgrade the dashboard shows the same scores as last week, and two unrelated queries get identical scores for a shared passage; a cold cache also makes one request take 200 round trips.',
+    'The key is `rerank:score:` plus the passage hash and nothing else, `SET` carries no expiry, and the loop issues a `GET` and possibly a model call per candidate instead of one `MGET`.',
+    'Build the key from query fingerprint, passage hash and model version; `MGET` the batch, recompute only nil positions, write them back with `EX 1800`, merge in candidate order.',
   ],
-  debrief: `The interviewer is testing whether you understand that a relevance score is not a property of a
-passage. The starter reads fine because the demo reruns the same query against the same build. Three
-defects are being checked: an incomplete pair key (query fingerprint missing), a missing model
-version (so a new build silently reuses old numbers), and no TTL (so a score outlives the build that
-made it). The batch read and the miss list are the operational half: a per-key loop issues N round
-trips and, under a cold cache, N model calls instead of one. Real systems add a lock or single-flight
-to collapse a stampede on one key, and they store the model version in the value as well so a
-mismatched entry can be detected even when the key is right.`,
+  debrief: `The key is the whole contract: a relevance score is a property of a comparison under one model,
+not of a passage, so the query fingerprint and the model version live in the key rather than in a
+field beside the value, and a version bump becomes an ordinary miss with no invalidation code at
+all. The TTL bounds how long any mistake in the key can survive. The batch read and the miss list
+are the operational half: a per-key loop costs N round trips and, on a cold cache, N model calls
+where one would do. A production cache would also collapse a stampede on one hot key with a lock or
+single-flight, and store the model version in the value as well so a mismatched entry can be
+detected even when the key is right.`,
 };

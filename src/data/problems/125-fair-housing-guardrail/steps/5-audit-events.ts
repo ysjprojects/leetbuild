@@ -8,33 +8,25 @@ export const auditEventsStep: Step = {
   focus: ['guard', 'kafka', 'consumer', 'audit'],
   task: `## Task
 
-**Starting point.** The starter is working code: every decision produces an
-event and a consumer writes it to the audit store, so the compliance dashboard fills up. Four
-production contracts are broken, and one of them turns the audit trail itself into the data leak.
-Debug it, fix it, and prove the fix.
-
-\`audit(...)\` is called after every guard decision; the consumer turns the events into the
-append-only record a compliance review reads.
-
-- Publish **one** \`fairhousing.audit\` event per decision with the **conversation id** as the
-  message key, so one conversation's decisions stay ordered on one partition. The event id is a
-  fresh UUID.
-- The payload carries \`event_id\`, \`conversation_id\`, \`direction\`, \`allowed\`, \`tier\`,
-  \`score\`, \`reasons\`, \`policy_version\`, \`text_hash\` and a timestamp — **never the text**.
-  The topic is retained for months and replicated; the user's question about protected classes
-  must not be in it, and the hash is enough to join against the decision cache.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` with a hashed, stable key), so a retried produce cannot duplicate an audit row.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it: a
-  missing audit row is a missing proof of what the guard decided.
-- The consumer (\`group.id = audit\`) **appends** the event to the audit store and **only then**
-  commits the offset. Commit first and a crash between the two loses the row forever.
+**Starting point.** The starter's \`audit(conversation_id, direction, text, decision, policy_version)\`
+builds an event with a fresh UUID, the raw text, verdict, tier, score, reasons and policy version,
+produces it to \`fairhousing.audit\` keyed by the event id on a default producer, and flushes.
+\`consume()\` polls with \`group.id = audit\`, commits the offset, then appends to \`audit_store\`.
+It serves the demo and hides five flaws.
 
 **Failure mode the checks target.** Keyed by event id, one conversation's input and output
-decisions land on different partitions and the review sees them out of order; the text in the
-payload is the leak with the longest tail in the whole system; an unconfigured producer duplicates
-rows on retry; a failed produce silently loses evidence; and commit-before-write makes the one
-store that must be complete the one that is not.`,
+decisions land on different partitions and a compliance review reads them out of order. The text
+in the payload is the leak with the longest tail in the system, retained for months and mirrored.
+An unconfigured producer duplicates rows on retry, a rejected produce silently loses evidence, and
+commit-before-append makes the one store that must be complete the one that is not.
+
+- Produce with \`key=conversation_id\`; the payload keeps \`event_id\` as a fresh UUID.
+- Take \`text_hash\` instead of the text and put it in the payload; the word for the raw content
+  must not appear anywhere in the file.
+- Configure the producer with \`enable.idempotence\` and \`"acks": "all"\`.
+- Wrap the produce in \`except KafkaException\` and call \`insert_outbox(...)\` there instead of
+  dropping the event.
+- In the consumer, \`audit_store.append(event)\` first, \`consumer.commit(msg)\` second.`,
   sequence: {
     participants: ['fhguard', 'fairhousing.audit', 'Audit consumer', 'audit store'],
     messages: [
@@ -48,9 +40,9 @@ store that must be complete the one that is not.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=conversation_id` (`Key: []byte(conversationID)`, `key: conversationId`, `ProducerRecord(topic, conversationId, …)`). Keyed by the event id, a conversation’s decisions scatter and lose order.',
-    'Take `text_hash` as the argument and build the event from ids, verdict, tier, score, reasons, policy version and the hash. If the word for the raw content appears anywhere in the file, something is being carried that should not be — the hash is the join key the audit needs.',
-    'Idempotence is producer configuration (`enable.idempotence` + `acks=all`, KafkaJS `idempotent: true`, kafka-go `RequireAll` + `Hash`). Wrap the produce and insert an outbox row on failure. In the consumer: `append` first, `commit` second.',
+    "The compliance dashboard shows an output decision before the input decision it followed, and a reviewer opening a row sees the user's question in full, months after the conversation.",
+    'The partition is chosen by the message key, and the key is a per-event UUID, so the two decisions of one turn hash to different partitions; the event dict copies `text` straight through.',
+    'Produce with `key=conversation_id` and replace `text` with `text_hash` in both the signature and the payload; idempotence, the `KafkaException` outbox branch and append-before-commit are covered by the other checks.',
   ],
   checks: [
     {
@@ -151,9 +143,7 @@ audit_store = AuditStore()
 
 
 def audit(conversation_id: str, direction: str, text: str, decision: Decision, policy_version: str) -> None:
-    # TODO: key by conversation instead of the event id, configure the idempotent producer with
-    # acks=all, keep the text out of the event, and write an outbox row when the broker rejects
-    # the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event_id = str(uuid.uuid4())
     event = {
         "event_id": event_id,
@@ -257,7 +247,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** fairhousing.audit: flawed code that keys by event id and ships the user's words. */
+      starter: `/** fairhousing.audit: one event per guard decision, consumed into the audit store. */
 import {randomUUID} from 'node:crypto';
 
 import {Kafka} from 'kafkajs';
@@ -284,9 +274,7 @@ export async function audit(
   decision: Decision,
   policyVersion: string,
 ): Promise<void> {
-  // TODO: key by conversation instead of the event id, configure the idempotent producer with
-  // acks=all, keep the text out of the event, and write an outbox row when the broker rejects
-  // the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const eventId = randomUUID();
   const event = {
     event_id: eventId,
@@ -428,8 +416,7 @@ func (s *AuditStore) Append(ctx context.Context, event AuditEvent) error {
 
 var auditStore = &AuditStore{}
 
-// TODO: key by conversation instead of the event id, configure acks=all / idempotence, keep the
-// text out of the event, and write an outbox row when the broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func audit(ctx context.Context, conversationID, direction, text string, decision Decision, policyVersion string) {
 	event := AuditEvent{
 		EventID:        uuid.NewString(),
@@ -589,9 +576,7 @@ object AuditEvents {
     props
   })
 
-  // TODO: key by conversation instead of the event id, configure the idempotent producer with
-  // acks=all, keep the text out of the event, and write an outbox row when the broker rejects the
-  // produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def audit(conversationId: String, direction: String, text: String, decision: Decision, policyVersion: String): Unit = {
     val eventId = UUID.randomUUID().toString
     val event = JsObject(
@@ -715,9 +700,7 @@ AuditStore auditStore;
 std::unique_ptr<RdKafka::Producer> producer;
 std::string uuidString();
 
-// TODO: key by conversation instead of the event id, configure the idempotent producer with
-// acks=all, keep the text out of the event, and write an outbox row when the broker rejects the
-// produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void audit(const std::string& conversationId, const std::string& direction, const std::string& text, const Decision& decision, const std::string& policyVersion) {
   const std::string eventId = uuidString();
   const json event = {
@@ -837,5 +820,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you treat the audit trail as the compliance artifact it is. An audit row is the only proof of what the guard decided, under which policy, for which conversation — so losing one (commit before append, a dropped produce) or duplicating one (a non-idempotent retry) is a correctness failure, not a logging nit. Four defects are being checked: the conversation as the partition key so a review reads input and output decisions in order; producer idempotence with acks=all; the outbox for the broker's bad day; and append-then-commit in the consumer. The text in the payload is the one that matters most and the one the starter gets most wrong: a topic retained for months and mirrored to the data platform is the worst place for a user's question about protected classes, and the hash gives the reviewer everything they need to join against the decision cache and the sampled human-review set the post describes. Real systems add a schema registry for the event, a policy checksum beside the version, and a periodic reconciliation that counts decisions against audit rows.`,
+  debrief: `An audit row is the only proof of what the guard decided, under which policy, for which conversation, so losing or duplicating one is a correctness failure. The conversation id as the key puts a turn's input and output decisions on one partition in order. Idempotence with \`acks=all\` collapses a retried produce to one row, and the outbox keeps the event when the broker is down so the row arrives late instead of not at all. Appending before committing means a crash replays the event rather than dropping it. The hash gives a reviewer the join key to the decision cache without putting a protected-class question into a topic retained for months. Production pipelines register a schema for the event and reconcile decision counts against audit rows on a schedule.`,
 };

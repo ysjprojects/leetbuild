@@ -8,27 +8,25 @@ export const readStep: Step = {
   focus: ['client', 'classifier', 'taxonomy'],
   task: `## Task
 
-The starter is working code: it returns the taxonomy and the demo shows labels,
-so it passes. It hides three production flaws. Find them, fix them, and prove the fix.
-
-Implement \`GET /v1/taxonomies/{taxonomy_id}\` — the read side of the taxonomy, and the contract the
-classifier depends on to explain a past result.
-
-- The tenant comes from \`X-Tenant-Id\` (missing is **401**) and the read is **scoped to that
-  tenant**: another tenant's taxonomy does not exist here and answers **404**, not 403 and not a
-  filtered view.
-- The response carries the **immutable version** of the taxonomy, its labels, and — when \`since\` is
-  given — the **changelog** between that version and the requested one, so a reader can see what
-  changed without diffing two snapshots by hand.
-- Versions are **immutable**: publishing an edit writes a *new* version row and never rewrites the
-  labels of an existing version. The starter's in-place update is what makes an old classification
-  unexplainable — the labels it was produced from no longer exist anywhere.
-- Every classification records the **exact taxonomy version** it used, so a result can always be
-  reproduced against the rules that were live when it was produced.
+**Starting point.** \`GET /v1/taxonomies/{taxonomy_id}\` reads \`X-Tenant-Id\`, loads the taxonomy
+by id and answers with the labels of its mutable latest; \`edit_taxonomy\` rewrites those labels in
+place with \`update_labels\`. The demo shows labels. It hides 4 flaws.
 
 **Failure mode the checks target.** Returning the mutable latest without a version makes "which
 rules produced this label?" unanswerable once an edit lands; an in-place edit silently rewrites
-history; and resolving the taxonomy by id alone exposes one tenant's edits to another tenant.`,
+history; and resolving the taxonomy by id alone exposes one tenant's edits to another tenant.
+
+Requirements:
+
+- The tenant comes from \`X-Tenant-Id\` (missing is **401**) and the read is **scoped to that
+  tenant**: another tenant's taxonomy answers **404**, not 403 and not a filtered view.
+- The response carries the **immutable version** of the taxonomy, its labels, and, when \`since\` is
+  given, the **changelog** between that version and the requested one.
+- Versions are **immutable**: publishing an edit (\`publish_version\`) writes a *new* version with
+  \`put_version\` and leaves the labels of existing versions untouched, so an old classification
+  stays explainable.
+- Every classification records the **exact taxonomy version** it used (\`record_classification\`), so
+  a result can be reproduced against the rules that were live when it was produced.`,
   sequence: {
     participants: ['Client', 'Content Classifier', 'taxonomy store'],
     messages: [
@@ -128,9 +126,7 @@ def read_taxonomy(
     taxonomy_id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
-    # alone so another tenant's edits are visible, and rewrites labels in place so an old
-    # classification can no longer be explained. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     taxonomy = taxonomy_store.load(taxonomy_id)
     return JSONResponse(
         {"taxonomy_id": taxonomy_id, "labels": taxonomy.latest.labels},
@@ -194,9 +190,7 @@ import Fastify from 'fastify';
 export const app = Fastify();
 
 app.get('/v1/taxonomies/:taxonomyId', async (request, reply) => {
-  // TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
-  // alone so another tenant's edits are visible, and rewrites labels in place so an old
-  // classification can no longer be explained. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {taxonomyId} = request.params as {taxonomyId: string};
   const taxonomy = await taxonomyStore.load(taxonomyId);
   return reply.code(200).send({taxonomy_id: taxonomyId, labels: taxonomy.latest.labels});
@@ -267,9 +261,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 func readTaxonomy(rw http.ResponseWriter, r *http.Request) {
 	taxonomyID := r.PathValue("taxonomy_id")
-	// TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
-	// alone so another tenant's edits are visible, and rewrites labels in place so an old
-	// classification can no longer be explained. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	taxonomy, _ := taxonomyStore.Load(taxonomyID)
 	writeJSON(rw, http.StatusOK, map[string]any{"taxonomy_id": taxonomyID, "labels": taxonomy.Latest().Labels})
 }
@@ -359,9 +351,7 @@ object TaxonomyApi {
   val route: Route =
     path("v1" / "taxonomies" / Segment) { taxonomyId =>
       get {
-        // TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by
-        // id alone so another tenant's edits are visible, and rewrites labels in place so an old
-        // classification can no longer be explained. Fix all three.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         val taxonomy = TaxonomyStore.load(taxonomyId)
         val labels = taxonomy.latest.labels.mkString("[", ",", "]")
         complete(StatusCodes.OK, s"""{"taxonomy_id":"$taxonomyId","labels":$labels}""")
@@ -457,9 +447,7 @@ int main() {
 
   svr.Get(R"(/v1/taxonomies/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
     const auto taxonomyId = req.matches[1];
-    // TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
-    // alone so another tenant's edits are visible, and rewrites labels in place so an old
-    // classification can no longer be explained. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto taxonomy = taxonomyStore.load(taxonomyId);
     res.status = 200;
     res.set_content(json{{"taxonomy_id", taxonomyId}, {"labels", taxonomy.latest().labels}}.dump(),
@@ -538,9 +526,9 @@ void recordClassification(const std::string& tenant, const std::string& taxonomy
     },
   },
   hints: [
-    'The response is a version, not a document: `{"taxonomy_id", "version", "labels", "changelog"}`. Every consumer of this read — a reviewer, a dashboard, a re-classification job — needs the version in order to say which rules were live.',
-    'Immutability is a write rule: an edit calls `putVersion`/`put_version` and creates a new row. An in-place `updateLabels` rewrites the labels that old classifications were produced from, which is how a result becomes unexplainable without anyone deleting anything.',
-    'Tenant scoping is the same rule as the classify path: `load(tenant, taxonomy_id)` and 404 for anything else. Returning 403 leaks the existence of another tenant’s taxonomy, and returning a filtered view hides an authorization bug instead of failing the request.',
+    'A reviewer asks which label set produced last week’s classification and nobody can say; after an edit the old labels exist nowhere; a tenant reads a taxonomy it does not own.',
+    'The read returns `taxonomy.latest.labels` with no version and loads by id without the tenant, and `edit_taxonomy` calls `update_labels`, which mutates the only copy old results were produced from.',
+    'Answer `{"taxonomy_id", "version", "labels", "changelog"}` from `load(tenant, taxonomy_id)` or 404; replace `update_labels` with `publish_version` → `put_version`; add `record_classification(request_id, taxonomy_version)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug the read side of a service, where correctness is about history rather than the current request. Three defects are being checked: version identity (a read without a version cannot support an explanation of the past), immutability (an edit is a new version, never a mutation of an old one, so old results stay reproducible), and tenant scoping (the same boundary as the write path, enforced on every read). The classification record naming its version is the fourth idea: provenance is only useful if the version it names still exists and can be read back. Real taxonomy services add signed version manifests, a deprecation window before a version is retired, and an index from classification id to version so a reviewer can pull up the exact label set behind any historical result.`,
+  debrief: `The read answers with a version because an explanation of a past result is a claim about which rules were live, and a response without a version cannot support that claim. Edits publish a new version because an in-place rewrite deletes the past without anyone deleting anything: the old labels simply stop existing. The classification record names its version for the same reason; provenance is only useful if what it names can still be read back. Tenant scoping on the read is the same boundary as on the write path, enforced again because reads are where leaks are quiet. Production taxonomy services go further: a deprecation window before a version is retired, and an index from classification id to version for pulling up the label set behind any historical result.`,
 };

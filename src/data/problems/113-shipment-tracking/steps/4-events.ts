@@ -8,33 +8,23 @@ export const eventsStep: Step = {
   focus: ['api', 'db', 'kafka', 'projection'],
   task: `## Task
 
-**Starting point.** The starter is working code: a scan arrives, an event goes
-out, a projector consumes it and the timeline grows. Three contracts of the topic are broken, and
-none of them shows in a demo where one carrier scans one parcel in order. Debug it, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter's \`publish_status_change(shipment, scan)\` builds an event with the
+shipment id, the status, the recipient's address and name, logs the address, produces it to
+\`shipment.event\` keyed by the carrier code, flushes, and only then calls
+\`store.commit_status(shipment_id, status, scan_at)\`. It serves the demo and hides five flaws.
 
-Your job is \`publish_status_change(shipment, scan)\`, called after the state store accepted a scan.
+**Failure mode the checks target.** Keyed by carrier, one shipment's events scatter across
+partitions and the projector can apply \`delivered\` before \`out_for_delivery\`, undoing a delivery in
+the customer's view. The recipient's address sits in a topic that is retained for days and
+replicated, long after the request and the customer who moved house. Publishing before the commit
+makes the topic describe a status the store never accepted, and a crash between the two leaves
+nothing to reconcile against.
 
-- The event is published to \`shipment.event\` with the **shipment id as the message key**:
-  partitioning by shipment keeps one shipment's timeline **ordered**. Keyed by carrier, one
-  shipment's events scatter across partitions and the timeline can project \`delivered\` before
-  \`out_for_delivery\`.
+- Produce to \`shipment.event\` with the shipment id as the message key (\`key=shipment_id\`).
 - The payload carries \`shipment_id\`, \`status\`, \`scan_city\`, \`carrier_ref\` and
-  \`occurred_at\`. The location is **city granularity** — the scan's city, nothing finer.
-- The topic **never carries a recipient address**, and neither do the logs: no street, no postcode,
-  no recipient name. The topic is retained for days and replicated, so anything written into it
-  outlives the request, the retention policy and the customer who moved house.
-- The event is produced **after the state store commits** the scan
-  (\`store.commit_status(shipment_id, status, scan_at)\` first, then \`produce\`). Publishing first
-  means a consumer can project a timeline for a status the shipment does not have — and a crash
-  between the two loses the event with nothing to reconcile against.
-
-**Failure mode the checks target.** Three independent bugs that all look like "the timeline is
-eventually right". Keying by carrier destroys per-shipment order, so the projector can apply
-\`delivered\` and then \`in_transit\` and undo a delivery in the customer's view. A full recipient
-address in a retained topic is a data-protection incident with a very long tail. And
-publish-before-commit inverts the source of truth: the event becomes the input to the state store's
-own history instead of a projection of it.`,
+  \`occurred_at\`. Location is the scan's city, nothing finer.
+- No recipient address, street, postcode or name in the payload or the logs.
+- \`store.commit_status(...)\` first, \`producer.produce(...)\` after it.`,
   sequence: {
     participants: ['Shipment API', 'shipments', 'shipment.event', 'Timeline projector'],
     messages: [
@@ -47,9 +37,9 @@ own history instead of a projection of it.`,
     ],
   },
   hints: [
-    'The message key is the ordering contract: `key=shipment_id`, `key: shipmentId`, `Key: []byte(shipmentID)`, `ProducerRecord("shipment.event", shipmentId, payload)`. The projector can only keep a shipment’s timeline in order if every event for that shipment lands on the same partition — keyed by carrier, the same parcel’s events are split across carriers.',
-    'Publish what a timeline needs and nothing that identifies a person: shipment id, status, the scan **city**, a carrier reference and the timestamp. An address is the one field that turns a retained, replicated topic into a data-protection problem, and no last-mile routing happens from the event — that is the carrier’s own system.',
-    'Order the two writes: the state store commits first, the event follows. `store.commit_status(...)` then `produce(...)` means the event describes a state that already exists, so a crash between them loses an event the reconciliation job can rebuild from the store — the other order invents history the store never accepted.',
+    'A customer timeline shows delivered, then in transit, then delivered again; and a data-protection review finds street addresses in a topic retained for a week.',
+    'The message key is the carrier, so one shipment lands on whichever partition that carrier maps to, and the projector reads its events out of order. The payload copies the scan verbatim.',
+    'Key with `key=shipment_id`, replace the address fields with `scan_city`, add `carrier_ref` and `occurred_at`, and move `store.commit_status(...)` above `producer.produce(...)`. The log line must drop the address too.',
   ],
   checks: [
     {
@@ -140,10 +130,7 @@ store = StateStore()
 
 
 def publish_status_change(shipment: dict, scan: dict) -> None:
-    # TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
-    # partitions, publishes the recipient's full address for last-mile routing, and produces before
-    # the state store has committed the scan. Key by shipment id, publish the scan city instead of
-    # the address, and produce only after the commit.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {
         "shipment_id": shipment["shipment_id"],
         "status": scan["status"],
@@ -202,7 +189,7 @@ def publish_status_change(shipment: dict, scan: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** shipment.event: flawed code keyed by carrier, carrying the address. */
+      starter: `/** shipment.event: publish one timeline event per status change. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'shipments', brokers: ['kafka:9092']});
@@ -232,10 +219,7 @@ class StateStore {
 const store = new StateStore();
 
 export async function publishStatusChange(shipment: Shipment, scan: Scan): Promise<void> {
-  // TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
-  // partitions, publishes the recipient's full address for last-mile routing, and produces before
-  // the state store has committed the scan. Key by shipment id, publish the scan city instead of
-  // the address, and produce only after the commit.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {
     shipment_id: shipment.shipment_id,
     status: scan.status,
@@ -336,10 +320,7 @@ func (s *stateStore) CommitStatus(ctx context.Context, shipmentID, status string
 var store = &stateStore{}
 
 func publishStatusChange(ctx context.Context, shipment Shipment, scan Scan) error {
-	// TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
-	// partitions, publishes the recipient's full address for last-mile routing, and produces before
-	// the state store has committed the scan. Key by shipment id, publish the scan city instead of
-	// the address, and produce only after the commit.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"shipment_id":    shipment.ShipmentID,
 		"status":         scan.Status,
@@ -427,10 +408,7 @@ object ShipmentEvents {
   /** Persist the accepted scan; the timeline event follows the store, never precedes it. */
   def commitStatus(shipmentId: String, status: String, scanAt: Long): Unit = ()
 
-  // TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
-  // partitions, publishes the recipient's full address for last-mile routing, and produces before
-  // the state store has committed the scan. Key by shipment id, publish the scan city instead of
-  // the address, and produce only after the commit.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publishStatusChange(shipment: Shipment, scan: Scan): Unit = {
     val event = Map(
       "shipment_id" -> shipment.shipment_id,
@@ -514,10 +492,7 @@ struct StateStore {
 StateStore store;
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
-// partitions, publishes the recipient's full address for last-mile routing, and produces before
-// the state store has committed the scan. Key by shipment id, publish the scan city instead of the
-// address, and produce only after the commit.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publishStatusChange(const Shipment& shipment, const Scan& scan) {
   const json event = {
       {"shipment_id", shipment.shipment_id},
@@ -608,5 +583,5 @@ void publishStatusChange(const Shipment& shipment, const Scan& scan) {
 `,
     },
   },
-  debrief: `The interview question is what a topic is allowed to be: a projection of durable state, ordered per entity, carrying only what consumers need. The starter breaks all three. Keying by carrier scatters a shipment’s timeline, so ordering is lost exactly where it matters. Publishing before the commit makes the topic the source of truth for scans the store never accepted. And the address is the quiet one: a retained, replicated topic is the worst place in the system for recipient data, and no consumer of the timeline needs a house number. Real platforms add a topic schema with city-level location types, an outbox so a broker rejection cannot lose an event, and a reconciliation job that replays the store into the projector.`,
+  debrief: `A timeline topic is a projection of durable state, ordered per entity, carrying only what consumers need, and the fix restores each property in turn. The shipment id as key puts every event for one parcel on one partition, the only ordering Kafka guarantees. Committing before producing means the event describes a state that already exists, so a crash between the two loses an event the store can rebuild rather than inventing one it cannot. The city-only payload keeps recipient data out of a log retained far longer than the request. Production platforms register the envelope in a schema registry so a producer cannot add an address field by accident, and write the event through an outbox in the commit's transaction so a broker rejection cannot drop it.`,
 };

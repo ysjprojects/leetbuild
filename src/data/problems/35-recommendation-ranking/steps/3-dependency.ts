@@ -8,38 +8,29 @@ export const dependencyStep: Step = {
   focus: ['recsvc', 'ranker', 'popularity'],
   task: `## Task
 
-**Starting point.** The starter is working code: while the ranker is healthy
-every request comes back with an ordered list and the demo looks right. Every failure path in it is
-wrong. Find them, fix them, and prove the fix with the checks below.
+**Starting point.** The starter implements \`rank(tenant, user, candidate_ids)\`, the client recsvc
+calls for the ranking model: it opens the gRPC call, loops over a bounded attempt count, and
+returns the ordered item ids together with a degraded marker and the model version. While the
+ranker is healthy every request comes back with an ordered list. It serves the demo and hides five
+flaws.
 
-Implement \`rank(tenant, user, candidate_ids)\`, the client recsvc calls for the ranking model. It
-returns the ordered item ids together with a degraded marker and the model version.
+**Failure mode the checks target.** A slow or absent ranker. One stuck call pins the request open,
+a timeout turns into a list that looks like "no candidates", a popularity list is counted as a
+model win in the A/B numbers, a malformed payload is re-sent until the attempt budget is spent, and
+the degraded marker dies inside the client where no downstream reader can see it.
 
 - Each attempt carries a **500 ms** deadline (\`timeout=\`, \`deadline:\`, \`WithTimeout\`,
-  \`withDeadlineAfter\`, \`set_deadline\`). Without one a single slow ranker holds the recommendation
-  request open for as long as it likes.
-- Attempts are bounded to **3** and only \`UNAVAILABLE\` is retried. \`INVALID_ARGUMENT\` — a
-  malformed candidate payload — is our bug, not a transient one: it fails fast. Retrying the same
-  bad payload three times spends load on the ranker’s hottest path and still fails.
-- \`DEADLINE_EXCEEDED\` is not retried either: the ranker has just told us it cannot answer inside
-  the budget, so the next attempt is another 500 ms spent on a service that is already failing us.
+  \`withDeadlineAfter\`, \`set_deadline\`).
+- Attempts are bounded to **3** and only \`UNAVAILABLE\` is retried. \`INVALID_ARGUMENT\`, a
+  malformed candidate payload, is our bug and fails fast. \`DEADLINE_EXCEEDED\` is not retried
+  either: the ranker has just said it cannot answer inside the budget.
 - When the attempt budget is gone, or the deadline was missed, degrade to the **popularity order**
-  over the same candidates (\`popularity_order(candidate_ids)\`, provided) instead of an empty list:
-  an empty list looks like a bug, and a popularity list is a real answer for the user.
-- The degraded result is tagged — \`"fallback": true\` in Python, \`fallback: true\`, \`Fallback: true\`,
-  \`fallback = true\` in the other languages — and stamped with the **popularity model version**, and
-  both travel out of the client on the returned result, so the impression event for that response can
-  record that the list was degraded. An unmarked fallback silently corrupts every offline comparison
-  built from those events.
-- Log the outcome with tenant, user, item count and the fallback flag — never feature values.
-
-**Failure mode the checks target.** The starter gets all four failure paths wrong. It calls without a
-deadline, so one stuck ranker pins the request. It answers an empty list on a timeout, so a degraded
-response is indistinguishable from “no candidates” and the user sees nothing. It never tags the
-fallback, so the A/B analysis counts a popularity list as a model win and nobody can tell whether the
-last change helped or the ranker was simply down. And its retry loop re-sends a malformed candidate
-payload, spending the ranker’s capacity on a request that can never succeed. All four are invisible
-against a healthy demo ranker and loud in production.`,
+  over the same candidates (\`popularity_order(candidate_ids)\`, provided) instead of an empty list.
+- The degraded result is tagged (\`"fallback": true\` in Python, \`fallback: true\`, \`Fallback: true\`,
+  \`fallback = true\` elsewhere) and stamped with the **popularity model version**, and both travel
+  out of the client on the returned result so the impression event can record that the list was
+  degraded.
+- Log the outcome with tenant, user, item count and the fallback flag, not feature values.`,
   sequence: {
     participants: ['Recommendation API', 'Ranking model', 'Popularity order'],
     messages: [
@@ -209,9 +200,7 @@ class Ranking:
 
 
 def rank(tenant: str, user: str, candidate_ids: list[str]) -> Ranking:
-    # TODO: the call carries no 500 ms deadline; a DEADLINE_EXCEEDED returns an empty list instead of
-    # the popularity order; the fallback is never tagged; and this loop retries INVALID_ARGUMENT
-    # candidate payloads. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     for _ in range(RANK_MAX_ATTEMPTS):
         try:
             request = ranker_pb2.RankRequest(tenant=tenant, user=user, candidate_ids=candidate_ids)
@@ -276,7 +265,7 @@ def rank(tenant: str, user: str, candidate_ids: list[str]) -> Ranking:
 `,
     },
     typescript: {
-      starter: `/** rank: the ranking client recsvc calls; flawed code with four wrong failure paths. */
+      starter: `/** rank: the ranking client recsvc calls; the starter. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -305,9 +294,7 @@ const {ranker: rankerPackage} = grpc.loadPackageDefinition(protoLoader.loadSync(
 const ranker = new rankerPackage.Ranker('ranker:9000', grpc.credentials.createInsecure());
 
 export async function rank(tenant: string, user: string, candidateIds: string[]): Promise<RankingResult> {
-  // TODO: the call carries no 500 ms deadline; a DEADLINE_EXCEEDED returns an empty list instead of
-  // the popularity order; the fallback is never tagged; and this loop retries INVALID_ARGUMENT
-  // candidate payloads. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < RANK_MAX_ATTEMPTS; attempt += 1) {
     try {
       const reply = await new Promise<{items: {id: string}[]; model_version: string}>((resolve, reject) => {
@@ -407,9 +394,7 @@ type RankingResult struct {
 var ranker pb.RankerClient
 
 func rank(tenant, user string, candidateIDs []string) (RankingResult, error) {
-	// TODO: the call carries no 500 ms deadline; a DEADLINE_EXCEEDED returns an empty list instead of
-	// the popularity order; the fallback is never tagged; and this loop retries INVALID_ARGUMENT
-	// candidate payloads. Fix all four.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < rankMaxAttempts; attempt++ {
 		reply, err := ranker.Rank(context.Background(), &pb.RankRequest{
 			Tenant:       tenant,
@@ -508,9 +493,7 @@ object RankingClient {
   def popularityOrder(candidateIds: Seq[String]): Seq[String] = ???
 
   def rank(tenant: String, user: String, candidateIds: Seq[String]): RankingResult = {
-    // TODO: the call carries no 500 ms deadline; a DEADLINE_EXCEEDED returns an empty list instead of
-    // the popularity order; the fallback is never tagged; and this loop retries INVALID_ARGUMENT
-    // candidate payloads. Fix all four.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     var attempt = 0
     while (attempt < RankMaxAttempts) {
       try {
@@ -588,9 +571,7 @@ struct RankingResult {
 };
 
 RankingResult rank(const std::string& tenant, const std::string& user, const std::vector<std::string>& candidate_ids) {
-  // TODO: the call carries no 500 ms deadline; a DEADLINE_EXCEEDED returns an empty result instead of
-  // the popularity order; the fallback is never tagged; and this loop retries INVALID_ARGUMENT
-  // candidate payloads. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (int attempt = 0; attempt < kRankMaxAttempts; attempt++) {
     grpc::ClientContext ctx;
     RankRequest request;
@@ -672,9 +653,11 @@ RankingResult rank(const std::string& tenant, const std::string& user, const std
     },
   },
   hints: [
-    'The deadline belongs on the call itself — `timeout=`, `deadline: Date.now() + RANK_TIMEOUT_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — not on a timer around it. Bound the attempts with a named constant and a counted loop: the starter’s retry loop has no exit for a payload that will never rank.',
-    'Retryability is a property of the status, not of “it threw”: capture the error, look at its code, and grant another attempt only to `UNAVAILABLE`, only while the attempt budget lasts. `DEADLINE_EXCEEDED` sends you straight to the fallback — the ranker has already told you it is slow — and `INVALID_ARGUMENT` is re-raised on the spot, because a malformed candidate list cannot become valid between attempts.',
-    'The fallback is the popularity order over the *same* candidate ids, and it is only honest when it is marked: the result you return carries `fallback = true` beside `model_version = POPULARITY_MODEL_VERSION` (names in the language at hand), so the metrics, the A/B analysis and the impression event can all tell a degraded list from a ranked one.',
+    'During a ranker brownout, p99 of the recommendation endpoint climbs without bound, some users see an empty home surface, and the A/B dashboard shows the new model "winning" on exactly those requests.',
+    'The call has no deadline, the timeout branch returns an empty list, nothing sets the fallback flag or the popularity version on the result, and the loop treats every error, including `INVALID_ARGUMENT`, as a reason to try again.',
+    'Put `timeout=RANK_TIMEOUT_S` on the call; on `DEADLINE_EXCEEDED` or exhausted attempts return `popularity_order(candidate_ids)` with `fallback = True` and `model_version = POPULARITY_MODEL_VERSION`; retry only `UNAVAILABLE`, re-raise `INVALID_ARGUMENT`.',
   ],
-  debrief: `The interview question is failure policy on a dependency you do not control: what does the user see when the ranker is slow or gone? The starter answers “nothing” — an empty list — and hides the outage inside a response that looks successful. Four contracts make the answer correct. A deadline per attempt bounds one call; a bounded attempt count over a status whitelist bounds the whole call; a popularity fallback guarantees the surface still recommends, because a worse-but-real list beats no list; and the fallback tag plus the popularity model version keep the degradation honest all the way into the impression stream, so offline evaluation can exclude or re-weight it instead of crediting popularity with a win. The subtle waste is \`INVALID_ARGUMENT\`: a malformed candidate payload cannot become valid between attempts, so every retry is load spent on the ranker’s most contended path, and a blanket handler that retries anything is how a bad payload turns into a hot loop. Real clients propagate the caller’s deadline instead of inventing one, add jittered backoff between \`UNAVAILABLE\` attempts, cap the fallback share per surface (a surface degrading on most requests should page, not serve popularity forever), and record why they degraded, so “slow” and “gone” stay distinguishable after the fact.`,
+  debrief: `Failure policy on a dependency you do not control has a fixed shape. A deadline per attempt bounds one call; a bounded attempt count over a status whitelist bounds the whole call; a popularity fallback guarantees the surface still recommends, because a worse-but-real list beats no list; and the fallback tag plus the popularity model version carry the degradation into the impression stream, so offline evaluation can exclude or re-weight it instead of crediting popularity with a win. \`INVALID_ARGUMENT\` is the costly one: a malformed candidate payload cannot become valid between attempts, so every retry is load spent on the ranker's most contended path.
+
+Production clients propagate the caller's deadline instead of inventing one, add jittered backoff between \`UNAVAILABLE\` attempts, cap the fallback share per surface so a surface degrading on most requests pages instead of serving popularity forever, and record why they degraded, so "slow" and "gone" stay distinguishable after the fact.`,
 };

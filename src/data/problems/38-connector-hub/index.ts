@@ -17,7 +17,7 @@ import {readStep} from './steps/5-read';
 export const connectorHubProblem: Problem = {
   id: 'connector-hub',
   title: 'Connector Hub',
-  tagline: 'Third-party connectors that sync on cursors, retry politely and never leak tokens.',
+  tagline: 'Vendor connectors with durable Redis cursors, backoff on 429 and a breaker on 5xx.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,42 +31,29 @@ on.
 
 ## The real system
 
-Production connector hubs never trust the URL a caller supplies: the base URL is registered once, by
-an operator, and every later sync fetches only that host, because "validate the customer's URL for
-me" is a server-side request forgery probe with your network position attached. They hold a
-reference to an OAuth token, never the token itself in a response or a log line, and they answer a
-replayed registration with the connector that already exists instead of a second one.
+Airbyte's connector framework makes the checkpoint explicit: a source emits an \`AirbyteStateMessage\`
+after each stream slice it finishes, the platform persists that state, and the next sync starts
+from it rather than from the beginning of the stream. The checkpoint is written after the slice's
+records are read, and the cursor field is the vendor's own ordering (an updated-at timestamp or an
+opaque page token), which is what this course's Redis ledger reproduces with a claim key per page and
+a cursor that moves only after the page has been committed.
 
-A sync is a long-running job over pages, so its checkpoint is durable state, not a cache: the cursor
-lives in Redis with no TTL, moves in one atomic step and only after the page has been committed, so
-a crash mid-page re-fetches that page — deduped by its own page key — rather than skipping it. A
-quiet connector that stops for a week must resume where it stopped, not replay three months of the
-vendor's history.
-
-Vendor calls fail in ways that must be told apart. A 429 is answered with exponential backoff and
-jitter, honouring the vendor's own \`Retry-After\` when it sends one; a 401 is permanent, so it stops
-after a single attempt and the connector is disabled with a reason a human can read; a run of 5xx
-responses trips a breaker so five failures do not become thousands of calls against a vendor that is
-already down.
-
-Every page and every run publishes one \`connector.sync\` event keyed by **connector id**, so one
-connector's run log stays ordered. The event carries counts, the cursor position and an error code —
-never the access token, never a record's contents: the topic is retained and replicated, so whatever
-it carries outlives the sync. The consumer folds the cursor forward before it commits its offset, so
-a rebalance replays a page instead of losing a cursor advance.
-
-And the health endpoint is what an alert fires on: last successful page time, cursor lag,
-consecutive failures and breaker state, turning unhealthy when no page has landed in twice the
-connector's configured sync interval — not "healthy, the last run was recent" while every page in
-that run failed.
+The other pieces follow the same shape in any hub that holds customers' OAuth tokens. Registration
+compares the caller's base URL against a host the operator registered instead of fetching it,
+because "validate this URL for me" is a request forgery probe made with the platform's network
+position. The token is referenced, not echoed. Vendor calls distinguish a 429 (backoff with jitter,
+honouring \`Retry-After\`) from a 401 (one attempt, then disable with a reason) and from a run of 5xx
+(a breaker). Progress events are keyed by connector id so one run reads back in order, and carry
+counts and cursors rather than tokens or record contents, because the topic is retained. The health
+read is an alert input: lag from the last successful page, consecutive failures, breaker state.
 
 ## What you build here
 
 One service, **connectord**, with five pieces:
 
 1. \`POST /v1/connectors\`: authenticated tenant, a source type from a fixed allowlist, an OAuth
-   token **reference**, and a base URL that must match the registration the platform already holds
-   — rejected before any fetch — with an \`Idempotency-Key\` so a replayed registration returns the
+   token **reference**, a base URL that must match the registration the platform already holds,
+   rejected before any fetch, and an \`Idempotency-Key\` so a replayed registration returns the
    existing connector.
 2. A **Redis** sync ledger: a durable cursor per connector with no TTL, a per-page dedupe key, and
    one atomic script that claims the page and moves the cursor only after it is committed.
@@ -81,9 +68,8 @@ One service, **connectord**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+it looks right. Your job in every step is to debug it against the failure modes, fix it, optimize
+what is wasteful, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

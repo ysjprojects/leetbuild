@@ -16,7 +16,7 @@ import {readStep} from './steps/5-read';
 export const voiceAgentProblem: Problem = {
   id: 'voice-agent',
   title: 'Voice Agent',
-  tagline: 'Realtime speech sessions with barge-in, bounded retries and transcript-safe events.',
+  tagline: 'Realtime speech sessions: codec contract, atomic barge-in, resumable TTS, tenant-scoped transcripts.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -32,20 +32,21 @@ bounded reader that serves the transcript afterwards.
 
 ## The real system
 
-Production voice platforms accept a small set of codecs and sample rates, because the media pipeline
-downstream is built for those and nothing else. They cap a session at a wall-clock maximum so one
-stuck caller cannot hold a stream and its GPU forever. They let a reconnecting client resume the
-session it already had — same session id, same turn count — instead of forking a second one that
+OpenAI's Realtime API is a public example of the codec contract: a session accepts PCM16 at 24 kHz
+(the default) plus G.711 μ-law and A-law, and nothing else, because the media pipeline behind it is
+built for exactly those formats. Voice platforms cap a session at a wall-clock maximum so one stuck
+caller cannot hold a stream and its GPU forever, and they let a reconnecting client resume the
+session it already had, same session id, same turn count, instead of forking a second one that
 bills twice. Turn state lives in a fast store with a short TTL refreshed by every audio frame, so a
 silent pause longer than the TTL ends a dead session but a long answer keeps its own alive. When the
 caller speaks over the agent, the interruption is a single atomic transition that changes the
 current speaker and truncates the speech stream at the token already delivered; two separate writes
 leave a window where the agent keeps talking over the user. The speech-to-text and text-to-speech
 calls are streaming RPCs with an idle deadline, and once audio has been delivered to the caller a
-retry resumes from the delivered offset or fails — it never replays the first sentence. Turn events
-are keyed by session so one transcript assembles in order, and they reference a stored, redacted
-transcript rather than carrying audio or raw speech. The read endpoint is capped and paginated, and
-it is scoped to the caller's tenant.
+retry resumes from the delivered offset or fails rather than replaying the first sentence. Turn
+events are keyed by session so one transcript assembles in order, and they reference a stored,
+redacted transcript rather than carrying audio or raw speech. The read endpoint is capped and
+paginated, and it is scoped to the caller's tenant.
 
 ## What you build here
 
@@ -64,15 +65,15 @@ One service, **voice-gateway**, with five pieces:
    index, timings and a reference to the stored redacted transcript, with the consumer committing
    its offset only after the transcript row is durable.
 5. \`GET /v1/voice/sessions/{id}\`: the transcript with per-turn timestamps and redaction spans,
-   capped at 500 turns with cursor pagination, scoped to the tenant, and never exposing an audio
+   capped at 500 turns with cursor pagination, scoped to the tenant, and without an audio
    storage path.
 
 ## The debugging habit
 
-Every starter in this course is working code with a flaw: it compiles, it plays the demo call, and
-it looks right. Your job in every step is the job you will have on a real AI feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it plays the demo call, and
+it looks right. Your job in every step is the job you will have on a real speech feature: debug it
+against the failure modes, find the subtle flaw, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

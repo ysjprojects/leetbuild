@@ -8,33 +8,25 @@ export const scanCacheStep: Step = {
   focus: ['metasense', 'redis', 'llm'],
   task: `## Task
 
-**Starting point.** The starter is working code: a second scan of the same
-entity comes back from the cache, the day's counter goes up, and the owner's pending verification is
-recorded, so the demo passes. It hides four production flaws. Debug it like the person who gets
-the model invoice and the "why is this table still Tier 1" ticket, fix it, and prove the fix.
+**Starting point.** The starter's \`classify_entity(entity, owner, columns)\` looks up
+\`classify:{entity}\`, calls \`classify_columns\` on a miss, then reads \`budget:today\`, increments
+it if under 400, stores the tags with no expiry and writes \`verify:{entity}\` with no expiry. A
+second scan of the same entity comes from the cache, so the demo passes; it hides five flaws.
 
-Implement \`classify_entity(entity, owner, columns)\`, the worker's path around the gateway call
-from the previous step:
+**Failure mode the checks target.** A cache keyed by name serves stale tags after a schema change,
+the one case governance cares about; a counter read and then incremented overspends under the
+concurrency a backlog creates; counting after the call makes the cap a report, not a limit; a
+verification key without a TTL grows the keyspace forever.
 
-- Results are cached under \`classify:{entity}:{schema_hash}\` (\`schema_hash\` is the hex SHA-256
-  of the columns joined by \`\\n\`) for **7 days** (\`RESULT_TTL_S = 604800\`). Keyed by entity name
-  alone, a table that gained a \`passport_no\` column keeps serving yesterday's tags.
-- The day's classification budget is **400 entities** (\`DAILY_ENTITY_BUDGET\`, the top of the
-  source's 300–400 per day) under \`budget:{day}\` (UTC \`YYYY-MM-DD\`), reserved by **one atomic
-  Lua script**: \`INCR\`, \`EXPIRE\` on first write (\`BUDGET_TTL_S = 172800\`), and a \`DECR\` plus
-  \`0\` when the increment crossed the cap. A read followed by a separate increment lets two workers
-  both see 399 and both call the model.
-- **Reserve before the gateway call.** A cache hit never spends budget; a rejected reservation
-  raises \`BudgetExhausted\` so the job is requeued for tomorrow and the model is never called.
-- After a fresh classification, record the pending verification under \`verify:{entity}\` as a hash
-  (\`owner\`, \`schema_hash\`, \`state=pending\`) with a **7-day** expiry (\`VERIFY_TTL_S = 604800\`)
-  — the source notifies owners weekly, and a reminder key that never expires is a reminder for a
-  table that may no longer exist.
-
-**Failure mode the checks target.** A cache keyed by name serves stale tags after a schema change —
-the one case governance cares about; the counter that is read and then incremented overspends under
-exactly the concurrency a backlog creates; counting after the call means the cap is a report, not a
-limit; and the verification key without a TTL grows the keyspace by one entry per entity forever.`,
+- Cache results under \`classify:{entity}:{schema_hash}\` (hex SHA-256 of the columns joined by
+  \`\\n\`) for **7 days** (\`RESULT_TTL_S = 604800\`).
+- The day's budget is **400 entities** (\`DAILY_ENTITY_BUDGET\`) under \`budget:{day}\` (UTC
+  \`YYYY-MM-DD\`), reserved by **one atomic Lua script**: \`INCR\`, \`EXPIRE\` on first write
+  (\`BUDGET_TTL_S = 172800\`), and \`DECR\` plus \`0\` when the increment crossed the cap.
+- **Reserve before the gateway call.** A cache hit spends no budget; a rejected reservation raises
+  \`BudgetExhausted\` so the job is requeued for tomorrow without calling the model.
+- After a fresh classification, record \`verify:{entity}\` as a hash (\`owner\`, \`schema_hash\`,
+  \`state=pending\`) with a **7-day** expiry (\`VERIFY_TTL_S = 604800\`).`,
   sequence: {
     participants: ['metasense', 'Redis', 'LLM gateway'],
     messages: [
@@ -58,9 +50,9 @@ limit; and the verification key without a TTL grows the keyspace by one entry pe
     ],
   },
   hints: [
-    'The cache key has two parts because the thing being cached is a classification of a *schema*, not of a name: `classify:{entity}:{schema_hash}`. Compute the hash the same way the intake did, and give the entry an `ex=` when you set it.',
-    'The budget script does everything on the server: `INCR`, then `EXPIRE` when the result is 1 (first write of the day), then compare with the cap — and `DECR` before returning 0 so a rejected reservation does not consume a slot. Call it with `EVAL` before the gateway stub is touched; on 0, raise `BudgetExhausted` and return without calling.',
-    'The verification record is a hash plus an expiry: `HSET verify:{entity} owner … schema_hash … state pending` and `EXPIRE verify:{entity} VERIFY_TTL_S` (or a pipeline that does both). Seven days is the source’s weekly reminder cadence.',
+    'A table gained a `passport_no` column last week and the catalog still shows the tags from before; the invoice for one busy day lists 460 entities against a cap of 400.',
+    'The key is the entity name, so a new schema hits the old entry; the counter is read, compared and incremented in three round trips after the model was paid; neither key has a TTL.',
+    'Key `classify:{entity}:{schema_hash}` with `ex=RESULT_TTL_S`; one `EVAL` script (`INCR`, `EXPIRE` on 1, `DECR` and return 0 over the cap) before `classify_columns`, raising `BudgetExhausted` on 0; `HSET verify:{entity}` plus `EXPIRE VERIFY_TTL_S`.',
   ],
   checks: [
     {
@@ -129,7 +121,7 @@ limit; and the verification key without a TTL grows the keyspace by one entry pe
       id: 'reserve-before-call',
       title: 'Reserves budget before the gateway call',
       detail:
-        'The reservation runs before `classify_columns(...)`; a cache hit never reserves and a rejected reservation never calls. The starter counts after the call, so the cap never stops a call.',
+        'The reservation runs before `classify_columns(...)`; a cache hit does not reserve and a rejected reservation does not call. The starter counts after the call, so the cap never stops a call.',
       match: {
         python: {order: [/reserve_budget\(/, /classify_columns\(/]},
         typescript: {order: [/reserveBudget\(/, /classifyColumns\(/]},
@@ -151,8 +143,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def classify_entity(entity: str, owner: str, columns: list[str]) -> list[dict]:
-    # TODO: this starter caches by entity name alone with no TTL, counts the day's entities after
-    # the call with a non-atomic read, never refuses, and leaves the verification record forever.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     cached = r.get(f"classify:{entity}")
     if cached is not None:
         return json.loads(cached)
@@ -232,8 +223,7 @@ import {classifyColumns, type ColumnTag} from './classify_columns';
 const r = new Redis('redis://redis:6379');
 
 export async function classifyEntity(entity: string, owner: string, columns: string[]): Promise<ColumnTag[]> {
-  // TODO: this starter caches by entity name alone with no TTL, counts the day's entities after
-  // the call with a non-atomic read, never refuses, and leaves the verification record forever.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const cached = await r.get(\`classify:\${entity}\`);
   if (cached !== null) return JSON.parse(cached) as ColumnTag[];
   const tags = await classifyColumns(entity, columns);
@@ -316,8 +306,7 @@ var (
 	client pb.ClassifierClient
 )
 
-// TODO: this starter caches by entity name alone with no TTL, counts the day's entities after the
-// call with a non-atomic read, never refuses, and leaves the verification record forever.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func classifyEntity(ctx context.Context, entity, owner string, columns []string) ([]ColumnTag, error) {
 	cached, err := rdb.Get(ctx, "classify:"+entity).Result()
 	if err == nil {
@@ -444,8 +433,7 @@ object ScanCache {
   implicit val tagFormat: RootJsonFormat[ColumnTag] = DefaultJsonProtocol.jsonFormat3(ColumnTag)
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: this starter caches by entity name alone with no TTL, counts the day's entities after the
-  // call with a non-atomic read, never refuses, and leaves the verification record forever.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def classifyEntity(entity: String, owner: String, columns: List[String]): List[ColumnTag] = {
     Option(jedis.get(s"classify:$entity")) match {
       case Some(cached) => cached.parseJson.convertTo[List[ColumnTag]]
@@ -548,8 +536,7 @@ std::vector<ColumnTag> classifyColumns(Classifier::Stub* stub, const std::string
 json toJson(const std::vector<ColumnTag>& tags);
 std::vector<ColumnTag> fromJson(const json& data);
 
-// TODO: this starter caches by entity name alone with no TTL, counts the day's entities after the
-// call with a non-atomic read, never refuses, and leaves the verification record forever.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::vector<ColumnTag> classifyEntity(sw::redis::Redis& redis, Classifier::Stub* stub, const std::string& entity,
                                       const std::string& owner, const std::vector<std::string>& columns) {
   const auto cached = redis.get("classify:" + entity);
@@ -653,5 +640,5 @@ std::vector<ColumnTag> classifyEntity(sw::redis::Redis& redis, Classifier::Stub*
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell a cache key from a cache *identity*. A classification belongs to a schema, so the key must carry the schema hash — the source's whole reason for re-scanning is that a column was added, and a name-keyed cache hides exactly that. Four separate defects are being checked: the key and its TTL, the atomic reservation (read-then-increment overspends under the concurrency a backlog produces), the order (reserve before the call, so the cap is a limit and not a report — the source's rate limiter sits in front of the provider for the same reason), and the expiry on the verification record, which matches the weekly reminder cadence the source describes. Real services add a refund when the gateway call fails after the reservation, a per-platform share of the daily budget, and a token-based budget alongside the entity count, since one 150-column job costs more than ten 5-column ones.`,
+  debrief: `A cache key names what the value is a function of. A classification is a function of a schema, so the key carries the schema hash; the source's reason for re-scanning is that a column was added, and a name-keyed cache hides exactly that. The budget moves into one Lua script because a read and an increment in separate round trips are a check followed by a race, and before the call because a cap counted afterwards describes the overspend instead of preventing it; the source's rate limiter sits in front of the provider for the same reason. The 7-day expiries match the weekly reminder cadence. Production services also refund the reservation when the gateway call fails, give each platform a share of the day, and budget tokens alongside entities.`,
 };

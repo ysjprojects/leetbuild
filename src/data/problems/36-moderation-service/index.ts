@@ -17,7 +17,7 @@ import {readStep} from './steps/5-read';
 export const moderationServiceProblem: Problem = {
   id: 'moderation-service',
   title: 'Moderation Service',
-  tagline: 'Auto-triage reports to a human queue with atomic claims and reporter-safe records.',
+  tagline: 'A report queue whose claims expire and whose case file hides the reporter.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -33,19 +33,18 @@ double-held, the evidence bar in front of an automatic removal, and the redactio
 
 ## The real system
 
-Production moderation pipelines receive reports from many tenants, prove that the reported content
-is actually theirs, and fold a reporter's repeated reports on one item into the case that already
-exists instead of minting a new one. They hand items to human moderators through a queue that is
-claimed atomically and leased, so an item a crashed reviewer was holding comes back to the queue
-instead of being stranded. They call a classifier under a tight deadline and treat it as advice,
-not authority: an automatic action requires a very high confidence *and* a second, independent
-signal, and everything weaker — including a timeout — lands in the human queue with the evidence
-recorded. They publish one action event per item keyed by the content id so an item's history stays
-ordered, carrying the action, the rule and the reviewer's role but never the reporter's identity or
-the verbatim report text, and they persist the action before committing the consumer offset so a
-crash cannot replay a removal into silence. And they never hand a case file to a caller who does
-not own the content, never volunteer who reported it outside the surveyor role, and never echo free
-text back unescaped.
+Mastodon's admin reports API is a concrete example of the human side of this pipeline: a report
+carries a category and the reporter's comment, a moderator calls "assign report to self" so the
+report shows an \`assigned_account\`, and the report can be unassigned, resolved or reopened, so
+two moderators are not working the same item without knowing it. Larger platforms put a classifier
+in front of that queue and treat it as advice under a tight deadline rather than authority: an
+automatic action requires a very high confidence *and* a second, independent signal, and anything
+weaker, including a timeout, lands in the human queue with the evidence recorded. They publish one
+action event per item keyed by the content id so an item's history stays ordered, carrying the
+action, the rule and the reviewer's role but not the reporter's identity or the verbatim report
+text, and they persist the action before committing the consumer offset so a crash cannot replay a
+removal into silence. The case file goes only to a caller who owns the content, names the reporter
+only to the surveyor role, and escapes free text before it reaches a console.
 
 ## What you build here
 

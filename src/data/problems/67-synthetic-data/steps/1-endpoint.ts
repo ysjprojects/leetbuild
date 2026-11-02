@@ -8,36 +8,31 @@ export const endpointStep: Step = {
   focus: ['client', 'synth', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the recipe and starts generating. It compiles, it serves the demo, and it expands a seed nobody can
-account for. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/synthetic/jobs\` with body
+\`{"seed_dataset": "wiki-dump", "seed_version": "2026-04-01", "recipe": "qa-pairs", "max_records": 1000}\`,
+mints a job id, calls \`start_expansion\` with whatever dataset name arrived, and returns
+\`{job_id, seed_dataset, status}\`. It compiles, serves the demo and hides 4 flaws.
 
-Implement \`POST /v1/synthetic/jobs\` with body
-\`{"seed_dataset": "wiki-dump", "seed_version": "2026-04-01", "recipe": "qa-pairs", "max_records": 1000}\`.
+**Failure mode the checks target.** An unregistered seed means the corpus cannot be traced or
+licensed at all. A registered dataset can still be forbidden to derive from, so the registry lookup
+and the license decision are two different gates, and both have to run before a single record is
+generated. Without a service-side cap one request produces an unbounded dataset, and without
+idempotency one client retry doubles it.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`Idempotency-Key\` is required (**400** when missing). A replay of the same \`(tenant, key)\`
-  returns the stored job — the *same* job id and the same cap — instead of starting a second run.
+  returns the stored job, the same job id and the same cap, instead of starting a second run.
 - \`seed_dataset\` and \`seed_version\` are looked up in the **seed registry**. An unregistered
-  dataset, or a version that was never published, is **422** — unprocessable, not unauthorized:
-  the request is well formed, the seed just cannot be used.
+  dataset, or a version that was not published, is **422**: the request is well formed, the seed
+  just cannot be used.
 - The seed's **license must permit derivative generation** (\`derivative_ok\` on the registered
-  seed entry). A seed whose license forbids derivatives is **422**. This check runs
-  **before any generation work is enqueued** — refusing after the job started leaves unlicensed
-  derivatives on disk.
+  seed entry). A seed whose license forbids derivatives is **422**, decided **before any generation
+  work is enqueued**.
 - \`max_records\` is an integer from **1** to \`MAX_RECORDS = 100000\` (**400** otherwise) and is
-  part of the job the service creates: the cap is enforced by the service, not by the client
-  stopping the stream.
+  stored on the job the service creates, so the service enforces the cap.
 - \`recipe\` is a non-empty string (**400** otherwise) and is stored on the job so record events can
   be keyed by it later.
-- Log the job id, the seed dataset and the cap — never the seed content.
-
-**Failure mode the checks target.** An unregistered seed means the corpus cannot be traced or
-licensed at all, and the starter expands whatever file path or dataset name the caller sends. The
-license flag is the subtle one: a dataset can be perfectly registered and still be *forbidden* to
-derive from, so the registry lookup and the license decision are two different checks. The missing
-cap is the expensive one — the starter keeps generating until the client disconnects, so one request
-can produce an unbounded, unlicensed, unmeasured dataset.`,
+- Log the job id, the seed dataset and the cap, not the seed content.`,
   sequence: {
     participants: ['Data curator', 'Synthetic Data API', 'seed registry'],
     messages: [
@@ -56,9 +51,9 @@ can produce an unbounded, unlicensed, unmeasured dataset.`,
     ],
   },
   hints: [
-    'Two different refusals: a missing tenant or a missing `Idempotency-Key` is the caller’s mistake (**400**/**401**), while a seed that exists but may not be derived from is **422**. Return the registry row on the miss path so the caller learns which field was wrong.',
-    'Do the registry lookup and the license decision before you create the job or enqueue anything. The check is an `order` check — the code that reads `derivative_ok` has to sit above the call that starts generation, not below it.',
-    'The cap is not a hint to the generator: put `max_records` on the stored job and let the worker stop at it. And key the idempotency store by `(tenant, idem_key)`, so a client retry returns the job that already exists instead of a second one against the same seed.',
+    'A curator submits a dataset name that exists on disk but was never registered, and the job is accepted. A second submit of the same request creates a second job and the row count doubles.',
+    'The handler calls `start_expansion` as soon as the body parses: nothing consults `SEED_REGISTRY`, reads `derivative_ok`, checks the headers, or stores anything keyed by `(tenant, Idempotency-Key)`.',
+    'Check the headers (401/400), look up the seed row in `SEED_REGISTRY` and require `derivative_ok` (422) above `enqueue(`, validate `max_records` against `MAX_RECORDS`, and call `store.get(` before `store.put(`.',
   ],
   checks: [
     {
@@ -128,7 +123,7 @@ can produce an unbounded, unlicensed, unmeasured dataset.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/synthetic/jobs: flawed code that expands whatever seed it is handed."""
+      starter: `"""POST /v1/synthetic/jobs: accept a generation job for a seed dataset."""
 import uuid
 
 from fastapi import FastAPI, Header
@@ -149,9 +144,7 @@ def start_expansion(job_id: str, seed_dataset: str, recipe: str) -> None:
 
 @app.post("/v1/synthetic/jobs")
 def create_job(body: JobRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
-    # the seed's license, has no record cap, and validates neither header: no tenant check and no
-    # idempotency, so one client retry expands the same seed a second time.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     job_id = str(uuid.uuid4())
     start_expansion(job_id, body.seed_dataset, body.recipe)
     return {"job_id": job_id, "seed_dataset": body.seed_dataset, "status": "queued"}
@@ -257,7 +250,7 @@ def create_job(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/synthetic/jobs: flawed code that expands whatever seed the caller sends. */
+      starter: `/** POST /v1/synthetic/jobs: accept a generation job for a seed dataset. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -278,9 +271,7 @@ async function startExpansion(jobId: string, seedDataset: string, seedVersion: s
 }
 
 app.post('/v1/synthetic/jobs', async (request, reply) => {
-  // TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
-  // the seed's license, has no record cap, and validates neither header: no tenant check and no
-  // idempotency, so one client retry expands the same seed a second time.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
   const body = request.body as JobBody;
   const jobId = randomUUID();
@@ -372,7 +363,7 @@ void app.listen({port: 8080, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// POST /v1/synthetic/jobs: flawed code that expands whatever seed the caller sends.
+      starter: `// POST /v1/synthetic/jobs: accept a generation job for a seed dataset.
 package main
 
 import (
@@ -404,9 +395,7 @@ func submitJob(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
-	// the seed's license, has no record cap, and validates neither header: no tenant check and no
-	// idempotency, so one client retry expands the same seed a second time.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	jobID := uuid.NewString()
 	startExpansion(jobID, body.SeedDataset, body.SeedVersion, body.Recipe)
 	log.Printf("job queued tenant=%s job_id=%s seed_dataset=%s", tenant, jobID, body.SeedDataset)
@@ -572,9 +561,7 @@ object SynthApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[JobRequest]) { body =>
-            // TODO: this starter expands whatever seed_dataset the caller sends, never consults the
-            // registry or the seed's license, has no record cap, and validates neither header: no
-            // tenant check and no idempotency, so one client retry expands the seed twice.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val jobId = UUID.randomUUID().toString
             startExpansion(jobId, body.seed_dataset, body.seed_version, body.recipe)
             complete(StatusCodes.Accepted, s"""{"job_id":"$jobId","seed_dataset":"\${body.seed_dataset}"}""")
@@ -680,7 +667,7 @@ object SynthApi {
 `,
     },
     cpp: {
-      starter: `// POST /v1/synthetic/jobs: flawed code that expands whatever seed the caller sends.
+      starter: `// POST /v1/synthetic/jobs: accept a generation job for a seed dataset.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -711,9 +698,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
-    // the seed's license, has no record cap, and validates neither header: no tenant check and no
-    // idempotency, so one client retry expands the same seed a second time.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto jobId = uuidString();
     const auto dataset = body.value("seed_dataset", std::string());
     startExpansion(jobId, dataset, body.value("seed_version", std::string()), body.value("recipe", std::string()));
@@ -835,5 +820,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the license boundary. The starter reads fine because the demo always sends a seed the platform owns and never retries. Five separate defects are being checked: authentication, the request cap, the registry lookup, the license decision, and the order the two happen in. The subtle one is the license: most candidates stop at "the dataset exists", but a registered dataset whose license forbids derivatives turns every generated record into a legal problem, and the fix has to run before generation starts, not after. The idempotency key is what makes a retried submit safe: without it, one client retry doubles the corpus against the same seed and the cap you validated is now two caps. Real services add a seed registry audit trail, per-tenant seed allowlists, and a license term record pinned to the job.`,
+  debrief: `The fix is shaped by where each refusal belongs. Header problems are the caller's mistake, so they are 400 and 401 and come first; the seed row is resolved next, and the license flag is read from that row rather than from the request, so a well-formed request for a forbidden seed is 422 before \`enqueue\` ever runs. Putting \`max_records\` on the stored job is what makes the cap the service's decision, and keying the store by \`(tenant, Idempotency-Key)\` is what makes a retried submit return the same job instead of a second expansion. A production registry would also version the license text itself, expire idempotency entries after a day or so, and answer a replay whose body differs from the stored job with 409 instead of silently returning the old job.`,
 };

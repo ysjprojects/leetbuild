@@ -8,34 +8,28 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-The starter is working code: a turn lands in Redis, so the demo passes. The
-handler trusts three things it must not — the session id in the path, the size of the body and the
-role string. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter registers \`POST /v1/sessions/{id}/turns\`, reads the tenant from
+\`X-Tenant-Id\`, builds a turn from the body, pushes it onto the session's Redis list and answers
+with \`session_id\`, \`turn_id\` and \`role\`. It serves the demo and hides four flaws.
 
-Implement the turn-append endpoint used by every chat client:
+**Failure mode the checks target.** A caller from tenant B posts to tenant A's session id and the
+turn lands in A's buffer. A 4 MB paste is stored before anyone measures it. \`role: "system"\` is
+saved as a \`user\` turn. A client that retries after a timeout doubles the conversation.
 
-- \`POST /v1/sessions/{id}/turns\`. The tenant comes from the authenticated request context
-  (\`X-Tenant-Id\`), never from the path or the body. The session id in the path is a claim, not a
-  proof: look up the session's owner and answer **404** when it belongs to another tenant, so a
-  cross-tenant write can never create or read another tenant's buffer.
-- The role must be \`user\` or \`assistant\`; anything else is a **400**. The starter folds an unknown
-  or missing role into \`user\`, silently storing a system prompt as a user turn.
-- \`content\` is capped at **32 KiB**, measured in UTF-8 bytes. Reject an oversized turn with
-  **413 before any Redis write** — the starter appends first, so a multi-megabyte paste is already in
-  the list by the time anyone looks at its size.
+- The tenant comes from the authenticated request context, not from the path or the body. The
+  session id in the path is a claim: look up the session's owner and answer **404** when it belongs
+  to another tenant.
+- The role must be \`user\` or \`assistant\`; anything else is a **400**.
+- \`content\` is capped at **32 KiB** of UTF-8 bytes; reject an oversized turn with **413 before
+  any Redis write**.
 - The optional \`Idempotency-Key\` makes the append replay-safe: the first successful append stores
   its response under \`idem:{tenant}:{key}\`, and a replay returns that stored turn with **200**
   instead of appending a duplicate.
 
-**Failure mode the checks target.** A caller from tenant B posts to tenant A's session id and the
-starter writes into A's buffer; a 4 MB paste is accepted and stored; \`role: "system"\` becomes a
-\`user\` turn; and a client that retries after a timeout doubles the conversation.
-
 ## What to keep
 
-The response shape (\`session_id\`, \`turn_id\`, \`role\`) and the Redis list append are fine. The
-fix is validation and identity: authorize the session, validate the role, measure the bytes, then
-dedupe — all before the first write.`,
+The response shape and the list append. The fix is validation and identity, all before the first
+write.`,
   sequence: {
     participants: ['Client', 'Memory API', 'Redis'],
     messages: [
@@ -54,9 +48,9 @@ dedupe — all before the first write.`,
     ],
   },
   hints: [
-    'The tenant header is the only identity you can trust. `r.hget("sessions", id)` returns the owner; when it is not the caller, answer `404` rather than `403`, so the caller cannot even learn whether the session exists.',
-    'Measure `len(content.encode("utf-8"))`, not `len(content)`: a character is not a byte and the cap is 32 KiB. Reject before the first Redis command so an oversized turn never reaches the buffer.',
-    'The idempotency key is a claim too. `SET idem:{tenant}:{key} <response> EX 86400 NX` makes the first writer win; on replay the `GET` finds the stored response and the handler returns it without touching the list.',
+    "Symptoms: a tenant sees a stranger's turn in its session, a huge paste shows up in the buffer, a system prompt reads back as a user turn, and a retried request appears twice.",
+    'The handler treats every input as fact: the path id picks the list, `body.role or "user"` swallows unknown roles, nothing measures the content, and the `Idempotency-Key` header is not read at all.',
+    'Before the `LPUSH`: `assert_tenant_owns` (404), check `role in VALID_ROLES` (400), compare `len(content.encode("utf-8"))` with `MAX_CONTENT_BYTES` (413), then `SET idem:{tenant}:{key} ... EX 86400 NX` and replay on a hit.',
   ],
   checks: [
     {
@@ -145,9 +139,7 @@ class TurnBody(BaseModel):
 
 @app.post("/v1/sessions/{id}/turns")
 def append_turn(id: str, body: TurnBody, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: reject a session that does not belong to the tenant, validate the role instead of
-    # defaulting it, cap the content at 32 KiB before any Redis write, and return the stored turn
-    # when the same Idempotency-Key is replayed.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     role = body.role or "user"
     turn = {"turn_id": uuid.uuid4().hex, "role": role, "content": body.content}
     r.lpush(f"turns:{id}", json.dumps(turn))
@@ -212,7 +204,7 @@ def append_turn(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/turns: flawed code that trusts the path and the body. */
+      starter: `/** POST /v1/sessions/:id/turns: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {randomUUID} from 'node:crypto';
@@ -230,9 +222,7 @@ app.post('/v1/sessions/:id/turns', async (request, reply) => {
   void tenant;
   const {id} = request.params as {id: string};
   const body = request.body as TurnBody;
-  // TODO: reject a session that does not belong to the tenant, validate the role instead of
-  // defaulting it, cap the content at 32 KiB before any Redis write, and return the stored turn
-  // when the same Idempotency-Key is replayed.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const turn = {turn_id: randomUUID(), role: body.role ?? 'user', content: body.content};
   await r.lpush(\`turns:\${id}\`, JSON.stringify(turn));
   return reply.code(201).send({session_id: id, turn_id: turn.turn_id, role: turn.role});
@@ -323,9 +313,7 @@ func appendTurn(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body turnBody
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: reject a session that does not belong to the tenant, validate the role instead of
-	// defaulting it, cap the content at 32 KiB before any Redis write, and return the stored turn
-	// when the same Idempotency-Key is replayed.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	role := body.Role
 	if role == "" {
 		role = "user"
@@ -454,9 +442,7 @@ object MemoryApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[TurnBody]) { body =>
-            // TODO: reject a session that does not belong to the tenant, validate the role instead
-            // of defaulting it, cap the content at 32 KiB before any Redis write, and return the
-            // stored turn when the same Idempotency-Key is replayed.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val role = body.role.getOrElse("user")
             val turnId = java.util.UUID.randomUUID().toString
             jedis.lpush(s"turns:$id", s"""{"turn_id":"$turnId","role":"$role","content":"\${body.content}"}""")
@@ -562,9 +548,7 @@ int main() {
     const auto id = req.path_params.at("id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: reject a session that does not belong to the tenant, validate the role instead of
-    // defaulting it, cap the content at 32 KiB before any Redis write, and return the stored turn
-    // when the same Idempotency-Key is replayed.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto role = body.value("role", std::string("user"));
     const auto turnId = std::to_string(std::rand());
     json turn = {{"turn_id", turnId}, {"role", role}, {"content", body.value("content", std::string())}};
@@ -655,13 +639,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is the trust boundary of a write endpoint. Every field
-the caller controls — the path, the body, the role, the idempotency key — is a claim, and the
-service has to turn each claim into a fact it can prove: who owns the session, how many bytes
-arrived, whether the role is one the schema allows, and whether this exact append already happened.
-The starter passes the demo because the happy path is one tenant, one small turn, one attempt; it
-fails exactly when a second tenant, a large paste or a retrying client shows up. Two details
-interviewers listen for: measuring bytes rather than characters, and rejecting before the first
-write so a bad request never leaves a trace in Redis. The replay-safe response is the third: a
-client that retries after a timeout must get the turn it already created, not a second copy.`,
+  debrief: `Every field the caller controls is a claim: the path, the body, the role, the idempotency key.
+The fix turns each claim into a fact before the first write: the owner lookup proves who the
+session belongs to, the byte count proves how much arrived, the role set proves the schema allows
+it, and the idempotency lookup proves whether this append already happened. Rejecting before the
+\`LPUSH\` means a bad request leaves no trace in Redis, and measuring bytes rather than characters
+means a multibyte paste cannot slip under the cap. Production services go further: the idempotency
+record is written in the same transaction as the turn, and the stored response carries a
+fingerprint of the request body so a reused key with a different payload is rejected.`,
 };

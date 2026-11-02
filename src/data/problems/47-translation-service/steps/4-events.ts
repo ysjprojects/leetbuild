@@ -8,28 +8,28 @@ export const localeEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the analytics path: it publishes one event
-per translated segment and updates quality counters from the consumer. It compiles, the dashboard
-fills, and it hides three production flaws. Debug it like the owner of the metric, fix it, and prove
-the fix with the checks below.
+**Starting point.** The starter is the \`translation.done\` quality path: \`publish\` sends one
+record per translated segment to the topic, keyed by tenant, with the segment's fields plus the
+source text in the payload, using a producer built with default settings and no handling for a
+rejected produce; \`consume\` polls the topic, commits the offset, then runs \`HINCRBY\` on the
+\`quality:{target}\` counter. It compiles, the dashboard fills, and it hides five flaws.
 
-Implement the \`translation.done\` quality path.
+**Failure mode the checks target.** A consumer restarts mid-batch and the per-locale counters fall
+behind with no error anywhere; the French quality number averages across partitions because one
+locale pair is scattered by tenant key; a broker hiccup during a produce retry duplicates a record
+or drops the segment outright; and a retained, replicated topic now holds customer text that
+nobody meant to log.
 
-- Publish one \`translation.done\` event per translated segment, **keyed by the locale pair**
-  (\`source->target\`). Per-locale quality requires per-locale ordering, and the key is the only thing
-  that gives it: a tenant key scatters one locale pair across partitions.
-- The payload carries \`latency_ms\`, \`glossary_version\`, \`quality_score\` and **hashes** of the source
-  and target text (\`source_sha256\`, \`target_sha256\`). It never carries the text itself: the topic is
-  retained and replicated, so a source or target string in a payload is customer content in a log.
+Requirements:
+
+- Each event is **keyed by the locale pair** (\`source->target\`), because per-locale quality needs
+  per-locale ordering and the key is the only thing that gives it.
+- The payload carries \`latency_ms\`, \`glossary_version\`, \`quality_score\` and **hashes** of the
+  source and target text (\`source_sha256\`, \`target_sha256\`), not the text itself.
 - The producer is **idempotent with \`acks=all\`**, so a retried produce cannot duplicate a record.
 - A produce the broker rejects writes an **outbox** row instead of dropping the event.
-- The consumer increments its Redis quality counters (\`HINCRBY quality:{target} …\`) **before** it
-  commits the offset, so a crash between the two replays the counter update rather than losing it.
-
-**Failure mode the checks target.** Keying by tenant makes per-locale quality unanswerable, publishing
-the source text for "spot checks" puts customer content into a retained topic, and committing before
-the counter update means a crash silently drops the metric. The last one is the quiet defect: the
-dashboard looks fine until the day a consumer restarts.`,
+- The consumer increments its Redis counters **before** it commits the offset, so a crash between
+  the two replays the update rather than losing it.`,
   sequence: {
     participants: ['Translation API', 'translation.done', 'Quality consumer', 'Redis'],
     messages: [
@@ -125,9 +125,7 @@ TOPIC = "translation.done"
 
 
 def publish(tenant: str, segment: dict, text: str) -> None:
-    # TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source
-    # text verbatim for spot checks, and updates its counters after committing the offset. Fix
-    # all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = {**segment, "source_text": text}
     producer.produce(TOPIC, key=tenant, value=json.dumps(payload))
     producer.poll(0)
@@ -212,7 +210,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** The quality path: tenant-keyed, text in the payload, commit too early. */
+      starter: `/** The translation.done quality path. */
 import {Redis} from 'ioredis';
 import {Kafka} from 'kafkajs';
 
@@ -230,8 +228,7 @@ interface Segment {
 }
 
 export async function publish(tenant: string, segment: Segment, text: string): Promise<void> {
-  // TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source text
-  // verbatim for spot checks, and updates its counters after committing the offset. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const value = JSON.stringify({...segment, tenant, source_text: text});
   await producer.send({topic: TOPIC, messages: [{key: tenant, value}]});
 }
@@ -348,8 +345,7 @@ var (
 )
 
 func publish(ctx context.Context, tenant string, event SegmentEvent, text string) error {
-	// TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source text
-	// verbatim for spot checks, and updates its counters after committing the offset. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	event.SourceText = text
 	payload, _ := json.Marshal(event)
 	return eventsWriter.WriteMessages(ctx, kafka.Message{Key: []byte(tenant), Value: payload})
@@ -485,9 +481,7 @@ object QualityEvents {
   val jedis = new Jedis("redis", 6379)
 
   def publish(tenant: String, segment: Map[String, String], text: String): Unit = {
-    // TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source
-    // text verbatim for spot checks, and updates its counters after committing the offset. Fix
-    // all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = (segment + ("source_text" -> text)).toJson.compactPrint
     producer.send(new ProducerRecord("translation.done", tenant, payload))
   }
@@ -585,8 +579,7 @@ const std::string kDoneTopic = "translation.done";
 std::unique_ptr<RdKafka::Producer> producer;
 
 void publish(const std::string& tenant, const json& segment, const std::string& text) {
-  // TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source text
-  // verbatim for spot checks, and updates its counters after committing the offset. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   json event = segment;
   event["source_text"] = text;
   const auto payload = event.dump();
@@ -597,7 +590,7 @@ void publish(const std::string& tenant, const json& segment, const std::string& 
 }
 
 void consume(const std::string& topic) {
-  // TODO: counters after commit — see the note above.
+  // The consumer loop lives in consumeLoop.
   consumeLoop(topic);
 }
 `,
@@ -668,9 +661,9 @@ void consume(const std::string& group) {
     },
   },
   hints: [
-    'The partition key is the unit of ordering, so pick the unit your metric needs: quality is asked per locale pair, so the key is `source->target`. A tenant key makes one pair land on many partitions and the dashboard averages across them.',
-    'Hash before you publish: `sha256(source)` and `sha256(target)` let reviewers correlate a segment without putting customer text into a retained, replicated topic. Keep the text in the request scope where it belongs.',
-    'Order in the consumer is a durability decision: `HINCRBY` first, then commit. A crash between the two replays an idempotent counter increment; a crash after committing loses the metric with no trace. Configure `enable.idempotence` with `acks=all` so the produce side has the same property.',
+    'After a quality consumer restart the French segment counter is lower than the number of segments the API logged, and a compliance scan of the topic finds customer sentences in the payload.',
+    '`publish` keys by tenant, puts `source_text` in the payload, uses a default producer and lets a produce error escape; `consume` commits the offset before `HINCRBY`, so a crash between them drops the update.',
+    'Key by `locale_pair_key(source, target)`, replace the text with `source_sha256`/`target_sha256`, configure idempotence with `ACKS_ALL`, catch `KafkaException` into `insert_outbox`, and move `HINCRBY` ahead of `commit`.',
   ],
-  debrief: `The interviewer is checking whether you treat a metric pipeline as production code. Three defects are checked: the partition key (per-locale ordering requires a locale-pair key), the payload (hashes, not text, because the topic is retained and replicated), and the consumer order (counters before commit, so a replay is safe and a crash is not silent). The producer configuration is the fourth, quieter point: idempotence plus \`acks=all\` is what makes a retried produce duplicate-free. Real systems add an outbox drainer with dedupe keys, a schema registry that rejects a payload field carrying text, and per-locale dashboards for fallback rate and quality drift.`,
+  debrief: `The partition key matches the question the metric answers: quality is asked per locale pair, so the pair is the unit of ordering. Hashes replace text because a retained, replicated topic is a log, and an analyst can still correlate a segment by hash without the content travelling with it. Counters move ahead of the commit because the two orderings fail differently: a crash before the commit replays an increment, a crash after it loses the metric with no trace, and the replay is the failure you can live with. Idempotence with \`acks=all\` gives the produce side the same property, and the outbox catches what the broker refuses. Production pipelines also drain the outbox with dedupe keys, enforce a schema that rejects text-bearing fields, and chart quality drift per locale.`,
 };

@@ -8,32 +8,29 @@ export const eventsStep: Step = {
   focus: ['classifier', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-The starter is working code: it produces an event on the happy path and the
-consumer moves counters, so the demo shows numbers going up. Three production contracts are broken.
-Find them, fix them, and prove the fix.
+**Starting point.** \`publish(event)\` produces one \`classify.result\` record keyed by the first
+label, with the request id, tenant, taxonomy version, labels and the full text in the payload, on a
+producer with default settings. \`run_consumer\` polls the topic, commits the offset, then increments
+a per-tenant counter. The demo shows numbers going up. It hides 5 flaws.
 
-\`publish(event)\` reports one classification, and the consumer turns \`classify.result\` into
-per-tenant label counters.
+**Failure mode the checks target.** The label key is a silent ordering bug that only shows up in
+per-tenant dashboards; the text in the payload is a data leak with a retention tail measured in days;
+and commit-before-process trades correctness for code that only *looks* exactly-once.
+
+Requirements:
 
 - Publish **exactly one** \`classify.result\` event per classification with the **tenant** as the
-  message key. Partition by tenant keeps each tenant's events ordered; keyed by label, one tenant's
-  events scatter across partitions and per-tenant dashboards break.
-- The payload carries the **request id, tenant, taxonomy version, labels and provenance** — and a
-  **text hash**, never the text. The topic is retained and replicated for days: content written
-  there outlives every retention policy the request path has, and a digest is enough to match a
-  result to a document without keeping the document.
-- The producer must be **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`,
-  KafkaJS's \`idempotent: true\`, or required acks \`all\` with a hash balancer), so a retried produce
-  cannot duplicate a record.
+  message key, so each tenant's events stay ordered on one partition.
+- The payload carries the **request id, tenant, taxonomy version, labels and provenance** plus a
+  **SHA-256 text hash** and no copy of the text. A digest is enough to match a result to a document.
+- The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`, KafkaJS's
+  \`idempotent: true\`, or required acks \`all\` with a hash balancer), so a retried produce cannot
+  duplicate a record.
 - When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
   failing the caller.
 - The consumer updates the counter (\`HINCRBY counters:{tenant}:{label}\`) and **only then** commits
-  the offset. Commit first and a crash between the two loses the increment forever, because the
-  offset already moved past the unprocessed record.
-
-**Failure mode the checks target.** The label key is a silent ordering bug that only shows up in
-per-tenant dashboards; the text in the payload is a data leak with a long tail; and
-commit-before-process trades correctness for code that only *looks* exactly-once.`,
+  the offset. Commit first and a crash between the two loses the increment, because the offset has
+  already moved past the unprocessed record.`,
   sequence: {
     participants: ['Content Classifier', 'classify.result', 'Metrics consumer', 'Redis'],
     messages: [
@@ -143,9 +140,7 @@ class ClassifyEvent(BaseModel):
 
 
 def publish(event: ClassifyEvent) -> None:
-    # TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
-    # per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-    # below commits the offset before it updates the counter. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = {
         "request_id": event.request_id,
         "tenant": event.tenant,
@@ -263,9 +258,7 @@ interface ClassifyEvent {
   text: string;
 }
 
-// TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
-// per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-// below commits the offset before it updates the counter. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 export async function publish(event: ClassifyEvent): Promise<void> {
   const payload = {
     requestId: event.requestId,
@@ -370,9 +363,7 @@ type ClassifyEvent struct {
 	Text            string
 }
 
-// TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
-// per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-// below commits the offset before it updates the counter. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func Publish(ctx context.Context, event ClassifyEvent) error {
 	payload := map[string]any{
 		"request_id":       event.RequestID,
@@ -533,9 +524,7 @@ object ClassifyEvents {
       text: String
   )
 
-  // TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
-  // per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-  // below commits the offset before it updates the counter. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publish(event: ClassifyEvent): Unit = {
     val payload = ClassifyPayload(
       requestId = event.requestId,
@@ -662,9 +651,7 @@ struct ClassifyEvent {
   std::string text;
 };
 
-// TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
-// per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-// below commits the offset before it updates the counter. Fix all three.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void publish(const ClassifyEvent& event) {
   json payload;
   payload["request_id"] = event.requestId;
@@ -757,9 +744,9 @@ void runConsumer() {
     },
   },
   hints: [
-    'The message key is the partition key: `key=event.tenant`, `key: event.tenant`, `Key: []byte(event.Tenant)`, `ProducerRecord("classify.result", event.tenant, …)`. Keyed by label, one tenant’s events land in different partitions and their order is no longer guaranteed — which is exactly what a per-tenant dashboard assumes.',
-    'Hash the text at the boundary and put only the digest on the wire: the event carries ids, the taxonomy version, labels, provenance and `text_hash`. Anything else about the document belongs in the store the classifier read it from, behind its own access control and retention.',
-    'The consumer order is the correctness half: `HINCRBY` first, `commitSync`/`commitOffsets` second. A crash in between then replays the record and re-applies an idempotent-in-effect increment, instead of losing the counter update because the offset already moved.',
+    'A tenant’s dashboard shows events out of order, a compliance scan finds customer documents sitting in a Kafka topic, and counters come up short after a consumer restart.',
+    'The key is `event.labels[0]`, so one tenant spreads across partitions; the payload copies `event.text`; the producer has no idempotence; and the consumer commits before it increments.',
+    'Produce with `key=event.tenant`, replace `"text"` with `text_hash = sha256(text)`, add provenance, configure `enable.idempotence` and `acks: all`, and in the consumer call `hincrby` before `consumer.commit`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an event path, where each line looks pointless and each mistake is invisible until an incident. Four contracts are being checked: partition ownership (the key decides ordering, so a per-tenant consumer needs a per-tenant key), data minimisation (a retained, replicated topic is the last place content should live), producer semantics (idempotence plus \`acks=all\` is what makes a retry safe), and processing order (counters before the offset commit, because the offset is the durable marker of work you cannot redo). Real pipelines add a schema registry so the payload shape is enforced rather than agreed, a dead-letter topic for records the consumer cannot parse, and a compaction or retention policy per topic so the data lifecycle is a topic property and not a hope.`,
+  debrief: `The key is the tenant because the key decides the partition and the partition decides order; a per-tenant consumer can only count on order it was given. The payload carries a digest because the retained, replicated topic is the longest-lived copy of anything written to it, and a hash still links a result to its document. Idempotence with \`acks=all\` is what makes a retried produce safe rather than a duplicate. The consumer increments before it commits because the offset is the durable marker of work done: commit first and a crash loses the increment; commit second and the same crash becomes a replay the counter can absorb. Production pipelines go further: a schema registry enforces the payload shape, and a dead-letter topic holds records the consumer cannot parse.`,
 };

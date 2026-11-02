@@ -8,24 +8,25 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code for the dedupe event publisher. It compiles, it
-works when the broker is healthy, and it hides three production flaws. Debug it like the
-data-platform owner, fix it, and prove the fix with the checks below.
-
-Implement the publisher for \`dedupe.event\`.
-
-- Events are **keyed by dataset id**, so every event for one dataset lands on the same partition and
-  the dataset's dedupe stream stays ordered. Keying by record scatters a dataset's history.
-- The payload carries **key hashes and outcomes only** — never record contents, raw names, emails or
-  keys. The topic is retained and replicated, so anything published there outlives the request.
-- The producer is **idempotent with acks=all**, so a retried produce does not duplicate an event.
-- Every produce that the broker rejects leaves an **outbox row** so the event can be replayed later
-  instead of being lost.
+**Starting point.** The starter is the publisher for \`dedupe.event\`: a module-level \`Producer\` with
+only \`bootstrap.servers\` set, and a \`publish(record)\` that builds a payload from the record's
+\`name\`, \`email\` and \`content\`, produces it keyed by \`record_id\` and flushes. It compiles, it
+works when the broker is healthy, and it hides four flaws.
 
 **Failure mode the checks target.** The starter keys by record, so one dataset's events scatter across
 partitions and order is lost. It publishes raw names and emails "so reviewers can confirm the match",
 turning a retained topic into a copy of the record store. And it writes no outbox row, so a rejected
-produce is silently dropped.`,
+produce is silently dropped.
+
+Requirements:
+
+- Events are **keyed by dataset id**, so every event for one dataset lands on the same partition and
+  the dataset's dedupe stream stays ordered. Keying by record scatters a dataset's history.
+- The payload carries **key hashes and outcomes only**: no record contents, raw names, emails or
+  keys. The topic is retained and replicated, so anything published there outlives the request.
+- The producer is **idempotent with acks=all**, so a retried produce does not duplicate an event.
+- Every produce that the broker rejects leaves an **outbox row** so the event can be replayed later
+  instead of being lost.`,
   sequence: {
     participants: ['Dedupe API', 'dedupe.event', 'Event consumer', 'record store'],
     messages: [
@@ -65,9 +66,9 @@ produce is silently dropped.`,
     },
     {
       id: 'hashed',
-      title: 'Carries key hashes, never raw contents',
+      title: 'Carries key hashes, not raw contents',
       detail:
-        'The payload carries `key_hashes` and the outcome; it never contains raw names, emails or content. The starter publishes raw fields so reviewers can confirm the match.',
+        'The payload carries `key_hashes` and the outcome and no raw names, emails or content. The starter publishes raw fields so reviewers can confirm the match.',
       match: {
         python: {all: [/key_hashes/], none: [/["']name["']|["']email["']|["']content["']/]},
         typescript: {all: [/key_hashes/], none: [/["']name["']|["']email["']|["']content["']/]},
@@ -113,8 +114,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish(record: dict) -> None:
-    # TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
-    # match, and writes no outbox row when the broker rejects the produce. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     record_id = record["record_id"]
     payload = {
         "record_id": record_id,
@@ -189,8 +189,7 @@ interface DedupeRecord {
 }
 
 async function publish(producer: Producer, record: DedupeRecord): Promise<void> {
-  // TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
-  // match, and writes no outbox row when the broker rejects the produce. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const payload = {
     record_id: record.record_id,
     name: record.name,
@@ -265,8 +264,7 @@ func NewWriter(brokers []string) *kafka.Writer {
 }
 
 func Publish(ctx context.Context, writer *kafka.Writer, record Record) error {
-	// TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
-	// match, and writes no outbox row when the broker rejects the produce. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(map[string]any{
 		"record_id": record.ID,
 		"name":      record.Name,
@@ -341,8 +339,7 @@ final case class DedupeRecord(record_id: String, name: String, email: String, co
 
 class DedupeEventPublisher(producer: KafkaProducer[String, String]) {
   def publish(record: DedupeRecord): Unit = {
-    // TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
-    // match, and writes no outbox row when the broker rejects the produce. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val payload =
       s"""{"record_id":"\${record.record_id}","name":"\${record.name}","email":"\${record.email}","content":"\${record.content}"}"""
     producer.send(new ProducerRecord[String, String]("dedupe.event", record.record_id, payload))
@@ -400,8 +397,7 @@ class DedupeEventPublisher {
   explicit DedupeEventPublisher(RdKafka::Producer& producer) : producer_(producer) {}
 
   void publish(const Record& record) {
-    // TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
-    // match, and writes no outbox row when the broker rejects the produce. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string payload = json{{"record_id", record.id},
                                      {"name", record.name},
                                      {"email", record.email},
@@ -463,9 +459,9 @@ class DedupeEventPublisher {
     },
   },
   hints: [
-    "The partition key is the ordering contract: key by dataset id so one dataset's events stay in order. Keying by record scatters a dataset's dedupe history across partitions and loses the ordering that makes the stream useful.",
-    'Events are read by reviewers and retained by the broker: publish key hashes and outcomes, never raw names, emails or content. If a reviewer needs to confirm a match, they load the record from the store — not from the topic.',
-    'A produce can fail. Write an outbox row when the broker rejects it and replay from the outbox later, so an event is never lost just because the broker was briefly unavailable.',
+    'Symptom: a consumer replaying one dataset sees a merge before the check that caused it, and a grep of the topic turns up customer emails in clear text.',
+    'Mechanism: `publish` keys the message by `record_id`, so events for one dataset land on different partitions; the payload copies `name`, `email` and `content` straight from the record; a rejected produce raises and nothing records it.',
+    'Change: key by `dataset_id`, publish `key_hashes` plus the outcome, build the producer with `enable.idempotence` and `acks=all`, and call `outbox.record(...)` when the produce is rejected.',
   ],
-  debrief: `The interviewer is testing whether you treat the event log as a product surface with its own contract. Three defects are being checked: the partition key (keying by record destroys per-dataset ordering), the payload (publishing raw fields turns a retained topic into a copy of the record store), and the outbox (a rejected produce silently drops an event). The subtle one is the key: ordering is only guaranteed within a partition, so the key choice decides what ordering you get. Real platforms add a schema registry so a future producer cannot smuggle content in, an outbox replay worker with its own idempotency key, and consumer offset commits only after the downstream write succeeds.`,
+  debrief: `The key choice is the whole ordering story: Kafka orders within a partition and nowhere else, so keying by dataset id is what makes "check, then merge" arrive in that order for a consumer. The payload shape follows from retention: a topic is replicated and kept for days, so a field published there is a second copy of the record that no erasure request will reach, which is why only hashes and outcomes go in. The outbox exists because the producer's own retries cover transient errors but not a broker that says no; the row is what lets a replay job finish the job later. Production platforms also pin a schema in a registry so a later producer cannot add a raw field, give the replay worker its own idempotency key, and commit consumer offsets only after the downstream write lands.`,
 };

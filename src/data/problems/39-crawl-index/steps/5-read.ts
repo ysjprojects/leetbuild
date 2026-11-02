@@ -8,29 +8,24 @@ export const readStep: Step = {
   focus: ['client', 'crawler', 'redis', 'index'],
   task: `## Task
 
-**Starting point.** The starter is working code: it answers with counts, a percentage and an HTTP
-200, so a dashboard has something to draw. The number it draws is not true. Find the flaws, fix
-them, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/crawl/jobs/{job_id}\`, the report an operator
+reads to decide whether a crawl is healthy: it builds \`{fetched, refused, pending, indexed,
+coverage}\` from the frontier, caches that entry per job and answers 200. It serves the demo and
+hides four flaws.
 
-Implement \`GET /v1/crawl/jobs/{job_id}\` — the report an operator reads to decide whether a crawl is
-healthy:
+**Failure mode the checks target.** A cached counter describes the past; a coverage number that
+counts refusals as progress gets a crawl turned off a week too late; a stall that is not a field
+cannot be alerted on, so the customer notices first; and a report that answers any caller is a
+cross-tenant read.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when missing), and a job
-  that belongs to a **different tenant is 404** — never 403, which would confirm the job exists. The
-  starter serves any job to any caller.
-- The counts — \`fetched\`, \`refused\`, \`pending\`, \`indexed\` — come from the **live frontier**,
-  not from a report cached on a timer. The starter refreshes its cached copy hourly, so an operator
-  watching a crawl that just died sees a stale picture.
+- The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when missing), and a
+  job that belongs to a **different tenant is 404**, not 403, which would confirm the job exists.
+- The counts \`fetched\`, \`refused\`, \`pending\` and \`indexed\` come from the **live
+  frontier** on every request, not from a report cached on a timer.
 - \`oldest_pending_age_s\` is the age of the oldest URL still waiting, and it drives an explicit
-  **\`stalled\`** flag: \`stalled = pending > 0 and oldest_pending_age_s > STALL_AFTER_S\`. A crawl
-  whose counts have not moved is “in progress” to the starter and “stalled” to an operator.
-- \`coverage\` is honest: **refused pages are excluded from it**. It is
-  \`indexed / (fetched + pending)\` — never \`1.0\` just because the queue drained, because a crawl
-  that refused half a site and fetched the rest has not covered half a site.
-
-**Failure mode the checks target.** A cached counter lies about the present; a coverage number that
-counts refusals as progress is the kind of metric that gets a crawl turned off a week too late; and a
-stall that is not a field cannot be alerted on, so the first person to notice is the customer.`,
+  **\`stalled\`** flag: \`stalled = pending > 0 and oldest_pending_age_s > STALL_AFTER_S\`.
+- \`coverage\` **excludes refused pages**: \`indexed / (fetched + pending)\`, with no shortcut to
+  \`1.0\` when the queue drains.`,
   sequence: {
     participants: ['Operator', 'Crawl service', 'Redis frontier', 'Search index'],
     messages: [
@@ -49,9 +44,9 @@ stall that is not a field cannot be alerted on, so the first person to notice is
     ],
   },
   hints: [
-    'Ownership is part of the lookup, not a separate check: fetch the job and compare its tenant to the caller’s in the same step, and answer 404 for a miss or a foreign job. A 403 for a foreign job still tells the caller the id exists.',
-    'The coverage denominator is the work you can still do plus the work you did: `indexed / (fetched + pending)`. Refused URLs are neither — they are decisions, not progress — so they must not appear in either the numerator or the denominator, and a drained queue with refusals is not 100%.',
-    'A stall is a fact about waiting, not about totals: expose the age of the oldest pending URL, compare it against a threshold constant, and return the flag explicitly. Downstream alerting should not have to re-derive “nothing has moved for ten minutes” from two counters that both look fine.',
+    'A crawl died twenty minutes ago and the dashboard still shows it moving. A job that refused half a site reports 100% coverage, and any tenant can read any job id.',
+    '`report` serves `cached_reports` until `CACHE_TTL_S` expires, sets coverage to `1.0` whenever `pending == 0`, computes no pending age, and reads no tenant header before answering.',
+    'Require `X-Tenant-Id` and 404 a job owned by another tenant; call `frontier.counts` on every request; compute `indexed / (fetched + pending)`; return `oldest_pending_age_s` and `stalled = pending > 0 and age > STALL_AFTER_S`.',
   ],
   checks: [
     {
@@ -134,10 +129,7 @@ cached_reports: dict = {}
 
 @app.get("/v1/crawl/jobs/{job_id}")
 def report(job_id: str) -> JSONResponse:
-    # TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
-    # drains even if pages were refused, never says how long the oldest pending URL has waited,
-    # and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
-    # expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     entry = cached_reports.get(job_id)
     if entry is None or time.time() - entry["refreshed_at"] > CACHE_TTL_S:
         counts = frontier.counts(job_id)
@@ -192,10 +184,7 @@ const CACHE_TTL_MS = 3600 * 1000;
 const cachedReports = new Map<string, {report: Record<string, number>; refreshedAt: number}>();
 
 app.get('/v1/crawl/jobs/:job_id', async (request, reply) => {
-  // TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
-  // drains even if pages were refused, never says how long the oldest pending URL has waited,
-  // and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
-  // expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {job_id: jobId} = request.params as {job_id: string};
   const cached = cachedReports.get(jobId);
   if (cached === undefined || Date.now() - cached.refreshedAt > CACHE_TTL_MS) {
@@ -286,10 +275,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func jobReport(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
-	// drains even if pages were refused, never says how long the oldest pending URL has waited,
-	// and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
-	// expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	jobID := r.PathValue("job_id")
 	mu.Lock()
 	cached, found := cachedReports[jobID]
@@ -411,11 +397,7 @@ object JobReportApi {
   val route: Route =
     path("v1" / "crawl" / "jobs" / Segment) { jobId =>
       get {
-        // TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
-        // drains even if pages were refused, never says how long the oldest pending URL has
-        // waited, and serves any job to any caller. Read the live frontier, keep refused pages out
-        // of coverage, expose the pending age and a stall flag, and 404 a job that belongs to
-        // another tenant.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         val cached = cachedReports.get(jobId) match {
           case Some((body, refreshedAt)) if Duration.between(refreshedAt, Instant.now()).compareTo(CacheTtl) < 0 =>
             Some(body)
@@ -526,10 +508,7 @@ constexpr long long kCacheTtlS = 3600;
 std::map<std::string, json> cachedReports;
 
 void jobReport(const httplib::Request& req, httplib::Response& res) {
-  // TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
-  // drains even if pages were refused, never says how long the oldest pending URL has waited,
-  // and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
-  // expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const auto jobId = req.matches[1];
   const auto& cached = cachedReports[jobId];
   if (cached.is_null()) {
@@ -601,5 +580,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether a read path can be debugged as carefully as a write path. The starter is a dashboard-shaped endpoint: it returns numbers, and the numbers move. Three defects are being checked: a cached counter that reports the past, a coverage percentage that treats refusal as progress, and a missing stall signal that leaves “nothing has moved” invisible until a customer notices. The tenancy check is the quiet one: a 403 on a foreign job would confirm the id exists, so the honest answer for a job that is not yours is the same 404 you give for a job that does not exist. Real crawl consoles also break the numbers down per host, expose the frontier's oldest and newest pending URLs, and show the last refusal rule per host so an operator can see why coverage stopped moving.`,
+  debrief: `The report reads live state and refuses to round in its own favour, because the property it protects is that an operator can act on it: a stale count describes a crawl that no longer exists, a coverage figure that counts refusals as progress hides the part of a site the crawler was told to leave alone, and a stall only derivable from two healthy-looking counters cannot be alerted on. The tenancy rule follows the same logic: a 404 for a foreign job gives the caller exactly as much as an unknown one. Production crawl consoles break the numbers down per host, record the last refusal rule per host so an operator sees why coverage stopped moving, and keep report history so a stall has a start time.`,
 };

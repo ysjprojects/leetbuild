@@ -8,37 +8,29 @@ export const stateStep: Step = {
   focus: ['scorer', 'redis', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: a transaction is scored, a
-counter goes up, and the alerting view shows numbers, so the demo looks alive. Four contracts are
-broken and none of them is visible on a happy path. Debug it, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter is the velocity store the scorer writes to at score time:
+\`record_attempt\` issues two client-side \`INCR\` calls on a card key and a device key bucketed by
+day, \`velocity_snapshot\` reads the raw counters back, \`should_alert\` compares them to literal
+thresholds, and \`score_with_velocity\` calls the model and then counts. It serves the demo and hides
+five flaws.
 
-Implement the velocity store the scorer writes to at score time.
+**Failure mode the checks target.** The starter scores first and counts afterwards, so a model
+timeout is a free attempt; its keys carry only a day bucket and no TTL, so today's suspicious device
+is still suspicious next month; it counts attempts where the rule is about distinct accounts, so a
+ring of twenty accounts from one device reads as one account retrying; and its thresholds live as
+literals in one function while the read path reports raw numbers, so the alert and the dashboard
+disagree by construction.
 
-- **One atomic script.** A single Lua \`EVAL\` increments the card's counter and adds the account to
-  the device's set. A client-side \`GET\` then \`INCR\` races itself: two concurrent requests both
-  read the old value, and the counter that alerting trusts silently loses increments.
+- **One atomic script.** A single Lua \`EVAL\` (\`VELOCITY_LUA\`) increments the card's counter and
+  adds the account to the device's set.
 - **Windows expire on their own boundary.** The key carries its bucket
   (\`vel:card:{card_ref}:{hour}\`, \`vel:device:{device_id}:{day}\`) and the script sets the TTL on
-  the first write of that bucket (\`EXPIRE\` with \`ATTEMPT_WINDOW_S\` / \`DEVICE_WINDOW_S\`). Without a
-  TTL the key outlives the window and a device that was suspicious once is flagged forever.
-- **Every attempt counts, including the failed ones.** The counter moves **before** the model call,
-  and nothing on the model's failure path may skip it: a declined attempt is the strongest signal a
-  fraud ring produces, so counting after the model answers means the busiest fraudsters are the ones
-  the counter never sees.
-- **Distinct accounts per device per day**, not attempts: \`PFADD\`/\`PFCOUNT\` (or \`SADD\`/\`SCARD\`)
-  on the device key. Twenty attempts from one account is a person with a bad card; twenty accounts
-  from one device is a ring.
-- **One rule set.** \`VELOCITY_RULES\` holds the thresholds and both the read path
-  (\`velocity_snapshot\`) and the alerting decision (\`should_alert\`) read it, so an alert can never
-  fire on a different rule than the one the scorer enforces.
-
-**Failure mode the checks target.** The starter scores first and counts afterwards, so a model timeout
-is a free attempt; its keys carry only a day bucket and no TTL, so today's suspicious device is still
-suspicious next month; it counts attempts where the rule is about distinct accounts, so a ring of
-twenty accounts from one device reads as twenty attempts from one device; and its thresholds live as
-literals in one function while the read path reports the raw numbers, so the alert and the dashboard
-disagree by construction.`,
+  the first write of that bucket (\`EXPIRE\` with \`ATTEMPT_WINDOW_S\` / \`DEVICE_WINDOW_S\`).
+- **Every attempt counts, including the failed ones.** The counter moves before the model call, and
+  nothing on the model's failure path may skip it.
+- **Distinct accounts per device per day**, not attempts: \`PFADD\`/\`PFCOUNT\` on the device key.
+- **One rule set.** \`VELOCITY_RULES\` holds the thresholds and both \`velocity_snapshot\` and
+  \`should_alert\` read it.`,
   sequence: {
     participants: ['Fraud Scorer', 'Velocity store', 'Redis', 'Fraud model'],
     messages: [
@@ -66,7 +58,7 @@ disagree by construction.`,
       id: 'atomic-script',
       title: 'One atomic Lua EVAL counts the attempt',
       detail:
-        'The counter update is a single script call — `redis.eval(VELOCITY_LUA, 2, …)` and its equivalents — not a client-side read followed by a write. The starter issues `GET`/`INCR` from the client, so two concurrent attempts overwrite each other.',
+        'The counter update is a single script call, `redis.eval(VELOCITY_LUA, 2, …)` and its equivalents, not separate client-side writes. The starter issues two `INCR` calls from the client, so a crash or a concurrent attempt between them leaves the card and device windows disagreeing.',
       match: {
         python: {all: [/VELOCITY_LUA/, /redis\.eval\(/]},
         typescript: {all: [/VELOCITY_LUA/, /redis\.eval\(/]},
@@ -79,7 +71,7 @@ disagree by construction.`,
       id: 'window-expiry',
       title: 'Window keys expire on their own boundary',
       detail:
-        'The script sets an expiry on first write — `EXPIRE`/`PEXPIRE` with the `ATTEMPT_WINDOW_S`/`DEVICE_WINDOW_S` constant — so an hourly and a daily window reset on schedule. The starter never sets a TTL, so a flagged device stays flagged forever.',
+        'The script sets an expiry on first write, `EXPIRE`/`PEXPIRE` with the `ATTEMPT_WINDOW_S`/`DEVICE_WINDOW_S` constant, so an hourly and a daily window reset on schedule. The starter sets no TTL at all, so a flagged device stays flagged forever.',
       match: {
         python: {all: [/ATTEMPT_WINDOW_S/, /EXPIRE/]},
         typescript: {all: [/ATTEMPT_WINDOW_S/, /EXPIRE/]},
@@ -92,7 +84,7 @@ disagree by construction.`,
       id: 'count-before-model',
       title: 'The attempt is counted before the model is called',
       detail:
-        'The script call happens before the model call, so a timeout, a retry or a terminal model error still counts the attempt. The starter calls the model first and counts afterwards, which makes every failed attempt invisible to velocity — the exact case fraud rings generate by the thousand.',
+        'The script call happens before the model call, so a timeout, a retry or a terminal model error still counts the attempt. The starter calls the model first and counts afterwards, which makes every failed attempt invisible to velocity, the case fraud rings generate by the thousand.',
       match: {
         python: {order: [/redis\.eval\(/, /model\.score\(/]},
         typescript: {order: [/redis\.eval\(/, /model\.score\(/]},
@@ -172,9 +164,7 @@ def should_alert(snapshot: dict) -> bool:
 
 
 def score_with_velocity(model, features: dict, card_ref: str, device_id: str, account_ref: str) -> tuple[dict, dict]:
-    # TODO: the starter counts after the model call, never expires the window keys, counts attempts
-    # where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-    # reports raw counters. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     scored = model.score(features)
     record_attempt(card_ref, device_id, account_ref)
     logger.info("velocity card=%s device=%s", card_ref, device_id)
@@ -299,9 +289,7 @@ export async function scoreWithVelocity(
   deviceId: string,
   accountRef: string,
 ): Promise<{scored: Record<string, unknown>; snapshot: VelocitySnapshot}> {
-  // TODO: the starter counts after the model call, never expires the window keys, counts attempts
-  // where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-  // reports raw counters. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const scored = await model.score(features);
   await recordAttempt(cardRef, deviceId, accountRef);
   return {scored, snapshot: await velocitySnapshot(cardRef, deviceId)};
@@ -463,9 +451,7 @@ func scoreWithVelocity(
 	features FeatureVector,
 	cardRef, deviceID, accountRef string,
 ) (ScoreVerdict, VelocitySnapshot, error) {
-	// TODO: the starter counts after the model call, never expires the window keys, counts attempts
-	// where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-	// reports raw counters. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	verdict, err := model.Score(ctx, features)
 	if err != nil {
 		return ScoreVerdict{}, VelocitySnapshot{}, err
@@ -632,9 +618,7 @@ object Velocity {
   def shouldAlert(snapshot: VelocitySnapshot): Boolean =
     snapshot.cardAttempts > 40 || snapshot.deviceAccounts > 5
 
-  // TODO: the starter counts after the model call, never expires the window keys, counts attempts
-  // where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-  // reports raw counters. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def scoreWithVelocity(model: ModelClient, features: Map[String, Any], cardRef: String, deviceId: String, accountRef: String): (Map[String, Any], VelocitySnapshot) = {
     val scored = model.score(features)
     recordAttempt(cardRef, deviceId, accountRef)
@@ -785,9 +769,7 @@ static bool shouldAlert(const VelocitySnapshot& snapshot) {
   return snapshot.card_attempts > 40 || snapshot.device_accounts > 5;
 }
 
-// TODO: the starter counts after the model call, never expires the window keys, counts attempts
-// where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-// reports raw counters. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 static std::pair<json, VelocitySnapshot> scoreWithVelocity(sw::redis::Redis& redis, const json& features,
                                                           const std::string& card_ref, const std::string& device_id) {
   const json scored = model.score(features);
@@ -900,10 +882,10 @@ static std::pair<json, VelocitySnapshot> scoreWithVelocity(sw::redis::Redis& red
     },
   },
   hints: [
-    'Write the window function first: bucket in the key, TTL set on the first write of that bucket (`if attempts == 1 then EXPIRE`). A key without an expiry does not have a window, it has a memory leak that flags devices forever.',
-    'Order is the fix for "declined attempts must count": `record_attempt(...)` runs before `model.score(...)`, and nothing on the model failure path skips it. If you find yourself wrapping the counter in the same `try` as the model call, the counter is in the wrong place.',
-    'The device rule is about distinct accounts, so the device key is a set (`PFADD`/`PFCOUNT`, or `SADD`/`SCARD`): same key namespace, different type. Then lift the thresholds into `VELOCITY_RULES` and have both `velocity_snapshot` and `should_alert` read them, so the dashboard and the alert cannot disagree.',
+    'A device that cycled twenty accounts yesterday still shows as suspicious in a month, while the burst that timed out the model during the incident shows zero attempts on the dashboard.',
+    '`window_keys` buckets by day with no `EXPIRE`, `record_attempt` runs after `model.score` with two plain `INCR` calls, and `should_alert` compares against literals the snapshot does not report.',
+    'Move `record_attempt` above `model.score`; make it one `redis.eval(VELOCITY_LUA, …)` that does `INCR` + `EXPIRE` on the hour key and `PFADD`/`PFCOUNT` on the day key; read thresholds from `VELOCITY_RULES` in both `velocity_snapshot` and `should_alert`.',
   ],
-  debrief: `This step is the difference between a counter and a velocity signal. Four defects are checked: the atomic script (a client-side read-then-write loses increments under exactly the concurrency a fraud ring creates), the expiring window (keys that never expire turn a one-hour rule into a permanent mark on a device), the counting point (an attempt that only counts when the model answers is a counter that is blind during the incident it was built for), and the single rule set (two copies of a threshold drift, and the alert becomes a suggestion). Real velocity stores add a sliding window with a sorted set for the exact rate, keep the card and device keys in one Redis cluster slot so the script stays atomic, and publish the snapshot with the decision so a reviewer sees what the scorer saw.
+  debrief: `The fix moves the count ahead of the model call because the counter exists for the attempts the model does not get to answer: a burst that times out the model is exactly the burst the window must see. Putting both keys in one Lua script keeps the card count and the device set consistent under concurrent attempts, and setting the TTL on the first write of a bucket turns a counter into a window that forgets on schedule. \`PFADD\`/\`PFCOUNT\` matches the rule being enforced, distinct accounts rather than attempts. Production velocity stores go further: a sorted set gives a sliding rather than a bucketed rate, hash tags keep the card and device keys in one cluster slot so the script stays atomic, and the snapshot is published with the decision so a case shows what the scorer saw.
 `,
 };

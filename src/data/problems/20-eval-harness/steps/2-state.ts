@@ -8,31 +8,27 @@ export const stateStep: Step = {
   focus: ['harness', 'redis'],
   task: `## Task
 
-The starter is working code: a sample is scored and the counter moves, so the
-demo shows progress on the dashboard. It races under load, it counts redeliveries, and it leaks keys
-forever. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter implements \`record_sample\`, the call a worker makes when one
+sample finishes: it validates the outcome, reads \`scored\`, \`passed\` and \`failed\` from the hash
+\`evals:run:{run_id}\` with three \`HGET\`s, runs two \`HINCRBY\`s, and returns counters it added up
+on the client. It compiles, serves the demo and hides 4 flaws.
 
-Implement \`record_sample\`, the call every worker makes when one sample finishes:
+**Failure mode the checks target.** The Kafka topic feeding the workers is at-least-once, so after
+any rebalance the same sample arrives twice and \`scored\` drifts above the run's budget. Under
+concurrency the client-side read-modify-write reports another worker's progress as this one's, and
+without a TTL every finished run's keys stay in Redis for months.
 
-- The run's progress lives in **one Redis hash per run**: \`evals:run:{run_id}\`, with the fields
-  \`scored\`, \`passed\` and \`failed\`. The starter reads and writes the fields as separate client calls,
-  so two samples that land together can overwrite each other's \`GET\`.
-- A sample is identified by \`(run_id, sample_id)\` and gets its **own dedupe key**:
-  \`sample:{run_id}:{sample_id}\`. A redelivered Kafka message must not score twice.
-- The dedupe flag, the \`scored\` increment and the \`passed\`/\`failed\` increment happen in **one
-  atomic Lua \`EVAL\`**: \`SET … NX\` first, and only when the key was actually created do the
-  increments run. A worker that decides "already seen" from a client-side read is exactly the race
-  the starter has.
-- Both keys **expire with the run**: \`EXPIRE\` from the same script, \`RUN_TTL_S = 86_400\`
-  seconds. Counters without a TTL outlive the run record and the release they belonged to.
-- Return the counters the caller reads: \`{applied, scored, passed, failed}\`, where \`applied\` is
-  false for a redelivered sample that changed nothing.
+Requirements:
 
-**Failure mode the checks target.** The subtle one is the redelivery: the Kafka topic is
-at-least-once, so the same sample will arrive twice after any rebalance, and \`scored\` drifts above
-the run's budget while the pass rate is computed over more samples than were ever scored. The
-client-side read-modify-write is the loud one under concurrency, and the missing TTL is the silent
-one that keeps every finished run's keys alive for months.`,
+- Progress lives in **one Redis hash per run**, \`evals:run:{run_id}\`, with the fields \`scored\`,
+  \`passed\` and \`failed\`.
+- A sample is identified by \`(run_id, sample_id)\` and gets its **own dedupe key**
+  \`sample:{run_id}:{sample_id}\`; a redelivered message must not score twice.
+- The dedupe claim, the \`scored\` increment and the \`passed\`/\`failed\` increment happen in **one
+  atomic Lua \`EVAL\`**: \`SET … NX\` first, and only when the key was created do the increments run.
+- Both keys **expire with the run**: \`EXPIRE\` from the same script, \`RUN_TTL_S = 86_400\`.
+- Return \`{applied, scored, passed, failed}\` from the script's reply, with \`applied\` false for a
+  redelivered sample that changed nothing.`,
   sequence: {
     participants: ['Eval worker', 'Second worker', 'Redis'],
     messages: [
@@ -45,9 +41,9 @@ one that keeps every finished run's keys alive for months.`,
     ],
   },
   hints: [
-    'Everything that decides the result has to run inside the script: read nothing on the client, because the client read is where the race lives. `SET sample:… NX` returns whether this worker created the flag; only then does the script `HINCRBY` the counters.',
-    'Make the dedupe key a function of both ids — `sample:{run_id}:{sample_id}` — and give it the same TTL as the counters. A run-scoped flag alone would collapse every sample into one; a flag without a TTL turns the dedupe set into the largest structure in Redis.',
-    'Return the fresh counters from the script and hand them straight back to the caller. If you re-read the hash after the script you can report another worker’s progress as yours, and `applied = false` is the signal the worker uses to skip its own bookkeeping.',
+    'Symptom: a run with a budget of 500 shows `scored: 517` after a consumer rebalance, and the pass rate on the dashboard moves while nobody can say which samples were counted twice.',
+    'Mechanism: the starter has no per-sample key, so a redelivery looks like a new sample, and it reads the hash with `HGET` before incrementing, so two workers landing together return the same stale snapshot.',
+    'Fix: one `EVAL` script: `SET sample:{run}:{sample} NX EX ttl`; if not fresh return `{0, counters}`, else `HINCRBY` scored and the outcome, `EXPIRE` the hash with `RUN_TTL_S`, and return the new values.',
   ],
   checks: [
     {
@@ -133,8 +129,7 @@ class SampleResult(BaseModel):
 
 
 def record_sample(result: SampleResult) -> dict:
-    # TODO: replace the client-side GET-then-INCR with one atomic script, add a per-sample dedupe
-    # key so a redelivered Kafka message is not scored twice, and expire the counters with the run.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if result.outcome not in {"passed", "failed"}:
         raise HTTPException(status_code=400, detail="outcome must be passed or failed")
     key = f"evals:run:{result.run_id}"
@@ -223,8 +218,7 @@ interface Counters {
 }
 
 export async function recordSample(result: SampleResult): Promise<Counters> {
-  // TODO: replace the client-side GET-then-INCR with one atomic script, add a per-sample dedupe
-  // key so a redelivered Kafka message is not scored twice, and expire the counters with the run.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const key = \`evals:run:\${result.run_id}\`;
   const scored = Number((await r.hget(key, 'scored')) ?? 0);
   const passed = Number((await r.hget(key, 'passed')) ?? 0);
@@ -322,8 +316,7 @@ type Counters struct {
 }
 
 func recordSample(ctx context.Context, result SampleResult) (Counters, error) {
-	// TODO: replace the client-side GET-then-INCR with one atomic script, add a per-sample dedupe
-	// key so a redelivered Kafka message is not scored twice, and expire the counters with the run.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("evals:run:%s", result.RunID)
 	scored, _ := rdb.HGet(ctx, key, "scored").Int64()
 	passed, _ := rdb.HGet(ctx, key, "passed").Int64()
@@ -413,8 +406,7 @@ object ProgressStore {
   val r = new Jedis("redis", 6379)
 
   def recordSample(result: SampleResult): Counters = {
-    // TODO: replace the client-side GET-then-INCR with one atomic script, add a per-sample dedupe
-    // key so a redelivered Kafka message is not scored twice, and expire the counters with the run.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val key = s"evals:run:\${result.run_id}"
     val scored = Option(r.hget(key, "scored")).map(_.toLong).getOrElse(0L)
     val passed = Option(r.hget(key, "passed")).map(_.toLong).getOrElse(0L)
@@ -500,8 +492,7 @@ struct Counters {
 };
 
 Counters recordSample(sw::redis::Redis& redis, const SampleResult& result) {
-  // TODO: replace the client-side GET-then-INCR with one atomic script, add a per-sample dedupe
-  // key so a redelivered Kafka message is not scored twice, and expire the counters with the run.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const auto key = "evals:run:" + result.run_id;
   auto rawScored = redis.hget(key, "scored");
   auto rawPassed = redis.hget(key, "passed");
@@ -569,5 +560,5 @@ Counters recordSample(sw::redis::Redis& redis, const SampleResult& result) {
 `,
     },
   },
-  debrief: `The interview question behind this step is idempotence under at-least-once delivery, with an atomicity question hiding behind it. The client-side read-modify-write fails only when two samples land together, which is exactly what a run with real parallelism does, and the missing dedupe key fails only on a consumer rebalance — both are invisible in a demo that scores one sample at a time. One Lua script fixes all three: \`SET … NX\` claims the sample and reports whether it was fresh, the increments happen only for a fresh sample, and \`EXPIRE\` ties both keys to the run's lifetime. Returning the counters from the same script keeps the caller from reading another worker's progress. Real harnesses store the per-sample verdict durably and treat Redis as a cache, add a monotonic sequence so out-of-order results cannot revise a finished run, and keep a separate low-cardinality key for the dashboard counter.`,
+  debrief: `The fix is one script because every decision that changes the counters has to see the same state: \`SET … NX\` claims the sample and reports whether it was fresh, the increments run only on a fresh claim, \`EXPIRE\` ties both keys to the run's lifetime, and the reply carries the counters the script just wrote, so no worker reports another worker's progress. Keeping the dedupe flag per sample rather than per run is what makes a redelivery a no-op instead of collapsing the whole run into one count. Production harnesses do not stop at a Redis hash: the per-sample verdict is written durably so Redis is a cache that can be rebuilt, and a sequence per run lets a late result be ignored instead of revising a verdict.`,
 };

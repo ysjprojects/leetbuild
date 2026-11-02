@@ -8,37 +8,32 @@ export const billingCursorStep: Step = {
   focus: ['billing', 'redis', 'processor', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it bills a period, records a
-marker and returns the charge reference, so the happy path passes. The run hides a lost race, a
-marker that cannot be reconciled, and an expiry that reopens a closed period. Find them, fix them,
-and prove the fix with the checks below.
+**Starting point.** The starter runs the billing for one \`(subscription, period)\`: it charges the
+period's invoice through the processor stub, writes a run marker in Redis under
+\`billing:run:{subscription_id}:{period_start}\` and returns the charge reference. It compiles, the
+happy path passes, and it hides five flaws.
 
-Implement the billing run for one \`(subscription, period)\`:
+**Failure mode the checks target.** Every flaw is invisible in a demo that runs once and does not
+crash: the second run of the demo sees the marker, no two runners race, and the demo never crosses a
+month boundary. Under a crash between charge and marker, two concurrent retries, or a late retry weeks
+later, the same code charges a customer twice.
 
-- The run key is \`billing:run:{subscription_id}:{period_start}\` — per subscription **and** per
-  period. A subscription-wide key blocks the next period; a period-less key lets two periods share
-  one marker.
+- The run key is per subscription **and** per period. A subscription-wide key blocks the next
+  period; a period-less key lets two periods share one marker.
 - The marker is claimed **atomically** with \`SET … NX\` **before** the charge. A read followed by a
-  later write lets two runners both see "no marker" and both charge the customer. Claim first,
-  charge second.
+  later write lets two runners both see "no marker" and both charge. Claim first, charge second.
 - After the charge, the marker is **confirmed with the invoice reference** (\`charged:{invoice_ref}\`),
-  so the marker and the charge reconcile. A marker whose value is a bare \`done\` proves nothing —
-  when support asks "was this period charged, and under which charge?", the marker has to answer.
-- A claim that exists but was never confirmed is an **in-flight or crashed run**: the retry must
-  reconcile with the processor (\`GetInvoice\` for the period's invoice) and adopt the charge
-  reference it reports, then confirm the marker. It must never charge again.
-- A **closed period** — one whose \`period_end\` is in the past — refuses a re-charge with **409** and
+  so the marker and the charge reconcile. A bare \`done\` cannot answer "was this period charged,
+  and under which charge?".
+- A claim that exists but was never confirmed is an **in-flight or crashed run**: the retry
+  reconciles with the processor (\`GetInvoice\` for the period's invoice), adopts the charge
+  reference it reports, then confirms the marker. It does not charge again.
+- A **closed period**, one whose \`period_end\` is in the past, refuses a re-charge with **409** and
   \`{"action_required": "adjustment"}\` unless the caller passes the explicit adjustment action. A
   billing retry is not an adjustment.
-- The marker **must not expire with the period or the month**: no TTL on the run marker. A marker
-  that lives for thirty days cannot tell a closed period from an unbilled one, so a late retry
-  recharges a period that was already billed and closed.
-- Log the run with subscription, period and reference — never the customer's payment details.
-
-**Failure mode the checks target.** The starter charges before it claims anything, writes a bare
-\`done\` marker afterwards, and gives that marker a month-long expiry. Every one of those is
-invisible in a demo that runs once and never crashes: the second run of the demo sees the marker, and
-the demo never crosses a month boundary.`,
+- The marker carries no TTL. A marker that lives for thirty days cannot tell a closed period from an
+  unbilled one, so a late retry recharges a period that was already billed and closed.
+- Log the run with subscription, period and reference, not the customer's payment details.`,
   sequence: {
     participants: ['Billing Service', 'Redis', 'billing db', 'Payment processor'],
     messages: [
@@ -169,9 +164,7 @@ def charge_invoice(invoice) -> str:
 
 
 def run_billing(subscription_id: str, period, action: str | None = None) -> dict:
-    # TODO: flawed code. It charges first and only then writes the marker, claims
-    # nothing atomically, records a bare "done" with no charge reference, expires the marker after a
-    # month, and has no guard for a closed period and no reconciliation for an in-flight run.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     invoice_ref = charge_invoice(period.invoice)
     r.set(marker_key(subscription_id, period.period_start), "done", ex=MONTH_TTL_S)
     logger.info("billed subscription=%s period=%s", subscription_id, period.period_start)
@@ -268,7 +261,7 @@ def start_run(body: RunRequest, tenant: str = Header(alias="X-Tenant-Id")) -> di
 `,
     },
     typescript: {
-      starter: `/** The billing run for one (subscription, period): flawed code. */
+      starter: `/** The billing run for one (subscription, period): the starter. */
 import {Redis} from 'ioredis';
 import Fastify from 'fastify';
 
@@ -303,9 +296,7 @@ export async function runBilling(
   period: Period,
   action?: string,
 ): Promise<{status: string; reference?: string}> {
-  // TODO: flawed code. It charges first and only then writes the marker, claims nothing
-  // atomically, records a bare 'done' with no charge reference, expires the marker after a month,
-  // and has no guard for a closed period and no reconciliation for an in-flight run.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const invoiceRef = await chargeInvoice(period.invoice);
   await r.set(markerKey(subscriptionId, period.period_start), 'done', 'EX', MONTH_TTL_S);
   return {status: 'charged', reference: invoiceRef};
@@ -439,9 +430,7 @@ func ChargeInvoice(invoice Invoice) (string, error) {
 
 // RunBilling bills one period of one subscription.
 func RunBilling(ctx context.Context, subscriptionID string, period Period, action string) (map[string]any, error) {
-	// TODO: flawed code. It charges first and only then writes the marker, claims
-	// nothing atomically, records a bare "done" with no charge reference, expires the marker after a
-	// month, and has no guard for a closed period and no reconciliation for an in-flight run.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	invoiceRef, err := ChargeInvoice(period.Invoice)
 	if err != nil {
 		return nil, err
@@ -610,9 +599,7 @@ object BillingRun {
     processor.Charge(ChargeRequest(invoice.id, invoice.amount_cents)).chargeId
 
   def runBilling(subscriptionId: String, period: Period, action: Option[String]): Map[String, String] = {
-    // TODO: flawed code. It charges first and only then writes the marker, claims
-    // nothing atomically, records a bare "done" with no charge reference, expires the marker after a
-    // month, and has no guard for a closed period and no reconciliation for an in-flight run.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val invoiceRef = chargeInvoice(period.invoice)
     jedis.setex(markerKey(subscriptionId, period.period_start), monthTtl, "done")
     Map("status" -> "charged", "reference" -> invoiceRef)
@@ -750,9 +737,7 @@ std::string chargeInvoice(const Invoice& invoice) {
 
 // RunBilling bills one period of one subscription.
 json runBilling(const std::string& subscription_id, const Period& period, const std::string& action) {
-  // TODO: flawed code. It charges first and only then writes the marker, claims nothing
-  // atomically, records a bare "done" with no charge reference, expires the marker after a month,
-  // and has no guard for a closed period and no reconciliation for an in-flight run.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto invoice_reference = chargeInvoice(period.invoice);
   redis->setex(markerKey(subscription_id, period.period_start), kMonthTtl, "done");
   std::cout << "billed subscription=" << subscription_id << " period=" << period.period_start << "\\n";
@@ -875,9 +860,9 @@ int main() {
     },
   },
   hints: [
-    'Order is the whole fix: claim, then charge, then confirm. `SET key claimed NX` is one round trip and exactly one runner gets `OK`; everything after the claim is work that only that runner may do. Anything that charges before it claims can be reached by two retries at once.',
-    'The marker value is evidence: store the charge reference (`charged:{invoice_ref}`) so the marker and the charge reconcile. A claim with no reference is an unknown outcome — the retry must read the processor invoice (`GetInvoice`) and adopt what it finds instead of charging again.',
-    'Never give the run marker an expiry. A marker that dies with the month cannot distinguish a closed period from an unbilled one, and the late retry that finds an empty key charges a period that was already billed and closed. The key is per `(subscription, period_start)` for the same reason: one subscription has many periods.',
+    'A worker crashed after the processor answered; the retry charged the customer again. Weeks later a replayed job charged a period that was already billed and closed, and support cannot say which charge belongs to which marker.',
+    'The marker is written after the charge and with a month-long expiry, so the window before the write and the time after the expiry both look like "unbilled". A bare `done` carries no reference to reconcile against.',
+    'Claim with `SET key claimed NX` before the charge, then `confirm_marker` with `charged:{invoice_ref}` and no TTL. An unconfirmed claim means `GetInvoice` first; a closed period answers 409 without the adjustment action.',
   ],
-  debrief: `The interviewer is testing idempotency under crashes, which is the one property a demo never exercises. Four things are being checked: the claim is atomic (\`SET NX\`, not read-then-write), the claim happens before the charge (so a lost race cannot spend money), the marker carries the charge reference (so a run can be reconciled instead of repeated), and the marker outlives its period (so a closed period stays closed). The subtle one is the TTL: it looks like hygiene, and it silently converts idempotency into "idempotent for thirty days". Real billing systems add a claim lease with a heartbeat for the in-flight case, a separate adjustment workflow with its own audit trail, reconciliation jobs that compare markers with processor settlement files, and per-run trace ids so on-call can tell a replay from a first attempt.`,
+  debrief: `The fix is an ordering: claim, charge, confirm. The claim is one atomic \`SET NX\`, so exactly one runner per \`(subscription, period)\` proceeds and a lost race cannot spend money. The confirmation stores the charge reference, so a claim without one is recognisably an unknown outcome that the retry reconciles with \`GetInvoice\` instead of repeating. The marker has no expiry because a TTL quietly turns idempotency into "idempotent for thirty days", and a closed period needs an explicit adjustment to be touched again. Production billing adds what this step left out: a claim lease with a heartbeat for the in-flight case, an adjustment workflow with its own audit trail, reconciliation jobs that compare markers with processor settlement files, and per-run trace ids so on-call can tell a replay from a first attempt.`,
 };

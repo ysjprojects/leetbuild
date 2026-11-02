@@ -8,43 +8,27 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: a single seller updating a price looks capped, the
-route answers 200 with a number, and the demo passes. It hides the one failure a pricing service is
-judged by — what ten updates arriving together do to the same budget. Debug it like the service
-owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/prices\` (body \`{"sku", "price_cents", "reason"}\`):
+it checks the sku and the floor and ceiling, compares this update's move against \`MAX_MOVE_BP\`
+using the price on disk, bumps a \`guard:{sku}\` counter with \`GET\` and \`INCRBY\`, publishes and
+writes the \`price:{sku}\` cache. It compiles, serves the demo and hides five flaws.
 
-Implement the guardrail reservation behind \`POST /v1/prices\`
-(body \`{"sku": "…", "price_cents": 1299, "reason": "…"}\`):
+**Failure mode the checks target.** A per-update bound is not a window budget: each update is legal
+alone, so ten of them compound. The counter is read and written in two round trips, so concurrent
+updates spend headroom that is already gone; the key has no window and no TTL, so one busy hour
+caps the sku for good; the refusal is a 422 with no bound; the publish carries no id.
 
-- \`MAX_MOVE_BP = 2000\` (20.00% of the current price, per sku, per hour window), \`FLOOR_CENTS = 50\`,
-  \`CEILING_CENTS = 500000\`, \`WINDOW_S = 3600\`. A move is
-  \`abs(price_cents - current_cents) * 10000 // current_cents\` basis points.
-- The headroom belongs to the **sku and the hour**: the key is \`guard:{sku}:{window}\` with
-  \`window = now // WINDOW_S\` and the hash field is \`moved\`, and the script must \`EXPIRE\` the key on
-  the write that created it while reporting the remaining \`TTL\`. A window-less key is a global cap on
-  the sku; a key without a TTL ratchets that cap down for good.
-- Read, check and consume the headroom **inside one Lua script** (\`RESERVE_LUA\`, run through
-  \`EVAL\`): \`HGET\` the accumulator, compare, and \`HINCRBY\` only on success. A client-side \`GET\`
-  followed by an \`INCRBY\` is two round trips, and two updates pass the same last basis points.
-- The compared quantity is the **accumulated** movement, not this update against the price on disk:
-  \`moved + this_move <= MAX_MOVE_BP\` decides, so ten 15% updates in one hour meet one 20% budget
-  instead of ten separate ones.
-- The reservation mints an \`update_id\` and returns it. \`store.publish(\` runs **after** the
-  reservation succeeded and carries that id, and the \`price:{sku}\` cache is written with
-  \`price_cents\`, \`source\`, \`updated_at\` and the same \`update_id\`, so any published price can be
-  traced back to the update that consumed its headroom.
-- An update that does not fit the window is rejected with **409** and
-  \`{"headroom_bp": …, "bound_cents": …}\` — what the window still has and the furthest price it still
-  allows — and the refusal happens **before** \`store.publish(\`. The bound is
-  \`delta = current_cents * headroom_bp // 10000\` applied in the direction of the move
-  (\`current_cents ± delta\`) and clamped by \`FLOOR_CENTS\` and \`CEILING_CENTS\`.
-
-**Failure mode the checks target.** A per-update bound is not a window budget. The starter measures each
-proposal against the price on disk, so every update is legal on its own and ten of them compound into
-a move no single update was ever allowed to make; its counter is read and written in two round trips,
-so concurrent updates spend headroom that is already gone; it is keyed without a window and never
-expires, so one busy hour permanently caps the sku; and the publish carries no id, which is exactly
-what makes a price movement explainable three weeks later.`,
+- \`MAX_MOVE_BP = 2000\` (20% per sku per hour window), \`FLOOR_CENTS = 50\`, \`CEILING_CENTS = 500000\`,
+  \`WINDOW_S = 3600\`. A move is \`abs(price_cents - current_cents) * 10000 // current_cents\` bp.
+- Key \`guard:{sku}:{window}\` with \`window = now // WINDOW_S\`, hash field \`moved\`; the script
+  must \`EXPIRE\` the key on the write that created it and report the remaining \`TTL\`.
+- One Lua script (\`RESERVE_LUA\`, run through \`EVAL\`): \`HGET\` the accumulator, compare
+  \`moved + this_move <= MAX_MOVE_BP\`, \`HINCRBY\` only on success.
+- The reservation mints an \`update_id\` (\`uuid4()\`); \`store.publish(\` runs after \`reserve(\` with
+  that id, and the \`price:{sku}\` cache gets \`price_cents\`, \`source\`, \`updated_at\`, \`update_id\`.
+- An update that does not fit is **409** with \`{"headroom_bp": …, "bound_cents": …}\` before
+  \`store.publish(\`; \`bound_cents = current_cents ± current_cents * headroom_bp // 10000\`, clamped
+  by \`FLOOR_CENTS\` and \`CEILING_CENTS\`.`,
   sequence: {
     participants: ['Pricing API', 'Redis', 'Price store'],
     messages: [
@@ -76,9 +60,9 @@ what makes a price movement explainable three weeks later.`,
     ],
   },
   hints: [
-    'The decision has to live where the accumulator lives. `HGET` the `moved` field inside `RESERVE_LUA`, add this update’s basis points, compare against `MAX_MOVE_BP`, and `HINCRBY` only when it fits. The starter reads with `GET` and writes with `INCRBY` from the client: between those two calls another update sees headroom it can no longer spend.',
-    'One sku, one hour, one accumulator: `guard:{sku}:{window}` with `window = now // WINDOW_S`. Inside the same script, `EXPIRE` the key when `TTL` says it was just created. A counter that never expires is not a window limit — it is a permanent ceiling that a single busy hour installs on the sku.',
-    'A refusal is a product answer, not just a status code: `409` with `headroom_bp` tells the seller what is left and `bound_cents` tells it the furthest price this window still allows, so it can retry with a price that fits. The refusal must return before `store.publish(`, and every publish that does happen must carry the `update_id` the reservation minted.',
+    'One seller submitting a 15% change is capped every time. Ten sellers submitting 15% changes in the same minute all get 200, and the sku ends the hour at four times its price.',
+    'Each request compares its own move against the price on disk, and `r.get` followed by `r.incrby` lets two requests read the same spent value; nothing accumulates, and `guard:{sku}` neither buckets by hour nor expires.',
+    'Move the decision into `RESERVE_LUA` via `r.eval`: `HGET moved`, test `moved + this_move`, `HINCRBY` on success, `EXPIRE` when `TTL` is -1; key `guard:{sku}:{window}`; return 409 with `headroom_bp` and `bound_cents` before `store.publish(`.',
   ],
   checks: [
     {
@@ -202,11 +186,7 @@ def price_key(sku: str) -> str:
 
 @app.post("/v1/prices")
 def post_price(body: PriceRequest) -> dict:
-    # TODO: this starter reads the window counter with a client-side GET and writes it back with
-    # INCRBY, and it never lets the counter decide: each update is compared against the price on
-    # disk, so ten parallel updates each pass and compound. The key has no window bucket and no TTL,
-    # so the limit ratchets down forever, and neither the publish nor the price:{sku} cache carries
-    # the id of the update that consumed the headroom.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if not store.get_sku(body.sku):
         raise HTTPException(status_code=404, detail="unknown sku")
     if not FLOOR_CENTS <= body.price_cents <= CEILING_CENTS:
@@ -415,11 +395,7 @@ function priceKey(sku: string): string {
 }
 
 app.post('/v1/prices', async (request, reply) => {
-  // TODO: this starter reads the window counter with a client-side GET and writes it back with
-  // INCRBY, and it never lets the counter decide: each update is compared against the price on
-  // disk, so ten parallel updates each pass and compound. The key has no window bucket and no TTL,
-  // so the limit ratchets down forever, and neither the publish nor the price:{sku} cache carries
-  // the id of the update that consumed the headroom.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const body = request.body as PriceBody;
   if (!(await store.get_sku(body.sku))) {
     return reply.code(404).send({error: 'unknown sku'});
@@ -647,11 +623,7 @@ func postPrice(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter reads the window counter with a client-side GET and writes it back with
-	// INCRBY, and it never lets the counter decide: each update is compared against the price on
-	// disk, so ten parallel updates each pass and compound. The key has no window bucket and no
-	// TTL, so the limit ratchets down forever, and neither the publish nor the price:{sku} cache
-	// carries the id of the update that consumed the headroom.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	known, _ := store.GetSKU(r.Context(), body.SKU)
 	if !known {
 		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown sku"})
@@ -941,11 +913,7 @@ object PricingApi {
     path("v1" / "prices") {
       post {
         entity(as[PriceRequest]) { body =>
-          // TODO: this starter reads the window counter with a client-side GET and writes it back
-          // with INCRBY, and it never lets the counter decide: each update is compared against the
-          // price on disk, so ten parallel updates each pass and compound. The key has no window
-          // bucket and no TTL, so the limit ratchets down forever, and neither the publish nor the
-          // price:{sku} cache carries the id of the update that consumed the headroom.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           if (!store.get_sku(body.sku)) {
             complete(StatusCodes.NotFound, """{"error":"unknown sku"}""")
           } else if (body.price_cents < FloorCents || body.price_cents > CeilingCents) {
@@ -1161,11 +1129,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/prices", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reads the window counter with a client-side GET and writes it back with
-    // INCRBY, and it never lets the counter decide: each update is compared against the price on
-    // disk, so ten parallel updates each pass and compound. The key has no window bucket and no
-    // TTL, so the limit ratchets down forever, and neither the publish nor the price:{sku} cache
-    // carries the id of the update that consumed the headroom.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
     const auto sku = body.value("sku", std::string());
@@ -1382,5 +1346,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is where shared state lives and what a refusal owes the caller. A per-update bound is not a window budget: ten 15% updates are each legal and together they are a 400% move, so the check and the consumption have to be one atomic step against an accumulator that belongs to a sku's hour — keyed, expired and read inside the same script. The starter's two round trips pass every serial test and fail exactly when the service is busy, which is when the limit matters; its key without a TTL turns one busy hour into a permanent ceiling on that sku, which is why operations has to reason about the window and not about individual updates. Traceability is the part candidates forget: an \`update_id\` minted with the reservation, carried into \`store.publish\` and mirrored into the \`price:{sku}\` cache is what lets someone answer "why is this 4999?" three weeks later, and the 409 body is what lets the caller retry with a price that fits instead of guessing the bound. Real systems add per-sku recipes, refund headroom when the store rejects a publish, and gliding windows for the skus that move constantly.`,
+  debrief: `The fix puts the decision where the accumulator lives. Ten 15% updates are each legal and together they quadruple the price, so the check and the consumption have to be one atomic step against a counter that belongs to a sku's hour: keyed by window, expired by the script that created it, read and incremented in the same \`EVAL\`. Two client-side round trips pass every serial test and fail when the service is busy, which is when the limit matters. The \`update_id\` minted with the reservation and carried into \`store.publish\` and \`price:{sku}\` is what answers "why is this 4999?" weeks later; the 409 body is what lets the caller retry with a price that fits. Production guards also refund headroom when the store rejects a publish and load per-sku limits from a recipe.`,
 };

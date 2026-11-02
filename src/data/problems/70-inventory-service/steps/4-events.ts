@@ -8,38 +8,32 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'ledger', 'db'],
   task: `## Task
 
-The starter is working code: every reservation change publishes a movement, the
-topic and the flush are there, and the demo's ledger fills up. Four production contracts are broken.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter publishes one event to \`inventory.event\` for every reserve,
+confirm and release: the topic, the producer and the flush are there and the demo's ledger fills up.
+It compiles, serves the demo and hides five flaws.
 
-Reserve, confirm and release each publish one event to \`inventory.event\`, and the ledger consumer
-rebuilds per-sku availability from that stream.
+**Failure mode the checks target.** An order-keyed stream loses per-sku order the moment two orders
+touch the same sku, and the consumer folds deltas in the wrong order. Publishing the release before
+the hold clears opens a window where the ledger shows stock released while the hold still blocks it.
+A default producer acknowledges before replication and can duplicate on retry, and a failed produce
+with no outbox is a movement that only ever existed in the writer's memory.
+
+The ledger consumer rebuilds per-sku availability from the stream.
 
 - The **record key is the sku** (\`key=sku\`, \`key: sku\`, \`Key: []byte(sku)\`,
   \`ProducerRecord(topic, sku, …)\`), so one sku's movements land in one partition and stay ordered.
-  The starter keys by the order id, so one sku's movements interleave across orders and a consumer
-  folding deltas can apply them out of order.
 - The payload carries \`{event_id, sku, delta, reservation_id, reason, available}\` with \`reason\`
   in \`reserved\` / \`confirmed\` / \`released\`: the signed delta and the reservation id travel
-  together, so a rebuild can attribute every movement to the reservation that caused it.
+  together, so a rebuild can attribute every movement to its reservation.
 - The producer is **durable**: \`acks=all\` (\`acks: -1\`, \`RequireAll\`) plus idempotence where the
   stack has it (\`enable.idempotence\`, \`idempotent: true\`, or the \`kafka.Hash\` balancer for
   kafka-go). An ack must mean the record is replicated, and a retried produce must not duplicate a
   movement.
 - On the **release path** the Redis hold is cleared **first** and the \`released\` event is produced
-  **after** it. The starter produces first, so a consumer can see a release for stock the store still
-  holds.
-- When the broker rejects the produce — an exception, an error code, a flush that leaves the record
-  pending — insert the event into an **outbox** store declared in the file (an in-memory stub is
-  fine), inside the same commit as the state change. A broker outage must leave the ledger
-  rebuildable, never silently short.
-
-**Failure mode the checks target.** An order-keyed stream loses per-sku order the moment two orders
-touch the same sku, and the consumer's per-sku state folds deltas in the wrong order. Publishing the
-release before the hold clears opens a window where the store shows stock released while the hold
-still blocks it. A default producer acknowledges before replication and can duplicate on retry, and a
-failed produce with no outbox is a movement that only ever existed in the writer's memory — the
-ledger drifts from the counter it is supposed to explain.`,
+  **after** it.
+- When the broker rejects the produce (an exception, an error code, a flush that leaves the record
+  pending) insert the event into an **outbox** store declared in the file (an in-memory stub is
+  fine). A broker outage must leave the ledger rebuildable.`,
   sequence: {
     participants: ['Inventory API', 'Redis holds', 'inventory.event', 'outbox'],
     messages: [
@@ -55,7 +49,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'sku-key',
       title: 'The record key is the sku',
       detail:
-        'The Kafka record key is the sku (`key=sku` / `key: sku` / `Key: []byte(sku)`), so one sku’s movements land in one partition and stay ordered. The starter keys by the order id, so one sku’s movements interleave across orders.',
+        'The Kafka record key is the sku (`key=sku` / `key: sku` / `Key: []byte(sku)`), so one sku’s movements land in one partition and stay ordered.',
       match: {
         python: {all: [/producer\.produce\([^)]*key=sku/]},
         typescript: {all: [/key:\s*sku\b/]},
@@ -68,7 +62,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'event-fields',
       title: 'The event carries delta, reservation_id and reason',
       detail:
-        'Each event payload carries the signed `delta`, the `reservation_id` and a `reason` in reserved / confirmed / released. The starter ships a quantity and an order id instead, so a consumer cannot attribute a movement to the reservation that caused it.',
+        'Each event payload carries the signed `delta`, the `reservation_id` and a `reason` in reserved / confirmed / released, so a consumer can attribute a movement to the reservation that caused it.',
       match: {
         python: {all: [/["']delta["']\s*:/, /["']reservation_id["']\s*:/, /["']reason["']\s*:/]},
         typescript: {all: [/\bdelta\b/, /\breservation_id\b/, /\breason\b/]},
@@ -81,7 +75,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'publish-after-hold',
       title: 'Release clears the hold before publishing',
       detail:
-        'On the release path the Redis hold is deleted first and the `released` event is produced after it, so no consumer can observe a release for stock the store still holds. The starter produces first.',
+        'On the release path the Redis hold is deleted first and the `released` event is produced after it, so no consumer can observe a release for stock the store still holds.',
       match: {
         python: {order: [/\.delete\(/, /publish_event\(/]},
         typescript: {order: [/\.del\(/, /publishEvent\(/]},
@@ -94,7 +88,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'outbox',
       title: 'A rejected produce falls back to the outbox',
       detail:
-        'When the produce fails — exception, error code or a flush that leaves the record pending — the event is inserted into the outbox store declared in the file, so a relay can republish it after the broker recovers. The starter has no outbox: an outage truncates the ledger.',
+        'When the produce fails (exception, error code or a flush that leaves the record pending) the event is inserted into the outbox store declared in the file, so a relay can republish it after the broker recovers.',
       match: {
         python: {all: [/class OutboxStore/, /insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/class OutboxStore/, /insertOutbox\(/, /catch\s*\(/]},
@@ -107,7 +101,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'durable-producer',
       title: 'Durable producer on inventory.event',
       detail:
-        'The publisher targets `inventory.event` with required acks `all` (`acks: -1`, `RequireAll`) and idempotence where the stack provides it, so an ack means the record is replicated and a retry cannot duplicate a movement. The starter leaves the producer on defaults.',
+        'The publisher targets `inventory.event` with required acks `all` (`acks: -1`, `RequireAll`) and idempotence where the stack provides it, so an ack means the record is replicated and a retry cannot duplicate a movement.',
       match: {
         python: {all: [/inventory\.event/, /enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/inventory\.event/, /idempotent:\s*true/, /acks:\s*-1/]},
@@ -141,10 +135,7 @@ class ReleaseRequest(BaseModel):
     quantity: int
 
 
-# TODO: key the record by the sku instead of the order id, carry the delta and the reservation id
-# with the reason, configure the producer for durability (enable.idempotence + acks=all), clear the
-# Redis hold before publishing the release, and insert an outbox row when the broker rejects the
-# produce.
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 def publish_event(order_id: str, sku: str, quantity: int, reason: str) -> None:
     event = {
         "event_id": str(uuid4()),
@@ -249,9 +240,7 @@ interface ReleaseBody {
   quantity: number;
 }
 
-// TODO: key the record by the sku instead of the order id, carry delta and reservation_id with the
-// reason, configure the producer for durability (idempotent: true with acks: -1), clear the Redis
-// hold before publishing the release, and fall back to the outbox when the broker rejects it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 async function publishEvent(orderId: string, sku: string, quantity: number, reason: string): Promise<void> {
   const event = {event_id: randomUUID(), sku, order_id: orderId, quantity, reason};
   await producer.send({
@@ -355,9 +344,7 @@ type ReleaseBody struct {
 	Quantity int    \`json:"quantity"\`
 }
 
-// TODO: key the record by the sku instead of the order id, carry Delta and ReservationID with the
-// reason, configure the writer with RequiredAcks: kafka.RequireAll and &kafka.Hash{}, clear the
-// Redis hold before publishing the release, and insert an outbox row when the produce fails.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func publishEvent(ctx context.Context, orderID string, sku string, quantity int, reason string) error {
 	event := map[string]any{
 		"event_id": uuid.NewString(),
@@ -453,9 +440,7 @@ object InventoryPublisher {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key the record by the sku instead of the order id, carry delta + reservation_id + reason,
-  // set enable.idempotence and acks=all on the producer, clear the Redis hold before publishing the
-  // release, and insert an outbox row when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publishEvent(orderId: String, sku: String, quantity: Int, reason: String): Unit = {
     val event = JsObject(
       "event_id" -> JsString(UUID.randomUUID().toString),
@@ -550,9 +535,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
 
-// TODO: key the record by the sku instead of the order id, carry delta + reservation_id + reason,
-// set enable.idempotence and acks=all on the producer, clear the Redis hold before publishing the
-// release, and insert an outbox row when the broker rejects the produce.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void publishEvent(const std::string& orderId, const std::string& sku, int quantity, const std::string& reason) {
   const json event = {{"event_id", newEventId()}, {"sku", sku}, {"order_id", orderId}, {"quantity", quantity}, {"reason", reason}};
   const auto payload = event.dump();
@@ -642,11 +625,9 @@ void release(const std::string& reservationId, const std::string& sku, int quant
     },
   },
   hints: [
-    'The key is an argument of the produce call, not a field in the payload: `key=sku` / `key: sku` / `Key: []byte(sku)` / `ProducerRecord(topic, sku, payload)` / the `sku.data(), sku.size()` pair. On the release path the hold clear is one Redis call and it must run before the produce — reorder the two statements; no timeout or retry can fix an ordering bug.',
-    'Durability is producer configuration, not application logic: `enable.idempotence` with `acks=all`, KafkaJS’s `idempotent: true` plus `acks: -1` on the record, kafka-go’s `RequiredAcks: kafka.RequireAll` with `&kafka.Hash{}`, or librdkafka’s `enable.idempotence` / `acks` properties. While you are in the payload, add `delta` and `reservation_id` next to the reason.',
-    'The outbox is the durability half: wrap the produce and, on the failure branch (exception, non-zero error code, pending flush), insert the row. Declare the store as a class/struct with an insert method — a relay reads that table when the broker recovers, so a produce failure must never lose the movement.',
+    'Symptom: the rebuilt ledger disagrees with the Redis counter after a busy hour, a replay shows a sku released while a hold still blocked it, and a short broker outage leaves gaps.',
+    'Mechanism: records are keyed by order id so one sku spans partitions, the release is produced before the hold is deleted, the producer runs on defaults, and a failed produce is dropped.',
+    'Change: pass `key=sku` to the produce call, add `delta` and `reservation_id` to the payload, set `enable.idempotence` plus `acks=all`, delete the hold before producing, and insert into the outbox on the failure branch.',
   ],
-  debrief: `A stock ledger is an ordered log per sku, and the partition key is what makes it ordered: key by sku and every movement of that sku is appended to one partition in order, so a consumer folding deltas sees them in the order they happened. Key by anything else — the order id in the starter — and two orders touching the same sku interleave. The key is therefore a correctness decision, not a routing detail, which is why the checks pin the key argument of the produce call rather than the topic name.
-
-The release path is the second contract: the hold is what stops the store from selling the unit again, so the movement may only become visible after the hold is gone. Producing first leaves a window in which the ledger says released while the store still holds the unit — a double-sell that only a replay exposes. The outbox closes the third gap: Redis state and the broker cannot commit together, so a rejected produce writes the event where a relay can find it, and the ledger stays rebuildable after an outage. Idempotence plus acks=all make the retry safe; without them a retry duplicates a movement and the rebuilt counter drifts from the one the API serves. Real systems add a relay that claims rows with \`FOR UPDATE SKIP LOCKED\`, consumer-side dedupe on \`event_id\`, a schema registry for the payload, and a reconciliation job between the ledger and the counter.`,
+  debrief: `A stock ledger is an ordered log per sku, and the partition key is what makes it ordered: key by sku and every movement of that sku is appended to one partition in order, so a consumer folding deltas sees them as they happened. Keyed by order id, two orders touching the same sku interleave. The key is a correctness decision, which is why the checks pin the key argument of the produce call rather than the topic name. The release path is the second contract: the hold is what stops the store from selling the unit again, so the movement may only become visible after the hold is gone. The outbox closes the gap between Redis state and the broker, which cannot commit together. Production systems add a relay that claims outbox rows with \`FOR UPDATE SKIP LOCKED\`, consumer-side dedupe on \`event_id\`, and a reconciliation job between the ledger and the counter.`,
 };

@@ -8,39 +8,16 @@ export const readStep: Step = {
   focus: ['client', 'purge', 'tenant'],
   task: `## Task
 
-**Starting point.** The starter reads the purge record and returns it as done. It compiles, and it
-is exactly the endpoint that told on-call a domain was clean for six hours while some edges were
-still serving the broken pricing page. Debug it like the owner of the status contract, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/purges/{purge_id}\`: it reads the record by id alone, keeps only the \`accepted\` entries of \`outcomes\`, and answers \`status: "done"\` with \`purge_id\` and \`domain\`. It compiles, and it is the endpoint that told on-call a domain was clean for six hours while some edges still served the broken pricing page. It hides five flaws.
 
-Implement \`GET /v1/purges/{purge_id}\`:
+**Failure mode the checks target.** The starter says \`done\` the moment the provider accepted the batch, while propagation is still in flight. It has no confirmation path, so nothing could stamp a real \`propagated_at\`. It filters \`outcomes\` down to the accepted paths, hiding the failures an operator needs. And it looks the purge up by id alone, so any tenant can read another tenant's purge.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing). A purge that belongs to another
-  tenant is **404**, exactly like a purge that does not exist: the endpoint must not confirm that
-  someone else's purge id is real.
-- The response reports \`purge_id\`, \`domain\`, \`status\`, \`outcomes\`, \`accepted_at\` and
-  \`propagated_at\`. \`outcomes\` is the per-path map **for every path** — the failed ones included,
-  because those are the ones an operator has to act on.
-- \`status\` is derived from the per-path outcomes by \`derive_status\`, using exactly these three
-  values: \`accepted\` (the purge is recorded, the provider has not confirmed every path),
-  \`propagated\` (every path confirmed at the edges) and \`partially_failed\` (at least one path
-  reached a terminal failure). There is no \`done\`: done is a claim this service cannot make while
-  edges are still catching up.
-- \`propagated_at\` is a real timestamp **only** when the status is \`propagated\`; until then it is
-  null. The confirmation path (\`mark_propagated\`) records the paths the provider confirmed and
-  stamps the time only when the last one lands — a 200 from the provider is acceptance, not
-  propagation.
-- A provider 200 that has not propagated yet must therefore read as \`accepted\`; a purge where one
-  path was refused must read as \`partially_failed\` with that path visible in \`outcomes\`, never as
-  a clean purge.
+- The tenant comes from \`X-Tenant-Id\` (**401** when missing). Another tenant's purge is **404**, exactly like a purge that does not exist.
+- The response reports \`purge_id\`, \`domain\`, \`status\`, \`outcomes\`, \`accepted_at\` and \`propagated_at\`. \`outcomes\` is the per-path map **for every path**, failed ones included.
+- \`derive_status\` maps the per-path outcomes to \`accepted\` (not every path confirmed), \`propagated\` (every path confirmed at the edges) or \`partially_failed\` (at least one terminal failure). There is no \`done\`.
+- \`propagated_at\` is a real timestamp **only** when the status is \`propagated\`; until then it is null. \`mark_propagated\` records confirmed paths and stamps the time when the last one lands.
 
-:::widget status-codes {}
-
-**Failure mode the checks target.** The starter answers \`done\` the moment the provider accepted the
-batch, so the status endpoint reports success while propagation is still in flight — the six hours
-of stale pricing came from trusting that word. It filters \`outcomes\` down to the accepted paths, so
-the failures an operator needs are hidden. And it looks up the purge by id alone, so any tenant can
-read (and, in the intake endpoint, infer) another tenant's purge.`,
+:::widget status-codes {}`,
   sequence: {
     participants: ['Client', 'Purge API', 'purge store'],
     messages: [
@@ -160,10 +137,7 @@ store = PurgeStore()
 
 @app.get("/v1/purges/{purge_id}")
 def get_purge(purge_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter reports done as soon as the provider accepted the batch, hides the paths
-    # that failed, and lets any tenant read any purge. Fix all three: a status derived from the
-    # per-path outcomes with propagated_at only after confirmation, the full outcome map in the
-    # response, and a 404 for a purge that belongs to another tenant.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     purge = store.get(purge_id)
     outcomes = {path: outcome for path, outcome in purge["outcomes"].items() if outcome == "accepted"}
     return {
@@ -253,10 +227,7 @@ const store = {
 };
 
 app.get('/v1/purges/:purgeId', async (request, reply) => {
-  // TODO: this starter reports done as soon as the provider accepted the batch, hides the paths that
-  // failed, and lets any tenant read any purge. Fix all three: a status derived from the
-  // per-path outcomes with propagated_at only after confirmation, the full outcome map in the
-  // response, and a 404 for a purge that belongs to another tenant.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   // Fastify types route params as a generic record; this route declares :purgeId.
   const params = request.params as {purgeId: string};
   // The starter assumes the purge exists, so it skips the missing-record path entirely.
@@ -363,10 +334,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func getPurge(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reports done as soon as the provider accepted the batch, hides the paths
-	// that failed, and lets any tenant read any purge. Fix all three: a status derived from the
-	// per-path outcomes with propagated_at only after confirmation, the full outcome map in the
-	// response, and a 404 for a purge that belongs to another tenant.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	purge, _ := store.Get(r.Context(), r.URL.Query().Get("id"))
 	outcomes := map[string]string{}
 	for path, outcome := range purge.Outcomes {
@@ -530,10 +498,7 @@ object PurgeReadApi {
     path("v1" / "purges" / Segment) { purgeId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter reports done as soon as the provider accepted the batch, hides the
-          // paths that failed, and lets any tenant read any purge. Fix all three: a status
-          // derived from the per-path outcomes with propagated_at only after confirmation, the
-          // full outcome map in the response, and a 404 for a purge that belongs to another tenant.
+          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
           store.get(purgeId) match {
             case Some(purge) =>
               val accepted = purge.outcomes.filter { case (_, outcome) => outcome == "accepted" }
@@ -665,10 +630,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/purges/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reports done as soon as the provider accepted the batch, hides the paths
-    // that failed, and lets any tenant read any purge. Fix all three: a status derived from the
-    // per-path outcomes with propagated_at only after confirmation, the full outcome map in the
-    // response, and a 404 for a purge that belongs to another tenant.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto purge = store.get(req.matches[1]);
     json outcomes = json::object();
     for (const auto& entry : (*purge)["outcomes"].items()) {
@@ -770,9 +732,11 @@ int main() {
     },
   },
   hints: [
-    'Model the purge as the provider reports it: a map from path to outcome, where a path is `pending`, `propagated` or `failed`. `derive_status` then has three cases in priority order — any failure wins, then all propagated, otherwise accepted — and no case in which the endpoint can say the cache is clean before the edges agree.',
-    'Stamp `propagated_at` where the confirmation arrives (`mark_propagated`), not where the purge is accepted: the provider’s 200 means it took the request, the confirmation means every edge has dropped the object. Until then the field is null, and the status stays accepted.',
-    'Scope the read by tenant and answer 404 for anything that is not the caller’s own purge — the same status a nonexistent id gets, so the endpoint never leaks that another tenant’s purge id is real. Return the outcomes map whole: the failed paths are the payload an operator is reading this endpoint for.',
+    'On-call reads `done` for six hours while some edges still serve the broken pricing page, the refused path is missing from the body, and a tenant can read a competitor’s purge by guessing its id.',
+    '`get_purge` calls `store.get(purge_id)` with no tenant check, filters `outcomes` down to `accepted`, and hardcodes `status: "done"`; nothing ever records a confirmation, so acceptance is read as propagation.',
+    'Answer 404 when `purge["tenant"] != tenant`, return `purge["outcomes"]` whole, compute `status` with `derive_status` over `PURGE_STATUSES`, and stamp `propagated_at` only in `mark_propagated` once every path is `OUTCOME_PROPAGATED`.',
   ],
-  debrief: `The interviewer is testing whether the status endpoint can be trusted at 3 a.m. The starter reads fine because the provider is healthy in the demo and every path is accepted, so \`done\` and \`propagated\` coincide. Three contracts are being checked. First, the vocabulary: \`accepted\`, \`propagated\`, \`partially_failed\` map to what the system actually knows, and a word like \`done\` claims something the service cannot verify while edges are catching up — the six-hour stale-pricing incident is exactly that word being believed. Second, the failure surface: hiding the paths that failed turns a partial purge into a silent one, and the operator cannot fix what the response does not show. Third, tenancy: a purge id is a capability, so a foreign read is 404 rather than 403, and the response never confirms that somebody else's purge exists. Real platforms add a \`Retry-After\`-style hint for a pending purge, per-POP propagation detail from the event stream, and an alert when a purge stays \`accepted\` for longer than the propagation SLO.`,
+  debrief: `The fix has its shape because a status endpoint may only state what the system can prove. \`derive_status\` works from the per-path outcomes, so \`propagated\` means every path confirmed and \`partially_failed\` means at least one refused; there is no \`done\`, because done is a claim the service cannot verify while edges are catching up, and the six-hour stale-pricing incident was that word being believed. \`propagated_at\` is stamped by \`mark_propagated\` when the last confirmation lands, so the timestamp carries the same evidence as the status. The whole \`outcomes\` map stays in the body because the failed paths are what an operator came for, and a foreign purge reads as \`404\` so the id is not an oracle for another tenant.
+
+Production platforms add per-POP propagation detail from the event stream and an alert when a purge stays \`accepted\` past the propagation SLO.`,
 };

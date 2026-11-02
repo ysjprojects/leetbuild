@@ -8,32 +8,30 @@ export const transcriptionEndpointStep: Step = {
   focus: ['client', 'api', 'db', 'storage'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the body and creates a job. It compiles, it serves the demo, and it hides three production flaws.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/transcriptions\`, reads the tenant from
+\`X-Tenant-Id\` and a body of \`{"audio_ref", "duration_seconds", "language"}\`, downloads the audio,
+and answers **201** with a random job id and the byte count. It compiles, it serves the demo, and it
+hides four flaws.
 
-Implement \`POST /v1/transcriptions\` with body
-\`{"audio_ref": "s3://bucket/talk.wav", "duration_seconds": 7200, "language": "en"}\`.
+**Failure mode the checks target.** A handler that downloads first and validates second has already
+paid for the bytes of every request it rejects. One that accepts any duration lets a five-hour file
+start a job. One that keys nothing turns every client retry into a second transcription of the same
+file. The fix is an ordering contract: authenticate, validate the metadata, look up the audio hash,
+and only then touch the audio store.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+Requirements for the fixed handler:
+
+- A missing tenant is **401**.
 - \`audio_ref\` is a non-empty string (**400** otherwise).
-- \`duration_seconds\` is an integer from **1** to **14400** (four hours) and anything else is
-  **400**. The decision must be made from the metadata alone: a five-hour submission is rejected
-  before a single byte of audio is fetched.
+- \`duration_seconds\` is an integer from **1** to **14400** (four hours); anything else is **400**,
+  decided from the metadata alone.
 - \`language\` is one of \`en\`, \`es\`, \`fr\`, \`de\`, \`ja\` (**400** otherwise).
-- \`Idempotency-Key\` is required (**400** when missing) and the job is keyed by the **audio hash**,
+- \`Idempotency-Key\` is required (**400** when missing) and the job is keyed by the audio hash,
   \`sha256(audio_ref)\`: a replay of the same audio returns the running job instead of starting a
   second one.
-- Only after the metadata validates may the service download the audio — the fetch call comes
-  *after* the duration and language checks, never before.
+- The \`fetch_audio\` call comes after the duration and language checks, not before.
 - The response reports the job id, a \`queued\` status and the total chunk count derived from the
-  duration at 30 seconds per chunk.
-
-**Failure mode the checks target.** A handler downloads first and validates second,
-so every bad request has already paid for the bytes; it accepts any duration, so a five-hour file
-starts a job; and it keys nothing, so every client retry starts a second transcription. The fix is
-an ordering contract: authenticate, validate the metadata, look up the audio hash, and only then
-touch the audio store.`,
+  duration at 30 seconds per chunk.`,
   sequence: {
     participants: ['Client', 'Transcription API', 'jobs store', 'audio store'],
     messages: [
@@ -165,8 +163,7 @@ def fetch_audio(audio_ref: str) -> bytes:
 
 @app.post("/v1/transcriptions")
 def create_transcription(body: TranscribeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
-    # job on every submit, and never checks the language hint. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     audio = fetch_audio(body.audio_ref)
     job = {"job_id": str(uuid.uuid4()), "bytes": len(audio)}
     return JSONResponse(job, status_code=201)
@@ -249,7 +246,7 @@ def create_transcription(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcriptions: flawed code that downloads first and never dedupes. */
+      starter: `/** POST /v1/transcriptions: the starter. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -265,8 +262,7 @@ interface TranscribeBody {
 const fetchAudio = async (_audioRef: string): Promise<Buffer> => Buffer.alloc(0);
 
 app.post('/v1/transcriptions', async (request, reply) => {
-  // TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
-  // job on every submit, and never checks the language hint. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as TranscribeBody;
   const audio = await fetchAudio(body.audio_ref);
   return reply.code(201).send({job_id: randomUUID(), bytes: audio.byteLength});
@@ -378,8 +374,7 @@ func createTranscription(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
-	// job on every submit, and never checks the language hint. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	audio := fetchAudio(body.AudioRef)
 	log.Printf("transcription ref=%s bytes=%d", body.AudioRef, len(audio))
 	writeJSON(rw, http.StatusCreated, map[string]any{"job_id": uuid.NewString(), "bytes": len(audio)})
@@ -537,8 +532,7 @@ object TranscriptionApi {
     path("v1" / "transcriptions") {
       post {
         entity(as[TranscribeRequest]) { body =>
-          // TODO: this starter accepts any duration, downloads the audio before validating it, starts
-          // a new job on every submit, and never checks the language hint. Fix all four.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val audio = fetchAudio(body.audio_ref)
           val jobId = UUID.randomUUID().toString
           complete(StatusCodes.Created, s"""{"job_id":"$jobId","bytes":\${audio.length}}""")
@@ -648,8 +642,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
-    // job on every submit, and never checks the language hint. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto audioRef = body.value("audio_ref", std::string());
     const auto audio = fetchAudio(audioRef);
     std::cerr << "transcription ref=" << audioRef << " bytes=" << audio.size() << "\\n";
@@ -751,9 +744,9 @@ int main() {
     },
   },
   hints: [
-    'Guard the request before it costs anything: tenant, Idempotency-Key, audio_ref, duration, language. A five-hour file must be a 400 from `duration_seconds` alone — reaching the audio store to find out is already a billable download.',
-    'Key idempotency on the audio, not the request: `sha256(audio_ref)` is stable across retries, and a hit returns the stored running job instead of creating a second one.',
-    'The order of the handler is the contract: validate the metadata, look up the audio hash, and only then call `fetch_audio`. If the download appears before the duration check, every rejection has already paid for the audio.',
+    'Symptom: the egress bill shows a full download for every request the API rejected, a five-hour upload sits in the queue, and one customer has three jobs for one talk after a retry.',
+    'Mechanism: the handler calls `fetch_audio` first, so no check has run when the bytes arrive; it reads no cap, no allowlist and no key, so every submit is new and any duration passes.',
+    'Change: before `fetch_audio`, reject a missing `Idempotency-Key`, a duration outside 1..14400 and a language outside the allowlist with 400; then `store.get(tenant, sha256(audio_ref))` and return a hit, else `store.put` and queue.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary before it spends money. The starter reads fine because the demo sends one well-formed, in-range request and never retries. Three defects are being checked: the missing metadata cap (a five-hour file must be a 400 decided before any download), the missing idempotency key (keyed by the audio hash so a retry resumes the same job instead of starting a second), and the ordering flaw that is the quiet one — the starter downloads the audio first and validates second, so every rejected request has already paid for bytes it will never use. Real pipelines validate the reference and its duration from an index or a manifest, never by pulling the object, and they keep the idempotency record in the same transaction that creates the job.`,
+  debrief: `The fix is an ordering contract because every flaw is a cost paid before a decision. Metadata is free to read and audio is not, so the duration cap and the language allowlist run first and the handler reaches the audio store only once the request has earned it. The idempotency key derives from the audio hash rather than the request because the request changes between retries and the audio does not; keying on what is stable is what lets a replay find the running job. Production pipelines go further. The duration comes from a manifest or the object's header, not the client's claim, and the idempotency record is written in the same transaction as the job, so a crash between the two cannot leave a job without its key.`,
 };

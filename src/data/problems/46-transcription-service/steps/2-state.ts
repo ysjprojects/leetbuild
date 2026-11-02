@@ -8,30 +8,26 @@ export const transcriptionStateStep: Step = {
   focus: ['worker', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it records finished chunks in
-Redis and the demo shows progress. Two workers that receive the same redelivered chunk both
-transcribe it, a failed chunk is marked done anyway, and the set it writes to never expires. Find
-the flaws, fix them, and prove the fix.
-
-The chunk worker records per-chunk progress for a 30-second-chunk job:
-
-- The progress key is **per job**: \`progress:{job_id}:chunks\`, a Redis set whose members are chunk
-  indices. The starter writes every job into one \`progress:chunks\` set, so chunk 7 of one job blocks
-  chunk 7 of every other job and no single job's progress is countable.
-- The claim is **one atomic operation and it runs before the ASR call**: a Lua \`EVAL\` that does
-  \`SISMEMBER\` + \`SADD\` and returns 1 only to the delivery that won. The starter checks on the
-  client, calls the provider, then \`SADD\`s — a redelivered chunk passes the check in both workers
-  and the provider bills twice.
-- A failed chunk is **not** progress: when the provider call throws, release the claim (\`SREM\`) so
-  a retry can transcribe the chunk. The starter catches the failure and marks the chunk done anyway.
-- When the job completes — the set holds the expected chunk count — set an \`EXPIRE\` of **86 400**
-  seconds on the progress key. The starter sets no TTL, so finished jobs pin memory forever.
-- Report the completed chunk count (\`SCARD\`) with the result.
+**Starting point.** The starter handles \`POST /v1/transcriptions/{job_id}/chunks/{index}\`: it
+checks one shared \`progress:chunks\` set for the index, calls the ASR provider, adds the index to
+the set and returns the text. It compiles, it serves the demo, and it hides five flaws.
 
 **Failure mode the checks target.** At-least-once delivery guarantees the same chunk arrives twice,
-and a client-side check-then-act window turns that into two provider calls and two invoices. The
-second failure is quieter: without a TTL a finished job's progress set is memory the service never
-gets back, and a failed chunk that was marked done makes the job look more complete than it is.`,
+and a client-side check-then-act window around the provider call turns that into two provider calls
+and two invoices. The quieter half: a failed chunk recorded as done makes the job look more complete
+than it is, and a progress set with no TTL is memory the service does not get back.
+
+Requirements for the chunk worker of a 30-second-chunk job:
+
+- The progress key is **per job**: \`progress:{job_id}:chunks\`, a Redis set whose members are chunk
+  indices.
+- The claim is **one atomic operation and it runs before the ASR call**: a Lua \`EVAL\` that does
+  \`SISMEMBER\` + \`SADD\` and returns 1 only to the delivery that won.
+- A failed chunk is **not** progress: when the provider call throws, release the claim (\`SREM\`) so
+  a retry can transcribe the chunk.
+- When the job completes (the set holds the expected chunk count) set an \`EXPIRE\` of **86 400**
+  seconds on the progress key.
+- Report the completed chunk count (\`SCARD\`) as \`completed\` in the result.`,
   sequence: {
     participants: ['Chunk worker', 'Redis', 'ASR provider'],
     messages: [
@@ -144,8 +140,7 @@ class ChunkWork(BaseModel):
 
 @app.post("/v1/transcriptions/{job_id}/chunks/{index}")
 def process_chunk(job_id: str, index: int, work: ChunkWork) -> dict:
-    # TODO: the check and the add are two separate commands around the provider call, the key
-    # forgets the job id, a failed chunk is still marked done and nothing ever expires.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = "progress:chunks"
     if r.sismember(key, index):
         return {"job_id": job_id, "chunk": index, "transcribed": False}
@@ -229,7 +224,7 @@ def process_chunk(job_id: str, index: int, work: ChunkWork) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcriptions/:jobId/chunks/:index: flawed code around one chunk. */
+      starter: `/** POST /v1/transcriptions/:jobId/chunks/:index: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -246,8 +241,7 @@ interface ChunkWork {
 app.post('/v1/transcriptions/:jobId/chunks/:index', async (request, reply) => {
   const {jobId, index} = request.params as {jobId: string; index: string};
   const work = request.body as ChunkWork;
-  // TODO: the check and the add are two separate commands around the provider call, the key
-  // forgets the job id, a failed chunk is still marked done and nothing ever expires.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = 'progress:chunks';
   if (await r.sismember(key, index)) {
     return reply.send({job_id: jobId, chunk: Number(index), transcribed: false});
@@ -361,8 +355,7 @@ func processChunk(rw http.ResponseWriter, r *http.Request) {
 	index, _ := strconv.Atoi(r.PathValue("index"))
 	var work chunkWork
 	_ = json.NewDecoder(r.Body).Decode(&work)
-	// TODO: the check and the add are two separate commands around the provider call, the key
-	// forgets the job id, a failed chunk is still marked done and nothing ever expires.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := "progress:chunks"
 	if rdb.SIsMember(ctx, key, index).Val() {
 		_ = json.NewEncoder(rw).Encode(map[string]any{"job_id": jobID, "chunk": index, "transcribed": false})
@@ -487,8 +480,7 @@ object ChunkProgress {
   final case class ChunkWork(audioUri: String, startS: Double, endS: Double, totalChunks: Int)
 
   def processChunk(jobId: String, index: Int, work: ChunkWork, asr: AsrClient): Map[String, Any] = {
-    // TODO: the check and the add are two separate commands around the provider call, the key
-    // forgets the job id, a failed chunk is still marked done and nothing ever expires.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = "progress:chunks"
     if (jedis.sismember(key, index.toString)) {
       Map("job_id" -> jobId, "chunk" -> index, "transcribed" -> false)
@@ -585,8 +577,7 @@ int main() {
   svr.Post("/v1/transcriptions/:jobId/chunks/:index", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto jobId = req.path_params.at("jobId");
     const auto index = req.path_params.at("index");
-    // TODO: the check and the add are two separate commands around the provider call, the key
-    // forgets the job id, a failed chunk is still marked done and nothing ever expires.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const std::string key = "progress:chunks";
     if (redis.sismember(key, index)) {
       res.set_content(json{{"job_id", jobId}, {"chunk", index}, {"transcribed", false}}.dump(), "application/json");
@@ -706,19 +697,9 @@ int main() {
     },
   },
   hints: [
-    'Atomicity belongs around the check-and-add, not around the call. Run one Lua `EVAL` that does `SISMEMBER` + `SADD` before the provider call — the delivery that gets `1` transcribes, the delivery that gets `0` returns without calling the ASR provider at all, so a redelivered chunk cannot re-bill.',
-    'The key is a scope: `progress:{job_id}:chunks` with the chunk index as the member. One shared `progress:chunks` set lets chunk 7 of one job block chunk 7 of another, and there is no way to count a single job’s progress.',
-    'Failure is not progress and memory is not free: `SREM` the claim when the provider call throws so a retry can take the chunk, and set the `EXPIRE` (86400 seconds) the moment `SCARD` reaches the expected chunk count — the TTL belongs to completion, not to every write.',
+    'Symptom: the provider invoice shows chunk 7 of a job billed twice after a broker redelivery, chunk 7 of a second job was skipped outright, and Redis memory climbs with every finished job.',
+    'Mechanism: `SISMEMBER` and `SADD` are separate commands with the provider call between them, so both deliveries pass the check; the key has no job id; the except branch still adds; nothing sets a TTL.',
+    'Change: key `progress:{job_id}:chunks`; claim with one Lua `EVAL` (`SISMEMBER` + `SADD`) before `asr.transcribe`; `SREM` on failure; a completion script that returns `SCARD` and sets `EXPIRE` 86400 when the count is reached.',
   ],
-  debrief: `The interview question here is the difference between "checked" and "claimed". At-least-once
-delivery guarantees the same chunk arrives twice, and a client-side \`SISMEMBER\` followed by the
-provider call and a separate \`SADD\` leaves a window wide enough for both deliveries to pass it —
-in production that window is billed twice. One Lua \`EVAL\` that does the check-and-add in a single
-step, run before the provider call, makes the set itself the claim: the loser returns early without
-touching the ASR provider. Two details get missed next. A failed chunk must be released (\`SREM\`)
-instead of counted, or the job looks more complete than it is and the chunk is never retried. And
-the keys need a lifetime: a finished job's progress set is memory that is never reclaimed unless
-completion sets the 24-hour TTL. Real systems add a lease to the claim so a crashed worker's chunk
-can be retried, drive progress and alerting from the completed count, and treat the progress key as
-a cache — the transcript in the durable store remains the source of truth.`,
+  debrief: `The claim has the shape of one Lua script because the set itself has to be the lock: a check in the client and an add in a second round trip leaves a window, and under at-least-once delivery that window is a second invoice. Running the script before the provider call is what makes the loser cheap, since it returns without touching the ASR provider. Releasing a failed chunk with \`SREM\` keeps the set meaning "transcribed" so a retry can take the chunk, and setting the TTL at completion rather than on every write lets a stalled job keep its progress while a finished one frees its memory. Production workers also lease the claim, so a worker that crashes mid-chunk hands it back after a timeout rather than holding it forever.`,
 };

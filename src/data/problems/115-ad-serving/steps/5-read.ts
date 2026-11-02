@@ -8,29 +8,25 @@ export const readStep: Step = {
   focus: ['advertiser', 'server', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the delivery report: it
-loads the campaign, reads a counter and formats a response. It hides three production flaws, and all
-three end up in the numbers an advertiser is shown. Debug it like the service owner, fix it, and
-prove the fix with the checks below.
-
-Implement \`GET /v1/campaigns/{campaign_id}/delivery\` for the advertiser console.
-
-- \`X-Advertiser-Id\` is required (**401** when missing) and the campaign must belong to that
-  advertiser — a **foreign campaign is 403**, not a redacted report. An unknown campaign is **404**.
-- \`paced_spend_micros\` and the impression count come from **the same counters the serve path
-  writes**, and the impression count is the one taken **at render**: \`counted_at\` says \`render\`
-  and \`reconciled_impressions\` is the count reconciled from render events. Serve-time counts are
-  what the starter reports, and they inflate delivery by every ad that was chosen but never shown.
-- The response includes \`cap_exhausted_at\` — when the pacing budget ran out, if it has — so the
-  console can explain a campaign that stopped early instead of hiding it behind a totals row.
-- The response includes \`under_delivery_impressions\`: the shortfall projected from the campaign's
-  schedule to its end. It must appear **before the campaign ends**, because that is the only time
-  anyone can still fix it.
+**Starting point.** The starter registers \`GET /v1/campaigns/{campaign_id}/delivery\` for the
+advertiser console: it loads the campaign, reads \`served_impressions\` and a raw \`spend_micros\`,
+and returns them with \`counted_at: "serve"\` to whoever asks. It serves the demo and hides four
+flaws, all of which end up in the numbers an advertiser is shown.
 
 **Failure mode the checks target.** The starter counts when the ad was served, so the report is
-optimistic; it omits the projection, so a campaign that will miss its goal looks healthy until the
-last day; and it answers any advertiser for any campaign, which is a data leak between advertisers
-and the kind of bug that ends a partnership rather than a demo.`,
+optimistic; it reports a raw spend with no pacing or exhaustion story, so a campaign that stopped
+early is unexplained; it omits the projection, so a campaign that will miss its goal looks healthy
+until the last day; and it answers any advertiser for any campaign, a data leak between accounts.
+
+- \`X-Advertiser-Id\` is required (**401** when missing) and the campaign must belong to that
+  advertiser: a **foreign campaign is 403**, not a redacted report. An unknown campaign is **404**.
+- \`paced_spend_micros\` and the impression count come from **the same counters the serve path
+  writes**, taken **at render**: \`counted_at\` says \`render\` and \`reconciled_impressions\` is
+  the count reconciled from render events.
+- The response includes \`cap_exhausted_at\`, when the pacing budget ran out if it has, so the
+  console can explain a campaign that stopped early.
+- The response includes \`under_delivery_impressions\`: the shortfall projected from the campaign's
+  schedule to its end, visible **before the campaign ends**, while someone can still fix it.`,
   sequence: {
     participants: ['Advertiser console', 'Ad Server', 'pacing counters', 'campaign store'],
     messages: [
@@ -158,9 +154,7 @@ reader = DeliveryReader()
 
 @app.get("/v1/campaigns/{campaign_id}/delivery")
 def delivery(campaign_id: str) -> JSONResponse:
-    # TODO: this starter reports the counts taken when the ad was served rather than when it was
-    # rendered, omits the under-delivery projection, and answers any campaign for any advertiser.
-    # Fix all three flaws.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     campaign = reader.campaign(campaign_id)
     return JSONResponse(
         {
@@ -268,9 +262,7 @@ interface DeliveryReader {
 declare const reader: DeliveryReader;
 
 app.get('/v1/campaigns/:campaignId/delivery', async (request, reply) => {
-  // TODO: this starter reports the counts taken when the ad was served rather than when it was
-  // rendered, omits the under-delivery projection, and answers any campaign for any advertiser.
-  // Fix all three flaws.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {campaignId} = request.params as {campaignId: string};
   const campaign = await reader.campaign(campaignId);
   return reply.code(200).send({
@@ -373,9 +365,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func delivery(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reports the counts taken when the ad was served rather than when it was
-	// rendered, omits the under-delivery projection, and answers any campaign for any
-	// advertiser. Fix all three flaws.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	campaignID := r.PathValue("campaignID")
 	campaign, err := reader.Campaign(campaignID)
 	if err != nil {
@@ -534,9 +524,7 @@ object DeliveryRead {
     path("v1" / "campaigns" / Segment / "delivery") {
       get {
         campaignId =>
-          // TODO: this starter reports the counts taken when the ad was served rather than when it
-          // was rendered, omits the under-delivery projection, and answers any campaign for any
-          // advertiser. Fix all three flaws.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           val campaign = reader.campaign(campaignId)
           complete(
             StatusCodes.OK,
@@ -664,9 +652,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/campaigns/([^/]+)/delivery)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reports the counts taken when the ad was served rather than when it was
-    // rendered, omits the under-delivery projection, and answers any campaign for any
-    // advertiser. Fix all three flaws.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string campaignId = req.matches[1];
     const auto campaign = reader.campaign(campaignId);
     if (!campaign) {
@@ -770,9 +756,9 @@ int main() {
     },
   },
   hints: [
-    'Read the counters the serve path writes, not a second set of numbers maintained by the report. `render:{campaign_id}` for the delivered impressions, `pace:{campaign_id}` for the paced spend — one source of truth, so the report and the pacing loop cannot disagree.',
-    'Say when the counts were taken: `counted_at: "render"` plus the reconciled count. A report without that label is just a number someone has to trust, and serve-time counts are the optimistic number the starter shipped.',
-    'Project before the end, not after it: derive the shortfall from the schedule and the current rate so the console can alarm while there is still time to raise the pacing. And gate on ownership — a foreign campaign is 403, not a redacted view.',
+    'An advertiser sees 12,000 impressions delivered while their own tag counted 9,000, a campaign that stopped on Tuesday shows no reason, and a rival can open the same report by changing the id.',
+    'The handler calls `reader.campaign` and `reader.served_impressions` with no header check, labels the result `counted_at: "serve"`, and returns raw `spend_micros`. Nothing reads the schedule, the pacing counter or the advertiser id.',
+    'Require `X-Advertiser-Id` (401), compare it with `campaign["advertiser_id"]` (403); return `counted_at: "render"` with `reconciled_impressions`, `paced_spend_micros`, `cap_exhausted_at` from the pacing counters, and `under_delivery_impressions` projected from the schedule.',
   ],
-  debrief: `The interviewer is testing whether the report tells the truth, which in an ad system is a billing question rather than a UI one. Three separate defects are checked: counts taken at render instead of at serve (reconciled against the same counters), a projection that surfaces under-delivery while the campaign can still be fixed, and an ownership check that keeps one advertiser out of another's delivery data. The projection is the one candidates skip, because it is the only part that has to know the campaign's schedule rather than just read a counter — and it is the part an advertiser actually acts on. Real delivery reads add a breakdown by placement and creative, a confidence interval on the projection from the last window's rate, the pacing curve in force at each hour, and an audit trail of who read which campaign's numbers.`,
+  debrief: `In an ad system the report is a billing artefact, so the fix reads the same counters the serve path writes and labels when they were taken, rather than keeping a second set of numbers the console maintains for itself. The ownership check sits first because a report that leaks across advertisers is worse than one that is late. The projection is the part most often skipped, because it is the only field that has to know the campaign's schedule rather than read a counter, and it is the one an advertiser actually acts on. A production delivery read adds a confidence interval on that projection from the last window's rate, so the console can tell a campaign that is slightly behind from one that will certainly miss.`,
 };

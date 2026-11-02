@@ -8,37 +8,28 @@ export const dependencyStep: Step = {
   focus: ['worker', 'effects', 'ledger'],
   task: `## Task
 
-**Starting point.** Step 1 published and pinned the definition; this is the half of \`workflowd\` that
-executes it. The starter is working code: it marks the step done, calls
-\`SendWelcome\`, and when the call deadlines it calls again, so the demo's welcome email goes out. It
-hides the flaw that decides whether a run may be replayed at all — the side effect is guarded by
-nothing. Debug it like the on-call engineer who owns the customer's inbox, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter's \`run_step(run_id, step, payload, stub)\` calls
+\`runs.mark_done(run_id, step)\`, then \`stub.SendWelcome\` under \`DEADLINE_S\`, and on
+\`DEADLINE_EXCEEDED\` calls \`SendWelcome\` once more and returns that reply.
+It compiles and hides five flaws.
 
-Implement \`run_step(run_id, step, payload, stub)\`: one step's side effect over gRPC, exactly once.
+**Failure mode the checks target.** A crash between \`mark_done\` and the call leaves a checkpoint
+that says the step ran and a customer with no email. A timeout whose request did arrive is retried
+on the spot, so that customer gets two emails. Nothing records whether an effect happened, so a
+resumed worker cannot tell.
 
-- Every step's effect carries a **deterministic** id. \`effect_id(run_id, step)\` returns
-  \`f"{run_id}:{step}"\`, so a replay of the same step computes the same key; a fresh uuid per attempt
-  would leave the ledger unable to recognise its own record.
-- Read the **effect ledger** *before* the call: \`done = ledger.done(key)\`, and when it is not
-  \`None\` return the recorded outcome and never touch the target. That read is the replay skip, and
-  the value in \`done\` is exactly what a resumed worker answers with.
-- Call the target under a **2 s deadline** (\`stub.SendWelcome(...)\`, \`timeout=2\`,
-  \`withDeadlineAfter\`, \`set_deadline\`): a call without one pins the worker for as long as the
-  target cares to take.
-- Write in this order: \`ledger.record(key, outcome)\` **first** and
-  \`runs.mark_done(run_id, step)\` **after**. The starter has it the other way round, so a crash
-  between the two loses the effect forever: the checkpoint says the step is done and the email was
-  never sent.
-- A \`DEADLINE_EXCEEDED\` is **ambiguous**, not a failure — the request may have arrived and only
-  the response been lost. Consult the ledger again before any retry, and when it still holds no
-  record for the key, fail loudly instead of resending.
+Requirements:
 
-**Failure mode the checks target.** Marking the step done before the call turns a crash in that
-window into a side effect that is never executed and never retried. Retrying a timeout without the
-ledger sends the welcome email twice to a customer who already got it. Both are invisible in a demo
-where nothing crashes and the target answers in milliseconds, and both are the reason the record
-must come before the checkpoint and a deadline must be reconciled instead of resent.`,
+- \`effect_id(run_id, step)\` returns \`f"{run_id}:{step}"\`: a replay of the same step computes the
+  same ledger key.
+- Read the ledger before the call: \`done = ledger.done(key)\`; when it is not \`None\`,
+  \`return done\` without touching the target.
+- Call \`stub.SendWelcome(...)\` under the 2 s deadline (\`timeout=2\`, \`withDeadlineAfter\`,
+  \`set_deadline\`).
+- After the call, \`ledger.record(key, outcome)\` first and \`runs.mark_done(run_id, step)\` after,
+  so a crash between the two leaves a record the replay returns.
+- On \`DEADLINE_EXCEEDED\` read \`ledger.done(key)\` again: a hit is the outcome, a miss raises
+  instead of resending.`,
   sequence: {
     participants: ['Worker', 'Effect ledger', 'Welcome service'],
     messages: [
@@ -136,7 +127,7 @@ must come before the checkpoint and a deadline must be reconciled instead of res
   ],
   code: {
     python: {
-      starter: `"""One step's side effect over gRPC: flawed code with no effect ledger."""
+      starter: `"""One step's side effect over gRPC: send the welcome email and advance the run."""
 import logging
 
 import grpc
@@ -159,10 +150,7 @@ runs = RunStore()
 
 
 def run_step(run_id: str, step: str, payload: dict, stub: welcome_pb2_grpc.WelcomeStub) -> dict:
-    # TODO: this starter marks the step done before the effect runs, so a crash in between skips the
-    # welcome email forever, and it retries a deadline blindly — a timeout that already sent the
-    # email sends it twice. There is no effect ledger at all: no deterministic effect id, no read
-    # before the call, and no record before the step is marked done.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     runs.mark_done(run_id, step)
     request = welcome_pb2.WelcomeRequest(to=payload["to"], name=payload.get("name", ""))
     try:
@@ -237,7 +225,7 @@ def run_step(run_id: str, step: str, payload: dict, stub: welcome_pb2_grpc.Welco
 `,
     },
     typescript: {
-      starter: `/** One step's side effect over gRPC: flawed code with no effect ledger. */
+      starter: `/** One step's side effect over gRPC: send the welcome email and advance the run. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -281,10 +269,7 @@ export async function runStep(
   payload: WelcomeRequest,
   stub: WelcomeClient,
 ): Promise<Outcome> {
-  // TODO: this starter marks the step done before the effect runs, so a crash in between skips the
-  // welcome email forever, and it retries a deadline blindly — a timeout that already sent the
-  // email sends it twice. There is no effect ledger at all: no deterministic effect id, no read
-  // before the call, and no record before the step is marked done.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await runs.markDone(runId, step);
   try {
     const reply = await stub.sendWelcome(payload, {deadline: Date.now() + DEADLINE_MS});
@@ -407,10 +392,7 @@ func (s *RunStore) MarkDone(ctx context.Context, runID, step string) error { ret
 
 var runs = &RunStore{}
 
-// TODO: this starter marks the step done before the effect runs, so a crash in between skips the
-// welcome email forever, and it retries a deadline blindly — a timeout that already sent the email
-// sends it twice. There is no effect ledger at all: no deterministic effect id, no read before the
-// call, and no record before the step is marked done.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func runStep(ctx context.Context, runID, step string, payload *pb.WelcomeRequest, stub pb.WelcomeClient) (*pb.WelcomeReply, error) {
 	if err := runs.MarkDone(ctx, runID, step); err != nil {
 		return nil, err
@@ -519,10 +501,7 @@ object Effects {
     def markDone(runId: String, step: String): Unit = ()
   }
 
-  // TODO: this starter marks the step done before the effect runs, so a crash in between skips the
-  // welcome email forever, and it retries a deadline blindly — a timeout that already sent the
-  // email sends it twice. There is no effect ledger at all: no deterministic effect id, no read
-  // before the call, and no record before the step is marked done.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def runStep(
       runId: String,
       step: String,
@@ -606,10 +585,7 @@ struct RunStore {
 
 RunStore runs;
 
-// TODO: this starter marks the step done before the effect runs, so a crash in between skips the
-// welcome email forever, and it retries a deadline blindly — a timeout that already sent the email
-// sends it twice. There is no effect ledger at all: no deterministic effect id, no read before the
-// call, and no record before the step is marked done.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 WelcomeReply runStep(const std::string& runId, const std::string& step, const WelcomeRequest& payload, Welcome::Stub* stub) {
   runs.markDone(runId, step);
   grpc::ClientContext ctx;
@@ -690,9 +666,9 @@ Outcome runStep(const std::string& runId, const std::string& step, const Welcome
     },
   },
   hints: [
-    'The ledger key is the effect id: a function of the run and the step (`f"{run_id}:{step}"`), computed the same way on every attempt. A fresh uuid per call makes the ledger useless, because the replay cannot recognise what the first attempt wrote.',
-    'Read before you call: `done = ledger.done(key)`, return `done` when it is not `None`, and only then `stub.SendWelcome(...)`. After the call — never before it — `ledger.record(key, outcome)` and then `runs.mark_done(run_id, step)`: the record has to survive a crash that kills the process before the checkpoint is written.',
-    'A deadline is an unknown, not a failure. Catch it, then call `ledger.done(key)` a second time: a record means the email went out and you return it, no record means it did not and you raise instead of resending, because a second `SendWelcome` is a second email to the customer.',
+    'Symptom: after a worker restart a customer gets two welcome emails, and in another run the checkpoint says `send_welcome` is done but no email was ever sent.',
+    'Mechanism: `run_step` calls `runs.mark_done` first, then `SendWelcome`, and on `DEADLINE_EXCEEDED` calls again. Nothing records whether the first request reached the target.',
+    'Fix: `effect_id` = `f"{run_id}:{step}"`; `done = ledger.done(key)` first, `return done` if set; call, then `ledger.record`, then `runs.mark_done`; after a deadline read `ledger.done` again.',
   ],
-  debrief: `The interviewer is asking one question: what happens if this step runs twice? A workflow step is executed by a worker that can crash between any two lines and be replaced, and the caller of \`SendWelcome\` cannot tell a lost request from a lost response. The deterministic effect id is what makes the ledger able to answer at all — a uuid minted per attempt records an effect nobody will ever look up again. Reading the ledger before the call turns a replay into a lookup, and recording the outcome before the checkpoint means a crash after the email still leaves the run knowing the email happened; the starter's order says the step is done while the email may never have been sent, which is the one failure no one notices until a customer complains. The second read after a deadline is the same idea applied to an ambiguous failure: a timeout means "unknown", and the ledger is the only thing that can resolve it, so a miss is a loud failure rather than a resend. Production adds a TTL and a status column on the ledger row so a long-dead attempt can be retried, an expiry after which an effect is considered abandoned, and a provider-side idempotency key so even the first send is safe.`,
+  debrief: `The worker can crash between any two lines and be replaced, and the caller of \`SendWelcome\` cannot tell a lost request from a lost response, so the fix is an ordering, not a retry policy. The deterministic effect id lets a replay find the first attempt's record. Reading the ledger before the call turns a replay into a lookup. Recording the outcome before the checkpoint means a crash after the email still leaves a record, where the starter's order leaves a step marked done and no email. The second read after a deadline resolves an ambiguous failure the same way, and a miss fails loudly. Production ledgers add a status and expiry on the row, and pass the effect id to the provider as an idempotency key.`,
 };

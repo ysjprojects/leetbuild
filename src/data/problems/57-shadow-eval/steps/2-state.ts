@@ -8,29 +8,25 @@ export const shadowStateStep: Step = {
   focus: ['shadow', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads a config flag, checks a budget and lets
-the shadow proceed. It compiles and the demo admits traffic. What it does when a shadow is disabled
-or when it runs out of budget is the flaw. Debug it, fix it, and prove the fix.
+**Starting point.** The starter is the Redis state layer the request path calls before it runs a
+shadow: \`admit\` reads an enabled flag keyed by shard, then reads the tenant's production quota
+counter, compares it with \`PRODUCTION_LIMIT\` and increments it. It compiles, the demo admits
+traffic, and it hides five flaws.
 
-Implement the Redis state layer the request path calls before it runs a shadow.
+**Failure mode the checks target.** A shadow that spends production state. The starter meters
+shadow traffic on the tenant's production quota key, so a 20 percent shadow can exhaust a tenant's
+real quota; it reads a per-shard flag, so some instances keep shadowing after a disable; and it
+reserves with GET-then-INCR, so two concurrent shadows both spend the last unit.
 
-- Every key is scoped to the config: \`shadow:{config_id}:…\`. The shadow's state never shares a key
-  with production, so a shadow at 20 percent can never draw down a tenant's production quota.
-- The config's enabled state is **one atomic flag** at \`shadow:{config_id}:enabled\`, read **once per
-  request**. There is no per-shard copy: a disable must take effect fleet-wide on the very next
-  request, not after every instance happens to refresh.
-- The shadow budget lives at \`shadow:{config_id}:budget\` with its **own** cap and TTL, reserved by
-  **one atomic operation** (a Lua \`EVAL\`/script or a single atomic counter) — never a read, a check
-  and a separate increment, which two concurrent requests both pass.
-- A disabled shadow returns without writing anything: no reservation, no sample counter, no partial
-  state left behind.
-- The budget key expires on first write (\`EXPIRE\` in the same atomic call), so a stale window cannot
-  silently block a config forever.
+Requirements:
 
-**Failure mode the checks target.** The starter uses the tenant's **production** rate-limit buckets for
-shadow traffic, so a shadow can exhaust a tenant's real quota; it toggles the flag per shard, so some
-instances keep shadowing after a disable; and it reserves with GET-then-INCR, so two concurrent
-shadows both spend the last unit of budget. A disabled shadow still leaves a half-written counter.`,
+- Every key is scoped to the config: \`shadow:{config_id}:…\`, sharing no key with production.
+- The enabled state is **one atomic flag** at \`shadow:{config_id}:enabled\`, read **once per
+  request**; no per-shard copy, so a disable takes effect fleet-wide on the next request.
+- The budget lives at \`shadow:{config_id}:budget\` with its **own** cap and TTL, reserved by **one
+  atomic operation** (a Lua \`EVAL\` script), not a read, a check and a separate increment.
+- A disabled shadow returns without writing anything: no reservation, no counter, no partial state.
+- The budget key expires on first write (\`EXPIRE\` in the same atomic call).`,
   sequence: {
     participants: ['Shadow Service', 'Redis'],
     messages: [
@@ -129,9 +125,7 @@ class ShadowState:
         return self.redis.get(f"shadow:enabled:{config_id}:{shard}") == "1"
 
     def admit(self, config_id: str, tenant: str) -> bool:
-        # TODO: the starter reads the flag per shard, draws the shadow from the tenant's production
-        # quota, and reserves with GET-then-INCR so two concurrent shadows double-spend. A disabled
-        # shadow still leaves the counter half-written. Fix all four.
+        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         if not self.is_enabled(config_id, "shard-0"):
             return False
         window = int(time.time() // 60)
@@ -211,9 +205,7 @@ export class ShadowState {
   }
 
   async admit(configId: string, tenant: string): Promise<boolean> {
-    // TODO: the starter reads the flag per shard, draws the shadow from the tenant's production
-    // quota, and reserves with GET-then-INCR so two concurrent shadows double-spend. A disabled
-    // shadow still leaves the counter half-written. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if (!(await this.isEnabled(configId, 'shard-0'))) return false;
     const window = Math.floor(Date.now() / 60000);
     const key = PRODUCTION_QUOTA_KEY.replace('{tenant}', tenant).replace('{window}', String(window));
@@ -307,9 +299,7 @@ func (s *ShadowState) isEnabled(ctx context.Context, configID, shard string) boo
 }
 
 func (s *ShadowState) Admit(ctx context.Context, configID, tenant string) bool {
-	// TODO: the starter reads the flag per shard, draws the shadow from the tenant's production
-	// quota, and reserves with GET-then-INCR so two concurrent shadows double-spend. A disabled
-	// shadow still leaves the counter half-written. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	if !s.isEnabled(ctx, configID, "shard-0") {
 		return false
 	}
@@ -398,9 +388,7 @@ final class ShadowState(jedis: Jedis) {
     jedis.get(s"shadow:enabled:$configId:$shard") == "1"
 
   def admit(configId: String, tenant: String): Boolean = {
-    // TODO: the starter reads the flag per shard, draws the shadow from the tenant's production
-    // quota, and reserves with GET-then-INCR so two concurrent shadows double-spend. A disabled
-    // shadow still leaves the counter half-written. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if (!isEnabled(configId, "shard-0")) return false
     val window = (System.currentTimeMillis() / 60000L).toString
     val key = s"quota:$tenant:$window"
@@ -482,9 +470,7 @@ class ShadowState {
   }
 
   bool admit(const std::string& configId, const std::string& tenant) {
-    // TODO: the starter reads the flag per shard, draws the shadow from the tenant's production
-    // quota, and reserves with GET-then-INCR so two concurrent shadows double-spend. A disabled
-    // shadow still leaves the counter half-written. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if (!isEnabled(configId, "shard-0")) return false;
     auto used = redis_.get("quota:" + tenant);
     if (used && std::stoi(*used) >= kProductionLimit) return false;
@@ -562,9 +548,9 @@ class ShadowState {
     },
   },
   hints: [
-    'Isolate first, then meter: every key includes the config id, so `shadow:{config_id}:budget` and `shadow:{config_id}:enabled` can never collide with `quota:{tenant}:…`. If you cannot point at the prefix in the key you just built, the shadow can reach production.',
-    'One atomic operation for the reservation. Read the counter, compare it and write it back in one Lua `EVAL` that also sets the TTL on the first increment; a GET followed by an INCR is a race that two concurrent shadows both win.',
-    'Read the flag once, before any write, from one key. A per-shard or per-instance flag means a disable is only eventually true; an early return before the reservation is what guarantees a disabled shadow leaves no partial state behind.',
+    'Symptom: a tenant with a 5 percent shadow starts getting 429s on real traffic at 95 percent of its quota, and an operator who disables the config still sees samples arriving from some instances.',
+    'Mechanism: `admit` increments `quota:{tenant}:{window}`, the same key the production limiter reads, after a flag lookup keyed by `"shard-0"`; and `get` followed by `incr` lets two concurrent requests both see `used < limit`.',
+    'Change: build keys from `SHADOW_PREFIX` (`ENABLED_KEY`, `BUDGET_KEY` with `BUDGET_LIMIT`), read `self.enabled(config_id)` first and return on false, then reserve with one `self.redis.eval(RESERVE_LUA, …)` that refunds over-budget and sets the TTL.',
   ],
-  debrief: `The interviewer is testing whether you can keep a shadow off production state, which is a data-model question, not a Redis trivia question. Three defects are being checked. The namespace: if shadow keys are not scoped by config id they collide with the tenant's production keys, and then a 20 percent shadow can exhaust 100 percent of a tenant's quota — the shadow reached production without calling it. The flag: a per-shard enabled key makes a disable eventually consistent, so the operator turns the shadow off and some instances keep observing. The reservation: GET-then-INCR is the classic read-modify-write race; only one atomic script that increments, refunds and sets the TTL on first write is safe under concurrency, and it is also what makes a disabled shadow leave no partial state. Real runners add a config version to every key so a rolled-back config cannot read the previous run's counters.`,
+  debrief: `The fix is a data-model change before it is a Redis change. Scoping every key under \`shadow:{config_id}:\` is what keeps a shadow off production state: once the budget and the flag live under that prefix, the shadow can exhaust itself without touching \`quota:{tenant}:…\`. One flag in one key makes a disable true fleet-wide on the next read instead of eventually, and reading it before the reservation is what guarantees a disabled shadow leaves no partial counter. GET-then-INCR is the classic read-modify-write race; the Lua script increments, refunds an over-budget increment and sets the TTL in one round trip, so concurrency and expiry are handled in the same place. Production shadow runners also put a config version in every key, so a rolled-back config cannot read the previous run's counters.`,
 };

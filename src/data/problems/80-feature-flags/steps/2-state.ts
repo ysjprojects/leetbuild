@@ -8,29 +8,23 @@ export const stateStep: Step = {
   focus: ['redis', 'engine'],
   task: `## Task
 
-**Starting point.** Every service evaluates flags on every request, so the rule set lives in Redis
-as a **cache of the flag store**. The starter is working code: it caches each flag under its own key
-and computes a bucket from the user id and a salt. It serves the demo and hides two flaws.
+**Starting point.** The starter caches each flag in Redis under its own \`flag:{key}:rules\` entry,
+buckets a user by hashing the user id and a salt, and evaluates from that one entry, returning key,
+value and bucket. It serves the demo and hides four flaws.
 
-Cache the **whole rule set as one versioned snapshot object** under \`flags:snapshot\`, and evaluate a
-flag for a user from that snapshot.
+**Failure mode the checks target.** When ten flags change at once, per-flag entries apply gradually
+and a reader can combine flag A from the new version with flag B from the old one, a torn rule set.
+A keyless bucket hash puts the same users in the tail of every flag.
 
-- The snapshot is a single JSON object \`{"version": N, "flags": {"checkout-redesign": {"salt": …,
-  "rollout": 25, "enabled": true, "default": false}}}\`, read with **one** \`GET flags:snapshot\`. A
-  reader must never observe a rule set stitched from two versions — an update is a **single atomic
-  write of that one key**, so a reader sees either the old object or the new one.
-- Bucketing is deterministic: \`bucket(flag key, user id, salt)\` hashes all three and returns \`0–99\`.
-  The **flag key must be an input**, so each flag splits users independently — with a keyless hash a
-  canary flag and a payment flag put the same users in the same tail.
-- For an unchanged snapshot version the same \`(flag key, user id)\` must land in the same bucket on
-  every instance and every call — no per-call randomness, no clock.
-- \`evaluate\` returns \`{"key", "value", "bucket", "version"}\`, where \`value\` is the flag's \`enabled\`
-  value when \`bucket < rollout\` and its \`default\` otherwise, and \`version\` is the snapshot version
-  that produced the decision.
-
-**The subtle flaw.** The starter writes \`flag:{key}:rules\` per flag, so ten flag changes apply
-gradually and a reader can read flag A from the new version and flag B from the old one — a torn rule
-set. Its bucket hash omits the flag key, so every flag applies the identical split.`,
+- Cache the rule set as one JSON object \`{"version": N, "flags": {"checkout-redesign": {"salt": …,
+  "rollout": 25, "enabled": true, "default": false}}}\` under \`flags:snapshot\`, read with one \`GET\`.
+- An update is a **single atomic write of that key**, so a reader sees the old object or the new one.
+- \`bucket(flag key, user id, salt)\` hashes all three and returns \`0–99\`, so each flag splits users
+  independently.
+- For an unchanged snapshot version the same \`(flag key, user id)\` lands in the same bucket on
+  every instance and call: no per-call randomness, no clock.
+- \`evaluate\` returns \`{"key", "value", "bucket", "version"}\`: \`enabled\` when \`bucket < rollout\`,
+  \`default\` otherwise, and the snapshot version that produced the decision.`,
   sequence: {
     participants: ['Client', 'Evaluation Engine', 'Redis', 'Flag Service'],
     messages: [
@@ -123,9 +117,7 @@ def bucket(user_id: str, salt: str) -> int:
 
 
 def cache_flag(redis: redis_client.Redis, flag: dict) -> None:
-    # TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
-    # gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
-    # every flag buckets a user identically.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     redis.set(f"flag:{flag['key']}:rules", json.dumps(flag))
 
 
@@ -182,9 +174,7 @@ interface CachedFlag {
 }
 
 async function cacheFlag(redis: Redis, flag: CachedFlag): Promise<void> {
-  // TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
-  // gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
-  // every flag buckets a user identically.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   await redis.set(\`flag:\${flag.key}:rules\`, JSON.stringify(flag));
 }
 
@@ -242,9 +232,7 @@ func Bucket(userID, salt string) int {
 }
 
 func CacheFlag(ctx context.Context, rdb *redis.Client, flag map[string]interface{}) error {
-	// TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
-	// gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
-	// every flag buckets a user identically.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(flag)
 	return rdb.Set(ctx, "flag:"+flag["key"].(string)+":rules", payload, 0).Err()
 }
@@ -321,9 +309,7 @@ def bucket(userId: String, salt: String): Int = {
 }
 
 def cacheFlag(redis: RedisClient, flag: Map[String, Any]): Unit = {
-  // TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
-  // gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
-  // every flag buckets a user identically.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   redis.set(s"flag:\${flag("key")}:rules", flag.toString)
 }
 
@@ -395,9 +381,7 @@ int bucket(const std::string& user_id, const std::string& salt) {
   return static_cast<int>(fnv1a(user_id + ":" + salt) % 100);
 }
 
-// TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
-// gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
-// every flag buckets a user identically.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 void cache_flag(httplib::Client& redis, const json& flag) {
   redis.set("flag:" + flag["key"].get<std::string>() + ":rules", flag.dump());
 }
@@ -444,9 +428,9 @@ json evaluate(httplib::Client& redis, const std::string& flag_key, const std::st
     },
   },
   hints: [
-    'Cache the rule set as **one** object under one key and swap that key in a single write. If you update flag-by-flag, a reader can pair flag A from the new version with flag B from the old one.',
-    'The bucket hash must take the **flag key** as an input alongside the user id and the salt, or every flag applies the identical split and the same users sit in the same tail everywhere.',
-    'Keep the salt stable per flag version. A per-call random salt re-buckets a user between evaluations even when nothing about the flag changed.',
+    "During a ten-flag rollout a user briefly gets the new checkout with the old payment rules, and the users in one flag's 25% tail are the same users in every other flag's tail.",
+    'Each `redis.set` on `flag:{key}:rules` lands separately, so a reader between two writes sees a torn rule set; `bucket(user_id, salt)` has no flag input, so identical salts give identical splits.',
+    'Write the whole rule set with one `set` on `flags:snapshot` in `swap_snapshot`, read it with one `get`, hash `flag_key` into `bucket`, and return `snapshot["version"]` with each decision.',
   ],
-  debrief: `The interviewer is testing whether you understand what "cache" means for a rule set read on every request. Two defects are checked: the snapshot must be one object swapped atomically — per-flag entries let a reader observe a torn rule set mid-update — and the bucket hash must include the flag key, or every flag applies the same split and a canary and a payment flag move the same users together. Deterministic bucketing means the same \`(flag key, user id)\` lands in the same bucket for an unchanged version; the follow-up question is how to keep that true across a flag rename, which needs a stable flag id or a per-flag salt rather than the key itself.`,
+  debrief: `One snapshot under one key is the fix because Redis guarantees atomicity per key, not across keys: a single \`SET\` is the cheapest way to make a reader see either the old rule set or the new one. Adding the flag key to the hash gives every flag its own independent split, and returning the version with each decision lets you prove that an unchanged version never re-buckets a user. What this step did not do is survive a flag rename: hashing the key means renaming a flag reshuffles its users, so production evaluators hash a stable flag id or a per-flag salt instead. They also watch the snapshot size, since a rule set read on every request grows until one \`GET\` is the hot path's biggest payload.`,
 };

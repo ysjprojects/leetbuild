@@ -8,33 +8,27 @@ export const refundDependencyStep: Step = {
   focus: ['api', 'psp', 'records'],
   task: `## Task
 
-**Starting point.** The starter is working code for the PSP client: the happy
-path refunds correctly, so the demo passes. Every failure path is wrong, and one of them pays twice.
-Find them, fix them, and prove the fix.
+**Starting point.** The starter is the PSP client: \`refund_via_psp(refund_id, payment_id,
+amount_minor)\` sends one \`Refund\` call with \`idempotency-key = uuid4()\` and no deadline, marks
+the refund confirmed on a reply, and on any \`RpcError\` marks it rejected, releases the whole
+payment with \`ledger.release_payment\` and returns \`FAILED\`. It compiles and hides five flaws.
 
-Implement \`refund_via_psp(refund_id, payment_id, amount_minor)\` — the only way this service moves
-money at the provider:
+**Failure mode the checks target.** A fresh key per call makes any retry a second refund at the
+provider; no deadline lets a wedged PSP hold the refund open; a single attempt gives up on the two
+codes that mean "unknown"; a timeout is written off as a failure while the PSP may have paid; and a
+terminal rejection releases the payment's whole balance instead of this refund's reservation.
 
-- Each attempt carries a **5-second deadline** (\`PSP_DEADLINE_S = 5\`). Without one, a wedged PSP
-  holds the refund open and the customer waits forever.
-- Every attempt sends the **refund id as the \`idempotency-key\` metadata** — the same key on the
-  first try and on every retry. A key generated per attempt makes the PSP see independent refunds,
-  which is exactly how one return gets paid twice.
-- **\`DEADLINE_EXCEEDED\` and \`UNAVAILABLE\` are retryable**, at most **3 attempts**, with the same
-  key and the same deadline each time. Any other status is terminal.
-- A timeout is **not** a failure: the PSP may have applied the refund. When the attempts are
-  exhausted with no answer, record the refund as **\`PENDING\`** and **reconcile** it with
-  \`GetRefund(refund_id)\` before anything is shown to the customer. Reconciliation may turn it into
-  \`CONFIRMED\` with the PSP reference, into \`REJECTED\`, or leave it \`PENDING\` for the next pass.
-- A **terminal rejection** (\`INVALID_ARGUMENT\`, \`FAILED_PRECONDITION\`) records \`REJECTED\` and
-  **releases exactly what was reserved** — the reservation this refund took, never the payment's
-  whole refundable balance.
+Requirements:
 
-**Failure mode the checks target.** The starter calls the PSP once with
-\`idempotency-key = uuid4()\`, so the first retry by any layer in the call chain is a second refund at
-the provider; it treats the resulting timeout as a failure in its own records while the PSP may have
-succeeded; and it releases the payment's balance on a terminal rejection, handing the customer a
-credit it never took.`,
+- Each attempt carries a **5-second deadline** (\`PSP_DEADLINE_S = 5\`, \`timeout=\` on the call).
+- Every attempt sends the **refund id as the \`idempotency-key\` metadata**, retries included.
+- \`DEADLINE_EXCEEDED\` and \`UNAVAILABLE\` are retryable, at most **\`MAX_ATTEMPTS = 3\`**. Any
+  other status is terminal.
+- When the attempts are exhausted with no answer, \`mark_pending\` the refund as **\`PENDING\`**
+  and reconcile it with \`GetRefund(refund_id)\` before the customer sees anything: \`CONFIRMED\`
+  with the PSP reference, \`REJECTED\`, or still \`PENDING\` for the next pass.
+- A terminal rejection (\`INVALID_ARGUMENT\`, \`FAILED_PRECONDITION\`) records \`REJECTED\` and
+  releases exactly what was reserved with \`release_reservation(refund_id)\`.`,
   sequence: {
     participants: ['Refund API', 'PSP', 'refund records'],
     messages: [
@@ -69,7 +63,7 @@ credit it never took.`,
       id: 'deadline',
       title: 'Every attempt carries a 5-second deadline',
       detail:
-        'The call is made with a 5-second deadline — a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + PSP_DEADLINE_MS`. The starter calls the PSP with no deadline at all.',
+        'The call is made with a 5-second deadline: a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + PSP_DEADLINE_MS`. The starter calls the PSP with no deadline at all.',
       match: {
         python: {all: [/PSP_DEADLINE_S\s*=\s*5/, /timeout=PSP_DEADLINE_S/, /\.Refund\(/]},
         typescript: {
@@ -123,7 +117,7 @@ credit it never took.`,
       id: 'terminal-release',
       title: 'A terminal rejection releases only the reservation',
       detail:
-        'A terminal rejection marks the refund `REJECTED` and releases the reservation this refund took — never the payment’s balance. The starter releases the payment, giving away credit it never held.',
+        'A terminal rejection marks the refund `REJECTED` and releases the reservation this refund took, not the payment’s balance. The starter releases the payment, giving away credit it never held.',
       match: {
         python: {all: [/REJECTED/, /release_reservation\(/]},
         typescript: {all: [/REJECTED/, /releaseReservation\(/]},
@@ -173,9 +167,7 @@ ledger = Ledger()
 
 
 def refund_via_psp(refund_id: str, payment_id: str, amount_minor: int) -> str:
-    # TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout
-    # refunds the customer twice; it has no deadline, treats a timeout as a permanent failure, and
-    # releases the whole payment when the PSP rejects the refund. Fix all four.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     metadata = (("idempotency-key", str(uuid.uuid4())),)
     request = psp_pb2.RefundRequest(payment_id=payment_id, amount_minor=amount_minor, ref=refund_id)
     try:
@@ -299,9 +291,7 @@ export const ledger = {
 };
 
 export async function refundViaPsp(refundId: string, paymentId: string, amountMinor: number): Promise<string> {
-  // TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout
-  // refunds the customer twice; it has no deadline, treats a timeout as a permanent failure, and
-  // releases the whole payment when the PSP rejects the refund. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const metadata = new grpc.Metadata();
   metadata.set('idempotency-key', randomUUID());
   try {
@@ -457,9 +447,7 @@ var (
 	ledger  = &Ledger{}
 )
 
-// TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout refunds
-// the customer twice; it has no deadline, treats a timeout as a permanent failure, and releases the
-// whole payment when the PSP rejects the refund. Fix all four.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func refundViaPSP(ctx context.Context, refundID, paymentID string, amountMinor int64) string {
 	callCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("idempotency-key", uuid.NewString()))
 	reply, err := psp.Refund(callCtx, &pb.RefundRequest{PaymentId: paymentID, AmountMinor: amountMinor, Ref: refundID})
@@ -577,9 +565,7 @@ object Client {
     def releasePayment(paymentId: String): Unit = ()
   }
 
-  // TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout
-  // refunds the customer twice; it has no deadline, treats a timeout as a permanent failure, and
-  // releases the whole payment when the PSP rejects the refund. Fix all four.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def refundViaPsp(refundId: String, paymentId: String, amountMinor: Long): String = {
     val headers = new Metadata()
     headers.put(Metadata.Key.of("idempotency-key", Metadata.ASCII_STRING_MARSHALLER), UUID.randomUUID().toString)
@@ -694,9 +680,7 @@ RefundStore records;
 Ledger ledger;
 std::string uuidString();
 
-// TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout refunds
-// the customer twice; it has no deadline, treats a timeout as a permanent failure, and releases the
-// whole payment when the PSP rejects the refund. Fix all four.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 std::string refund_via_psp(const std::string& refund_id, const std::string& payment_id, long long amount_minor) {
   grpc::ClientContext ctx;
   ctx.AddMetadata("idempotency-key", uuidString());
@@ -792,9 +776,9 @@ std::string refund_via_psp(const std::string& refund_id, const std::string& paym
     },
   },
   hints: [
-    'The idempotency key is derived from the refund, not generated at the call site: `metadata=(("idempotency-key", refund_id),)`, `metadata.Pairs(...)`, `headers.put(...)`, `AddMetadata(...)`. Keep it in one constant outside the loop so the retry cannot accidentally compute a new one.',
-    'Bound the retries with `MAX_ATTEMPTS = 3` and retry only `DEADLINE_EXCEEDED` / `UNAVAILABLE`. The deadline goes on the call itself (`timeout=`, `deadline: Date.now() + …`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call in a helper changes nothing.',
-    'A timeout is an **unknown outcome**, not a failure: `mark_pending`, then ask the PSP with `GetRefund` and fold the answer back in. On a terminal rejection, release the reservation this refund took (`release_reservation(refund_id)`) — releasing the payment hands the customer credit the service never held.',
+    'Symptom: one return is credited twice after a slow PSP; another refund hangs forever; a refund the PSP rejected leaves the customer with the whole payment refundable again.',
+    'Mechanism: `uuid.uuid4()` makes every call a new refund to the provider; `psp.Refund` has no `timeout=`; one `except grpc.RpcError` treats a timeout like a rejection and calls `release_payment`.',
+    'Change: `metadata=(("idempotency-key", refund_id),)` once; `range(MAX_ATTEMPTS)` with `timeout=PSP_DEADLINE_S`, retrying only the two unknown codes; exhausted → `mark_pending` then `GetRefund`; terminal → `REJECTED` plus `release_reservation(refund_id)`.',
   ],
-  debrief: `The interviewer is asking one question under several names: what is the worst case of this call, and what do you know after it? A deadline bounds a single attempt; a bounded retry loop with a fixed retryable set bounds the call. The idempotency key is the correctness answer: money movement is not idempotent by default, so the client has to make it so, and the key must be a property of the refund — never of the attempt — or the retry that saves you from a timeout is the retry that pays twice. The third answer is the one candidates miss: a timeout tells you nothing about whether the PSP applied the refund, so the honest local state is \`PENDING\`, and reconciliation with \`GetRefund\` is what turns an unknown into an answer before the customer reads anything. The fourth is the ledger's books: a terminal rejection must release exactly what this refund reserved, because releasing the payment would invent a balance nobody paid. Real clients add jittered backoff, per-PSP concurrency limits, and a reconciliation worker that sweeps pending refunds until the PSP answers.`,
+  debrief: `The shape of the fix follows from one question: what do you know after the call? A deadline bounds a single attempt; a fixed retryable set with a small attempt count bounds the whole call. The idempotency key is a property of the refund rather than of the attempt, because the retry that saves you from a timeout is otherwise the retry that pays twice. A timeout says nothing about whether the PSP applied the refund, so the local state is \`PENDING\` and \`GetRefund\` turns the unknown into an answer before the customer reads anything. A terminal rejection releases exactly what this refund reserved; releasing the payment would invent a balance nobody paid. Production clients also back off with jitter and sweep pending refunds until the PSP answers.`,
 };

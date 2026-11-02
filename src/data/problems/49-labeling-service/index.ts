@@ -17,70 +17,58 @@ import {progressReadStep} from './steps/5-read';
 export const labelingServiceProblem: Problem = {
   id: 'labeling-service',
   title: 'Labeling Service',
-  tagline: 'Human labeling queues with leases, idle-time pre-labels and agreement-safe progress.',
+  tagline: 'Spec-pinned tasks, Redis leases on labeling items and agreement math over task-keyed events.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Labeling Service
 
-A labeling service is the piece of an AI platform that turns raw items into human judgment, and the
-only thing that decides whether it works is what happens to work nobody finished. The visible part
-is a form with a next item in it; the parts that decide whether the queue is healthy are the pinned
-label spec, the lease that returns abandoned items, the failure policy around the pre-label model,
-the event that makes agreement math possible, and the progress view that must not let annotators
-copy each other.
+A labeling service turns raw items into human judgment, and what decides whether it works is what
+happens to work nobody finished. The visible part is a form with a next item in it; the parts that
+keep the queue healthy are the pinned label spec, the lease that returns abandoned items, the
+failure policy around the pre-label model, the event that makes agreement math possible, and the
+progress view that must not let annotators copy each other.
 
 ## The real system
 
-Production labeling queues create a task from an item batch under a frozen spec version, so every
-annotator on that task answers the same question with the same options; an item whose content is
-already in the task under that spec is not queued twice, because a duplicate is a second payment for
-the same answer. Items are handed out with a lease, not a flag: an annotator who closes the tab
-returns their item to the pool when the lease expires, and a claim is one atomic operation so two
-annotators never open the same item. Before an item reaches a human, a cheaper model pre-labels it
-under a short deadline; when that model is unavailable the item still shows up, marked unlabeled, so
-the queue keeps moving instead of stopping. Every submitted label becomes an event keyed by task —
-per-task ordering is what makes agreement computable — and the event is written after the label
-persists, with an outbox when the broker refuses it. And the progress endpoint reports completion and
-agreement statistics without ever handing one annotator the labels another annotator has already
-given.
+Label Studio Enterprise hands out tasks with a **task reservation**: placed the moment an annotator
+opens a task, it blocks other annotators until the annotator submits, skips, or the reservation
+time (configurable, up to 1440 minutes) expires. The reservation honours the project's
+annotations-per-task overlap, and an "enforce strict overlap" setting stops a third annotator from
+piling on after a reservation lapses. Its documentation describes both failure modes this course
+debugs: too long a reservation leaves tasks locked by annotators who cherry-pick easy items; too
+short a one lets a task collect more annotations than the overlap asked for. Agreement columns are
+hidden from annotators in its data manager, the visibility rule step 5 enforces.
 
 ## What you build here
 
 One service, **labeld**, with five pieces:
 
 1. \`POST /v1/tasks\`: an authenticated tenant, a bounded item batch, a required \`spec_version\`
-   the task is pinned to, a reviewer count from 1 to 5, content-hash deduplication within the batch
-   and against the spec, an \`Idempotency-Key\` so a retried create reuses the task, and a response
-   that reports how many items were accepted and how many were duplicates.
+   the task is pinned to, content-hash deduplication, and an \`Idempotency-Key\` so a retried
+   create reuses the task.
 2. A **Redis** assignment pool: \`claim\` takes one item with a 900-second lease in one atomic
-   script, \`renew\` extends only the holder's lease, and \`reclaim\` returns every expired lease to
-   the pool so the pool depth always matches the item records.
+   script, \`renew\` extends only the holder's lease, \`reclaim\` returns expired leases to the pool.
 3. A **gRPC** pre-label client: a 2-second deadline per call, at most two attempts, retries only
-   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, and a failure that marks the item unlabeled with the reason
-   recorded instead of blocking the assignment that is waiting for it.
-4. A **Kafka** label path: one \`label.submitted\` event per submission keyed by **task id**,
-   carrying the label values, the spec version and the time spent, an idempotent producer, an outbox
-   row when the broker rejects the produce, and a consumer that folds labels into agreement counters
-   idempotently before it commits the offset.
-5. \`GET /v1/tasks/{id}/progress\`: completion and per-label agreement for one task, a caller's own
-   labels visible and a peer's labels hidden until they submit, annotators flagged by quality review
-   excluded from the agreement math, and metrics that rebuild from the events alone.
+   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, and a failure that marks the item unlabeled.
+4. A **Kafka** label path: one \`label.submitted\` event per submission keyed by **task id**, an
+   outbox row when the broker rejects the produce, and a consumer that folds labels into agreement
+   counters idempotently before it commits the offset.
+5. \`GET /v1/tasks/{id}/progress\`: completion and per-label agreement, a peer's labels hidden until
+   they submit, flagged annotators excluded from the math, and metrics rebuilt from the events alone.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+Every starter in this course is working code with flaws: it compiles, serves the happy path, and
+looks right. In every step you debug it against the failure modes, fix it, and prove the fix with
 checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Annotator onboarding and identity, pay and productivity accounting, item imports from arbitrary
-sources, label taxonomy governance, gold-standard seeding and onboarding rounds, reviewer escalation
-workflows, per-language pre-label models, and storage of the raw item payloads themselves. The five
-pieces above are the ones that decide whether the queue is correct, fair and shippable.`,
+Annotator onboarding and identity, pay accounting, item imports, label taxonomy governance,
+gold-standard seeding, reviewer escalation workflows, per-language pre-label models, and storage of
+the raw item payloads.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Annotator', sub: 'next item · submit · progress', x: 8, y: 50},

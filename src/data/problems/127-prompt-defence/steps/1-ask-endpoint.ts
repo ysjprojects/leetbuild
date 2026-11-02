@@ -8,35 +8,26 @@ export const askEndpointStep: Step = {
   focus: ['client', 'api', 'docs'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, loads
-the document, caps the question and forwards it to the model. It compiles, it answers the demo
-question, and it hides four production flaws. Debug it like the owner of the ask-a-question
-feature, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/ask\` with body \`{"document_id": "…", "question": "…"}\`.
-
-- The user comes from the authenticated \`X-User-Id\` header; a missing user is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(user, key)\`
-  returns the stored answer instead of asking the model again.
-- Normalise the question before anything else is measured: strip the raw control characters
-  (\`\\x00\`–\`\\x08\`, \`\\x0b\`–\`\\x1f\`, \`\\x7f\` — newline and tab stay) **and** the two-character
-  escape strings \`\\b\` and \`\\r\`, because the source shows both forms, en masse, make the model
-  forget the instructions that precede them. An empty question after normalisation is **400**.
-- Cap the question in **tokens, not characters**: encode it with the model's tokenizer
-  (\`cl100k_base\`) and reject more than **512** tokens with **413**. The source's 450 encoded
-  backspaces were 450 tokens in a few hundred characters; a character cap does not see them.
-- Detect repeated token sequences: for sequences of 1 to 3 tokens, the share of the question covered
-  by the most repeated sequence is its **repeat ratio**; at **64** tokens or more, a ratio above
-  **0.5** is **422**. A single token or a two-token phrase repeated thousands of times is how the
-  model is made to diverge.
-- The document is loaded by id (**404** when unknown); the answer is logged with user, document id
-  and token count — never the question or the document text.
+**Starting point.** The starter registers \`POST /v1/ask\` with body \`{"document_id": "…", "question": "…"}\`,
+reads \`X-User-Id\`, caps the question at 2 000 characters, loads the document and forwards the
+question to the model as it arrived. It compiles and hides four flaws.
 
 **Failure mode the checks target.** A character cap lets a short-looking question carry hundreds of
-control-character tokens; passing the text through unchanged lets those tokens reach the template;
-an un-keyed endpoint asks the model twice for every client retry; and without repeat detection a
-2 048-fold \`jq_THREADS\` sails through to produce someone else's training data. The log line is the
-quiet one: the question is user content and must never be written verbatim.`,
+control-character tokens straight into the template; an un-keyed endpoint asks the model twice per
+client retry; without repeat detection a 2 048-fold \`jq_THREADS\` sails through; and the log line
+prints user content verbatim.
+
+- A missing \`X-User-Id\` is **401**; a missing \`Idempotency-Key\` is **400**. A retry with the
+  same \`(user, key)\` returns the stored answer instead of asking the model again.
+- Before anything is measured, strip the raw control characters (\`\\x00\`–\`\\x08\`,
+  \`\\x0b\`–\`\\x1f\`, \`\\x7f\`; newline and tab stay) **and** the escape strings \`\\b\` and \`\\r\`.
+  An empty question after that is **400**.
+- Cap in **tokens, not characters**: encode with \`cl100k_base\` and reject more than **512**
+  tokens with **413**. The source's 450 encoded backspaces were 450 tokens in a few hundred
+  characters.
+- For sequences of 1 to 3 tokens, the share of the question covered by the most repeated one is
+  its **repeat ratio**; at **64** tokens or more, a ratio above **0.5** is **422**.
+- An unknown document is **404**; log user, document id and token count only.`,
   sequence: {
     participants: ['Client', 'promptguard', 'document store', 'Model'],
     messages: [
@@ -180,8 +171,7 @@ docs = DocumentStore()
 
 @app.post("/v1/ask")
 def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
-    # TODO: this starter caps the question in characters, forwards control characters and repeated
-    # tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     if len(body.question) > MAX_QUESTION_CHARS:
         raise HTTPException(status_code=413, detail="question too long")
     document = docs.get(body.document_id)
@@ -311,8 +301,7 @@ interface AskBody {
 }
 
 app.post('/v1/ask', async (request, reply) => {
-  // TODO: this starter caps the question in characters, forwards control characters and repeated
-  // tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const user = request.headers['x-user-id'] as string;
   const body = request.body as AskBody;
   if (body.question.length > MAX_QUESTION_CHARS) return reply.code(413).send({error: 'question too long'});
@@ -449,8 +438,7 @@ func ask(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter caps the question in characters, forwards control characters and repeated
-	// tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	if len(body.Question) > maxQuestionChars {
 		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "question too long"})
 		return
@@ -661,8 +649,7 @@ object AskApi {
       post {
         headerValueByName("X-User-Id") { user =>
           entity(as[AskRequest]) { body =>
-            // TODO: this starter caps the question in characters, forwards control characters and
-            // repeated tokens to the template, ignores Idempotency-Key and logs the question.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             if (body.question.length > MaxQuestionChars) {
               complete(StatusCodes.RequestEntityTooLarge, """{"error":"question too long"}""")
             } else {
@@ -815,8 +802,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter caps the question in characters, forwards control characters and repeated
-    // tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto question = body.value("question", std::string());
     if (question.size() > kMaxQuestionChars) {
       res.status = 413;
@@ -981,9 +967,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order: user, Idempotency-Key, normalise, encode, token cap, repeat ratio, idempotency lookup, document, model. Every rejection happens before the model is paid for, and the normalisation happens before anything is measured — a cap on the raw text would count control characters that are about to be stripped.',
-    'The source’s point is that the model sees tokens, not characters: 450 JSON-encoded backspaces are 450 tokens. Encode the normalised question with `cl100k_base` and compare the length to 512. For the repeat ratio, count every 1-, 2- and 3-token window; the largest `count × n / len` is how much of the question one phrase covers.',
-    'The idempotency lookup is keyed by `(user, key)` and returns the stored decision with 200 before the document is loaded. Log user, document id and token count only — the question is user content, so it never goes into a log line verbatim.',
+    'A 300-character question full of JSON-encoded backspaces gets a confident answer that ignores the document, a client retry is billed twice, and the question text shows up in the log.',
+    'The starter measures `len(body.question)` in characters while the model counts tokens; nothing strips controls or looks at repetition, and there is no `(user, Idempotency-Key)` lookup before `answer()` is called.',
+    'Strip controls, encode with `cl100k_base`, reject above 512 tokens or a 0.5 repeat ratio at 64+ tokens, return the stored answer for a known `(user, key)`, and log user, document id and token count.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of an LLM feature. The starter reads fine because the demo sends short, clean questions. Four defects are being checked: caps counted in the unit the model counts in (tokens), normalisation of control characters and their escape strings before anything is measured, detection of repeated 1–3 token sequences by the share of the input they cover, and authentication plus idempotency keyed by user so a retry cannot ask the model twice. The log line is the one candidates miss: the question is user content and must never be logged verbatim. Real services add a tokenizer per model, an allow-list for legitimate control characters in code-review use cases (the source names that trade-off), and a per-document token budget so the context cannot crowd out the instructions.`,
+  debrief: `The guards run in cost order: user, key, normalise, encode, cap, repeat ratio, idempotency lookup, document, model. Normalisation precedes measurement because a cap on the raw text would count characters that are about to be stripped, and the cap is in tokens because that is the unit the model and the attack both count in. The repeat ratio uses 1 to 3 token windows since a phrase, not just a single token, is what drives divergence. Keying idempotency by \`(user, key)\` means a client retry never costs a second model call. Production services go further with a tokenizer per model and an allow-list of control characters for workloads such as code review, where a bare \`\\t\` or \`\\x1b\` is legitimate content rather than an attack.`,
 };

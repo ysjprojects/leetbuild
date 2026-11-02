@@ -8,42 +8,32 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'worker', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the pointer swap: it reads the current version,
-writes the new one and returns the old one. It compiles, the demo rotates cleanly, and it hides
-three production flaws — a non-atomic swap, an old version that dies the instant the new one
-activates, and a TTL on the pointer itself. Debug it like the service owner, fix it, and prove the
-fix with the checks below.
+**Starting point.** The starter implements \`activate(name, version_id)\` against Redis: it reads
+\`secret:{name}:active\`, writes the new version into it with \`POINTER_TTL_S\`, and returns the
+previous version id. \`valid_versions(name)\` reads the pointer. It compiles, the demo rotates
+cleanly, and it hides four flaws.
 
-Implement the version pointer in Redis. Three keys per secret, all derived from the name:
+**Failure mode the checks target.** Without an overlap, a fleet mid-deploy fails the moment the
+pointer moves: the 11-minute checkout outage the mock describes. A pointer that expires looks like
+hygiene but drops the newest material after an idle window. Two round trips let concurrent
+rotations lose a previous version. And a retirement that is whatever a TTL did is not a decision.
 
-- \`secret:{name}:active\` — the version a new consumer must use. **No TTL, ever**: an idle week
-  must not make the newest material unreachable while the material itself still exists.
-- \`secret:{name}:overlap\` — the previous version while it is still valid. It carries
-  \`EXPIRE secret:{name}:overlap OVERLAP_SECONDS\`, and nothing else in the flow deletes it.
-- \`secret:{name}:revoked\` — a set of version ids revoked after the fact.
+Three keys per secret:
 
-\`activate(name, version_id)\` publishes a new version:
+- \`secret:{name}:active\`: the version a new consumer must use. **No TTL.**
+- \`secret:{name}:overlap\`: the previous version while still valid, with
+  \`EXPIRE OVERLAP_SECONDS\`; nothing else deletes it.
+- \`secret:{name}:revoked\`: a set of revoked version ids.
 
-- The swap is **one atomic Lua \`EVAL\`** (\`SWAP_SCRIPT\`, key count **2**). The script reads the
-  current pointer, stores it under the overlap key and expires that key, then sets the pointer to
-  the new version, returning the previous version id. Two round trips from the client — a
-  \`GET\` then a \`SET\` — let two rotations interleave and lose a version.
-- \`OVERLAP_SECONDS\` is **900** — at least one deploy cycle. A consumer that fetched the previous
-  version seconds before the swap must keep decrypting until it has redeployed; folding the overlap
-  into the request's own 2-second deadline is not an overlap.
+\`activate(name, version_id)\`:
+
+- The swap is **one atomic Lua \`EVAL\`** (\`SWAP_SCRIPT\`, key count **2**): read the pointer, store
+  it under the overlap key and expire that key, set the pointer, return the previous id.
+- \`OVERLAP_SECONDS\` is **900**, at least one deploy cycle.
 - \`valid_versions(name)\` returns the active version **and**, while the overlap key is alive, the
-  previous one. That list is the answer to "can I still decrypt with what I hold?".
-- \`revoke(name, version_id)\` is **explicit and after the overlap**: it refuses to revoke the
-  active version and otherwise records the version in the revoked set. Revocation must never be an
-  incidental side effect of the overlap key expiring.
-
-**Failure mode the checks target.** The overlap window is the whole reason the pointer is in Redis
-rather than in a column. Without it, a fleet mid-deploy fails hard the moment the pointer moves —
-the 11-minute checkout outage the mock describes. The pointer TTL is the quiet one: it looks like
-hygiene, but an idle window silently drops the key and the newest material becomes unreachable while
-every consumer still believes an older version is current. And a non-atomic swap means two
-concurrent rotations can each read the same previous version, so one of them is never recorded as
-overlapping at all.`,
+  previous one.
+- \`revoke(name, version_id)\` is explicit: it refuses the active version and otherwise adds the
+  version to the revoked set.`,
   sequence: {
     participants: ['Rotation worker', 'Secrets API', 'Redis', 'Fleet consumers'],
     messages: [
@@ -160,8 +150,7 @@ POINTER_TTL_S = 3600
 
 
 def activate(name: str, version_id: str) -> str:
-    # TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
-    # version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     previous = redis_client.get(ACTIVE_KEY.format(name)) or ""
     redis_client.set(ACTIVE_KEY.format(name), version_id, ex=POINTER_TTL_S)
     redis_client.delete(OVERLAP_KEY.format(name))
@@ -233,7 +222,7 @@ def revoke(name: str, version_id: str) -> bool:
 `,
     },
     typescript: {
-      starter: `/** The active-version pointer: flawed code that drops the old version at the swap. */
+      starter: `/** The active-version pointer: the starter. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -243,8 +232,7 @@ const OVERLAP_KEY = (name: string): string => \`secret:\${name}:overlap\`;
 const POINTER_TTL_S = 3600;
 
 export async function activate(name: string, versionId: string): Promise<string> {
-  // TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
-  // version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const previous = (await r.get(ACTIVE_KEY(name))) ?? '';
   await r.set(ACTIVE_KEY(name), versionId, 'EX', POINTER_TTL_S);
   await r.del(OVERLAP_KEY(name));
@@ -329,8 +317,7 @@ func activeKey(name string) string  { return "secret:" + name + ":active" }
 func overlapKey(name string) string { return "secret:" + name + ":overlap" }
 
 func activate(ctx context.Context, name, versionID string) (string, error) {
-	// TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
-	// version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	previous, _ := rdb.Get(ctx, activeKey(name)).Result()
 	if err := rdb.Set(ctx, activeKey(name), versionID, pointerTTL).Err(); err != nil {
 		return "", err
@@ -424,8 +411,7 @@ object SecretState {
   def activeKey(name: String): String = s"secret:$name:active"
   def overlapKey(name: String): String = s"secret:$name:overlap"
 
-  // TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
-  // version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def activate(name: String, versionId: String): String = {
     val previous = jedis.get(activeKey(name))
     jedis.setex(activeKey(name), PointerTtlSeconds, versionId)
@@ -499,8 +485,7 @@ std::string kActiveKey(const std::string& name) { return "secret:" + name + ":ac
 std::string kOverlapKey(const std::string& name) { return "secret:" + name + ":overlap"; }
 
 std::string activate(const std::string& name, const std::string& versionId) {
-  // TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
-  // version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   auto previous = redis->get(kActiveKey(name));
   redis->set(kActiveKey(name), versionId, std::chrono::seconds(kPointerTtlSeconds));
   redis->del(kOverlapKey(name));
@@ -569,9 +554,9 @@ bool revoke(const std::string& name, const std::string& versionId) {
     },
   },
   hints: [
-    'Write the Lua script before the client code: `GET` the pointer into `previous`, `SET` the overlap key to it, `EXPIRE` **the overlap key** for `OVERLAP_SECONDS`, then `SET` the pointer to the new version and return `previous`. The pointer never gets a TTL — if you need expiry hygiene, expire the overlap.',
-    'Call it with an explicit key count (`eval(script, 2, active, overlap, …)`): Redis needs the count to know where keys end and arguments begin, and a script that reads a key from `ARGV` cannot be clustered or analysed.',
-    'The overlap length is a product decision, not a timeout: it must cover the slowest deploy among registered consumers, which is why 900 s beats a 2-second request deadline. And keep `revoke` separate from the TTL: a version retired because every consumer verified it is a different fact from a key that expired.',
+    'Symptom: a rotation runs, every pod still holding the old version fails to decrypt at once, and a week of no rotations later a consumer finds no active version at all.',
+    'Mechanism: `activate` does GET then SET from the client, sets the pointer with `ex=POINTER_TTL_S`, and deletes the overlap key; `valid_versions` only ever reports the pointer, and nothing records a revocation.',
+    'Change: one `SWAP_SCRIPT` via `eval` with key count 2 that writes the overlap key, expires it for `OVERLAP_SECONDS`, and sets the pointer without a TTL; `valid_versions` adds the overlap; `revoke` writes `REVOKED_KEY` with `sadd`.',
   ],
-  debrief: `The interview question here is how you move a pointer without a flag day. Three properties are being checked. Atomicity: read-and-swap in one script, because a client-side GET then SET lets two rotations interleave and lose the previous version entirely. Overlap: the previous version stays valid for a bounded window that is longer than the slowest redeploy, which is the difference between a rotation and an outage. Permanence: the pointer must not expire — the TTL on a pointer is a classic "hygiene" mistake that turns an idle week into missing material, while the overlap key is exactly the thing that should expire. On top of that, revocation is its own explicit step in the revoked set, so "this version must never be used again" is a decision someone made and recorded, not an accident of expiry. Real secret stores add a lease per consumer, a per-version activation timestamp, and a read-through cache that re-checks the pointer instead of holding a version for the process lifetime.`,
+  debrief: `The fix is one Lua script because the swap has three writes that must be seen together: the previous version moves to the overlap key, that key gets its expiry, and the pointer moves. Two client round trips let two rotations interleave and lose a previous version. The overlap length is a product decision rather than a timeout: it must cover the slowest redeploy among registered consumers, hence 900 seconds and not a request deadline. The pointer must not expire, since a TTL there turns an idle week into missing material, while the overlap key is exactly what should expire. Revocation is recorded explicitly so retiring a version is a decision someone made. Production stores add per-consumer leases and read-through caches that re-check the pointer rather than holding a version for the process lifetime.`,
 };

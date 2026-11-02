@@ -8,27 +8,25 @@ export const readStep: Step = {
   focus: ['admin', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: an admin opens the submissions list and sees the
-data. It compiles, it serves the demo, and it turns an admin screen into a data-export tool with no
-role check, no redaction and a filename built from user input. Debug it, fix it, and prove the fix.
+**Starting point.** The starter serves \`GET /v1/forms/{id}/submissions\` to any caller with a
+tenant header, returns the full field values, pages by \`offset\`, and names the export file by
+concatenating the submission id and its values. It compiles, it serves the demo, and it hides 5
+flaws.
 
-Implement \`GET /v1/forms/{id}/submissions\` and the export beside it:
+**Failure mode the checks target.** An admin screen that doubles as a bulk export with no role
+check, no redaction, no record of who took the emails, pages that repeat under concurrent
+submissions, and a filename a submitter controls.
 
-- The read requires the **owner role**. A tenant member who is not the form's owner gets **403**;
-  the starter answers any tenant member with the full payload.
+Requirements:
+
+- The read requires the **owner role**. A tenant member who is not the form's owner gets **403**.
 - The default view is **redacted**: PII fields (\`email\`, \`phone\`) come back as \`[redacted]\`.
   Reading the real values requires the **export** path, and that path writes an **audit record**
   naming the tenant, the form and the generated file.
 - The list **pages by cursor**, not by offset: the response carries the cursor for the next page.
-  An offset shifts when rows are inserted between requests, so a page can repeat or skip rows.
-- Export filenames are **generated**, never derived from field values. Concatenating a submission id
+- Export filenames are **generated**, not derived from field values. Concatenating a submission id
   and its values into a name lets a submitted \`../../etc/passwd\` become a path traversal the moment
-  the export tool writes the file to disk.
-
-**Failure mode the checks target.** The starter answers every tenant member with the full payload, so
-redaction is not the default; it exports PII with no audit trail; it pages by offset, so concurrent
-submissions make pages repeat; and it builds the filename out of user-supplied values, which is a
-path-traversal primitive waiting for the first tool that writes the file.`,
+  the export tool writes the file to disk.`,
   sequence: {
     participants: ['Admin (owner)', 'Form API', 'Submissions store', 'Audit log'],
     messages: [
@@ -44,9 +42,9 @@ path-traversal primitive waiting for the first tool that writes the file.`,
     ],
   },
   hints: [
-    'The default view is for browsing, the export is for extracting. Browsing must not return PII, and extracting must leave a record of who took it and why. Make redaction the shape of the default response and put the raw values only behind the export endpoint.',
-    'Cursor pagination asks the store for "the next 20 after this position". Offset pagination asks for "rows 20 to 40", which changes meaning when a submission arrives in between — that is why a page can repeat a row or skip one.',
-    'A filename is not a place to put data. Generate it — a random id or a timestamp — and keep the submitted values in the file body. A value like `../..` must never reach the filesystem, so it can never be part of a path.',
+    'A support agent with no owner role opens the submissions list and sees every email and phone number. Page 2 repeats the last two rows of page 1 whenever the form is busy.',
+    'The handler checks only that a tenant header exists; it serialises rows as stored, slices them by a numeric `offset` that shifts under inserts, and `filename_from_values` folds submitted text into a path.',
+    'Compare the role to `"owner"` and answer 403, `redact` `email` and `phone` on the list, take and return a `cursor`, name the export `"export_"` plus a generated id, and write an `audit` row before returning PII.',
   ],
   checks: [
     {
@@ -66,7 +64,7 @@ path-traversal primitive waiting for the first tool that writes the file.`,
       id: 'redacted-default',
       title: 'Redacts PII in the default view',
       detail:
-        'The default list response redacts the PII fields, so a browse never returns an email address or a phone number.',
+        'The default list response redacts the PII fields, so a browse does not return an email address or a phone number.',
       match: {
         python: {all: [/redact/]},
         typescript: {all: [/redact/]},
@@ -130,9 +128,7 @@ def filename_from_values(submission_id: str, fields: dict) -> str:
 
 @app.get("/v1/forms/{form_id}/submissions")
 def list_submissions(form_id: str, tenant: str = Header(alias="X-Tenant-Id"), offset: int = 0) -> dict:
-    # TODO: this starter returns the full payloads to any tenant member, builds the export filename by
-    # concatenating field values (so a malicious value becomes a path traversal), pages by offset,
-    # and writes no audit record when PII is exported.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     rows = [row for row in submissions.values() if row["form_id"] == form_id]
     page = rows[offset : offset + 20]
     return {"items": page, "offset": offset}
@@ -220,9 +216,7 @@ function filenameFromValues(submissionId: string, fields: Record<string, string>
 }
 
 app.get('/v1/forms/:id/submissions', async (req, reply) => {
-  // TODO: this starter returns the full payloads to any tenant member, builds the export filename by
-  // concatenating field values (so a malicious value becomes a path traversal), pages by offset,
-  // and writes no audit record when PII is exported.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const {id} = req.params as {id: string};
   const {offset = 0} = req.query as {offset?: number};
   const rows = Object.values(submissions).filter(row => row.formId === id);
@@ -316,9 +310,7 @@ func filenameFromValues(submissionID string, fields map[string]string) string {
 }
 
 func ListSubmissions(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter returns the full payloads to any tenant member, builds the export filename by
-	// concatenating field values (so a malicious value becomes a path traversal), pages by offset,
-	// and writes no audit record when PII is exported.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	rows := make([]storedSubmission, 0)
 	for _, row := range stored {
@@ -431,9 +423,7 @@ object Read {
 
   val routes: Route = path("v1" / "forms" / Segment / "submissions") { _ =>
     get {
-      // TODO: this starter returns the full payloads to any tenant member, builds the export filename
-      // by concatenating field values (so a malicious value becomes a path traversal), pages by
-      // offset, and writes no audit record when PII is exported.
+      // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
       parameter("offset".as[Int].withDefault(0)) { offset =>
         complete(s"""{"items":[],"offset":$offset}""")
       }
@@ -508,9 +498,7 @@ static std::string FilenameFromValues(const std::string& submissionId, const jso
 
 void RegisterRoutes(httplib::Server& svr, const json& submissions) {
   svr.Get("/v1/forms/([^/]+)/submissions", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter returns the full payloads to any tenant member, builds the export filename by
-    // concatenating field values (so a malicious value becomes a path traversal), pages by offset,
-    // and writes no audit record when PII is exported.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const int offset = std::stoi(req.get_param_value("offset"));
     json items = json::array();
     for (const auto& row : submissions) {
@@ -593,5 +581,5 @@ void RegisterRoutes(httplib::Server& svr, const json& submissions) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat a read endpoint as a security boundary and a list endpoint as a data structure. Redaction must be the default because the default is what every future caller gets; raw PII belongs only on a path that names its purpose and leaves a record. The audit row is what turns "someone exported the emails" into a fact you can answer. Cursor paging asks the store for a position in a stable order; offset paging asks for a numeric window that shifts under writes, so a page can repeat or skip rows. And a filename is generated, never derived from a submitted value: concatenating user input into a path hands an attacker \`../..\`, so the values stay in the file body while the name stays opaque. Real systems add per-field redaction policy driven by config, signed download URLs with an expiry, and an export quota per tenant.`,
+  debrief: `A read endpoint is a security boundary and a list endpoint is a data structure, and the fix follows both. Redaction is the default because the default is what every future caller gets; raw PII belongs only on a path that names its purpose and leaves a record, and the audit row is what turns "someone exported the emails" into a fact you can answer. Cursor paging asks the store for a position in a stable order; offset paging asks for a numeric window that shifts under writes, so a page can repeat or skip rows. The filename is generated because concatenating user input into a path hands an attacker \`../..\`: the values stay in the file body while the name stays opaque. What this step did not do: per-field redaction policy driven by config, signed download URLs with an expiry, and an export quota per tenant.`,
 };

@@ -8,33 +8,24 @@ export const dependencyStep: Step = {
   focus: ['meter', 'pricing', 'cache'],
   task: `## Task
 
-The starter is working code: while the pricing service is healthy every report
-gets a rate and the dashboard has a number. Every failure path is wrong. Find them, fix them, and
-prove the fix.
+**Starting point.** The starter implements \`price_for(model)\`, the lookup the meter makes before
+it turns tokens into money: it serves a per-model \`PRICE_CACHE\` entry when one exists, otherwise
+calls \`GetPrice\` with no deadline, falls back to \`FALLBACK_RATE\` on any \`RpcError\`, and caches
+whatever it ends up with. It compiles, serves the demo and hides five flaws.
 
-Implement \`price_for(model)\`, the lookup the meter makes before it turns tokens into money:
+**Failure mode the checks target.** One slow pricing replica holds a metering worker open for as
+long as it takes. A bad minute on the pricing service pins an invented rate on every model looked
+up during it, for the life of the process, marked \`priced: true\`. A model added last week is
+charged at the same invented rate, and no row says which pricing version produced any number.
 
-- Each call carries a **200 ms** deadline (\`PRICE_DEADLINE_S = 0.2\`). The starter calls with no
-  deadline, so one slow pricing replica holds a metering worker — and the request it is serving —
-  open for as long as the replica takes.
-- Rates come back as a **table** with the pricing **version** in it. A successful reply replaces
-  the cached table and its \`fetched_at\`, and the version travels with every price you return so an
-  invoice can be explained months later.
-- When the call fails or misses its deadline the **cached table is the fallback**, and it is only
-  usable while it is no older than \`PRICE_MAX_AGE_S = 3600\`. A table older than that is reported as
-  **uncosted**; a price from last week is a wrong number with no way to tell.
-- A model that is missing from the served table is **uncosted** — \`priced: false\`, \`source:
-  "uncosted"\` — never a hardcoded rate. The starter's \`FALLBACK_RATE\` silently misprices every model
-  the pricing team added after the starter was written, and nothing in the ledger says so.
-- A **failure is never cached**. The starter writes its fallback rate into the per-model cache inside
-  the \`except\` block, so one bad minute on the pricing service pins a wrong rate on that model for
-  as long as the process lives.
-
-**Failure mode the checks target.** The deadline is the loud one (a hung pricing call becomes a
-hung request), the hardcoded rate is the quiet one (it looks like resilience and is a silent
-misprice), and the cached failure is the one that survives every review: a cache that is written on
-the error path turns a transient outage into a permanent, wrong answer — and the version field is
-the only thing that would have made it visible on the invoice.`,
+- Each call carries a **200 ms** deadline (\`PRICE_DEADLINE_S = 0.2\`).
+- Rates come back as a table with the pricing **version** in it. A successful reply replaces the
+  cached table (\`PRICE_TABLE\`) and its \`fetched_at\`; the version travels with every price.
+- When the call fails or misses its deadline the cached table is the fallback (\`source: "cache"\`),
+  usable only while no older than \`PRICE_MAX_AGE_S = 3600\`. An older table means **uncosted**.
+- A model missing from the served table is uncosted (\`priced: false\`, \`source: "uncosted"\`), not
+  a hardcoded rate.
+- A failure is not cached: nothing on the error path writes the table.`,
   sequence: {
     participants: ['Cost Meter', 'Pricing service', 'Rate table'],
     messages: [
@@ -141,9 +132,7 @@ pricing = pricing_pb2_grpc.PricingStub(channel)
 
 
 def price_for(model: str) -> dict:
-    # TODO: put the 200 ms deadline on the call, keep a versioned table as the fallback instead of
-    # a hardcoded rate, answer uncosted for a model the table does not have, and never cache a
-    # failed lookup.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if model in PRICE_CACHE:
         return PRICE_CACHE[model]
     try:
@@ -242,9 +231,7 @@ const {pricing} = grpc.loadPackageDefinition(protoLoader.loadSync('pricing.proto
 const client = new pricing.Pricing('pricing:9000', grpc.credentials.createInsecure());
 
 export async function priceFor(model: string): Promise<Price> {
-  // TODO: put the 200 ms deadline on the call, keep a versioned table as the fallback instead of
-  // a hardcoded rate, answer uncosted for a model the table does not have, and never cache a
-  // failed lookup.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const cached = priceCache[model];
   if (cached !== undefined) return cached;
   let row: Price;
@@ -375,9 +362,7 @@ type Price struct {
 }
 
 func priceFor(ctx context.Context, model string) (Price, error) {
-	// TODO: put the 200 ms deadline on the call, keep a versioned table as the fallback instead of
-	// a hardcoded rate, answer uncosted for a model the table does not have, and never cache a
-	// failed lookup.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	if cached, ok := priceCache[model]; ok {
 		return cached, nil
 	}
@@ -486,9 +471,7 @@ object PricingClient {
   private val stub = PricingGrpc.blockingStub(channel)
 
   def priceFor(model: String): Map[String, Any] = {
-    // TODO: put the 200 ms deadline on the call, keep a versioned table as the fallback instead of
-    // a hardcoded rate, answer uncosted for a model the table does not have, and never cache a
-    // failed lookup.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     priceCache.getOrElseUpdate(
       model, {
         try {
@@ -580,9 +563,7 @@ const double kFallbackRate = 0.002;
 std::unordered_map<std::string, json> price_cache;
 
 json priceFor(const std::string& model) {
-  // TODO: put the 200 ms deadline on the call, keep a versioned table as the fallback instead of a
-  // hardcoded rate, answer uncosted for a model the table does not have, and never cache a failed
-  // lookup.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto cached = price_cache.find(model);
   if (cached != price_cache.end()) return cached->second;
 
@@ -679,9 +660,9 @@ json priceFor(const std::string& model) {
     },
   },
   hints: [
-    'The deadline goes on the call: `timeout=` in Python, `deadline:` in TypeScript, a `context.WithTimeout` in Go, `withDeadlineAfter` in Scala, `set_deadline` in C++. A metering path with an unbounded dependency blocks every request behind it, not just the slow one.',
-    'Two fields make a cached table trustworthy: the pricing `version` and the time it was fetched. Serve the table on failure only while it is within `PRICE_MAX_AGE_S`, and return `uncosted` when it is not — a wrong rate with a version attached is still wrong, and an honest gap is what finance can chase.',
-    'Read the error branch twice: nothing in it may write the cache. Storing a fallback rate there is how an outage becomes a permanent misprice; only a successful reply may replace the table and its timestamp.',
+    'After a ten-minute pricing outage, every model is billed at 0.002 per 1k for the rest of the day, and finance cannot say which rate table any invoice line came from.',
+    'The `except` branch builds a row with `FALLBACK_RATE` and `priced: True`, and `PRICE_CACHE[model] = row` runs on both paths, so the outage result is served from memory until restart.',
+    'Call `GetPrice` with `timeout=PRICE_DEADLINE_S`; on success replace `PRICE_TABLE` with the table, version and `fetched_at`; on `RpcError` serve it only within `PRICE_MAX_AGE_S`, else `uncosted`.',
   ],
-  debrief: `The interviewer is testing failure policy on a dependency that decides money. Three properties matter: the call must be bounded (a deadline, always), the fallback must be a real artifact rather than an invented number (the cached, versioned table, bounded by age), and the fallback must never harden into state (no cache writes on the error path, and an unknown model answered as uncosted). The version field is the part senior candidates add unprompted: without it nobody can answer "why was I charged this rate in March" — and with it, a pricing bug becomes an auditable row instead of an argument. Real meters add cache prewarming before deploys, a breaker in front of the pricing service so a sick dependency is not hammered, and a reconciliation job that reprices a sample of past usage against the current table.`,
+  debrief: `The lookup has three properties because it decides money: the call is bounded by a deadline, the fallback is a real artifact (the last table the pricing service served, with its version and age) rather than an invented number, and the fallback cannot harden into state, so nothing on the error path writes the cache and an unknown model is answered as uncosted. The version is what makes a misprice auditable months later: "why was I charged this rate in March" becomes a row lookup instead of an argument. Production meters also warm the table before a deploy so a new process does not depend on the pricing service for its first requests, and reprice a sample of past usage against the current table to catch drift.`,
 };

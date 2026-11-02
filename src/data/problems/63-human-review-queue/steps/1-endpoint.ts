@@ -8,31 +8,26 @@ export const endpointStep: Step = {
   focus: ['client', 'queue', 'items'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the body and returns
-an item. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/review/items\` with body
+\`{"source_type": "…", "source_id": "…", "priority": "…", "payload_text": "…"}\`: it reads the tenant
+header, builds an item from the body as sent, stores it under \`source_id\` and returns **201**. It
+compiles, serves the demo and hides 4 flaws.
 
-Implement \`POST /v1/review/items\` with body
-\`{"source_type": "…", "source_id": "…", "payload_ref": "…"}\`.
+**Failure mode the checks target.** A noisy integration that sends \`priority: p1\` on every style
+complaint, five workers escalating the same blocked completion, model output copied into the queue's
+retained records, and a request with no tenant that still enqueues.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`source_type\` is one of \`guardrail_block\`, \`user_report\`, \`model_output\` (**400** otherwise).
 - \`source_id\` is a non-empty string of at most **128** characters (**400** otherwise).
 - \`payload_ref\` is a non-empty string (**400** otherwise): a pointer into the retention-managed
-  payload store. The request body must **not** carry the payload text, and the queue row must store
-  only the reference — model output and user text never land in the queue's retained records.
-- \`priority\` is derived **server-side** from the platform's rules: \`guardrail_block\` → \`p1\`,
-  \`user_report\` → \`p2\`, \`model_output\` → \`p3\`. A caller-supplied priority field is ignored.
+  payload store. The request body must **not** carry the payload text, and the queue row stores
+  only the reference.
+- \`priority\` is derived **server-side**: \`guardrail_block\` → \`p1\`, \`user_report\` → \`p2\`,
+  \`model_output\` → \`p3\`. A caller-supplied priority field is ignored.
 - Enqueuing dedupes by \`(source_type, source_id)\`: a second escalation for the same source returns
   the existing item (**200**, \`deduped: true\`) instead of creating a duplicate; a new source is
-  **201** with \`deduped: false\`.
-
-**Failure mode the checks target.** Three defects are being tested. The starter trusts a caller-provided
-\`priority\`, so a noisy integration can mark every style complaint \`p1\` and starve the guardrail
-queue. It accepts duplicate escalations for one source, so five workers noticing the same blocked
-completion create five review tasks. And it inlines the full payload into the queue record, so model
-output and user text are copied into a store with the queue's retention instead of a pointer into the
-payload store that owns its own retention.`,
+  **201** with \`deduped: false\`.`,
   sequence: {
     participants: ['Source / client', 'Review Queue', 'Item store'],
     messages: [
@@ -143,8 +138,7 @@ store = ItemStore()
 
 @app.post("/v1/review/items")
 def enqueue(body: ReviewItem, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter trusts the caller's priority, accepts duplicate escalations for one source
-    # and inlines the full payload into the queue record. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     item = {
         "item_id": body.source_id,
         "tenant": tenant,
@@ -247,8 +241,7 @@ interface ReviewBody {
 const enqueued: unknown[] = [];
 
 app.post('/v1/review/items', async (request, reply) => {
-  // TODO: this starter trusts the caller's priority, accepts duplicate escalations for one source
-  // and inlines the full payload into the queue record. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as ReviewBody;
   const item = {
@@ -381,8 +374,7 @@ func enqueue(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter trusts the caller's priority, accepts duplicate escalations for one source
-	// and inlines the full payload into the queue record. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	item := map[string]any{
 		"item_id":      body.SourceID,
 		"tenant":       tenant,
@@ -534,8 +526,7 @@ object Api {
   def route: Route =
     path("v1" / "review" / "items") {
       post {
-        // TODO: this starter trusts the caller's priority, accepts duplicate escalations for one
-        // source and inlines the full payload into the queue record. Fix all three.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         headerValueByName("X-Tenant-Id") { _ =>
           entity(as[ReviewBody]) { body =>
             items.put(body.sourceId, body)
@@ -628,8 +619,7 @@ int main() {
   httplib::Server svr;
   svr.Post("/v1/review/items", [](const httplib::Request& req, httplib::Response& res) {
     auto body = json::parse(req.body);
-    // TODO: this starter trusts the caller's priority, accepts duplicate escalations for one
-    // source and inlines the full payload into the queue record. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     json item = {
         {"item_id", body["source_id"]},
         {"tenant", req.get_header_value("X-Tenant-Id")},
@@ -741,9 +731,9 @@ int main() {
     },
   },
   hints: [
-    'Priority is a server-side decision. Map `source_type` to a priority in a table you own, and never read a `priority` field from the request body.',
-    'Dedupe needs a stable key. Build one from `(source_type, source_id)`, look it up before you insert, and return the existing item instead of creating a second one.',
-    'The queue row should carry `payload_ref` — a pointer into the retention-managed payload store — not the payload text itself. Reject requests that carry content.',
+    'Symptoms: the p1 queue fills with style complaints, one blocked completion shows up as five review tasks, and a request with no tenant header still lands in the queue.',
+    'The handler copies `priority` and `payload_text` straight from the body, writes with `store.put` without a prior `store.get`, and the tenant header is read but not checked.',
+    'Add a `SOURCE_PRIORITY` table with `derive_priority`, a `dedupe_key` from `(source_type, source_id)` checked with `store.get` before `store.put`, replace `payload_text` with `payload_ref`, and return 401 when the tenant is missing.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one integration and never retries. Three separate defects are being checked: server-side priority derivation (the caller names a source, the platform names the priority — otherwise a noisy integration can starve the guardrail queue), dedupe by source so five workers noticing the same blocked completion create one task, and a payload reference instead of content so model output and user text never land in the queue's retained records. The subtle one candidates miss is the priority: it looks like a harmless convenience field, but it is the queue's fairness control. Real queues add per-tenant source allow-lists, a hashed payload fingerprint for dedupe across source types, and a signed reference so only the queue can fetch the payload.`,
+  debrief: `The fix moves every decision the caller used to make onto the server. Priority is a table the platform owns because it is the queue's fairness control: a convenience field becomes a starvation lever the moment one integration gets noisy. The dedupe key is built from the source, not the item id, so the same blocked completion enqueues once no matter how many workers saw it. The row stores a reference because the payload store owns its retention and the queue must not become a second copy of user text. Production queues go further: per-tenant source allow-lists, a hashed payload fingerprint so the same content under two source types dedupes too, and a signed reference so only the queue can fetch the payload.`,
 };

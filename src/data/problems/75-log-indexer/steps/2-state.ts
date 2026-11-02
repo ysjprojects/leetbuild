@@ -8,31 +8,25 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'writer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it keeps one buffer per index,
-appends a record, and drains a batch of 1000. It compiles, it buffers the happy path, and it hides
-three production flaws — one of them turns a search outage into an out-of-memory kill of the ingest
-tier. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter keeps one Redis hash per \`(tenant, service)\` buffer: \`append\` bumps
+\`count\`, adds to \`bytes\` and sets \`offset\` as three commands; \`offer\` appends and answers 202;
+\`drain\` pops up to \`BUFFER_BATCH\` records. It compiles, it buffers the happy path, and it hides
+four flaws; one of them turns a search outage into an out-of-memory kill of the ingest tier.
 
-Implement the Redis buffer state the writer and the ingest path share:
-
-- One buffer per index, keyed by \`(tenant, service)\`; a shared or tenant-less key lets one service
-  consume another's back-pressure.
-- Appends move the record \`count\`, the \`bytes\` total and the \`offset\` in **one atomic operation**
-  (a single Lua \`EVAL\`, a script object, or one multi-field write). Three separate commands let a
-  crash land between them, and a buffer whose count and offset disagree cannot be drained safely.
-- A per-index byte cap of **64 MiB** (\`64 << 20\`). When a buffer is at or over the cap, the ingest
-  path **sheds**: it answers **429** with a \`Retry-After\` header in seconds and does not append the
-  record. An overflow must never be buffered.
+- One buffer per index, keyed by \`(tenant, service)\`.
+- Appends move \`count\`, \`bytes\` and \`offset\` in **one atomic operation** (one Lua \`EVAL\` or
+  script object); a buffer whose count and offset disagree cannot be drained safely.
+- A per-index byte cap of **64 MiB** (\`64 << 20\`). At or over it the ingest path **sheds**: **429**
+  with a \`Retry-After\` header in seconds, and no append.
 - The cap is checked **before** the append, so a shed record costs one read and no write.
-- Draining takes at most **1000** records (\`BUFFER_BATCH\`) and settles count and bytes in the same
-  atomic step that advances the offset.
-- Give an idle buffer a TTL so a service that stops shipping does not hold memory forever.
+- A drain takes at most **1000** records (\`BUFFER_BATCH\`) and settles count and bytes in the step
+  that advances the offset.
+- Keep the TTL on an idle buffer.
 
-**Failure mode the checks target.** The starter increments count and bytes and sets the offset as three
-independent commands, so a crash between them leaves a buffer that reports one number more record
-than it holds; it never compares the total against a cap, so a shard that stops accepting batches
-grows the buffer until the ingest pod dies; and its \`offer\` returns 202 for every record, so the
-agent keeps shipping into a pipeline that can no longer accept anything.`,
+**Failure mode the checks target.** Three independent commands let a crash leave a buffer reporting
+one more record than it holds; the byte total meets no cap, so a shard that stops accepting batches
+grows the buffer until the ingest pod dies; and \`offer\` answers 202 for every record, so the agent
+keeps shipping into a pipeline that can no longer accept anything.`,
   sequence: {
     participants: ['Ingest API', 'Redis buffer', 'Buffered writer'],
     messages: [
@@ -62,7 +56,7 @@ agent keeps shipping into a pipeline that can no longer accept anything.`,
       id: 'byte-cap',
       title: 'Tracks a per-index byte cap',
       detail:
-        'The buffer keeps a `bytes` total next to the count and compares it with `64 << 20`. The starter counts records but never bytes, so nothing can stop the buffer from growing.',
+        'The buffer keeps a `bytes` total next to the count and compares it with `64 << 20`. The starter has no cap, so nothing can stop the buffer from growing.',
       match: {
         python: {all: [/MAX_BUFFER_BYTES\s*=\s*/, /['"]bytes['"]/]},
         typescript: {all: [/MAX_BUFFER_BYTES\s*=\s*/, /['"]bytes['"]/]},
@@ -101,7 +95,7 @@ agent keeps shipping into a pipeline that can no longer accept anything.`,
       id: 'shed-before-append',
       title: 'Checks the cap before it appends',
       detail:
-        '`over_cap` (or its equivalent) is evaluated before the append, so an overflowing buffer sheds instead of buffering. The starter appends first and asks questions never.',
+        '`over_cap` (or its equivalent) is evaluated before the append, so an overflowing buffer sheds instead of buffering. The starter appends first and checks nothing.',
       match: {
         python: {all: [/over_cap\(/], order: [/over_cap\(tenant, service\)/, /append\(tenant, service/]},
         typescript: {all: [/overCap\(/], order: [/overCap\(tenant, service\)/, /append\(tenant, service/]},
@@ -131,8 +125,7 @@ def bytes_used(tenant: str, service: str) -> int:
 
 
 def append(tenant: str, service: str, record_bytes: int, offset: str) -> None:
-    # TODO: there is no byte cap and no back-pressure, the offset and the count move in separate
-    # commands, and an overflowing buffer keeps growing instead of shedding. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     key = buffer_key(tenant, service)
     r.hincrby(key, "count", 1)
     r.hincrby(key, "bytes", record_bytes)
@@ -268,8 +261,7 @@ export async function append(
   recordBytes: number,
   offset: string,
 ): Promise<void> {
-  // TODO: there is no byte cap and no back-pressure, the offset and the count move in separate
-  // commands, and an overflowing buffer keeps growing instead of shedding. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const key = bufferKey(tenant, service);
   await redis.hincrby(key, 'count', 1);
   await redis.hincrby(key, 'bytes', recordBytes);
@@ -429,8 +421,7 @@ func bytesUsed(ctx context.Context, tenant, service string) (int64, error) {
 
 // Append buffers one record for its index.
 func Append(ctx context.Context, tenant, service string, recordBytes int64, offset string) error {
-	// TODO: there is no byte cap and no back-pressure, the offset and the count move in separate
-	// commands, and an overflowing buffer keeps growing instead of shedding. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	key := bufferKey(tenant, service)
 	if err := rdb.HIncrBy(ctx, key, "count", 1).Err(); err != nil {
 		return err
@@ -610,8 +601,7 @@ object State {
   def bytesUsed(tenant: String, service: String): Long =
     Option(jedis.hget(bufferKey(tenant, service), "bytes")).map(_.toLong).getOrElse(0L)
 
-  // TODO: there is no byte cap and no back-pressure, the offset and the count move in separate
-  // commands, and an overflowing buffer keeps growing instead of shedding. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   def append(tenant: String, service: String, recordBytes: Long, offset: String): Unit = {
     val key = bufferKey(tenant, service)
     jedis.hincrBy(key, "count", 1L)
@@ -738,8 +728,7 @@ long long bytesUsed(sw::redis::Redis& redis, const std::string& tenant, const st
   return raw ? std::stoll(*raw) : 0;
 }
 
-// TODO: there is no byte cap and no back-pressure, the offset and the count move in separate
-// commands, and an overflowing buffer keeps growing instead of shedding. Fix all three.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 void append(sw::redis::Redis& redis, const std::string& tenant, const std::string& service, long long recordBytes, const std::string& offset) {
   const auto key = bufferKey(tenant, service);
   redis.hincrby(key, "count", 1);
@@ -849,9 +838,9 @@ std::vector<std::string> drain(sw::redis::Redis& redis, const std::string& tenan
     },
   },
   hints: [
-    "Back-pressure belongs to the buffer, not to the writer's hope. Compare the buffer's byte total with the `64 << 20` cap on the ingest path and answer **429** with `Retry-After` in seconds; the record is dropped by the caller instead of living in the ingest pod's heap.",
-    'Three commands are three chances to crash: `HINCRBY count`, then `HINCRBY bytes`, then `HSET offset` can stop in the middle, and the buffer then reports a record it does not hold. One Lua `EVAL` (or one script object) does all three — and can enforce the cap on the same round trip, which makes an over-cap append a no-op write.',
-    'The cap check has to happen before the append, not inside a retry afterwards. Keep the read cheap (`HGET bytes`) and let the script be the authority, so a race between two ingest requests cannot both pass an empty buffer and both write.',
+    'During a shard outage the ingest pods grow until the kernel kills them, every agent still gets 202, and after a restart the buffer reports one more record than a drain can find.',
+    '`append` runs `HINCRBY count`, `HINCRBY bytes`, `HSET offset` as separate round trips, so a crash between them splits the state; `offer` reads `bytes` only to report it, so nothing is compared with a limit.',
+    'Add `MAX_BUFFER_BYTES = 64 << 20` and `over_cap` reading `HGET bytes`; call it in `offer` before `append` and answer 429 with `Retry-After`. Move the three writes into one `APPEND_LUA` script run via `eval`.',
   ],
-  debrief: `The interviewer is testing whether you can make a buffer fail in a way that protects the tier in front of it. Three things are being checked. Atomicity: a record count, a byte total and an offset are one fact, so they move in one script — the starter's three commands are individually correct and collectively wrong after any crash. Back-pressure: a buffer with no cap is a shard outage that becomes an out-of-memory kill, so the ingest path must shed with 429 and Retry-After the moment the cap is reached, which is the only place the load can be refused cheaply. And direction: an overflow sheds instead of buffering, so the check runs before the write. Real pipelines add a per-tenant buffer quota, an older-than-the-search-outage retention policy that samples or drops low-severity records first, and a shed counter that is exported and alerted on.`,
+  debrief: `The fix moves the three writes into one Lua script because a count, a byte total and an offset are one fact: Redis runs the script without interleaving, so a crash applies all three or none, and the drain can trust what it reads. The cap lives on the ingest path rather than in the writer because that is the only place load can be refused for the price of one read; a buffer that has stored the record has already paid the memory. Production pipelines go further: a per-tenant quota across all of a tenant's buffers, a retention rule that drops the oldest records once an outage outlasts the cap, and a gauge of buffered bytes per index so the shed rate is visible before the first 429.`,
 };

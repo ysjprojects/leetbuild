@@ -8,31 +8,27 @@ export const feedbackEventsStep: Step = {
   focus: ['router', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-The starter is working code: it produces an event on the happy path and the
-consumer updates counters, so the demo shows numbers moving. Three production contracts are broken.
-Find them, fix them, and prove the fix.
-
-\`POST /v1/feedback\` is how the router reports the outcome of a routed request, and the consumer
-turns those events into per-tenant quality counters.
-
-- Publish **exactly one** \`route.feedback\` event per request with the **tenant** as the message
-  key — partition by tenant keeps each tenant's events ordered. The event **id is the request id**;
-  the payload carries ids, model, outcome and latency.
-- **Never** put the prompt or message text in the event, and never log it: the topic is retained
-  for days and replicated, so tenant content written there outlives every retention policy the
-  request pipeline has.
-- The producer must be **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus hashed, stable keys), so a retry of a produce cannot duplicate a record.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the caller; a relay republishes outbox rows when the broker recovers.
-- The consumer updates the Redis counters (\`HINCRBY quality:{tenant}:{model}\`) and **only then**
-  commits the offset. Commit first and one crash loses the counter update forever, because the
-  offset already moved past the unprocessed record.
+**Starting point.** The starter's \`POST /v1/feedback\` logs the request, builds an event from
+the request id, tenant and prompt, produces it to \`route.feedback\` keyed by the request id and
+flushes; \`consume\` reads the topic, commits, then runs \`HINCRBY\` on the tenant's quality hash.
+It compiles, it serves the demo, and it hides five flaws.
 
 **Failure mode the checks target.** Keying by request id scatters one tenant's events across
 partitions; an unconfigured producer can duplicate on retry; the retained prompt is a data leak
 with a long tail; a failed produce silently loses the event; and commit-before-process trades
-correctness for exactly-once *looking* code.`,
+correctness for exactly-once *looking* code.
+
+- Publish **exactly one** \`route.feedback\` event per request with the **tenant** as the message
+  key. The event **id is the request id**; the payload carries ids, model, outcome and latency.
+- Keep the prompt and message text out of the event and the logs: the topic is retained for days
+  and replicated, so tenant content written there outlives every retention policy the request
+  pipeline has.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
+  \`all\` plus hashed, stable keys), so a retry of a produce cannot duplicate a record.
+- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
+  failing the caller; a relay republishes outbox rows when the broker recovers.
+- The consumer updates the Redis counters (\`HINCRBY quality:{tenant}:{model}\`) and **only then**
+  commits the offset.`,
   sequence: {
     participants: ['Model Router', 'route.feedback', 'Feedback consumer', 'Redis'],
     messages: [
@@ -46,9 +42,9 @@ correctness for exactly-once *looking* code.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=tenant` (or `Key: []byte(tenant)`, `key: tenant`, `ProducerRecord(topic, tenant, …)`). Keyed by the request id, one tenant’s events land in different partitions and their order is no longer guaranteed.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, or required acks `all` with hashed routing. It needs the same message key on every retry, which is the same fix as the tenant key.',
-    'The outbox is the durability half: wrap the produce and, when the broker rejects it, insert the event into the outbox row. In the consumer, do `HINCRBY` first and `commit` second — a crash between the two then replays the record instead of losing it.',
+    'Replay a tenant’s feedback topic and the outcomes arrive out of order; grep the topic and every prompt is there in plain text. Restart the consumer during a Redis blip and some counters stay behind for good.',
+    '`produce` is keyed by `body.request_id`, the `Producer` has only `bootstrap.servers`, the event and the log line both carry `body.prompt`, nothing checks whether the broker accepted the record, and `consume` commits before `hincrby`.',
+    'Produce with `key=tenant`, configure `enable.idempotence` and `acks: all`, drop `prompt` from the event and the log, call `store.insert_outbox` in the except branch, and move `consumer.commit` after `r.hincrby`.',
   ],
   checks: [
     {
@@ -68,7 +64,7 @@ correctness for exactly-once *looking* code.`,
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true`, or required acks `all` with a hash balancer. A retry of a produce must not duplicate the record.',
+        'The producer is configured for idempotence and `acks=all`: `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true`, or required acks `all` with a hash balancer. A retry of a produce must not duplicate the record.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -81,7 +77,7 @@ correctness for exactly-once *looking* code.`,
       id: 'no-text',
       title: 'No prompt or message text in the event or logs',
       detail:
-        'Neither the event payload nor any log line carries the prompt or message text. The starter logs the prompt and copies it into the event — a leak that is retained and replicated with the topic.',
+        'Neither the event payload nor any log line carries the prompt or message text. The starter logs the prompt and copies it into the event, a leak that is retained and replicated with the topic.',
       match: {
         python: {none: [/\bprompt\b/i]},
         typescript: {none: [/\bprompt\b/i]},
@@ -152,9 +148,7 @@ store = OutboxStore()
 
 @app.post("/v1/feedback")
 def feedback(body: FeedbackRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: key by tenant instead of the request id, configure the idempotent producer with
-    # acks=all, keep the prompt and message text out of the event and the logs, and write an
-    # outbox row when the broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     logger.info("feedback tenant=%s prompt=%r", tenant, body.prompt)
     event = {"id": body.request_id, "tenant": tenant, "prompt": body.prompt}
     producer.produce("route.feedback", key=body.request_id, value=json.dumps(event))
@@ -241,7 +235,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** route.feedback: flawed code that keys by request id and commits too early. */
+      starter: `/** route.feedback: producer and quality consumer. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -260,9 +254,7 @@ interface FeedbackBody {
 }
 
 app.post('/v1/feedback', async (request, reply) => {
-  // TODO: key by tenant instead of the request id, configure the idempotent producer with
-  // acks=all, keep the prompt and message text out of the event and the logs, and write an
-  // outbox row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as FeedbackBody;
   request.log.info({tenant, prompt: body.prompt}, 'feedback');
@@ -382,9 +374,7 @@ func feedback(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	body := FeedbackRequest{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: key by tenant instead of the request id, configure acks=all / idempotence, keep the
-	// prompt and message text out of the event and the logs, and write an outbox row when the
-	// broker rejects the produce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	log.Printf("feedback tenant=%s prompt=%q", tenant, body.Prompt)
 	event := map[string]any{"id": body.RequestID, "tenant": tenant, "prompt": body.Prompt}
 	payload, _ := json.Marshal(event)
@@ -507,9 +497,7 @@ object FeedbackApi {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key by tenant instead of the request id, configure the idempotent producer with
-  // acks=all, keep the prompt and message text out of the event and the logs, and write an outbox
-  // row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publish(tenant: String, requestId: String, prompt: String, model: String, outcome: String): Unit = {
     log.info(s"feedback tenant=$tenant prompt=$prompt")
     val payload = Map("id" -> requestId, "tenant" -> tenant, "prompt" -> prompt).toJson.compactPrint
@@ -593,9 +581,7 @@ const std::string kFeedbackTopic = "route.feedback";
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: key by tenant instead of the request id, configure the idempotent producer with acks=all,
-// keep the prompt and message text out of the event and the logs, and write an outbox row when the
-// broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publish(const std::string& tenant, const std::string& requestId, const std::string& prompt) {
   std::cerr << "feedback tenant=" << tenant << " prompt=" << prompt << "\\n";
   const json event = {{"id", requestId}, {"tenant", tenant}, {"prompt", prompt}};
@@ -671,5 +657,5 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by tenant and one tenant’s events arrive in order; key by request id and they do not. Second, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer must apply its state change before the offset commit, or a crash between them loses the update permanently. Third, a broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes, the same pattern the ingest path uses. The prompt leak is the quiet one: the topic retains and replicates whatever you write into it. Real platforms add schema registry validation, per-tenant partition quotas, and dead-letter topics for permanently unprocessable events.`,
+  debrief: `The fix treats the Kafka record as a contract rather than a payload. The key is an ordering contract: partition by tenant and one tenant's events arrive in order, key by request id and they scatter. Idempotence and \`acks=all\` make a retried produce safe, which only works if the key is stable across retries, the same fix twice. The consumer applies \`HINCRBY\` before the commit because an offset that has moved past an unprocessed record cannot be moved back; a crash on the other side replays one record, and counters tolerate that better than losing it. The outbox is the durability answer when the broker refuses the write, and the prompt stays out because the topic retains and replicates everything in it. Production platforms add schema registry validation, per-tenant partition quotas, and a dead-letter topic for records that can never be processed.`,
 };

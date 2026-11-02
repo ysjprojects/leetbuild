@@ -8,38 +8,28 @@ export const dependencyStep: Step = {
   focus: ['api', 'notifier', 'attendee'],
   task: `## Task
 
-**Starting point.** The starter is working code: when an event write commits, the
-notify path calls the notifier and one invitation leaves per attendee, so the demo looks right. The
-starter sends the RPC with no deadline, always declares a full invitation, mints a token inside the retry
-loop and cancels removed attendees whose create never left the service. Debug it like the service
-owner, fix the notify path, and prove the fix with the checks below.
+**Starting point.** The starter's \`notify_attendees(event_id, revision, prev, next, removed)\`
+runs after an event write commits: it loops over the removed attendees and retries each gRPC
+\`Notify\` call up to three times, so one invitation leaves per attendee and the demo looks right.
+It compiles, serves the demo, and hides five flaws.
 
-\`notify_attendees(prev, next, removed)\` runs after the event write commits. It must:
+**Failure mode the checks target.** The token is the subtle one. Minting it inside the retry loop
+looks idempotent because the notifier dedupes on it, but the first attempt times out, the retry
+sends a new token, and the attendee is invited twice. Around it: a call with no deadline pins the
+API worker on a stuck notifier, a timezone correction arrives as a full invite, and a cancel
+leaves for an attendee whose create was not delivered.
 
-- Set a **3 s deadline** on every notification call — \`timeout=3.0\` in Python, a deadline built from
-  \`Date.now() + 3000\` in TypeScript, a context with \`3*time.Second\` in Go, \`DeadlineAfter(3, SECONDS)\`
-  in Scala, a 3 s channel deadline in C++ — and keep the number in a named constant
-  (\`NOTIFY_DEADLINE_S\` and its per-language equivalents). The starter sends the call with no deadline at
-  all, so one stuck notifier pins the API worker.
-- Declare the change kind on the request: \`CHANGE_KIND_CREATE\`, \`CHANGE_KIND_UPDATE\`,
-  \`CHANGE_KIND_CANCEL\` or \`CHANGE_KIND_INSTANCE_EXCEPTION\`, computed from the diff of \`prev\` and
-  \`next\` rather than chosen at the call site. The starter sends a full invitation for every write.
-- Classify a **content-preserving change** as an update: a timezone-only or title-only correction leaves
-  the content fields (\`start\`, \`end\`, \`attendees\`, \`rrule\`) untouched, so \`classify_change\` returns the
-  update kind and no attendee re-responds. The starter escalates the correction to a create.
-- Derive the **idempotency token from the change**, not from the attempt:
-  \`idempotency_token(event_id, revision, kind)\`, or a stored token read before the loop, so a retry
-  after a timeout sends the same token. The starter calls the random-uuid generator inside the retry loop.
-- Send a \`cancel\` only when the original \`create\` was delivered: keep a \`DELIVERED_CREATES\` record and
-  skip the removed attendee whose create never went out. The starter cancels every removed attendee.
-- Bound the retries: at most **3** attempts, only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retryable,
-  and the kind and the token are computed once, outside the loop.
-
-**Failure mode the checks target.** The token is the subtle one. Computing it inside the retry loop
-looks idempotent — the RPC carries a token, so the notifier dedupes — but the first attempt times out,
-the retry mints a new token, and the attendee gets a second invitation. The starter hides two more
-escalations: a timezone correction arrives as a full invite, and a cancel leaves for an attendee whose
-create never reached the mailer.`,
+- Set a **3 s deadline** on every call (\`timeout=\`, \`deadline:\`, \`context.WithTimeout\`,
+  \`withDeadlineAfter\`, \`set_deadline\`) from a named constant (\`NOTIFY_DEADLINE_S\` and
+  per-language equivalents).
+- Declare the change kind on the request (\`CHANGE_KIND_CREATE\`, \`CHANGE_KIND_UPDATE\`,
+  \`CHANGE_KIND_CANCEL\`, \`CHANGE_KIND_INSTANCE_EXCEPTION\`), computed by \`classify_change\` from
+  the diff of \`prev\` and \`next\`; a timezone-only or title-only correction is an update.
+- Derive the token from the change, \`idempotency_token(event_id, revision, kind)\`, so a retry
+  sends the same token.
+- Send a \`cancel\` only when the original \`create\` was delivered (\`DELIVERED_CREATES\`).
+- At most **3** attempts, only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` retry, and kind and token
+  are computed once, outside the loop.`,
   sequence: {
     participants: ['Calendar API', 'Postgres', 'Notifier', 'Attendee mailer'],
     messages: [
@@ -180,11 +170,7 @@ notifier = notifications_pb2_grpc.NotifierStub(channel)
 
 
 def notify_attendees(event_id: str, revision: int, prev: dict, next: dict, removed: list[str]) -> None:
-    # TODO: this starter sends no deadline, always declares a full invitation, mints a fresh token on
-    # every attempt and cancels removed attendees whose create was never delivered. Give each call a
-    # 3 s deadline from a named constant, compute the change kind from the diff of prev and next,
-    # classify a timezone-only correction as an update, derive the idempotency token from the change
-    # so retries share it, and keep a delivered-creates record before cancelling.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     for attendee in removed:
         for _ in range(3):
             request = notifications_pb2.NotifyRequest(
@@ -289,7 +275,7 @@ def notify_attendees(event_id: str, revision: int, prev: dict, next: dict, remov
 `,
     },
     typescript: {
-      starter: `/** Notify path: flawed code that invites everyone on every write. */
+      starter: `/** Notify path: gRPC notifications for calendard event writes. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {randomUUID} from 'node:crypto';
@@ -323,11 +309,7 @@ export async function notifyAttendees(
   next: Record<string, unknown>,
   removed: string[],
 ): Promise<void> {
-  // TODO: this starter sends no deadline, always declares a full invitation, mints a fresh token on
-  // every attempt and cancels removed attendees whose create was never delivered. Give each call a
-  // 3 s deadline from a named constant, compute the change kind from the diff of prev and next,
-  // classify a timezone-only correction as an update, derive the idempotency token from the change
-  // so retries share it, and keep a delivered-creates record before cancelling.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (const attendee of removed) {
     for (let attempt = 0; attempt < 3; attempt++) {
       const request: NotifyRequest = {
@@ -488,11 +470,7 @@ import (
 	pb "calendar/notificationspb"
 )
 
-// TODO: this starter sends no deadline, always declares a full invitation, mints a fresh token on
-// every attempt and cancels removed attendees whose create was never delivered. Give each call a
-// 3 s deadline from a named constant, compute the change kind from the diff of prev and next,
-// classify a timezone-only correction as an update, derive the idempotency token from the change
-// so retries share it, and keep a delivered-creates record before cancelling.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func notifyAttendees(ctx context.Context, client pb.NotifierClient, eventID string, revision int64,
 	prev, next map[string]string, removed []string) {
 	for _, attendee := range removed {
@@ -636,11 +614,7 @@ object NotifyClient {
   private val notifier =
     NotifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("notifier", 9001).usePlaintext().build())
 
-  // TODO: this starter sends no deadline, always declares a full invitation, mints a fresh token on
-  // every attempt and cancels removed attendees whose create was never delivered. Give each call a
-  // 3 s deadline from a named constant, compute the change kind from the diff of prev and next,
-  // classify a timezone-only correction as an update, derive the idempotency token from the change
-  // so retries share it, and keep a delivered-creates record before cancelling.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def notifyAttendees(
       eventId: String,
       revision: Long,
@@ -786,11 +760,7 @@ std::string makeToken() {
   return std::to_string(rng());
 }
 
-// TODO: this starter sends no deadline, always declares a full invitation, mints a fresh token on
-// every attempt and cancels removed attendees whose create was never delivered. Give each call a
-// 3 s deadline from a named constant, compute the change kind from the diff of prev and next,
-// classify a timezone-only correction as an update, derive the idempotency token from the change
-// so retries share it, and keep a delivered-creates record before cancelling.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void notifyAttendees(Notifier::Stub* stub,
                      const std::string& event_id,
                      int revision,
@@ -920,9 +890,9 @@ void notifyAttendees(Notifier::Stub* stub,
     },
   },
   hints: [
-    'The deadline belongs to the call itself — `timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — and the number belongs in a constant beside the attempt bound, so both are visible in the notify path. The starter sends the RPC without one, so a notifier that never answers pins the API worker.',
-    'The change kind is a property of the diff, not of the call site: compare the content fields first and, when only presentation fields moved, return the update kind. A timezone correction that re-invites everyone is exactly the failure the demo hides.',
-    'Compute the token once, before the retry loop, from the event id, revision and kind: a token minted per attempt is a new invitation per attempt. Then keep the delivered-creates record current when a create succeeds, so a later cancel for an attendee who was never invited is skipped.',
+    'An organizer fixes the timezone on a standup and every attendee gets a fresh invitation, one of them twice; a person removed last week receives a cancellation for a meeting they were not told about.',
+    'The starter hard-codes the create kind, calls the uuid generator inside the retry loop, sends the RPC with no deadline, and cancels every removed attendee without asking whether their create was ever delivered.',
+    'Add `NOTIFY_DEADLINE_S` as `timeout=`, compute the kind with `classify_change` and the token with `idempotency_token(event_id, revision, kind)` before the loop, and skip cancels for ids not in `DELIVERED_CREATES`.',
   ],
-  debrief: `The step treats a notification as a side effect with a contract rather than a fire-and-forget RPC. Four properties are being checked: bounded time — a deadline on the call, so a stuck notifier cannot pin the API worker — bounded retries restricted to retryable statuses, an idempotency token derived from the change so a retry dedupes instead of re-inviting, and a change kind computed from the diff so a timezone correction is an update rather than a second invitation. The delivered-creates record is the part candidates miss: a cancel is the consequence of an invite that actually went out, so the notifier needs a delivery record or the pair never holds. Real systems add jittered backoff, a notifier-side dedupe store keyed by the token, and a dead-letter path for a cancel whose create is still in flight.`,
+  debrief: `A notification is a side effect with a contract rather than a fire-and-forget RPC. The deadline lives on the call because the API worker is the resource being protected; the retry bound and the retryable-status set keep a flapping notifier from becoming a storm. The token is derived from the change rather than the attempt because the notifier's dedupe can only recognise what it has seen before: same event, revision and kind means same token. The change kind comes from the diff so a presentation-only edit cannot escalate to an invite, and the delivered-creates record exists because a cancel is the consequence of an invite that went out. At scale the notifier keeps its own dedupe store keyed by token, retries use jittered backoff, and an orphaned cancel lands in a dead-letter queue.`,
 };

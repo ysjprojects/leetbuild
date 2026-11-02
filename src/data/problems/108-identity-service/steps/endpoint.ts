@@ -8,12 +8,10 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the signup endpoint: it registers
-\`POST /v1/users\`, parses the body and writes a user row. It compiles, it serves the demo — one
-signup, from one browser, typed in lowercase — and it hides three production flaws. Debug it like
-the identity service owner, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/users\` with body \`{"email": "…", "phone": "…"}\`.
+**Starting point.** The starter registers \`POST /v1/users\` with body
+\`{"email": "…", "phone": "…"}\`, validates the fields, looks the raw email up in the store and
+writes a user row. It compiles, it serves the demo (one signup, from one browser, typed in
+lowercase) and hides 4 flaws.
 
 - \`Idempotency-Key\` is required (**400** when missing).
 - \`email\` must be an address of at most **254** bytes with a local part and a dotted domain
@@ -252,10 +250,7 @@ def signup(
     body: SignupRequest,
     idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JSONResponse:
-    # TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
-    # and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
-    # creates another account on every retry; and its 409 interpolates the submitted address, so
-    # an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     email = body.email.strip()
     phone = body.phone.strip()
     if store.find_by_email(email) is not None:
@@ -403,10 +398,7 @@ interface SignupBody {
 }
 
 app.post('/v1/users', async (request, reply) => {
-  // TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
-  // and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
-  // creates another account on every retry; and its 409 interpolates the submitted address, so
-  // an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const idemKey = request.headers['idempotency-key'];
   const body = request.body as SignupBody;
   request.log.info({idemKey}, 'signup');
@@ -553,10 +545,7 @@ func signup(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
-	// and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
-	// creates another account on every retry; and its 409 interpolates the submitted address, so
-	// an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	email := body.Email
 	phone := body.Phone
 	if _, found := store.FindByEmail(r.Context(), email); found {
@@ -791,11 +780,7 @@ object SignupApi {
       post {
         optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
           entity(as[SignupRequest]) { body =>
-            // TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two
-            // accounts and (415) 555-0100 and +14155550100 become two identities; it ignores
-            // Idempotency-Key and creates another account on every retry; and its 409
-            // interpolates the submitted address, so an unauthenticated caller can confirm
-            // which addresses already have accounts. Fix all three.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val email = body.email.trim
             val phone = body.phone.trim
             store.findByEmail(email) match {
@@ -954,10 +939,7 @@ int main() {
       res.set_content(R"({"error":"email and phone are required"})", "application/json");
       return;
     }
-    // TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
-    // and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
-    // creates another account on every retry; and its 409 interpolates the submitted address, so
-    // an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto email = body["email"].get<std::string>();
     const auto phone = body["phone"].get<std::string>();
     if (store.findByEmail(email)) {
@@ -1119,24 +1101,21 @@ int main() {
     },
   },
   hints: [
-    'Normalization is not cosmetic: the index has to hold one canonical form. Write `normalize_email`/`normalizeEmail`, fold case everywhere, and fold dots and `+` aliases only for the domains in `FOLD_ALIAS_DOMAINS` — then compare and store what the helper returns, never the raw string the caller sent.',
-    'The comment says the starter creates an account per retry, and the fix is not a flag on the client. Look up `Idempotency-Key` before any claim or write and answer **200** with the `user_id` recorded in the stored row — the retry that arrives while the confirmation mail is in flight must not mint a second account.',
-    'The phone claim must be atomic: `SET NX` on the canonical number, not a lookup followed by an insert, so two signups racing the same recycled number cannot both win. And reuse one constant body for every collision — interpolating the address into the 409 hands an unauthenticated caller an existence oracle for any address.',
+    'Alice signs up as `Alice@x.com`, retries when the confirmation mail is slow, and ends up with two accounts; a stranger posting her address learns from the 409 body that she has one.',
+    'The store compares the raw strings the caller sent, nothing reads `Idempotency-Key` before the write, the phone is checked with a lookup rather than a claim, and the 409 interpolates the address.',
+    'Add `normalize_email` (case fold; dots and `+` only for `FOLD_ALIAS_DOMAINS`) and `normalize_phone` (E.164), look up the key first and answer 200 with the stored `user_id`, `SET NX` the phone before the email claim, and return one constant `SIGNUP_CONFLICT` body.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the identity trust boundary.
-The starter reads fine because the demo signs up once, in lowercase, from one browser and never retries. Three
-defects are being checked. First, identity is a normalization contract: the index may only ever hold the canonical
-form. Case folding is universal; dots and \`+\` aliases are per-domain policy, which is why \`FOLD_ALIAS_DOMAINS\` is a
-set rather than a blanket \`gsub\`. Second, uniqueness must be a claim, not a check: \`find\` followed by \`create\` is a
-race, and the resource being raced is a phone number the carrier will recycle — so the phone is \`SET NX\`'d before
-the email lookup, and a lost claim is a neutral 409 rather than a second account. Third, \`Idempotency-Key\` is what
-makes a slow confirmation email harmless: the retry returns the original \`user_id\` instead of creating an account
-the human never asked for. The subtle one is the response body: \`"email … already exists"\` looks helpful, but it
-converts signup into an unauthenticated enumeration oracle — the fix is one fixed constant body for both
-collisions, with no field name and no address.
+  debrief: `The fix has the shape of a contract on what the index is allowed to hold. Identity is
+canonical form, so \`normalize_email\` runs before any comparison, and \`FOLD_ALIAS_DOMAINS\` is a set
+rather than a blanket \`gsub\` because dots and \`+\` are only aliases where the domain says so.
+Uniqueness is a claim, not a check: \`find\` then \`create\` is a race over a phone number the carrier
+will recycle, so the canonical number is \`SET NX\`'d before the email lookup. \`Idempotency-Key\` is
+looked up first because the retry that lands while the confirmation mail is in flight must return
+the original \`user_id\`. And the 409 is one constant body because an interpolated address turns
+signup into an enumeration oracle.
 
-Real services go further: the canonical address and the canonical number are the only values persisted, the raw
-input is kept only for the audit trail; the confirmation mail is enqueued after the row commits, never before; a
-recycled-number flow lets a legitimate owner re-claim; and the strictest deployments answer every signup with the
-same 202 and let the mail decide, so the status code itself discloses nothing.`,
+Production services persist only the canonical values and keep the raw input for the audit trail,
+enqueue the confirmation mail after the row commits, give a recycled-number flow to the legitimate
+owner, and in the strictest deployments answer every signup with the same 202 so the status code
+itself discloses nothing.`,
 };

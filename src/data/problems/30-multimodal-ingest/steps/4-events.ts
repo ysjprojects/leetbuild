@@ -8,33 +8,29 @@ export const eventsStep: Step = {
   focus: ['ingest', 'kafka', 'consumer', 'indexer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds the event, publishes it
-to \`asset.indexed\` and the consumer reacts. It hides a partition key that is not the asset, a payload
-that carries a permanent URL, and a publish that happens before anything is readable. Find them, fix
-them, and prove the fix.
+**Starting point.** The starter's \`publish_indexed(event)\` produces to \`asset.indexed\` a payload
+of \`asset_id\`, \`uploader\` and a permanent \`object_url\`, keyed by the uploader, with a default
+producer; \`ingest()\` publishes first and upserts the index second. It serves the demo and hides
+five flaws.
 
-Implement the \`asset.indexed\` producer used after an asset is embedded.
+**Failure mode the checks target.** The URL is the one the demo cannot show: a durable, replayable
+pointer to the original bytes handed to every consumer of a topic retained for weeks, which
+bypasses the signed read path. An uploader key merges unrelated assets into one ordering;
+publishing before the index write makes the consumer race the writer and usually lose; a producer
+without \`acks=all\` and idempotence duplicates events on a retried timeout; and a rejected produce
+is dropped with nothing to replay.
 
-- The event is keyed by **asset id** (\`key = asset_id\`), so every event about one asset lands on one
-  partition and a consumer sees them in order. Keying by uploader scatters one asset's events across
-  partitions and orders them against every other asset of that user.
-- The payload carries **facts**: \`asset_id\`, \`tenant\`, \`checksum\`, \`embedding_ids\`, \`mime\`,
-  \`degraded\`. It never carries a **URL** — a permanent object URL in a retained topic is a read
-  credential that outlives the asset, the tenant and the retention policy.
-- Publish **after** the index write confirms: a consumer that reacts to an event must be able to read
-  the asset it names. The starter produces first and indexes second, so the consumer races the writer.
+The \`asset.indexed\` producer used after an asset is embedded:
+
+- Keyed by **asset id** (\`key = asset_id\`), so every event about one asset lands on one
+  partition and a consumer sees them in order.
+- The payload carries **facts**: \`asset_id\`, \`tenant\`, \`checksum\`, \`embedding_ids\`,
+  \`mime\`, \`degraded\`. No URL.
+- Published **after** the index write confirms, in source order and call order.
 - The producer is idempotent and waits for the leader: \`acks=all\` with \`enable.idempotence\`
-  (\`idempotent: true\` in kafkajs, \`RequiredAcks: RequireAll\` in kafka-go). A retry after a timeout
-  must not duplicate an event, and a broker that has not acknowledged must not look like success.
-- When the produce is **rejected**, write an **outbox row** (\`asset_events_outbox\`) with the topic,
-  key, payload and error, and let the relay republish it. The starter drops the event on the floor.
-
-**Failure mode the checks target.** The URL is the subtle one: the demo works, the consumer works, and
-the payload looks helpful. What it actually does is hand a durable, replayable pointer to the original
-bytes to every consumer of a topic that is retained for weeks — the signed-access design of the read
-path bypassed by an event. The key and the ordering are the next two: an uploader key merges unrelated
-assets into one ordering, and publishing before the index write turns Kafka into a race the consumer
-usually loses.`,
+  (\`idempotent: true\` in kafkajs, \`RequiredAcks: RequireAll\` in kafka-go).
+- A **rejected** produce writes an **outbox row** (\`asset_events_outbox\`) with the topic, key,
+  payload and error, and the relay republishes it.`,
   sequence: {
     participants: ['Ingest API', 'Indexer', 'asset.indexed', 'Event consumer'],
     messages: [
@@ -52,9 +48,9 @@ usually loses.`,
     ],
   },
   hints: [
-    'The key decides the partition, and the partition decides the order. Key by `asset_id` so everything about one asset is serialized; never key by the uploader, which is a different ordering question the consumer did not ask.',
-    'Publish only after the index write returns. The event is a promise that the data is readable, so producing it first makes the consumer race the writer for the same asset.',
-    '`acks=all` plus idempotence makes a retry safe, but it does not make a rejected produce disappear: catch it and insert an outbox row (topic, key, payload, error) so a relay can republish it and the consumer can dedupe on the asset id.',
+    'A consumer fetched an asset the event named and got 404; a week later a security review found object URLs in a topic dump that still download without a signature.',
+    'The starter calls `publish_indexed` before `index.upsert`, so the event precedes the data; the payload embeds `object_url`; the key is `event["uploader"]`; and a broker error propagates with nothing recorded.',
+    'Upsert, then `produce(topic, key=asset_id, value=…)` with `checksum` and `embedding_ids`; configure `acks=all` and `enable.idempotence`; on a rejected produce call `record_outbox` into `OUTBOX_TABLE`.',
   ],
   checks: [
     {
@@ -137,9 +133,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_indexed(event: dict) -> None:
-    # TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
-    # retained topic, publishes before the index write confirms, and drops the event when the
-    # broker rejects it.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = json.dumps(
         {
             "asset_id": event["asset_id"],
@@ -239,9 +233,7 @@ interface AssetEvent {
 }
 
 export async function publishIndexed(event: AssetEvent): Promise<void> {
-  // TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
-  // retained topic, publishes before the index write confirms, and drops the event when the broker
-  // rejects it.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: TOPIC,
     messages: [
@@ -349,9 +341,7 @@ var writer = &kafka.Writer{
 }
 
 func publishIndexed(ctx context.Context, event IndexedEvent) error {
-	// TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
-	// retained topic, publishes before the index write confirms, and drops the event when the
-	// broker rejects it.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(map[string]any{
 		"asset_id":   event.AssetID,
 		"uploader":   event.Uploader,
@@ -456,9 +446,7 @@ object Events {
   private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
   def publishIndexed(event: IndexedEvent): Unit = {
-    // TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
-    // retained topic, publishes before the index write confirms, and drops the event when the
-    // broker rejects it.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"asset_id":"\${event.asset_id}","uploader":"\${event.uploader}","object_url":"https://objects.internal/\${event.asset_id}.png"}"""
     producer.send(new ProducerRecord[String, String](Topic, event.uploader, payload))
   }
@@ -537,9 +525,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 auto producer = make_producer();
 
 void publish_indexed(const json& event) {
-  // TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
-  // retained topic, publishes before the index write confirms, and drops the event when the broker
-  // rejects it.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto uploader = event.at("uploader").get<std::string>();
   const std::string payload =
       json{{"asset_id", event.at("asset_id")}, {"object_url", "https://objects.internal/" + uploader + ".png"}}.dump();
@@ -627,16 +613,12 @@ void ingest(IndexClient& index, const Asset& asset) {
 `,
     },
   },
-  debrief: `The interviewer is testing what an event is allowed to contain. The starter's payload is the shape a
-model reaches for when it is asked to "notify the rest of the platform": the id, who did it, and where
-the file is. That last field is the bug — a URL that lives for weeks in a retained, replicated topic is
-a read credential nobody signed, and the read endpoint's 15-minute expiry is bypassed by whoever reads
-the topic.
-
-The key and the order are the next two. A partition key is a promise about ordering: keyed by asset,
-every event about the asset is serialized; keyed by uploader, two assets of the same user interleave
-and the consumer throttles work it does not need to. Publishing before the index write is a promise
-that the data is there. Real systems also carry a schema version and an event id in the payload so a
-consumer can dedupe on replay, and drive the relay from the outbox with the same idempotent producer,
-so a broker outage costs latency instead of data.`,
+  debrief: `The starter's payload is the shape "notify the rest of the platform" suggests: the id, who did it,
+and where the file is. That last field is a read credential nobody signed, and a retained,
+replicated topic keeps it for weeks after the read endpoint's 15-minute expiry. A partition key is a
+promise about ordering: keyed by asset, every event about the asset is serialized; keyed by
+uploader, two assets of one user interleave and the consumer serializes work it did not need to.
+Publishing after the index write is the other promise, that the data the event names can be read.
+Production producers also put a schema version and an event id in the payload so a consumer can
+dedupe on replay, and drive the outbox relay with the same idempotent producer.`,
 };

@@ -8,25 +8,23 @@ export const readStep: Step = {
   focus: ['client', 'gateway', 'transcripts'],
   task: `## Task
 
-**Starting point.** The starter is working code: it returns the transcript for
-the session id it was given, so the demo shows turns. It leaks across tenants and hides two
-unbounded responses. Find them, fix them, and prove the fix.
-
-Implement \`GET /v1/voice/sessions/{session_id}\`, returning the session transcript.
-
-- Turns are ordered by \`turn_index\` and each turn carries \`turn_index\`, \`started_at\`, \`ended_at\`
-  and \`redaction_spans\` — the character ranges redacted before the transcript was stored.
-- The page is capped at **500 turns** (\`MAX_TURNS\`) and paginated with an opaque \`next_cursor\`
-  derived from the last turn's index; a caller walks a 30-minute session in pages and the cap holds
-  on every page. \`limit\` may shrink the page, never exceed the cap.
-- The tenant comes from \`X-Tenant-Id\`; a session that belongs to another tenant is **404**, exactly
-  like a session that does not exist — never another tenant's transcript.
-- The reader never returns an audio storage path (\`audio_path\`, \`audio_url\`): it answers with the
-  redacted transcript and its references, not the media.
+**Starting point.** The starter registers \`GET /v1/voice/sessions/{session_id}\` and returns the
+transcript for whatever session id it is given, so the demo shows turns. It serves the demo and
+hides four flaws.
 
 **Failure mode the checks target.** A reader that ignores the tenant serves one customer's
 transcript to another; an unbounded response turns a 30-minute call into an unbounded payload; and
-echoing the audio path hands the caller the raw media the redaction was supposed to stand in for.`,
+echoing the audio path hands the caller the raw media the redaction was supposed to stand in for.
+
+- Turns are ordered by \`turn_index\` and each turn carries \`turn_index\`, \`started_at\`, \`ended_at\`
+  and \`redaction_spans\`, the character ranges redacted before the transcript was stored.
+- The page is capped at **500 turns** (\`MAX_TURNS\`) and paginated with an opaque \`next_cursor\`
+  derived from the last turn's index; a caller walks a 30-minute session in pages and the cap holds
+  on every page. \`limit\` may shrink the page, not exceed the cap.
+- The tenant comes from \`X-Tenant-Id\`; a session that belongs to another tenant is **404**, exactly
+  like a session that does not exist.
+- The reader does not return an audio storage path (\`audio_path\`, \`audio_url\`): it answers with the
+  redacted transcript and its references, not the media.`,
   sequence: {
     participants: ['Client', 'Voice Gateway', 'Transcript store'],
     messages: [
@@ -64,7 +62,7 @@ echoing the audio path hands the caller the raw media the redaction was supposed
       id: 'tenant-scope',
       title: 'A foreign session is 404, never another tenant’s transcript',
       detail:
-        'The tenant comes from `X-Tenant-Id` and a session that belongs to a different tenant answers **404**. The starter serves whatever session id it is given.',
+        'The tenant comes from `X-Tenant-Id` and a session that belongs to a different tenant answers **404**, the same as a missing one.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*404/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*404\s*\)/]},
@@ -77,7 +75,7 @@ echoing the audio path hands the caller the raw media the redaction was supposed
       id: 'turn-cap',
       title: 'Caps every page at 500 turns',
       detail:
-        'The page is bounded by `MAX_TURNS` (500) with a `DEFAULT_LIMIT` (`defaultLimit` / `DefaultLimit` / `kDefaultLimit`) and the caller’s `limit` is clamped to the cap. The starter returns every turn of the session.',
+        'The page is bounded by `MAX_TURNS` (500) with a `DEFAULT_LIMIT` (`defaultLimit` / `DefaultLimit` / `kDefaultLimit`) and the caller’s `limit` is clamped to the cap.',
       match: {
         python: {all: [/MAX_TURNS/, /DEFAULT_LIMIT/]},
         typescript: {all: [/MAX_TURNS/, /DEFAULT_LIMIT/]},
@@ -90,7 +88,7 @@ echoing the audio path hands the caller the raw media the redaction was supposed
       id: 'cursor',
       title: 'Pages the transcript with a cursor over the turn index',
       detail:
-        'The response carries `next_cursor` built from the last turn index, and the caller passes `limit`/`cursor` to walk the session. The starter returns one unbounded array.',
+        'The response carries `next_cursor` built from the last turn index, and the caller passes `limit`/`cursor` to walk the session.',
       match: {
         python: {all: [/next_cursor/, /limit/]},
         typescript: {all: [/next_cursor/, /limit/]},
@@ -103,7 +101,7 @@ echoing the audio path hands the caller the raw media the redaction was supposed
       id: 'no-audio-path',
       title: 'Returns redaction spans, never an audio path',
       detail:
-        'Every turn carries `redaction_spans` and no `audio_path` or `audio_url` key appears anywhere in the file. The starter echoes the storage path of the raw audio.',
+        'Every turn carries `redaction_spans` and no `audio_path` or `audio_url` key appears anywhere in the file.',
       match: {
         python: {all: [/redaction_spans/], none: [/audio_path/, /audio_url/]},
         typescript: {all: [/redaction_spans/], none: [/audio_path/, /audio_url/]},
@@ -138,9 +136,7 @@ turns = TranscriptReader()
 
 @app.get("/v1/voice/sessions/{session_id}")
 def read_session(session_id: str) -> JSONResponse:
-    # TODO: this starter serves whichever session id it is given — it never checks that the caller's
-    # X-Tenant-Id owns the session; it returns every turn of the session in one unbounded array;
-    # and it echoes each turn's audio_path instead of the redaction_spans. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     rows = turns.list_turns(session_id, -1, 10_000)
     return JSONResponse(
         {
@@ -247,9 +243,7 @@ interface StoredTurn {
 }
 
 app.get('/v1/voice/sessions/:session_id', async (request, reply) => {
-  // TODO: this starter serves whichever session id it is given — it never checks that the caller's
-  // X-Tenant-Id owns the session; it returns every turn of the session in one unbounded array;
-  // and it echoes each turn's audio_path instead of the redaction_spans. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {session_id: sessionId} = request.params as {session_id: string};
   const rows = (await turns.listTurns(sessionId, -1, 10_000)) as StoredTurn[];
   return reply.code(200).send({
@@ -367,9 +361,7 @@ func (r *TranscriptReader) ListTurns(sessionID string, afterIndex, limit int) ([
 var turns = &TranscriptReader{}
 
 func readSession(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves whichever session id it is given — it never checks that the caller's
-	// X-Tenant-Id owns the session; it returns every turn of the session in one unbounded array;
-	// and it echoes each turn's audio_path instead of the redaction_spans. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	sessionID := r.PathValue("session_id")
 	rows, _ := turns.ListTurns(sessionID, -1, 10000)
 	rw.Header().Set("Content-Type", "application/json")
@@ -532,9 +524,7 @@ object Read {
   val route: Route =
     path("v1" / "voice" / "sessions" / Segment) { sessionId =>
       get {
-        // TODO: this starter serves whichever session id it is given — it never checks that the
-        // caller's X-Tenant-Id owns the session; it returns every turn of the session in one
-        // unbounded array; and it echoes each turn's audio_path instead of the redaction_spans.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         val rows = TranscriptStore.listTurns(sessionId, -1, 10000)
         val response = JsObject(
           "session_id" -> JsString(sessionId),
@@ -672,9 +662,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/voice/sessions/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves whichever session id it is given — it never checks that the caller's
-    // X-Tenant-Id owns the session; it returns every turn of the session in one unbounded array;
-    // and it echoes each turn's audio_path instead of the redaction_spans. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto sessionId = req.matches[1].str();
     json turns = json::array();
     for (const auto& row : store.listTurns(sessionId, -1, 10000)) {
@@ -808,9 +796,9 @@ int main() {
     },
   },
   hints: [
-    'Scope first: `X-Tenant-Id` plus the session’s tenant decides 200 or 404, and a foreign session must look exactly like a missing one — same status, same body, same latency. Resolve the session by `(tenant, session_id)` and answer the 404 before you touch a single turn.',
-    'The cap is a constant and the cursor is the last returned `turn_index`: read `MAX_TURNS` rows at a time, clamp the caller’s `limit` down to that cap, and return `next_cursor` only when the page came back full. A caller walks a 30-minute session in pages and no single request can ever return the whole call.',
-    'The response shape is the contract: per-turn `turn_index`, timestamps and `redaction_spans`, a `next_cursor` when more remain, and no `audio_path` or `audio_url` key anywhere. The transcript you serve is the redacted record — the media path is exactly the thing the redaction was supposed to replace.',
+    "A customer opens a transcript link with a guessed session id and reads another company's call; on a long call the same endpoint returns a multi-megabyte array with a storage path to the raw audio in every turn.",
+    'The handler looks the session up by id alone, lists turns with a hard-coded 10,000 limit and no cursor, and copies the stored `audio_path` straight into each turn instead of the redaction spans.',
+    'Resolve the session by `(tenant, session_id)` and 404 otherwise; read at most `MAX_TURNS` (clamp `limit`, default `DEFAULT_LIMIT`), return `next_cursor` from the last `turn_index`, and emit `redaction_spans` with no `audio_path`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read endpoint as a scope check first and a shape contract second. The starter looks finished because the demo asks for one session the caller owns and the transcript fits on a single page. Three defects are being checked. Authorization comes first because a transcript is the most sensitive object the service holds: the tenant in \`X-Tenant-Id\` has to own the session, and a foreign session must be indistinguishable from a missing one — same \`404\`, same body, no timing hint — or the endpoint becomes a probe for which sessions exist. Bounding comes second: a 30-minute call is thousands of turns, so the reader needs a \`MAX_TURNS\` cap with the caller's \`limit\` clamped to it and an opaque \`next_cursor\` over the last returned \`turn_index\`, which also keeps the window stable while the call is still appending turns. The shape is the third contract, and the quiet one: every turn carries its timestamps and \`redaction_spans\`, and no \`audio_path\` or \`audio_url\` key appears anywhere in the response — the redacted transcript exists precisely so the caller receives the safe representation instead of the raw media it stands in for. Real readers add per-tenant transcript retention, a signed short-lived cursor so the position cannot be forged, and one audit entry per transcript access.`,
+  debrief: `The fix is a scope check first and a shape contract second. Authorization comes first because a transcript is the most sensitive object the service holds: the tenant in \`X-Tenant-Id\` has to own the session, and a foreign session must be indistinguishable from a missing one, same \`404\`, same body, or the endpoint becomes a probe for which sessions exist. Bounding comes second: a 30-minute call is thousands of turns, so the reader needs a \`MAX_TURNS\` cap with the caller's \`limit\` clamped to it and a \`next_cursor\` over the last returned \`turn_index\`, which also keeps the window stable while the call is still appending turns. The shape matters because the redacted transcript exists so the caller receives the safe representation instead of the raw media. Production readers also sign the cursor so a position cannot be forged, and write one audit entry per transcript access.`,
 };

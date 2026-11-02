@@ -8,34 +8,27 @@ export const monitorEndpointStep: Step = {
   focus: ['client', 'monitor', 'registry'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns a monitor id. It compiles, the demo registers one monitor against a promoted
-version, and the three ways a monitor can be born useless are all invisible until drift fails to
-fire. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/monitors\` with body
+\`{"model_version": "…", "metric": "input_distribution", "window_s": 3600, "baseline": "…"}\`: it
+reads the tenant header, copies the body into a monitor record, generates an id and answers 201. It
+serves the demo and hides 4 flaws.
 
-Implement \`POST /v1/monitors\` with body
-\`{"model_version": "…", "metric": "input_distribution", "window_s": 3600, "baseline": "…"}\`.
+**Failure mode the checks target.** A monitor is only as good as what it observes and what it is
+compared against. A monitor on an unpromoted version watches traffic that does not exist yet; a
+baseline that is the live traffic compares the signal with itself and cannot fire; a registration
+that is not idempotent turns one client retry into two monitors and two pages. None of these shows
+up in a happy-path demo.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`metric\` is one of \`input_distribution\`, \`outcome_rate\` or \`calibration\` (**400** otherwise).
 - \`window_s\` is an integer from **300** to **86400** seconds (**400** otherwise) and defaults to 3600.
-- \`model_version\` must be **promoted** in the model registry (**400** otherwise). A monitor on an
-  unpromoted version watches traffic that does not exist yet, and its alerts can never be attributed
-  to a release.
+- \`model_version\` must be **promoted** in the model registry (**400** otherwise).
 - \`baseline\` must be a **resolvable** reference in the form \`baseline:{model_version}:{yyyy-mm-dd}\`
-  (**400** otherwise), and it must not point at **live traffic**: the starter lets the baseline be the
-  very traffic the monitor is meant to watch, so it compares the signal with itself and drift can
-  never fire.
+  (**400** otherwise) and must not point at **live traffic**.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the **original** monitor instead of registering a second one; the starter has no key, so a
-  client retry multiplies monitors and pages twice.
+  returns the **original** monitor instead of registering a second one.
 - The response carries the monitor id, tenant, model version, metric, window and baseline reference.
-- Log the registration with tenant, monitor id and metric — never the whole body.
-
-**Failure mode the checks target.** A monitor is only as good as what it observes and what it is
-compared against. Registering against an unpromoted version, accepting the live traffic itself as the
-baseline, and duplicating on retry are three quiet ways to ship a detector that never fires or fires
-twice — and none of them shows up in a happy-path demo.`,
+- Log the registration with tenant, monitor id and metric, not the whole body.`,
   sequence: {
     participants: ['Client', 'Drift Monitor', 'model registry', 'monitor store'],
     messages: [
@@ -92,7 +85,7 @@ twice — and none of them shows up in a happy-path demo.`,
       id: 'baseline',
       title: 'Rejects a baseline that is live traffic',
       detail:
-        'The reference must match the frozen form `baseline:{version}:{date}` and a reference that points at live traffic is **400**. The starter accepts the live traffic it is meant to watch as the baseline, so the reference drifts with the signal and nothing can ever fire.',
+        'The reference must match the frozen form `baseline:{version}:{date}` and a reference that points at live traffic is **400**. The starter accepts the live traffic it is meant to watch as the baseline.',
       match: {
         python: {all: [/BASELINE_RE\.match\(/, /is_live_baseline\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/BASELINE_RE\.test\(/, /isLiveBaseline\(/, /code\(\s*400\s*\)/]},
@@ -142,9 +135,7 @@ def create_monitor(
     body: MonitorRequest,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter registers a monitor against any model version, lets the baseline be the live
-    # traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-    # registers a second monitor. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     monitor = {
         "monitor_id": str(uuid.uuid4()),
         "tenant": tenant,
@@ -263,9 +254,7 @@ interface MonitorBody {
 }
 
 app.post('/v1/monitors', async (request, reply) => {
-  // TODO: this starter registers a monitor against any model version, lets the baseline be the live
-  // traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-  // registers a second monitor. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as MonitorBody;
   const monitor = {
@@ -392,9 +381,7 @@ func createMonitor(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter registers a monitor against any model version, lets the baseline be the live
-	// traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-	// registers a second monitor. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	log.Printf("monitor registered tenant=%s version=%s", tenant, body.ModelVersion)
 	writeJSON(rw, http.StatusCreated, map[string]any{
 		"monitor_id":    uuid.NewString(),
@@ -591,9 +578,7 @@ object MonitorApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[MonitorRequest]) { body =>
-            // TODO: this starter registers a monitor against any model version, lets the baseline be
-            // the live traffic the monitor is meant to watch, and ignores Idempotency-Key, so a
-            // client retry registers a second monitor. Fix all three.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             system.log.info(s"monitor registered tenant=$tenant")
             complete(
               StatusCodes.Created,
@@ -724,9 +709,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter registers a monitor against any model version, lets the baseline be the live
-    // traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-    // registers a second monitor. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     std::cerr << "monitor registered tenant=" << tenant << "\\n";
     res.status = 201;
     res.set_content(
@@ -861,18 +844,17 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order before anything is stored: tenant, Idempotency-Key, metric, window, promoted version, baseline reference. Each one returns before the monitor exists, so an invalid registration can never page anyone.',
-    'The baseline check is two questions: is the reference resolvable at all (`BASELINE_RE`), and does it point at frozen traffic? `baseline:model-7:2026-09-01` is frozen; `baseline:live:2026-10-21` is the traffic you are trying to watch, and comparing it with itself can never fire.',
-    'The idempotency lookup is keyed by `(tenant, key)` and happens before the store write; a hit returns the stored monitor with 200. Storing the monitor — not just the request hash — is what lets a replay answer without generating a second id.',
+    'Symptom: a tenant registers a monitor on a version that was never promoted, retries once on a timeout, and ends up with two monitors that both stay silent for weeks.',
+    'Mechanism: the handler copies the body straight into the record. Nothing asks the registry, nothing compares the baseline against the live segment, and nothing looks up the Idempotency-Key before writing.',
+    'Change: guard in cost order (tenant, key, metric, window, `registry.is_promoted`, `BASELINE_RE` plus `is_live_baseline`), then `store.get((tenant, key))` before `store.put`; a hit returns the stored monitor.',
   ],
-  debrief: `The interviewer is testing whether you can debug a registration endpoint at the trust boundary. The
-starter reads fine because a demo registers one monitor, for one promoted version, once. Three defects
-are being checked: authentication and the metric/window whitelist (cheap rejections before anything is
-written), resolution against the registry (a monitor on an unpromoted version is watching a release
-that does not exist), and baseline validity — the subtle one. A baseline that is live traffic makes the
-monitor structurally unable to fire, because the reference moves with the signal; the fix is to demand
-a frozen, dated reference and to reject the live segment explicitly. Idempotency on registration is the
-fourth: registration is a client retry away from duplicates, so it is keyed like any other write. Real
-platforms add a promotion audit trail, per-tenant baseline retention, and a scheduled job that re-freezes
-the baseline when a new version is promoted.`,
+  debrief: `The fix is a stack of guard clauses that all return before the monitor exists, ordered from cheapest
+to most expensive: header and whitelist checks cost nothing, the registry call costs a round trip, and
+the idempotency lookup comes last because it is the only one that touches the store. The baseline
+rule has two halves on purpose: the regex proves the reference is resolvable, and the live-segment
+check proves it is frozen, because a reference that moves with the signal makes the monitor
+structurally unable to fire. Storing the whole monitor under \`(tenant, key)\` rather than a request
+hash is what lets a replay answer with the original id. Production platforms also keep a promotion
+audit trail and re-freeze baselines on a schedule when a new version is promoted, which this step
+leaves out.`,
 };

@@ -8,37 +8,34 @@ export const dependencyStep: Step = {
   focus: ['api', 'vendor', 'review', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the KYC service’s vendor
-client: it calls the vendor’s \`CheckDocument\` and moves the case along, and against a healthy vendor
-the demo verifies applicants and the funnel stays open. It hides three production flaws, and all
-three look like features on a conversion dashboard. Debug it like the compliance owner, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter is the KYC service's vendor client: \`check_document(applicant,
+doc_type, ref)\` calls the vendor's \`CheckDocument\` over gRPC in a retry loop, maps the reply onto
+a verdict and moves the case along. Against a healthy vendor the demo verifies applicants and the
+funnel stays open. It compiles and hides four flaws, and all of them look like features on a
+conversion dashboard.
 
-Implement \`check_document(applicant, doc_type, ref)\` — the gRPC call that decides one document — and
-the paths around it:
+**Failure mode the checks target.** During a vendor outage the service keeps approving: identities
+nobody checked come out verified, a bad deployment mints approved applicants from the error path,
+and an applicant whose documents the vendor rejected is approved anyway once the retries run out.
+None of this is visible while the vendor is healthy, because the demo sees no timeout, no error and
+no rejection.
+
+Requirements:
 
 - The \`CheckDocument\` call carries a **10 s** deadline as a named constant on the call itself
   (\`DEADLINE_S = 10\` with \`timeout=DEADLINE_S\`, \`DEADLINE_MS = 10_000\` with
   \`deadline: Date.now() + DEADLINE_MS\`, a \`context.WithTimeout\`, a \`withDeadlineAfter\`, a
-  \`set_deadline\`): with no deadline, one stuck vendor pins a verification request until the client
-  gives up.
+  \`set_deadline\`).
 - The vendor answers **\`APPROVED\`**, **\`REJECTED\`** or **\`MANUAL_REVIEW\`**, and nothing else counts
-  as an approval — the vendor’s own \`MANUAL_REVIEW\`, and any outcome you cannot classify, is a
-  human’s call.
-- A **timeout or a vendor error** — \`DEADLINE_EXCEEDED\`, \`UNAVAILABLE\`, anything else — routes the
-  case to **manual review** with a **\`degraded\`** marker: identity is a legal decision, and an
-  outage is not a verification. No path from a vendor failure to \`APPROVED\` without a human.
-- A **rejection is terminal**: it carries the vendor’s **reason**, and the case ends there. The same
+  as an approval: the vendor's own \`MANUAL_REVIEW\`, and any outcome you cannot classify, is a
+  human's call.
+- A **timeout or a vendor error** (\`DEADLINE_EXCEEDED\`, \`UNAVAILABLE\`, anything else) routes the
+  case to **manual review** with a **\`degraded\`** marker. Identity is a legal decision, and an
+  outage is not a verification.
+- A **rejection is terminal**: it carries the vendor's **reason**, and the case ends there. The same
   documents buy the same answer, so a second call only adds latency.
-- The outcome — decision, reason and the \`degraded\` flag — is **persisted to the decision store**
-  before \`check_document\` returns, so the case record cannot disagree with what the vendor said.
-
-**Failure mode the checks target.** The starter keeps conversion up three ways: it approves on a
-timeout, so a vendor outage silently verifies identities nobody checked; it returns \`VERIFIED\` from
-its catch block, so a bad deployment mints approved applicants; and it re-calls the vendor after a
-\`REJECTED\` to “give it another chance”, so the applicant whose documents are wrong is approved when
-the loop runs out. Every one of those is invisible while the vendor is healthy — the demo never sees
-a timeout, an error or a rejection — and every one of them is a finding in production.`,
+- The outcome (decision, reason and the \`degraded\` flag) is **persisted to the decision store**
+  before \`check_document\` returns, so the case record cannot disagree with what the vendor said.`,
   sequence: {
     participants: ['KYC API', 'Vendor', 'Review queue', 'Decision store'],
     messages: [
@@ -53,9 +50,9 @@ a timeout, an error or a rejection — and every one of them is a finding in pro
     ],
   },
   hints: [
-    'A deadline is an argument on the call itself — `timeout=`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — not a wrapper around it. The starter calls `CheckDocument` bare, so one stuck vendor holds the verification request (and the worker behind it) open until the client gives up.',
-    'Failure is a statement about the system, not about the applicant: catch the RPC error, classify `DEADLINE_EXCEEDED`, `UNAVAILABLE` or anything else as “the vendor did not answer”, write `MANUAL_REVIEW` with `degraded` set, and enqueue the case for a reviewer. The starter answers `APPROVED`/`VERIFIED`, which is the one outcome a failure can never justify.',
-    'A `REJECTED` is terminal: keep the vendor’s `reason`, persist it, and stop — the same documents would be rejected the same way, so a second call buys latency and, in the starter, an approval. Persist every outcome to the decision store before returning it, so the case record and the vendor’s answer can never disagree.',
+    'The vendor had a 40-minute outage last night. The approval rate did not dip; it rose. The review queue stayed empty, and one applicant the vendor rejected shows as approved.',
+    'The call has no deadline, the `except` path and the exhausted retry loop both fall through to an approval, and a `REJECTED` reply is treated as a reason to try again.',
+    'Put `DEADLINE_S = 10` on the call. On any RPC error write `MANUAL_REVIEW` with `degraded` set and enqueue a reviewer. On `REJECTED` keep the reason and stop. Persist every outcome before returning.',
   ],
   checks: [
     {
@@ -128,7 +125,7 @@ a timeout, an error or a rejection — and every one of them is a finding in pro
   ],
   code: {
     python: {
-      starter: `"""Vendor document checks: flawed code that keeps conversion up."""
+      starter: `"""Vendor document checks: the starter."""
 import asyncio
 
 import grpc
@@ -145,9 +142,7 @@ vendor = vendor_pb2_grpc.VendorStub(grpc.aio.insecure_channel("vendor:9000"))
 
 
 async def check_document(decisions, applicant: str, doc_type: str, ref: str) -> str:
-    # TODO: give the CheckDocument call the 10 s deadline, route a timeout or a vendor error to
-    # manual review marked degraded, keep a rejection terminal with the vendor's reason, and persist
-    # the outcome to the decision store — the starter approves the applicant instead.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     for retry in range(3):
         try:
             request = vendor_pb2.CheckDocumentRequest(applicant=applicant, doc_type=doc_type, ref=ref)
@@ -223,7 +218,7 @@ async def check_document(decisions, applicant: str, doc_type: str, ref: str) -> 
 `,
     },
     typescript: {
-      starter: `/** Vendor document checks: flawed code that keeps conversion up. */
+      starter: `/** Vendor document checks: the starter. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -253,9 +248,7 @@ export async function checkDocument(
   docType: string,
   ref: string,
 ): Promise<string> {
-  // TODO: give the CheckDocument call the 10 s deadline, route a timeout or a vendor error to
-  // manual review marked degraded, keep a rejection terminal with the vendor's reason, and persist
-  // the outcome to the decision store — the starter approves the applicant instead.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (let retry = 0; retry < 3; retry++) {
     try {
       const reply = await new Promise<{outcome: string; reason: string}>((resolve, reject) => {
@@ -391,9 +384,7 @@ type Client struct {
 // CheckDocument asks the vendor and moves the case along, so a vendor hiccup never blocks an
 // applicant.
 func (c *Client) CheckDocument(ctx context.Context, applicant, docType, ref string) (string, error) {
-	// TODO: give the CheckDocument call the 10 s deadline, route a timeout or a vendor error to
-	// manual review marked degraded, keep a rejection terminal with the vendor's reason, and persist
-	// the outcome to the decision store — the starter approves the applicant instead.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	for retry := 0; retry < 3; retry++ {
 		reply, err := c.vendor.CheckDocument(ctx, &pb.CheckDocumentRequest{
 			Applicant: applicant,
@@ -517,9 +508,7 @@ object VendorClient {
 
   val vendor = VendorGrpc.blockingStub(ManagedChannelBuilder.forAddress("vendor", 9000).usePlaintext().build())
 
-  // TODO: give the CheckDocument call the 10 s deadline, route a timeout or a vendor error to
-  // manual review marked degraded, keep a rejection terminal with the vendor's reason, and persist
-  // the outcome to the decision store — the starter approves the applicant instead.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def checkDocument(decisions: Decisions, applicant: String, docType: String, ref: String): String = {
     var retry = 0
     while (retry < 3) {
@@ -614,9 +603,7 @@ struct DecisionStore {
   virtual ~DecisionStore() = default;
 };
 
-// TODO: give the CheckDocument call the 10 s deadline, route a timeout or a vendor error to manual
-// review marked degraded, keep a rejection terminal with the vendor's reason, and persist the
-// outcome to the decision store — the starter approves the applicant instead.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 Decision check_document(DecisionStore& decisions, Vendor::Stub* vendor, const std::string& applicant,
                         const std::string& doc_type, const std::string& ref) {
   for (int retry = 0; retry < 3; ++retry) {
@@ -707,5 +694,5 @@ Decision check_document(DecisionStore& decisions, Vendor::Stub* vendor, const st
 `,
     },
   },
-  debrief: `The interviewer is asking one question through five checks: what does the service believe when the vendor does not answer? The starter answers “approved”, and it is easy to see why — every other answer costs conversion, and conversion is the number on the dashboard. But a KYC verdict is a legal decision, so the failure policy *is* the product: a timeout or a vendor error produces a case a reviewer has to look at, marked \`degraded\` so the queue knows the vendor was unhealthy when the case arrived. The rejection is the other half of the same discipline: the vendor has told you these documents do not prove this identity, so calling again with the same ones cannot change the answer — the case ends with the vendor’s reason, and the applicant supplies different documents or stays closed. Persisting the outcome before returning it is what makes the decision auditable: the decision store and the events that follow it are what a regulator reads, not the demo. The starter is indistinguishable from the fix while the vendor is healthy, which is exactly why the failure paths are the interview. Real services add per-outcome metrics and an alert on the \`degraded\` rate, a review-queue SLA that pages when cases age, a breaker so a sick vendor stops burning the deadline, and a rejection webhook that tells the applicant what to resubmit.`,
+  debrief: `The question under this step is what the service believes when the vendor does not answer. The starter believes "approved", because every other answer costs conversion. A KYC verdict is a legal decision, so the failure policy is the product, and that gives the fix its shape: a deadline on the call so a stuck vendor cannot pin a worker; a timeout or error that lands in manual review marked \`degraded\` so the queue knows the vendor was unhealthy; a rejection that ends the case with the vendor's reason, since the same documents cannot buy a different answer; and the outcome persisted before it is returned, so the record a regulator reads matches what the vendor said. What this step did not do: alert on the \`degraded\` rate, age the review queue against an SLA, or open a breaker so a sick vendor stops burning the deadline.`,
 };

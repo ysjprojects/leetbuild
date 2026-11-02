@@ -8,11 +8,13 @@ export const chunkEmbedStep: Step = {
   focus: ['kafka', 'worker', 'embed', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it compiles and passes the
-happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
-flaw, fix it, and prove the fix with the checks below.
+**Starting point.** The starter consumes \`doc.ingest\` events carrying \`{doc_id, version, content}\`,
+cuts the text into 800-character pieces, embeds each piece with its own \`Embed\` call, stores
+\`chunk:<uuid>\` in Redis and commits the offset. It compiles and hides 5 flaws.
 
-Consume \`doc.ingest\` events carrying \`{doc_id, version, content}\` and write searchable chunks.
+**Failure mode the checks target.** Random chunk ids plus retry-everything looks harmless in the
+demo: the first upload works. A redelivery then doubles the index, and a permanent \`INVALID_ARGUMENT\`
+spins the consumer forever because the starter catches every exception.
 
 - Split the text into chunks of about **800 characters** with **100 characters of overlap**, so a
   sentence crossing a boundary is still contiguous in one chunk. Skip chunks that are empty after
@@ -24,10 +26,6 @@ Consume \`doc.ingest\` events carrying \`{doc_id, version, content}\` and write 
 - Retry only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, with exponential backoff and jitter, at most
   **3 attempts**. Every other status is a permanent failure for that batch.
 - Upsert by chunk id, so replaying an event overwrites the same rows instead of appending new ones.
-
-**Failure mode the checks target.** Random chunk ids plus retry-everything looks harmless in the
-demo: the first upload works. A redelivery then doubles the index, and a permanent \`INVALID_ARGUMENT\`
-spins the consumer forever because the starter catches every exception.
 
 :::widget deadline-retry {}
 
@@ -181,8 +179,7 @@ def handle(event: dict) -> None:
             continue
         chunk_id = str(uuid.uuid4())
         vector = embed_one(piece)
-        # TODO: chunk ids are random, one RPC per chunk, and every error is retried forever.
-        # A redelivered doc.ingest event duplicates the whole index.
+        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         redis.set(f"chunk:{chunk_id}", json.dumps({"text": piece, "vector": list(vector), "index": index}))
 
 
@@ -351,8 +348,7 @@ async function handle(event: IngestEvent): Promise<void> {
   let index = 0;
   for (const piece of split(event.content)) {
     if (piece === '') continue;
-    // TODO: chunk ids are random, one RPC per chunk, and every error is retried forever.
-    // A redelivered doc.ingest event duplicates the whole index.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const chunkId = randomUUID();
     const vector = await embedOne(piece);
     await redis.set(\`chunk:\${chunkId}\`, JSON.stringify({text: piece, vector, index}));
@@ -546,7 +542,7 @@ func embedOne(client pb.EmbedderClient, text string) []float32 {
 		if err == nil {
 			return reply.Vectors[0].Values
 		}
-		// TODO: retries every error forever, with no deadline, no batching and random ids.
+		// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	}
 }
 
@@ -770,7 +766,7 @@ object ChunkEmbed {
       if (piece.nonEmpty) {
         val chunkId = UUID.randomUUID().toString
         val vector = embedOne(piece)
-        // TODO: random chunk id, one RPC per chunk, every error retried forever.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         jedis.set("chunk:" + chunkId, s"""{"text":"$piece","index":$index}""")
       }
     }
@@ -919,7 +915,7 @@ std::vector<float> embedOne(const std::shared_ptr<Embedder::Stub>& stub, const s
     if (status.ok()) {
       return std::vector<float>(reply.vectors(0).values().begin(), reply.vectors(0).values().end());
     }
-    // TODO: retries every status forever, with no deadline, no batching and random ids.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   }
 }
 
@@ -1055,9 +1051,11 @@ int main() {
     },
   },
   hints: [
-    'Chunk with `start` and `end` cursors, not `text.grouped(n)`: overlap means the next start is `end - 100`, not `end`. Stop when a chunk reaches the end of the document.',
-    'Build the id from the document identity and the chunk geometry. The embedding is derived data; the id must be derivable from the event alone, so a replay recomputes the same key.',
-    'Retry inside one batch call. Check `status.code()` / `e.code()` before sleeping; `INVALID_ARGUMENT` and `PERMISSION_DENIED` will never heal, so fail the batch immediately.',
+    'After a broker redelivery the same document answers twice in search, and the consumer lag graph climbs without end while one document sits at the head of the partition.',
+    'uuid4 ids make every replay write new keys. embed_one loops on bare `except Exception`, so a status that cannot heal is retried forever, one chunk per RPC with no deadline.',
+    'Walk the text with a start cursor stepping 700. Id is sha256 of `doc_id:version:index:start`. Embed 32 texts per call with timeout 2.0; retry only UNAVAILABLE and DEADLINE_EXCEEDED three times; HSET by id.',
   ],
-  debrief: `The interviewer is looking for debugging instincts around derived data. The starter has three independent production bugs that the first upload hides: non-overlapping chunks quietly cut sentences in half, one RPC per chunk with no deadline lets a slow embedder stall the consumer, and catch-all retries turn a permanent error into poison-message thrash. The stable id is the design signal: it makes the pipeline idempotent without a dedupe table, because replaying an event addresses the same Redis hashes. Batch size and deadline are one decision — 32 texts is a latency/size trade-off, and 2 seconds bounds the tail; max attempts and jitter bound the batch. Real pipelines add a dead-letter topic for permanent failures, metrics on retry rate, and a content hash in the id when the same document id can be re-ingested with different bytes.`,
+  debrief: `The stable id does the heavy lifting: once a chunk's key is a function of the event alone, idempotency needs no dedupe table, because a replay addresses the same Redis hashes and the upsert overwrites them. Overlap is a geometry change in the same loop, which is why the id includes \`start\` rather than only \`index\`. Batch size and deadline are one decision (32 texts bounds the payload, 2 seconds bounds the tail) and max attempts with jitter bounds the batch; classifying the gRPC status first is what keeps a permanent error from being retried at all.
+
+This step did not route permanent failures to a dead-letter topic, did not expose a retry-rate metric, and did not include a content hash in the id for the case where one \`(doc_id, version)\` is re-ingested with different bytes.`,
 };

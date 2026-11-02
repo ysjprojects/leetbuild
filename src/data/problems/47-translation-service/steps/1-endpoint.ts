@@ -8,31 +8,30 @@ export const translateEndpointStep: Step = {
   focus: ['client', 'api', 'glossary', 'detector'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route,
-parses the body, calls the detector and returns a translation. It compiles, it serves the demo, and
-it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter registers \`POST /v1/translations\` with body \`{"text": "…",
+"source": "en", "target": "fr", "glossary_version": "…"}\`, reads the tenant from \`X-Tenant-Id\`,
+asks the detector whether the text is already in the target language, and otherwise calls the model
+and returns the translation. It compiles, serves the demo, and hides four flaws.
 
-Implement \`POST /v1/translations\` with body \`{"text": "…", "source": "en", "target": "fr",
-"glossary_version": "…"}\`.
+**Failure mode the checks target.** A request that skips every guard: an oversized text reaches
+the detector and the model, a language tag outside the allowlist is passed straight through, a
+\`glossary_version\` the store does not know is quietly ignored, and text already in the target
+language comes back stamped as a successful translation, so a UI shows English as French and the
+CDN caches it.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`text\` is a non-empty string of at most **16 KiB** (\`1 << 14\` bytes) of UTF-8; a larger text is
-  **413**.
+Requirements:
+
+- A missing tenant header is **401**.
+- \`text\` is a non-empty string of at most **16 KiB** (\`1 << 14\` bytes) of UTF-8; larger is
+  **413**, empty or non-string is **400**.
 - \`source\` and \`target\` must both be in the platform allowlist
-  (\`en\`, \`fr\`, \`de\`, \`es\`, \`ja\`, \`pt\`); anything else is **400**. A **400** for
-  \`source == target\`: translating into the source language is a caller bug, not a no-op.
-- \`glossary_version\` names the tenant's glossary version to bind for the whole request. An unknown
-  version is **404** — never silently ignored, because a translation that ignores its glossary ships
-  terms the customer forbade.
+  (\`en\`, \`fr\`, \`de\`, \`es\`, \`ja\`, \`pt\`); anything else is **400**. \`source == target\` is
+  also **400**: translating into the source language is a caller bug, not a no-op.
+- \`glossary_version\` binds the tenant's glossary version for the whole request; an unknown version
+  is **404**, because a translation that ignores its glossary ships terms the customer forbade.
 - When confident detection says the text is already in the target language, return the input text
-  with an explicit untranslated marker (\`"marker": "untranslated"\`) rather than a plain success that
-  downstream caches as a real translation.
-
-**Failure mode the checks target.** Trusting the caller's language tags turns an allowlist into a
-suggestion; ignoring the glossary version makes a bound glossary a decorative field; and an
-unmarked identity translation is the quiet one: a UI stamps English text as French, the CDN caches
-it, and no downstream system can tell a fallback from a translation.`,
+  with \`"marker": "untranslated"\` rather than a plain success that downstream caches as a real
+  translation.`,
   sequence: {
     participants: ['Client', 'Translation API', 'Glossary store', 'Language detector'],
     messages: [
@@ -141,9 +140,7 @@ def translate_text(text: str, source: str, target: str) -> str:
 
 @app.post("/v1/translations")
 def translate(body: TranslateRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter trusts any language tags, ignores glossary_version entirely, and reports the
-    # input text as a successful translation when the detector says the source is already the
-    # target. Fix all three before this reaches production.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if detect_language(body.text) == body.target:
         return JSONResponse({"translation": body.text, "target": body.target}, status_code=200)
     logger.info("translate tenant=%s source=%s target=%s", tenant, body.source, body.target)
@@ -261,9 +258,7 @@ interface TranslateBody {
 }
 
 app.post('/v1/translations', async (request, reply) => {
-  // TODO: this starter trusts any language tags, ignores glossary_version entirely, and reports the
-  // input text as a successful translation when the detector says the source is already the
-  // target. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as TranslateBody;
   if ((await detectLanguage(body.text)) === body.target)
@@ -364,9 +359,7 @@ func translate(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter trusts any language tags, ignores GlossaryVersion entirely, and reports the
-	// input text as a successful translation when the detector says the source is already the
-	// target. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	detected, _ := detectLanguage(body.Text)
 	if detected == body.Target {
 		writeJSON(rw, http.StatusOK, map[string]any{"translation": body.Text, "target": body.Target})
@@ -519,9 +512,7 @@ object TranslateApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[TranslateRequest]) { body =>
-            // TODO: this starter trusts any language tags, ignores glossary_version entirely, and
-            // reports the input text as a successful translation when the detector says the source
-            // is already the target. Fix all three.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             if (Detector.detect(body.text).contains(body.target)) {
               complete(StatusCodes.OK, s"""{"translation":"\${body.text}","target":"\${body.target}"}""")
             } else {
@@ -631,9 +622,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter trusts any language tags, ignores glossary_version entirely, and reports the
-    // input text as a successful translation when the detector says the source is already the
-    // target. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto text = body["text"].get<std::string>();
     const auto source = body.value("source", std::string());
     const auto target = body.value("target", std::string());
@@ -759,9 +748,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guard clauses by cost: tenant, body shape, text bytes, language allowlist, source==target, then the glossary lookup. Every rejection must happen before the detector or the model is called, so a malformed request never spends money.',
-    '`glossary_version` is not a hint, it is a binding: resolve `(tenant, version)` up front and hand the terms to the model call. A version the store does not know is a **404** — ignoring it silently changes what the customer asked for.',
-    'The detector disagreement is the defect candidates miss: returning the input with the target locale looks like success, but downstream caches and reviewers cannot tell it apart from a real translation. Return the text with `"marker": "untranslated"` so every consumer can decide what to do.',
+    'Send a 20 KiB body, a `target` of `xx`, or a `glossary_version` that does not exist: all three come back 200. Send French text with target `fr`: it comes back as a "translation" too.',
+    'The handler runs no guards before the detector call, never reads `glossary_version` at all, and its identity branch returns the input with only the target locale stamped on it.',
+    'Guard in cost order: tenant, text bytes (413/400), allowlist and `source == target` (400), then `resolve_glossary(tenant, version)` (404). In the detector branch return the text with `"marker": "untranslated"`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a localization system. The starter reads fine because the demo sends a valid pair and a glossary version that exists. Three separate defects are checked: input caps (cheap rejections before expensive work), the language allowlist plus the source==target refusal (a caller bug must not become a paid model call), and glossary binding (a version that does not resolve is a 404, not a silent no-glossary translation). The marked identity response is the one candidates miss: an unmarked fallback is indistinguishable from a translation once it is cached, so real services carry a marker, a quality signal and a retriable status all the way out.`,
+  debrief: `The guards sit in cost order because every rejection before the detector or the model is a request that spends nothing; the glossary lookup comes last among them because it is the only one that touches a store. The marker exists because an unmarked identity response is indistinguishable from a translation once anything caches it, so the response has to carry the fact that nothing was translated. Production services go further: they attach a quality signal and a retriable status to the marked response, record per-tenant quotas before the model call, normalize BCP 47 tags (\`pt-BR\` versus \`pt\`) before the allowlist, and treat the detector's confidence as a threshold rather than a boolean.`,
 };

@@ -8,34 +8,27 @@ export const summarizerEventsStep: Step = {
   focus: ['api', 'kafka', 'store', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds a producer, assembles a payload and
-publishes the completion event. It works until the broker blinks or someone reads the topic. Debug
-it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`publish_summary(summary, tenant)\` builds a payload of
+\`summary_id\`, \`source_id\` and \`summary_text\` and produces it to \`summary.done\` keyed by the
+tenant; \`consume_summary\` commits the offset and then stores the record. It compiles, it serves the
+demo, and it hides five flaws.
 
-Publish one \`summary.done\` event per completed summary:
+**Failure mode the checks target.** Keyed by tenant, one source's updates can be consumed out of
+order. The payload carries the summary text, so a retained topic becomes a copy of every document the
+platform has summarized, and none of the numbers a consumer could check. The producer is
+fire-and-forget with no acks, no idempotence and no outbox, so a broker blip loses the completion.
+And the consumer commits before it stores, so a crash between the two loses the summary.
 
-- Key the record by the **source hash** (\`event_key\`), not by the tenant or the summary id, so
-  every event for one source lands on the same partition and one source's history stays ordered
-  relative to the others. Ordering is per key: a summary, a re-summary and a stale marking for the
-  same source must be read in the order they happened.
-- The payload (\`event_payload\`) carries **numbers only**: \`source_bytes\`, \`summary_chars\`,
-  \`compression_ratio\` (\`summary_chars / source_bytes\`), \`model_version\`, \`band\` and
-  \`chunks_done\`. Never the summary text, never the source text. A retained, replicated topic is not
-  a place for the content it describes, and "for quality review" is how a topic becomes a copy of
-  every document the platform has ever summarized.
-- The producer is **durable and idempotent**: \`acks=all\` with idempotence enabled, and a produce the
-  broker rejects writes an **outbox** row (\`outbox.put\`) instead of dropping the event. Losing a
-  completion event silently means a citation index that never learns about a summary.
-- The consumer **persists the summary record before it commits the offset** (\`store.put\` then
-  \`commit\`). Committing first turns a crash into data loss; committing after the write turns it into
-  a redelivery the handler can absorb.
+Requirements:
 
-**Failure mode the checks target.** The starter keys by tenant, so one tenant's events are ordered
-against each other only by accident and one source's updates can be consumed out of order. It
-publishes \`summary_text\` — the tenant's document, abstracted — into a retained topic. It produces
-fire-and-forget with no acks, no idempotence and no outbox, so a broker blip loses the event. And it
-commits the offset before storing the record, so a crash between the two loses the summary while the
-topic believes it was delivered.`,
+- Key the record by the source hash (\`event_key\`), so a summary, a re-summary and a stale marking
+  for one source are read in the order they happened.
+- \`event_payload\` carries numbers only: \`source_bytes\`, \`summary_chars\`, \`compression_ratio\`
+  (\`summary_chars / source_bytes\`), \`model_version\`, \`band\` and \`chunks_done\`. No
+  \`summary_text\`, no \`source_text\`.
+- The producer runs with \`acks=all\` and idempotence enabled; a produce the broker rejects writes an
+  outbox row (\`outbox.put\`).
+- The consumer calls \`store.put\` before \`commit\`.`,
   sequence: {
     participants: ['Summarizer', 'summary.done', 'Summary store', 'Relay'],
     messages: [
@@ -137,9 +130,7 @@ store = SummaryStore()
 
 
 def publish_summary(summary: dict, tenant: str) -> None:
-    # TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
-    # with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-    # commits the offset before the record is stored. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = {
         "summary_id": summary["summary_id"],
         "source_id": summary["source_ref"],
@@ -227,7 +218,7 @@ def consume_summary(value: bytes, offset_committer: object) -> None:
 `,
     },
     typescript: {
-      starter: `/** Publish summary.done: flawed code that publishes the summary text. */
+      starter: `/** Publish summary.done: the starter publishes the summary text. */
 import {Kafka} from 'kafkajs';
 
 const SUMMARY_DONE = 'summary.done';
@@ -246,9 +237,7 @@ interface SummaryRecord {
 }
 
 export async function publishSummary(summary: SummaryRecord, tenant: string): Promise<void> {
-  // TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
-  // with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-  // commits the offset before the record is stored. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: SUMMARY_DONE,
     messages: [
@@ -365,9 +354,7 @@ type SummaryRecord struct {
 // publishSummary publishes one summary.done event. The starter keys by tenant and
 // publishes the summary text.
 func publishSummary(ctx context.Context, tenant string, summary SummaryRecord) error {
-	// TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
-	// with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-	// commits the offset before the record is stored. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	value, err := json.Marshal(map[string]any{"summary_id": summary.SummaryID, "summary_text": summary.Summary})
 	if err != nil {
 		return err
@@ -489,9 +476,7 @@ object SummaryEvents extends DefaultJsonProtocol {
 
   /** Publish one summary.done event. The starter keys by tenant and publishes the summary text. */
   def publishSummary(summary: SummaryRecord, tenant: String): Unit = {
-    // TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
-    // with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-    // commits the offset before the record is stored. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = JsObject("summary_id" -> JsString(summary.summaryId), "summary_text" -> JsString(summary.summary))
     producer.send(new ProducerRecord[String, String](SummaryDone, tenant, payload.compactPrint))
   }
@@ -591,9 +576,7 @@ const char* kSummaryDone = "summary.done";
 // publishes the summary text.
 void publish_summary(RdKafka::Producer& producer, const std::string& tenant, const std::string& summary_id,
                      const std::string& summary_text) {
-  // TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
-  // with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-  // commits the offset before the record is stored. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto payload = json{{"summary_id", summary_id}, {"summary_text", summary_text}}.dump();
   producer.produce(kSummaryDone, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                    const_cast<char*>(payload.data()), payload.size(), tenant.data(), tenant.size(), 0, nullptr);
@@ -674,20 +657,16 @@ void consume_summary(RdKafka::KafkaConsumer& consumer, RdKafka::Message& message
     },
   },
   hints: [
-    'The partition key decides ordering, so key by the thing whose history must stay ordered: the source hash. One source’s summary, re-summary and stale marking then arrive in order, and unrelated sources never wait behind each other.',
-    'A topic outlives the request, the tenant and the retention policy you meant to set: publish numbers (`source_bytes`, `summary_chars`, `compression_ratio`, `model_version`) and let the reader fetch the content from the system that owns it.',
-    'The consumer contract is store-then-commit: a crash after the write re-delivers an event the handler can absorb, while a crash after the commit loses the summary outright. Combine that with `acks=all` and an outbox so a broker blip is not a lost completion either.',
+    'A broker restart and a handful of summaries are missing from the citation index. A data-retention audit finds full summary paragraphs sitting in a topic with 30-day retention.',
+    '`producer.produce` runs with default config and no delivery callback, so a rejected write vanishes. The key is `tenant`, so partition order is per tenant. `consume_summary` commits before `store.put`.',
+    'Configure `acks=all` and `enable.idempotence`; on `KafkaException` call `outbox.put`. Key with `event_key(source_hash)`, build `event_payload` from counts and `model_version`, and move `commit()` after `store.put`.',
   ],
-  debrief: `The interview question behind this step is what an event is allowed to carry and what its key means.
-The key is a partitioning decision: keyed by source hash, one source's summaries stay in order, which
-is what a citation index needs; keyed by tenant, an unrelated document's events serialize behind each
-other and a source's own updates can be consumed out of order. The payload is a data-retention
-decision: a retained topic with the summary text in it becomes a second copy of tenant content with a
-different lifecycle, so the event carries the numbers and the identifiers, and the reader fetches
-content from the system that owns retention. The producer is a durability decision: without
-\`acks=all\`, without idempotence and without an outbox, a broker blip silently drops the completion.
-And the consumer is the one most candidates miss — persist before you commit, because the offset is a
-promise that the work is done. Real systems add a schema registry so a future producer cannot smuggle
-text in, an outbox relay with dedupe ids, per-source compaction so one source's history stays
-bounded, and metrics on the extractive share straight from the payload.`,
+  debrief: `Each part of the fix answers a different question. The key is a partitioning decision: keyed by
+source hash, one source's summaries stay in order, which is what a citation index needs. The payload
+is a retention decision: a topic with the summary text in it is a second copy of tenant content with
+its own lifecycle, so the event carries numbers and identifiers and the reader fetches content from
+the system that owns it. The producer settings and the outbox are a durability decision, because a
+dropped completion is a summary the index will not learn about. The consumer persists before it
+commits because the offset is a promise that the work is done. Production pipelines add a schema
+registry so text fields cannot come back.`,
 };

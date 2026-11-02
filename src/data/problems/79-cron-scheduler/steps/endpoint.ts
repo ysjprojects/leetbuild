@@ -8,38 +8,29 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns a created schedule, so the demo passes. The time spec it accepts is not a
-contract. Debug it like the owner of the scheduler, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter registers \`POST /v1/schedules\` with body
+\`{"cron": "*/5 * * * *", "timezone": "Europe/Berlin", "job_ref": "billing.invoice", "misfire_policy": "skip"}\`,
+reads the tenant from \`X-Tenant-Id\`, copies the four fields onto a schedule and stores it with
+**201**. It serves the demo and hides 4 flaws.
 
-Implement \`POST /v1/schedules\` with body
-\`{"cron": "*/5 * * * *", "timezone": "Europe/Berlin", "job_ref": "billing.invoice", "misfire_policy": "skip"}\`.
+**Failure mode the checks target.** A schedule accepted with a broken time spec is an incident
+nobody sees until the wrong hour arrives: the fire runs in the wrong zone for a whole tenant, a
+sub-minute cadence turns one job into the queue's whole load, a free-form job reference resolves to
+nothing, and a missing misfire policy decides on the caller's behalf what happens to missed windows.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`timezone\` must be an IANA name the service can actually resolve: check it against the known set
-  \`IANA_TIMEZONES\` **and** construct the zone (\`ZoneInfo(name)\`,
-  \`Intl.DateTimeFormat('en-US', {timeZone: name})\`, \`time.LoadLocation\`, \`ZoneId.of\`, or the
-  lookup table). A name the service cannot resolve is **400** — never "keep the string and fall back
-  to server time". A schedule that fires in the wrong zone fires at the wrong hour for a whole
-  tenant, every day, silently.
+- A missing tenant is **401**.
+- \`timezone\` must be an IANA name the service can resolve: check it against \`IANA_TIMEZONES\`
+  **and** construct the zone (\`ZoneInfo(name)\`, \`Intl.DateTimeFormat('en-US', {timeZone: name})\`,
+  \`time.LoadLocation\`, \`ZoneId.of\`, or the lookup table). An unresolvable name is **400**, not a
+  fallback to server time.
 - \`cron\` must be a five-field expression (minute granularity). An expression that fires more often
   than **once a minute** is **400**: \`MAX_FIRES_PER_MINUTE = 1\` with \`MIN_INTERVAL_SECONDS = 60\`.
-  A six-field expression carries a seconds field — \`*/30 * * * * *\` is 120 fires a minute — and is
-  what turns one job into the queue's whole load.
+  A six-field expression carries a seconds field; \`*/30 * * * * *\` is 120 fires a minute.
 - \`job_ref\` is required and must match \`JOB_REF_PATTERN\` (\`^[a-z][a-z0-9_.-]{0,127}$\`);
-  anything else is **400**. The reference is what the scheduler triggers, so an empty or free-form
-  one is a schedule that can never resolve to a job.
+  anything else is **400**.
 - \`misfire_policy\` is required and must be one of \`MISFIRE_POLICIES\` = \`skip\`,
-  \`fire_once_now\`, \`catch_up\`. A missing policy is **400**: "skip everything" has to be a choice
-  the caller makes, not the default the service invents.
-- Answer **201** with the stored schedule, including its generated \`id\`.
-
-**Failure mode the checks target.** The starter resolves nothing: it stores whatever timezone string
-the caller sent and quietly runs on server time; it accepts a seconds-level expression and turns a
-one-second cadence into a queue flood; it lets \`job_ref\` be empty; and it defaults
-\`misfire_policy\` to \`skip\`, so a caller who never thought about misfires loses every missed run
-without ever seeing it. All four are invisible in a demo that sends one well-formed request.`,
+  \`fire_once_now\`, \`catch_up\`. A missing or unknown policy is **400**.
+- Answer **201** with the stored schedule, including its generated \`id\`.`,
   sequence: {
     participants: ['Client', 'Scheduler API', 'schedule store'],
     messages: [
@@ -160,9 +151,7 @@ def create_schedule(
     body: ScheduleRequest,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter keeps whatever timezone string the caller sent (and runs on server time
-    # when it cannot resolve it), accepts a seconds-level cron, validates no job reference, and
-    # defaults the misfire policy to skip. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     schedule = {
         "id": "sched-1",
         "tenant": tenant,
@@ -275,7 +264,7 @@ def create_schedule(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/schedules: flawed code that stores the caller's time spec. */
+      starter: `/** POST /v1/schedules: stores the caller's time spec. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -288,9 +277,7 @@ interface ScheduleBody {
 }
 
 app.post('/v1/schedules', async (request, reply) => {
-  // TODO: this starter keeps whatever timezone string the caller sent (and runs on server time when
-  // it cannot resolve it), accepts a seconds-level cron, validates no job reference, and defaults
-  // the misfire policy to skip. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as ScheduleBody;
   const schedule = {
@@ -430,9 +417,7 @@ func createSchedule(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter keeps whatever timezone string the caller sent (and runs on server time
-	// when it cannot resolve it), accepts a seconds-level cron, validates no job reference, and
-	// defaults the misfire policy to skip. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	timezone := body.Timezone
 	if timezone == "" {
 		timezone = "UTC"
@@ -613,9 +598,7 @@ object ScheduleApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ScheduleRequest]) { body =>
-            // TODO: this starter keeps whatever timezone string the caller sent (and runs on server
-            // time when it cannot resolve it), accepts a seconds-level cron, validates no job
-            // reference, and defaults the misfire policy to skip. Fix all four.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val timezone = if (body.timezone.isEmpty) "UTC" else body.timezone
             val policy = if (body.misfire_policy.isEmpty) "skip" else body.misfire_policy
             val schedule = Map(
@@ -744,9 +727,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter keeps whatever timezone string the caller sent (and runs on server time
-    // when it cannot resolve it), accepts a seconds-level cron, validates no job reference, and
-    // defaults the misfire policy to skip. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto cron = body.value("cron", std::string());
     const auto timezone = body.value("timezone", std::string("UTC"));
     const json schedule = {
@@ -876,9 +857,9 @@ int main() {
     },
   },
   hints: [
-    'Validate in cheapest order and return before touching the store: tenant, timezone, cron cadence, job_ref, misfire_policy. Every one of those is a 400 the caller can fix; a schedule accepted with a broken time spec is an incident nobody sees until the wrong hour arrives.',
-    'A cadence is a number, not a vibe: count the fields and treat a six-field expression as a seconds field. `*/30 * * * * *` is 120 fires a minute; `MIN_INTERVAL_SECONDS = 60` with `MAX_FIRES_PER_MINUTE = 1` is the bound that keeps one job from owning the queue.',
-    'The misfire policy is the field a caller must never omit. Keep the allowlist as data (`MISFIRE_POLICIES`), reject anything outside it with a 400, and store the policy on the schedule so the fire path and the history read consult the same value.',
+    'A tenant in Berlin reports that a 09:00 schedule fires at 07:00, and another tenant registered a job that now floods the queue from a single schedule.',
+    'The handler copies every field straight onto the schedule: the timezone is stored as text and resolved by nobody, the cron is not measured, and an empty policy or job_ref passes through.',
+    'Resolve the zone against `IANA_TIMEZONES` and construct it, count cron fields against `MIN_INTERVAL_SECONDS`, match `job_ref` to `JOB_REF_PATTERN`, require a policy from `MISFIRE_POLICIES`; each miss is a 400.',
   ],
-  debrief: `The interviewer is testing whether the endpoint treats the time spec as a contract. The starter reads fine because the demo sends one well-formed request with a timezone the server happens to be in and a cadence nobody measured. Four defects are checked: an unresolvable timezone that silently degrades to server time, an unbounded cadence that lets a caller schedule 120 fires a minute, a job reference that can never resolve, and a misfire policy defaulted instead of chosen. A real scheduler also stores the next fire time in UTC, caps the number of schedules per tenant, and echoes the computed next fire so the caller can confirm that the timezone it asked for is the one it got.`,
+  debrief: `The fix validates before it stores because every one of these fields is a contract the rest of the scheduler relies on: the lease step computes windows in the stored zone, the trigger step consults the stored policy, and the history read rebuilds expectations from the stored cron. A value that was accepted unchecked here is wrong in three later places. The checks are all 400s rather than coercions because a caller can fix a rejected request, while a coerced one fires at the wrong hour for a whole tenant. Production schedulers also store the next fire time in UTC and echo it in the response so the caller can confirm the zone it asked for is the one it got, and cap the number of schedules per tenant so one tenant cannot own the queue.`,
 };

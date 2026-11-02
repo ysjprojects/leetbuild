@@ -13,42 +13,29 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'audit'],
   task: `## Task
 
-**Starting point.** The starter is working code: every transition publishes a
-\`workflow.step\` event and the audit consumer appends it to the run's history, so the demo shows a
-run's story from start to finish. It compiles, it produces, and it hides five production flaws.
-Debug it like the worker's owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`publish_step(run_id, workflow, step, document)\` builds an event
+holding the run id, the workflow name, the step, the step's document and \`"outcome": "done"\`, and
+produces it to \`workflow.step\` with \`key=workflow\` from a producer on default settings. It
+compiles and hides five flaws.
 
-\`publish_step(run_id, step, effect_id, outcome)\` — \`publishStep\` in the other languages — is the
-worker's only way to report a transition.
+**Failure mode the checks target.** An auditor replaying one run's history reads other runs
+interleaved, cannot tell a running step from a finished one, finds the customer's document on a
+topic retained for days, and misses the transitions that happened while the broker was down or a
+leader failed over.
 
-- The message key is the **run id**, so every event about one run lands on one partition and the
-  audit consumer reads that run's history in order. The starter keys by the workflow definition name,
-  so one run's events scatter across partitions and a replay cannot rebuild the run.
-- The event carries \`step\`, \`effect_id\`, \`outcome\` and \`run_id\` — and **never the step's
-  document**. The topic is retained for days and replicated, so whatever the step received outlives
-  every retention policy the run itself has.
-- \`outcome\` is one of the four names the engine understands: \`started\`, \`succeeded\`, \`failed\`,
-  \`skipped\` — the \`OUTCOMES\` set in python and typescript, \`Outcomes\` in scala, \`kOutcomes\` in
-  cpp, \`outcomeStarted\` and \`outcomeSucceeded\` in go. The caller publishes \`started\` before the
-  step runs and \`succeeded\` after it returns. The starter reports \`"done"\`, so a retried step looks
-  finished while it is still running.
-- An **outbox row is written before the produce** and deleted **only after the broker acknowledged**
-  the record — \`outbox.insert(...)\` → produce → \`outbox.delete(...)\` — so a transition survives a
-  broker outage instead of vanishing from the history.
-- The producer is **durable and idempotent**: \`acks=all\` with \`enable.idempotence\` (KafkaJS
-  \`idempotent: true\` with \`acks: -1\`, kafka-go \`RequiredAcks: kafka.RequireAll\` with a
-  \`Completion\` callback). The starter leaves the defaults, so a record it called published can be
-  lost on a leader failover and a producer retry can duplicate it.
+Requirements for \`publish_step(run_id, step, effect_id, outcome)\` (\`publishStep\` elsewhere):
 
-**Failure mode the checks target.** The starter is a working publisher that answers the wrong
-questions: keying by the workflow definition name scatters one run's history, so the auditor's
-replay sees another run's events interleaved; \`"done"\` is not an outcome, so the history cannot
-tell a step that is running from one that finished, and a step that retries after reporting its
-start looks complete while it is still in flight; the step's document in the event is a leak every
-replica keeps for the topic's whole retention; a produce with no outbox row loses the transition
-exactly when the broker is down, which is when the history matters most; and default
-acknowledgements make "published" a statement about the client's socket rather than about the
-replicas.`,
+- The message key is the run id: \`key=run_id\`, \`key: runId\`, \`Key: []byte(runID)\`,
+  \`new ProducerRecord[String, String]("workflow.step", runId, …)\`, \`runId.data()\`.
+- The event carries \`run_id\`, \`step\`, \`effect_id\` and \`outcome\`, and no document.
+- \`outcome\` comes from a fixed set, \`started\`, \`succeeded\`, \`failed\`, \`skipped\`
+  (\`OUTCOMES\` in python and typescript, \`Outcomes\` in scala, \`kOutcomes\` in cpp,
+  \`outcomeStarted\` and \`outcomeSucceeded\` in go). The caller publishes \`started\` before the
+  step runs and \`succeeded\` after it returns.
+- \`outbox.insert(...)\` runs before the produce and \`outbox.delete(...)\` only after the broker
+  acknowledged the record.
+- The producer sets \`acks=all\` with \`enable.idempotence\` (KafkaJS \`idempotent: true\` with
+  \`acks: -1\`, kafka-go \`RequiredAcks: kafka.RequireAll\` with a \`Completion\` callback).`,
   sequence: {
     participants: ['Worker', 'Outbox (Postgres)', 'workflow.step topic', 'Audit consumer'],
     messages: [
@@ -144,9 +131,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 def publish_step(run_id: str, workflow: str, step: str, document: dict) -> None:
     """Report one step transition to the workflow.step topic."""
-    # TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
-    # instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
-    # outbox row, and leaves the producer on its default settings.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {
         "run_id": run_id,
         "workflow": workflow,
@@ -219,7 +204,7 @@ def run_step(run_id: str, step: str, effect_id: str, effect: Callable[[], None])
 `,
     },
     typescript: {
-      starter: `/** workflow.step: flawed code that keys by the workflow definition name. */
+      starter: `/** workflow.step: report one step transition to the topic. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'workflow', brokers: ['kafka:9092']});
@@ -233,9 +218,7 @@ export async function publishStep(
   step: string,
   document: Record<string, unknown>,
 ): Promise<void> {
-  // TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
-  // instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
-  // outbox row, and leaves the producer on its default settings.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {run_id: runId, workflow, step, document, outcome: 'done'};
   await producer.send({
     topic: 'workflow.step',
@@ -325,9 +308,7 @@ type stepEvent struct {
 }
 
 // PublishStep reports one step transition to the workflow.step topic.
-// TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
-// instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
-// outbox row, and leaves the writer on its default acknowledgements.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func PublishStep(ctx context.Context, runID string, workflow string, step string, document map[string]any) error {
 	event := stepEvent{RunID: runID, Workflow: workflow, Step: step, Document: document, Outcome: "done"}
 	value, err := json.Marshal(event)
@@ -445,9 +426,7 @@ object StepEvents {
     props
   })
 
-  // TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
-  // instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
-  // outbox row, and leaves the producer on its default settings.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publishStep(runId: String, workflow: String, step: String, document: String): Unit = {
     val event = s"""{"run_id":"$runId","workflow":"$workflow","step":"$step","document":$document,"outcome":"done"}"""
     producer.send(new ProducerRecord("workflow.step", workflow, event))
@@ -522,9 +501,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-// TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
-// instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
-// outbox row, and leaves the producer on its default acknowledgements.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publishStep(RdKafka::Producer& producer, const std::string& runId, const std::string& workflow,
                  const std::string& step, const json& document) {
   const json event = {
@@ -614,9 +591,9 @@ void runStep(RdKafka::Producer& producer, const std::string& runId, const std::s
     },
   },
   hints: [
-    'The message key is the partition key. Key by the run id — `key=run_id`, `key: runId`, `Key: []byte(runID)`, `new ProducerRecord[String, String]("workflow.step", runId, …)`, `runId.data()` — and every event about one run lands on one partition in order. Keyed by the workflow definition name, a single run’s history scatters across partitions and a replay cannot rebuild it.',
-    'The outbox row is the durability half, and its order matters: insert the row first, produce second, and delete the row only after the broker acknowledged the record. A produce the broker refused leaves the row behind for a relay to republish, instead of dropping the transition. And keep the step’s document out of the event — the topic’s retention is measured in days, so anything written there outlives the run.',
-    'Configure durability on the producer, not per call: `acks=all` with `enable.idempotence=true` (KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a `Completion` callback). Then report the vocabulary the engine understands — `started` before the step runs, `succeeded` after it returns — and never `"done"`, which cannot tell a running step from a finished one.',
+    'Symptom: the auditor replays `workflow.step` for one run and sees other runs interleaved; after a broker outage, transitions the worker reported are missing from the history.',
+    'Mechanism: `publish_step` sets `key=workflow`, so one run spreads across partitions; it produces with no outbox row and default acks, so a rejected or unreplicated record is simply gone.',
+    'Fix: `key=run_id`; `outbox.insert` before `producer.produce`, `outbox.delete` after the ack; `"acks": "all"` with `"enable.idempotence": True`; `OUTCOMES` with `started`/`succeeded`; no document. The checks cover each.',
   ],
-  debrief: `The interviewer is testing whether you can debug a producer at the point where a worker's transition becomes an audit trail. The starter reads fine because the demo runs one workflow once, the broker stays up and nobody replays the topic. Five defects are being checked, and each one is a class of production incident: keyed by the definition name, a run's history is scattered across partitions, so a replay interleaves other runs and cannot rebuild the sequence; "done" is not an outcome, so the history cannot distinguish a step that is running from one that finished, and a step that retried after reporting its start looks complete while it is still in flight; the step's document in the event is a leak that outlives the run, because the topic's retention is measured in days and every replica keeps a copy; a produce with no outbox row loses the transition exactly when the broker is down, which is when the history matters most; and default acknowledgements make "published" a statement about the client's socket rather than about the replicas. The order matters as much as the pieces: the row is inserted before the produce and deleted only after the broker acknowledged, so a crash between the two replays the row instead of losing the transition. In a real engine the consumer is what turns the topic into the run's history, the relay republishes rows the broker rejected, and the event also carries the definition version and a monotonically increasing sequence number so the auditor can order a run without trusting the clock.`,
+  debrief: `The event exists for an auditor replaying one run, and that decides each fix. The key is the run id because a partition is the only ordering guarantee Kafka gives; keyed by definition name, one run scatters. The outcome vocabulary lets the history tell a running step from a finished one, which \`"done"\` cannot. The document stays out because topic retention outlives the run's own retention policy. The outbox row is inserted before the produce and deleted after the acknowledgement, so a crash between the two replays the row, and \`acks=all\` with idempotence makes that acknowledgement mean replicated. Production events also carry a per-run sequence number so the auditor can order a run without trusting the clock.`,
 };

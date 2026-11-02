@@ -8,33 +8,25 @@ export const redactEndpointStep: Step = {
   focus: ['client', 'redactor', 'detector'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the body, calls the detector and returns something. It compiles, the demo hides nothing because the
-demo text always matches, and it fails open in the three ways that turn a redactor into a leak.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/redact\` with body
+\`{"text": "…", "entities": ["EMAIL", "PHONE"], "document_id": "…"}\`, reads the tenant from
+\`X-Tenant-Id\`, calls the detector and returns the redacted text. It serves the demo, because the
+demo text always matches and the demo detector always answers, and hides 4 flaws.
 
-Implement \`POST /v1/redact\` with body \`{"text": "…", "entities": ["EMAIL", "PHONE"], "document_id": "…"}\`.
+**Failure mode the checks target.** A redactor is judged by what it does when it cannot answer. On
+no-match, on detector error and on an oversized payload the starter prefers a convenient answer to
+a safe one, and each one moves customer text into a response, a log line or a crash report.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`text\` is a non-empty string of at most **256 KiB** (\`1 << 18\` bytes) of UTF-8; a larger text
-  is **413** and the error body must **never** quote the payload.
+- A missing \`X-Tenant-Id\` is **401**.
+- \`text\` is a non-empty string of at most **256 KiB** (\`1 << 18\` bytes); a larger text is
+  **413** with a constant error body, not a slice of the payload. Name the caps.
 - \`entities\` is a subset of the eight declared types (at most eight); an unknown or oversized
   list is **400**. The default set is \`EMAIL\`, \`PHONE\`, \`SSN\`.
-- \`document_id\` is required (**400** when absent) — the audit trail is keyed by it later.
-- Detection returns spans; the response is the redacted text plus the spans, the per-type counts
-  and the pattern version: \`{"document_id", "status", "redacted_text", "spans", "entity_counts",
-  "pattern_version"}\`.
-- Clean text with no match is still **processed**: the response status is \`"processed"\` with an
-  empty span list. Never treat "nothing matched" as "return the input unchanged and call it done".
-- A detector failure is **503** with \`{"error": "detector_unavailable"}\` and **no text** in the
-  body. The starter catches the detector error and returns the original text with a warning, so an
-  outage becomes an exfiltration path.
-
-**Failure mode the checks target.** The whole point of a redactor is what it does when it cannot
-answer. The starter's three flaws are one flaw in three places: it prefers a convenient answer to a
-safe one. Returning the input on no-match means a regex miss silently disables redaction; returning
-the input on detector error means a provider outage leaks every document in flight; quoting a
-truncated payload in the 413 body puts sensitive text into error logs and client-side crash reports.`,
+- \`document_id\` is required (**400** when absent).
+- Every 200 is \`{"document_id", "status": "processed", "redacted_text", "spans", "entity_counts",
+  "pattern_version"}\`, with an empty span list when nothing matched. No \`text\` field anywhere,
+  including error bodies.
+- A detector failure is **503** with \`{"error": "detector_unavailable"}\` and no text in the body.`,
   sequence: {
     participants: ['Client', 'Redactor', 'Detector'],
     messages: [
@@ -159,8 +151,7 @@ def apply_spans(text: str, spans: list[dict]) -> str:
 
 @app.post("/v1/redact")
 def redact(body: RedactRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter returns the original text when no entity matches, swallows detector errors
-    # and returns the input unchanged, and echoes oversized inputs in the error body.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if len(body.text.encode("utf-8")) > 1 << 18:
         return JSONResponse({"error": f"text too large: {body.text[:64]}"}, status_code=413)
     try:
@@ -285,8 +276,7 @@ interface RedactBody {
 }
 
 app.post('/v1/redact', async (request, reply) => {
-  // TODO: this starter returns the original text when no entity matches, swallows detector errors
-  // and returns the input unchanged, and echoes oversized inputs in the error body.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const body = request.body as RedactBody;
   if (Buffer.byteLength(body.text, 'utf8') > 1 << 18)
     return reply.code(413).send({error: \`text too large: \${body.text.slice(0, 64)}\`});
@@ -429,8 +419,7 @@ func redact(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter returns the original text when no entity matches, swallows detector errors
-	// and returns the input unchanged, and echoes oversized inputs in the error body.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	if len([]byte(body.Text)) > 1<<18 {
 		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "text too large: " + body.Text[:64]})
 		return
@@ -627,8 +616,7 @@ object RedactApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RedactRequest]) { body =>
-            // TODO: this starter returns the original text when no entity matches, swallows detector
-            // errors and returns the input unchanged, and echoes oversized inputs in the error body.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             if (body.text.getBytes("UTF-8").length > (1 << 18)) {
               complete(StatusCodes.RequestEntityTooLarge, s"""{"error":"text too large: \${body.text.take(64)}"}""")
             } else {
@@ -796,8 +784,7 @@ int main() {
     }
     const auto text = body.value("text", std::string());
     const auto documentId = body.value("document_id", std::string());
-    // TODO: this starter returns the original text when no entity matches, swallows detector errors
-    // and returns the input unchanged, and echoes oversized inputs in the error body.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if (text.size() > 1u << 18) {
       res.status = 413;
       res.set_content(json{{"error", "text too large: " + text.substr(0, 64)}}.dump(), "application/json");
@@ -948,9 +935,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guards by cost and by blame: tenant (401), document_id (400), text shape (400), byte length (413), entity whitelist (400). Each returns before the detector is called, so an oversized or malformed request never reaches the model — and the 413 body stays a constant error string, never a slice of the payload.',
-    'Fail closed means the error path is the most important path. `except DetectorUnavailable: raise HTTPException(503, {"error": "detector_unavailable"})` — no `degraded: true`, no returning `body.text`. A warning header is not a control; if the detector cannot answer, the request cannot be served.',
-    'A clean document is a successful redaction, not a no-op. Always answer with `status: "processed"`, the span list (possibly empty), `entity_counts` and `pattern_version`, so a caller can tell "ran and found nothing" from "redaction was skipped".',
+    'During a detector outage every request still returns 200, and the body contains the customer text the caller sent, untouched, under a warning header.',
+    'The handler catches the detector error and returns `body.text` with `degraded: true`; a no-match takes the same path, and the 413 body quotes a slice of the payload.',
+    'Catch `DetectorUnavailable` and answer 503 `{"error": "detector_unavailable"}`; always return `status: "processed"` with spans, counts and `pattern_version`; make the 413 body a constant string behind named caps.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler for its failure behavior, not its happy path. The starter reads fine because the demo always matches and the detector never fails. The three defects are one defect: it prefers an answer to a safe answer. Returning the input on no-match silently disables redaction; returning the input on detector error turns a model outage into an exfiltration path; quoting a slice of the payload in the 413 body ships sensitive text into logs, crash reports and retry queues. A real redactor adds the model's own health signal to the response (\`pattern_version\`, counts), makes "processed" a first-class status so a down detector is visible in dashboards, and keeps the raw text only in the caller's request buffer — never in a response, a log line or a metric label.`,
+  debrief: `The fix has the shape of a guard list that ends in a safe default: every validation returns before the detector is called, the 413 body is a constant, and the only 200 is one that carries spans, counts and a pattern version. Fail closed means the error path is the most important path: if the detector cannot answer, the request cannot be served, and a warning header is not a substitute for a status code. "Processed with zero spans" is a distinct outcome from "skipped", which is why the response shape is fixed. Production redactors go further: they keep the raw text only in the request buffer, scrub it from exception messages and metric labels, and alert on the 503 rate rather than on a rise in unredacted documents.`,
 };

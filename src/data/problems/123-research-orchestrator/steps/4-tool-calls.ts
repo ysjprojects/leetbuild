@@ -8,33 +8,26 @@ export const toolCallsStep: Step = {
   focus: ['subagent', 'tools', 'citation'],
   task: `## Task
 
-**Starting point.** The starter is working code: when the tool service is
-healthy it returns the page text, and the citation pass returns every citation marked verified, so
-the demo passes. Every failure path and every trust boundary is wrong. Find the four flaws, fix
-them, and prove the fix.
+**Starting point.** The starter implements \`call_tool(name, args)\` and
+\`verify_citations(citations, sources)\`: \`call_tool\` sends \`Tools.Call\` inside a \`while True\`
+that retries on any \`RpcError\` and returns the reply text as is; \`verify_citations\` marks every
+citation verified. With a healthy tool service the demo passes. It compiles and hides five flaws.
 
-Implement \`call_tool(name, args)\` and \`verify_citations(citations, sources)\` for the subagents
-and the citation pass:
+**Failure mode the checks target.** Catching every error and looping forever spins a subagent on a
+permanent \`INVALID_ARGUMENT\` and hot-loops a struggling tool service; a result forwarded verbatim
+lets any web page inject instructions into a subagent with tools; a citation pass that verifies
+everything turns the report's promise of attribution into decoration.
 
-- Each \`Tools.Call\` carries a **30 s** deadline (\`TOOL_DEADLINE_S\`). A search or fetch that
-  hangs must fail the attempt, not the subagent's whole deadline.
-- At most **3 attempts** (\`MAX_ATTEMPTS\`), with exponential backoff from **500 ms**
-  (\`BACKOFF_BASE_S = 0.5\`, doubling), and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retried; every other status is raised to the subagent at once, so the model can adapt — the
-  source's lesson is that telling the agent a tool is failing works better than hiding it.
-- A tool result is **untrusted text**: a fetched page is data to reason about, never instructions
-  to follow. \`sanitize_result\` drops lines that match \`INSTRUCTION_PATTERN\` ("ignore the previous
-  instructions", "system:", "you are now …") and reports how many it dropped, so the trace can show
-  that a source tried to steer the agent.
+- Each \`Tools.Call\` carries a **30 s** deadline (\`TOOL_DEADLINE_S\`).
+- At most **3 attempts** (\`MAX_ATTEMPTS\`), exponential backoff from **500 ms**
+  (\`BACKOFF_BASE_S = 0.5\`, doubling); only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried,
+  every other status is raised to the subagent at once so the model can adapt.
+- A tool result is **untrusted text**. \`sanitize_result\` drops lines matching
+  \`INSTRUCTION_PATTERN\` ("ignore the previous instructions", "system:", "you are now …") and
+  reports how many it dropped, so the trace shows that a source tried to steer the agent.
 - The citation pass keeps a citation **only when its span is a literal substring of the fetched
-  source** it names. A span that is not in the source is a claim with no evidence; it stays in the
-  report unverified and the end-state judge scores citation accuracy accordingly.
-
-**Failure mode the checks target.** The starter catches every error and loops forever — a permanent
-\`INVALID_ARGUMENT\` spins the subagent, and a struggling tool service gets a hot loop with no
-pause between attempts; a result forwarded verbatim lets any web page inject instructions into a
-subagent that has tools; and a citation pass that marks everything verified turns the report's
-strongest promise — every claim attributed to a source — into decoration.`,
+  source** it names; otherwise it stays unverified and the end-state judge scores citation accuracy
+  accordingly.`,
   sequence: {
     participants: ['Subagent', 'Tools', 'Citation pass'],
     messages: [
@@ -59,9 +52,9 @@ strongest promise — every claim attributed to a source — into decoration.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). Bound the attempts with a constant and a `for` loop: the starter’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
-    'Retryability is a property of the status, not of “it threw”: compare the code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, raise anything else immediately, and sleep `BACKOFF_BASE_S * 2 ** attempt` before the next try.',
-    'Two small pure functions carry the trust boundary: `sanitize_result` splits the text into lines, drops the ones `INSTRUCTION_PATTERN` matches and counts them; `verify_citations` sets `verified` to whether the span is a substring (`in`, `includes`, `strings.Contains`, `contains`, `find`) of the named source’s text.',
+    'A subagent whose fetch gets `INVALID_ARGUMENT` spins at 100% CPU until its deadline, a tool outage shows thousands of calls per second, and a report cites a quote its source page does not contain.',
+    '`call_tool` is `while True` around `tools.Call` with no timeout, retrying every `RpcError` immediately and returning `reply.text` untouched; `verify_citations` sets `verified=True` without reading the source.',
+    'Pass `timeout=TOOL_DEADLINE_S` to `Call`, loop `range(MAX_ATTEMPTS)`, retry only `RETRYABLE` codes after `sleep(BACKOFF_BASE_S * 2 ** attempt)`, run `sanitize_result` with `INSTRUCTION_PATTERN`, and set `verified` to `citation.span in sources[...]`.',
   ],
   checks: [
     {
@@ -185,9 +178,7 @@ class Citation:
 
 
 def call_tool(name: str, args: dict) -> ToolResult:
-    # TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
-    # UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-    # pass check the span against the source. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = tools.Call(tools_pb2.CallRequest(name=name, args=args))
@@ -305,9 +296,7 @@ export interface Citation {
 }
 
 export async function callTool(name: string, args: Record<string, string>): Promise<ToolResult> {
-  // TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
-  // UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-  // pass check the span against the source. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const reply = await new Promise<CallReply>((resolve, reject) => {
@@ -434,9 +423,7 @@ type Citation struct {
 	Verified bool
 }
 
-// TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
-// UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-// pass check the span against the source. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func callTool(ctx context.Context, client pb.ToolsClient, name string, args map[string]string) (ToolResult, error) {
 	for {
 		reply, err := client.Call(ctx, &pb.CallRequest{Name: name, Args: args})
@@ -554,9 +541,7 @@ final case class Citation(span: String, sourceId: String, verified: Boolean = fa
 object ToolCalls {
   val stub = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
 
-  // TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
-  // UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-  // pass check the span against the source. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def callTool(name: String, args: Map[String, String]): ToolResult = {
     var result: Option[ToolResult] = None
     while (result.isEmpty) {
@@ -643,9 +628,7 @@ struct Citation {
   bool verified = false;
 };
 
-// TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
-// UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-// pass check the span against the source. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 ToolResult callTool(Tools::Stub* stub, const std::string& name, const std::map<std::string, std::string>& args) {
   while (true) {
     grpc::ClientContext ctx;
@@ -753,5 +736,5 @@ std::vector<Citation> verifyCitations(const std::vector<Citation>& citations, co
 `,
     },
   },
-  debrief: `The interviewer is probing two boundaries at once. The first is the worst case of a call: a deadline bounds one attempt, the attempt count bounds the call, the retryable set decides which failures are worth another try, and the backoff keeps three subagents retrying in step from becoming a hot loop against the tool service. The source's advice — tell the agent a tool is failing and let it adapt — only works if a permanent error reaches it instead of being swallowed by a retry loop. The second is trust: a tool result is text from the outside world, and a subagent with tools will act on instructions it reads unless the system makes the distinction for it. Stripping and counting instruction-like lines is a crude filter, and that is the point — it is deterministic, traceable and testable, where "the model will know" is none of those. The literal-substring citation check is the same idea applied to the output: the report's promise that every claim is attributed is only worth something if attribution is verified against what was actually fetched. Real systems add jitter to the backoff, per-tool concurrency limits, a content-type allowlist on fetches, and a citation pass that also normalises whitespace and quotes before comparing.`,
+  debrief: `The fix bounds two things. The first is the worst case of a call: a deadline bounds one attempt, the attempt count bounds the call, the retryable set decides which failures deserve another try, and the backoff keeps three subagents retrying in step from hot-looping the tool service. Letting the agent adapt to a failing tool only works if a permanent error reaches it instead of a retry loop swallowing it. The second is trust: a tool result is text from the outside world, and a subagent with tools will act on instructions it reads unless the system draws the line for it. Stripping instruction-like lines is crude on purpose: deterministic, traceable, testable. Production systems add jitter, per-tool concurrency limits and a content-type allowlist on fetches.`,
 };

@@ -8,37 +8,25 @@ export const researchEndpointStep: Step = {
   focus: ['client', 'api', 'lead'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns a research report. It compiles, it serves the demo, and it hides four
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/research\` with body
+\`{"query": "…", "effort": "compare"}\`: it reads the tenant header, builds a budget from the body,
+calls the lead agent inline and answers 200 with the report. There is no status route. It
+compiles, serves the demo, and hides five flaws.
 
-Implement \`POST /v1/research\` with body \`{"query": "…", "effort": "compare"}\` and
-\`GET /v1/research/{job_id}\`.
+**Failure mode the checks target.** Research inside the request ties a worker to a multi-minute
+job and loses it on every timeout or deploy; a caller-supplied budget and an uncapped query make
+one request an unbounded bill; an un-keyed start endpoint spawns a second job per retry.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401** on
-  both routes.
-- \`query\` is a non-empty string of at most **8 KiB** (\`1 << 13\` bytes) of UTF-8; larger is
-  **413**.
-- \`effort\` is one of \`fact\`, \`compare\`, \`deep\` (**400** otherwise) and defaults to \`fact\`.
-  The budget is chosen server-side from an effort table — the source's scaling rules — and the
-  caller can never set it: \`fact\` → 1 subagent, 10 tool calls, 50 000 tokens; \`compare\` → 4
-  subagents, 60 tool calls, 250 000 tokens; \`deep\` → 10 subagents, 150 tool calls, 1 000 000
-  tokens.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the stored job instead of starting a second one.
+- Tenant from the \`X-Tenant-Id\` header; missing is **401** on both routes.
+- \`query\` is non-empty and at most **8 KiB** (\`1 << 13\` bytes); larger is **413**.
+- \`effort\` is \`fact\`, \`compare\` or \`deep\` (**400** otherwise), default \`fact\`. The budget
+  comes from a server-side table: \`fact\` → 1 subagent, 10 tool calls, 50 000 tokens;
+  \`compare\` → 4, 60, 250 000; \`deep\` → 10, 150, 1 000 000.
+- \`Idempotency-Key\` is required (**400** when missing); a replay of \`(tenant, key)\` returns the
+  stored job.
 - The handler stores the job, **enqueues** it for the lead agent and answers **202** with
-  \`{job_id, status: "queued", budget}\`. It never runs the research inline: a job can take minutes
-  and fifteen chats' worth of tokens, and an HTTP request is neither a durable nor a resumable
-  place to hold it.
-- \`GET /v1/research/{job_id}\` returns the job's status for the tenant that owns it, **404** when
-  there is none.
-
-**Failure mode the checks target.** Running the research inside the request ties a worker to a
-multi-minute job and loses it on every timeout, retry or deploy; a caller-supplied budget turns one
-request into an unbounded bill — the source's whole economic argument is that multi-agent spend
-must be matched to the value of the task; the missing cap on the query is the same leak at the
-input; and an un-keyed start endpoint spawns a second job, with a second budget, for every client
-retry.`,
+  \`{job_id, status: "queued", budget}\`; the research does not run inline.
+- \`GET /v1/research/{job_id}\` returns the owning tenant's job status, **404** otherwise.`,
   sequence: {
     participants: ['Client', 'researchd API', 'job store', 'Lead agent'],
     messages: [
@@ -180,8 +168,7 @@ jobs = JobStore()
 
 @app.post("/v1/research")
 def research(body: ResearchRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter runs the whole research job inside the request, takes the budget from the
-    # caller, caps neither the query nor the effort, and ignores Idempotency-Key. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     job_id = str(uuid.uuid4())
     budget = {
         "max_subagents": body.max_subagents,
@@ -308,8 +295,7 @@ interface ResearchBody {
 }
 
 app.post('/v1/research', async (request, reply) => {
-  // TODO: this starter runs the whole research job inside the request, takes the budget from the
-  // caller, caps neither the query nor the effort, and ignores Idempotency-Key. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as ResearchBody;
   const jobId = randomUUID();
@@ -444,8 +430,7 @@ func research(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter runs the whole research job inside the request, takes the budget from the
-	// caller, caps neither the query nor the effort, and ignores Idempotency-Key. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	jobID := uuid.NewString()
 	budget := Budget{MaxSubagents: body.MaxSubagents, MaxToolCalls: body.MaxToolCalls, TokenBudget: body.TokenBudget}
 	log.Printf("research tenant=%s job=%s effort=%s", tenant, jobID, body.Effort)
@@ -660,8 +645,7 @@ object ResearchApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ResearchRequest]) { body =>
-            // TODO: this starter runs the whole research job inside the request, takes the budget
-            // from the caller, caps neither the query nor the effort, and ignores Idempotency-Key.
+            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
             val jobId = UUID.randomUUID().toString
             val budget = Budget(body.max_subagents, body.max_tool_calls, body.token_budget)
             system.log.info(s"research tenant=$tenant job=$jobId effort=\${body.effort}")
@@ -793,8 +777,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter runs the whole research job inside the request, takes the budget from the
-    // caller, caps neither the query nor the effort, and ignores Idempotency-Key. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const auto jobId = uuidString();
     const auto effort = body.value("effort", std::string("fact"));
     const json budget = {
@@ -930,9 +913,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant, Idempotency-Key, query shape, byte length, effort whitelist. Every one of them returns before the job store is touched, so a malformed request can never reserve a budget.',
-    'The budget is a lookup, not an input: `EFFORT_BUDGETS[effort]` gives `max_subagents`, `max_tool_calls` and `token_budget`; delete the body fields that let the caller set them. The source’s scaling rules — one agent for a fact, 2–4 for a comparison, 10+ for deep research — are the table.',
-    'The handler’s last three lines are `jobs.put(tenant, idem_key, job)`, `queue.enqueue(job)`, `202`. A replay hits `jobs.get` first and returns the stored job with the same 202. The lead agent reads the queue; nothing in the request waits for it.',
+    'A client that times out at 30 s and retries gets a second bill for the same question, and a request body with `"max_tool_calls": 100000` is honoured. Nothing lets the caller poll a running job.',
+    'The handler awaits `run_research` inside the request, copies `max_subagents` and friends from the body, checks neither query size nor effort, and reads no `Idempotency-Key`, so every retry is a brand-new job.',
+    'Guard tenant, `Idempotency-Key`, query bytes (`MAX_QUERY_BYTES`) and `ALLOWED_EFFORTS`; look the budget up in `EFFORT_BUDGETS[effort]`; `jobs.get` then `jobs.put` and `queue.enqueue(job)`; answer 202 and add `GET /v1/research/{job_id}`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler for a job that costs fifteen chats and runs for minutes. The starter reads fine because the demo sends one short query, waits, and never retries. Four separate defects are being checked: the synchronous call (a multi-minute job inside an HTTP request dies on every timeout, retry and deploy, and cannot be resumed), the caller-supplied budget (the source's economic argument is that multi-agent spend must be matched to the task's value — a server-side effort table is how that becomes code), the missing input caps, and idempotency keyed by tenant so a retry cannot spawn a second job with a second budget. The status route is the half candidates forget: a 202 without a way to poll is a fire-and-forget. Real systems add per-tenant concurrency limits on open jobs, a daily token budget on top of the per-job one, and a cancel route that stops the subagents and refunds nothing.`,
+  debrief: `The fix moves the job out of the request because an HTTP connection is the wrong place to hold minutes of work and fifteen chats of spend: the queue plus a job record makes the work durable and pollable, the effort table makes the spend a server decision, the byte cap closes the same leak at the input, and the \`(tenant, key)\` lookup makes a retry cost nothing. The status route is the half that gets forgotten: a 202 without a way to poll is fire-and-forget. Production systems go further with a per-tenant limit on open jobs, a daily token budget layered over the per-job one, a cancel route that stops the subagents, and job records that outlive the process so a replay still finds its key after a restart.`,
 };

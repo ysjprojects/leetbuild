@@ -8,28 +8,25 @@ export const readStep: Step = {
   focus: ['api', 'coverage', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the read, looks up a number and
-returns it. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/accounts/{account}/usage\`: it reads
+\`batch:usage:{account}\` from Redis and answers \`{"account", "units"}\` to whoever asks. It
+compiles, serves the demo and hides four flaws.
 
-Implement \`GET /v1/accounts/{account}/usage\`.
+**Failure mode the checks target.** The batch key is written by a nightly job, so the number is up to
+a day stale and disagrees with the counters the limiter is enforcing right now; the response drops
+the overage flag and the close id, so an account past its cap reads "fine" and nothing ties the
+number to billing; and the caller is not compared to the account, so any authenticated client can
+read any account's usage.
 
-- The read returns the **current window's** units — the same \`usage:{account}:{window}\` counters the
-  limiter and billing see — not a number from a nightly batch. A report that lags a day cannot answer
-  "what has this account used this hour".
+- The read returns the **current window's** units, the same \`usage:{account}:{window}\` counters the
+  limiter and billing see, not a number from a nightly batch.
 - The response carries the **cap**, the **overage** flag and the **last reconciled close id**, so a
   customer or an on-call engineer can tell a plan that is over from a plan that is merely close, and
   can tie the number to the billing close that confirmed it.
 - The caller must be the account: the authenticated \`X-Account-Id\` is required (**401** when missing)
-  and a mismatch with the path's account is **403**. Serving any account to any caller turns the read
-  into an enumeration oracle.
+  and a mismatch with the path's account is **403**.
 - The \`period\` in the response is the window bucket the number was read from, so the reader knows
-  when it resets.
-
-**Failure mode the checks target.** The starter reads \`batch:usage:{account}\`, a key a nightly job
-writes, so the number is up to a day stale and disagrees with the counters the limiter is enforcing
-right now; it drops the overage flag, so an account past its cap still reads "fine"; and it never
-compares the caller to the account, so any authenticated client can read any account's usage.`,
+  when it resets.`,
   sequence: {
     participants: ['Caller', 'Usage read API', 'Redis counters'],
     messages: [
@@ -123,9 +120,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/accounts/{account}/usage")
 def get_usage(account: str) -> JSONResponse:
-    # TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
-    # the counters the limiter enforces; it never reports overage; and it serves whatever account the
-    # path names to whoever asks. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     units = int(r.get(f"batch:usage:{account}") or 0)
     return JSONResponse({"account": account, "units": units}, status_code=200)
 `,
@@ -182,9 +177,7 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/accounts/:account/usage', async (request, reply) => {
-  // TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
-  // the counters the limiter enforces; it never reports overage; and it serves whatever account the
-  // path names to whoever asks. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {account} = request.params as {account: string};
   const units = Number((await r.get(\`batch:usage:\${account}\`)) ?? 0);
   return reply.code(200).send({account, units});
@@ -239,9 +232,7 @@ import (
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func getUsage(rw http.ResponseWriter, req *http.Request) {
-	// TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
-	// the counters the limiter enforces; it never reports overage; and it serves whatever account the
-	// path names to whoever asks. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	account := req.PathValue("account")
 	units, _ := rdb.Get(req.Context(), "batch:usage:"+account).Int64()
 	writeJSON(rw, http.StatusOK, map[string]any{"account": account, "units": units})
@@ -322,9 +313,7 @@ object Read {
   val route: Route =
     path("v1" / "accounts" / Segment / "usage") { account =>
       get {
-        // TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees
-        // with the counters the limiter enforces; it never reports overage; and it serves whatever
-        // account the path names to whoever asks. Fix all three.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         val units = MeteringState.r.get(s"batch:usage:$account").toLongOption.getOrElse(0L)
         complete(StatusCodes.OK, s"""{"account":"$account","units":$units}""")
       }
@@ -393,9 +382,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/accounts/:account/usage", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
-    // the counters the limiter enforces; it never reports overage; and it serves whatever account the
-    // path names to whoever asks. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto account = req.path_params.at("account");
     const auto units = std::stoll(redisGet("batch:usage:" + account));
     res.status = 200;
@@ -463,16 +450,16 @@ int main() {
     },
   },
   hints: [
-    'Read the same key the limiter writes: `usage:{account}:{window}` for the current bucket. A nightly batch key is a different number with a different meaning, and a customer reading it will disagree with what the meter is enforcing.',
-    'Overage is the whole point of the read. Return the cap, the `overage` flag and the period, so "close to the cap" and "past the cap" are distinguishable without a second request.',
-    'The caller must be the account. Compare the authenticated `X-Account-Id` to the path segment and answer `403` on a mismatch; a read that serves any account is an enumeration oracle. Also return the last reconciled close id so the number can be tied to billing.',
+    'A customer who was flagged over their cap ten minutes ago reads a number from yesterday with no cap state, and a client holding one account’s token can read every other account by changing the path.',
+    'The handler takes the path account, does one `GET` on `batch:usage:{account}` and returns two fields. It reads no header, no window key, no overage flag and no close id.',
+    'Require `X-Account-Id` (401 missing, 403 mismatch), read `window_key(account, now)` via `WINDOW_SECONDS`, and return units, cap, `overage`, `period` and the `close:{account}:{period}` close id.',
   ],
-  debrief: `The interviewer is testing whether the read path tells the same story as the write path. Three
-defects: the number comes from a nightly batch, so it lags the counters the limiter enforces and the
-close billing confirmed; the overage flag is dropped, so a plan past its cap reads healthy; and the
-account in the path is trusted, so any authenticated caller can read any account. The fix is to read
-the live window key, to return the cap state and the last reconciled close id alongside the units,
-and to authorize the caller against the path. Real systems add a short cache with the window bucket in
-the key so the read is cheap without being stale, a signed caller identity rather than a bare header,
-and a nightly reconciliation that compares the read's totals against the gateway's own counters.`,
+  debrief: `The read takes its number from the live window key because a read that disagrees with the
+limiter is not a read of usage, it is a read of something else; the two paths have to share one
+source. The cap state and the close id ride along for the same reason: the number alone cannot say
+whether the account is over or whether billing has confirmed it, and those are the two questions a
+caller has. Authorizing against the path turns an enumeration oracle into a tenant-scoped read. A
+production read usually fronts the window key with a short cache that includes the bucket in its key,
+so it stays cheap without going stale, and takes the caller identity from a signed token rather than
+a bare header.`,
 };

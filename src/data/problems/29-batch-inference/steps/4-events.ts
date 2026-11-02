@@ -8,29 +8,29 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'coordinator', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: a finished shard produces an
-event and the coordinator consumes it, so the happy path moves shards through the topic. Three
-production contracts are broken. Find them, fix them, and prove the fix with the checks below.
+**Starting point.** The starter implements \`publish_shard\`, which produces a \`batch.shard\` event keyed
+by \`worker_id\` with \`shard_id\` and the record count, then writes the output object; and \`consume\`,
+which commits the offset and then calls \`fold_shard\` with an empty checksum. It moves shards through
+the topic in the demo and hides 5 flaws.
+
+**Failure mode the checks target.** Events that describe state that does not exist yet and a
+coordinator that forgets shards: keying by worker destroys per-batch ordering, publishing before the
+flush makes the checksum meaningless, a rejected produce drops the shard with nothing to recover it,
+and committing before folding turns a crash into a permanently missing shard.
 
 Every finished shard publishes exactly one \`batch.shard\` event, and the coordinator folds those
 events back into the batch manifest.
 
 - **Key by batch id.** The message key is the batch, so every shard of one batch lands in the same
-  partition in a stable order. The starter keys by worker, so one batch's shards scatter and the
-  coordinator folds them out of order.
+  partition in a stable order.
 - **Publish only after the output is flushed.** Write the output object first and take its
-  \`checksum\`, then produce the event carrying \`shard_id\`, the record \`records\` count and that
-  \`checksum\`. The starter produces first, so the checksum can reference an object that is not readable
-  yet — or does not exist.
+  \`checksum\`, then produce the event carrying \`shard_id\`, the \`records\` count and that
+  \`checksum\`.
 - **Outbox on a rejected produce.** When the broker rejects the produce, write an outbox row inside
   the error branch instead of dropping the event, so a relay can republish it.
 - **Fold before committing the offset.** The coordinator inserts the shard into the manifest and
   records it as folded, and only then commits the offset. It also skips a shard it has already
-  folded, so a replay after a crash does not double-count the batch.
-
-**Failure mode the checks target.** Keying by worker destroys per-batch ordering; publishing before
-the flush makes the checksum a lie; a dropped produce loses a shard with no outbox to recover it;
-and committing before folding turns a crash into a permanently missing shard.`,
+  folded, so a replay after a crash does not double-count the batch.`,
   sequence: {
     participants: ['Worker pool', 'Output store', 'batch.shard', 'Coordinator', 'batch · outbox'],
     messages: [
@@ -49,9 +49,9 @@ and committing before folding turns a crash into a permanently missing shard.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=batch_id` / `Key: []byte(batchID)` / `key: batchId` / `ProducerRecord("batch.shard", batchId, …)`. Keyed by the worker, one batch’s shards land in many partitions and the coordinator sees them out of order.',
-    'The checksum must describe a readable object, so the write comes first: `checksum = outputs.put(...)` and only then the produce. Publishing first is how a consumer ends up with a checksum for a file that was never flushed.',
-    'The outbox is the durability half: wrap the produce and, when it is rejected, `insertOutbox(...)` the event. In the coordinator, check the folded set, then `fold_shard`, then `commit` — a crash between fold and commit then replays into an idempotent fold instead of a double-count.',
+    'A coordinator restart and one batch is short a shard that the worker swears it finished; another batch shows a checksum for an output object that a GET says does not exist.',
+    'The produce runs before `outputs.put`, with the worker id as key and no checksum in the event; the consumer commits before `fold_shard`, so a crash in between loses the event for good.',
+    '`checksum = outputs.put(...)` first, then produce with `key=batch_id` and the checksum, `insertOutbox` in the error branch; in `consume`, skip already folded, `fold_shard`, then `commit`.',
   ],
   checks: [
     {
@@ -131,8 +131,7 @@ consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "coordinator
 
 
 def publish_shard(batch_id: str, worker_id: str, shard_id: str, records: list[str]) -> None:
-    # TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
-    # commits its offset before it folds the shard into the manifest.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {"batch_id": batch_id, "shard_id": shard_id, "records": len(records)}
     producer.produce("batch.shard", key=worker_id, value=json.dumps(event))
     outputs.put(batch_id, shard_id, records)
@@ -196,7 +195,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** batch.shard: flawed code that keys by worker and commits before folding. */
+      starter: `/** batch.shard: shard events and the coordinator fold. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'batchd', brokers: ['kafka:9092']});
@@ -209,8 +208,7 @@ export async function publishShard(
   shardId: string,
   records: string[],
 ): Promise<void> {
-  // TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
-  // commits its offset before it folds the shard into the manifest.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event = {batch_id: batchId, shard_id: shardId, records: records.length};
   await producer.send({topic: 'batch.shard', messages: [{key: workerId, value: JSON.stringify(event)}]});
   await outputs.put(batchId, shardId, records);
@@ -278,8 +276,7 @@ import (
 var producer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "batch.shard"}
 
 func PublishShard(ctx context.Context, batchID, workerID, shardID string, records []string) error {
-	// TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
-	// commits its offset before it folds the shard into the manifest.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{"batch_id": batchID, "shard_id": shardID, "records": len(records)}
 	payload, _ := json.Marshal(event)
 	if err := producer.WriteMessages(ctx, kafka.Message{Key: []byte(workerID), Value: payload}); err != nil {
@@ -387,8 +384,7 @@ object ShardEvents {
   val producer = new KafkaProducer[String, String](new Properties())
 
   def publishShard(batchId: String, workerId: String, shardId: String, records: Seq[String]): Unit = {
-    // TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
-    // commits its offset before it folds the shard into the manifest.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val event = s"""{"batch_id":"$batchId","shard_id":"$shardId","records":\${records.size}}"""
     producer.send(new ProducerRecord("batch.shard", workerId, event))
     outputs.put(batchId, shardId, records)
@@ -465,8 +461,7 @@ std::unique_ptr<RdKafka::Producer> producer;
 
 void publish_shard(const std::string& batchId, const std::string& workerId, const std::string& shardId,
                    const std::vector<std::string>& records) {
-  // TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
-  // commits its offset before it folds the shard into the manifest.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const json event = {{"batch_id", batchId}, {"shard_id", shardId}, {"records", records.size()}};
   const auto payload = event.dump();
   producer->produce("batch.shard", RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()), payload.size(), workerId.data(), workerId.size(), 0, nullptr);
@@ -549,13 +544,14 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking three contracts a Kafka snippet almost always gets wrong.
-First, the message key is an ordering contract: partition by batch and every shard of that batch
-arrives in order; key by worker and the coordinator folds shards out of order and the manifest is
-nondeterministic. Second, an event may only describe state that already exists: publish after the
-output is flushed and the checksum means something; publish before and a consumer can hold a
-checksum for an object that was never written. Third, a broker is not a database — when the produce
-is rejected the durable path is an outbox row a relay republishes, and the consumer must fold before
-it commits, with a folded set so the replay is idempotent. Real platforms add a schema registry,
-tombstones for withdrawn shards, and a dead-letter topic for events that repeatedly fail to fold.`,
+  debrief: `Each part of the fix is a contract between producer and consumer. The key is an ordering contract:
+partition by batch and every shard of that batch arrives in sequence on one partition, which is the
+only reason the coordinator can fold deterministically. The publish order is an existence contract:
+an event may only describe state already durable, so the output is flushed and checksummed before the
+produce. The outbox and the fold-then-commit order are the delivery contract: the broker is not the
+system of record, so a rejected produce lands in a table a relay drains, and the consumer only
+advances its offset once the fold is on disk, with a folded set making the inevitable replay a no-op.
+
+Not done here: a schema for the event payload with a registry enforcing it, and a dead-letter topic
+for events that repeatedly fail to fold.`,
 };

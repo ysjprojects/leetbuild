@@ -8,35 +8,30 @@ export const eventsStep: Step = {
   focus: ['generator', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an admitted record
-and the consumer moves a counter, so the pipeline looks wired. It keys the event so one recipe's
-admissions arrive out of order, it copies the generated content into a retained topic, and it
-announces the admission before the record exists anywhere. Find the flaws, fix them, and prove the
-fix.
+**Starting point.** The starter's \`publish_admission(record)\` logs the record id with its
+generated text, builds an event of \`record_id\`, \`job_id\`, \`entity_id\` and \`generated_text\`,
+produces it to \`synthetic.record\` keyed by the record id with a default producer, and flushes.
+Nothing is persisted. It compiles, serves the demo and hides 5 flaws.
 
-Implement \`publish_admission(record)\`, the call a generator worker makes once a record has been
-admitted:
+**Failure mode the checks target.** Keying by record id works in a demo with one worker, but a
+recipe's admissions then spread across partitions and the ordering the downstream consumer relies
+on is gone. Publishing content into a retained topic is the leak, and publishing before persisting
+is the durability bug: an event is a promise that the record exists.
+
+\`publish_admission\` is the call a generator worker makes once a record has been admitted:
 
 - Publish **exactly one** \`synthetic.record\` event per admission with the **recipe id as the
-  message key** — \`key=record["recipe_id"]\` — so every admission of one recipe lands in one
-  partition and stays ordered. The starter keys by record id, which scatters a recipe's admissions and
-  destroys the order a reviewer needs to reconstruct what a recipe produced.
+  message key** (\`key=record["recipe_id"]\`), so every admission of one recipe lands in one
+  partition and stays ordered.
 - The payload carries **\`seed_digest\`** and **\`judge_score\`**, plus the record, job and entity ids.
-  \`seed_digest\` is the **sha256 of the seed record the generated record came from** — computed here,
-  never the seed text. The payload never carries \`generated_text\`, \`seed_text\` or any other
-  content: the topic is retained for days and replicated, so content written there outlives the
-  corpus it was generated for.
+  \`seed_digest\` is the **sha256 of the seed record the generated record came from**, computed here.
+  The payload never carries \`generated_text\`, \`seed_text\` or any other content: the topic is
+  retained for days and replicated, so content written there outlives the corpus.
 - The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: \`enable.idempotence\`
   plus required acks \`all\`, KafkaJS's \`idempotent: true\` with \`acks: -1\`, and a hash balancer for
   the key), so a retried produce cannot double an admission.
 - The admission is **persisted before it is published**: \`admissions.put(record)\` runs before
-  \`produce\`/\`send\`, and only then is the event published. The starter acknowledges the record and
-  never persists it, so a crash leaves an event for a record that does not exist.
-
-**Failure mode the checks target.** The key is the subtle one: keying by record id still works in a
-demo with one worker, but a recipe's admissions then spread across partitions and the ordering the
-downstream consumer relies on is gone. Publishing content into a retained topic is the leak, and
-publishing before persisting is the durability bug — an event is a promise that the record exists.`,
+  \`produce\`/\`send\`.`,
   sequence: {
     participants: ['Generator worker', 'admission store', 'synthetic.record', 'Coverage consumer'],
     messages: [
@@ -60,9 +55,9 @@ publishing before persisting is the durability bug — an event is a promise tha
     ],
   },
   hints: [
-    'The message key is the partition key: `key=record["recipe_id"]`, `key: recipeId`, `Key: []byte(recipeID)`, `ProducerRecord("synthetic.record", recipeId, …)`. Keyed by the record id, two admissions of one recipe land in different partitions and their order depends on the cluster.',
-    'Provenance is a digest, not a copy: hash the seed record and publish the hash. A reviewer can verify that an admitted record came from a seed they have without the topic ever holding seed or generated text — which is also what keeps the topic legal to retain.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS\u2019s `idempotent: true`, or required acks `all` with the hash balancer — and it needs a stable message key, which is the recipe id. Then order the two writes: persist the admission first, publish second.',
+    'The coverage consumer sees one recipe\u2019s records arrive interleaved and out of order, the topic holds every generated sentence in plain text, and after a worker crash the consumer counts a record no store can return.',
+    'The partition is chosen from the key, and the key is the record id, so a recipe is spread over the cluster; the event is built from `generated_text`; `produce` is called before anything is stored.',
+    'Key with `record["recipe_id"]`, publish `seed_digest` (`sha256` of the seed) and `judge_score` instead of text, configure `enable.idempotence` with `acks: "all"`, and call `admissions.put(` above `producer.produce(`.',
   ],
   checks: [
     {
@@ -133,7 +128,7 @@ publishing before persisting is the durability bug — an event is a promise tha
   ],
   code: {
     python: {
-      starter: `"""publish_admission: flawed code that keys by record id and ships the content."""
+      starter: `"""publish_admission: announce an admitted record on synthetic.record."""
 import json
 import logging
 
@@ -147,10 +142,7 @@ TOPIC = "synthetic.record"
 
 
 def publish_admission(record: dict) -> None:
-    # TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
-    # content into the payload and the logs, carries no seed digest and no judge score, and announces
-    # the admission before the record is persisted. The producer has no idempotence and no delivery
-    # guarantee.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     logger.info("admitted record_id=%s generated=%r", record["record_id"], record["generated_text"])
     event = {
         "record_id": record["record_id"],
@@ -207,7 +199,7 @@ def publish_admission(record: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** synthetic.record: flawed code that keys by record id and ships the content. */
+      starter: `/** synthetic.record: announce an admitted record on the topic. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'synthd', brokers: ['kafka:9092']});
@@ -222,10 +214,7 @@ interface GeneratedRecord {
 }
 
 export async function publishAdmission(record: GeneratedRecord): Promise<void> {
-  // TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
-  // content into the payload and the logs, carries no seed digest and no judge score, and announces
-  // the admission before the record is persisted. The producer has no idempotence and no delivery
-  // guarantee.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   console.log('admitted', record.record_id, record.generated_text);
   const event = {
     record_id: record.record_id,
@@ -288,7 +277,7 @@ export async function publishAdmission(record: GeneratedRecord): Promise<void> {
 `,
     },
     go: {
-      starter: `// synthetic.record: flawed code that keys by record id and ships the content.
+      starter: `// synthetic.record: announce an admitted record on the topic.
 package main
 
 import (
@@ -311,10 +300,7 @@ type GeneratedRecord struct {
 }
 
 func publishAdmission(ctx context.Context, record GeneratedRecord) error {
-	// TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
-	// content into the payload and the logs, carries no seed digest and no judge score, and announces
-	// the admission before the record is persisted. The writer has no idempotence and no delivery
-	// guarantee.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	log.Printf("admitted record_id=%s generated=%q", record.RecordID, record.GeneratedText)
 	payload, _ := json.Marshal(map[string]any{
 		"record_id":      record.RecordID,
@@ -402,7 +388,7 @@ func publishAdmission(ctx context.Context, record GeneratedRecord) error {
 `,
     },
     scala: {
-      starter: `// synthetic.record: flawed code that keys by record id and ships the content.
+      starter: `// synthetic.record: announce an admitted record on the topic.
 import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
@@ -421,10 +407,7 @@ object Records {
   val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
   def publishAdmission(record: GeneratedRecord): Unit = {
-    // TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
-    // content into the payload and the logs, carries no seed digest and no judge score, and announces
-    // the admission before the record is persisted. The producer has no idempotence and no delivery
-    // guarantee.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     println(s"admitted record_id=\${record.record_id} generated=\${record.generated_text}")
     val payload =
       s"""{"record_id":"\${record.record_id}","job_id":"\${record.job_id}","entity_id":"\${record.entity_id}","generated_text":"\${record.generated_text}"}"""
@@ -498,7 +481,7 @@ object Records {
 `,
     },
     cpp: {
-      starter: `// synthetic.record: flawed code that keys by record id and ships the content.
+      starter: `// synthetic.record: announce an admitted record on the topic.
 #include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
@@ -517,10 +500,7 @@ struct GeneratedRecord {
 };
 
 void publishAdmission(RdKafka::Producer& producer, const GeneratedRecord& record) {
-  // TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
-  // content into the payload and the logs, carries no seed digest and no judge score, and announces
-  // the admission before the record is persisted. The producer has no idempotence and no delivery
-  // guarantee.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto payload = json{{"record_id", record.record_id},
                             {"job_id", record.job_id},
                             {"entity_id", record.entity_id},
@@ -606,5 +586,5 @@ void publishAdmission(RdKafka::Producer& producer, const GeneratedRecord& record
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell a transport detail from a contract. The key looks like a performance knob and is actually the ordering guarantee a downstream consumer builds on; keying by record id works perfectly in a single-worker demo and silently reshuffles a recipe's history in production. The digest is the same kind of decision on the other axis: provenance needs a fingerprint, not the payload, because the topic is retained, replicated and read by people who were never licensed to see the seed. Persist-before-publish is the ordering every event pipeline eventually has to learn — publish first and the event becomes a claim about a record that may not survive the next crash. Real platforms add an outbox for broker outages, a schema registry that rejects content fields, and a replayer that rebuilds coverage from the topic.`,
+  debrief: `The key is the shape of the fix because it is not a performance knob: it is the ordering guarantee a downstream consumer builds on, so it has to be the thing whose history must stay in order, the recipe. The digest replaces the payload for the same reason on another axis: provenance needs a fingerprint the reviewer can recompute, and the topic is retained, replicated and read by people who hold no license to the seed. Persist-before-publish follows from what an event is, a claim that the record exists; publishing first turns a crash into a claim about nothing. A production platform would add an outbox so a broker outage does not lose the event, a schema registry that rejects content fields, and a replayer that rebuilds coverage from the topic.`,
 };

@@ -8,19 +8,16 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads and writes cached top suggestions per
-prefix, and it looks exactly like a cache. It compiles, it improves the demo latency, and it hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
-
-Implement the Redis suggestion cache behind \`GET /v1/autocomplete\`.
+**Starting point.** The starter reads and writes cached top suggestions under
+\`autocomplete:{prefix}\` with a plain \`SET\`, and the lookup behind \`GET /v1/autocomplete\` goes
+through it. It compiles, it improves the demo latency, and it hides 5 flaws.
 
 - Top suggestions are cached per **\`(tenant, prefix)\`** under a key that also carries the
   **catalog version**, so a catalog change moves reads to a new key instead of serving stale terms.
 - Every cached entry has a **5-minute TTL** (\`TTL_SECONDS = 300\`). A prefix that is never requested
   again expires on its own.
 - A tenant may hold at most **\`MAX_PREFIXES_PER_TENANT\` distinct cached prefixes**. When the cap is
-  hit the **coldest** prefix — least recently read or written — is evicted first, so a flood of
+  hit the **coldest** prefix (least recently read or written) is evicted first, so a flood of
   prefixes cannot grow memory without bound.
 - Reads are tenant-scoped: one tenant can never read another tenant's cached suggestions, even when
   the prefix text is identical.
@@ -29,8 +26,8 @@ Implement the Redis suggestion cache behind \`GET /v1/autocomplete\`.
 
 **Failure mode the checks target.** Caching every prefix with no cap turns the cache into the memory
 leak: a bot walking the keyspace fills Redis until eviction pressure destroys the hit rate for
-everyone. No TTL is the second one — a catalog change leaves the old top suggestions served forever,
-so a retracted term stays "popular". The key without the tenant is the subtle one: it compiles and it
+everyone. No TTL and no catalog version leave the old top suggestions served indefinitely, so a
+retracted term stays "popular". The key without the tenant is the subtle part: it compiles and it
 is faster, and it silently answers one tenant with another tenant's suggestions the first time two
 tenants type the same prefix.`,
   sequence: {
@@ -121,9 +118,7 @@ class SuggestionCache:
         self.redis = redis
 
     def get(self, tenant: str, prefix: str):
-        # TODO: this starter caches every prefix under a key with no tenant, no TTL and no cap, so
-        # one tenant's flood grows memory, stale suggestions outlive a catalog change, and two
-        # tenants that type the same prefix share an entry. Fix all three.
+        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         raw = self.redis.get(f"autocomplete:{prefix}")
         if raw is None:
             return None
@@ -186,9 +181,7 @@ export class SuggestionCache {
   constructor(private readonly redis: Redis) {}
 
   async get(tenant: string, prefix: string): Promise<string[] | null> {
-    // TODO: this starter caches every prefix under a key with no tenant, no TTL and no cap, so
-    // one tenant's flood grows memory, stale suggestions outlive a catalog change, and two
-    // tenants that type the same prefix share an entry. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const raw = await this.redis.get(\`autocomplete:\${prefix}\`);
     if (raw === null) return null;
     return JSON.parse(raw) as string[];
@@ -258,9 +251,7 @@ type SuggestionCache struct {
 }
 
 func (c *SuggestionCache) Get(ctx context.Context, tenant, prefix string) ([]string, error) {
-	// TODO: this starter caches every prefix under a key with no tenant, no TTL and no cap, so
-	// one tenant's flood grows memory, stale suggestions outlive a catalog change, and two
-	// tenants that type the same prefix share an entry. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	raw, err := c.redis.Get(ctx, "autocomplete:"+prefix).Result()
 	if err != nil {
 		return nil, err
@@ -359,9 +350,7 @@ func (c *SuggestionCache) evictColdest(ctx context.Context, tenant string) error
 
 object State {
   def remember(redis: Redis, tenant: String, prefix: String, suggestions: List[String]): Unit = {
-    // TODO: this starter caches every prefix under a key with no tenant, no TTL and no cap, so
-    // one tenant's flood grows memory, stale suggestions outlive a catalog change, and two
-    // tenants that type the same prefix share an entry. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     redis.set(s"autocomplete:$prefix", suggestions.mkString("[", ",", "]"))
   }
 }
@@ -418,9 +407,7 @@ using namespace sw::redis;
 std::string join(const std::vector<std::string>& values);
 
 void remember(Redis& redis, const std::string& tenant, const std::string& prefix, const std::vector<std::string>& suggestions) {
-  // TODO: this starter caches every prefix under a key with no tenant, no TTL and no cap, so
-  // one tenant's flood grows memory, stale suggestions outlive a catalog change, and two
-  // tenants that type the same prefix share an entry. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   redis.set("autocomplete:" + prefix, join(suggestions));
 }
 `,
@@ -464,9 +451,9 @@ void remember(Redis& redis, const std::string& tenant, const std::string& prefix
     },
   },
   hints: [
-    'The key is the whole design: `(tenant, prefix, catalog version)`. Tenant first so a read can never cross a tenant boundary, version next so a catalog change moves to a fresh key without a flush.',
-    'Bound the cache per tenant, not globally. Keep a per-tenant sorted set of cached prefixes scored by last use, and when its cardinality passes the cap, `ZPOPMIN` the coldest and delete its entry — the flood then costs the flooder, not everyone.',
-    'Write the payload and the TTL in one pipeline so a crash cannot leave an entry without its expiry. The TTL is 300 seconds, and the eviction runs after the write, not instead of it.',
+    'Two tenants type "caf" and the second one sees the first one\'s suggestions; a retracted term keeps showing up days after the catalog changed.',
+    'The key is the prefix text alone, written with a bare SET: nothing scopes it to a tenant or a catalog version, nothing expires it, and nothing counts how many prefixes a tenant holds.',
+    'Key by (tenant, catalog version, prefix), SETEX with TTL_SECONDS, ZADD the prefix into a per-tenant sorted set scored by time, and ZPOPMIN plus DEL when ZCARD passes MAX_PREFIXES_PER_TENANT.',
   ],
-  debrief: `The interviewer is testing whether you can debug a cache at the multi-tenant boundary. The starter reads fine because one tenant types a handful of prefixes and never retries. Three defects are being checked. No TTL means a catalog change cannot refresh cached suggestions, so a retracted term stays "popular" for as long as the key lives. No per-tenant cap means the cache is the memory leak: a bot walking the keyspace grows the keyspace until eviction pressure destroys the hit rate for every tenant. The subtle one is the key without the tenant: it is faster and it compiles, and it answers one tenant with another tenant's suggestions the first time two tenants type the same prefix. Real caches add a hot-prefix prewarm after a catalog change, a per-tenant cap that scales with plan size, and a metric on evictions so a flood is visible before it hurts.`,
+  debrief: `The key carries the tenant first so a read can never cross a tenant boundary by construction, and the catalog version next so a catalog change moves reads to a fresh key instead of needing a flush. The TTL goes in the same pipeline as the payload so a crash between the two cannot leave an entry without its expiry. The cap is per tenant, tracked in a sorted set scored by last use, because a global cap lets one tenant's flood evict everyone's hot prefixes; evicting the coldest first is what keeps the hit rate for real users intact during the flood. Production caches go further: a hot-prefix prewarm after a catalog change, a cap that scales with plan size, and an eviction counter per tenant so a flood is visible before the hit rate drops.`,
 };

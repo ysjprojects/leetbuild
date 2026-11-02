@@ -8,29 +8,24 @@ export const endpointStep: Step = {
   focus: ['client', 'registry', 'db', 'storage'],
   task: `## Task
 
-**Starting point.** The starter is working code for the register endpoint: it
-parses the body, writes a version record and answers \`201\`. It compiles, it serves the demo, and it
-hides four production flaws. Debug it like the registry owner, fix it, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/datasets\` with body
+\`{"dataset": "imdb-reviews", "version": "2026-01", "content_sha256": "…", "license": "mit", "owner": "team-lm", "size_bytes": 12}\`:
+it reads the tenant from \`X-Tenant-Id\`, builds a record straight from the body, calls
+\`store.put_version\` and answers \`201\`. It compiles, it serves the demo, and it hides four flaws.
 
-Implement \`POST /v1/datasets\` with body
-\`{"dataset": "imdb-reviews", "version": "2026-01", "content_sha256": "…", "license": "mit", "owner": "team-lm", "size_bytes": 12}\`.
+**Failure mode the checks target.** A version name is a promise about bytes. The starter lets a second
+register of the same \`(dataset, version)\` overwrite the pointer, so the hash stops identifying the
+content and every run recorded against that name becomes unreproducible. The license, owner and
+byte count are claims the caller made, not facts the registry checked.
 
 - The caller comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - \`dataset\`, \`version\`, \`content_sha256\` and \`owner\` are non-empty strings (**422** otherwise).
-- \`license\` must be on the server-side allowlist (**422** otherwise): a dataset with no license is
-  never registered, because unregistered data is data nobody may train on.
-- A \`(dataset, version)\` pair is immutable. If the version already exists, answer **409** and never
-  move the pointer. The handler's \`head\` check and the store's write are the same key.
-- The stored \`size_bytes\` and \`row_count\` come from scanning the stored object once —
-  \`measure_content(store, content_sha256)\` — never from the caller's \`size_bytes\`. The body's number
-  is a budget hint at most; it is never the recorded truth.
-- Answer **201** with the stored record.
-
-**Failure mode the checks target.** A version name is a promise about bytes. The starter lets a second
-register of the same \`(dataset, version)\` overwrite the pointer, so the content hash stops
-identifying the content and every run recorded against that name becomes unreproducible. The
-missing license check admits data nobody may legally train on, and reporting the caller's size lets
-a client claim a 10 GiB dataset costs 1 KiB of budget.`,
+- \`license\` must be on the server-side allowlist (**422** otherwise).
+- A \`(dataset, version)\` pair is immutable: if it already exists, answer **409** without moving
+  the pointer. The handler's \`head\` check and the store's write use the same key.
+- \`size_bytes\` and \`row_count\` come from \`measure_content(store, content_sha256)\`, a single scan
+  of the stored object, not from the caller's \`size_bytes\`.
+- Answer **201** with the stored record.`,
   sequence: {
     participants: ['Client', 'Dataset Registry', 'registry store', 'object store'],
     messages: [
@@ -141,8 +136,7 @@ store = RegistryStore()
 
 @app.post("/v1/datasets")
 def register(body: RegisterRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
-    # license, stores the caller-supplied size, and never checks the owner. Fix all four.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     record = {
         "dataset": body.dataset,
         "version": body.version,
@@ -262,8 +256,7 @@ class RegistryStore {
 const store = new RegistryStore();
 
 app.post('/v1/datasets', async (request, reply) => {
-  // TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
-  // license, stores the caller-supplied size, and never checks the owner. Fix all four.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as RegisterBody;
   const record: VersionRecord = {
     dataset: body.dataset,
@@ -414,8 +407,7 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
-	// license, stores the caller-supplied size, and never checks the owner. Fix all four.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	record := map[string]any{
 		"dataset":        body.Dataset,
 		"version":        body.Version,
@@ -597,8 +589,7 @@ object DatasetApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RegisterRequest]) { body =>
-            // TODO: this starter overwrites an existing version's pointer, accepts a dataset with
-            // no license, stores the caller-supplied size, and never checks the owner.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val record = VersionRecord(
               body.dataset,
               body.version,
@@ -742,8 +733,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
-    // license, stores the caller-supplied size, and never checks the owner. Fix all four.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto dataset = body.value("dataset", std::string());
     const auto version = body.value("version", std::string());
     const auto license = body.value("license", std::string());
@@ -854,9 +844,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guards by cost: tenant (401), required fields (422), license allowlist (422), immutability (409) — then, and only then, scan. A version that already exists is rejected before any object is read.',
-    "Size is not an input. `measure_content(store, content_sha256)` scans the object once and returns bytes and rows; the caller's `size_bytes` is a budget hint at most and must never be the recorded truth.",
-    'Immutability is a store contract, not a handler convention: `head(dataset, version)` must read the same key `put_version` writes, and the store must fail when that key appears twice. A handler-only check still races two concurrent registers.',
+    'A team re-registers `imdb-reviews@2026-01` with a different hash and gets `201`; the run that quoted that name now points at other bytes. A body with no owner and `size_bytes: 1` is accepted too.',
+    'The handler copies the body into the record and calls `put_version` unconditionally: nothing reads the existing key first, nothing compares `license` against a list, and `size_bytes` is whatever the client typed.',
+    'Before the write: reject a missing `owner` or hash with 422, check `license` against `ALLOWED_LICENSES`, call `store.head(dataset, version)` and answer 409 if present, then fill the record from `measure_content(store, content_sha256)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, where a version name is a promise about bytes. The starter reads fine because the demo registers each dataset once from one tenant. Four defects are checked: the missing required fields (no accountable owner, no hash identity), the license allowlist (legal exposure, not a style choice), immutability (409 on a re-register, keyed exactly like the write), and provenance measured by scanning the content instead of trusting a number the caller sent. Real registries add server-side hash verification of the uploaded object, per-license obligations recorded alongside the id, a size budget checked against the measured value, and an approval trail on the version record.`,
+  debrief: `The guards sit in front of the write because a version record is read far more often than it is written, and every reader treats it as fact: the run that trained on it, the license audit, the budget report. Checking the hash key before \`put_version\` keeps a name bound to one set of bytes; measuring the object makes the size a fact the registry produced rather than a claim it repeated. Production registries go further: they verify the uploaded object's hash server-side instead of trusting the field, record per-license obligations next to the id, compare the measured size against a tenant budget, and attach an approval trail to the version record so a reader can tell who vouched for it.`,
 };

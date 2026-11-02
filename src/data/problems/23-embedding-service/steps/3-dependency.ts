@@ -8,25 +8,24 @@ export const dependencyStep: Step = {
   focus: ['api', 'model', 'fallback'],
   task: `## Task
 
-**Starting point.** The starter is working code: while the model server is up
-every input gets a vector. Every failure path is wrong. Find them, fix them, and prove the fix.
+**Starting point.** The starter implements \`embed(text, model_version)\`, the one call the write
+path makes: it calls the primary model server and, when that call fails for any reason, calls the
+fallback model and returns whatever vector comes back under the primary's namespace. While the
+model server is up every input gets a vector. It compiles and hides 5 flaws.
 
-Implement \`embed(text, model_version)\`, the one call the write path makes:
+**Failure mode the checks target.** A bad deployment that becomes a hot loop against a service that
+is already down, and a fallback whose 384-dimension vectors land where 1024-dimension ones are
+expected, so retrieval ranks garbage before anyone notices.
 
-- Each attempt carries a **2-second deadline** (\`DEADLINE_S = 2.0\`). A call without one lets one
-  slow model server pin a worker for the whole batch.
-- At most **2 attempts** and only \`UNAVAILABLE\` is retryable. A malformed input — \`INVALID_ARGUMENT\`
-  — is returned to the caller immediately: retrying it wastes the budget and still fails.
+Requirements:
+
+- Each attempt carries a **2-second deadline** (\`DEADLINE_S = 2.0\`).
+- At most **2 attempts** and only \`UNAVAILABLE\` is retryable. A malformed input, \`INVALID_ARGUMENT\`,
+  is returned to the caller immediately: retrying it wastes the budget and still fails.
 - When the attempts run out, the input is embedded by the **fallback model**; because the fallback has
-  a different dimension, its vectors go to a **different cache namespace** (\`{version}+fallback\`) and
-  are never mixed into the primary's.
+  a different dimension, its vectors go to a **different cache namespace** (\`{version}+fallback\`).
 - The returned vector's dimension is checked against the namespace it would be cached under: a
-  wrong-dimension fallback must raise instead of being returned as a primary vector.
-
-**Failure mode the checks target.** The starter retries every status forever, so a bad deployment
-becomes a hot loop against the service that is already down. It caches by content hash alone, so the
-fallback's 384-dimension vector overwrites the primary's 1024-dimension one. And it returns the
-fallback vector silently, so a shape mismatch only surfaces when retrieval ranks garbage.`,
+  wrong-dimension fallback must raise instead of being returned as a primary vector.`,
   sequence: {
     participants: ['Embedding API', 'Model server', 'Fallback model'],
     messages: [
@@ -44,9 +43,9 @@ fallback vector silently, so a shape mismatch only surfaces when retrieval ranks
     ],
   },
   hints: [
-    'The deadline belongs on the call itself — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`. Bound the attempts with a constant; an unbounded loop has no exit for a permanent error.',
-    'Retryability is a property of the status: capture the error, retry only `UNAVAILABLE`, and return `INVALID_ARGUMENT` immediately.',
-    "Give the fallback its own namespace and check the vector's dimension before returning it — the fallback's shape must never be cached under the primary version.",
+    'During a model server outage, CPU on the API pods pins at 100% and nothing returns; after the outage, some lookups for the primary model return vectors of the wrong length.',
+    'The loop has no attempt limit and treats every error alike, so INVALID_ARGUMENT retries too. The fallback reply goes out under the primary namespace with no shape check.',
+    "Add `MAX_ATTEMPTS = 2`, retry only `UNAVAILABLE`, return `cache_namespace(version, used_fallback)` with the vector, and raise when `len(vector)` differs from that namespace's dimension.",
   ],
   checks: [
     {
@@ -117,15 +116,14 @@ fallback vector silently, so a shape mismatch only surfaces when retrieval ranks
   ],
   code: {
     python: {
-      starter: `"""Draft: the model server call — retries every status forever, no dimension guard."""
+      starter: `"""The model server call: primary first, fallback model when the primary fails."""
 import grpc
 
 TIMEOUT_S = 2.0
 
 
 def embed(text: str, model_version: str) -> dict:
-    # TODO: retries every status forever, never guards the vector's dimension, and lets the
-    # fallback's shape mix into the primary namespace.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = primary_stub.Embed(Request(text=text, model_version=model_version), timeout=TIMEOUT_S)
@@ -176,7 +174,7 @@ def embed(text: str, model_version: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Draft: the model server call — retries every status forever, no dimension guard. */
+      starter: `/** The model server call: primary first, fallback model when the primary fails. */
 import * as grpc from '@grpc/grpc-js';
 
 const TIMEOUT_MS = 2_000;
@@ -189,8 +187,7 @@ declare const fallbackStub: {
 };
 
 export async function embed(text: string, modelVersion: string): Promise<{vector: number[]}> {
-  // TODO: retries every status forever, never guards the vector's dimension, and lets the
-  // fallback's shape mix into the primary namespace.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const reply = await primaryStub.Embed({text, model_version: modelVersion}, {deadline: Date.now() + TIMEOUT_MS});
@@ -246,7 +243,7 @@ export async function embed(text: string, modelVersion: string): Promise<{namesp
 `,
     },
     go: {
-      starter: `// Draft: the model server call — retries every status forever, no dimension guard.
+      starter: `// The model server call: primary first, fallback model when the primary fails.
 package main
 
 import (
@@ -260,10 +257,9 @@ type modelClient interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
 }
 
-// embed retries every status forever and never guards the vector's dimension.
+// embed calls the primary model server and falls back when it fails.
 func embed(ctx context.Context, primary modelClient, fallback modelClient, text, modelVersion string) ([]float32, error) {
-	// TODO: bound the attempts, retry only UNAVAILABLE, switch the fallback's namespace and check
-	// the vector's dimension before returning it.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
 		callCtx, cancel := context.WithTimeout(ctx, timeoutMS*time.Millisecond)
 		vector, err := primary.Embed(callCtx, text)
@@ -360,7 +356,7 @@ func embed(
 `,
     },
     scala: {
-      starter: `// Draft: the model server call — retries every status forever, no dimension guard.
+      starter: `// The model server call: primary first, fallback model when the primary fails.
 import scala.concurrent.Future
 
 import io.grpc.StatusRuntimeException
@@ -369,8 +365,7 @@ object ModelClient {
   val TimeoutMs = 2000
 
   def embed(text: String, modelVersion: String): Future[Vector[Float]] = {
-    // TODO: bound the attempts, retry only UNAVAILABLE, switch the fallback's namespace and check
-    // the vector's dimension before returning it.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     def loop(): Future[Vector[Float]] =
       primaryStub.embed(Request(text, modelVersion)).recoverWith { case _: StatusRuntimeException =>
         fallbackStub.embed(Request(text)).recoverWith { case _: StatusRuntimeException => loop() }
@@ -432,7 +427,7 @@ object ModelClient {
 `,
     },
     cpp: {
-      starter: `// Draft: the model server call — retries every status forever, no dimension guard.
+      starter: `// The model server call: primary first, fallback model when the primary fails.
 #include <grpcpp/grpcpp.h>
 
 #include <chrono>
@@ -446,8 +441,7 @@ std::vector<float> embed(
     Model::Stub* fallbackStub,
     const std::string& text,
     const std::string& modelVersion) {
-  // TODO: bound the attempts, retry only UNAVAILABLE, switch the fallback's namespace and check
-  // the vector's dimension before returning it.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kTimeoutMs));
@@ -522,7 +516,14 @@ Embedding embed(Model::Stub* primary, Model::Stub* fallback_stub, const std::str
 `,
     },
   },
-  debrief: `A deadline bounds one attempt, max attempts bound the call, and the retryable set decides which
-failures are even worth another attempt. The fallback is business continuity — but only under its own
-namespace, because a 384-dimension vector cached where 1024 is expected poisons every later lookup.`,
+  debrief: `A deadline bounds one attempt, the attempt cap bounds the call, and the retryable set decides which
+failures are worth a second attempt at all: \`UNAVAILABLE\` is the transport saying try again, while
+\`INVALID_ARGUMENT\` is the model saying this input will fail every time. The fallback keeps the
+write path alive during an outage, but only under its own namespace, because a 384-dimension vector
+cached where 1024 is expected poisons every later lookup. The dimension guard turns that silent
+corruption into an exception at the only place that knows both shapes.
+
+This step retries immediately. A production client backs off with jitter, opens a circuit after
+repeated \`UNAVAILABLE\` so the fallback is reached without paying two deadlines first, and labels
+each vector with the model that produced it.`,
 };

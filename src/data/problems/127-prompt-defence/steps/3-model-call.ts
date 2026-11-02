@@ -8,34 +8,27 @@ export const modelCallStep: Step = {
   focus: ['api', 'model'],
   task: `## Task
 
-**Starting point.** The starter is working code: it builds a prompt, calls
-the model and returns the text, so the demo answers questions. Every boundary in it is missing.
-Five production flaws; find them, fix them, prove the fix.
-
-Implement \`answer(document, question)\` for the model layer, over \`Model.Complete\` at
-\`model:9000\`:
-
-- The prompt is a **template with sections**, not a concatenation. The instructions come first;
-  the document sits between the delimiters \`<<<DOCUMENT\` and \`DOCUMENT>>>\`; the question sits
-  in triple backticks as the source's template does. Any delimiter or triple backtick inside the
-  untrusted document or question is **escaped** (\`escape_untrusted\`) so user content cannot close
-  a section early and open its own.
-- The instructions carry a per-request **canary**: a random 16-hex-character tag the model is told
-  never to write. If the canary — or any instruction line — appears in the reply, the model has
-  been talked into echoing its instructions: raise \`Rejected\` so the caller refuses instead of
-  returning the text.
-- Every attempt carries a **5-second deadline** and \`max_tokens = 256\` — the source shows a short
-  "repeat this forever" prompt producing output until the proxy timed out ten minutes later. At
-  most **2 attempts**, and only \`UNAVAILABLE\` / \`DEADLINE_EXCEEDED\` are retried.
-- The model is asked for one JSON object \`{"answer": string, "spans": [string]}\`;
-  \`parse_answer\` validates that shape and raises \`Rejected\` for anything else. The spans are what
-  the output guard will check against the document in the next step.
+**Starting point.** The starter implements \`answer(document, question)\` over \`Model.Complete\` at
+\`model:9000\`: it joins a fixed instruction string, the document and the question with blank lines,
+calls the stub once with that prompt and wraps \`reply.text\` in a \`ModelAnswer\`. It compiles and
+hides five flaws.
 
 **Failure mode the checks target.** A concatenated prompt has no boundary the model can hold onto:
-the source shows a few hundred control-character tokens in the question making GPT-3.5 forget
-everything before them, and a repeated phrase replacing the answer with memorised text. With no
-canary and no schema, the starter returns whatever came back — the instructions, the repeated phrase,
-a 32 K-token loop — and with no deadline it waits for all of it.`,
+the source shows a few hundred control-character tokens making GPT-3.5 forget everything before
+them, and a repeated phrase replacing the answer with memorised text. With no canary and no schema,
+the starter returns whatever came back, and with no deadline it waits for all of it.
+
+- The prompt is a **template with sections**: instructions first, the document between
+  \`<<<DOCUMENT\` and \`DOCUMENT>>>\`, the question in triple backticks. Any delimiter or triple
+  backtick inside the document or question is **escaped** (\`escape_untrusted\`) so user content
+  cannot close a section early.
+- The instructions carry a per-request **canary**, a random 16-hex tag the model is told not to
+  write. If the canary or any instruction line appears in the reply, raise \`Rejected\`.
+- Every attempt carries a **5-second deadline** and \`max_tokens = 256\`; the source's "repeat this
+  forever" prompt produced output until the proxy timed out ten minutes later. At most
+  **2 attempts**, and only \`UNAVAILABLE\` / \`DEADLINE_EXCEEDED\` are retried.
+- The model is asked for one JSON object \`{"answer": string, "spans": [string]}\`;
+  \`parse_answer\` validates that shape and raises \`Rejected\` for anything else.`,
   sequence: {
     participants: ['promptguard', 'Model'],
     messages: [
@@ -58,9 +51,9 @@ a 32 K-token loop — and with no deadline it waits for all of it.`,
     ],
   },
   hints: [
-    'Build the prompt from three sections with fixed delimiters, and escape the delimiters and the triple backticks inside the document and the question before they go in. The instructions name the delimiters, the "I can’t answer" phrase, the JSON shape and the canary.',
-    'The canary is generated per request (`secrets.token_hex(8)`, `randomBytes(8)`, `crypto/rand`, `SecureRandom`, `random_device`) and checked on the way out: if the reply contains it, or any instruction line, raise `Rejected`. The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`), as is `max_tokens`.',
-    'Bound the attempts with a constant and a `for` loop; only `UNAVAILABLE` and `DEADLINE_EXCEEDED` get the second attempt, anything else is returned at once. Parse the reply as JSON and check `answer` is a string and `spans` a list of strings — a reply that is not that shape is a refusal, not an answer.',
+    'A question ending in a few hundred `\\b` escapes comes back with the system instructions quoted verbatim, and a "repeat this forever" question holds the connection open until the proxy gives up.',
+    'The starter glues `INSTRUCTIONS`, document and question into one string, so nothing marks where data ends; `Complete` is called once with no timeout and no `max_tokens`, and `reply.text` is returned unread.',
+    'Build the prompt from delimited, escaped sections with a per-request canary; call with `timeout=DEADLINE_S` and `max_tokens=256`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED` once, then `parse_answer` and raise `Rejected` on a leak or bad shape.',
   ],
   checks: [
     {
@@ -198,9 +191,7 @@ class ModelAnswer:
 
 
 def answer(document: str, question: str) -> ModelAnswer:
-    # TODO: this starter concatenates instructions, document and question into one string, plants
-    # no canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-    # checking its shape. Fix all five.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     prompt = INSTRUCTIONS + "\\n\\n" + document + "\\n\\n" + question
     reply = model.Complete(model_pb2.CompleteRequest(prompt=prompt))
     return ModelAnswer(answer=reply.text)
@@ -325,9 +316,7 @@ const INSTRUCTIONS =
   'Answer the question using only the document below. If the document does not contain the answer, say that you cannot answer from this document.';
 
 export async function answer(document: string, question: string): Promise<ModelAnswer> {
-  // TODO: this starter concatenates instructions, document and question into one string, plants
-  // no canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-  // checking its shape. Fix all five.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const prompt = INSTRUCTIONS + '\\n\\n' + document + '\\n\\n' + question;
   const {promise, resolve, reject} = Promise.withResolvers<string>();
   client.Complete({prompt}, (error, reply) => (error ? reject(error) : resolve(reply.text)));
@@ -467,9 +456,7 @@ type ModelAnswer struct {
 
 var modelClient pb.ModelClient
 
-// TODO: this starter concatenates instructions, document and question into one string, plants no
-// canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-// checking its shape. Fix all five.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func answer(ctx context.Context, document, question string) (ModelAnswer, error) {
 	prompt := instructions + "\\n\\n" + document + "\\n\\n" + question
 	reply, err := modelClient.Complete(ctx, &pb.CompleteRequest{Prompt: prompt})
@@ -616,9 +603,7 @@ object ModelCall {
 
   val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
 
-  // TODO: this starter concatenates instructions, document and question into one string, plants no
-  // canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-  // checking its shape. Fix all five.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def answer(document: String, question: String): ModelAnswer = {
     val prompt = Instructions + "\\n\\n" + document + "\\n\\n" + question
     val reply = stub.complete(CompleteRequest(prompt = prompt))
@@ -737,9 +722,7 @@ const std::string kInstructions =
 std::unique_ptr<Model::Stub> stub =
     Model::NewStub(grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials()));
 
-// TODO: this starter concatenates instructions, document and question into one string, plants no
-// canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-// checking its shape. Fix all five.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 ModelAnswer answer(const std::string& document, const std::string& question) {
   grpc::ClientContext ctx;
   CompleteRequest request;
@@ -874,5 +857,5 @@ ModelAnswer answer(const std::string& document, const std::string& question) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat the prompt as a protocol with a trust boundary rather than as a string. The source's template is the shape: instructions first, the context in a named section, the question in delimiters — and the source's finding is that the boundary alone does not hold when user content carries enough control-character or repeated tokens, which is why the escape, the canary and the schema exist on top of it. The canary turns "did the model obey?" into a string comparison; the schema turns "did the model answer?" into a parse; the deadline and max_tokens bound what one request can cost, which the source's ten-minute "repeat this forever" request makes concrete. Real systems put the instructions in a system message where the API has one, run a second cheap model as a judge on the reply, and version the template so a change can be rolled back.`,
+  debrief: `The prompt is a protocol with a trust boundary, not a string. The source's template gives the shape: instructions first, the context in a named section, the question in delimiters. Its finding is that the boundary alone does not hold when user content carries enough control-character or repeated tokens, which is why the escape, the canary and the schema sit on top of it. The canary turns "did the model obey?" into a string comparison; the schema turns "did the model answer?" into a parse; the deadline and \`max_tokens\` bound what one request can cost, which the ten-minute "repeat this forever" request makes concrete. Production services put the instructions in a system message where the API offers one, and version the template so a bad change can be rolled back.`,
 };

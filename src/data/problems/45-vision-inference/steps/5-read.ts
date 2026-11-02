@@ -8,28 +8,27 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks the row up by id and
-returns it. It is also a cross-tenant data leak, an unbounded result store and a lie about work in
-flight. Find the three flaws, fix them, and prove the fix.
+**Starting point.** The starter registers \`GET /v1/inferences/{id}\`, looks the row up by id with
+no tenant header, substitutes a \`{"status": "complete", "label": null}\` row when nothing is found,
+and returns whatever it has with 200. It serves the demo and hides four flaws.
 
-Implement \`GET /v1/inferences/{id}\`:
+**Failure mode the checks target.** Any row is served to any caller, so one tenant reads another's
+predictions by guessing an id. Nothing expires, so the table becomes a silent training set of tenant
+data nobody asked to retain. And a row the worker is still writing goes out with a 200, which a cache
+in front of the service then stores as the finished answer.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing) and the record is checked against it: an
-  inference id that belongs to another tenant is **404**, exactly like an id that does not exist.
-  Never confirm that a foreign id is real.
+Requirements:
+
+- The tenant comes from \`X-Tenant-Id\` (**401** when missing) and the record is checked against it:
+  an inference id that belongs to another tenant is **404**, exactly like an id that does not exist,
+  so a foreign id is not confirmed as real.
 - The response carries the stored prediction, its **model version** and its **confidence**.
 - **Results expire after \`RESULT_TTL_DAYS = 30\` days**: an older result is **410 Gone**, but the
-  metadata that records *that a decision was made* — id, digest, created-at, and
-  \`METADATA_TTL_DAYS\` — is still returned, so an audit can answer "was there a prediction for this
-  image?" long after the prediction itself is gone. Keeping results forever turns the table into a
-  silent training set of tenant data nobody asked to retain.
-- A **non-terminal** inference — the worker is still writing it — is **never** returned as final: it
-  answers **202 Accepted** with the pending status, so a client cannot mistake a half-written row for
-  a prediction.
-
-**Failure mode the checks target.** The starter serves any row to any caller, so one tenant can read
-another's predictions by guessing an id; it never expires anything; and it returns a partial record
-with a 200, which downstream caching layers then treat as the finished answer.`,
+  metadata that records *that a decision was made* (id, digest, created-at, and
+  \`METADATA_TTL_DAYS\`) is still returned, so an audit can answer "was there a prediction for this
+  image?" long after the prediction itself is gone.
+- A **non-terminal** inference, one the worker is still writing, answers **202 Accepted** with the
+  pending status instead of being returned as final.`,
   sequence: {
     participants: ['Client', 'Vision API', 'Results store'],
     messages: [
@@ -84,7 +83,7 @@ with a 200, which downstream caching layers then treat as the finished answer.`,
       id: 'expired-gone',
       title: 'An expired result is 410 with its metadata',
       detail:
-        'A result older than the result TTL answers **410 Gone** and still returns the metadata that proves a decision was made (id, digest, created-at, the metadata TTL). The starter never expires anything.',
+        'A result older than the result TTL answers **410 Gone** and still returns the metadata that proves a decision was made (id, digest, created-at, the metadata TTL). The starter expires nothing.',
       match: {
         python: {all: [/status_code\s*=\s*410/, /metadata/]},
         typescript: {all: [/code\(\s*410\s*\)/, /metadata/]},
@@ -95,7 +94,7 @@ with a 200, which downstream caching layers then treat as the finished answer.`,
     },
     {
       id: 'terminal',
-      title: 'A pending inference never masquerades as final',
+      title: 'A pending inference is 202, not a final result',
       detail:
         'An inference the worker has not finished answers **202 Accepted** with the pending status instead of a 200 that looks like a prediction. The starter returns the half-written row as final.',
       match: {
@@ -127,8 +126,7 @@ store = InferenceStore()
 
 @app.get("/v1/inferences/{inference_id}")
 def read_inference(inference_id: str) -> JSONResponse:
-    # TODO: this starter serves any inference id to any caller, keeps every result forever, and
-    # returns a half-written row as final. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     record = store.get(inference_id) or {"id": inference_id, "status": "complete", "label": None}
     return JSONResponse(record, status_code=200)
 `,
@@ -225,8 +223,7 @@ interface StoredRow {
 }
 
 app.get('/v1/inferences/:id', async (request, reply) => {
-  // TODO: this starter serves any inference id to any caller, keeps every result forever, and
-  // returns a half-written row as final. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const record: StoredRow | null = await store.get(id);
   return reply.code(200).send(record ?? {id, status: 'complete', label: null});
@@ -296,8 +293,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readInference(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves any inference id to any caller, keeps every result forever, and
-	// returns a half-written row as final. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	record, _ := store.Get(r.PathValue("id"))
 	if record == nil {
 		writeJSON(rw, http.StatusOK, map[string]any{"id": r.PathValue("id"), "status": "complete"})
@@ -411,8 +407,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "inferences" / Segment) { inferenceId =>
       get {
-        // TODO: this starter serves any inference id to any caller, keeps every result forever, and
-        // returns a half-written row as final. Fix all three.
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
         store.get(inferenceId) match {
           case Some(record) => complete(StatusCodes.OK, record.payload)
           case None => complete(StatusCodes.OK, s"""{"id":"$inferenceId","status":"complete"}""")
@@ -519,8 +514,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/inferences/:id", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves any inference id to any caller, keeps every result forever, and
-    // returns a half-written row as final. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto record = store.get(req.path_params.at("id"));
     res.status = 200;
     res.set_content(record ? record->payload.dump() : json{{"id", req.path_params.at("id")}}.dump(),
@@ -608,17 +602,16 @@ int main() {
     },
   },
   hints: [
-    'Tenant scope first: fetch the row, then compare `record.tenant_id` with the authenticated tenant and answer 404 for a mismatch — the same 404 as a missing id. A 403 would confirm the id exists, which is exactly what an enumeration attack needs.',
-    'Two clocks, two budgets: the prediction expires at `RESULT_TTL_DAYS` and the audit metadata at the longer `METADATA_TTL_DAYS`. 410 is the honest status for the expired result, and it is only useful if the body still carries the id, the digest and the created-at.',
-    'A record the worker is still writing is not a result: check the status before you build the response and answer 202 with the pending status. Otherwise a cache in front of you stores a half-written row as the final answer, and the client never asks again.',
+    "Request another tenant's id without any header: the starter answers 200 with their prediction. Request a 31-day-old id and the label is still there; request one the worker is writing and it reads as final.",
+    'The handler takes no `X-Tenant-Id` and compares nothing against `tenant_id`, defines no `RESULT_TTL_DAYS` or `METADATA_TTL_DAYS`, and checks no status before `JSONResponse(record, status_code=200)`.',
+    'Read the tenant header, answer 404 when `record.tenant_id` differs, 410 with a `metadata` body past `RESULT_TTL_DAYS = 30` (metadata kept until `METADATA_TTL_DAYS`), and 202 while the status is `PENDING`.',
   ],
-  debrief: `The interviewer is testing the read path, which is where retention and isolation live. Three defects
-are being checked: tenant scope on a primary-key lookup (the starter turns a guessed id into another
-tenant's data), the retention split between the result and its audit metadata (keeping predictions
-forever quietly builds a training set of tenant data), and the terminal-status contract (a pending row
-served as final is indistinguishable from a real prediction downstream). The status choice matters in
-the follow-up: 404 for someone else's id is deliberate — 403 leaks existence — and 410 rather than 404
-for an expired result is a deliberate signal that the decision happened. Real systems add a signed
-result URL with its own short TTL, an erasure path that deletes by tenant, and a per-tenant retention
-override for regulated customers.`,
+  debrief: `The read path is where isolation and retention live. The tenant check is a comparison
+on the row, not a filter the id could bypass, and a mismatch answers 404 rather than 403 because a
+403 confirms the id exists, which is exactly what an enumeration needs. The two TTLs split what the
+service stores from what it must be able to prove: the prediction has a 30-day shelf life, the fact
+that a decision was made outlives it, and 410 rather than 404 says so. The 202 keeps a half-written
+row out of every cache between the worker and the client. Production services also hand out a signed
+result URL with its own short TTL, run an erasure path that deletes by tenant, and allow a per-tenant
+retention override for regulated customers.`,
 };

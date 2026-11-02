@@ -8,34 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and answers \`202 queued\`, so the demo submits a job. It trusts everything the caller says.
-Debug it like the platform owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/sandbox/jobs\`, parses
+\`{"code": "…", "entry_point": "main.py", "profile": "gvisor", "needs": ["filesystem"]}\`, derives a
+job id from a hash of the code, logs the code, and answers \`202 queued\` with the job id, profile
+and needs. It compiles and hides four flaws.
 
-Implement \`POST /v1/sandbox/jobs\` with body
-\`{"code": "…", "entry_point": "main.py", "profile": "gvisor", "needs": ["filesystem"]}\`.
+**Failure mode the checks target.** The caller decides everything. Any profile string is stored, a
+declared \`network\` need is treated as granted, a body of any size reaches the container service,
+and a client retry queues the same code twice.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`code\` is required and at most **256 KiB** (\`1 << 18\` bytes) of UTF-8 — a larger body is
-  **413**. The platform runs whatever it is handed, so the cap is enforced before anything else
-  happens.
-- \`profile\` must come from the **allowlist** of isolation profiles (\`runc\`, \`gvisor\`,
-  \`kata\`); anything else is **400**. The caller asks for a strength, it does not name a runtime.
-- \`needs\` is the capability model: the job **declares** what it wants, the profile determines what
-  is granted. Every declared capability must be both known (\`network\`, \`filesystem\`,
-  \`subprocess\`) and granted by the requested profile — anything undeclared or ungranted is
-  **400**. Capabilities are default-deny: an empty \`needs\` gets nothing extra, and the weak
-  \`runc\` profile never grants \`network\`.
-- \`Idempotency-Key\` is required (**400** when missing). The stored job is looked up **before** a
-  new one is created, so a client retry returns the **original job id** and the code is not
-  submitted twice.
-- Never echo the code back in the response or a log line; the response carries the job id, the
-  profile and a digest of the code.
-
-**Failure mode the checks target.** The starter accepts any profile string, treats an undeclared
-\`network\` need as allowed, and keys nothing, so a retried submit queues the body again. The
-capability half is the quiet one: "the job said it needed the network" is not a permission, it is a
-request, and the profile is the thing that decides.`,
+- The tenant is the \`X-Tenant-Id\` header; a missing tenant is **401**.
+- \`code\` is required and at most **256 KiB** of UTF-8 (\`MAX_CODE_BYTES = 1 << 18\`); larger is
+  **413**, checked before anything is stored.
+- \`profile\` must be in \`ALLOWED_PROFILES\` (\`runc\`, \`gvisor\`, \`kata\`); anything else is
+  **400**.
+- Every entry in \`needs\` must be in \`ALLOWED_CAPABILITIES\` (\`network\`, \`filesystem\`,
+  \`subprocess\`) and granted to the profile by \`PROFILE_CAPABILITIES\`; otherwise **400**. An
+  empty \`needs\` grants nothing extra, and \`runc\` does not grant \`network\`.
+- \`Idempotency-Key\` is required (**400** when missing). Call \`store.lookup(tenant, key)\` before
+  \`store.create(...)\` and return the original job id on a replay.
+- The response carries the job id, the profile and a SHA-256 digest of the code. The code itself is
+  not echoed or logged.`,
   sequence: {
     participants: ['Client', 'Sandbox API', 'job store'],
     messages: [
@@ -48,9 +41,9 @@ request, and the profile is the thing that decides.`,
     ],
   },
   hints: [
-    'Order the rejections: tenant (401), then the size cap (413), then the profile allowlist (400), then the capabilities. A rule that runs after the work starts is not a rule — the code cap in particular must be checked against the byte length of the UTF-8 body, not the character count.',
-    'Capabilities are default-deny in two directions: the requested profile must grant each declared need, **and** the need must be in the platform’s capability vocabulary. `runc` grants only `subprocess`, so `needs: ["filesystem"]` under `runc` is a 400, not a silent grant — and an empty `needs` never means "anything".',
-    'Key the submit on `(tenant, Idempotency-Key)`: look the job up first and return it when it exists; only create a new one when it does not. That is what makes the client’s retry safe, and it keeps the code digest stable instead of queueing the same body twice.',
+    'A tenant submits `profile: "host"` with `needs: ["network"]` and gets `202 queued` with that profile echoed back. The same submit, retried after a timeout, queues a second job.',
+    'The handler consults no table: the profile string and the needs list go straight into the response, and the job id is a hash of the code rather than a lookup under the idempotency key.',
+    'Add `MAX_CODE_BYTES = 1 << 18`, `ALLOWED_PROFILES`, `ALLOWED_CAPABILITIES` and `PROFILE_CAPABILITIES`; reject in order 401, 413, 400, 400; then `store.lookup` on `Idempotency-Key` before `store.create`.',
   ],
   checks: [
     {
@@ -148,8 +141,7 @@ store = JobStore()
 
 @app.post("/v1/sandbox/jobs")
 def submit(body: JobRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: enforce the 256 KiB code cap, validate the profile against an allowlist, deny
-    # capabilities the requested profile does not grant, and replay on (tenant, Idempotency-Key).
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     job_id = "job-" + str(abs(hash(body.code)))
     logger.info("sandbox submit tenant=%s code=%r", tenant, body.code)
     return JSONResponse(
@@ -240,7 +232,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sandbox/jobs: flawed code that believes whatever the caller declares. */
+      starter: `/** POST /v1/sandbox/jobs: accepts a submission and queues it. */
 import Fastify from 'fastify';
 import {randomUUID} from 'node:crypto';
 
@@ -256,8 +248,7 @@ interface JobBody {
 }
 
 app.post('/v1/sandbox/jobs', async (request, reply) => {
-  // TODO: enforce the 256 KiB code cap, validate the profile against an allowlist, deny
-  // capabilities the requested profile does not grant, and replay on (tenant, Idempotency-Key).
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as JobBody;
   const job = {
@@ -368,8 +359,7 @@ func (s *JobStore) Create(ctx context.Context, tenant, idemKey string, job map[s
 var store = &JobStore{}
 
 func submit(rw http.ResponseWriter, r *http.Request) {
-	// TODO: enforce the 256 KiB code cap, validate the profile against an allowlist, deny
-	// capabilities the requested profile does not grant, and replay on (tenant, Idempotency-Key).
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	body := JobRequest{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -528,8 +518,7 @@ object SandboxApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[JobRequest]) { body =>
-            // TODO: enforce the 256 KiB code cap, validate the profile against an allowlist, deny
-            // capabilities the requested profile does not grant, and replay on Idempotency-Key.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val job = Map(
               "job_id" -> UUID.randomUUID().toString,
               "tenant" -> tenant,
@@ -652,8 +641,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/sandbox/jobs", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: enforce the 256 KiB code cap, validate the profile against an allowlist, deny
-    // capabilities the requested profile does not grant, and replay on (tenant, Idempotency-Key).
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
@@ -780,15 +768,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is trust: what may the caller decide, and what may only
-the platform decide? A submission endpoint is an input to a hostile-code pipeline, so the caller
-names a *strength* from an allowlist and *declares* capabilities; the platform's profile table
-decides what is actually granted, and the default is nothing. The size cap runs first because
-everything after it costs memory or a container slot: 256 KiB is about the largest program a model
-plausibly writes, and it is the difference between a bounded queue and an OOM. The idempotency key is
-the third contract: submission is not idempotent by nature, so a client retry must land on the
-*original* job id — that is what stops one flaky socket from running the same code twice, and it is
-the reason the response carries an id and a digest instead of the code itself. Real platforms add
-image allowlists, per-tenant quota on concurrent jobs, and signed submissions so the registry can
-prove the code came from the review path.`,
+  debrief: `The caller names a strength from an allowlist and declares capabilities; the profile table decides
+what is granted, and the default is nothing, because a declared need is a request, not a
+permission. The size cap runs first since everything after it costs memory or a container slot.
+Submission is not idempotent by nature, so the lookup under \`(tenant, Idempotency-Key)\` precedes
+the create and a retry lands on the original job id; that is also why the response carries an id
+and a digest rather than the code. Production runners count concurrent jobs per tenant and refuse
+submissions over the quota, pin a profile's base images by digest, and require the code to arrive
+signed by the pipeline that produced it.`,
 };

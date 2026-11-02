@@ -8,29 +8,24 @@ export const endpointStep: Step = {
   focus: ['api', 'schema', 'store'],
   task: `## Task
 
-**Starting point.** A flag is not a boolean in a config file; it is a rule set with a schema.
-\`POST /v1/flags\` creates one, and the schema registry decides what a valid rule may say. The starter
-is working code: it parses the body and echoes it back. It compiles, it serves the demo, and it
-hides three flaws.
+**Starting point.** The starter registers \`POST /v1/flags\` for body \`{"key": "checkout-redesign",
+"type": "boolean", "default": false, "rules": [{"attribute": "country", "operator": "eq", "value": "US"}]}\`,
+parses it with a model whose \`default\` falls back to \`false\`, and echoes key, default and rules back
+with a **200**. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/flags\` for body \`{"key": "checkout-redesign", "type": "boolean", "default": false,
-"rules": [{"attribute": "country", "operator": "eq", "value": "US"}]}\`.
+**Failure mode the checks target.** A flag is a rule set with a schema. A rule on \`plan_tier\`, when the
+registry only provides \`country\`, \`user_id\`, \`app_version\` and \`email_domain\`, is dead: it looks
+configured and silently never matches. A missing default quietly becomes \`false\`, and a client retry
+creates a second version of the same flag.
 
 - \`key\` is non-empty, at most **128** characters, matching \`^[a-z0-9][a-z0-9-]*$\` (**422** otherwise).
 - \`type\` is one of \`boolean\`, \`string\`, \`number\`, \`json\` (**422** otherwise).
-- \`default\` must be **present** and type-consistent with \`type\` (**422** when it is absent). An absent
-  default is not a default of \`false\`.
+- \`default\` must be **present** and type-consistent with \`type\` (**422** when it is absent).
 - Every rule's \`attribute\` must be a **registered** user attribute and its \`operator\` must exist for
-  the flag's type (**422** otherwise). A rule on \`plan_tier\`, when the registry only provides
-  \`country\`, \`user_id\`, \`app_version\` and \`email_domain\`, is dead — it looks configured and never
-  matches.
+  the flag's type (**422** otherwise).
 - \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(key,
   Idempotency-Key)\` returns the original flag **and its original version**.
-- A successful create returns **201** with \`{"key": …, "version": 1, "default": …, "rules": […]}\`.
-
-**The subtle flaw.** The starter silently turns a missing default into \`false\`, accepts any attribute
-name so an unknown attribute becomes a dead rule, and writes a fresh version on every retry. The dead
-rule is the quiet one: nothing errors, and the flag simply behaves as if the rule were not there.`,
+- A successful create returns **201** with \`{"key": …, "version": 1, "default": …, "rules": […]}\`.`,
   sequence: {
     participants: ['Client', 'Flag API', 'Schema Registry', 'Flag Store'],
     messages: [
@@ -132,8 +127,7 @@ class FlagRequest(BaseModel):
 
 @app.post("/v1/flags")
 def create(body: FlagRequest) -> JSONResponse:
-    # TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
-    # attributes the system never provides, and writes a new version on every retry.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     return JSONResponse(
         {"key": body.key, "default": body.default, "rules": [r.model_dump() for r in body.rules]}
     )
@@ -227,8 +221,7 @@ interface FlagRequest {
 }
 
 app.post('/v1/flags', async (req, reply) => {
-  // TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
-  // attributes the system never provides, and writes a new version on every retry.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = req.body as FlagRequest;
   return reply.code(200).send({
     key: body.key,
@@ -315,8 +308,7 @@ type FlagRequest struct {
 }
 
 func createFlag(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
-	// attributes the system never provides, and writes a new version on every retry.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	var body FlagRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -433,8 +425,7 @@ case class FlagRequest(key: String, \`type\`: String, default: Option[JsValue], 
 def createFlag: Route = path("v1" / "flags") {
   post {
     entity(as[FlagRequest]) { body =>
-      // TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
-      // attributes the system never provides, and writes a new version on every retry.
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
       complete(Map(
         "key" -> body.key.toJson,
         "default" -> body.default.getOrElse(false.toJson),
@@ -510,8 +501,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/flags", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
-    // attributes the system never provides, and writes a new version on every retry.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body);
     json out = {
         {"key", body["key"]},
@@ -590,9 +580,9 @@ int main() {
     },
   },
   hints: [
-    'A rule whose attribute is not in the registry is dead: the evaluator looks up a value that never exists. Reject unknown attributes and unknown operators with **422** before the flag is stored.',
-    'An absent `default` is not `false`. Check whether the field was *provided*, not whether it is truthy — a flag with no default has no defined behavior when no rule matches.',
-    'Idempotency is keyed by `(flag key, Idempotency-Key)`. On a replay return the stored flag **and its stored version**, so a client retry cannot fork the flag.',
+    'A rule on `plan_tier` is accepted with 200 and then silently never matches; a retried create shows version 2; a flag created without a default evaluates to off.',
+    'The starter skips the attribute and operator registry, its model gives `default` a `False` fallback so absence is invisible, and it ignores `Idempotency-Key`, so each retry is a fresh create.',
+    'Reject unknown attributes and operators with 422, test `default` in `model_fields_set` rather than its value, store the flag under `(key, Idempotency-Key)` and replay the stored version, then answer 201.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends a well-formed flag and never retries. Three defects are checked: schema validation (a dead attribute reference looks configured but never matches), an explicit default (an absent default must not silently become \`false\`), and idempotency keyed by flag so a retry cannot fork it. Real flag services add a schema-registry version, per-type operator sets, and a dry-run endpoint that evaluates a rule set against sample users before it is stored.`,
+  debrief: `The fix sits at the trust boundary because every later step trusts what this handler stored. Validating rules against the registry at create time is cheaper than discovering a dead rule in production, where nothing errors and the flag simply behaves as if the rule were missing. Checking presence rather than truthiness is what makes "no default" a 422 instead of a silent \`false\`. Keying idempotency by \`(key, Idempotency-Key)\` and replaying the stored version is what stops a client retry from forking the flag. Production flag services go further with a dry-run endpoint that evaluates a proposed rule set against sample users before it is stored, so a rule that can match nobody is caught before the save.`,
 };

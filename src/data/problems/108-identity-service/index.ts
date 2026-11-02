@@ -17,7 +17,7 @@ import {stateStep} from './steps/state';
 export const identityServiceProblem: Problem = {
   id: 'identity-service',
   title: 'Identity Service',
-  tagline: 'Accounts that are unique, verified deliberately and minimal in what they expose.',
+  tagline: 'Signup, Redis handle claims, a verification round trip and a profile read with one owner.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -31,17 +31,19 @@ verification step, and the projection that keeps contact data out of everything 
 
 ## The real system
 
-Production identity services normalize an address before they compare it: case folding, the domain's
-dot and plus-alias policy, and the same for phone numbers, because "Alice@x.com" and "alice@x.com"
-are one person, and two accounts for one person is how fraud and support tickets begin. Uniqueness is
-enforced by an atomic claim on each handle — set-if-absent in a durable namespace — never by a read
-followed by a write, and a claim is released when the signup that made it aborts. Verification is a
-deliberate round trip to a provider under a deadline: a timeout queues the attempt and leaves the
-account unverified, a hard bounce is terminal and suppresses the address, and nothing is ever marked
-verified without the provider's confirmation. Lifecycle events are keyed by user id so one person's
-history stays ordered, carry event kinds and reason codes rather than contact data, and are published
-only after the account write commits. And a profile read gives the owner the full record, everyone
-else a minimal public projection, and support roles a record only through an audited tool.
+Keycloak, the open source identity provider, lowercases every username and email before it stores
+them in its user table, so \`Alice@x.com\` and \`alice@x.com\` are one account and the uniqueness
+index compares canonical forms rather than what the form submitted. Production identity services
+go on from there: a domain's dot and plus-alias policy is folded the same way, phone numbers are
+canonicalized to E.164, and uniqueness is enforced by an atomic claim on each handle (set-if-absent
+in a durable namespace) rather than a read followed by a write, with the claim released when the
+signup that made it aborts. Verification is a deliberate round trip to a provider under a deadline:
+a timeout queues the attempt and leaves the account unverified, a hard bounce is terminal and
+suppresses the address, and nothing is marked verified without the provider's confirmation.
+Lifecycle events are keyed by user id so one person's history stays ordered, carry event kinds and
+reason codes rather than contact data, and are published only after the account write commits. A
+profile read gives the owner the full record, everyone else a minimal public projection, and support
+roles a record only through an audited tool.
 
 ## What you build here
 

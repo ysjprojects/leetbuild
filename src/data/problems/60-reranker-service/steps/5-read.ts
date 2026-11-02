@@ -8,27 +8,23 @@ export const readStatsStep: Step = {
   focus: ['api', 'redis', 'db', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the stats route, reads a few counters
-and returns a hit ratio. It looks like observability and it is actually a way to miss an incident.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/rerank/cache/stats\`, reads the global
+\`rerank:hits\` and \`rerank:misses\` counters plus a list of client-observed request times from
+Redis, and returns \`{"hit_ratio": …, "latency_p50": …}\`. It serves the demo and hides 4 flaws.
 
-Implement \`GET /v1/rerank/cache/stats\`:
+**Failure mode the checks target.** The endpoint looks like observability and works as a way to miss
+an incident: a model build whose batches are timing out and falling back to retrieval order shows the
+same hit ratio as a healthy one, a regression in one version disappears into the fleet average, and a
+latency spike caused by a deep worker queue is read as a slow model.
 
-- Report **per model version**. A single global hit ratio hides the version that regressed, because
-  the mix of versions changes the aggregate even when each version is steady.
-- Make the **unscored batch share** a first-class number. If failed batches are invisible, a model
-  that is degrading into unscored passes reads as healthy.
-- Report **latency at both boundaries**: the **queue** wait (time waiting for a worker) and the
-  **model** call, as percentiles. Client-observed time includes the queue, so it cannot tell a slow
-  queue from a slow model.
-- Report the **share of requests where fallback order was used**, so degradation caused by the
-  retrieval-order fallback is visible alongside the unscored share.
-- Keep the hit ratio, but compute it from per-version counters.
+Requirements:
 
-**Failure mode the checks target.** The starter returns one global \`hit_ratio\`, omits the unscored
-share entirely, and computes latency from client-observed samples that include the queue wait — so
-silent degradation looks like success and a real model slowdown is indistinguishable from a busy
-worker pool.`,
+- Report **per model version**, one entry per version with its \`model_version\`; keep the hit ratio
+  but compute it from per-version counters.
+- Surface the **unscored batch share** (\`unscored_share\`) from a count of failed batches.
+- Report **latency at both boundaries** as percentiles: the **queue** wait and the **model** call,
+  measured at those boundaries rather than from a client clock.
+- Report the **share of requests where fallback order was used**, next to the unscored share.`,
   sequence: {
     participants: ['Client', 'Rerank API', 'Redis'],
     messages: [
@@ -118,9 +114,7 @@ app = FastAPI()
 
 @app.get("/v1/rerank/cache/stats")
 def stats() -> JSONResponse:
-    # TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
-    # degradation looks like success, and computes latency from client-observed times that include
-    # the queue wait. Break it down per model version and keep the two latency boundaries apart.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     hits = int(redis.get("rerank:hits") or 0)
     misses = int(redis.get("rerank:misses") or 0)
     client_times = sorted(float(value) for value in redis.lrange("rerank:client_times", 0, -1))
@@ -185,9 +179,7 @@ def stats(tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSO
 const app = Fastify();
 
 app.get('/v1/rerank/cache/stats', async (_request, reply) => {
-  // TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
-  // degradation looks like success, and computes latency from client-observed times that include
-  // the queue wait. Break it down per model version and keep the two latency boundaries apart.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const hits = Number((await rdb.get('rerank:hits')) ?? 0);
   const misses = Number((await rdb.get('rerank:misses')) ?? 0);
   const clientTimes = (await rdb.lrange('rerank:client_times', 0, -1)).map(Number).sort((a, b) => a - b);
@@ -256,9 +248,7 @@ import (
 )
 
 func stats(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
-	// degradation looks like success, and computes latency from client-observed times that include
-	// the queue wait. Break it down per model version and keep the two latency boundaries apart.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	hits := readCounter("rerank:hits")
 	misses := readCounter("rerank:misses")
 	clientTimes := readSamples("rerank:client_times")
@@ -367,9 +357,7 @@ object StatsApi extends DefaultJsonProtocol {
   val jedis = new Jedis("redis", 6379)
 
   def stats: JsObject = {
-    // TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
-    // degradation looks like success, and computes latency from client-observed times that include
-    // the queue wait. Break it down per model version and keep the two latency boundaries apart.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val hits = counter("rerank:hits")
     val misses = counter("rerank:misses")
     val clientTimes = samples("rerank:client_times").sorted
@@ -465,9 +453,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/rerank/cache/stats", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
-    // degradation looks like success, and computes latency from client-observed times that include
-    // the queue wait. Break it down per model version and keep the two latency boundaries apart.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto hits = readCounter("rerank:hits");
     const auto misses = readCounter("rerank:misses");
     auto clientTimes = readSamples("rerank:client_times");
@@ -543,17 +529,16 @@ int main() {
     },
   },
   hints: [
-    'Aggregate stats lie when the mix changes. Key the counters by model version and return one entry per version, so the version that regressed is the version with the bad numbers.',
-    'Latency has two boundaries: time waiting for a worker and time inside the model call. Measure both as percentiles; a single client-observed number cannot tell a deep queue from a slow model.',
-    'The unscored share is the number that would have caught this incident. Count failed batches alongside batches and return the ratio, next to the fallback share.',
+    'An on-call engineer watches a model rollout: users report worse results and slower responses, but the stats page shows a steady hit ratio and a p50 that moved for no reason anyone can name.',
+    'Two counters and one list of client times cannot carry that story: there is no per-version key, no count of failed batches, and the samples include queue wait, so queue and model blur into one.',
+    'Iterate the version set, build each entry with `model_version`, hit ratio, `unscored_share` from `unscored_batches`, fallback share, and separate queue and model percentiles from their own sample lists.',
   ],
-  debrief: `The interviewer is testing whether you can design the numbers that explain a regression rather than the
-numbers that look good. The starter reads fine because in the demo nothing fails and the model is fast.
-Three defects are being checked: one global hit ratio (a version-specific regression hides in the
-mix), a missing unscored share (silent degradation reads as success), and client-observed latency
-(the queue wait is charged to the model). Splitting queue and model latency is the same discipline as
-splitting unscored from scored: each boundary gets its own number so a change in one cannot be
-mistaken for a change in the other. Real systems add per-tenant breakdowns, an alert on the unscored
-share, and a dashboard that pins the metric definitions in version control so a change in the numbers
-is a change in the system, not in the query.`,
+  debrief: `The stats are keyed by model version because an aggregate changes whenever the traffic mix changes,
+even when every version is steady; the version that regressed has to be the version with the bad
+numbers. The unscored share is first-class because it is the one number that distinguishes a model
+quietly failing into fallback order from a model that is fine. Queue and model latency are split for
+the same reason unscored is split from scored: each boundary gets its own number so a change in one
+cannot be mistaken for a change in the other. A production read side would add per-tenant
+breakdowns, an alert on the unscored share, and metric definitions pinned in version control so a
+change in the numbers is a change in the system rather than in the query.`,
 };

@@ -8,15 +8,15 @@ import {readStep} from './steps/5-read';
 
 /**
  * Vision inference: the course is not "call a model with an image", it is the debugging you owe a
- * vision service before it serves tenants. A validated, scoped, idempotent upload contract → a
- * per-tenant GPU admission pool with an owner-checked release → a model call with a deadline that
- * downgrades honestly instead of inventing a label → per-version quality events with digests and
- * an outbox → a read path with a tenant scope and a shelf life.
+ * vision service before it serves tenants. A validated, scoped, idempotent upload contract, a
+ * per-tenant GPU admission pool with an owner-checked release, a model call with a deadline that
+ * records its downgrade instead of inventing a label, per-version quality events with digests and
+ * an outbox, and a read path with a tenant scope and a shelf life.
  */
 export const visionInferenceProblem: Problem = {
   id: 'vision-inference',
   title: 'Vision Inference',
-  tagline: 'Image inference with tenant quotas, honest fallbacks and results that expire.',
+  tagline: 'Image inference with tenant-scoped storage keys, a GPU admission pool and results that expire.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -30,15 +30,17 @@ models, and the retention of the results it has already produced.
 
 ## The real system
 
-Production vision services never dereference what a caller sends: they accept a key inside the
-tenant's own prefix and reject everything else before a byte is read. They admit work through a
-per-tenant pool so a burst from one customer cannot take the whole GPU, and they let a crashed
-worker's admission expire rather than leak slots forever. They call the models under a deadline and,
-when the large model is overloaded, recalibrate to the small one **honestly** — the downgrade is in
-the response, never replaced by a fabricated label. They publish one event per completed inference,
-keyed so per-version quality streams stay ordered, carrying digests rather than bytes or URLs. And
-they expire results on a schedule while keeping the metadata that proves a decision was made, because
-keeping predictions forever quietly builds a training set of tenant data.
+NVIDIA Triton Inference Server ships the admission half of this course: its rate limiter
+(\`--rate-limit=execution_count\`) schedules requests onto model instances only when the resources an
+instance group declares are free, with a priority per model, so one hot model cannot starve the
+rest of the GPU; without it, every request is dispatched as soon as an instance is idle. The tenant
+half lives in the service in front of it. Multi-tenant vision APIs accept a key inside the tenant's
+own prefix and reject everything else before a byte is read, call the models under a deadline and
+record a downgrade to the small model in the response rather than replacing it with a fabricated
+label, publish one event per inference keyed so per-version quality streams stay ordered and carry
+digests rather than bytes or URLs, and expire results on a schedule while keeping the metadata that
+proves a decision was made, because keeping predictions forever builds a training set of tenant
+data nobody agreed to.
 
 ## What you build here
 
@@ -63,8 +65,8 @@ One service, **visiond**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+the failure modes, fix it, optimize what is wasteful, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 

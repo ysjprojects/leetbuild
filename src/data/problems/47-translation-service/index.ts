@@ -18,67 +18,60 @@ import {glossaryReadStep} from './steps/5-read';
 export const translationServiceProblem: Problem = {
   id: 'translation-service',
   title: 'Translation Service',
-  tagline: 'Translate on demand with glossaries that bind, honest fallbacks and locale-keyed metrics.',
+  tagline: 'Translate on demand with tenant glossaries, marked fallbacks and locale-keyed quality counters.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Translation Service
 
-A translation service is the piece of a product platform that turns one language into another on
-demand: it validates the language pair, binds the request to a customer's glossary, calls a machine
-translation model under a deadline, caches what it can reuse, and reports quality per locale. The
-visible part is a string in another language; the parts that decide whether the product is safe are
-the validation funnel, the cache key, the failure policy and the metric key.
+A translation service turns one language into another on demand: it validates the language pair,
+binds the request to a customer's glossary, calls a machine translation model under a deadline,
+caches what it can reuse, and reports quality per locale. The visible part is a string in another
+language; the parts that decide whether the product is safe are the validation funnel, the cache
+key, the failure policy and the metric key.
 
 ## The real system
 
-Production translation services receive text from many tenants, and every tenant has its own
-glossary — product names, legal terms, do-not-translate words. A glossary is versioned and
-immutable: a request is pinned to one version for its whole lifetime, and changing terms publishes a
-new version so in-flight translations never see a half-updated glossary. Caches for glossaries and
-translation memory are keyed by tenant, locale pair and glossary version, with a TTL, so one
-customer's terminology can never translate another customer's text. The model call runs over gRPC
-under a deadline, and when it fails the service does **not** pretend: it returns the source text
-with an explicit untranslated marker and a retriable status, and that marked response is never
-cached as if it were a translation. Every translated segment emits one quality event keyed by locale
-pair, carrying timings, the glossary version, a quality score and redacted text hashes — never the
-text itself — and the consumer updates its counters before it commits the offset.
+Amazon Translate's synchronous \`TranslateText\` call caps the input at 10,000 bytes of UTF-8 and
+accepts one custom terminology file per request, with a 20 MB cap per file and 100 files per account
+per region: terminology is a size-bounded resource imported ahead of time and attached to a call by
+name, not a free-text hint. A multi-tenant service built on such an API keeps the same discipline.
+A glossary is versioned and immutable, so a request pins one version for its whole lifetime and an
+edit publishes a new version. Caches are keyed by tenant, locale pair and glossary version, with a
+TTL. When the model call fails under its deadline, the service returns the source text with an
+untranslated marker and a retriable status, and that response is not cached as a translation.
+Each segment emits one quality event keyed by locale pair, carrying text hashes rather than text,
+and the consumer updates its counters before it commits the offset.
 
 ## What you build here
 
 One service, **translationd**, with five pieces:
 
-1. \`POST /v1/translations\`: authenticated tenant, text capped at **16 KiB**, a source and target
-   language from the platform allowlist, a refusal to translate into the source language, a bound
-   glossary version (**404** when unknown), and a marker instead of a silent identity translation
-   when confident detection says the text is already in the target language.
+1. \`POST /v1/translations\`: authenticated tenant, text capped at **16 KiB**, both languages from
+   the platform allowlist, no translation into the source language, a bound glossary version
+   (**404** when unknown), and a marker when the text is already in the target language.
 2. A **Redis** glossary and translation-memory cache: keys scoped by \`(tenant, locale pair,
-   glossary version)\`, a one-hour TTL, and invalidation by version bump — a new immutable glossary
-   version, never an in-place mutation of a live one.
+   glossary version)\`, a one-hour TTL, and invalidation by version bump.
 3. A **gRPC** MT client: a two-second deadline per attempt, bounded attempts, retries only for
-   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, no retry for a rejected language pair, and a fallback that
-   returns the source text with an untranslated marker and a **503**.
-4. A **Kafka** quality path: one \`translation.done\` event per segment keyed by locale pair, latency,
-   glossary version, quality score and text hashes only, an idempotent producer with \`acks=all\`, an
-   outbox row when the broker rejects the produce, and a consumer that increments its counters
-   before it commits the offset.
+   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`, and a fallback that returns the source text with an
+   untranslated marker and a **503**.
+4. A **Kafka** quality path: one \`translation.done\` event per segment keyed by locale pair with
+   text hashes only, an idempotent producer with \`acks=all\`, an outbox row when the broker rejects
+   the produce, and a consumer that increments its counters before it commits the offset.
 5. \`GET /v1/glossaries/{locale}\`: the tenant's active glossary with its version and term count,
-   **403** when the lookup resolves to another tenant's glossary, and a response no cache may hold
-   past the next update.
+   **403** for another tenant's glossary, and a response no cache may hold past the next update.
 
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+it looks right. In each step you debug it against the failure modes the checks describe, fix it,
+optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on yours.
 
 ## Left out on purpose
 
 Model fine-tuning, translator workbenches, per-locale formatting of dates and currencies, billing,
-multi-region deployments, glossary authoring UIs and quality-score model training. The five pieces
-above are the ones that decide whether the translation service is correct, isolated and shippable.`,
+multi-region deployments, glossary authoring UIs and quality-score model training.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'translate · glossary', x: 8, y: 50},

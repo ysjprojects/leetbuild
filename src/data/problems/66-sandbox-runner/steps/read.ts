@@ -8,30 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-The starter is working code: it returns the stored job and the demo shows a
-result, so the read path looks done. It reports the wrong profile, serves the wrong tenant, and hands
-out output nobody verified. Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter registers \`GET /v1/sandbox/jobs/{job_id}\`, loads the record with
+\`store.get(job_id)\` and answers 200 with \`exit_code\`, \`usage\`, the requested profile under
+\`profile\`, and an output object holding a download URL plus the raw bytes from
+\`store.read_output\`. It serves the demo and hides four flaws.
 
-Implement \`GET /v1/sandbox/jobs/{job_id}\`:
+**Failure mode the checks target.** The read path trusts the record. Any tenant reads any job by
+guessing an id, a queued or lease-expired job comes back as a result, a container that started
+weaker reads as isolated, and the output bytes are served without a check that they are the ones
+the job produced.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing). The job must belong to that tenant —
-  a job id from another tenant is **404**, not a 403 that confirms the id exists and not a 200.
-- Only a **finished** job has a result: a queued or running job answers **409**, so a reader can
-  never mistake "not done yet" for "done". The starter returns whatever the record holds.
-- Report the isolation profile the runner **actually used** (\`used_profile\`), not the one the
-  submitter requested. Provenance means the read path describes what ran, not what was asked for.
-- The response carries \`exit_code\` and \`usage\` (wall time, CPU time, peak memory, and whether the
-  job hit its limit).
-- Every output is returned as a **digest-verified download**: recompute the digest of the stored
-  output and compare it with the recorded one before publishing a URL. On mismatch answer **500**
-  and serve nothing — a result whose bytes do not match its digest is not a result.
-- The starter also reads an expired job’s leftovers: a job whose lease lapsed without a result is not
-  a finished job, and the **409/404** path above must catch it.
-
-**Failure mode the checks target.** A read path that trusts the record is the last place a mistake
-becomes invisible: the used profile is the evidence the isolation actually held, the digest is the
-only proof the bytes are the ones the job produced, and the tenant check is what stops one tenant
-from reading another tenant’s program output by guessing an id.`,
+- The tenant comes from \`X-Tenant-Id\` (**401** when missing). An unknown id or a job owned by
+  another tenant is **404**; a 403 would confirm the id exists.
+- Only a job in \`JOB_FINISHED\` has a result; a queued, running or lease-expired job answers
+  **409**.
+- Report \`used_profile\`, the profile the runner recorded, not \`requested_profile\`.
+- Keep \`exit_code\` and \`usage\` (wall time, CPU time, peak memory, whether the limit was hit) in
+  the response.
+- \`verify_digest\` recomputes the SHA-256 of the stored output and compares it with the recorded
+  digest before publishing a URL; on mismatch answer **500** with \`DIGEST_MISMATCH\` and serve no
+  download.`,
   sequence: {
     participants: ['Client', 'Sandbox API', 'job store'],
     messages: [
@@ -49,9 +45,9 @@ from reading another tenant’s program output by guessing an id.`,
     ],
   },
   hints: [
-    'The tenant is part of the lookup, not a filter after it: `if job is None or job["tenant"] != tenant: 404`. Returning the record first and checking afterwards is how one tenant reads another tenant’s output.',
-    'Provenance is the point of the read path: `used_profile` comes from the runner’s record of what actually started, while `requested_profile` was only ever a request. An evaluator or an auditor comparing the two is the whole reason to store both.',
-    'Verify before serving: recompute the digest of the stored output and compare it with the recorded digest. A mismatch is a 500 with no download, because a URL that serves bytes the job never produced is worse than an error. And a job that has not finished — or whose lease lapsed without a result — is a 409, never a 200 with an empty output.',
+    'A tenant pastes a job id from another team’s logs and gets that team’s program output; a job that is still queued returns 200 with an empty output and the requested profile.',
+    '`store.get(job_id)` carries no tenant, nothing reads the status, the response copies `requested_profile`, and the bytes come straight from `read_output` with no comparison against the recorded digest.',
+    '`if job is None or job["tenant"] != tenant: 404`; `status != JOB_FINISHED: 409`; return `used_profile`; `verify_digest(store.read_output(job_id), job["output_digest"])`, else 500 `DIGEST_MISMATCH`.',
   ],
   checks: [
     {
@@ -142,9 +138,7 @@ store = JobStore()
 
 @app.get("/v1/sandbox/jobs/{job_id}")
 def read_job(job_id: str) -> JSONResponse:
-    # TODO: check the tenant and answer 404 for a foreign job, refuse an unfinished job with 409,
-    # report the profile that was actually used instead of the requested one, and verify the output
-    # digest before publishing a download.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     job = store.get(job_id)
     return JSONResponse(
         {
@@ -219,7 +213,7 @@ def read_job(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/sandbox/jobs/:id: flawed code that serves any job it finds. */
+      starter: `/** GET /v1/sandbox/jobs/:id: returns the stored result of a job. */
 import Fastify from 'fastify';
 
 import {store} from './job_store';
@@ -227,9 +221,7 @@ import {store} from './job_store';
 export const app = Fastify();
 
 app.get('/v1/sandbox/jobs/:id', async (request, reply) => {
-  // TODO: check the tenant and answer 404 for a foreign job, refuse an unfinished job with 409,
-  // report the profile that was actually used instead of the requested one, and verify the output
-  // digest before publishing a download.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const job = await store.get(id);
   return reply.code(200).send({
@@ -314,9 +306,7 @@ func (s *JobStore) ReadOutput(ctx context.Context, jobID string) ([]byte, error)
 var store = &JobStore{}
 
 func readJob(rw http.ResponseWriter, r *http.Request) {
-	// TODO: check the tenant and answer 404 for a foreign job, refuse an unfinished job with 409,
-	// report the profile that was actually used instead of the requested one, and verify the output
-	// digest before publishing a download.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	jobID := r.PathValue("id")
 	job, _ := store.Get(r.Context(), jobID)
 	body, _ := store.ReadOutput(r.Context(), jobID)
@@ -433,9 +423,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "sandbox" / "jobs" / Segment) { jobId =>
       get {
-        // TODO: check the tenant and answer 404 for a foreign job, refuse an unfinished job with
-        // 409, report the profile that was actually used, and verify the output digest before
-        // publishing a download.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         val job = store.get(jobId).get
         complete(
           StatusCodes.OK,
@@ -525,9 +513,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/sandbox/jobs/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: check the tenant and answer 404 for a foreign job, refuse an unfinished job with 409,
-    // report the profile that was actually used instead of the requested one, and verify the output
-    // digest before publishing a download.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto jobId = req.matches[1].str();
     const auto job = store.get(jobId);
     res.status = 200;
@@ -621,15 +607,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question is "what makes a stored result trustworthy?" Three things, in this
-order. The tenant is part of the primary key, so a read is scoped by construction and a foreign job
-id is indistinguishable from an unknown one — 404 for both, because a 403 confirms the id exists.
-The status is part of the answer: returning a job that is still queued, or whose lease lapsed
-without a result, teaches every caller to treat an empty output as a real one. And the digest is the
-read path’s own verification: the runner recorded what it ran, so the API can prove the bytes it is
-about to serve are the bytes the job produced instead of trusting a path it never checked. The used
-profile belongs in the same sentence — provenance means describing what ran, and the requested
-profile is a request, not a fact. Real platforms add signed download URLs with short TTLs, per-tenant
-access logs on every read, and a retention policy that deletes output bytes while keeping the
-digests.`,
+  debrief: `The tenant is part of the lookup, so a read is scoped by construction and a foreign id is
+indistinguishable from an unknown one: 404 for both, because a 403 confirms the id exists. Status
+is part of the answer, since returning a queued job, or one whose lease lapsed, teaches every
+caller to treat an empty output as real. The digest is the read path’s own verification: the
+runner recorded what it ran, so the API can prove the bytes it serves are the bytes the job
+produced. The used profile belongs in the same response because provenance describes what ran.
+Production platforms sign download URLs with a short expiry, log every read per tenant, and delete
+output bytes on a retention schedule while keeping the digests.`,
 };

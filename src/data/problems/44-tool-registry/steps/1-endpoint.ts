@@ -8,38 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'registry', 'db', 'reviewer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the tenant, unpacks the body and stores the definition under whatever version the caller sent. It
-compiles, it serves the demo, and it hides three production flaws. Debug it like the platform
-owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/tools\` (body \`{name, schema, side_effect,
+owner}\`), reads the tenant and stores the definition under whatever version the caller sent. It
+compiles, serves the demo, and hides 4 flaws.
 
-Implement \`POST /v1/tools\` with body
-\`{"name": "payments.charge", "schema": {…}, "side_effect": "irreversible", "owner": "payments"}\`.
+- A missing \`X-Tenant-Id\` is **401**. \`X-Roles\` must include \`platform-reviewer\`; anything
+  else is **403**, before any lookup or write.
+- \`name\` matches \`^[a-z][a-z0-9_.-]{1,63}$\` and \`side_effect\` is one of \`read\`, \`write\`,
+  \`irreversible\` (**400** otherwise).
+- \`schema\` is validated as JSON Schema before anything is written: \`type\` is \`object\`, every
+  entry of \`properties\` has a \`type\`, every name in \`required\` is declared. An invalid schema is
+  **422** with the failing JSON \`pointer\`.
+- The version is **minted server-side**: a sha256 digest of \`(name, schema, side_effect, owner)\`,
+  truncated to 16 hex characters. Re-registering an existing version is **409**.
+- A stored registration answers **201** with \`{name, version, side_effect, owner}\` and an audit
+  row. Log name, version and actor, not the schema.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- Registration is a privileged change: the caller's \`X-Roles\` claim must include
-  \`platform-reviewer\`; anything else is **403**. A service account that merely authenticates is
-  not allowed to mint a tool.
-- \`name\` is a lowercase dotted identifier (\`^[a-z][a-z0-9_.-]{1,63}$\`, **400** otherwise).
-- \`side_effect\` is one of \`read\`, \`write\`, \`irreversible\` (**400** otherwise). The class is
-  what callers and reviewers reason about, so an unknown class may never be stored.
-- \`schema\` is validated as JSON Schema *before* anything is written: \`type\` must be \`object\`,
-  every entry of \`properties\` needs a \`type\`, and every name in \`required\` must be declared in
-  \`properties\`. An invalid schema is **422** with the failing JSON pointer, e.g.
-  \`{"errors": [{"pointer": "/properties/amount/type", "message": "…"}]}\`.
-- The version is **minted server-side** from the definition's content (a digest of
-  \`(name, schema, side_effect, owner)\`, truncated to 16 hex characters). The caller never supplies
-  a version. Re-registering a version that already exists is **409** — versions are immutable, so a
-  changed definition is a new version, never a silent overwrite.
-- A registration that is stored answers **201** with \`{name, version, side_effect, owner}\` and
-  writes the audit row (actor, action, version). Log the registration with name, version and actor —
-  never the schema.
-
-**Failure mode the checks target.** The starter trusts three things it must not. It treats an
-authenticated caller as an entitled one, so any service account can mint a tool and then resolve it;
-it accepts any JSON object as a schema, so the failure surfaces much later, in the agent that cannot
-build arguments for the tool; and it takes the version from the request body, so a later registration
-of the same tool and version quietly replaces the definition an agent is running against.`,
+**Failure mode the checks target.** The starter trusts the request where it must not: an
+authenticated caller counts as entitled, so any service account can mint a tool; any string passes
+as the side-effect class and any object as the schema, so the failure surfaces later in the agent
+that cannot build arguments; and the version comes from the body, so a re-registration quietly
+replaces a definition agents are running against.`,
   sequence: {
     participants: ['Agent runtime', 'Tool Registry', 'Reviewer claim', 'tools · versions'],
     messages: [
@@ -143,9 +132,7 @@ def register(
     body: dict = Body(...),
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
-    # JSON object arrives as the schema, and takes the version from the request body so a later
-    # registration overwrites the same version. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     logger.info("register tool=%s schema=%s", body["name"], body["schema"])
     row = {"name": body["name"], "version": body["version"], "side_effect": body["side_effect"]}
     store.put(body["name"], body["version"], row)
@@ -282,9 +269,7 @@ interface RegistrationBody {
 }
 
 app.post('/v1/tools', async (request, reply) => {
-  // TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
-  // JSON object arrives as the schema, and takes the version from the request body so a later
-  // registration overwrites the same version. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RegistrationBody;
   request.log.info({name: body.name, schema: body.schema}, 'register');
@@ -424,9 +409,7 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
-	// JSON object arrives as the schema, and takes the version from the request body so a later
-	// registration overwrites the same version. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	log.Printf("register tool=%s schema=%v", body.Name, body.Schema)
 	row := map[string]any{
 		"name":        body.Name,
@@ -626,9 +609,7 @@ object ToolApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[String]) { raw =>
-            // TODO: this starter treats any authenticated caller as entitled to register, accepts
-            // whatever JSON object arrives as the schema, and takes the version from the request
-            // body so a later registration overwrites the same version. Fix all three.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val fields = raw.parseJson.asJsObject.fields
             val name = fields("name").convertTo[String]
             val version = fields("version").convertTo[String]
@@ -797,9 +778,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
-    // JSON object arrives as the schema, and takes the version from the request body so a later
-    // registration overwrites the same version. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     std::cerr << "register tool=" << body["name"] << " schema=" << body.value("schema", json()) << "\\n";
     const auto name = body["name"].get<std::string>();
     const auto version = body.value("version", std::string());
@@ -941,9 +920,9 @@ int main() {
     },
   },
   hints: [
-    'Order the guards by cost and by trust: tenant (401), role (403), name and side_effect shape (400), schema validation (422), then the store. Every rejection happens before a write, and the role check happens before the body is even parsed.',
-    'The version is a function of the definition, not an input: hash `(name, schema, side_effect, owner)` canonically (sorted keys) and take a short prefix. That makes re-registration of the same content idempotent-by-conflict (409) and makes a changed definition a different version instead of a silent overwrite.',
-    'A JSON Schema check that only says "invalid" is not reviewable. Return the JSON pointer of the first bad node — `/type`, `/properties/amount/type`, `/required/currency` — because the tool author, not the registrar, has to fix it.',
+    'Symptom: a plain service account registers `payments.charge` with `side_effect: "maybe"` and an untyped schema, and a later registration of the same version makes running agents call a different definition.',
+    'Mechanism: the handler checks only that the tenant header exists, stores body fields verbatim, and upserts under `body["version"]`, so entitlement, class, schema and immutability are all decided by the caller.',
+    'Fix: require `platform-reviewer` in `X-Roles` (403), check `side_effect` against the closed set (400), validate the schema with a JSON pointer (422), mint the version from a sha256 digest, 409 if it exists.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the boundary where a *change* is introduced. The starter reads fine because the demo registers one tool from an admin token. Three defects are being checked: entitlement (authenticating is not authorising — the platform reviewer role is a separate claim), validation with a location (a schema that is not JSON Schema must never be stored, and the rejection has to name the failing pointer), and immutability (a version is content-addressed, so a re-registration is a 409 rather than an overwrite that changes what running agents call). The habit to name out loud is that the registry is a release process, not a CRUD table: privileged write, validated artefact, immutable version, audited actor. Real registries add schema diff review, deprecation windows, and signed provenance of the definition itself.`,
+  debrief: `The fix has the shape of a release gate, not a CRUD write: guards ordered by trust and cost (tenant, role, field shape, schema), every one of them before the store is touched, then a version that is a function of the content so the same definition cannot land twice and a changed one cannot overwrite. The pointer in the 422 matters because the tool author, not the registrar, has to fix the schema. Production registries go further: they run a full JSON Schema validator rather than the three rules here, require a second reviewer for \`irreversible\` tools, sign the stored definition so the sandbox and the resolver can check it was not altered, and attach the audit row to a change ticket a human can read later.`,
 };

@@ -8,38 +8,30 @@ export const stateStep: Step = {
   focus: ['hub', 'shadow', 'device'],
   task: `## Task
 
-**Starting point.** The starter is working code: an operator's desired document is stored, a
-device's report is stored, and the demo shows the shadow changing. What happens to the operator's
-change when a device reconnects with its old configuration — and to the version numbers the fleet
-reads back — is the flaw. Debug it like the service owner, fix it, and prove the fix.
+**Starting point.** The starter keeps one hash per device at \`shadow:{device_id}\`. Both
+\`PUT /v1/devices/{id}/desired\` and \`POST /v1/devices/{id}/reported\` call \`write_state\`, which
+runs \`HINCRBY version 2\` and \`HSET state\` and answers \`{"version": n}\`. The device's
+\`reported_version\` is parsed and ignored. It compiles and hides five flaws.
 
-Implement the Redis shadow state behind the hub. One hash per device at \`shadow:{device_id}\`:
+**Failure mode the checks target.** A device that reconnects with its old configuration overwrites
+the operator's newer document wholesale, no divergence is ever visible, and the version numbers
+the fleet reads skip every other value and belong to neither side.
 
-- The shadow holds **two documents with their own counters**: the operator's \`desired\` document with
-  \`desired_version\`, and the device's \`reported\` document with \`reported_version\`. A counter
-  advances only when *its own* document changes — a report must never advance \`desired_version\`,
-  and an operator write must never advance \`reported_version\`.
-- \`PUT /v1/devices/{id}/desired\` replaces \`desired\` with the body's \`state\`, bumps
-  \`desired_version\` by exactly **one**, and answers \`{"desired_version": n}\`.
-- \`POST /v1/devices/{id}/reported\` carries the device's \`reported_version\`. The update **merges by
-  version**: a report that is **not newer** than the stored \`reported_version\` is ignored — it
-  writes nothing at all — while a newer one stores \`reported\` and records its version. It never
-  touches the desired document. Answer \`{"accepted": bool, "reported_version": n}\`.
-- The comparison, the write and the version bump happen in **one atomic script** (a Lua \`EVAL\`). A
-  \`HGET\` in your process followed by an \`HSET\` lets two reports that arrive together both see the
-  old version and both write.
-- \`POST /v1/devices/{id}/reconcile\` reads both documents and both counters and answers
-  \`{"converged": bool, "divergence": ["fields where reported is behind"], "apply": <the desired document>}\`.
-  Reconciliation converges **on the desired document**: the device is asked to adopt what the
-  operator wants, never the other way around.
+Requirements:
 
-**Failure mode the checks target.** The starter keeps one \`state\` document and one fused \`version\`
-counter for both sides, and it advances that counter by two on every write, so the versions the
-fleet sees skip every other number and neither document owns its version. Because there is only one
-document, a device that reconnects with its old configuration overwrites the operator's intended
-change wholesale: intent disappears and no divergence is ever flagged. And with no version
-comparison, whatever arrives last wins — a report delayed by a reconnect erases a newer document,
-and there is nothing left to reconcile back to.`,
+- Two documents, two counters in the hash: \`desired\` with \`desired_version\`, \`reported\` with
+  \`reported_version\`. A counter advances only when its own document changes.
+- \`PUT .../desired\` runs \`DESIRED_LUA\`: \`HINCRBY desired_version 1\`, \`HSET desired\`, answer
+  \`{"desired_version": n}\`.
+- \`POST .../reported\` runs \`REPORT_LUA\`: \`HGET reported_version\`, then
+  \`if incoming <= stored then return {0, stored} end\`; otherwise \`HSET reported\` and
+  \`reported_version\`. Answer \`{"accepted": bool, "reported_version": n}\`. The read, the
+  comparison and the write stay inside one \`EVAL\` so two concurrent reports cannot both see the old
+  version.
+- \`POST /v1/devices/{id}/reconcile\` calls \`reconcile(device_id)\`: read both documents and both
+  counters, \`behind = reported_version < desired_version\`, and answer
+  \`{"converged": bool, "divergence": [fields where reported differs], "apply": <desired document>}\`.
+  The device adopts the desired document, not the reverse.`,
   sequence: {
     participants: ['IoT Hub', 'Shadow', 'Device'],
     messages: [
@@ -54,9 +46,9 @@ and there is nothing left to reconcile back to.`,
     ],
   },
   hints: [
-    'Two documents, two counters. The desired write is `HINCRBY` on `desired_version` inside its own script; the report script records the device’s own `reported_version`. A fused counter cannot tell an operator write from a device report, makes the numbers skip, and leaves neither document with a version of its own.',
-    'Merging by version is a comparison that has to live inside Redis: read the stored version with `HGET`, then `if incoming <= stored then return {0, stored} end`. Do the read, the comparison and the `HSET` in one script — two reports that arrive together otherwise both see the old version and the later one wins.',
-    'The reconciler is read-only and one-directional: both documents, both counters, `behind = reported_version < desired_version`, and `apply` is always the desired document with `divergence` listing the fields the device has not adopted. Copying reported into desired is the starter’s bug, not convergence.',
+    'An operator sets `mode=eco`, the device reconnects an hour later and reports `mode=normal` from before the outage. The shadow now says `normal` and nothing records that the operator wanted otherwise.',
+    'Both routes write the same `state` field through `write_state`, and the fused `version` counter cannot tell an operator write from a device report, so the last writer wins.',
+    'Split into `DESIRED_LUA` and `REPORT_LUA` over `desired`/`reported` fields with their own counters; `REPORT_LUA` keeps only `incoming > stored`. The checks also cover `reconcile` and `divergence`.',
   ],
   checks: [
     {
@@ -151,11 +143,7 @@ class ReportedBody(BaseModel):
 
 
 def write_state(device_id: str, state: dict[str, str]) -> int:
-    # TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
-    # it by two per write so the versions it hands out skip every other number. A device that
-    # reports its old configuration overwrites the operator's intended document wholesale. Give
-    # desired and reported their own fields and their own version counters, ignore a report that is
-    # not newer than the stored reported_version, and reconcile toward the desired document.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = shadow_key(device_id)
     version = r.hincrby(key, "version", 2)
     r.hset(key, "state", json.dumps(state))
@@ -169,7 +157,7 @@ def put_desired(device_id: str, body: DesiredBody) -> dict:
 
 @app.post("/v1/devices/{device_id}/reported")
 def post_reported(device_id: str, body: ReportedBody) -> dict:
-    # The device's own version is ignored: the last write wins.
+    # The device's own version is parsed from the body.
     return {"version": write_state(device_id, body.state)}
 `,
       solution: `import json
@@ -252,7 +240,7 @@ def post_reconcile(device_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** IoT hub shadow state: flawed code with one document and one fused counter. */
+      starter: `/** IoT hub shadow state: one Redis hash per device. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -271,11 +259,7 @@ interface ReportedBody {
 }
 
 async function writeState(deviceId: string, state: Record<string, string>): Promise<number> {
-  // TODO: the starter keeps one document ('state') and one fused counter for both sides, advancing it
-  // by two per write so the versions it hands out skip every other number, and a device that
-  // reports its old configuration overwrites the operator's intended document wholesale. Give
-  // desired and reported their own fields and their own version counters, ignore a report that is
-  // not newer than the stored reported_version, and reconcile toward the desired document.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = shadowKey(deviceId);
   const version = await r.hincrby(key, 'version', 2);
   await r.hset(key, 'state', JSON.stringify(state));
@@ -291,7 +275,7 @@ app.put('/v1/devices/:deviceId/desired', async request => {
 app.post('/v1/devices/:deviceId/reported', async request => {
   const {deviceId} = request.params as {deviceId: string};
   const body = request.body as ReportedBody;
-  // The device's own version is ignored: the last write wins.
+  // The device's own version is parsed from the body.
   return {version: await writeState(deviceId, body.state)};
 });
 
@@ -407,11 +391,7 @@ func shadowKey(deviceID string) string {
 }
 
 func writeState(ctx context.Context, deviceID string, state map[string]string) int64 {
-	// TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
-	// it by two per write so the versions it hands out skip every other number. A device that
-	// reports its old configuration overwrites the operator's intended document wholesale. Give
-	// desired and reported their own fields and their own version counters, ignore a report that
-	// is not newer than the stored reported_version, and reconcile toward the desired document.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(state)
 	version, _ := rdb.HIncrBy(ctx, shadowKey(deviceID), "version", 2).Result()
 	rdb.HSet(ctx, shadowKey(deviceID), "state", string(payload))
@@ -434,7 +414,7 @@ func postReported(rw http.ResponseWriter, r *http.Request) {
 		State           map[string]string \`json:"state"\`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// The device's own version is ignored: the last write wins.
+	// The device's own version is parsed from the body.
 	version := writeState(r.Context(), r.PathValue("id"), body.State)
 	rw.Header().Set("Content-Type", "application/json")
 	_, _ = rw.Write([]byte(fmt.Sprintf(\`{"version":%d}\`, version)))
@@ -617,11 +597,7 @@ object ShadowStateApi {
   def shadowKey(deviceId: String): String = "shadow:" + deviceId
 
   def writeState(deviceId: String, state: Map[String, String]): Long = {
-    // TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
-    // it by two per write so the versions it hands out skip every other number, and a device that
-    // reports its old configuration overwrites the operator's intended document wholesale. Give
-    // desired and reported their own fields and their own version counters, ignore a report that
-    // is not newer than the stored reported_version, and reconcile toward the desired document.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = shadowKey(deviceId)
     val version = jedis.hincrBy(key, "version", 2)
     jedis.hset(key, "state", state.toJson.compactPrint)
@@ -640,7 +616,7 @@ object ShadowStateApi {
         path("reported") {
           post {
             entity(as[ReportedBody]) { body =>
-              // The device's own version is ignored: the last write wins.
+              // The device's own version is parsed from the body.
               complete(StatusCodes.OK, s"""{"version":\${writeState(deviceId, body.state)}}""")
             }
           }
@@ -766,11 +742,7 @@ std::string shadowKey(const std::string& deviceId) {
 }
 
 long long writeState(sw::redis::Redis& redis, const std::string& deviceId, const json& state) {
-  // TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
-  // it by two per write so the versions it hands out skip every other number. A device that
-  // reports its old configuration overwrites the operator's intended document wholesale. Give
-  // desired and reported their own fields and their own version counters, ignore a report that is
-  // not newer than the stored reported_version, and reconcile toward the desired document.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const auto key = shadowKey(deviceId);
   const long long version = redis.hincrby(key, "version", 2);
   redis.hset(key, "state", state.dump());
@@ -793,7 +765,7 @@ int main() {
     const auto deviceId = req.matches[1].str();
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // The device's own version is ignored: the last write wins.
+    // The device's own version is parsed from the body.
     const auto version = writeState(redis, deviceId, body.value("state", json::object()));
     res.set_content(json{{"version", version}}.dump(), "application/json");
   });
@@ -921,5 +893,13 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is state that is allowed to disagree with itself. A shadow exists because desired and reported are two different documents, and every property the fleet depends on follows from keeping them apart: two documents with two counters, a merge that refuses to move backward, and a read that reports the disagreement instead of hiding it. The starter looks right because the demo writes the same value twice; its real behaviour is that the device is the authority, so an operator's change is undone the moment the device reconnects with its old configuration, and the fused counter makes the versions the fleet reads meaningless — they skip numbers and neither side can be compared against the other. The stale guard has to be a comparison inside Redis, not in your process: a \`HGET\` followed by an \`HSET\` lets two reports that arrive together both observe the old version and the later one wins. Convergence is the last piece and the easiest to get backwards: reconciliation asks the device to adopt the desired document, never the reverse, and copying reported into desired is how intent is lost, not how a shadow converges. Real device managers add per-document TTLs, delta updates over MQTT, per-field conflict policies, and a delivery loop that re-sends the desired document until the device acknowledges it.`,
+  debrief: `The shape of the fix is two documents that are allowed to disagree. \`desired\` and
+\`reported\` get their own hash fields and counters because the fleet needs to compare them:
+\`reported_version < desired_version\` only means something when each side advances its own number.
+The stale guard lives inside \`REPORT_LUA\` rather than in the handler because a \`HGET\` followed by
+an \`HSET\` from two concurrent reports lets both observe the old version and the later one wins; one
+\`EVAL\` serialises the comparison with the write. Reconciliation hands back the desired document
+because the operator's intent is what a reconnecting device must adopt. This step does not push: a
+production shadow service re-sends the desired delta until the device acknowledges, and lets each
+field carry its own conflict policy.`,
 };

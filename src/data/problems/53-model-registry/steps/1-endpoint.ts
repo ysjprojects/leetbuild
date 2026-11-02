@@ -8,38 +8,25 @@ export const endpointStep: Step = {
   focus: ['client', 'registry', 'db', 'eval'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the body, mints a version and returns it. It compiles, it serves the demo, and it accepts three
-claims the registry exists to verify. Debug it like the service owner, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter handles \`POST /v1/models\` with body
+\`{"name", "artifact_digest", "training_run_id", "eval_id", "lineage_tag"}\`, reads \`X-Tenant-Id\`,
+mints a version from a UUID and answers **201** with
+\`{"name", "version", "artifact_digest", "eval_id", "lineage_tag", "stage": "staged"}\`. It never
+reads any store. It compiles and hides four flaws.
 
-Implement \`POST /v1/models\` with body
-\`{"name": "…", "artifact_digest": "sha256:…", "training_run_id": "…", "eval_id": "…", "lineage_tag": "…"}\`.
+**Failure mode the checks target.** A version that names bytes the artifact store cannot fetch, a
+training run that was invented, an eval score that was measured on another model or another
+digest, and a client retry that mints a second version for the same model.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the version stored the first time instead of minting a second one.
-- The \`artifact_digest\` must **resolve** in the artifact store. An unresolvable digest is
-  **422** — a version may not name bytes the registry cannot fetch.
-- The \`training_run_id\` must exist **and belong to this model**; an unknown or foreign run is
-  **422**. Lineage is a claim, and every claim is checked against the store.
-- The \`eval_id\` must exist and be **bound to this model and this exact artifact digest**. An eval
-  produced for another model, or for a different digest of the same model, is **422** — otherwise a
-  promotion gate could be opened by a score that never saw this artifact.
-- The **version is minted by the registry**, never supplied by the caller, and the response carries
-  the lineage the registry will serve from: \`{"name", "version", "artifact_digest", "eval_id",
-  "lineage_tag", "stage"}\` with \`stage = "staged"\`.
-
-**Failure mode the checks target.** The starter accepts whatever digest it is handed, so a version
-can point at bytes that do not exist; it accepts any eval id, so a score from a different model
-opens this version's gate; and it mints a fresh version on every retry, so a flaky client forks a
-model's history into two versions that were meant to be one.
-
-## What to keep
-
-The response shape and the stage the version starts in are fine. The fix is verification before
-minting — artifact, training run, eval binding — plus a version minted from the registry and stored
-under \`(tenant, Idempotency-Key)\` so a replay is not a second version.`,
+- A missing tenant is **401**. \`Idempotency-Key\` is required (**400** when missing); a retry with
+  the same \`(tenant, key)\` reads the stored response with \`store.get\` and returns it, and a first
+  call saves it with \`store.put\` before answering.
+- \`require_artifact\`: the digest must resolve in the artifact store, else **422**.
+- \`require_training_run\`: the run must exist and belong to this model, else **422**.
+- \`require_eval_binding\`: the eval record must name this model and this exact
+  \`artifact_digest\`, else **422**.
+- The version is minted by the registry, not taken from the body, and the response shape and
+  \`stage = "staged"\` stay as they are.`,
   sequence: {
     participants: ['Client', 'Model Registry', 'Artifact store', 'Eval store'],
     messages: [
@@ -140,10 +127,7 @@ class RegisterBody(BaseModel):
 
 @app.post("/v1/models")
 def register_model(body: RegisterBody, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: the starter trusts every claim — it never resolves the artifact digest, never checks the
-    # training run, never binds the eval record to the model and the exact digest, and mints a new
-    # version on every retry. Verify the lineage, mint the version here, and store the response
-    # under (tenant, Idempotency-Key) so a replay returns the original version.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     return JSONResponse(
         {
             "name": body.name,
@@ -261,7 +245,7 @@ def register_model(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/models: flawed code that trusts the caller's lineage. */
+      starter: `/** POST /v1/models: registers a version from the request body. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -277,10 +261,7 @@ interface RegisterBody {
 }
 
 app.post('/v1/models', async (request, reply) => {
-  // TODO: the starter trusts every claim — it never resolves the artifact digest, never checks the
-  // training run, never binds the eval record to the model and the exact digest, and mints a new
-  // version on every retry. Verify the lineage, mint the version here, and store the response
-  // under (tenant, Idempotency-Key) so a replay returns the original version.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as RegisterBody;
   return reply.code(201).send({
     name: body.name,
@@ -402,10 +383,7 @@ func registerModel(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: the starter trusts every claim — it never resolves the artifact digest, never checks the
-	// training run, never binds the eval record to the model and the exact digest, and mints a new
-	// version on every retry. Verify the lineage, mint the version here, and store the response
-	// under (tenant, Idempotency-Key) so a replay returns the original version.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	writeJSON(rw, http.StatusCreated, map[string]any{
 		"name":            body.Name,
 		"version":         "v" + uuid.NewString()[:8],
@@ -579,11 +557,7 @@ object RegistryApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RegisterBody]) { body =>
-            // TODO: the starter trusts every claim — it never resolves the artifact digest, never
-            // checks the training run, never binds the eval record to the model and the exact
-            // digest, and mints a new version on every retry. Verify the lineage, mint the version
-            // here, and store the response under (tenant, Idempotency-Key) so a replay returns the
-            // original version.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val version = s"v\${java.util.UUID.randomUUID().toString.take(8)}"
             complete(
               StatusCodes.Created,
@@ -709,10 +683,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: the starter trusts every claim — it never resolves the artifact digest, never checks the
-    // training run, never binds the eval record to the model and the exact digest, and mints a new
-    // version on every retry. Verify the lineage, mint the version here, and store the response
-    // under (tenant, Idempotency-Key) so a replay returns the original version.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const json response = {
         {"name", body.value("name", std::string())},
         {"version", "v" + uuidString().substr(0, 8)},
@@ -837,9 +808,9 @@ int main() {
     },
   },
   hints: [
-    'Verify before you mint. Order the guard clauses by cost: tenant, Idempotency-Key, artifact digest, training run, eval binding — every one of them returns `422` (or `401`/`400`) before a version exists, so an unverifiable lineage can never be stored.',
-    'The eval record is not a score you trust, it is a record you match. Require `record.model == body.name` **and** `record.artifact_digest == body.artifact_digest`: a score from another model, or from another digest of the same model, saw different bytes and cannot open this version’s gate.',
-    'Mint the version from the registry, never from the caller, and store the response under `(tenant, Idempotency-Key)` before returning it. A replay then reads the stored version back — the same id, the same lineage — instead of forking the model into two versions.',
+    'A client retries a registration after a network blip and the model now has two versions with identical lineage. A promotion later names one of them while the serving pool loaded the other.',
+    'The handler mints a fresh UUID on every call and consults no store, so nothing distinguishes a replay from a new registration, and nothing distinguishes a real digest from a typo.',
+    'Guard in cost order: tenant, `Idempotency-Key` (`store.get` replay), `require_artifact`, `require_training_run`, `require_eval_binding` (model and digest both equal), each `422`; then mint, `store.put`, return. The checks cover each guard.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo registers well-formed requests from one tenant and never retries. The three defects are one habit: it accepts the caller's claims as facts. A digest that does not resolve makes a version that cannot be served; an eval id that belongs to another model opens a gate on a score that never saw this artifact; a retry that mints a new version forks a model's history into two ids that were meant to be one. Real registries add signature verification of the artifact, immutable version records, a lineage graph that links training runs to data snapshots, and an audit trail that records who registered what and when.`,
+  debrief: `The guards run before the mint because a version is a promise the rest of the platform acts on: the serving probe compares against the registered digest, the promotion gate reads the eval record, and the event stream replays the lineage. Each guard answers 422 with the field that failed so a pipeline can repair its request instead of guessing. Storing the response under (tenant, Idempotency-Key) before returning it turns a retry into a read. Production registries go further: MLflow keeps the artifact in an object store it controls and records a source run per version, and model signing (Sigstore, in-toto attestations) lets the registry check who produced the bytes, not only that the bytes exist.`,
 };

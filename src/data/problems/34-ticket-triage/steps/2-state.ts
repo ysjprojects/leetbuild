@@ -8,31 +8,27 @@ export const triageStateStep: Step = {
   focus: ['triage', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: a ticket that fits gets through, so the demo
-passes. The state layer hides a race and a leak. Find them, fix them, and prove the fix.
+**Starting point.** The starter hashes the ticket, calls the classifier, checks
+\`triage:dedupe:{tenant}:{ticket_hash}\` with \`EXISTS\`, \`HINCRBY\`s the admission counter from the
+client, raises a bare 429 past the cap and finally \`SET\`s the dedupe key. It serves the demo and
+hides five flaws.
 
-Implement the Redis layer every triage call goes through:
+**Failure mode the checks target.** \`EXISTS\`-then-\`SET\` is a check-then-act race, so both copies
+of a duplicate webhook classify; a counter with no expiry means a queue that had one bad minute
+stays at capacity for good; and claiming after classification means a duplicate is only noticed
+once it has been paid for.
 
 - **Dedupe key per \`(tenant, ticket hash)\`**: \`triage:dedupe:{tenant}:{ticket_hash}\`. Two
-  concurrent identical tickets may classify **once** — the second must see the claim fail instead of
-  running its own classification.
-- **Admission counter per queue per minute**: \`admit:{tenant}:{queue}:{window}\` where \`window\` is
-  the UTC minute bucket (\`floor(unix_seconds / 60)\`), capped at **240 tickets per queue per
-  minute**. A classifier spike must not be able to funnel every ticket of a tenant into one queue.
-- Both the claim and the admission increment happen inside **one atomic Lua \`EVAL\`**: the claim is
-  \`SET … NX … EX\`, and the counter is \`HINCRBY\`ed in the same script. Checking the dedupe key with
-  \`EXISTS\` and writing it *after* classification lets two concurrent duplicates both classify;
-  incrementing the counter from the client leaves a window where two admissions both fit.
-- The admission key must **expire with its window**: set \`EXPIRE\` inside the script on the first
-  write. Without it the counter only ever grows and the queue jams forever.
-- When the queue is at capacity answer **429** with \`Retry-After\` (seconds, the key's TTL) and
-  \`X-Queue-Remaining\` (slots left in this window), and **do not call the classifier**.
-- **Claim before classifying**: the admission comes first, the classifier second. The starter
-  classifies first and claims afterwards, so the duplicate has already cost a model call.
-
-**Failure mode the checks target.** \`EXISTS\`-then-\`SET\` is a check-then-act race: both duplicate
-tickets classify; a counter with no expiry means a queue that had one bad minute never recovers; and
-claiming after classification means a duplicate is only noticed when it is already paid for.`,
+  concurrent identical tickets classify **once**; the second sees the claim fail.
+- **Admission counter per queue per minute**: \`admit:{tenant}:{queue}:{window}\` where \`window\`
+  is the UTC minute bucket (\`floor(unix_seconds / 60)\`), capped at **240 tickets per queue per
+  minute**.
+- The claim (\`SET … NX … EX\`) and the admission increment (\`HINCRBY\`) happen inside **one atomic
+  Lua \`EVAL\`**.
+- The admission key **expires with its window**: \`EXPIRE\` inside the script on the first write.
+- At capacity answer **429** with \`Retry-After\` (seconds, the key's TTL) and \`X-Queue-Remaining\`
+  (slots left in this window), and do not call the classifier.
+- **Claim before classifying**: admission first, classifier second.`,
   sequence: {
     participants: ['triage-api', 'Redis', 'Classifier'],
     messages: [
@@ -69,7 +65,7 @@ claiming after classification means a duplicate is only noticed when it is alrea
     },
     {
       id: 'dedupe-nx',
-      title: 'Claims the dedupe key with SET NX, never EXISTS',
+      title: 'Claims the dedupe key with SET NX, not EXISTS',
       detail:
         'The dedupe key is `triage:dedupe:{tenant}:{ticket_hash}` and is claimed with `SET … NX`, so exactly one of two concurrent identical tickets wins. The starter checks it with `EXISTS` and writes it later, which is a race by construction.',
       match: {
@@ -97,7 +93,7 @@ claiming after classification means a duplicate is only noticed when it is alrea
       id: 'admission-429',
       title: 'Answers 429 with Retry-After and slots remaining',
       detail:
-        'A queue at its cap answers `429 Too Many Requests` with `Retry-After` in seconds and `X-Queue-Remaining`, both built from the script’s return value — not a hardcoded constant, and not a bare 429 with no headers.',
+        'A queue at its cap answers `429 Too Many Requests` with `Retry-After` in seconds and `X-Queue-Remaining`, both built from the script’s return value, not a hardcoded constant and not a bare 429 with no headers.',
       match: {
         python: {all: [/Retry-After/, /X-Queue-Remaining/, /status_code\s*=\s*429/]},
         typescript: {all: [/Retry-After/, /X-Queue-Remaining/, /\.code\(\s*429\s*\)/]},
@@ -110,7 +106,7 @@ claiming after classification means a duplicate is only noticed when it is alrea
       id: 'claim-before-classify',
       title: 'Claims before it classifies',
       detail:
-        'The claim and the admission run before the classifier call, so a rejected or duplicate ticket never reaches the model. The starter classifies first and claims afterwards.',
+        'The claim and the admission run before the classifier call, so a rejected or duplicate ticket does not reach the model. The starter classifies first and claims afterwards.',
       match: {
         python: {order: [/admit\(/, /classify\(/]},
         typescript: {order: [/admit\(/, /classify\(/]},
@@ -145,9 +141,7 @@ class TriageRequest(BaseModel):
 
 @app.post("/v1/tickets/triage")
 def triage(body: TriageRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter checks the dedupe key with EXISTS and writes it after classification, so two
-    # concurrent identical tickets both classify; the admission counter is incremented from the
-    # client with no expiry, so the window never resets; and the 429 carries no headers.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     ticket_hash = hashlib.sha256(body.text.encode("utf-8")).hexdigest()[:32]
     decision = classify(body.text)
     dedupe_key = f"triage:dedupe:{tenant}:{ticket_hash}"
@@ -250,9 +244,7 @@ const QUEUE_CAP = 240;
 const DEDUPE_TTL_S = 24 * 3600;
 
 app.post('/v1/tickets/triage', async (request, reply) => {
-  // TODO: this starter checks the dedupe key with EXISTS and writes it after classification, so two
-  // concurrent identical tickets both classify; the admission counter is incremented from the
-  // client with no expiry, so the window never resets; and the 429 carries no headers.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as {text: string};
   const ticketHash = createHash('sha256').update(body.text, 'utf8').digest('hex').slice(0, 32);
@@ -372,9 +364,7 @@ func triage(rw http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	sum := sha256.Sum256([]byte(body.Text))
 	ticketHash := hex.EncodeToString(sum[:])[:32]
-	// TODO: this starter checks the dedupe key with Exists and writes it after classification, so two
-	// concurrent identical tickets both classify; the admission counter is incremented from the
-	// client with no expiry, so the window never resets; and the 429 carries no headers.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	decision, err := client.Classify(r.Context(), body.Text)
 	if err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
@@ -541,9 +531,7 @@ object TriageState {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[TriageRequest]) { body =>
-            // TODO: this starter checks the dedupe key with exists and writes it after classification,
-            // so two concurrent identical tickets both classify; the admission counter is
-            // incremented from the client with no expiry; the 429 carries no headers.
+            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
             val hash = ticketHash(body.text)
             val decision = Classifier.classify(body.text)
             val dedupeKey = s"triage:dedupe:$tenant:$hash"
@@ -697,9 +685,7 @@ int main() {
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
     const auto text = body.value("text", std::string());
-    // TODO: this starter checks the dedupe key with exists and writes it after classification, so two
-    // concurrent identical tickets both classify; the admission counter is incremented from the
-    // client with no expiry, so the window never resets; the 429 carries no headers.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const std::string ticketHash = hashTicket(text);
     const auto decision = classify(text);
     const std::string dedupeKey = "triage:dedupe:" + tenant + ":" + ticketHash;
@@ -815,9 +801,9 @@ int main() {
     },
   },
   hints: [
-    'One script does all of it: `SET dedupe 1 NX EX` decides the winner, `HINCRBY admit n 1` reserves the slot, `EXPIRE` opens the window on the first write. Splitting those commands across round trips is exactly the race the starter loses.',
-    'The two keys are independent: the dedupe key is per ticket and lives for a day, the admission key is per queue and lives for the minute bucket. Racing them in one `EVAL` keeps them consistent — a ticket is never claimed without a slot, and a slot is never taken for a ticket that was already claimed.',
-    'The 429 is a contract with the caller: `Retry-After` is the remaining `TTL` of the admission key and `X-Queue-Remaining` is the capacity left in this minute. Both come from the script’s reply; a hardcoded 60 hides how long the queue is really jammed.',
+    'Fire the same ticket twice at once: both requests return a classification and the model is billed twice. A queue that hit 240 in one minute keeps answering 429 an hour later.',
+    'The handler calls `classify` before it looks at Redis, checks the dedupe key with `EXISTS` and writes it last, and `HINCRBY`s a key nothing ever expires. Every step is a separate round trip.',
+    'Put `SET dedupe NX EX`, `HINCRBY admit n 1`, `EXPIRE` on first write and `TTL` in one `ADMIT_LUA` script, run it before `classify`, and build `Retry-After`/`X-Queue-Remaining` from its reply.',
   ],
-  debrief: `The interviewer is testing whether you can see a check-then-act race in code that looks careful. The starter does check the dedupe key — with \`EXISTS\`, and it writes the key after it has already classified. Two duplicate webhooks in flight therefore both miss the key and both pay for a model call. The admission counter has the second flaw: it is incremented from the client and never given an expiry, so the counter is a monotone lock — a queue with one busy minute is at capacity forever. The fix is one Lua script that claims, admits and expires atomically, plus a 429 that tells the caller when to come back. Real systems add a per-tenant admission budget alongside the per-queue one, and a sweep that reconciles Redis counters against the routing records when they drift.`,
+  debrief: `The fix is one script because the two keys only stay consistent if they move together: \`SET NX EX\` decides the winner, \`HINCRBY\` reserves the slot, and \`EXPIRE\` on the first write turns the counter into a window instead of a monotone lock. Running it before the classifier means a duplicate or a rejected ticket costs one Redis round trip and no model call, and returning the TTL and the remaining slots lets the caller back off for the right amount of time instead of guessing. Production services layer a per-tenant admission budget alongside the per-queue one, and run a sweep that reconciles Redis counters against the routing records when the two drift apart.`,
 };

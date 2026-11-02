@@ -8,46 +8,28 @@ export const labelEventsStep: Step = {
   focus: ['service', 'db', 'kafka'],
   task: `## Task
 
-**Starting point.** The starter is working code: the submit handler writes a
-label, publishes a \`label.submitted\` event, and a consumer moves agreement counters, so the demo
-shows numbers rising. It compiles, the demo never crashes, and it breaks four production contracts
-at once. Debug it like the service owner, name the subtle ones, fix them, and prove the fix with
-the checks below.
+**Starting point.** The starter is \`POST /v1/tasks/{id}/labels\` plus the agreement consumer:
+the handler builds a \`label.submitted\` event from the ids and the values, produces it keyed by
+the annotator, flushes, then persists the label row and answers \`submitted\`; the consumer
+commits each offset, then \`HINCRBY\`s the per-task agreement counters. It serves the demo and
+hides 5 flaws.
 
-\`POST /v1/tasks/{id}/labels\` accepts one human answer for one item, and the consumer folds those
-events into the per-task agreement counters the progress endpoint reads.
+**Failure mode the checks target.** The demo shows numbers rising. Under failure the stream stops
+being trustworthy: a task's events scatter across partitions, an event can outlive the label it
+describes, a broker outage drops events behind a 202, and a consumer replay or crash double-counts
+or loses a counter update.
 
-- Validate before anything is written: label \`values\` must be non-empty (**400**), \`ms_spent\`
-  must be non-negative (**400**), and the submitted \`spec_version\` must equal the version the task
-  was pinned to when it was created (**409** \`{"error": "spec_version_mismatch"}\`). A label
-  answered under an older taxonomy is not the same measurement, so it must not reach agreement math
-  wearing a fresh version number.
-- **Persist first, publish second.** The label row is the source of truth; the event is a
-  notification about that row. Publish before the row lands and a crash between the two loses the
-  label while its event survives — the agreement fold then counts an answer nobody stored.
-- The event is keyed by \`task_id\`, never by annotator or label id: one task's submissions must
-  land on one partition, because per-task ordering is exactly what makes the fold well defined. The
-  producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
-  plus a hashed, stable key); an idempotent producer deduplicates a retry only when the retry
-  repeats the same key.
-- The payload carries \`{"label_id", "task_id", "item_id", "annotator", "spec_version", "values",
-  "ms_spent", "submitted_at"}\`. The spec version and the time spent are the two fields the
-  agreement job and the productivity reports cannot reconstruct later.
+- Validate first: \`values\` non-empty (**400**), \`ms_spent\` non-negative (**400**), submitted
+  \`spec_version\` equal to the task's pinned one (**409** \`{"error": "spec_version_mismatch"}\`).
+- **Persist first, publish second.** The label row is the source of truth.
+- Key the event by \`task_id\` on an **idempotent, \`acks=all\`** producer (or the stack's
+  equivalent), so one task's submissions land on one partition in order.
+- Payload: \`{"label_id", "task_id", "item_id", "annotator", "spec_version", "values", "ms_spent",
+  "submitted_at"}\`.
 - When the broker rejects the produce, write the same payload to an **outbox** row
-  (\`insert_outbox\`/\`insertOutbox\`) so a relay republishes it when the broker recovers. Never
-  drop the event, and never fail the annotator's submit because a broker blinked.
-- The consumer folds each event **idempotently**: \`SADD agreement:applied:{task_id} label_id\`
-  guards the fold, the counters move (\`HINCRBY agreement:{task_id}:{value} {annotator} 1\`), and
-  only then is the **offset committed**. Counters before commit, so a crash replays the record
-  instead of losing the update; the applied set makes that replay a no-op instead of a double count.
-
-**Failure mode the checks target.** The starter is wrong in four places that only show up under
-failure. Keying by annotator scatters one task's events across partitions, so "this is the second
-label for this item" stops being a fact you can compute. Publishing before persisting inverts the
-guarantee you actually want: the event is durable and the label is not. A producer with no outbox
-turns a broker outage into silent data loss, with the submit still returning 202. And a consumer
-that commits the offset first and increments afterwards has a window where a crash drops a counter
-update *forever*, with no applied set to stop a replay from counting the same label twice.`,
+  (\`insert_outbox\`/\`insertOutbox\`); the submit still succeeds.
+- The consumer folds idempotently: \`SADD agreement:applied:{task_id} label_id\` guards the fold,
+  then \`HINCRBY agreement:{task_id}:{value} {annotator} 1\`, then the offset commit.`,
   sequence: {
     participants: ['Annotator', 'labeld', 'Postgres', 'label.submitted', 'Agreement consumer', 'Redis'],
     messages: [
@@ -208,12 +190,7 @@ store = LabelStore()
 
 @app.post("/v1/tasks/{task_id}/labels")
 def submit_label(task_id: str, body: LabelSubmission) -> dict:
-    # TODO: key the event by task_id instead of the annotator (annotator keys scatter one task's
-    # labels across partitions, so per-task agreement can never fold them in order), persist the
-    # label before publishing instead of after the flush (a publish-before-persist keeps the event
-    # and loses the label on a crash), write an outbox row when the broker rejects the produce, and
-    # fix the consumer: there is no applied-set guard and the offset is committed before the
-    # counters, so a replay double-counts and a crash between them drops the update.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "label_id": body.label_id,
         "task_id": task_id,
@@ -355,10 +332,7 @@ interface LabelBody {
 }
 
 app.post('/v1/tasks/:taskId/labels', async (request, reply) => {
-  // TODO: key the event by the task id instead of the annotator, persist the label before it is
-  // published instead of after, write an outbox row when the broker rejects the produce, and give
-  // the consumer an applied-set guard with the counters before the commit — as written the offset
-  // moves first and a replay double-counts.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const {taskId} = request.params as {taskId: string};
   const body = request.body as LabelBody;
   if (body.values.length === 0) return reply.code(400).send({error: 'empty_label_values'});
@@ -511,10 +485,7 @@ type LabelSubmission struct {
 	Values    []string \`json:"values"\`
 }
 
-// TODO: key the event by the task id instead of the annotator, persist the label before it is
-// published instead of after, write an outbox row when the broker rejects the produce, and give
-// the consumer an applied-set guard with the counters before the commit — as written the offset
-// moves first and a replay double-counts.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func submitLabel(rw http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("taskID")
 	body := LabelSubmission{}
@@ -688,10 +659,7 @@ object LabelEventsApi {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key the event by the task id instead of the annotator, persist the label before it is
-  // published instead of after, write an outbox row when the broker rejects the produce, and give
-  // the consumer an applied-set guard with the counters before the commit — as written the offset
-  // moves first and a replay double-counts.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def submitLabel(taskId: String, labelId: String, annotator: String, values: List[String]): Unit = {
     val event = Map(
       "label_id" -> labelId,
@@ -800,10 +768,7 @@ const std::string kSubmittedTopic = "label.submitted";
 std::unique_ptr<RdKafka::Producer> producer;
 std::unique_ptr<sw::redis::Redis> redis;
 
-// TODO: key the event by the task id instead of the annotator, persist the label before it is
-// published instead of after, write an outbox row when the broker rejects the produce, and give
-// the consumer an applied-set guard with the counters before the commit — as written the offset
-// moves first and a replay double-counts.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void submitLabel(const std::string& taskId, const std::string& labelId, const std::string& annotator, const json& values) {
   const json event = {{"label_id", labelId}, {"task_id", taskId}, {"annotator", annotator}, {"values", values}};
   const auto payload = event.dump();
@@ -913,9 +878,9 @@ void consumeSubmitted(const std::string& group) {
     },
   },
   hints: [
-    'The message key is the ordering contract: `key=task_id`, `key: label.task_id`, `Key: []byte(label.TaskID)`, `new ProducerRecord(SUBMITTED_TOPIC, task_id, payload)`. Keyed by annotator, one task’s submissions share no partition and “the second label for this item” stops being computable. Idempotence rides along: a retry can only be deduplicated if it repeats the same key, and `acks=all` is what makes the record durable before the caller is told it is.',
-    'Persist, then produce — the order is a correctness property, not style. Publish first and a crash between the two keeps the event and loses the label, so agreement math counts an answer nobody stored. When the broker rejects the produce, take the same payload to the outbox row (`insert_outbox`, `insertOutbox`, `insertOutbox` in a producer callback, `if err != nil` in Go) so a relay can republish it; an ignored broker error is silent loss.',
-    'The consumer must be re-runnable. Guard the fold with `SADD agreement:applied:{task_id} label_id` (or its language equivalent: `sadd`, `SAdd`), increment the counters (`HINCRBY`), and commit the offset last. Commit first and a crash between commit and increment loses the update permanently; no applied set and every replay counts the same label twice.',
+    'After a broker hiccup the progress page shows agreement for labels nobody can find in the database, and after a consumer restart one annotator is credited twice for the same item.',
+    'The produce runs before `persist_label`, keyed by annotator on a default producer with no error branch; the event omits `spec_version` and `ms_spent`; the consumer calls `commit` before `hincrby` and keeps no applied set.',
+    'Persist, then produce with `key=task_id` on an idempotent `acks=all` producer, add the missing fields, write `insert_outbox` in the `KafkaException` branch, and in the consumer `SADD agreement:applied:{task_id}`, `HINCRBY`, then commit.',
   ],
-  debrief: `The interviewer is testing whether you can keep an event stream honest under failure, not whether you can call a producer. Three ordering decisions carry the step. The message key is the first: keying \`label.submitted\` by task id is what makes “one task’s labels, in submission order” a fact — key it by annotator and a task’s answers are spread over partitions, and the agreement fold has nothing stable to walk. The key also has to be stable across retries, which is why idempotence and the key belong to the same decision. The second is persist-then-publish: the database row is the source of truth and the event is a notification about it, so writing the event first quietly inverts the guarantee — after a crash the event exists and the label does not, and every downstream count is wrong in a way no replay can repair. The third is the consumer: counters before the offset commit, plus an applied set keyed by label id, turns the fold into an operation that is safe to replay. Commit first and one crash loses a counter update forever; commit with no applied set and one replay double-counts a label. Your code will be replayed often — a broker redelivers, a rebalance hands a partition to another worker, a deploy restarts the group — so the fold has to be idempotent by construction rather than by luck. The outbox is the same idea on the write side: the broker is a network service, not a database, so a rejected produce lands in a durable row a relay can republish instead of disappearing behind a 202.`,
+  debrief: `Three ordering decisions carry the step. The message key comes first: keyed by task id, "one task's labels, in submission order" is a fact the fold can walk, and a stable key is what lets an idempotent producer deduplicate a retry. Persist-then-publish comes second: the row is the source of truth and the event a notification about it, so writing the event first inverts the guarantee and a crash leaves an event whose label does not exist. Third is the consumer: applied set, counters, then commit, so a replay (redelivery, rebalance, deploy) is a no-op rather than a double count, and a crash replays rather than loses. The outbox is the same idea on the write side. Production pipelines add a relay that drains the outbox in order and a lag alert on the consumer group.`,
 };

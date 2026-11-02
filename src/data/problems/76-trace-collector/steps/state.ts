@@ -8,41 +8,29 @@ export const stateStep: Step = {
   focus: ['collector', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: a span arrives, the starter
-appends it to a list under the trace key and recomputes the roots from that list. Serial, well-formed
-traffic assembles correctly, so the demo shows a tree. Under real traffic the starter loses spans
-twice, flips a trace between two trees in front of a reader, and never lets go of anything.
+**Starting point.** The starter implements \`insert_span(tenant, span)\`: it appends the span to a
+list under \`trace:{trace_id}\` with \`RPUSH\`, reads the list back, recomputes the roots on the
+client and returns the count and gap state. Serial traffic assembles correctly, so the demo shows a
+tree. The starter hides five flaws.
 
-Implement the assembly state for a partial trace: \`insert_span(tenant, span)\` → one Redis script
-that returns the state the ingest path answers with.
+**Failure mode the checks target.** One root cause: the assembly is a sequence of independent
+commands instead of one step. The list and the computed root can disagree, so a late root flips the
+tree between two reads; a retry inserts a span twice and corrupts the gap count; and a key with no
+expiry makes every aborted trace permanent.
 
-- State lives under \`trace:{trace_id}\` as one hash: \`count\` (accepted spans), \`missing\` (spans
-  whose parent has not arrived), \`root\` (the first root span seen, \`""\` while unknown),
-  \`extra_roots\` (how many further roots arrived), \`seen:{span_id}\` (the spans we hold) and
-  \`refs:{span_id}\` (how many spans named it as their parent). The owner tenant is recorded on first
-  insert so the read path can scope access to it.
-- **One atomic script** (\`EVAL\`) inserts the span and updates every one of those fields. The starter
-  appends to a list with \`RPUSH\` and recomputes the roots with a second command, so between the two
-  commands a reader sees one tree and after them another: a late root span flips the trace, and a
-  reader can be looking at a state that never existed on its own.
-- A redelivered span is a no-op under a **per-span dedupe key** \`span:{trace_id}:{span_id}\`, set with
-  \`NX\` \`EX\` inside the same script and checked *before* any state changes. The return value says
-  whether the span was inserted (\`1\`), so the ingest path can answer \`duplicate: true\` without the
-  tree moving; the starter has no dedupe at all, so an exporter that retries inflates \`count\` and
-  reopens gaps that had already closed.
-- A span whose parent is already in the hash **closes** the gaps that referenced it: for every
-  \`refs:{span_id}\` pointing at it, \`missing\` decreases. A span whose parent is not there yet
-  increments \`missing\` once and is otherwise stored. A second root never creates a second tree: the
-  first root wins and the extra one is counted in \`extra_roots\`.
-- Every key expires **15 minutes after the last span** of the trace: the script sets \`EXPIRE\` on the
-  trace hash on every insert (and the dedupe marker carries the same TTL with \`EX\`), so a trace
-  whose last span arrived at 12:04 is gone at 12:19. The starter sets no TTL anywhere, so abandoned
-  traces accumulate until the instance is full.
-
-**Failure mode the checks target.** Three failures with one root cause: the assembly is a sequence of
-independent commands instead of one step. The spans list and the computed root can disagree (a late
-root flips the tree between two reads); a retry duplicates a span and corrupts the gap count; and a
-key with no expiry makes every aborted trace permanent. Each one is invisible in a serial test.`,
+- State lives under \`trace:{trace_id}\` as one hash: \`count\`, \`missing\`, \`root\` (\`""\` while
+  unknown), \`extra_roots\`, \`seen:{span_id}\`, \`refs:{span_id}\` (spans naming it as parent) and
+  the owner tenant.
+- **One atomic script** (\`EVAL\`) inserts the span and updates every field; no \`RPUSH\`/\`LRANGE\`
+  and no client-side recompute remain.
+- A redelivered span is a no-op under a **per-span dedupe key** \`span:{trace_id}:{span_id}\`, set
+  with \`NX\` \`EX\` inside the script before any state changes; the script returns whether the span
+  was new.
+- A span whose parent is present closes the gaps that referenced it (\`missing\` decreases by
+  \`refs:{span_id}\`); an absent parent increments \`missing\` once. The first root wins; a second is
+  counted in \`extra_roots\`.
+- Every key expires **15 minutes after the last span**: \`EXPIRE\` on every insert, the same TTL on
+  the marker.`,
   sequence: {
     participants: ['Traces SDK', 'Trace Collector', 'Redis'],
     messages: [
@@ -62,9 +50,9 @@ key with no expiry makes every aborted trace permanent. Each one is invisible in
     ],
   },
   hints: [
-    'Everything that reads and writes the tree has to be one script: `SET` the dedupe marker with `NX` `EX`, return early when it already existed, then `HINCRBY` the counters, `HSET` the seen/refs fields and `EXPIRE` the hash. `RPUSH` plus a client-side recompute is two states with a reader in between.',
-    'The dedupe marker is a key of its own, not a field you scan: `span:{trace_id}:{span_id}` with `NX` and the assembly TTL. Because the script returns before touching the hash, a redelivered span cannot inflate `count` or re-open a gap that a late parent already closed.',
-    'The gap bookkeeping is what makes a late parent cheap: `refs:{parent_id}` counts the children waiting for that parent, so when the parent finally lands you subtract exactly that many from `missing` and the trace becomes whole. Keep `root` first-wins — a late root is not a second tree, it is a contradictory trace worth counting in `extra_roots`.',
+    'During an incident the waterfall for one trace changes shape between two refreshes, a retried export batch raises the span count without adding spans, and Redis memory climbs until the instance is restarted.',
+    '`RPUSH` then a client recompute is two states with a reader in between; nothing marks a span as already seen, so a duplicate is appended; and no key carries a TTL.',
+    'Move the insert into `INSERT_SPAN_LUA` run with `eval`: `SET` `span:{trace}:{span}` `NX` `EX`, return early if it existed, `HINCRBY` count/missing/refs, `HSET` root first-wins, `EXPIRE` with `ASSEMBLY_TTL_S`.',
   ],
   checks: [
     {
@@ -234,9 +222,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 def insert_span(tenant: str, span: dict) -> dict:
     """Assemble one span into its trace and answer with the state the ingest path reports."""
-    # TODO: the starter appends to a list and recomputes the roots with a second command, so a late
-    # root span flips the trace between two trees while a reader can still see the first. There is
-    # no dedupe marker, and no key ever expires. Replace all three with one atomic script.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     trace_id = span["trace_id"]
     key = f"trace:{trace_id}"
     r.rpush(f"{key}:spans", json.dumps(span))
@@ -365,9 +351,7 @@ export interface AssemblyState {
 }
 
 export async function insertSpan(tenant: string, span: Span): Promise<AssemblyState> {
-  // TODO: the starter appends to a list and recomputes the roots with a second command, so a late
-  // root span flips the trace between two trees while a reader can still see the first. There is
-  // no dedupe marker, and no key ever expires. Replace all three with one atomic script.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`trace:\${span.trace_id}\`;
   await r.rpush(\`\${key}:spans\`, JSON.stringify(span));
   const raw = await r.lrange(\`\${key}:spans\`, 0, -1);
@@ -504,9 +488,7 @@ type Span struct {
 }
 
 func insertSpan(ctx context.Context, tenant string, span Span) (map[string]any, error) {
-	// TODO: the starter appends to a list and recomputes the roots with a second command, so a late
-	// root span flips the trace between two trees while a reader can still see the first. There is
-	// no dedupe marker, and no key ever expires. Replace all three with one atomic script.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("trace:%s", span.TraceID)
 	payload, _ := json.Marshal(span)
 	if err := rdb.RPush(ctx, key+":spans", payload).Err(); err != nil {
@@ -644,9 +626,7 @@ object TraceState {
   val jedis = new Jedis("redis", 6379)
 
   def insertSpan(tenant: String, span: Map[String, Any]): Map[String, Any] = {
-    // TODO: the starter appends to a list and recomputes the roots with a second command, so a late
-    // root span flips the trace between two trees while a reader can still see the first. There is
-    // no dedupe marker, and no key ever expires. Replace all three with one atomic script.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val traceId = span("trace_id").toString
     val key = s"trace:$traceId"
     jedis.rpush(s"$key:spans", span.toJson.compactPrint)
@@ -761,9 +741,7 @@ using json = nlohmann::json;
 std::unique_ptr<sw::redis::Redis> redis;
 
 json insertSpan(const std::string& tenant, const json& span) {
-  // TODO: the starter appends to a list and recomputes the roots with a second command, so a late
-  // root span flips the trace between two trees while a reader can still see the first. There is
-  // no dedupe marker, and no key ever expires. Replace all three with one atomic script.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const std::string traceId = span.value("trace_id", std::string());
   const std::string key = "trace:" + traceId;
   const std::string payload = span.dump();
@@ -870,5 +848,5 @@ json insertSpan(const std::string& tenant, const json& span) {
 `,
     },
   },
-  debrief: `The interviewer is asking one question: what can a reader observe while a span is being inserted? The starter answers "two things" — it writes the list, then writes the root — and everything else follows from that. A late root span rewrites \`root\` while the children are already there, so the tree flips mid-incident; a retried export appends the same span a second time, so \`count\` and \`missing\` drift away from the spans you actually hold; and because nothing expires, every trace that was abandoned by a crashed service occupies memory until the instance is restarted. One Lua script removes all three: the marker is claimed before any state changes, the counters and the refs/seen fields move together, and the \`EXPIRE\` slides with the last span, so "abandoned" becomes a property of the data rather than of a cleanup job. Real collectors add a per-trace span cap, a spill to disk for the traces that exceed it, and a \`missing\` count that feeds a sampling decision — but they all assume the assembly step is atomic.`,
+  debrief: `The fix is one Lua script because the property worth protecting is that a reader observes exactly one state per span insert. The starter writes the list, then the root, and everything follows: a late root rewrites \`root\` while the children are already there, a retried export appends the same span twice so \`count\` and \`missing\` drift from the spans actually held, and because nothing expires, every abandoned trace occupies memory until a restart. Inside the script the marker is claimed first, the counters and the refs/seen fields move together, and the \`EXPIRE\` slides with the last span, so "abandoned" becomes a property of the data rather than of a cleanup job. Production collectors also cap spans per trace and spill oversized traces to disk, both assuming an atomic insert.`,
 };

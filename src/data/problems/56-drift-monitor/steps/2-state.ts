@@ -8,32 +8,29 @@ export const windowedSketchStep: Step = {
   focus: ['monitor', 'redis', 'baseline'],
   task: `## Task
 
-**Starting point.** The starter is working code: batches arrive, buckets go up, and the demo shows a
-distribution. It hides two multi-window bugs — one that loses counts under concurrency, one that
-destroys the reference — and one about time. Debug it, fix it, and prove the fix.
+**Starting point.** The starter merges a batch of \`(bucket, count)\` pairs into a Redis hash under
+one \`sketch:{tenant}:{monitor}:{window}\` namespace, one \`HGET\`, add and \`HSET\` per bucket, and
+sets a 3600 s TTL on the first write. It serves the demo and hides 5 flaws.
+
+**Failure mode the checks target.** A read-modify-write from the client is a lost-update race; a
+shared key between the live signal and its own baseline makes the comparison self-referential; a
+fixed TTL is not a window. Each one leaves the monitor running, quiet and wrong.
 
 Input distributions are tracked as **windowed sketches** in Redis, one per (tenant, monitor, window),
 with the baseline kept apart.
 
 - The **live** sketch key is \`sketch:live:{tenant}:{monitor_id}:{window}\`, where \`window\` is the
   window start (\`floor(now / window_s) * window_s\`). A key without the tenant, the monitor or the
-  window mixes unrelated monitors or never resets. The starter uses one \`sketch:{tenant}:{monitor}:{…}\`
-  namespace for everything.
-- A batch is a list of \`(bucket, count)\` pairs and must be merged by **one atomic Lua \`EVAL\`**: the
-  counters are incremented server-side with \`HINCRBY\`, never read and written back from the client.
-  The starter does \`HGET\` → add → \`HSET\` per bucket, so two concurrent batches lose counts.
+  window mixes unrelated monitors or does not reset.
+- A batch must be merged by **one atomic Lua \`EVAL\`**: the counters are incremented server-side with
+  \`HINCRBY\`, not read and written back from the client.
 - The **baseline** sketch lives under its own prefix, \`sketch:baseline:{tenant}:{baseline_ref}\`, and a
-  live merge must never touch it. The starter writes the baseline into the same mutable namespace as
-  live traffic, so last week's reference slowly becomes this week's data and drift stops firing.
+  live merge refuses a key in that space.
 - The baseline is **frozen once**: \`freeze_baseline\` uses a write-once set, so a second freeze is a
   no-op rather than a silent overwrite of the reference.
 - **Window expiry follows the window boundary exactly**: \`EXPIRE\` is set to
   \`window_end - now\` (\`window_end = window_start + window_s\`), so the key dies when its window's last
-  second does. The starter expires it an hour after the first write, which is not a window at all.
-
-**Failure mode the checks target.** A read-modify-write from the client is a lost-update race; a shared
-key between the live signal and its own baseline makes the comparison self-referential; a fixed TTL is
-not a window. Each one leaves the monitor running, quiet and wrong.`,
+  second does.`,
   sequence: {
     participants: ['Drift Monitor', 'Redis', 'Baseline sketch'],
     messages: [
@@ -59,7 +56,7 @@ not a window. Each one leaves the monitor running, quiet and wrong.`,
       id: 'atomic-merge',
       title: 'Merges a whole batch with one atomic script',
       detail:
-        'Every bucket of a batch is merged inside one `EVAL`/`NewScript` call with `HINCRBY`. The starter reads with `HGET`, adds in the client and writes with `HSET`, so two concurrent batches both read the same value and one increment is lost.',
+        'Every bucket of a batch is merged inside one `EVAL`/`NewScript` call with `HINCRBY`. The starter reads with `HGET`, adds in the client and writes with `HSET`, so two concurrent batches can lose an increment.',
       match: {
         python: {all: [/MERGE_LUA/, /\.eval\(/, /HINCRBY/]},
         typescript: {all: [/MERGE_LUA/, /\.eval\(/, /HINCRBY/]},
@@ -72,7 +69,7 @@ not a window. Each one leaves the monitor running, quiet and wrong.`,
       id: 'live-key',
       title: 'Keys live sketches by tenant, monitor and window',
       detail:
-        'The live key is `sketch:live:{tenant}:{monitor_id}:{window}`, built by `live_key`/`liveKey`. A key that drops the monitor, the tenant or the window makes unrelated monitors share a sketch or lets a window never reset.',
+        'The live key is `sketch:live:{tenant}:{monitor_id}:{window}`, built by `live_key`/`liveKey`. A key that drops the monitor, the tenant or the window makes unrelated monitors share a sketch or lets a window skip its reset.',
       match: {
         python: {all: [/sketch:live:/, /live_key\(/]},
         typescript: {all: [/sketch:live:/, /liveKey\(/]},
@@ -111,7 +108,7 @@ not a window. Each one leaves the monitor running, quiet and wrong.`,
       id: 'window-boundary',
       title: 'Expires the sketch exactly at the window boundary',
       detail:
-        'The TTL is `window_end - now`, set by `EXPIRE` inside the merge script, so the key dies when its window ends. The starter expires the key 3600 s after the first write, which drifts out of step with the window it claims to represent.',
+        'The TTL is `window_end - now`, set by `EXPIRE` inside the merge script, so the key dies when its window ends. The starter expires the key 3600 s after the first write, out of step with the window it claims to represent.',
       match: {
         python: {all: [/window_end\(/, /EXPIRE/]},
         typescript: {all: [/windowEnd\(/, /EXPIRE/]},
@@ -137,9 +134,7 @@ def window(now: int, window_s: int) -> int:
 
 
 def merge_batch(tenant: str, monitor_id: str, window_start: int, batch: dict[int, int]) -> int:
-    # TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
-    # batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-    # the key an hour after the first write instead of at the window boundary. Fix all three.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     key = f"{SKETCH_ROOT}:{tenant}:{monitor_id}:{window_start}"
     total = 0
     for bucket_id, count in batch.items():
@@ -238,9 +233,7 @@ export async function mergeBatch(
   windowStart: number,
   batch: Batch,
 ): Promise<number> {
-  // TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
-  // batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-  // the key an hour after the first write instead of at the window boundary. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = SKETCH_ROOT + ':' + tenant + ':' + monitorId + ':' + windowStart;
   let total = 0;
   for (const [bucket, count] of Object.entries(batch)) {
@@ -354,9 +347,7 @@ func sketchKey(parts ...string) string {
 }
 
 func mergeBatch(ctx context.Context, tenant, monitorID string, windowStart int64, batch Batch) (int64, error) {
-	// TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
-	// batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-	// the key an hour after the first write instead of at the window boundary. Fix all three.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	key := sketchKey(tenant, monitorID, fmt.Sprintf("%d", windowStart))
 	var total int64
 	for bucket, count := range batch {
@@ -470,9 +461,7 @@ object SketchStore {
   def sketchKey(parts: String*): String = (SketchRoot +: parts).mkString(":")
 
   def mergeBatch(tenant: String, monitorId: String, windowStart: Long, batch: Map[Int, Long]): Long = {
-    // TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
-    // batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-    // the key an hour after the first write instead of at the window boundary. Fix all three.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val key = sketchKey(tenant, monitorId, windowStart.toString)
     var total = 0L
     batch.foreach { case (bucket, count) =>
@@ -573,9 +562,7 @@ long mergeBatch(const std::string& tenant,
                 const std::string& monitorId,
                 long windowStart,
                 const std::unordered_map<std::string, long>& batch) {
-  // TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
-  // batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-  // the key an hour after the first write instead of at the window boundary. Fix all three.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const auto key = sketchKey({tenant, monitorId, std::to_string(windowStart)});
   long total = 0;
   for (const auto& [bucket, count] : batch) {
@@ -672,18 +659,16 @@ bool freezeBaseline(const std::string& tenant,
     },
   },
   hints: [
-    'The script must do the whole batch on the server: pass the `(bucket, count)` pairs as `ARGV` and let Lua run `HINCRBY` per bucket, returning the merged total. `HGET` followed by `HSET` in the client leaves a window between the two commands where another batch reads the same value.',
-    'Two key spaces, never one: `sketch:live:{tenant}:{monitor_id}:{window}` for traffic and `sketch:baseline:{tenant}:{ref}` for the reference. The live path should refuse a key in the baseline space, and `freeze_baseline` should write once (`nx`) so a re-run cannot rebase the monitor on today’s traffic.',
-    'A window key must die with its window. Compute `window_end = window_start + window_s` and pass `window_end - now` as the TTL into the same script, so the key expires exactly when its window does instead of an hour after the first batch.',
+    'Symptom: the evaluated distribution has fewer samples than the batches that arrived, the distance to the baseline shrinks toward zero week over week, and keys from old windows are still alive.',
+    'Mechanism: `HGET` then `HSET` leaves a gap where a concurrent batch reads the same value; live merges and `freeze_baseline` write the same mutable namespace; the TTL is counted from the first write, not the window.',
+    'Change: one `EVAL` with `HINCRBY` per bucket and `EXPIRE window_end - now` inside it; `sketch:live:` and `sketch:baseline:` prefixes with the merge refusing the latter; `freeze_baseline` writes with `nx`.',
   ],
-  debrief: `This step is about the two ways a drift monitor lies to itself. The first is concurrency: a
-client-side read-modify-write over sketch buckets loses increments whenever two batches for the same
-window land together, so the distribution that gets evaluated is not the distribution that arrived —
-the fix is one \`EVAL\` per batch with \`HINCRBY\` on the server. The second is the reference: writing the
-baseline into the same mutable key as live traffic turns the monitor into a comparison of the signal
-with itself, and over a few windows nothing can ever be detected. Separate prefixes plus a write-once
-freeze keep the reference a reference. The third is time: a TTL of 3600 s after the first write is not
-a window, so keys overlap and windows never line up with the buckets being compared; the TTL has to be
-computed from the boundary. Real deployments add Cuckoo or t-digest sketches with serialized merge,
-per-feature namespaces, and a compaction job that archives expired windows.`,
+  debrief: `The merge moves into one Lua script because Redis executes a script atomically: every \`HINCRBY\` and
+the \`EXPIRE\` for a batch land together, and a concurrent batch sees either all of it or none of
+it. The TTL is computed from the window boundary inside the same script so the key's lifetime and
+its contents are decided at the same moment. Splitting the key space is what keeps the reference a
+reference: the live path cannot reach \`sketch:baseline:\`, and the write-once freeze means a
+re-run cannot rebase the monitor on today's traffic. Production deployments go further with
+serialized sketch types (t-digest, count-min) merged inside the script, per-feature namespaces and
+a compaction job that archives expired windows, none of which this step does.`,
 };

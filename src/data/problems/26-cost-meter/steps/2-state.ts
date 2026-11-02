@@ -8,35 +8,26 @@ export const stateStep: Step = {
   focus: ['meter', 'redis'],
   task: `## Task
 
-The starter is working code: a report arrives, the counters move, and the
-dashboard shows spend. It races under concurrency, it never rolls over, and it leaks keys forever.
-Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter implements \`record_usage(tenant, model, input_tokens, output_tokens)\`,
+called once a report is validated: it rejects negative counts, runs two \`HINCRBY\` commands against
+\`meter:{tenant}\`, reads both fields back with \`HGET\` and returns them. It compiles, serves the
+demo and hides five flaws.
 
-Implement \`record_usage(tenant, model, input_tokens, output_tokens)\`, the call the API makes once a
-usage report has been validated:
+**Failure mode the checks target.** Two concurrent reports each move one counter and the totals
+drift. A tenant that exhausted its budget last week is still over it today, because the key has no
+hour in it and no expiry. The returned totals come from a second round trip that can include another
+request's increment, and \`events\` is always 0.
 
-- Spend lives in **one Redis hash per \`(tenant, hour bucket)\`**: \`meter:{tenant}:{bucket}\` with
-  fields \`input_tokens\`, \`output_tokens\` and \`events\`, where \`bucket = int(now // WINDOW_S)\` and
-  \`WINDOW_S = 3600\`. The starter keys on the tenant alone, so the counter never resets and "this
-  hour's spend" is really "all spend since the tenant first appeared".
-- Both token increments, the event count and the window expiry happen in **one atomic Lua
-  \`EVAL\`**: a report is one unit of spend, so a process that dies mid-update must not leave the
-  input counter moved and the output counter behind. Two client-side \`HINCRBY\` commands are the
-  exact half-applied state the limiter reads.
-- The expiry is set **when the window opens** — \`WINDOW_TTL_S = 7200\`, the hour the window covers
-  plus one hour of grace for reconciliation — and never re-set by a later write, so the key
-  disappears an hour after its window closes instead of living forever. A \`TTL\` read inside the
-  script tells you whether the deadline is already there.
-- The script returns the fresh \`input_tokens\`, \`output_tokens\` and \`events\` so the caller never
-  needs a second round trip: a re-read after the write can pick up another request's increment and
-  report it as this one's.
-- The limiter and the meter read the **same key**: pricing and enforcement must not disagree about
-  which window a token belongs to.
-
-**Failure mode the checks target.** The atomicity flaw is the loud one under load — two concurrent
-reports each move one counter and the totals drift — but the missing hour bucket is the one that
-survives review: without it every window shares one counter, so a tenant that spent its budget last
-week is still over it today, and no TTL can fix a key that is supposed to keep counting.`,
+- Spend lives in one hash per \`(tenant, hour bucket)\`: \`meter:{tenant}:{bucket}\` with fields
+  \`input_tokens\`, \`output_tokens\` and \`events\`, where \`bucket = int(now // WINDOW_S)\` and
+  \`WINDOW_S = 3600\`.
+- Both increments, the event count and the expiry happen in one atomic Lua \`EVAL\` (\`METER_LUA\`),
+  so a process that dies mid-update cannot leave the input counter moved and the output counter
+  behind.
+- The expiry, \`WINDOW_TTL_S = 7200\` (window plus one hour of grace), is set when the window opens
+  and not re-set by later writes; a \`TTL\` read inside the script tells you whether it exists.
+- The script returns the fresh \`input_tokens\`, \`output_tokens\` and \`events\`.
+- The limiter and the meter read the same key, so pricing and enforcement agree on the window.`,
   sequence: {
     participants: ['Cost Meter', 'Second request', 'Redis'],
     messages: [
@@ -127,8 +118,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def record_usage(tenant: str, model: str, input_tokens: int, output_tokens: int) -> dict:
-    # TODO: move both increments and the expiry into one atomic script, key the hash by
-    # (tenant, hour bucket) instead of the tenant alone, and expire the key with its window.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if input_tokens < 0 or output_tokens < 0:
         raise HTTPException(status_code=400, detail="token counts must not be negative")
     key = f"meter:{tenant}"
@@ -209,8 +199,7 @@ export async function recordUsage(
   inputTokens: number,
   outputTokens: number,
 ): Promise<Meter> {
-  // TODO: move both increments and the expiry into one atomic script, key the hash by
-  // (tenant, hour bucket) instead of the tenant alone, and expire the key with its window.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`meter:\${tenant}\`;
   await r.hincrby(key, 'input_tokens', inputTokens);
   await r.hincrby(key, 'output_tokens', outputTokens);
@@ -300,8 +289,7 @@ type Meter struct {
 }
 
 func recordUsage(ctx context.Context, tenant, model string, inputTokens, outputTokens int64) (Meter, error) {
-	// TODO: move both increments and the expiry into one atomic script, key the hash by
-	// (tenant, hour bucket) instead of the tenant alone, and expire the key with its window.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	if inputTokens < 0 || outputTokens < 0 {
 		return Meter{}, errors.New("token counts must not be negative")
 	}
@@ -386,8 +374,7 @@ object MeterState {
   val r: RedisClient = new RedisClient("redis", 6379)
 
   def recordUsage(tenant: String, model: String, inputTokens: Long, outputTokens: Long): Map[String, Long] = {
-    // TODO: move both increments and the expiry into one atomic script, key the hash by
-    // (tenant, hour bucket) instead of the tenant alone, and expire the key with its window.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     require(inputTokens >= 0 && outputTokens >= 0, "token counts must not be negative")
     val key = s"meter:$tenant"
     r.hincrBy(key, "input_tokens", inputTokens)
@@ -466,8 +453,7 @@ using sw::redis::Redis;
 Redis r("tcp://redis:6379");
 
 json recordUsage(const std::string& tenant, const std::string& model, long long inputTokens, long long outputTokens) {
-  // TODO: move both increments and the expiry into one atomic script, key the hash by
-  // (tenant, hour bucket) instead of the tenant alone, and expire the key with its window.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const std::string key = "meter:" + tenant;
   r.hincrby(key, "input_tokens", inputTokens);
   r.hincrby(key, "output_tokens", outputTokens);
@@ -540,9 +526,9 @@ json recordUsage(const std::string& tenant, const std::string& model, long long 
     },
   },
   hints: [
-    'Everything that decides the result runs inside the script: both `HINCRBY` calls, the `events` increment and the expiry. A client-side read before or after the write is where the race lives, and it is also a second round trip the caller pays for on every request.',
-    'The key is the contract with the limiter: `meter:{tenant}:{bucket}`, with `bucket = now // WINDOW_S`. Price this window and enforce the same window, or the platform will happily admit a request the meter has already billed for an hour ago.',
-    'Only set the deadline when there is none: `TTL` returns -1 for a key with no expiry and -2 for a missing one, so `if redis.call(\'TTL\', KEYS[1]) < 0` means "this window just opened". Re-setting `EXPIRE` on every write slides the deadline forward and the key outlives its window by as long as the tenant keeps spending.',
+    'The spend dashboard shows a tenant over budget on the first of the month, and the limiter blocks it, although this hour has no reports at all.',
+    '`meter:{tenant}` has no bucket and no `EXPIRE`, so every hour lands in one counter; the two `HINCRBY` calls and the `HGET` re-read also let a concurrent report leak into this result.',
+    'Build `meter:{tenant}:{bucket}` from `now // WINDOW_S`, and run one `EVAL` that does both `HINCRBY`, the `events` increment, `EXPIRE` only when `TTL` < 0, and returns the `HGET` values.',
   ],
-  debrief: `The interviewer is testing whether you know what the counter is *for*: it is the number the budget limiter reads before admitting a request and the number the spend report prints afterwards, so it has to be one atomic unit of spend that belongs to one window and disappears when that window is done. The starter fails all three: two client commands instead of one script, a key without the hour in it, and no expiry at all. The subtle part is the third one done right — setting the TTL on every write looks careful and is wrong, because an active tenant then never lets the key go; the deadline belongs to the window, not to the write. Real meters keep a second, coarser counter for the billing period, a reconciliation key that survives longer than the window, and a hash tag so all of one tenant's window keys land on the same Redis cluster slot.`,
+  debrief: `The counter is the number the budget limiter reads before admitting a request and the number the spend report prints afterwards, so it has to be one atomic unit of spend that belongs to one window and disappears when the window is done. That is why everything lives in one script: the increments, the event count, the expiry decision and the read-back, so no client-side interleaving can show a half-applied hash or another request's total. The TTL is set only when \`TTL\` reports none, because re-setting it on every write slides the deadline forward for as long as the tenant keeps spending. Production meters also snapshot closed windows to durable storage before the key expires, since Redis is the enforcement copy, not the ledger.`,
 };

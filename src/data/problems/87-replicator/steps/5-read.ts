@@ -8,32 +8,27 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'target'],
   task: `## Task
 
-**Starting point.** The starter is working code: it answers the lag route with a
-number that goes down over time, so the dashboard looks alive. It proves nothing. Find the flaws, fix
-them, and prove the fix.
-
-Implement \`GET /v1/replications/{id}/lag\`.
-
-- The operator comes from the authenticated \`X-Operator-Id\` header, and a replication the caller
-  does **not** own is **404** — not 403, which would confirm that the id exists, and not 200, which
-  leaks another team's replication state to any caller who guesses an id.
-- The response reports **per shard**, never a single global number: the shard id, the confirmed
-  applied \`offset\`, the source's head offset, and \`lag_changes\` = head − applied, clamped at
-  zero. A single global lag hides the one shard that is stuck while the other ninety-nine are
-  caught up.
-- The divergence check actually runs: sample \`SAMPLE_KEYS\` (256) keys of the shard, digest each one
-  in both regions with \`key_digest(region, key)\`, and collect every key whose digests differ. The
-  response names the \`divergent_shards\` instead of hiding them, and reports the sample size in
-  \`sampled_keys\` so the caller knows how strong the claim is.
-- Lag and divergence are different questions and must both be answered: a shard at offset zero-lag
-  can still be divergent, because a change applied out of order or with the wrong conflict policy
-  leaves rows that no offset difference will ever reveal.
+**Starting point.** The starter serves \`GET /v1/replications/{id}/lag\`: it looks up the
+replication, reads one offset from Redis, subtracts it from \`LAG_BUDGET_CHANGES\` and answers a
+single \`lag\` number with \`healthy: true\`. The number goes down over time, so the dashboard
+looks alive. It compiles, it serves the demo, and it hides 4 flaws.
 
 **Failure mode the checks target.** The starter reports one global lag computed from a configured
-budget number, so an operator can never see which shard is behind; it marks the replication healthy
-because nothing in it ever compares the two regions, so a divergent shard looks current; and it
-serves any replication to any caller, so one team can read another team's replica state by guessing
-an id. The divergence check is the one that turns this endpoint from a progress report into a proof.`,
+budget, so an operator cannot see which shard is behind; it marks the replication healthy because
+nothing in it compares the two regions, so a divergent shard looks current; and it serves any
+replication to any caller, so one team can read another team's replica state by guessing an id.
+
+- The operator comes from the \`X-Operator-Id\` header, and a replication the caller does **not**
+  own is **404**: not 403, which confirms the id exists, and not 200, which leaks the state.
+- The response reports **per shard**: the shard id, the confirmed applied \`offset\`, the source's
+  head from \`source_head_offset\`, and \`lag_changes\` = head − applied, clamped at zero. A global
+  number hides the one shard that is stuck while the other ninety-nine are caught up.
+- The divergence check runs: \`divergence_sample\` takes \`SAMPLE_KEYS\` (256) keys of the shard
+  via \`sample_keys\`, digests each one in both regions with \`key_digest(region, key)\`, and
+  collects the keys whose digests differ. The response names the \`divergent_shards\` and reports
+  \`sampled_keys\` so the caller knows how strong the claim is.
+- Lag and divergence are different questions: a shard at zero lag can still be divergent, because
+  a change applied out of order leaves rows that no offset difference will reveal.`,
   sequence: {
     participants: ['Operator', 'Replicator API', 'Source region', 'Target region'],
     messages: [
@@ -131,9 +126,7 @@ class ReplicationStore:
 store = ReplicationStore()
 
 
-# TODO: the starter reports a single global lag taken from the configured budget, never lists the
-# per-shard offsets, never samples digests so a divergent shard looks healthy, and serves any
-# replication to any caller.
+# TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 @app.get("/v1/replications/{replication_id}/lag")
 def lag(replication_id: str, x_operator_id: str | None = Header(default=None)):
     replication = store.get(replication_id)
@@ -246,9 +239,7 @@ interface Replication {
   conflict_policy: string;
 }
 
-// TODO: the starter reports a single global lag taken from the configured budget, never lists the
-// per-shard offsets, never samples digests so a divergent shard looks healthy, and serves any
-// replication to any caller.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 app.get('/v1/replications/:id/lag', async (request, reply) => {
   const replication = store.get((request.params as {id: string}).id);
   if (replication === undefined) return reply.code(404).send({error: 'unknown replication'});
@@ -373,9 +364,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// TODO: the starter reports a single global lag taken from the configured budget, never lists the
-// per-shard offsets, never samples digests so a divergent shard looks healthy, and serves any
-// replication to any caller.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 func lag(rw http.ResponseWriter, r *http.Request) {
 	replication, err := store.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -544,9 +533,7 @@ object LagApi {
 
   val store = ReplicationStore.open()
 
-  // TODO: the starter reports a single global lag taken from the configured budget, never lists the
-  // per-shard offsets, never samples digests so a divergent shard looks healthy, and serves any
-  // replication to any caller.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   val route: Route =
     path("v1" / "replications" / Segment / "lag") { replicationId =>
       get {
@@ -660,9 +647,7 @@ struct Replication {
 int main() {
   httplib::Server svr;
 
-  // TODO: the starter reports a single global lag taken from the configured budget, never lists the
-  // per-shard offsets, never samples digests so a divergent shard looks healthy, and serves any
-  // replication to any caller.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   svr.Get(R"(/v1/replications/([^/]+)/lag)", [](const httplib::Request& req, httplib::Response& res) {
     const auto replicationId = req.matches[1].str();
     const auto replication = store.get(replicationId);
@@ -762,9 +747,9 @@ int main() {
     },
   },
   hints: [
-    'Answer per shard, never globally: `lag_changes = max(head - applied, 0)` for each shard in the replication, with the offset read from the durable key the state step wrote. A global number is an average that hides the shard that is stuck.',
-    'The divergence check is a sample, not a scan: take `SAMPLE_KEYS` keys of the shard, digest each one in both regions, and keep the keys whose digests differ. Report the sample size next to the result so the caller can judge the claim — and name the `divergent_shards`.',
-    'Authorise by ownership and answer **404** for a foreign replication: 403 confirms the id exists, and 200 leaks another team’s state. Reading the operator from the header and comparing it with the stored owner is the whole fix.',
+    'Stall one shard of a hundred, or apply a batch under the wrong policy: the lag read still reports a shrinking number and `healthy: true`. Any operator who guesses an id gets the same answer.',
+    'The handler reads one key, `offset`, subtracts it from a constant budget, and hard-codes `healthy`; it compares no digests and no owner, so nothing in it can distinguish shards, regions or callers.',
+    'Compare `replication["owner"]` with `x_operator_id` (404 on mismatch); loop the shards with `source_head_offset` and `lag_changes = max(head - applied, 0)`; run `divergence_sample` over `SAMPLE_KEYS` with `key_digest`; return `shards`, `divergent_shards`, `sampled_keys`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a read path for whether it proves anything. A single lag number computed from a budget is not evidence: it cannot show which shard is behind, and it cannot detect divergence at all, because a change applied with the wrong order leaves both regions at the same offset with different rows. The sample is what gives the endpoint teeth — 256 keys, digests compared per region, the divergent shards named — and reporting the sample size is what keeps the claim honest. The ownership check is the security half of the same fix: a replication id is guessable, so the endpoint has to answer 404 for someone else's replication. Real platforms add a background reconciler that repairs divergences, a checksum job over full shards, and an alert on the divergence count rather than on the lag.`,
+  debrief: `The fix makes the read path answer a question it can settle. A lag number derived from a budget is not evidence: it cannot show which shard is behind, and it cannot detect divergence, because a change applied in the wrong order leaves both regions at the same offset with different rows. Per-shard offsets answer the first question; the digest sample answers the second, and reporting its size tells the caller how strong the claim is. The ownership check belongs in the same handler because a replication id is guessable, so a foreign replication has to look exactly like a missing one. Production platforms add a background reconciler that repairs the divergences this read names, and alert on the divergence count rather than on lag.`,
 };

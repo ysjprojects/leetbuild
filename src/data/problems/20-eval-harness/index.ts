@@ -23,25 +23,23 @@ export const evalHarnessProblem: Problem = {
   minutes: 70,
   statement: `# Eval Harness
 
-An eval harness is the piece of an AI platform that answers one question before a model version
-ships: does it score at least as well as the last one on the samples we trust. The visible part is
-a number on a dashboard; the parts that decide whether anyone can believe that number are the
-validation funnel, the atomic progress counters, the deadline-bounded judge call, the per-sample
-event, and the gate that reads the finished record.
+An eval harness answers one question before a model version ships: does it score at least as well
+as the last one on the samples we trust. The visible part is a number on a dashboard; the parts
+that decide whether anyone can believe that number are the validation funnel, the atomic progress
+counters, the deadline-bounded judge call, the per-sample event, and the gate that reads the
+finished record.
 
 ## The real system
 
-Production eval harnesses start a run only for a dataset the service owns, with a sample budget
-someone can afford, and they answer a retried start with the run they already created. They score
-sample by sample on workers, so progress arrives concurrently: the counters move inside one atomic
-step, and a redelivered sample is recognized by its own key instead of being scored twice. Each
-sample goes to a judge model under a deadline, with a bounded number of attempts on the statuses
-that deserve one, a deterministic fallback when the judge is down, and a breaker so a sick judge is
-not hammered. Every scored sample is published keyed by run so one run's results stay ordered, with
-no sample text in a topic that is retained and replicated, and an outbox row when the broker
-rejects the produce. The consumer folds the sample into the counters before it commits the offset.
-And nothing ships on a report that was cached before the last batch, or that was gated by whatever
-threshold the caller put in the query string.
+The open source \`openai/evals\` framework registers every eval under a name of the form
+\`<eval_name>.<split>.<version>\`, with the rule that a changed eval bumps its version so scores
+from different runs stay comparable. Its basic templates (\`Match\`, \`Includes\`, \`FuzzyMatch\`)
+score each sample by comparing the completion with an \`ideal\` label, next to model-graded evals
+that hand the sample to a judge model. A hosted harness wraps that spine in a service: runs that
+start only for a dataset the service owns, workers that score samples concurrently and report
+progress through one atomic step, judge calls under a deadline with a deterministic fallback,
+results published keyed by run with ids and scores rather than sample text, and a report that
+cannot be read stale or gated by a threshold the caller chose.
 
 ## What you build here
 
@@ -63,16 +61,14 @@ One service, **evald**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+and it looks right. Debug it against the failure modes, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Golden-set curation and labeling, judge prompt engineering, statistical significance testing,
-per-slice and per-language breakdowns, dataset versioning, cost accounting for judge calls, and the
-dashboard. The five pieces above are the ones that decide whether the numbers are correct, current
-and shippable.`,
+per-slice breakdowns, dataset versioning, cost accounting for judge calls, and the dashboard. The
+five pieces above decide whether the numbers are correct, current and shippable.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Eval CLI', sub: 'start · report', x: 8, y: 50},

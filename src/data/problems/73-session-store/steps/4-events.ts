@@ -8,28 +8,28 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a \`session.event\` for every
-session change so audit and analytics can consume it. It compiles, it serves the demo, and it hides
-three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
-
-Implement \`emit_session_event\` against the \`session.event\` topic.
-
-- **Key by user.** The event's partition key is the \`user_id\`, so one user's session history stays ordered.
-  Keying by session id scatters one user's events across partitions and destroys that ordering.
-- **Hash the token.** The payload carries \`token_hash\`, \`device_class\`, \`session_id\` and \`rotation\` — never the
-  raw token. A token in a retained, replicated topic is a credential leak with a long memory.
-- **Commit before you announce.** The session record is committed **before** the event is produced, so a consumer
-  never sees a session the store does not have. Use \`store.commit(id)\` then \`producer.produce(...)\`.
-- **Outbox on failure.** If the broker rejects the produce, write an \`outbox\` row so the event can be replayed
-  after the broker recovers instead of being lost.
-- **Idempotent producer.** The producer runs with \`enable.idempotence\` and \`acks\` set so a retry cannot publish
-  the same event twice.
+**Starting point.** The starter's \`emit_session_event\` builds a JSON payload with the session id,
+device class, raw token and rotation, logs the token, produces it to \`session.event\` keyed by
+session id with a default-configured producer, and commits the session record afterwards. It
+compiles and hides 5 flaws.
 
 **Failure mode the checks target.** Keying by session id means two events for one user can land in different
 partitions and be consumed out of order. Publishing the raw token turns the topic into a credential store. And
-producing before committing the record — or dropping the event when the broker rejects it — means the topic and
-the store disagree, which is the bug audit teams spend a week chasing.`,
+producing before committing the record, or dropping the event when the broker rejects it, means the topic and
+the store disagree, which is the bug audit teams spend a week chasing.
+
+Requirements:
+
+- **Key by user.** The event's partition key is the \`user_id\`, so one user's session history stays ordered.
+- **Hash the token.** The payload carries \`token_hash\`, \`device_class\`, \`session_id\` and \`rotation\`; the
+  raw token is neither published nor logged. A token in a retained, replicated topic is a credential leak with a
+  long memory.
+- **Commit before you announce.** The session record is committed **before** the event is produced, so a consumer
+  cannot see a session the store does not have. Use \`store.commit(id)\` then \`producer.produce(...)\`.
+- **Outbox on failure.** If the broker rejects the produce, write an \`outbox\` row so the event can be replayed
+  after the broker recovers instead of being lost.
+- **Idempotent producer.** The producer runs with \`enable.idempotence\` and \`acks\` set so a retry cannot publish
+  the same event twice.`,
   sequence: {
     participants: ['Session API', 'Session Store', 'session.event', 'Session consumer'],
     messages: [
@@ -42,9 +42,9 @@ the store disagree, which is the bug audit teams spend a week chasing.`,
     ],
   },
   hints: [
-    'What has to be true before a consumer sees the event? The starter announces the session before the store has it.',
-    'The topic is retained and replicated. Which field in the payload would you never want a future reader to have?',
-    'A produce can fail. Where does the event go so it is not lost, and what makes the retry safe to publish twice?',
+    "An audit consumer sees a login event for a session the store cannot find, sees a user's rotation before their login, and finds live tokens sitting in the topic and the service log.",
+    'The produce runs before `store.commit`, the key is `session_id` so one user spans partitions, payload and log line carry `token`, a failed produce is lost, and the producer uses defaults.',
+    'Commit first, then `produce("session.event", key=user_id, ...)` with a `sha256` `token_hash`; on a produce error call `outbox.add(...)`; configure `enable.idempotence` and `acks: "all"`.',
   ],
   checks: [
     {
@@ -123,8 +123,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def emit_session_event(session_id: str, user_id: str, device_class: str, token: str, rotation: int) -> None:
-    # TODO: the event is produced before the record is committed and it carries the raw token; it is
-    # also keyed by session id, so one user's events scatter across partitions.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     payload = json.dumps(
         {
             "session_id": session_id,
@@ -183,8 +182,7 @@ export async function emitSessionEvent(
   token: string,
   rotation: number,
 ): Promise<void> {
-  // TODO: the event is produced before the record is committed and it carries the raw token; it is
-  // also keyed by session id, so one user's events scatter across partitions.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const payload = JSON.stringify({
     session_id: sessionId,
     device_class: deviceClass,
@@ -247,8 +245,7 @@ type SessionEvent struct {
 }
 
 func EmitSessionEvent(ctx context.Context, sessionID, userID, deviceClass, token string, rotation int) error {
-	// TODO: the event is produced before the record is committed and it carries the raw token; it is
-	// also keyed by session id, so one user's events scatter across partitions.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(SessionEvent{SessionID: sessionID, DeviceClass: deviceClass, Token: token, Rotation: rotation})
 	if err != nil {
 		return err
@@ -328,8 +325,7 @@ object SessionEvents {
 
   case class SessionEvent(sessionId: String, deviceClass: String, token: String, rotation: Int)
 
-  // TODO: the event is produced before the record is committed and it carries the raw token; it is
-  // also keyed by session id, so one user's events scatter across partitions.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def emitSessionEvent(sessionId: String, userId: String, deviceClass: String, token: String, rotation: Int): Unit = {
     val payload = SessionEvent(sessionId, deviceClass, token, rotation).asJson.noSpaces
     logger.info(s"session $sessionId changed for token $token")
@@ -390,8 +386,7 @@ using json = nlohmann::json;
 
 namespace session {
 
-// TODO: the event is produced before the record is committed and it carries the raw token; it is
-// also keyed by session id, so one user's events scatter across partitions.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void emit_session_event(RdKafka::Producer& producer, const std::string& session_id, const std::string& user_id,
                         const std::string& device_class, const std::string& token, int rotation) {
   const json payload = {
@@ -451,5 +446,5 @@ void emit_session_event(RdKafka::Producer& producer, const std::string& session_
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug an event path for ordering, secrecy and durability. Three defects are being checked: keying by session id instead of user id scatters one user's history and breaks per-user ordering; publishing the raw token puts a credential in a retained, replicated topic; and producing before the record commit — or dropping a rejected produce — leaves the topic and the store disagreeing. The habits to name out loud are: choose the partition key by what needs to stay ordered, keep credentials out of any topic or log line, make the store the source of truth before you announce a change, and give a failed produce a durable home. Real systems add an outbox relay with its own retry and dedupe, a schema registry so a future producer cannot smuggle content in, and a consumer that updates counters before committing its offset.`,
+  debrief: `The fix has this shape because an event path answers three different questions and each answer is a separate line of code. Ordering is a partition-key decision: whatever must stay ordered is the key, and a user's history must. Secrecy is a payload decision: a hash lets a consumer correlate events without holding a credential, and the log line follows the same rule. Durability is an ordering-of-side-effects decision: the store commits first so the topic can only ever lag the truth, and a rejected produce goes to an outbox rather than the void, which the idempotent producer makes safe to replay. Production systems add an outbox relay with its own retry and dedupe, a schema registry so a future producer cannot smuggle a field in, and a consumer that updates its counters before committing its offset.`,
 };

@@ -8,30 +8,24 @@ export const eventsStep: Step = {
   focus: ['registry', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the event publisher: it
-builds a payload, produces to \`dataset.event\` and acks. It compiles, it serves the demo, and it
-hides three production flaws that only show up once there is more than one producer or a consumer
-that acts on the event. Debug it like the owner of the topic training pins live on.
-
-Implement the event path behind \`POST /v1/datasets/{dataset}/purge\`.
-
-- Every event is produced to the topic \`dataset.event\` **keyed by the dataset name** (\`key\`,
-  \`Key: []byte(dataset)\`, \`ProducerRecord(topic, dataset, payload)\`, the message key argument), so
-  one dataset's history is ordered and lands in one partition. The starter keys by owner team, so a
-  dataset's events scatter and reorder whenever its team changes.
-- The payload carries \`type\`, \`dataset\`, \`version\`, the license id and the validator outcome —
-  **never the content sample the validator inspected**. A retained topic is the last place tenant
-  bytes should live.
-- The registry write **commits first, then the event is published**. The starter acks the produce
-  before the write commits, so a consumer can act on a version the registry never recorded.
-- If the broker rejects the produce, write an **outbox** row and answer \`503\`, so the event is
-  retried instead of lost.
+**Starting point.** The starter serves \`POST /v1/datasets/{dataset}/purge\` with body
+\`{"version": "2026-01", "reason": "…", "team": "team-lm", "content_sample": "…"}\`. It builds a
+\`dataset.purged\` event carrying the team and the content sample, produces it to \`dataset.event\`
+keyed by the team, flushes, then calls \`store.commit_purge\`; a rejected produce raises out of the
+handler. It compiles, it serves the demo, and it hides four flaws that only show up with a second
+producer or a consumer that acts on the event.
 
 **Failure mode the checks target.** Ordering is the subtle one: keying by something that changes
-(owner team) means two events for one dataset can be consumed out of order, and a consumer that
-builds its view incrementally then believes the older event. Publish-before-commit is the other
-half: an event is a promise that the registry state exists, and a promise made early is a lie the
-consumer cannot detect.`,
+(owner team) means two events for one dataset can be consumed out of order, and an incremental
+consumer then believes the older one. Publish-before-commit is the other half: an event is a
+promise that the registry state exists, and a promise made early cannot be checked by the consumer.
+
+- Every event goes to \`dataset.event\` **keyed by the dataset name** (\`key\`, \`Key: []byte(dataset)\`,
+  \`ProducerRecord(topic, dataset, payload)\`), so one dataset's history lands in one partition.
+- The payload carries \`type\`, \`dataset\`, \`version\`, the license id and the validator outcome,
+  **not the content sample the validator inspected**.
+- The registry write **commits first, then the event is published**.
+- If the broker rejects the produce, write an **outbox** row and answer \`503\`.`,
   sequence: {
     participants: ['Registry API', 'registry store', 'Kafka', 'consumer'],
     messages: [
@@ -142,8 +136,7 @@ store = RegistryStore()
 
 
 def publish_dataset_event(event: dict) -> None:
-    # TODO: this starter keys by owner team, ships the content sample the validator inspected, and
-    # acks the produce before the registry write commits. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     team = event["team"]
     producer.produce(TOPIC, key=team.encode("utf-8"), value=json.dumps(event).encode("utf-8"))
     producer.flush()
@@ -269,8 +262,7 @@ class RegistryStore {
 const store = new RegistryStore();
 
 async function publishDatasetEvent(event: DatasetEvent): Promise<void> {
-  // TODO: this starter keys by owner team, ships the content sample the validator inspected, and
-  // acks the produce before the registry write commits. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   await producer.send({topic: TOPIC, messages: [{key: event.team, value: JSON.stringify(event)}]});
 }
 
@@ -391,8 +383,7 @@ type DatasetEvent struct {
 }
 
 func publishDatasetEvent(ctx context.Context, writer *kafka.Writer, event DatasetEvent) error {
-	// TODO: this starter keys by owner team, ships the content sample the validator inspected, and
-	// acks the produce before the registry write commits. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -514,8 +505,7 @@ object Events {
   val producer = new KafkaProducer[String, String](new Properties())
 
   def publishDatasetEvent(event: DatasetEvent): Unit = {
-    // TODO: this starter keys by owner team, ships the content sample the validator inspected, and
-    // acks the produce before the registry write commits. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     producer.send(new ProducerRecord[String, String](DatasetEventTopic, event.team, event.toString))
   }
 
@@ -615,8 +605,7 @@ static std::string toJson(const DatasetEvent& event) {
 }
 
 static void publish_dataset_event(RdKafka::Producer* producer, const DatasetEvent& event) {
-  // TODO: this starter keys by owner team, ships the content sample the validator inspected, and
-  // acks the produce before the registry write commits. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const std::string payload = toJson(event);
   producer->produce(kDatasetEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                     const_cast<char*>(payload.data()), payload.size(), event.team.c_str(), event.team.size(), 0,
@@ -717,9 +706,9 @@ int main() {
     },
   },
   hints: [
-    'The message key decides the partition, and the partition decides the order a consumer sees. Key by `dataset` — the thing whose history must be ordered — not by the team that happened to own it this quarter.',
-    'A payload carries identity and outcomes: type, dataset, version, license id, validator result. The inspected sample belongs to the validator’s report, not to a retained topic with a longer retention than the dataset itself.',
-    'Publish after the commit, and keep the produce inside the same try: a rejection writes an outbox row and returns 503. An event is a promise that the registry state exists; published early, it is a promise the consumer cannot verify.',
+    'After a team handover, a consumer sees `dataset.purged` for `2026-02` before `dataset.promoted` for it and un-purges the view. A broker hiccup turns a purge into a 500 with no event at all.',
+    'The key is `event["team"]`, so one dataset lands on two partitions; `content_sample` is copied into the payload; `producer.produce` runs before `store.commit_purge`; a produce error propagates instead of being recorded.',
+    'Key the produce with `dataset`, drop `content_sample` from the event, call `store.commit_purge` before `publish_dataset_event`, and wrap the produce so a rejection writes an outbox row and answers 503.',
   ],
-  debrief: `The interviewer is testing whether you understand a topic as an ordered log per key and an event as a promise about committed state. The starter reads fine with one producer, one team and a fast broker. Three defects are checked: the key (ordering), the payload (content leakage into a retained topic), and the ordering relative to the registry commit (consumers acting on uncommitted versions), with the outbox as the durability half of the same argument. Real registries add a schema registry with a compatibility policy, a per-dataset event version in the payload, compaction with a tombstone for purged datasets, and a consumer that stores the last applied version so a replayed partition cannot move a view backwards.`,
+  debrief: `The order of the two writes is the whole fix: an event is a promise that the registry state exists, so it can only be made after the commit, and the outbox turns a failed promise into a retry rather than a gap. Keying by the dataset gives one partition per dataset, which is what makes "a dataset's history arrives in order" true at all; a mutable key breaks that the day it changes. Keeping the sample out of the payload keeps tenant bytes out of a topic with its own retention. Production registries put a schema with a compatibility policy on the topic, carry a per-dataset sequence in the payload, compact with tombstones for purged datasets, and have consumers persist the last applied sequence so a replay cannot move a view backwards.`,
 };

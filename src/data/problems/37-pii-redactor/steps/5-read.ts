@@ -8,33 +8,26 @@ export const readRedactionStep: Step = {
   focus: ['client', 'redactor', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: the endpoint returns what it
-stored, it is fast, and the demo always asks for its own document. It hides two flaws — one that
-leaks across tenants, and one that quietly turns the audit endpoint back into a copy of the data.
-Debug it, fix it, and prove the fix.
-
-Implement \`GET /v1/documents/{document_id}/redaction\`:
-
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the lookup is scoped by it:
-  \`WHERE id = $1 AND tenant_id = $2\`. The starter resolves by document id alone, so any tenant can
-  read any document's redaction record.
-- A missing **or foreign** document is **404**, never 403: a 403 confirms the document exists, which
-  is itself information the caller is not entitled to. One code for both cases.
-- The response is \`{"document_id", "spans", "entity_types", "pattern_version", "redacted_length"}\`
-  and **no text field of any kind** — not the original, not even the stored redacted text. The starter
-  returns \`redacted_text\` "for convenience"; the audit endpoint must not become a second copy of
-  what redaction produced.
-- Each span is \`{start, end, entity, replacement}\` and the response carries
-  \`redacted_length\`, so a caller who already holds the redacted output can reconstruct it exactly:
-  every \`[cursor, start)\` is a kept run, every \`replacement\` is a removed run, and the last run ends
-  at \`redacted_length\`. Proving completeness without ever transferring the text is the point of the
-  endpoint.
+**Starting point.** The starter serves \`GET /v1/documents/{document_id}/redaction\` by selecting
+\`redacted_text\` from \`redactions\` by document id alone and returning it, with an empty string
+when no row matches. It serves the demo, because the demo always asks for its own document, and
+hides 4 flaws.
 
 **Failure mode the checks target.** Two boundaries, one ceremony: tenancy and content. The missing
-tenant predicate is an IDOR — any authenticated caller reads any document. Returning the redacted
-text feels harmless because it *is* redacted, but it makes the log system a second, less-guarded copy
-of customer data and widens the blast radius of any future storage mistake. Offsets are the safe
-projection of the same fact.`,
+tenant predicate is an IDOR; any authenticated caller reads any document. Returning the redacted
+text feels harmless because it *is* redacted, but it makes the audit system a second, less-guarded
+copy of customer data.
+
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the lookup is scoped by it:
+  \`WHERE id = $1 AND tenant_id = $2\`.
+- A missing **or foreign** document is **404**, not 403: a 403 confirms the document exists. One
+  code for both cases.
+- The response is \`{"document_id", "spans", "entity_types", "pattern_version", "redacted_length"}\`
+  and no text field of any kind, not the original and not the stored redacted text.
+- Each span is \`{start, end, entity, replacement}\`, so a caller who already holds the redacted
+  output can reconstruct it: every \`[cursor, start)\` is a kept run, every \`replacement\` is a
+  removed run, and the last run ends at \`redacted_length\`. Proving completeness without
+  transferring the text is the point of the endpoint.`,
   sequence: {
     participants: ['Client', 'Redactor', 'Postgres'],
     messages: [
@@ -143,8 +136,7 @@ app = FastAPI()
 
 @app.get("/v1/documents/{document_id}/redaction")
 def read_redaction(document_id: str, cur=None) -> JSONResponse:
-    # TODO: this starter returns the redacted text for convenience and resolves the document by id
-    # alone, so any tenant can read any document. Return spans only and scope the query.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     cur.execute("SELECT redacted_text FROM redactions WHERE id = %s", (document_id,))
     row = cur.fetchone()
     return JSONResponse(
@@ -205,8 +197,7 @@ import Fastify from 'fastify';
 export const app = Fastify();
 
 app.get('/v1/documents/:document_id/redaction', async (request, reply) => {
-  // TODO: this starter returns the redacted text for convenience and resolves the document by id
-  // alone, so any tenant can read any document. Return spans only and scope the query.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {document_id} = request.params as {document_id: string};
   const {rows} = await db.query('SELECT redacted_text FROM redactions WHERE id = $1', [document_id]);
   return reply.code(200).send({document_id, redacted_text: rows[0]?.redacted_text ?? ''});
@@ -263,8 +254,7 @@ import (
 
 func readRedaction(rw http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("document_id")
-	// TODO: this starter returns the redacted text for convenience and resolves the document by id
-	// alone, so any tenant can read any document. Return spans only and scope the query.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	var redacted string
 	err := db.QueryRowContext(r.Context(), "SELECT redacted_text FROM redactions WHERE id = $1", documentID).Scan(&redacted)
 	if err != nil {
@@ -360,8 +350,7 @@ object AuditApi {
   val route: Route =
     path("v1" / "documents" / Segment / "redaction") { documentId =>
       get {
-        // TODO: this starter returns the redacted text for convenience and resolves the document by
-        // id alone, so any tenant can read any document. Return spans only and scope the query.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         val redacted = db.lookupRedactedText(documentId).getOrElse("")
         complete(StatusCodes.OK, s"""{"document_id":"$documentId","redacted_text":"$redacted"}""")
       }
@@ -453,8 +442,7 @@ int main() {
 
   svr.Get(R"(/v1/documents/([\\w-]+)/redaction)", [](const httplib::Request& req, httplib::Response& res) {
     const std::string document_id = req.matches[1];
-    // TODO: this starter returns the redacted text for convenience and resolves the document by id
-    // alone, so any tenant can read any document. Return spans only and scope the query.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string redacted = lookup_redacted_text(document_id);
     res.status = 200;
     res.set_content(json{{"document_id", document_id}, {"redacted_text", redacted}}.dump(), "application/json");
@@ -536,9 +524,9 @@ int main() {
     },
   },
   hints: [
-    'One code for two situations: `WHERE id = $1 AND tenant_id = $2`, then `if row is None: 404`. A separate 403 branch leaks the document’s existence to a tenant that has no business knowing it, so "not found" is the only safe answer for both.',
-    'Resist the convenience of returning `redacted_text`. The audit endpoint’s value is the projection: `{start, end, entity, replacement}` plus `redacted_length`. The caller already has the redacted output from the redact call; offsets let it verify that every removed run is accounted for without any text crossing the wire.',
-    'Keep the shapes aligned with step 1: the same span fields the redact response returned, the same `pattern_version`, plus `redacted_length` so the final kept run is bounded. If the lengths and offsets do not reconcile, the caller has caught a storage bug.',
+    "Any tenant can fetch any document id and get a 200 with that document's redacted text in the body; an id that does not exist also gets a 200, with an empty string.",
+    'The query is `WHERE id = %s` with no tenant predicate, the handler ignores `X-Tenant-Id`, and the body is built from the stored `redacted_text` column with `""` when `fetchone()` returns nothing.',
+    'Require `X-Tenant-Id`, query `WHERE id = $1 AND tenant_id = $2`, answer 404 when no row, and return `spans` of `{start, end, entity, replacement}`, `entity_types`, `pattern_version` and `redacted_length` instead of any text.',
   ],
-  debrief: `The interviewer is testing two boundaries in one endpoint: who may read, and what may be read. The IDOR is the obvious one — a query without the tenant predicate turns any authenticated session into a reader of every tenant’s redaction records, and the fix is not a post-fetch check but the predicate itself, plus a 404 that refuses to confirm existence. The subtler one is the response shape: returning the redacted text feels safe because it is already redacted, but it recreates the very artifact the system was built to avoid retaining, and it invites a later change that returns the original "for the diff view". Offsets are strictly more useful for verification and strictly safer to store: an auditor can prove that the spans tile the redacted output — kept runs, replacements, and a final length — without the system ever holding a second copy of the customer’s text.`,
+  debrief: `The fix puts the tenant in the predicate rather than in a post-fetch check because the predicate is the only place a foreign row cannot be observed at all, and a single 404 for missing and foreign documents means the response carries no information about existence. The response drops text because an audit endpoint that returns the redacted output recreates the artifact the system was built to avoid retaining, and invites a later change that returns the original "for the diff view". Offsets plus \`redacted_length\` are strictly more useful: the caller can prove the spans tile its own redacted output. Production audit reads also log the reader, tenant and document id per request, rate-limit id enumeration, and serve from a read replica.`,
 };

@@ -8,33 +8,26 @@ export const stateStep: Step = {
   focus: ['hub', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: a page finishes, the cursor moves and the next run
-resumes from the right place. It survives exactly one demo. Find the flaws, fix them, and prove the
-fix.
+**Starting point.** The starter's \`load_cursor\` reads \`connector:{connector_id}:cursor\`, and
+\`commit_page\` sets that cursor to \`next_cursor\` with a 24-hour TTL, then writes a
+\`page:{connector_id}:{page_token}\` marker with the same TTL and returns \`{applied: true, cursor}\`.
+It compiles, serves the demo and hides 4 flaws.
 
-Implement \`commit_page\` — the call a sync worker makes when one page has been fetched **and
-processed** — and \`load_cursor\`, the read the next run starts from:
+**Failure mode the checks target.** The TTL is the silent one: \`ex=86_400\` looks like hygiene,
+and it means a connector that goes quiet for a day restarts from the beginning of the vendor's
+history, re-fetching and re-billing pages the platform already processed. The write order is the
+loud one: advancing the cursor before the page is committed turns any crash into skipped data, and
+nothing will notice.
 
-- The cursor is a **durable checkpoint per connector**, not a cache: key
-  \`connector:{connector_id}:cursor\`, written with a plain \`SET\` and **no TTL at all**. A connector
-  that goes quiet for a week must resume where it stopped, not replay three months of the vendor's
-  history.
-- A page is identified by \`(connector_id, page_token)\` and gets its **own claim key**:
-  \`page:{connector_id}:{page_token}\`. A re-fetch of a page — after a crash, a retry or a rebalance —
-  must not apply it twice.
-- The claim and the cursor move happen in **one atomic Lua \`EVAL\`**: \`SET … NX\` on the page key
-  first, and the \`SET\` of the new cursor only when the claim actually succeeded. The starter writes
-  the cursor **before** it claims the page, so a crash between the fetch and the write skips a page
-  and the bare \`SET\` race loses a cursor move under concurrency.
+- The cursor is a **durable checkpoint per connector**, not a cache: a plain \`SET\` with no TTL.
+- A page is identified by \`(connector_id, page_token)\` and gets its own claim key
+  \`page:{connector_id}:{page_token}\`, taken with \`SET … NX\`, so a re-fetch after a crash, a retry
+  or a rebalance is not applied twice.
+- The claim and the cursor move happen in one atomic Lua \`EVAL\`: the \`NX\` claim first, and the
+  cursor \`SET\` on \`KEYS[2]\` only when the claim succeeded.
 - Return \`{applied, cursor}\`: \`applied\` is false for a page that was already committed, and
-  \`cursor\` is the checkpoint the caller can log. A worker that decides "already seen" from a
-  client-side read is exactly the race the starter has.
-
-**Failure mode the checks target.** The TTL is the silent one: \`EX\` 86 400 looks like hygiene, and
-it means a quiet connector silently restarts from the beginning of history tomorrow, re-fetching and
-re-billing pages the platform has already processed. The write-order is the loud one: advancing the
-cursor before the page is committed turns any crash into skipped data, which is worse than a
-re-fetch because nothing will ever notice.`,
+  \`cursor\` is the checkpoint the script actually wrote. A worker that decides "already seen" from
+  a client-side read is exactly the race the starter has.`,
   sequence: {
     participants: ['Sync worker', 'Redis', 'Second worker'],
     messages: [
@@ -136,9 +129,7 @@ def load_cursor(connector_id: str) -> str | None:
 
 
 def commit_page(commit: PageCommit) -> dict:
-    # TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is
-    # committed, so a quiet connector restarts from the beginning of history and an interrupted run
-    # skips a page. Claim the page and move the cursor in one atomic script, with no TTL.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     r.set(f"connector:{commit.connector_id}:cursor", commit.next_cursor, ex=CURSOR_TTL_S)
     r.set(f"page:{commit.connector_id}:{commit.page_token}", "1", ex=CURSOR_TTL_S)
     return {"applied": True, "cursor": commit.next_cursor}
@@ -216,9 +207,7 @@ export async function loadCursor(connectorId: string): Promise<string | null> {
 }
 
 export async function commitPage(commit: PageCommit): Promise<CommitResult> {
-  // TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is committed,
-  // so a quiet connector restarts from the beginning of history and an interrupted run skips a
-  // page. Claim the page and move the cursor in one atomic script, with no TTL.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   await r.set(\`connector:\${commit.connector_id}:cursor\`, commit.next_cursor, 'EX', CURSOR_TTL_S);
   await r.set(\`page:\${commit.connector_id}:\${commit.page_token}\`, '1', 'EX', CURSOR_TTL_S);
   return {applied: true, cursor: commit.next_cursor};
@@ -296,9 +285,7 @@ func loadCursor(ctx context.Context, connectorID string) (string, error) {
 }
 
 func commitPage(ctx context.Context, commit PageCommit) (CommitResult, error) {
-	// TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is
-	// committed, so a quiet connector restarts from the beginning of history and an interrupted run
-	// skips a page. Claim the page and move the cursor in one atomic script, with no TTL.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	key := fmt.Sprintf("connector:%s:cursor", commit.ConnectorID)
 	if err := rdb.Set(ctx, key, commit.NextCursor, 24*time.Hour).Err(); err != nil {
 		return CommitResult{}, err
@@ -370,9 +357,7 @@ object CursorStore {
   def loadCursor(connectorId: String): Option[String] = Option(r.get(s"connector:$connectorId:cursor"))
 
   def commitPage(commit: PageCommit): CommitResult = {
-    // TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is
-    // committed, so a quiet connector restarts from the beginning of history and an interrupted run
-    // skips a page. Claim the page and move the cursor in one atomic script, with no TTL.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     r.setex(s"connector:\${commit.connector_id}:cursor", CursorTtlS, commit.next_cursor)
     r.setex(s"page:\${commit.connector_id}:\${commit.page_token}", CursorTtlS, "1")
     CommitResult(applied = true, cursor = commit.next_cursor)
@@ -438,9 +423,7 @@ std::string loadCursor(sw::redis::Redis& redis, const std::string& connectorId) 
 }
 
 CommitResult commitPage(sw::redis::Redis& redis, const PageCommit& commit) {
-  // TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is committed,
-  // so a quiet connector restarts from the beginning of history and an interrupted run skips a
-  // page. Claim the page and move the cursor in one atomic script, with no TTL.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   redis.set(cursorKey(commit.connector_id), commit.next_cursor, std::chrono::hours(24));
   redis.set("page:" + commit.connector_id + ":" + commit.page_token, "1", std::chrono::hours(24));
   return {true, commit.next_cursor};
@@ -495,9 +478,9 @@ CommitResult commitPage(sw::redis::Redis& redis, const PageCommit& commit) {
     },
   },
   hints: [
-    'The cursor is a checkpoint, not a cache: `SET connector:{id}:cursor <token>` with no `EX`, no `ex=`, no `setex`. If you want hygiene for the page claims, do it in a separate compaction job — a TTL on the cursor itself is the bug the incident came from.',
-    'Everything that decides the result runs inside the script: `SET page:{connector}:{page_token} 1 NX` claims the page, and only when that returns true does the script `SET` the cursor and return the new position. Read nothing on the client before the script, because the client read is where the race lives.',
-    'Return `{applied, cursor}` from the script and hand it straight back: `applied = false` tells the worker the page was already committed, so it skips its side effects instead of re-applying them, and the cursor it reports is the one the script actually wrote.',
+    'Symptoms: a connector that synced on Monday and again on Wednesday replays its full history; after a worker crash mid-run, one page is missing downstream and no alert fires.',
+    'Both `r.set` calls carry `ex=CURSOR_TTL_S`, so the checkpoint expires like a cache. The cursor is written first and the page marker second, with no `NX`, so a crash between them leaves the cursor past an unprocessed page.',
+    'Move both writes into one `CURSOR_LUA` script run with `r.eval`: `SET KEYS[1] 1 NX` on the page key, and only when that succeeds `SET KEYS[2] ARGV[1]` for the cursor; return `{applied, cursor}`. Drop the TTL and `CURSOR_TTL_S`.',
   ],
-  debrief: `The interview question is the difference between a cache and a checkpoint, plus the write order that makes it safe. A TTL on the cursor is invisible in the demo and catastrophic in production: the connector simply stops advancing for a day, and the next sync reprocesses months of history, which costs the vendor's rate limit and can double-apply downstream effects. Moving the cursor before the page is committed is the second half — a crash then skips data silently, and nothing in the system can tell that a page was missed. One Lua script fixes both: the page claim is the idempotence token, the cursor moves only after it, and neither key expires. Real hubs keep a monotonically increasing sequence number alongside the cursor so out-of-order commits are rejected, a bounded page-claim set with a compaction job instead of per-key TTLs, and a durable "last committed page" row so a cursor can be rebuilt from the vendor's API.`,
+  debrief: `The fix is one script because the two properties it needs, "this page applied at most once" and "the cursor is past only applied pages", cannot be guaranteed by two client calls with a crash window between them. Inside Redis the page claim is the idempotence token, the cursor moves only after it, and the result the script returns is the only truth the worker acts on. The TTL goes because a checkpoint is not a cache: nothing can regenerate it except a full replay. Production hubs keep a monotonic sequence number beside the cursor so an out-of-order commit is rejected, bound the page-claim set with a compaction job instead of per-key expiry, and persist a last-committed-page row so a lost cursor can be rebuilt from the vendor's API.`,
 };

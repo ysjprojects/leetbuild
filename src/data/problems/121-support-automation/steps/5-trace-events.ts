@@ -8,36 +8,26 @@ export const traceEventsStep: Step = {
   focus: ['workflow', 'kafka', 'consumer', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for LLM observability: the workflow calls
-\`emit\` after every model call, tool call and guardrail gate, an event lands on Kafka, and a
-consumer turns events into counters, so the demo dashboard shows numbers moving. Five production
-contracts are broken. Find them, fix them, and prove the fix.
-
-Implement \`emit(span)\` and \`consume()\` for the \`assistant.trace\` topic:
-
-- Publish **exactly one** event per LLM, tool or guardrail call with the **conversation** as the
-  message key — partition by conversation keeps one conversation's spans ordered, which is what
-  makes an iteration count or a latency timeline readable. The event carries tenant, conversation,
-  **turn id**, iteration, kind (\`llm\` / \`tool\` / \`guardrail\`), the model or tool name,
-  latency, input and output token counts and the guardrail verdicts.
-- **Never** put the prompt, the answer or any message text in the event, and never log it: the
-  topic is retained for days and replicated, so guest content written there outlives every
-  retention policy the conversation store has.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus hashed, stable keys), so a retried produce cannot duplicate a span and double-count
-  tokens.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the turn; a relay republishes outbox rows when the broker recovers.
-- The consumer (group \`insights\`) updates the Redis metrics
-  (\`HINCRBY metrics:{tenant}:{kind}:{name}\` — \`calls\`, \`latency_ms\`, \`input_tokens\`,
-  \`output_tokens\`, \`blocked\`) and **only then** commits the offset. Commit first and one crash
-  loses that span's tokens from every dashboard forever.
+**Starting point.** The starter is LLM observability: the workflow calls \`emit(span)\` after
+every model call, tool call and guardrail gate, the event lands on \`assistant.trace\` keyed by
+turn id with the prompt and answer inside, and \`consume()\` (group \`insights\`) commits the
+offset and then turns events into Redis counters. It serves the demo and hides 5 flaws.
 
 **Failure mode the checks target.** Keying by turn id scatters one conversation's spans across
 partitions; an unconfigured producer duplicates spans on retry and inflates the token bill; the
-retained text is a data leak with a long tail; a failed produce silently loses the span that would
-have explained the expensive turn; and commit-before-process trades correctness for exactly-once
-*looking* code.`,
+retained text is a data leak with a long tail; a failed produce silently loses the span; and
+commit-before-process loses a span on every crash.
+
+- Publish **one** event per LLM, tool or guardrail call with the **conversation** as the message
+  key. The event carries tenant, conversation, **turn id**, iteration, kind (\`llm\` / \`tool\` /
+  \`guardrail\`), the model or tool name, latency, token counts and the guardrail verdicts.
+- The prompt, the answer and any message text stay out of the event and the logs.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
+  \`all\` plus hashed, stable keys).
+- When the broker rejects the produce, write the event to the **outbox** instead of dropping it.
+- The consumer updates the Redis metrics (\`HINCRBY metrics:{tenant}:{kind}:{name}\` for
+  \`calls\`, \`latency_ms\`, \`input_tokens\`, \`output_tokens\`, \`blocked\`) and **only then**
+  commits the offset.`,
   sequence: {
     participants: ['CoT workflow', 'assistant.trace', 'Trace consumer', 'Redis'],
     messages: [
@@ -51,9 +41,9 @@ have explained the expensive turn; and commit-before-process trades correctness 
     ],
   },
   hints: [
-    'The message key is the partition key: `key=span.conversation` (or `Key: []byte(span.Conversation)`, `key: span.conversation`, `ProducerRecord(topic, span.conversation, …)`). Keyed by the turn id, one conversation’s spans land in different partitions and their order is no longer guaranteed.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, or required acks `all` with hashed routing. Delete the prompt and answer fields from the span entirely — a field that does not exist cannot be logged by accident.',
-    'The outbox is the durability half: wrap the produce and, when the broker rejects it, insert the event into the outbox. In the consumer, run every `HINCRBY` first and `commit` second — a crash between the two then replays the span instead of losing it.',
+    'One conversation’s latency timeline shows the tool outcome before the reasoning call that asked for it; token totals jump after a broker hiccup; a guest’s message text turns up in a Kafka topic.',
+    'The producer keys by `span.turn_id`, has no idempotence or acks setting, copies `prompt` and `answer` into the event and the log line, ignores the produce result, and the consumer calls `commit` before `hincrby`.',
+    'Produce with `key=span.conversation`, `enable.idempotence` + `acks: all`; drop the prompt and answer fields; wrap the produce and call `insert_outbox(event)` in the `except`; in the consumer run every `hincrby` and then `consumer.commit()`.',
   ],
   checks: [
     {
@@ -153,16 +143,13 @@ class Span:
 
 
 def emit(span: Span) -> None:
-    # TODO: key by conversation instead of the turn id, configure the idempotent producer with
-    # acks=all, keep the prompt and answer out of the event and the logs, and write an outbox
-    # row when the broker rejects the produce.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     logger.info("trace turn=%s prompt=%r answer=%r", span.turn_id, span.prompt, span.answer)
     producer.produce("assistant.trace", key=span.turn_id, value=json.dumps(asdict(span)))
     producer.flush()
 
 
 def consume() -> None:
-    # TODO: update the metrics before committing the offset.
     consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "insights"})
     consumer.subscribe(["assistant.trace"])
     while True:
@@ -241,7 +228,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** assistant.trace: flawed code that keys by turn id and commits too early. */
+      starter: `/** assistant.trace: emits one span per model, tool or guardrail call and consumes them into metrics. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 
@@ -266,9 +253,7 @@ export interface Span {
 }
 
 export async function emit(span: Span): Promise<void> {
-  // TODO: key by conversation instead of the turn id, configure the idempotent producer with
-  // acks=all, keep the prompt and answer out of the event and the logs, and write an outbox
-  // row when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   console.info(\`trace turn=\${span.turn_id} prompt=\${span.prompt} answer=\${span.answer}\`);
   await producer.send({
     topic: 'assistant.trace',
@@ -277,7 +262,6 @@ export async function emit(span: Span): Promise<void> {
 }
 
 export async function consume(): Promise<void> {
-  // TODO: update the metrics before committing the offset.
   const consumer = kafka.consumer({groupId: 'insights'});
   await consumer.connect();
   await consumer.subscribe({topic: 'assistant.trace'});
@@ -379,16 +363,13 @@ type Span struct {
 	Verdicts     map[string]string \`json:"verdicts"\`
 }
 
-// TODO: key by conversation instead of the turn id, configure acks=all / idempotence, keep the
-// prompt and answer out of the event and the logs, and write an outbox row when the broker
-// rejects the produce.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func Emit(ctx context.Context, span Span) {
 	log.Printf("trace turn=%s prompt=%q answer=%q", span.TurnID, span.Prompt, span.Answer)
 	payload, _ := json.Marshal(span)
 	_ = traceWriter.WriteMessages(ctx, kafka.Message{Key: []byte(span.TurnID), Value: payload})
 }
 
-// TODO: update the metrics before committing the offset.
 func Consume(ctx context.Context) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{"kafka:9092"},
@@ -525,15 +506,12 @@ object TraceEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key by conversation instead of the turn id, configure the idempotent producer with
-  // acks=all, keep the prompt and answer out of the event and the logs, and write an outbox row
-  // when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def emit(span: Span): Unit = {
     log.info(s"trace turn=\${span.turnId} prompt=\${span.prompt} answer=\${span.answer}")
     producer.send(new ProducerRecord("assistant.trace", span.turnId, span.toJson.compactPrint))
   }
 
-  // TODO: update the metrics before committing the offset.
   def consume(): Unit = {
     val consumer = new KafkaConsumer[String, String](new Properties())
     consumer.subscribe(java.util.List.of("assistant.trace"))
@@ -647,9 +625,7 @@ struct Span {
 std::unique_ptr<RdKafka::Producer> producer;
 std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
 
-// TODO: key by conversation instead of the turn id, configure the idempotent producer with
-// acks=all, keep the prompt and answer out of the event and the logs, and write an outbox row
-// when the broker rejects the produce.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void emit(const Span& span) {
   std::cerr << "trace turn=" << span.turnId << " prompt=" << span.prompt << " answer=" << span.answer << "\\n";
   const json event = {
@@ -680,7 +656,6 @@ void emit(const Span& span) {
   producer->flush(2000);
 }
 
-// TODO: update the metrics before committing the offset.
 void consume() {
   std::string err;
   std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
@@ -789,5 +764,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong, in the setting the post calls LLM-oriented observability: detailed insight into each LLM interaction, its latency and its token usage. First, the message key is an ordering contract: partition by conversation and a turn's spans — reason, tool, reason, guardrail — arrive in the order they happened; key by turn id and the timeline a debugger reads is shuffled. Second, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all so a retry cannot double-count tokens, and the consumer must apply its counters before the offset commit, or a crash between them loses the span permanently. Third, a broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes. The text leak is the quiet one: a trace topic is retained and replicated precisely because it is useful later, which is precisely why guest messages must never be in it — ids, counts and verdicts tell the whole story. Real platforms add a schema registry for the span, per-tenant cost rollups from the token counters, a sampled full-fidelity trace in a store with its own retention and access control, and an alert on the blocked-rate per guardrail.`,
+  debrief: `The fix has three parts because a trace pipeline makes three promises. The message key is an ordering promise: partitioned by conversation, a turn's spans (reason, tool, reason, guardrail) arrive in the order they happened, which makes a latency timeline readable. Idempotence with acks=all plus counters-before-commit is a counting promise: a retried produce cannot double-count tokens and a consumer crash replays a span instead of dropping it. The outbox is a durability promise: when the broker refuses, the row waits for a relay rather than vanishing. Keeping text out follows from retention: the topic is kept because it is useful later, and ids, counts and verdicts tell the story. Production platforms also register a schema for the span, roll token counters into per-tenant cost, and keep a sampled full trace under its own access control.`,
 };

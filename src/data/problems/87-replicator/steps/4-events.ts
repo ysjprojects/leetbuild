@@ -8,35 +8,27 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a
-\`replication.applied\` event per batch and the consumer group sees traffic, so the demo shows
-progress. Three production contracts are broken. Find them, fix them, and prove the fix.
-
-Implement the progress path: a function that walks one shard's batch
-(\`replicate_batch(replication_id, shard, changes)\` or the stack's equivalent) and
-\`publish_applied\`.
-
-- Publish **exactly one** \`replication.applied\` event per **confirmed** batch, with the **shard**
-  as the message key — partition by shard keeps one shard's stream in order, which is what lets a
-  lag consumer compare offsets without gaps. The starter keys by the ordered region pair, so every
-  shard of a replication shares a key and the stream order means nothing.
-- The payload carries the offsets and the change counts: \`replication_id\`, \`shard\`, \`offset\`
-  (the confirmed applied offset), \`applied\` (changes applied in the batch) and \`rejected\`
-  (changes the target refused). **Rejected changes are counted, never omitted** — a payload that
-  only counts applied changes makes a shard that is refusing every change look perfectly current.
-- Publish **after** the target confirms the batch: the event is a statement about what the target
-  holds, so an event published while reading changes announces progress that may never have
-  happened.
-- The producer must be **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus a hashed, stable key), so a retried produce cannot duplicate a record or move it to
-  another partition.
-- When the broker rejects the produce, write the event to the **outbox** instead of swallowing the
-  error; a relay republishes outbox rows when the broker recovers.
+**Starting point.** The starter's \`replicate_batch(replication_id, source_region, target_region,
+shard, changes)\` publishes a \`replication.applied\` event through \`publish_applied\` and then
+applies the batch at the target; the consumer group sees traffic, so the demo shows progress. It
+compiles, it serves the demo, and it hides 5 flaws.
 
 **Failure mode the checks target.** The starter publishes on read rather than on confirmation, keys
 the event by region pair so a shard's stream is unordered, drops the rejected count so a divergent
-shard looks healthy, configures no acks or idempotence, and swallows broker errors — which is how a
-replica loses progress silently while every dashboard stays green.`,
+shard looks healthy, configures no acks or idempotence, and swallows broker errors. That is how a
+replica loses progress silently while every dashboard stays green.
+
+- Publish **exactly one** \`replication.applied\` event per **confirmed** batch, keyed by
+  \`shard_key(replication_id, shard)\`: partitioning by shard keeps one shard's stream in order.
+- The payload carries \`replication_id\`, \`shard\`, \`offset\` (the confirmed applied offset),
+  \`applied\` and \`rejected\` counts. Rejected changes are **counted, not omitted**; otherwise a
+  shard refusing every change looks current.
+- Publish **after** the target confirms the batch (\`confirmed_batch = apply_to_target(...)\`): the
+  event is a statement about what the target holds.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
+  \`all\` plus a hashed, stable key), so a retried produce cannot duplicate or misplace a record.
+- When the broker rejects the produce (\`KafkaException\`), write the event to the **outbox**
+  instead of swallowing the error; a relay republishes outbox rows when the broker recovers.`,
   sequence: {
     participants: ['Replication controller', 'replication.applied', 'Outbox'],
     messages: [
@@ -148,10 +140,7 @@ TOPIC = "replication.applied"
 producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
-# TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
-# loses its order; it publishes while reading the changes instead of after the target confirms
-# them; it drops the rejected count so a shard refusing every change looks current; configures no
-# idempotence or acks; and swallows a broker error instead of writing an outbox row.
+# TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 def replicate_batch(
     replication_id: str,
     source_region: str,
@@ -248,10 +237,7 @@ interface Change {
   payload: Buffer;
 }
 
-// TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
-// loses its order; it publishes while reading the changes instead of after the target confirms
-// them; it drops the rejected count so a shard refusing every change looks current; configures no
-// idempotence or acks; and swallows a broker error instead of writing an outbox row.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 export async function replicateBatch(
   replicationId: string,
   sourceRegion: string,
@@ -358,10 +344,7 @@ type Change struct {
 	Payload  []byte
 }
 
-// TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
-// loses its order; it publishes while reading the changes instead of after the target confirms
-// them; it drops the rejected count so a shard refusing every change looks current; configures no
-// idempotence or acks; and swallows a broker error instead of writing an outbox row.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func replicateBatch(ctx context.Context, replicationID, sourceRegion, targetRegion string, shard int, changes []Change) error {
 	event := map[string]any{"region_pair": fmt.Sprintf("%s->%s", sourceRegion, targetRegion), "applied": len(changes)}
 	value, _ := json.Marshal(event)
@@ -468,10 +451,7 @@ object AppliedEvents {
   props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
   private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
-  // TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
-  // loses its order; it publishes while reading the changes instead of after the target confirms
-  // them; it drops the rejected count so a shard refusing every change looks current; configures no
-  // idempotence or acks; and swallows a broker error instead of writing an outbox row.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def replicateBatch(replicationId: String, sourceRegion: String, targetRegion: String, shard: Int, changes: Seq[Change]): Unit = {
     val pair = s"$sourceRegion->$targetRegion"
     publishApplied(pair, s"""{"region_pair":"$pair","applied":\${changes.size}}""")
@@ -543,10 +523,7 @@ const std::string kAppliedTopic = "replication.applied";
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
-// loses its order; it publishes while reading the changes instead of after the target confirms
-// them; it drops the rejected count so a shard refusing every change looks current; configures no
-// idempotence or acks; and swallows a broker error instead of writing an outbox row.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void replicateBatch(const std::string& replicationId, const std::string& sourceRegion,
                     const std::string& targetRegion, int shard, const std::vector<Change>& changes) {
   const auto pair = sourceRegion + "->" + targetRegion;
@@ -623,9 +600,9 @@ Batch applyToTarget(const std::string& replicationId, int shard, const std::vect
     },
   },
   hints: [
-    'The message key is the partition key: `key=shard_key(replication_id, shard)`, `Key: []byte(shardKey(...))`, `ProducerRecord(topic, shardKey(...), payload)`. Keyed by the region pair, every shard of the replication shares one partition and the ordering guarantee is gone.',
-    'Write the loop as apply → confirm → publish, and hand the publish the confirmed batch: the event is a claim about what the target holds. Add every count you have (`offset`, `applied`, `rejected`) — an event that omits the rejections makes a broken shard look caught up.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` plus a hashed balancer. It only helps if the key is stable, which is the same fix as keying by shard. Wrap the produce and write an outbox row when the broker rejects it.',
+    'Point a target at a schema it refuses: the lag dashboard still shows every batch as applied. Stop the broker for a minute: no error, and the events for that minute are gone for good.',
+    '`publish_applied` runs before `apply_to_target` with `len(changes)` as the only count, the key is `"{source}->{target}"` so all shards share a partition, the producer has no `acks`, and `except Exception: pass` eats the failure.',
+    'Order the loop apply, confirm, publish with `confirmed_batch`; key by `shard_key(replication_id, shard)`; carry `offset`, `applied`, `rejected`; set `enable.idempotence` and `"acks": "all"`; on `KafkaException` call `outbox.insert(replication_id, event)`.',
   ],
-  debrief: `The interviewer is testing whether you can debug event publishing for what the stream claims. Keyed by region pair, the stream no longer says anything about a shard’s order; published on read, it announces progress that was never confirmed; and without the rejected count it hides exactly the shard an operator needs to see. The outbox is the durability half: a produce that fails must leave a row behind, or the replica loses progress while every dashboard stays green. Real platforms add a schema registry so the topic cannot silently change shape, a relay that republishes outbox rows with the same key, and a consumer that compares the event’s offset with Redis before it commits.`,
+  debrief: `The fix changes what the stream claims. Keyed by shard, a partition holds one shard's events in order, so a consumer can compare consecutive offsets; published after confirmation and carrying the rejected count, each event describes work the target holds and work it refused, which is exactly the shard an operator needs to see. The producer settings matter because the key is the partition key: idempotence with replicated acks only helps when a retry carries the same stable key. The outbox is the durability half: a produce that fails must leave a row behind. Production platforms also register the event schema so the topic cannot silently change shape, and have the lag consumer compare the event's offset with Redis before it commits.`,
 };

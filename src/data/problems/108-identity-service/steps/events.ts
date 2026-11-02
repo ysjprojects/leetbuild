@@ -8,16 +8,12 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: the lifecycle endpoint answers **202**, a record
-lands on \`identity.event\` and the demo shows the topic filling up. Three production contracts are
-broken. It keys the record by the **email address** instead of the user id, it copies the
-**address and the number** into the payload "for downstream dedupe", and it lets the producer
-acknowledge the record **before the account write commits**, so the topic can announce a state the
-database never stored. On top of that the producer is a bare one with no idempotence, and any
-\`kind\` string a caller sends is published as-is.
+**Starting point.** The starter serves \`POST /v1/users/{user_id}/events\`: it updates the account
+state, produces a record to \`identity.event\` from a default producer, flushes, commits the write
+and answers **202**. It compiles, it serves the demo (the topic fills up) and hides 5 flaws.
 
-\`POST /v1/users/{user_id}/events\` records a lifecycle change on an account and announces it to the
-consumer that projects profiles. Implement the lifecycle publisher:
+The endpoint records a lifecycle change on an account and announces it to the consumer that
+projects profiles. Requirements for the lifecycle publisher:
 
 - the event is produced to the **\`identity.event\`** topic with the **user id** as the message key,
   so one user's lifecycle stays in order in one partition.
@@ -51,9 +47,9 @@ retried; and an open \`kind\` lets typo events into a topic consumers switch on.
     ],
   },
   hints: [
-    'The message key is the partition key: `key=user_id` (`key: userId`, `Key: []byte(userID)`, `ProducerRecord(topic, user.id, …)`). Keyed by the address, one account’s lifecycle splits across partitions, and an address change would re-key the whole history — the key must be the identity, not a handle of it.',
-    'The payload is a contract, not a copy of the request: build it from an allow-list (`ALLOWED_EVENT_FIELDS`) so only the kind and the reason code can travel. The topic is retained and replicated, so an address written there outlives every deletion the accounts table does.',
-    'Order the write and the produce: `commit()` the account row first, then publish, and let a failed transaction reach the client instead of the topic. Configure the producer with `enable.idempotence` and `acks=all` (KafkaJS `idempotent: true` plus `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a `&kafka.Hash{}` balancer), and check the kind against the closed enum before either.',
+    "The profile projector sees `suspended` before `created` for one account, a consumer's logs contain email addresses, and a state the database rolled back is already on the topic.",
+    'The record is keyed by `event.email`, the payload is a copy of the request, the produce happens before `commit`, the producer is a bare default, and `kind` is forwarded unchecked.',
+    'Key by `user_id`, project the body through `ALLOWED_EVENT_FIELDS = ("kind", "reason")`, call `store.commit_state` before `producer.produce`, configure `enable.idempotence` with `acks=all`, and validate against `LIFECYCLE_EVENTS`.',
   ],
   checks: [
     {
@@ -182,10 +178,7 @@ class LifecycleEvent(BaseModel):
 
 @app.post("/v1/users/{user_id}/events", status_code=202)
 def record_event(user_id: str, event: LifecycleEvent) -> dict:
-    # TODO: key the record by \`user_id\` instead of \`event.email\`, keep the address and the number
-    # out of the payload (\`kind\` and \`reason\` only), set enable.idempotence + acks=all on the
-    # producer, reject kinds outside created/verified/suspended, and commit the account write
-    # before the produce is acknowledged.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     body = {"kind": event.kind, "reason": event.reason, "email": event.email, "phone": event.phone}
     producer.produce("identity.event", key=event.email, value=json.dumps(body))
     producer.flush(2.0)
@@ -272,10 +265,7 @@ interface LifecycleEvent {
 }
 
 app.post('/v1/users/:id/events', async (request, reply) => {
-  // TODO: key the record by the user id instead of \`event.email\`, keep the address and the number
-  // out of the payload (\`kind\` and \`reason\` only), set \`idempotent: true\` and \`acks: -1\` on the
-  // producer, reject kinds outside created/verified/suspended, and commit the account write before
-  // the produce is acknowledged.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const userId = (request.params as {id: string}).id;
   const event = request.body as LifecycleEvent;
   const body = {kind: event.kind, reason: event.reason, email: event.email, phone: event.phone};
@@ -368,10 +358,7 @@ type lifecycleEvent struct {
 }
 
 func recordEvent(rw http.ResponseWriter, r *http.Request) {
-	// TODO: key the record by the user id instead of the address, keep the address and the number
-	// out of the payload (kind and reason only), configure RequiredAcks: kafka.RequireAll with a
-	// &kafka.Hash{} balancer, reject kinds outside created/verified/suspended, and commit the
-	// account write before the writer acknowledges the record.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	userID := r.PathValue("user_id")
 	event := lifecycleEvent{}
 	_ = json.NewDecoder(r.Body).Decode(&event)
@@ -504,10 +491,7 @@ object Events {
     path("v1" / "users" / Segment / "events") { userId =>
       post {
         entity(as[String]) { bodyText =>
-          // TODO: key the record by userId instead of the address, keep the address and the number
-          // out of the payload (kind and reason only), configure the producer with
-          // enable.idempotence and acks=all, reject kinds outside created/verified/suspended, and
-          // commit the account write before the send is acknowledged.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val body = bodyText.parseJson.asJsObject.fields
           val kind = body("kind").convertTo[String]
           val reason = body("reason").convertTo[String]
@@ -626,10 +610,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: key the record by user.id instead of user.email, keep the address and the number out of
-// the payload (kind and reason only), set enable.idempotence and acks=all on the producer, reject
-// kinds outside created/verified/suspended, and commit the account write before the produce is
-// acknowledged.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void recordEvent(const User& user, const std::string& kind, const std::string& reason) {
   const json event = {{"kind", kind}, {"reason", reason}, {"email", user.email}, {"phone", user.phone}};
   const auto payload = event.dump();
@@ -733,5 +714,7 @@ void recordEvent(const User& user, const std::string& kind, const std::string& r
 `,
     },
   },
-  debrief: `The interviewer is checking whether the event stream is a contract or a copy of the request. The key is the first contract: a Kafka key chooses the partition, so keying by the user id keeps one account's created → verified → suspended sequence in one partition and in order, while keying by the email address puts the ordering at the mercy of a handle the account can change — and the address at the mercy of the topic's retention. The payload is the second: the topic is replicated and retained for days, so anything written there outlives every delete the accounts table performs. The fix is not "remember not to add the address" but an allow-list the code projects through, so a field added to the request model one day fails at the boundary rather than leaking quietly. The third contract is ordering between the two systems: a produce is durable and immediate, a database commit can still roll back, so publishing first announces a state that may never exist — commit, then produce, and let a failed transaction reach the caller instead of the topic. Idempotence with acks=all is the producer-side half: without it a retry after a timeout can duplicate a lifecycle event a consumer counts. Closing the kind vocabulary keeps consumers' switch statements honest. Real platforms add a schema registry so producers and consumers agree on the payload shape, an outbox row when the broker is unreachable so a committed change is not lost, and a consumer-side dedupe on (user id, kind, version) for the at-least-once handoff the broker still gives.`,
+  debrief: `The fix treats the event stream as a contract rather than a copy of the request. A Kafka key chooses the partition, so keying by the user id keeps one account's created → verified → suspended sequence in one partition and in order, where keying by the address puts ordering at the mercy of a handle the account can change. The payload goes through an allow-list because the topic is replicated and retained for days: a field added to the request model one day fails at the boundary rather than leaking quietly. Commit precedes produce because a produce is durable and immediate while a commit can still roll back. Idempotence with acks=all keeps a retried produce from duplicating an event a consumer counts, and the closed kind vocabulary keeps consumers' switch statements accurate.
+
+Production platforms add a schema registry so producers and consumers agree on the payload shape, an outbox row so a committed change survives an unreachable broker, and consumer-side dedupe on (user id, kind, version) for the at-least-once handoff the broker still gives.`,
 };

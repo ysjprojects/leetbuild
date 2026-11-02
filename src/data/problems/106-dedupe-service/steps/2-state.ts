@@ -8,26 +8,28 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code for the exact-key index. It compiles, it works in a
-single-writer demo, and it hides three production flaws. Debug it like the service owner, fix it,
-and prove the fix with the checks below.
-
-Implement the exact-key index over Redis.
-
-- Exact keys live in **per-tenant sets**: the namespace is \`t:{tenant}:exact:{key_type}\`, so two
-  tenants with the same hash never share a set. A namespace that omits the tenant turns one tenant's
-  key into another tenant's duplicate.
-- Insert-and-check is **one atomic operation**: a single Lua script does the \`SADD\` and returns
-  whether the key already existed, so two concurrent submissions of the same record agree on one
-  winner instead of both creating a row. Do not \`SISMEMBER\` and then \`SADD\` in the client.
-- The index must be **rebuildable from the durable record store**: a \`rebuild\` routine reads every
-  record's exact keys and re-inserts them into the right tenant namespaces, so the sets survive a
-  flush or a failover without losing duplicates.
+**Starting point.** The starter is the exact-key index over Redis: \`ExactKeyIndex.key()\` builds the
+set name from the key type alone, and \`insert_and_check()\` runs \`SISMEMBER\` and then \`SADD\` as two
+client commands, returning a bare boolean. It compiles, it works in a single-writer demo, and it
+hides five flaws.
 
 **Failure mode the checks target.** \`SISMEMBER\`-then-\`SADD\` is two round trips: both concurrent
-requests can observe a miss, and both create a record. A namespace without the tenant is worse — it
+requests can observe a miss, and both create a record. A namespace without the tenant is worse. It
 does not lose a duplicate, it invents one, merging two tenants' records because their email hashes
-collided in a shared set.`,
+collided in a shared set.
+
+Requirements:
+
+- Exact keys live in **per-tenant sets**: the namespace is \`t:{tenant}:exact:{key_type}\`, built by a
+  \`tenant_namespace\` helper, so two tenants with the same hash do not share a set.
+- Insert-and-check is **one atomic operation**: a single registered Lua script does the \`SADD\` and
+  returns whether the key already existed, so two concurrent submissions of the same record agree on
+  one winner instead of both creating a row. Do not \`SISMEMBER\` and then \`SADD\` in the client.
+- The result names the outcome: \`winner\` when the caller inserted the key, \`existing\` when it was
+  already there.
+- The index must be **rebuildable from the durable record store**: a \`rebuild\` routine reads every
+  record's exact keys and re-inserts them into the right tenant namespaces, so the sets survive a
+  flush or a failover without losing duplicates.`,
   sequence: {
     participants: ['Dedupe API', 'Redis', 'record store'],
     messages: [
@@ -62,7 +64,7 @@ collided in a shared set.`,
       id: 'atomic',
       title: 'Inserts and checks in one atomic call',
       detail:
-        'The script does the `SADD` and reports existence in the same call; the client never issues a separate `SISMEMBER`. The starter checks membership first, so two concurrent submissions both see a miss.',
+        'The script does the `SADD` and reports existence in the same call; the client issues no separate `SISMEMBER`. The starter checks membership first, so two concurrent submissions both see a miss.',
       match: {
         python: {all: [/sadd/i], none: [/sismember/i]},
         typescript: {all: [/sadd/i], none: [/sismember/i]},
@@ -125,9 +127,7 @@ class ExactKeyIndex:
         return f"exact:{key_type}"
 
     def insert_and_check(self, tenant: str, key_type: str, value: str) -> bool:
-        # TODO: this starter checks membership then inserts in two round trips, so two concurrent
-        # submissions both see a miss and both create records; and the key namespace omits the
-        # tenant so distinct tenants collide. Add the tenant and make the check atomic.
+        # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         if self.client.sismember(self.key(key_type), value):
             return False
         self.client.sadd(self.key(key_type), value)
@@ -179,9 +179,7 @@ class ExactKeyIndex {
   }
 
   async insertAndCheck(tenant: string, keyType: string, value: string): Promise<boolean> {
-    // TODO: this starter checks membership then inserts in two round trips, so two concurrent
-    // submissions both see a miss and both create records; and the key namespace omits the tenant
-    // so distinct tenants collide. Add the tenant and make the check atomic.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if (await this.client.sismember(this.key(keyType), value)) return false;
     await this.client.sadd(this.key(keyType), value);
     return true;
@@ -252,9 +250,7 @@ func (idx *ExactKeyIndex) key(keyType string) string {
 }
 
 func (idx *ExactKeyIndex) InsertAndCheck(ctx context.Context, tenant, keyType, value string) (bool, error) {
-	// TODO: this starter checks membership then inserts in two round trips, so two concurrent
-	// submissions both see a miss and both create records; and the key namespace omits the tenant
-	// so distinct tenants collide. Add the tenant and make the check atomic.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	exists, err := idx.client.Sismember(ctx, idx.key(keyType), value).Result()
 	if err != nil {
 		return false, err
@@ -335,9 +331,7 @@ class ExactKeyIndex(jedis: Jedis) {
     "exact:" + keyType
 
   def insertAndCheck(tenant: String, keyType: String, value: String): Boolean = {
-    // TODO: this starter checks membership then inserts in two round trips, so two concurrent
-    // submissions both see a miss and both create records; and the key namespace omits the tenant
-    // so distinct tenants collide. Add the tenant and make the check atomic.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if (jedis.sismember(key(keyType), value)) {
       false
     } else {
@@ -397,9 +391,7 @@ class ExactKeyIndex {
 
   bool insert_and_check(const std::string& tenant, const std::string& keyType,
                         const std::string& value) {
-    // TODO: this starter checks membership then inserts in two round trips, so two concurrent
-    // submissions both see a miss and both create records; and the key namespace omits the tenant
-    // so distinct tenants collide. Add the tenant and make the check atomic.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     if (redis_.sismember(key(keyType), value)) {
       return false;
     }
@@ -459,9 +451,9 @@ class ExactKeyIndex {
     },
   },
   hints: [
-    'Insert-and-check is one operation, not two. Register the script once and call it with the namespace as `KEYS[1]`; the script returns whether the key already existed, so two concurrent submissions cannot both be the winner.',
-    'The namespace is part of the correctness, not just the key: `t:{tenant}:exact:{key_type}` keeps two tenants\' identical hashes from colliding into a false duplicate. A shared set turns "same person" into "different person, merged".',
-    "Redis is a cache of the durable record store. Ship a `rebuild` path that re-inserts every tenant's exact keys from the records table so the index can be reconstructed after a flush or a failover without losing duplicates.",
+    'Symptom: two clients submit the same record at the same instant and both get "winner", so the store ends up with two rows; separately, tenant B is told its new contact duplicates one it never created.',
+    'Mechanism: `insert_and_check` runs `SISMEMBER` then `SADD` as two round trips, so both callers see a miss before either writes; and `key()` names only the key type, so every tenant shares one set.',
+    "Change: register one Lua script that does `SADD` and returns existing-or-winner; build the set name with `tenant_namespace(tenant, key_type)`; add a `rebuild` that re-inserts every record's keys from the durable store.",
   ],
-  debrief: `The interviewer is testing whether you understand that dedupe state is a correctness boundary. Two defects are being checked: atomicity (a read-then-write race lets two concurrent submissions both create a record) and namespace (omitting the tenant turns a hash collision into a false cross-tenant duplicate). The third is operability: an in-memory index that cannot be rebuilt from durable records is a single point of data loss. Real services add a Lua script that also sets a TTL or a max size, keep the durable records as the source of truth with a backfill job, and make the rebuild idempotent so it can run while traffic is live.`,
+  debrief: `The fix puts the decision inside Redis because that is the only place the two concurrent writers are serialized: a script that inserts and reports in one call gives both callers the same answer, where two client commands give each caller its own answer. The tenant goes into the set name for the same reason the tenant went into the search scope in step 1: the key space is the isolation boundary, and a shared set makes a hash collision look like a duplicate person. Rebuild exists because Redis is a cache of the record store, not the record store. Production indexes also set a TTL or a size cap in the script, run the rebuild as an idempotent backfill that can overlap live traffic, and alert when the set count drifts from the durable row count.`,
 };

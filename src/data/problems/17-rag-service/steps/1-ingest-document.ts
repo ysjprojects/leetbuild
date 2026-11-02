@@ -8,27 +8,24 @@ export const ingestDocumentStep: Step = {
   focus: ['client', 'api', 'db', 'kafka'],
   task: `## Task
 
-**Starting point.** The starter is working code: it compiles and passes the
-happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
-flaw, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/documents\` with body
-\`{"doc_id": "…", "version": 3, "content_type": "text/markdown", "content": "…"}\`. The tenant comes
-from the authenticated \`X-Tenant-Id\` header and must never be taken from the body.
-
-- \`doc_id\` matches \`^[a-z0-9][a-z0-9_-]{2,63}$\`, \`version\` is an integer \`>= 1\`, and
-  \`content_type\` is one of \`text/plain\`, \`text/markdown\`, \`application/pdf\`; otherwise **400**.
-- The UTF-8 content must be at most **1 MiB** (\`1 << 20\`); otherwise **413**.
-- Compute SHA-256 over the raw content bytes.
-- Idempotency is keyed by \`(tenant, doc_id, version, sha256)\`: a retry of the exact same upload
-  returns **202** with the **existing** job id. The same \`version\` with a different hash is a
-  **409** — the caller is trying to replace immutable history.
-- Insert the document row and an **outbox** row in **one transaction**. Only after that transaction
-  commits may a \`doc.ingest\` event be published. The request never chunks or embeds inline.
+**Starting point.** The starter serves \`POST /v1/documents\` with body
+\`{"doc_id": "…", "version": 3, "content_type": "text/markdown", "content": "…"}\`, reads the tenant
+from the \`X-Tenant-Id\` header, looks up an existing job by \`doc_id\`, hashes the content, publishes
+\`doc.ingest\` and then inserts the document row. It compiles and hides 4 flaws.
 
 **Failure mode the checks target.** Keying idempotency by \`doc_id\` alone means a new version is
 mistaken for a retry, and a changed payload for the same version is silently accepted. Publishing
 before the commit means the consumer can read a document that the database later rolled back.
+
+- \`doc_id\` matches \`^[a-z0-9][a-z0-9_-]{2,63}$\`, \`version\` is an integer \`>= 1\`, and
+  \`content_type\` is one of \`text/plain\`, \`text/markdown\`, \`application/pdf\`; otherwise **400**.
+- The UTF-8 content must be at most **1 MiB** (\`1 << 20\`); otherwise **413**.
+- Compute SHA-256 over the raw content bytes. The tenant comes only from the header.
+- Idempotency is keyed by \`(tenant, doc_id, version, sha256)\`: a retry of the exact same upload
+  returns **202** with the **existing** job id. The same \`version\` with a different hash is a
+  **409**, because the caller is trying to replace immutable history.
+- Insert the document row and an **outbox** row in **one transaction**. Only after that transaction
+  commits may a \`doc.ingest\` event be published. The request does not chunk or embed inline.
 
 :::widget status-codes {}
 
@@ -168,8 +165,7 @@ store = Store()
 
 @app.post("/v1/documents")
 def ingest(body: DocumentRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter looks up idempotency by doc_id only, never validates the body,
-    # and publishes before the write is durable. Fix all three before trusting it.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     existing = store.find_by_doc(tenant, body.doc_id)
     if existing is not None:
         return JSONResponse({"job_id": existing.job_id}, status_code=202)
@@ -271,8 +267,7 @@ interface DocumentBody {
 }
 
 app.post('/v1/documents', async (request, reply) => {
-  // TODO: this starter looks up idempotency by doc_id only, never validates the body,
-  // and publishes before the write is durable. Fix all three before trusting it.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as DocumentBody;
 
@@ -423,8 +418,7 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: idempotency ignores version and hash, nothing is validated, and this produce
-	// can land before the row exists. The retry path is not safe.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	existing, _ := store.FindByDoc(r.Context(), tenant, body.DocID)
 	if existing != nil {
 		writeJSON(rw, http.StatusAccepted, map[string]string{"job_id": existing.JobID})
@@ -601,8 +595,7 @@ object IngestApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[DocumentRequest]) { body =>
-            // TODO: keyed by doc only, no validation, produce before insert. A retry can
-            // double-publish and a rolled-back document can still be ingested.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             store.findById(tenant, body.docId) match {
               case Some(existing) =>
                 complete(StatusCodes.Accepted, s"""{"job_id":"$existing.jobId"}""")
@@ -735,8 +728,7 @@ int main() {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto body = json::parse(req.body);
     const auto docId = body.value("doc_id", std::string());
-    // TODO: lookup by doc only, no validation, publish before insert. A retry can
-    // double-publish and a rolled-back document can still be ingested.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto existing = store.findByDoc(tenant, docId);
     if (existing) {
       res.status = 202;
@@ -848,9 +840,11 @@ int main() {
     },
   },
   hints: [
-    'Write the four validations as one early-return block before any lookup: shape and type first, byte length next, hash last. The hash is the only expensive part.',
-    'The lookup is inside the transaction and returns the stored hash. Compare hashes before comparing job ids: equal hash → 202 with the stored job id; different hash → 409.',
-    'Commit the document and outbox writes as one transaction, then publish. If the produce fails, the outbox row remains for the relay; the document is still durable.',
+    'A client re-uploads version 2 with new text and gets 202 plus the old job id. Later a consumer chunks a document that no row in the database describes.',
+    'find_by_doc ignores version and hash, so any earlier upload looks like a retry. The produce runs before insert_document, so a failed insert has already been announced.',
+    'Validate shape, type and size before hashing. Look up (tenant, doc_id, version), compare the stored hash. Insert document and outbox inside store.transaction, then producer.send.',
   ],
-  debrief: `The interviewer is testing whether you can debug an ingest handler at its durability boundary. The starter reads cleanly because the happy path only exercises the first upload: no lookup, no conflict, no broker failure. Three things are being checked here — an idempotency key that includes every part of the identity (tenant, doc, version, bytes), a validation funnel that rejects cheaply before hashing, and a transaction boundary that includes the outbox. The outbox is the interview signal: it shows you know a broker is not transactional with a database, and that "publish after commit" needs a durable row rather than hope. Real systems add a relay that marks outbox rows published, content-addressed storage for the bytes, and a unique constraint on \`(tenant, doc_id, version)\` so two concurrent retries races resolve in the database, not in application code.`,
+  debrief: `The fix has three parts because the handler has three boundaries. Validation sits first so a bad request costs nothing: no hash, no lookup. The idempotency key carries the whole identity, tenant, document, version and bytes, so a retry and a conflicting rewrite are told apart by the stored hash rather than by whoever uploaded first. The transaction includes the outbox row because a broker is not transactional with a database; the row is what lets a relay publish later if the produce after commit fails.
+
+This step did not build that relay, nor the unique constraint on \`(tenant, doc_id, version)\` that would let two concurrent first uploads race safely inside the database instead of in handler code, nor content-addressed storage for the bytes themselves.`,
 };

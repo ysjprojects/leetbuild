@@ -8,32 +8,26 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it caches the effective permission set per
-\`(subject, scope)\` in Redis, serves it for 300 s, and clears the entry on every assignment change,
-so the demo — assign, then read — always shows the new set. It compiles, it serves the happy path,
-and it hides the flaw that makes a revocation unreliable. Debug it like the service owner, fix it,
-and prove the fix with the checks below.
+**Starting point.** The starter caches the effective permission set per \`(subject, scope)\` under
+\`perm:{subject}:{scope}\` in Redis with a 300 s TTL; on every assignment change it writes the grant
+and deletes the cached key, so the demo (assign, then read) shows the new set. It compiles, serves
+the demo, and hides 5 flaws.
 
-Implement the effective-permission cache behind every read:
+**Failure mode the checks target.** Delete-after-write looks like invalidation and is only a hint. A
+read that lands between the \`DEL\` and the re-derive repopulates the pre-change set, so a revoked
+contractor keeps access for the rest of the TTL.
 
-- The cache key is \`perm:{subject}:{scope}\`; the entry holds the permission set and a TTL of
-  **300 s**. The TTL bounds memory only — it is never the invalidation mechanism.
+- The key stays \`perm:{subject}:{scope}\` with a **300 s** TTL. The TTL bounds memory, not truth.
 - One global counter \`perm:grant_version\` is the invalidation clock. Every assignment change bumps
-  it with an atomic **\`INCR\`** *after* the grant store records the change and *before* the
-  response is acked, so the bump is durable by the time the caller sees \`200\`.
-- A read loads the current version first, then the entry, and serves the entry only while the
-  entry's stamped version equals the version it just read; a mismatch recomputes instead of serving.
-- The recompute is **single-flight** behind a short-lived \`SET NX\` lock at
-  \`perm:lock:{subject}:{scope}\` with a **2000 ms** TTL, so concurrent misses cannot stampede the
-  policy engine and none of them can stamp the entry from a snapshot taken before the last change.
-- The freshly derived entry is written with the current version stamp and the 300 s TTL, so a
-  revocation is visible to a reader holding an old entry **within one second** — neither the lock
-  nor the TTL may override the counter.
-
-**Failure mode the checks target.** Delete-after-write invalidation looks correct in a demo and is
-wrong under load: a read that lands between the \`DEL\` and the re-derive repopulates the pre-change
-set, so a revoked contractor keeps access for the rest of the TTL. Deleting the key is not the
-mechanism — bumping the shared counter is.`,
+  it with an atomic **\`INCR\`** *after* the grant store records the change and *before* the ack.
+  Keys are not deleted.
+- A read loads the current version, then the entry, and serves the entry only while its stamped
+  version equals the one just read; a mismatch recomputes.
+- The recompute is **single-flight** behind a \`SET NX\` lock at \`perm:lock:{subject}:{scope}\`
+  with a **2000 ms** TTL, so concurrent misses cannot stampede the policy engine or stamp the entry
+  from a stale snapshot.
+- The fresh entry is written with the current version stamp and the 300 s TTL, so a revocation is
+  visible within one second.`,
   sequence: {
     participants: ['Permission Service', 'Redis', 'Grant store', 'Policy engine'],
     messages: [
@@ -63,9 +57,9 @@ mechanism — bumping the shared counter is.`,
     ],
   },
   hints: [
-    'A TTL bounds memory, not truth: an entry written before a revocation is still a perfectly valid entry until it expires. Something per-write has to let a read tell "derived before the change" from "derived after", and it has to be cheap enough to check on every single read.',
-    'That something is a counter: entries carry the counter value they were derived at, and the read compares it with the current counter before trusting the entry. The mutation path increments the counter *after* the grant is recorded and *before* it acks, so the very next read already sees a mismatch and cannot serve a pre-change entry.',
-    'Recomputing on every mismatch is a stampede: concurrent misses all rebuild, and the slowest one can write an older snapshot over a newer one. The rebuild runs under a short-lived `SET NX` lock, so only the holder derives and the others read what it wrote; the lock may lapse, because the entry it produces — not the lock — is the durable result.',
+    'Revoke a contractor, then read their permissions from a second connection a moment later: the old set is back, with a fresh 300 s TTL, and stays until it expires.',
+    'The starter deletes `perm:{subject}:{scope}` after the write. A reader that missed just before the delete re-derives from pre-change grants and stores that set; nothing in the entry says which change it predates.',
+    'Add `GRANT_VERSION_KEY`, stamp entries with `CACHE_VERSION_FIELD`, gate reads on `cache_is_current`, replace the delete with `bump_version` (`INCR` after `store.record_change`), and rebuild under a `LOCK_KEY_PREFIX` `SET NX` lock.',
   ],
   checks: [
     {
@@ -136,7 +130,7 @@ mechanism — bumping the shared counter is.`,
   ],
   code: {
     python: {
-      starter: `"""Effective-permission cache: flawed code that deletes the key on every change."""
+      starter: `"""Effective-permission cache in Redis, refreshed on assignment changes."""
 import logging
 
 from fastapi import FastAPI
@@ -194,9 +188,7 @@ def get_permissions(subject: str, scope: str = "org") -> JSONResponse:
 
 @app.post("/v1/roles/assignments")
 def assign(body: Assignment) -> JSONResponse:
-    # TODO: this starter invalidates by deleting the cached key after the write and leans on the
-    # 300 s TTL. A read that slips in between the write and the re-derive repopulates the old set,
-    # so a revoked permission survives. There is no version stamp, no counter and no lock either.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     store.put(body.subject, body.scope, body.role)
     redis.delete(cache_key(body.subject, body.scope))
     logger.info("assigned subject=%s role=%s scope=%s", body.subject, body.role, body.scope)
@@ -315,7 +307,7 @@ def bump_version() -> int:
 `,
     },
     typescript: {
-      starter: `/** Effective-permission cache: flawed code that deletes the key on every change. */
+      starter: `/** Effective-permission cache in Redis, refreshed on assignment changes. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -357,9 +349,7 @@ app.get('/v1/users/:subject/permissions', async (request, reply) => {
 });
 
 app.post('/v1/roles/assignments', async (request, reply) => {
-  // TODO: this starter invalidates by deleting the cached key after the write and leans on the 300 s
-  // TTL. A read that slips in between the write and the re-derive repopulates the old set, so a
-  // revoked permission survives. There is no version stamp, no counter and no lock either.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const body = request.body as {subject: string; role: string; scope: string};
   await store.put(body.subject, body.scope, body.role);
   await redis.del(cacheKey(body.subject, body.scope));
@@ -466,7 +456,7 @@ async function bumpVersion(): Promise<number> {
 `,
     },
     go: {
-      starter: `// Effective-permission cache: flawed code that deletes the key on every change.
+      starter: `// Effective-permission cache in Redis, refreshed on assignment changes.
 package main
 
 import (
@@ -540,9 +530,7 @@ func getPermissions(rw http.ResponseWriter, r *http.Request) {
 }
 
 func assign(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter invalidates by deleting the cached key after the write and leans on the
-	// 300 s TTL. A read that slips in between the write and the re-derive repopulates the old set,
-	// so a revoked permission survives. There is no version stamp, no counter and no lock either.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	var body AssignmentRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -774,9 +762,7 @@ object StateCache {
       path("v1" / "roles" / "assignments") {
         post {
           entity(as[AssignmentRequest]) { body =>
-            // TODO: this starter invalidates by deleting the cached key after the write and leans on
-            // the 300 s TTL. A read that slips in between the write and the re-derive repopulates
-            // the old set, so a revoked permission survives. No version, no counter, no lock.
+            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
             store.put(body.subject, body.scope, body.role)
             jedis.del(cacheKey(body.subject, body.scope))
             system.log.info(s"assigned subject=\${body.subject} role=\${body.role} scope=\${body.scope}")
@@ -905,7 +891,7 @@ object StateCache {
 `,
     },
     cpp: {
-      starter: `// Effective-permission cache: flawed code that deletes the key on every change.
+      starter: `// Effective-permission cache in Redis, refreshed on assignment changes.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
@@ -977,9 +963,7 @@ int main() {
   });
 
   svr.Post("/v1/roles/assignments", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter invalidates by deleting the cached key after the write and leans on the
-    // 300 s TTL. A read that slips in between the write and the re-derive repopulates the old set,
-    // so a revoked permission survives. There is no version stamp, no counter and no lock either.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -1149,5 +1133,5 @@ std::string uuidString() {
 `,
     },
   },
-  debrief: `The interview question behind this step is whether a cached authorization decision can outlive the change that should have killed it. Delete-on-write reads as invalidation but is only a hint: the key is gone, so the next reader rebuilds it — and if that reader sampled the grants before the change, it rebuilds the old set and stamps it with a fresh 300 s TTL. Nothing tells the following reader that the entry predates the revocation, and that is exactly what a version counter removes: the entry carries the counter value it was derived at, the read compares it with the counter now, and the mutation path — record the grant, then \`INCR\`, then ack — guarantees the mismatch is visible to the very next read. Single-flight is the second half: without a lock, concurrent misses all rebuild, and the slowest one can write an older snapshot over a newer entry. Real services also publish the version through the event stream so the counter can be rebuilt after a Redis loss, warm the entry on write instead of on the next read, and shard the lock so one slow subject cannot stall the rest.`,
+  debrief: `The fix is a counter rather than a delete because a delete carries no information about time. Once the key is gone, the next reader rebuilds it, and a reader that sampled the grants before the change rebuilds the old set with a fresh TTL. A version stamp turns "is this entry fresh?" into a comparison the read makes on every request: the entry carries the counter value it was derived at, and the mutation path (record the grant, then \`INCR\`, then ack) makes the mismatch visible to the very next read. The \`SET NX\` lock keeps concurrent misses from racing to write an older snapshot last. Production services also carry the version through the event stream so the counter survives a Redis loss, and warm the entry on write.`,
 };

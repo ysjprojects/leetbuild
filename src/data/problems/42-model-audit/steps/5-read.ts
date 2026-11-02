@@ -8,32 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'auditd', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: the endpoint answers quickly, it
-is right for every record the demo asks about, and it hides three flaws — one that makes verification
-meaningless, one that makes it partial, and one that leaks across tenants. Debug it, fix it, and
-prove the fix.
-
-Implement \`GET /v1/audit/decisions/{record_id}/verify\`:
-
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the record lookup is scoped by it:
-  \`WHERE record_id = $1 AND tenant_id = $2\`. A missing **or foreign** record is **404**, never a
-  \`403\` and never a \`200\` — a 403 confirms the record exists, which the caller is not entitled to
-  know. The starter resolves the record by id alone and takes the chain’s tenant from a query string,
-  so any caller can verify against any tenant’s chain.
-- **Actually verify.** Walk the chain from the record’s position to the head, recomputing
-  \`sha1(prev | record_digest | position)\` at every step and comparing it with the stored digest, and
-  stop at the first position that disagrees or is missing. The starter returns \`valid\` whenever the
-  record exists and only checks that the head value is non-empty — which is not verification.
-- **Report what was covered.** The response is
-  \`{"record_id", "valid", "chain_length", "first_divergence"}\`: the number of positions actually
-  walked and the exact position of the first divergence, or \`null\`. The starter reports neither, so a
-  partial walk is indistinguishable from a whole chain.
-- Verification covers from the record’s position **up to the head it names** and stops there: the
-  head read at the start of the request is the head the answer refers to.
+**Starting point.** The starter serves \`GET /v1/audit/decisions/{record_id}/verify\`: it looks the
+record up by id alone, takes the chain's tenant from a \`tenant\` query parameter, reads the head and
+answers \`{"record_id", "valid"}\` with \`valid\` true whenever the head is non-empty. It compiles,
+serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** A verification endpoint that cannot fail. If \`valid\` is derived
 from existence, tampering passes; if the walk is unscoped, a caller verifies a chain that is not
-theirs; and an answer without a covered length cannot be audited later.`,
+theirs; and an answer without a covered length cannot be audited later.
+
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the record lookup is scoped by it:
+  \`WHERE record_id = $1 AND tenant_id = $2\`. A missing or foreign record is **404**, not a
+  \`403\`: a 403 confirms the record exists, which the caller is not entitled to know.
+- Actually verify. Walk the chain from the record's position to the head, recomputing
+  \`sha1(prev | record_digest | position)\` at every step and comparing it with the stored digest, and
+  stop at the first position that disagrees or is missing.
+- Report what was covered. The response is
+  \`{"record_id", "valid", "chain_length", "first_divergence"}\`: the number of positions actually
+  walked and the exact position of the first divergence, or \`null\`.
+- Verification covers from the record's position up to the head it names and stops there: the head
+  read at the start of the request is the head the answer refers to.`,
   sequence: {
     participants: ['Client', 'Audit Service', 'Postgres', 'Redis'],
     messages: [
@@ -141,9 +135,7 @@ app = FastAPI()
 
 @app.get("/v1/audit/decisions/{record_id}/verify")
 def verify(record_id: str, tenant: str = "", cur=None) -> JSONResponse:
-    # TODO: the starter returns valid whenever the record exists, checks only that the head value is
-    # non-empty and resolves the chain from the tenant the request names. Recompute the hashes,
-    # scope the lookup to the caller's tenant, and 404 a missing or foreign record.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     cur.execute("SELECT position FROM audit_entries WHERE record_id = %s", (record_id,))
     row = cur.fetchone()
     if row is None:
@@ -231,9 +223,7 @@ import Fastify from 'fastify';
 export const app = Fastify();
 
 app.get('/v1/audit/decisions/:record_id/verify', async (request, reply) => {
-  // TODO: the starter returns valid whenever the record exists, checks only that the head value is
-  // non-empty and resolves the chain from the tenant the request names. Recompute the hashes, scope
-  // the lookup to the caller's tenant, and 404 a missing or foreign record.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {record_id} = request.params as {record_id: string};
   const {tenant} = request.query as {tenant?: string};
   const {rows} = await db.query('SELECT position FROM audit_entries WHERE record_id = $1', [record_id]);
@@ -317,9 +307,7 @@ import (
 )
 
 func verifyRecord(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the starter returns valid whenever the record exists, checks only that the head value is
-	// non-empty and resolves the chain from the tenant the request names. Recompute the hashes,
-	// scope the lookup to the caller's tenant, and 404 a missing or foreign record.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	recordID := r.PathValue("record_id")
 	tenant := r.URL.Query().Get("tenant")
 	var position int
@@ -453,9 +441,7 @@ object VerifyApi {
   val route: Route =
     path("v1" / "audit" / "decisions" / Segment / "verify") { recordId =>
       get {
-        // TODO: the starter returns valid whenever the record exists, checks only that the head value
-        // is non-empty and resolves the chain from the tenant the request names. Recompute the
-        // hashes, scope the lookup to the caller's tenant, and 404 a missing or foreign record.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         parameter("tenant") { tenant =>
           db.lookupPosition(recordId) match {
             case None => complete(StatusCodes.OK, s"""{"record_id":"$recordId","valid":false}""")
@@ -582,9 +568,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/audit/decisions/([\\w-]+)/verify)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the starter returns valid whenever the record exists, checks only that the head value is
-    // non-empty and resolves the chain from the tenant the request names. Recompute the hashes,
-    // scope the lookup to the caller's tenant, and 404 a missing or foreign record.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string record_id = req.matches[1];
     const auto position = lookup_position(record_id);
     if (!position) {
@@ -683,9 +667,9 @@ int main() {
     },
   },
   hints: [
-    'Two boundaries, one endpoint: who may read, and what "valid" means. `WHERE record_id = $1 AND tenant_id = $2` plus a single `404` — a 403 confirms the record exists, which is itself information the caller is not entitled to.',
-    'Verification is a recomputation, not a lookup. Walk from the record’s position to the head, recompute `sha1(prev | record_digest | position)` at each step, and stop at the first mismatch or missing entry. If your `valid` is derived from `exists`, an edited record passes and the endpoint is decoration.',
-    'Report the coverage. `chain_length` is how many positions you actually walked and `first_divergence` is where the walk stopped, so a partial verification can never be mistaken for a whole chain — and an answer recorded today can be re-checked against the head it named.',
+    'An auditor edits a record in staging and the endpoint still answers valid. A caller from another tenant gets a 200 for a chain they do not own. No answer says how far it checked.',
+    'The handler selects by `record_id` only and takes the tenant from the query string; `valid` is `head is not None`, so nothing is rehashed and nothing reports position or coverage.',
+    'Scope the SELECT with `AND tenant_id = $2`, 404 when empty; run the verify script from the record position, rehash `sha1hex(prev|record|n)`; return `chain_length` and `first_divergence` (or `null`).',
   ],
-  debrief: `The interviewer is testing the endpoint whose whole job is to be able to say "no". The starter fails in three independent ways, and each one is a different lesson. Trusting existence makes the verifier vacuous: the tamper an auditor performs is exactly the one the starter ignores. Resolving the chain from a request parameter is an IDOR with an audit flavour — you can verify against a chain you do not own, and the answer leaks whether it is intact. And a bare boolean hides the uncomfortable case: a walk that stopped at position 12 of 4 000 is "valid" up to 12, which is a very different statement from "the chain is intact". Reporting the covered length and the divergence position makes the endpoint falsifiable, which is the only property that matters for evidence. Real systems also sign the head at intervals and return the checkpoint, so verification can be bounded and delegated.`,
+  debrief: `The fix makes the endpoint able to say "no", which is the only property that matters for evidence. Deriving \`valid\` from existence makes the verifier vacuous, because the tamper an auditor performs is exactly the one it ignores; recomputing from \`prev\` to the head is what gives the answer weight. Scoping the lookup by tenant and answering 404 for both missing and foreign records closes an IDOR with an audit flavour, where the caller could verify a chain it does not own and learn whether it is intact. Reporting the covered length and the divergence position turns a bare boolean into a falsifiable statement: "valid up to 12 of 4000" is not "the chain is intact". Production verifiers also sign the head at intervals and return that checkpoint, so verification can be bounded and delegated to an auditor offline.`,
 };

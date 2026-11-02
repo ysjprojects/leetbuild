@@ -8,16 +8,18 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'console'],
   task: `## Task
 
-**Starting point.** The starter is working code: a moderator asks for work and gets an item, so the
-demo passes. The claim hides a race, a stranded item and two counters that move apart. Find them,
-fix them, and prove the fix.
+**Starting point.** The starter's \`claim(moderator)\` pops an item from the pending sorted set
+with a client-side \`ZPOPMIN\`, records the holder in an active hash, and bumps two counters with
+separate calls. It compiles, serves the demo and hides 5 flaws.
 
-Implement the queue that hands reported items to moderators:
+**Failure mode the checks target.** A pop outside a script is a race, not a claim; a claim without
+a lease strands the item when the reviewer disappears; two counters updated apart drift from
+reality. The demo has one moderator who finishes, so none of this surfaces.
+
+Requirements for the queue that hands reported items to moderators:
 
 - Items wait in a pending sorted set; a claim pops one **and** records the holder in the same
-  atomic Lua \`EVAL\`. A client-side \`ZPOPMIN\` followed by a separate write leaves a window where
-  the item is in neither the queue nor anyone's hands, and two moderators can pop and both think
-  they own it.
+  atomic Lua \`EVAL\`, so an item is always either in the queue or in exactly one moderator's hands.
 - A claim takes a **10-minute lease** (\`LEASE_S = 600\`): the lease deadline is written next to the
   item and the holder's session key carries the same \`EXPIRE\`, so a moderator who walks away does
   not hold the item forever.
@@ -25,15 +27,9 @@ Implement the queue that hands reported items to moderators:
   deadline and re-\`EXPIRE\`s the session key, and it **refuses** when another moderator owns the
   item.
 - \`pending\` and \`in_review\` are two fields of one counters hash, moved by \`HINCRBY\` **inside the
-  same script**. The starter moves them with two separate client calls, so a crash between them
-  leaves the queue length wrong forever.
+  same script**, so a crash between them cannot leave the queue length wrong.
 - \`requeue_expired(now)\` scans the leases sorted set for deadlines in the past and puts those items
-  back in the pending set, clearing the owner — an abandoned claim returns to the queue instead of
-  being stranded.
-
-**Failure mode the checks target.** Claim without a lease strands an item when the reviewer
-disappears; two counters updated apart drift from reality; and a pop outside a script is a race, not
-a claim. The starter fails all three because the demo never crashes and never has two moderators.`,
+  back in the pending set, clearing the owner, so an abandoned claim returns to the queue.`,
   sequence: {
     participants: ['Moderator console', 'Redis', 'Moderation API'],
     messages: [
@@ -126,8 +122,7 @@ COUNTERS = "moderation:counters"
 
 
 def claim(moderator: str) -> str | None:
-    # TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
-    # strands it forever, and it moves the pending and in-review counters in two separate calls.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     popped = r.zpopmin(QUEUE, 1)
     if not popped:
         return None
@@ -220,8 +215,7 @@ const ACTIVE = 'moderation:active';
 const COUNTERS = 'moderation:counters';
 
 export async function claim(moderator: string): Promise<string | null> {
-  // TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
-  // strands it forever, and it moves the pending and in-review counters in two separate calls.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const popped = await r.zpopmin(QUEUE, 1);
   if (popped.length === 0) return null;
   const item = popped[0];
@@ -314,8 +308,7 @@ const (
 )
 
 func claim(ctx context.Context, rdb *redis.Client, moderator string) (string, error) {
-	// TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
-	// strands it forever, and it moves the pending and in-review counters in two separate calls.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	popped, err := rdb.ZPopMin(ctx, queueKey, 1).Result()
 	if err != nil || len(popped) == 0 {
 		return "", err
@@ -418,8 +411,7 @@ object ModerationQueue {
   val redis = new Jedis("redis", 6379)
 
   def claim(moderator: String): Option[String] = {
-    // TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
-    // strands it forever, and it moves the pending and in-review counters in two separate calls.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val popped = redis.zpopmin(QueueKey)
     if (popped == null) None
     else {
@@ -527,8 +519,7 @@ const std::string kActiveKey = "moderation:active";
 const std::string kCountersKey = "moderation:counters";
 
 std::optional<std::string> claim(sw::redis::Redis& redis, const std::string& moderator) {
-  // TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
-  // strands it forever, and it moves the pending and in-review counters in two separate calls.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   auto popped = redis.zpopmin(kQueueKey);
   if (!popped) return std::nullopt;
   const auto item = popped->first;
@@ -613,9 +604,9 @@ long long requeueExpired(sw::redis::Redis& redis, long long now) {
     },
   },
   hints: [
-    'There is no safe way to pop and record in two round trips. Put `ZPOPMIN`, the lease `ZADD`, the owner `HSET` and both `HINCRBY`s in one Lua script: either a moderator walks away with the item and its lease, or the queue is untouched.',
-    'A lease is two things: a deadline in a sorted set (so a reaper can find expired claims) and a session key with `EXPIRE` (so the holder record dies with the lease). Renewing re-`ZADD`s a later deadline and re-`EXPIRE`s the session, and it checks `HGET owners == moderator` first so it cannot steal someone else’s item.',
-    'Atomicity applies to the counters too. `pending` and `in_review` are two fields of one hash: move them with `HINCRBY` inside the same script, so the queue never reports one item as both pending and in-review, or as neither.',
+    'Two moderators on the console open the same item at once, a moderator who closes the tab leaves that item invisible to everyone else, and the dashboard counts of pending and in-review stop adding up.',
+    'Every step of the claim is its own round trip: `zpopmin`, then `hset`, then two `hincrby`s. A crash or a second client between any two of them leaves the item owned by nobody and the counters apart.',
+    'Move the pop, the lease `ZADD`, the owner `HSET` and both `HINCRBY`s into one `CLAIM_LUA` run via `r.eval`; add `renew` with `EXPIRE` on the session key and `requeue_expired` that `ZADD`s expired leases back.',
   ],
-  debrief: `The interviewer is testing whether you can debug a queue that is claimed, not just read. The starter looks fine because in the demo one moderator claims one item and finishes. Three defects are being checked: the claim must be one atomic script (a pop followed by a write is a race, and the "lost" item lives in neither the queue nor any moderator's hands), a claim needs a lease so an abandoned item returns to the queue rather than being stranded, and the two counters must move together so the queue's own metrics stay consistent. Real queues add a heartbeat thread that renews the lease, a reaper on a schedule, a per-moderator in-flight cap, and a WATCH-free design because Lua already gives them the atomicity they would otherwise build with optimistic locking.`,
+  debrief: `The claim is one Lua script because Redis executes a script without interleaving other clients, so the pop, the lease, the owner record and both counter moves either all happen or none do. The lease is stored twice on purpose: a deadline in a sorted set lets a reaper find expired claims with one range query, and an \`EXPIRE\` on the session key lets the holder record die on its own. Renewal checks the owner first so a long review cannot steal another moderator's item. Production queues also run a heartbeat that renews the lease while the console is open, schedule the reaper rather than calling it by hand, and cap in-flight items per moderator so one person cannot hoard the queue.`,
 };

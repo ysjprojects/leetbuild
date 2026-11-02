@@ -8,32 +8,28 @@ export const changeEventsStep: Step = {
   focus: ['sync', 'kafka', 'audit'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an event after a
-batch and applies the changes, so the demo shows messages in the topic and documents moving. Three
-contracts are broken, and each of them only matters when someone needs the stream later. Find them,
-fix them, and prove the fix.
+**Starting point.** The starter's \`apply_and_publish\` produces one \`sync.change\` event per batch,
+keyed by device and carrying a device id and a change count, flushes it, then applies the batch and
+returns the applied ids. It compiles, the demo shows messages in the topic and documents moving, and
+it hides five flaws. Each only matters when someone needs the stream later.
 
-Implement the change-event path that runs after a push is accepted:
+**Failure mode the checks target.** Support asks how a document reached a conflicted state and the
+topic has nothing about it. A replay of the stream rebuilds revisions that never became durable, and
+the broker's rejection during a two-minute outage drops events with no trace anywhere.
 
-- Publish **one event per document** to \`sync.change\`, **keyed by the document id**. The key is the
+Requirements:
+
+- Publish one event per document to \`sync.change\`, keyed by the document id. The key is the
   partition key, so every event about one document lands in the same partition and its revision
-  stream stays ordered — which is what makes a replay of the topic reconstruct the document.
-- **Publish only after the apply has committed.** An event that describes a revision which then
-  rolled back is worse than a missing event: it is a false statement in the audit trail, and it is
-  the state a device replays from on its next pull.
-- The payload carries the **revision** and the **content hash** of the state that was applied —
-  identifiers and digests, so a replay can verify what it rebuilt.
-- **Conflicted documents are published like applied ones.** A conflict is a state change: if
-  conflicted documents are filtered out of the topic, no replay and no audit can ever explain how a
-  document reached a conflicted state.
-- When the broker rejects the produce, write the event to the **outbox** (\`insert_outbox\`) instead
-  of dropping it: a relay republishes outbox rows when the broker recovers.
-
-**Failure mode the checks target.** Keying by device puts every document of one device in one
-partition, so a device that edits a hundred documents serialises them all and a per-document replay
-impossible. Publishing before the apply commits creates events for work that never happened.
-Dropping conflicted documents from the stream hides exactly the state a support engineer is looking
-for. And an ignored produce result loses the event with no trace anywhere.`,
+  stream stays ordered, which is what lets a replay of the topic reconstruct the document.
+- Publish only after the apply has committed. An event for a revision that then rolled back is a
+  false statement in the audit trail and the state a device replays from on its next pull.
+- The payload carries the revision and the content hash of the applied state, so a replay can
+  verify what it rebuilt.
+- Conflicted documents are published like applied ones (\`PUBLISH_STATUSES\`). A conflict is a
+  state change; filtered out of the topic, no replay can explain how a document got there.
+- When the broker rejects the produce, write the event to the outbox (\`insert_outbox\`) instead of
+  dropping it: a relay republishes outbox rows when the broker recovers.`,
   sequence: {
     participants: ['Sync Engine', 'sync.change', 'outbox'],
     messages: [
@@ -150,9 +146,7 @@ store = OutboxStore()
 
 
 def apply_and_publish(device: str, changes: list[dict]) -> dict:
-    # TODO: key the event by document instead of by device, publish only after the apply has
-    # committed, carry the revision and the content hash, publish conflicted documents like any
-    # other state change, and write an outbox row when the broker rejects the produce.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {"device": device, "changes": len(changes)}
     producer.produce(TOPIC, key=device, value=json.dumps(event))
     producer.flush()
@@ -239,9 +233,7 @@ interface ChangeOutcome {
 }
 
 export async function applyAndPublish(device: string, changes: unknown[]): Promise<unknown> {
-  // TODO: key the event by document instead of by device, publish only after the apply has
-  // committed, carry the revision and the content hash, publish conflicted documents like any
-  // other state change, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: TOPIC,
     messages: [{key: device, value: JSON.stringify({device, changes: changes.length})}],
@@ -324,9 +316,7 @@ func applyBatch(ctx context.Context, device string, changes []Change) ([]ChangeO
 }
 
 func applyAndPublish(ctx context.Context, device string, changes []Change) (map[string]any, error) {
-	// TODO: key the event by document instead of by device, publish only after the apply has
-	// committed, carry the revision and the content hash, publish conflicted documents like any
-	// other state change, and write an outbox row when the broker rejects the produce.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{"device": device, "changes": len(changes)})
 	_ = changeWriter.WriteMessages(ctx, kafka.Message{Key: []byte(device), Value: payload})
 	outcomes, err := applyBatch(ctx, device, changes)
@@ -439,9 +429,7 @@ object ChangeEvents {
   def insertOutbox(docId: String, event: Map[String, Any]): Unit = ()
 
   def applyAndPublish(device: String, changes: List[Change]): Map[String, Any] = {
-    // TODO: key the event by document instead of by device, publish only after the apply has
-    // committed, carry the revision and the content hash, publish conflicted documents like any
-    // other state change, and write an outbox row when the broker rejects the produce.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = Map("device" -> device, "changes" -> changes.size).toJson.compactPrint
     producer.send(new ProducerRecord(Topic, device, payload))
     val outcomes = applyBatch(device, changes)
@@ -526,9 +514,7 @@ struct ChangeOutcome {
 std::vector<ChangeOutcome> applyBatch(const std::string& device, const json& changes);
 
 json applyAndPublish(const std::string& device, const json& changes) {
-  // TODO: key the event by document instead of by device, publish only after the apply has
-  // committed, carry the revision and the content hash, publish conflicted documents like any
-  // other state change, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const json event = {{"device", device}, {"changes", changes.size()}};
   const auto payload = event.dump();
   producer->produce(
@@ -620,9 +606,11 @@ json applyAndPublish(const std::string& device, const json& changes) {
     },
   },
   hints: [
-    'The message key is the partition key, and the partition is the unit of ordering. Ask what has to arrive in order: a document\'s revisions do, so the key is the document id (`key=change_outcome["doc_id"]`, `Key: []byte(changeOutcome.DocID)`, `ProducerRecord(Topic, changeOutcome.docId, …)`). Keyed by device, two documents edited in the same batch share a partition for no reason and no per-document consumer can keep order.',
-    'Publish after the apply, in the same order the apply produced: `outcomes = apply_batch(...)` first, then loop over the outcomes and publish. An event published before the commit describes a state that a crash can erase, and it is the revision a device would trust on its next pull.',
-    'The conflicted case is the one candidates filter out. `PUBLISH_STATUSES` includes both `applied` and `conflicted`, because the topic is a record of state changes, not a list of successes. Then wrap the produce and write an outbox row when the broker rejects it — a stream nobody can replay is a stream nobody can audit.',
+    'A support engineer replays `sync.change` to explain a conflicted document and finds one event per batch, keyed by device, with a count and no revision. The conflicted document never appears.',
+    'The starter produces before `apply_batch`, keys by `device`, sends `{"device", "changes"}`, publishes only `applied` outcomes, and ignores what `produce` returned. Each one erases something a replay needs.',
+    'Apply first, then loop over outcomes with status in `PUBLISH_STATUSES` (`applied`, `conflicted`); produce with `key=change_outcome["doc_id"]` and a payload with `revision` and `content_hash`, and on `KafkaException` call `store.insert_outbox`.',
   ],
-  debrief: `The interviewer is checking whether you understand that a change topic is a replay log rather than a notification channel. Three contracts are being checked. Ordering: the key decides the partition, and the partition decides what a consumer sees in order — key by document and a replayer can rebuild one document's history; key by device and one document's history is interleaved with a hundred others. Order of operations: publishing before the apply commits puts revisions in the log that never became durable, so a replay reconstructs a state that never existed. Completeness: conflicts are the most interesting state changes in a sync system, and dropping them means the topic cannot answer "why is this document conflicted?" — which is exactly the question support asks. The outbox is the durability half: a broker is not a database, so a rejected produce needs a durable row that a relay republishes. Real platforms add a schema registry so a producer cannot smuggle content in, compaction by document for infinite retention, and a per-document sequence number so consumers can detect gaps without trusting offsets.`,
+  debrief: `The fix treats the topic as a replay log rather than a notification channel, and every change follows from that. The key is the document id because the partition is the unit of ordering and the thing that has to stay ordered is one document's revisions. The produce moves after the apply because the log must describe only durable state. Conflicted outcomes are published because a conflict is the state change support most often asks about. The outbox exists because a broker is not a database: a rejected produce becomes a durable row a relay replays, not a dropped event.
+
+Production change streams add a schema registry so a producer cannot smuggle document content in, compaction by document for long retention, and a per-document sequence number so consumers detect gaps without trusting offsets.`,
 };

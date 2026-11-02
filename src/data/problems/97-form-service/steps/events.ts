@@ -8,28 +8,24 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'outbox'],
   task: `## Task
 
-**Starting point.** The starter is working code: one submission produces one event, the consumer
-sees it, and the demo ends. The event itself hides three problems — the partition key, the payload
-and the failure path. Debug it, fix it, and prove the fix.
+**Starting point.** The starter stores an accepted submission and produces one \`form.submission\`
+event keyed by the submitter, with the raw field map as the payload, through a producer with default
+settings and no outbox. It compiles, it serves the demo, and it hides 5 flaws.
 
-Every accepted submission publishes one \`form.submission\` event:
+**Failure mode the checks target.** A consumer sees submission 2 before submission 1 for one form;
+email addresses sit in a retained, replicated topic; and a broker outage loses the event while the
+submission is stored, so nothing downstream hears about it.
+
+Requirements:
 
 - The event key is the **form id**, so every event for one form lands on one partition and a form's
-  intake stays in order. The starter keys by the submitter, so one form's events scatter across
-  partitions and a consumer sees submission 2 before submission 1.
-- The event carries **field names and a value hash**, never raw values. A topic is retained and
-  replicated, so publishing the raw fields — including email addresses — ships personal data into
-  every broker and every consumer's log. \`field_names\` lists the fields; \`value_hash\` is the
-  SHA-256 of the canonicalised values.
+  intake stays in order.
+- The event carries **field names and a value hash**, not raw values: \`field_names\` lists the
+  fields; \`value_hash\` is the SHA-256 of the canonicalised values.
 - The producer is configured for durable delivery (\`acks=all\`, and idempotence where the client
   supports it) so a retry does not publish the same event twice.
-- When the produce is **rejected**, the event is not dropped: an **outbox row** records the topic,
-  key and payload so a relay can publish it once the broker recovers. The starter has no outbox, so a
-  broker outage silently loses every submission event.
-
-**Failure mode the checks target.** A submitter-keyed topic breaks per-form ordering; raw values in a
-retained topic turn a public form into a PII leak with a long memory; and with no outbox a rejected
-produce loses the event — the submission is stored but nothing downstream ever hears about it.`,
+- When the produce is **rejected**, an **outbox row** records the topic, key and payload so a relay
+  can publish it once the broker recovers.`,
   sequence: {
     participants: ['Form API', 'Kafka', 'Outbox relay'],
     messages: [
@@ -43,9 +39,9 @@ produce loses the event — the submission is stored but nothing downstream ever
     ],
   },
   hints: [
-    'The partition key decides ordering. Kafka guarantees order within a partition only, so keying by the submitter means two events for one form can land on different partitions and be consumed out of order. Key by the form id and every event for a form arrives in intake order.',
-    'A topic is a retained, replicated log — treat it as public to every consumer and every operator who reads it. Publish the shape of the submission, not its contents: the field names and a SHA-256 hash of the canonicalised values prove what was sent without copying an email address into the log.',
-    'A rejected produce must leave a durable trace. Write the event into an outbox row in the same transaction that stores the submission, and let a relay publish it later — the row is the promise that the event will eventually reach the topic.',
+    'A CRM consumer reads a form’s second submission before its first, and a grep of the topic for an `@` finds every email address ever submitted through the public form.',
+    'Kafka orders within a partition only, and the starter’s key is the submitter, so one form spreads across partitions; the payload is the raw field map; a rejected produce raises and the event is gone.',
+    'Produce with `key=form_id`, a payload of `field_names` plus a `sha256` `value_hash`, `acks=all` with `enable.idempotence`, and on rejection append an `outbox` row holding topic, key and payload.',
   ],
   checks: [
     {
@@ -134,9 +130,7 @@ def raw_payload(fields: dict) -> str:
 
 @app.post("/v1/forms/{form_id}/submissions")
 def submit(form_id: str, body: dict) -> dict:
-    # TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
-    # publishes the raw field values — including email addresses — into a retained topic, and has no
-    # outbox: when the produce is rejected the event is simply lost.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     submission_id = "sub_" + str(len(submissions) + 1)
     submissions[submission_id] = body
     submitter = body.get("submitter", "")
@@ -216,9 +210,7 @@ function rawPayload(fields: Record<string, unknown>): string {
 }
 
 app.post('/v1/forms/:id/submissions', async (req, reply) => {
-  // TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
-  // publishes the raw field values — including email addresses — into a retained topic, and has no
-  // outbox: when the produce is rejected the event is simply lost.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const {id} = req.params as {id: string};
   const body = req.body as {submitter?: string; fields?: Record<string, unknown>};
   const submissionId = 'sub_' + String(Object.keys(submissions).length + 1);
@@ -297,9 +289,7 @@ func rawPayload(fields map[string]string) string {
 }
 
 func Submit(w http.ResponseWriter, r *http.Request) {
-	// TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
-	// publishes the raw field values — including email addresses — into a retained topic, and has no
-	// outbox: when the produce is rejected the event is simply lost.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	var body struct {
 		Submitter string            ` +
         '`' +
@@ -420,9 +410,7 @@ object Events {
   val routes: Route = path("v1" / "forms" / Segment / "submissions") { _ =>
     post {
       entity(as[String]) { _ =>
-        // TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
-        // publishes the raw field values — including email addresses — into a retained topic, and has
-        // no outbox: when the produce is rejected the event is simply lost.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         val submitter = "anonymous"
         producer.send(new ProducerRecord[String, String]("form.submission", submitter, rawPayload(Map.empty)))
         complete("created")
@@ -504,9 +492,7 @@ std::string RawPayload(const std::map<std::string, std::string>& fields) {
 
 void RegisterRoutes(httplib::Server& svr, RdKafka::Producer& producer) {
   svr.Post("/v1/forms/([^/]+)/submissions", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
-    // publishes the raw field values — including email addresses — into a retained topic, and has no
-    // outbox: when the produce is rejected the event is simply lost.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const std::string submitter = "anonymous";
     const std::string payload = RawPayload({{"name", "ada"}});
     RdKafka::Producer::MessageBuilder builder;
@@ -594,5 +580,5 @@ void RegisterRoutes(httplib::Server& svr, RdKafka::Producer& producer) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand that Kafka's ordering guarantee is per partition, and that a topic is a place data goes to live forever. The key is the ordering lever: key by the form id and every event for that form lands on one partition in intake order; key by the submitter and one form's events scatter, so a consumer can see submission 2 before submission 1. The payload is a privacy decision: a retained topic is replicated to every broker and read by every consumer and operator, so publishing field names and a value hash proves what was submitted without copying an email address into the log. And a rejected produce is not an error to swallow — it is a promise to keep, so the event goes into an outbox row written with the submission and a relay publishes it once the broker recovers. Real systems add a schema registry so the event shape is enforced, per-topic retention and compaction settings, and an outbox relay with backoff and a dead-letter topic.`,
+  debrief: `Kafka's ordering guarantee is per partition, and a topic is a place data goes to live for a long time; both facts shape the fix. The key is the ordering lever: key by the form id and every event for that form lands on one partition in intake order, while a submitter key scatters one form's events so a consumer can see submission 2 before submission 1. The payload is a privacy decision: a retained topic is replicated to every broker and read by every consumer and operator, so field names and a value hash prove what was submitted without copying an email address into the log. A rejected produce is a promise to keep, not an error to swallow, so the event goes into an outbox row written with the submission and a relay publishes it later. What this step did not do: a schema registry enforcing the event shape, per-topic retention and compaction, and a relay with backoff and a dead-letter topic.`,
 };

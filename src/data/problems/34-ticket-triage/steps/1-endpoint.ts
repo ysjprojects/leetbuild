@@ -8,30 +8,27 @@ export const triageEndpointStep: Step = {
   focus: ['client', 'triage', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and returns a routing decision. It compiles, it serves the demo, and it hides three
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/tickets/triage\` with body
+\`{"text": "…", "priority": "…", "queue": "…"}\`, reads the tenant from \`X-Tenant-Id\`, takes the
+queue and priority straight from the body (falling back to \`general\`/\`normal\`), logs the request
+and returns the decision. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/tickets/triage\` with body \`{"text": "…", "priority": "…", "queue": "…"}\`.
+**Failure mode the checks target.** A caller who can set \`priority\` routes itself to the front of
+the human queue; a text with no size cap turns one pasted stack trace into unbounded classifier
+work; a handler without an idempotency key re-triages the same ticket on every webhook retry; and
+a log line that prints the ticket text ships customer content into the log pipeline on every
+request.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- A missing tenant is **401**.
 - \`text\` is a non-empty string of at most **32 KiB** (\`1 << 15\` bytes) of UTF-8; a larger ticket
   is **413** *before* any classification work, and a missing or empty \`text\` is **400**.
-- \`priority\` and \`queue\` are accepted for wire compatibility and **ignored**: the queue, the
-  priority and the extracted fields are chosen server-side from the ticket text. Never echo a
-  caller-supplied \`queue\` or \`priority\` into the routing decision — the caller describes the
-  problem, triage decides where it goes.
+- \`priority\` and \`queue\` are accepted for wire compatibility and **ignored**: queue, priority
+  and extracted fields are derived server-side from the ticket text.
 - The ticket is hashed (\`sha256(text)\` truncated to 32 hex characters) and looked up as
   \`(tenant, ticket_hash)\`. A replayed \`Idempotency-Key\` for the same ticket returns the stored
   routing with **200** instead of re-triaging.
 - \`Idempotency-Key\` is required (**400** when missing).
-- Log the decision with tenant, queue, priority and hash — never the ticket text.
-
-**Failure mode the checks target.** Trusting \`priority\` and \`queue\` from the body lets an angry
-customer self-assign \`critical\` and jump the human queue; skipping the size cap turns one pasted
-stack trace into unbounded classifier work; and an endpoint with no idempotency key re-triages the
-same ticket on every webhook retry, minting duplicate routings. The ticket text in the log line is
-the quiet one: it ships customer content into the log pipeline on every request.`,
+- Log the decision with tenant, queue, priority and hash, not the ticket text.`,
   sequence: {
     participants: ['Support client', 'triage-api', 'routing store'],
     messages: [
@@ -99,7 +96,7 @@ the quiet one: it ships customer content into the log pipeline on every request.
       id: 'server-side-routing',
       title: 'Chooses queue, priority and fields server-side',
       detail:
-        'The queue and priority come from the ticket text through the server-side derivation, and the body’s `priority`/`queue` are never read. The starter uses `body.priority` and `body.queue` when present, so a caller routes itself.',
+        'The queue and priority come from the ticket text through the server-side derivation, and the body’s `priority`/`queue` are not read. The starter uses `body.priority` and `body.queue` when present, so a caller routes itself.',
       match: {
         python: {
           all: [/PRIORITIES/, /derive_queue\(/, /derive_priority\(/, /extract_fields\(/],
@@ -138,9 +135,9 @@ the quiet one: it ships customer content into the log pipeline on every request.
     },
     {
       id: 'no-ticket-log',
-      title: 'Logs the decision, never the ticket text',
+      title: 'Logs the decision, not the ticket text',
       detail:
-        'The routing decision is logged with tenant, queue, priority and hash; the ticket text never reaches a log line. The starter logs `text` on every request.',
+        'The routing decision is logged with tenant, queue, priority and hash; the ticket text does not reach a log line. The starter logs `text` on every request.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*text/]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*text/]},
@@ -208,8 +205,7 @@ def extract_fields(text: str) -> dict:
 
 @app.post("/v1/tickets/triage")
 def triage(body: TriageRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter trusts the caller's priority and queue, never checks the 32 KiB cap, and
-    # has no Idempotency-Key, so every retry re-triages the ticket. It also logs the text.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     queue = body.queue or "general"
     priority = body.priority or "normal"
     logger.info("triage tenant=%s queue=%s text=%r", tenant, queue, body.text)
@@ -349,8 +345,7 @@ function extractFields(text: string): Record<string, string> {
 }
 
 app.post('/v1/tickets/triage', async (request, reply) => {
-  // TODO: this starter trusts the caller's priority and queue, never checks the 32 KiB cap, and has
-  // no Idempotency-Key, so every retry re-triages the ticket. It also logs the text.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as TriageBody;
   const queue = body.queue !== undefined && body.queue !== '' ? body.queue : deriveQueue(body.text);
@@ -512,8 +507,7 @@ func triage(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter trusts the caller's priority and queue, never checks the 32 KiB cap, and has
-	// no Idempotency-Key, so every retry re-triages the ticket. It also logs the text.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	queue := body.Queue
 	if queue == "" {
 		queue = deriveQueue(body.Text)
@@ -708,8 +702,7 @@ object TriageApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[TriageRequest]) { body =>
-            // TODO: this starter trusts the caller's priority and queue, never checks the 32 KiB cap,
-            // and has no Idempotency-Key, so every retry re-triages the ticket. It logs the text.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val queue = if (body.queue.nonEmpty) body.queue else deriveQueue(body.text)
             val priority = if (body.priority.nonEmpty) body.priority else derivePriority(body.text)
             system.log.info(s"triage tenant=$tenant queue=$queue text=\${body.text}")
@@ -866,8 +859,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter trusts the caller's priority and queue, never checks the 32 KiB cap, and has
-    // no Idempotency-Key, so every retry re-triages the ticket. It also logs the text.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto text = body.value("text", std::string());
     const auto queue = body.value("queue", deriveQueue(text));
     const auto priority = body.value("priority", derivePriority(text));
@@ -996,9 +988,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, in cost order: tenant, Idempotency-Key, text shape, byte length, then the hash lookup. Every one of them returns before the classifier is touched, so a malformed ticket can never cost a model call.',
-    'The routing decision is not a field you echo back — `derive_queue` and `derive_priority` take the ticket text only. Keeping `priority` and `queue` on the request model but never reading them is the point: the wire format stays compatible while the authority moves to the server.',
-    'The log line is a contract: tenant, queue, priority, hash. The ticket text belongs to the customer; if you need it for debugging, log its length or its hash. `logger.info(..., body.text)` ships customer content into every log sink.',
+    'Send the same ticket twice with one `Idempotency-Key`, or send `priority: "critical"` in the body: the starter routes twice and lands the ticket exactly where the caller asked.',
+    'The handler reads `body.queue` and `body.priority` before anything else and only calls `extract_fields`. Nothing hashes the text, checks its size, or consults the store, so retries and oversized tickets flow straight through.',
+    'Guard in cost order: tenant, `Idempotency-Key`, text shape, `MAX_TEXT_BYTES`, then `store.get` by `(tenant, ticket_hash)`. Route with `derive_queue`/`derive_priority`, `store.put`, and log tenant, queue, priority, hash only.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed tickets from one tenant and never retries. Three defects are being checked: server-side routing (the caller describes the problem, triage picks the queue — a body-supplied \`priority: "critical"\` must never change where the ticket lands), a cheap input cap (32 KiB rejected with 413 before any expensive work), and idempotency keyed by the ticket hash so a webhook retry returns the original routing instead of minting a second one. The log line is the one candidates miss: ticket text is customer content and may never be logged verbatim. Real triage services add per-tenant queue overrides from config, a redacted text preview for agents, and a routing audit record that names the ruleset version.`,
+  debrief: `The fix moves authority to the server: \`priority\` and \`queue\` stay on the request model so existing clients keep working, but the decision is derived from the text alone, so a body-supplied \`critical\` changes nothing. The guards run in cost order, cheapest first, so a malformed or oversized ticket is rejected before any work that costs money, and the hash lookup makes a webhook retry return the original routing instead of minting a second one. The log line carries ids and a hash because ticket text is customer content and log sinks are the least protected store a platform has. Production triage services go further: per-tenant queue overrides from config, a redacted preview for agents, and an audit record that names the ruleset version behind each decision.`,
 };

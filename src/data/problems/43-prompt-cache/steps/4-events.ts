@@ -8,36 +8,26 @@ export const cacheEventsStep: Step = {
   focus: ['cache', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: every decision publishes a
-\`cache.result\` event and the topic looks healthy in the console. Its three flaws are the three things
-analysts get wrong about a cache topic — the partition key, the payload, and the moment the offset is
-committed. Debug it, fix it, and prove the fix.
+**Starting point.** The starter publishes one \`cache.result\` record per decision, keyed by prompt
+version and carrying a 512-byte \`prefix\` sample, and its consumer commits the offset before it
+updates the hit-ratio counter. It serves the demo and hides four flaws.
 
-Publish one event per decision (hit, miss) and maintain the ratio counter from the same events.
+**Failure mode the checks target.** The starter treats the cache topic as a log of everything it
+knows rather than a stream of decisions: a version key that destroys per-tenant ordering, a payload
+that carries the prompt, and an offset commit that runs ahead of the state it describes.
 
-- **The record key is the tenant.** The key decides the partition, so one tenant’s events keep their
-  order on one partition and one tenant’s traffic cannot land behind another’s. The starter keys by
-  prompt version, which scatters a tenant across every partition — the ordering a hit-ratio series
-  needs is exactly what it destroys — and puts every tenant that shares a version in one partition.
-- **The payload carries a digest, never prompt text.** The event is
-  \`{"prefix_digest", "version", "decision", "latency_ms"}\`: enough to aggregate hits and misses per
-  tenant and prompt version, and enough for latency percentiles. The starter ships \`"prefix":
-  prefix[:512]\` so analysts can "eyeball traffic" — a 512-byte slice of customer prompt text in a
-  retained, replicated topic, which is the leak the cache was supposed to reduce.
-- **\`cache.result\` is the topic, and every decision produces exactly one record** — a hit and a miss
-  both matter, because a ratio computed from hits alone is not a ratio. Configure the producer durably:
-  \`acks=all\` and the idempotent producer, so a broker failover cannot drop a decision and the
-  producer’s own retries cannot duplicate one.
-- **The consumer updates the hit-ratio counter before it commits the offset.** \`HINCRBY
-  pc:access:{tenant}:{version} hits|misses 1\`, *then* \`commit\`. The starter commits first, so a crash
-  between the two loses the counter update while the offset says the event was processed — the ratio
-  drifts downward for the rest of the version’s life.
-- **Never put the prompt, the completion or a sample of either in the event.** The topic is the one
-  place where "we only keep metadata" has to be literally true.
-
-**Failure mode the checks target.** The starter treats the cache topic as a log of everything it knows
-rather than a stream of decisions: a version key that destroys per-tenant ordering, a payload that
-carries the prompt, and an offset commit that runs ahead of the state it is supposed to describe.`,
+- **The record key is the tenant.** The key decides the partition, so one tenant's events keep their
+  order on one partition. Keying by version scatters a tenant across every partition.
+- **The payload is \`{"prefix_digest", "version", "decision", "latency_ms"}\`**: enough to aggregate
+  hits and misses per tenant and version and to plot latency. A slice of customer prompt text in a
+  retained, replicated topic is the leak the cache was supposed to reduce.
+- **\`cache.result\` is the topic, and every decision produces exactly one record.** A ratio computed
+  from hits alone is not a ratio.
+- **The consumer updates the counter before it commits.** \`HINCRBY pc:access:{tenant}:{version}
+  hits|misses 1\`, *then* \`commit\`. Committing first means a crash between the two loses the
+  increment while the offset says the event was processed.
+- **No prompt, completion or sample of either in the event.** The topic is the one place where "we
+  only keep metadata" has to be literally true.`,
   sequence: {
     participants: ['Prompt Cache', 'cache.result', 'Stats consumer', 'Redis'],
     messages: [
@@ -59,9 +49,9 @@ carries the prompt, and an offset commit that runs ahead of the state it is supp
     ],
   },
   hints: [
-    'The key is the ordering contract, and the ordering you want is per tenant. `key = tenant` puts every event for one tenant on one partition in produce order — which is what a hit-ratio series and a debugging session both need. Keying by prompt version is a decision to shuffle one tenant’s traffic through every partition.',
-    'A digest is enough for everything an analyst legitimately does with this topic: aggregate per tenant and version, compute ratio, plot latency. `prefix[:512]` buys "eyeballing" and pays with prompt text in a retained topic; if an analyst really needs the text they can ask the caller who owns it.',
-    'Commit is a statement about work already done, so do the work first: `HINCRBY` the counter, then `commit`. If the process dies in between, the event is replayed and the counter is incremented twice rather than lost — which is why the counter update should be idempotent-friendly (count from the event, not a blind `INCR`) when you get to production.',
+    "One tenant's hit-ratio series arrives out of order across partitions, a compliance scan finds customer prompt text in a retained topic, and the ratio drifts downward after every consumer restart.",
+    'The producer uses `key=str(version)` and a value with `prefix[:512]` where the digest should be; the consumer calls `commit` before `hincrby`, so a crash in between drops the increment.',
+    'Key by `tenant`, send `{prefix_digest, version, decision, latency_ms}` with the digest in place of the sample, and in the consumer run `hincrby` first, then `commit`.',
   ],
   checks: [
     {
@@ -149,9 +139,7 @@ TOPIC = "cache.result"
 
 
 def publish_decision(tenant: str, version: int, prefix: str, decision: str, latency_ms: int) -> None:
-    # TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it
-    # ships a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the
-    # offset before it updates the hit-ratio counter.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     producer.produce(
         TOPIC,
         key=str(version),
@@ -221,9 +209,7 @@ export async function publishDecision(
   decision: string,
   latency_ms: number,
 ): Promise<void> {
-  // TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it
-  // ships a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the
-  // offset before it updates the hit-ratio counter.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   await producer.connect();
   await producer.send({
     topic: TOPIC,
@@ -306,9 +292,7 @@ const topic = "cache.result"
 
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
-// TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it ships
-// a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the offset
-// before it updates the hit-ratio counter.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 func publishDecision(ctx context.Context, tenant string, version int, prefix, decision string, latencyMs int) error {
 	payload, err := json.Marshal(map[string]any{
 		"prefix":     prefix[:512],
@@ -409,9 +393,7 @@ object CacheEvents {
   props.put("bootstrap.servers", "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it
-  // ships a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the
-  // offset before it updates the hit-ratio counter.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def publishDecision(tenant: String, version: Int, prefix: String, decision: String, latencyMs: Int): Unit = {
     val payload = s"""{"prefix":"\${prefix.take(512)}","version":$version,"decision":"$decision","latency_ms":$latencyMs}"""
     producer.send(new ProducerRecord[String, String](Topic, version.toString, payload))
@@ -469,9 +451,7 @@ object CacheEvents {
 
 const std::string kTopic = "cache.result";
 
-// TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it ships
-// a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the offset
-// before it updates the hit-ratio counter.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 void publish_decision(RdKafka::Producer* producer, const std::string& tenant, int version, const std::string& prefix,
                       const std::string& decision, int latency_ms) {
   nlohmann::json event = {
@@ -535,5 +515,5 @@ void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& cache) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can design a cache’s event stream as a stream of *decisions* rather than a copy of traffic. All three defects come from treating the topic as an observability dump: the starter keys for its own convenience (version) instead of for the reader’s ordering needs (tenant), it ships the payload "in case someone wants to look", and it commits the offset as though the commit were bookkeeping rather than a claim about state. The correct shape is deliberately thin — tenant key, digest, version, decision, latency — because a cache that leaks completions through its logs, its metrics or its analytics topic has not reduced the leak at all; it has moved it somewhere with a longer retention period. The commit ordering is the same principle applied to the counter: the offset must never be able to say "processed" about a counter update that did not happen.`,
+  debrief: `The fix makes the topic a stream of *decisions* rather than a copy of traffic. The key is chosen for the reader's ordering needs (tenant) instead of the writer's convenience (version); the payload is deliberately thin (digest, version, decision, latency) because a cache that leaks prompts through its analytics topic has only moved the leak somewhere with a longer retention period; and the commit comes after the counter update so the offset can only say "processed" about work that happened. That ordering means a crash replays the event and counts it twice, which is why production consumers make the counter update idempotent, usually by recording the last applied offset per partition next to the counter and skipping events at or below it.`,
 };

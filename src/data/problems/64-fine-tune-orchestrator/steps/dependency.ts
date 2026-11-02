@@ -8,31 +8,24 @@ export const dependencyStep: Step = {
   focus: ['trainer', 'checkpoints'],
   task: `## Task
 
-**Starting point.** The starter is working code for the gRPC client: it starts a trainer and
-watches its heartbeat. It compiles, it drives the happy path, and it discards hours of progress the
-first time the trainer goes quiet. Debug it like the on-call owner, fix it, and prove the fix with
-the checks below.
+**Starting point.** The starter is the gRPC trainer client: \`watch\` loops forever, sends a
+\`Heartbeat\` under a 30-second timeout and calls \`restart_job\` the moment one is missed, with no
+checkpoint and no failure path. It drives the happy path and hides five flaws.
 
-The orchestrator drives a long-running trainer over gRPC with a \`Heartbeat\` call and a
-\`RequestCheckpoint\` call.
+**Failure mode the checks target.** Restarting a silent trainer from scratch throws away every hour
+already paid for, and because the job looks \`running\` again nobody can tell. Without the checkpoint
+id a restart resumed from, a result cannot be reproduced a week later. And a trainer whose heartbeat
+is broken becomes an infinite restart loop that burns budget without surfacing a failure.
 
 - **Heartbeat deadline.** Every \`Heartbeat\` runs under a **60-second** deadline; a trainer that
   does not answer within it has missed a heartbeat.
-- **Checkpoint before restart.** A missed heartbeat is not proof of a crash. Ask the trainer to
-  \`RequestCheckpoint\` **first**; only when a checkpoint id comes back may the job be restarted, and
-  the restart must name the checkpoint it resumed from.
-- **Honest failure.** A trainer that cannot checkpoint must be **failed explicitly** — mark the job
-  failed with a reason — rather than restarted blind from scratch. A restart that silently discards
-  progress is worse than a failed job, because nobody notices the wasted GPUs.
-- **Stop on repeated failure.** After repeated heartbeat failures (**3**) the job is failed and the
-  watch loop stops, instead of restarting forever.
-- Record on the job whether a restart reused a checkpoint, so the lineage is honest.
-
-**Failure mode the checks target.** Restarting a silent trainer from scratch throws away every hour
-of training already paid for, and because the job looks \`running\` again, nobody can tell it happened.
-Not recording the checkpoint a restart resumed from means a result cannot be reproduced or debugged a
-week later. The repeated-failure loop is the quiet one: a trainer with a broken heartbeat becomes an
-infinite restart loop that keeps burning budget and never surfaces a failure.`,
+- **Checkpoint before restart.** A missed heartbeat is not proof of a crash. Call
+  \`RequestCheckpoint\` first; only when a checkpoint id comes back may the job restart, and the
+  restart names the checkpoint it resumed from.
+- **Explicit failure.** A trainer that cannot checkpoint is failed with a reason, not restarted
+  blind.
+- **Stop on repeated failure.** After **3** heartbeat failures the job is failed and the loop stops.
+- Record on the job whether a restart reused a checkpoint, so the lineage is accurate.`,
   sequence: {
     participants: ['Orchestrator', 'Trainer', 'Checkpoint store'],
     messages: [
@@ -139,9 +132,7 @@ class TrainerClient:
             return False
 
     def watch(self, job_id: str, team: str) -> None:
-        # TODO: on a missed heartbeat ask the trainer to checkpoint first; resume the restart from
-        # that checkpoint; fail the job explicitly when the trainer cannot checkpoint; and stop
-        # after repeated heartbeat failures instead of looping.
+        # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         while True:
             if not self._heartbeat(job_id):
                 self._jobs.restart_job(job_id)
@@ -222,9 +213,7 @@ class Trainer {
   }
 
   async watch(jobId: string): Promise<void> {
-    // TODO: on a missed heartbeat ask the trainer to checkpoint first; resume the restart from that
-    // checkpoint; fail the job explicitly when the trainer cannot checkpoint; and stop after
-    // repeated heartbeat failures instead of looping.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     for (;;) {
       if (!(await this.heartbeat(jobId))) await this.jobs.restartJob(jobId);
     }
@@ -305,9 +294,7 @@ func (c *TrainerClient) heartbeat(jobID string) bool {
 }
 
 func (c *TrainerClient) Watch(jobID string) error {
-	// TODO: on a missed heartbeat ask the trainer to checkpoint first; resume the restart from that
-	// checkpoint; fail the job explicitly when the trainer cannot checkpoint; and stop after
-	// repeated heartbeat failures instead of looping.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	for {
 		if !c.heartbeat(jobID) {
 			if err := c.jobs.RestartJob(jobID); err != nil {
@@ -394,9 +381,7 @@ object Client {
       }
 
     def watch(jobId: String): Unit = {
-      // TODO: on a missed heartbeat ask the trainer to checkpoint first; resume the restart from
-      // that checkpoint; fail the job explicitly when the trainer cannot checkpoint; and stop
-      // after repeated heartbeat failures instead of looping.
+      // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
       while (true) {
         if (!heartbeat(jobId)) jobs.restartJob(jobId)
       }
@@ -465,9 +450,7 @@ class TrainerClient {
   }
 
   void Watch(const std::string& job_id) {
-    // TODO: on a missed heartbeat ask the trainer to checkpoint first; resume the restart from that
-    // checkpoint; fail the job explicitly when the trainer cannot checkpoint; and stop after
-    // repeated heartbeat failures instead of looping.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     while (true) {
       if (!Heartbeat(job_id)) jobs_->RestartJob(job_id);
     }
@@ -543,9 +526,9 @@ class TrainerClient {
     },
   },
   hints: [
-    'Give every heartbeat a 60-second deadline: a trainer that has not answered within it has missed a heartbeat, and nothing more dramatic should be assumed yet.',
-    'Ask for a checkpoint before you restart. A restart that names the checkpoint it resumes from keeps the hours already trained; a restart from scratch throws them away silently.',
-    'When the trainer cannot checkpoint, fail the job explicitly; and stop after repeated heartbeat failures so a broken heartbeat cannot become an infinite restart loop.',
+    'A trainer paused on a slow checkpoint write finds its job restarted at step zero, and a trainer with a broken heartbeat is restarted all night without a failed job ever appearing.',
+    'The 30-second timeout fires on ordinary stalls, and the only reaction to a miss is `restart_job`: no checkpoint request, no resume id, no failure path, no counter.',
+    'Set `HEARTBEAT_DEADLINE_S = 60.0`; on a miss call `RequestCheckpoint`, pass its `checkpoint_id` as `resume_from` to `restart_job`, `fail_job` with "cannot checkpoint" otherwise, and count `failures` against `MAX_HEARTBEAT_FAILURES`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a long-running client against partial failure. The starter reads fine because the trainer usually answers. Four separate defects are being checked: the heartbeat deadline (60 s, not a twitchy 30 s), the checkpoint request that must precede any restart, the checkpoint id the restart resumes from and the job records, and the honest failure path plus the failure cap that stops the loop. The subtle one is the resume id: without it, a restart looks successful but the lineage cannot be reproduced, and nobody can tell that the progress was discarded. Real systems also keep the checkpoint id on the job record and expose the lineage on the read path.`,
+  debrief: `The fix has this shape because a missed heartbeat is ambiguous: the trainer may be dead, or it may be writing a checkpoint, and the client cannot tell which from silence. Asking for a checkpoint first resolves the ambiguity in the direction that preserves work; naming the resume id on the restart keeps the lineage reproducible; failing explicitly when the trainer cannot checkpoint and capping the failure count turn a silent loop into a visible, bounded failure. Production orchestrators treat the checkpoint id as part of the job record that the read path exposes, and use a lease on the trainer so a second orchestrator instance cannot restart a job that the first one is still watching.`,
 };

@@ -8,35 +8,28 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the Redis layer behind the
-upload handshake: it writes the session hash, increments the tenant's usage, and acks a chunk with a
-\`HSET\`. It compiles, it serves the demo, and it hides two production flaws — the ack and the
-accounting are separate calls, and the session key never expires. Debug it, fix it, and prove the fix
-with the checks below.
-
-Implement the upload state on Redis:
-
-- The tenant's usage is one integer key \`quota:used:{tenant}\`; a session's declaration is also a
-  member of the sorted set \`quota:reservations:{tenant}\` whose score is the declared size, so a
-  reservation can be found without scanning the keyspace.
-- \`session:{upload_id}\` is a hash: \`tenant\`, \`declared_size\`, \`actual_bytes\` and one field per
-  acked chunk.
-- **Reserve** (\`CREATE_LUA\`): \`INCRBY\` the tenant's usage, \`HSET\` the session, \`ZADD\` the
-  reservation and \`EXPIRE\` both the session key and the reservation set in **one** \`EVAL\`, so the
-  reservation and the bytes it protects cannot drift apart.
-- **Ack a chunk** (\`ACK_LUA\`): the chunk's \`HSETNX\` and the session's \`actual_bytes\` accounting run
-  in one script. A chunk that is acked twice — a client retry after a dropped response — must not add
-  its bytes twice, so the accounting only happens when the field is new.
-- The session key expires after **24 hours** (\`86400\` seconds) so an abandoned multi-gigabyte upload
-  stops pinning the tenant's quota.
-- **Sweep** (\`sweep\`): for each member of \`quota:reservations:{tenant}\` whose session key no longer
-  exists, \`ZREM\` the reservation and \`DECRBY\` the tenant's usage, returning the released bytes. That is
-  how an abandoned session's quota comes back without a background job that owns a copy of the state.
+**Starting point.** The starter is the Redis layer behind the upload handshake: \`create_session\`
+writes the session hash and increments usage in two calls, and \`ack_chunk\` does an \`HSET\` and a
+second \`INCRBY\`. It compiles and hides five flaws.
 
 **Failure mode the checks target.** Two separate calls mean a crash between them charges the tenant for
-a chunk that was never stored — a crash loop burns quota for bytes that do not exist. A session key
-with no TTL means every abandoned upload pins its declared size forever, so the tenant's real headroom
-silently shrinks. And an ack that just \`HSET\`s counts a retried chunk twice.`,
+a chunk that was never stored. A session key with no TTL means every abandoned upload pins its
+declared size forever. A plain \`HSET\` ack counts a retried chunk twice, and with no reservation
+record there is nothing a sweep can find to release.
+
+Requirements:
+
+- Usage is one integer key \`quota:used:{tenant}\`; each declaration is also a member of the sorted set
+  \`quota:reservations:{tenant}\` scored by declared size, so reservations are found without a scan.
+- \`session:{upload_id}\` is a hash: \`tenant\`, \`declared_size\`, \`actual_bytes\` and one field per
+  acked chunk.
+- **Reserve** (\`CREATE_LUA\`): \`INCRBY\` usage, \`HSET\` the session, \`ZADD\` the reservation and
+  \`EXPIRE\` both keys in **one** \`EVAL\`.
+- **Ack** (\`ACK_LUA\`): the chunk's \`HSETNX\` and the \`actual_bytes\` accounting run in one script,
+  and the accounting only happens when the field is new, so a client retry adds nothing.
+- The session key expires after **24 hours** (\`86400\` seconds).
+- **Sweep** (\`sweep\`): for each reservation whose session key is gone, \`ZREM\` the member and
+  \`DECRBY\` usage, returning the released bytes.`,
   sequence: {
     participants: ['Client', 'Upload API', 'Redis'],
     messages: [
@@ -131,15 +124,12 @@ r = redis.Redis.from_url("redis://localhost:6379")
 
 
 def create_session(upload_id, tenant, declared_size):
-    # TODO: this starter writes the session with no expiry and keeps no reservation record, so an
-    # abandoned upload pins its declared size forever.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     r.hset("session:" + upload_id, mapping={"tenant": tenant, "declared_size": declared_size})
     r.incrby("quota:used:" + tenant, declared_size)
 
 
 def ack_chunk(upload_id, tenant, chunk_index, size):
-    # TODO: the ack and the accounting are two separate calls, so a crash between them leaves the
-    # chunk unstored but its bytes charged.
     r.hset("session:" + upload_id, "chunk:" + str(chunk_index), size)
     r.incrby("quota:used:" + tenant, size)
 
@@ -220,15 +210,12 @@ class UploadState:
 const client = new Redis();
 
 export async function createSession(uploadId: string, tenant: string, declaredSize: number): Promise<number> {
-  // TODO: this starter writes the session with no expiry and keeps no reservation record, so an
-  // abandoned upload pins its declared size forever.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await client.hset('session:' + uploadId, 'tenant', tenant, 'declared_size', String(declaredSize));
   return client.incrby('quota:used:' + tenant, declaredSize);
 }
 
 export async function ackChunk(uploadId: string, tenant: string, chunkIndex: number, size: number): Promise<number> {
-  // TODO: the ack and the accounting are two separate calls, so a crash between them leaves the
-  // chunk unstored but its bytes charged.
   await client.hset('session:' + uploadId, 'chunk:' + String(chunkIndex), String(size));
   return client.incrby('quota:used:' + tenant, size);
 }
@@ -328,8 +315,7 @@ import (
 )
 
 func createSession(ctx context.Context, rdb *redis.Client, uploadID, tenant string, declaredSize int64) error {
-	// TODO: this starter writes the session with no expiry and keeps no reservation record, so an
-	// abandoned upload pins its declared size forever.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	if err := rdb.HSet(ctx, "session:"+uploadID, "tenant", tenant, "declared_size", declaredSize).Err(); err != nil {
 		return err
 	}
@@ -337,8 +323,6 @@ func createSession(ctx context.Context, rdb *redis.Client, uploadID, tenant stri
 }
 
 func ackChunk(ctx context.Context, rdb *redis.Client, uploadID, tenant string, chunkIndex, size int64) error {
-	// TODO: the ack and the accounting are two separate calls, so a crash between them leaves the
-	// chunk unstored but its bytes charged.
 	field := "chunk:" + strconv.FormatInt(chunkIndex, 10)
 	if err := rdb.HSet(ctx, "session:"+uploadID, field, size).Err(); err != nil {
 		return err
@@ -436,16 +420,13 @@ func sweep(ctx context.Context, rdb *redis.Client, tenant string) (int64, error)
 
 object UploadState {
   def createSession(jedis: Jedis, uploadId: String, tenant: String, declaredSize: Long): Long = {
-    // TODO: this starter writes the session with no expiry and keeps no reservation record, so an
-    // abandoned upload pins its declared size forever.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     jedis.hset("session:" + uploadId, "tenant", tenant)
     jedis.hset("session:" + uploadId, "declared_size", String.valueOf(declaredSize))
     jedis.incrBy("quota:used:" + tenant, declaredSize)
   }
 
   def ackChunk(jedis: Jedis, uploadId: String, tenant: String, chunkIndex: Long, size: Long): Long = {
-    // TODO: the ack and the accounting are two separate calls, so a crash between them leaves the
-    // chunk unstored but its bytes charged.
     jedis.hset("session:" + uploadId, "chunk:" + String.valueOf(chunkIndex), String.valueOf(size))
     jedis.incrBy("quota:used:" + tenant, size)
   }
@@ -534,16 +515,13 @@ struct UploadState {
   sw::redis::Redis redis;
 
   long createSession(const std::string& uploadId, const std::string& tenant, long declaredSize) {
-    // TODO: this starter writes the session with no expiry and keeps no reservation record, so an
-    // abandoned upload pins its declared size forever.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     redis.hset("session:" + uploadId, "tenant", tenant);
     redis.hset("session:" + uploadId, "declared_size", std::to_string(declaredSize));
     return redis.incrby("quota:used:" + tenant, declaredSize);
   }
 
   long ackChunk(const std::string& uploadId, const std::string& tenant, long chunkIndex, long size) {
-    // TODO: the ack and the accounting are two separate calls, so a crash between them leaves the
-    // chunk unstored but its bytes charged.
     redis.hset("session:" + uploadId, "chunk:" + std::to_string(chunkIndex), std::to_string(size));
     return redis.incrby("quota:used:" + tenant, size);
   }
@@ -617,9 +595,9 @@ struct UploadState {
     },
   },
   hints: [
-    'Both scripts exist for the same reason: the session hash and the quota counter must never disagree. Register them once at startup and call them by key, so the ack path cannot fall back to two round-trips.',
-    'The TTL belongs on both keys the reserve script writes: the session hash so an abandoned upload stops existing, and the reservation set so the sweeper still has the member to release. A reservation with no session is a leak; a session with no reservation is unaccounted storage.',
-    '`HSETNX` is what makes a retried ack safe. A client that never saw your response will resend the same chunk; the second ack must return the same stored total instead of adding the bytes again.',
+    "A tenant's dashboard shows 40 GiB used against 2 GiB of real objects. Uploads abandoned last week still count, and a flaky client that retried its chunks was charged for each retry.",
+    'The starter writes the session hash with no EXPIRE and no reservation member, then increments quota:used in a separate round-trip; ack_chunk HSETs the field and increments again, so retries and crashes both skew the counter.',
+    'Move reserve into CREATE_LUA (INCRBY, HSET, ZADD, EXPIRE with SESSION_TTL_S) and ack into ACK_LUA using HSETNX, both via register_script; add a sweep that ZREMs dead reservations and DECRBYs usage.',
   ],
-  debrief: `The interviewer is testing whether you understand that a reservation is a promise about bytes that do not exist yet. The starter's two calls look equivalent to one script until the process dies between them, and its missing TTL looks harmless until an abandoned upload keeps its declared size reserved for a week. The two fixes are one idea: keep the accounting and the thing it accounts for in the same atomic unit, and give every promise an expiry with a path that releases it. Real systems add a sweeper on a schedule instead of inline, a lease so two sweepers cannot double-release, and a reconciliation job against the object store for the bytes that leaked anyway.`,
+  debrief: `A reservation is a promise about bytes that do not exist yet, and the fix keeps every promise next to the thing it accounts for. One script for reserve means the usage counter, the session hash and the reservation member are written together or not at all; one script for ack means a chunk is charged exactly when its field first appears, which is what makes a retry free. The TTL plus the reservation set gives an abandoned upload a way to die and a way to be found afterwards, so the sweep returns the bytes without scanning the keyspace. Production quota systems run that sweep on a schedule under a lease, so two sweepers cannot release the same reservation twice, and reconcile the counter against the object store for whatever leaked anyway.`,
 };

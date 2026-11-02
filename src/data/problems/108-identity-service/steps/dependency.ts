@@ -8,14 +8,12 @@ export const dependencyStep: Step = {
   focus: ['api', 'provider', 'retry', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the identity service’s verification client: it
-calls the provider’s \`SendVerification\` and moves the signup along. Against a healthy provider —
-one signup, one delivered email — everything looks perfect, and the demo passes. It hides three
-production flaws. Debug it like the identity service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter is the verification client: \`send_verification(email)\` calls the
+provider's \`SendVerification\`, sets the account \`verified\` whether the call returned or raised,
+appends failures to an in-memory list, and a worker re-sends that list every 60 seconds. Against a
+healthy provider (one signup, one delivered email) it compiles, serves the demo and hides 5 flaws.
 
-Implement \`send_verification(email, attempt)\` — the gRPC call that mails the verification link —
-and the paths around it:
+Requirements for \`send_verification(email, attempt)\` and the paths around it:
 
 - The provider call carries a **3 s** deadline as a named constant on the call itself
   (\`DEADLINE_S = 3\` with \`timeout=DEADLINE_S\`, \`deadline: Date.now() + DEADLINE_MS\`, a
@@ -36,8 +34,8 @@ mints verified identities for addresses nobody proved they own — sign up with 
 during the outage and log straight in. It also re-queues every failure and drains that queue on a
 \`60 s\` ticker forever, so a permanently bounced address is re-sent once a minute until a human
 notices, burning the provider’s quota and the domain’s sender reputation. And because neither call
-carries a deadline, one stuck provider holds a worker (and the signup behind it) open indefinitely
-— the outage the other two flaws then paper over.`,
+carries a deadline, one stuck provider holds a worker (and the signup behind it) open indefinitely,
+which is the outage the auto-verify then papers over.`,
   sequence: {
     participants: ['Client', 'Identity API', 'Accounts DB', 'Verification Provider', 'Retry Queue'],
     messages: [
@@ -66,9 +64,9 @@ carries a deadline, one stuck provider holds a worker (and the signup behind it)
     ],
   },
   hints: [
-    'A deadline is an argument on the call itself — `timeout=`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — not a wrapper around it. The starter calls `SendVerification` bare, so one stuck provider holds the signup request open until the client walks away.',
-    'A timeout is a retryable failure, not a confirmation: classify `DEADLINE_EXCEEDED` as retryable, `queue_retry(email, attempt + 1)` and write the account back to `unverified`. `verified` has exactly one author — the `ConfirmVerification` reply carrying `confirmed` — and the send result must never touch it.',
-    'A hard bounce arrives as an `INVALID_ARGUMENT` whose detail says `hard_bounce`: `suppress` the address (and gate signup on `is_suppressed`) and drop it from the retry schedule, because it is terminal. Space the remaining retries by the schedule constant (`BACKOFF_BASE_S = 60`, doubling) and stop at `MAX_ATTEMPTS = 5` — the starter’s fixed `60 s` loop never ends.',
+    "During a provider outage, accounts signed up with other people's addresses show `verified` and can log in, a bounced mailbox is re-sent once a minute, and one stuck call holds a signup open.",
+    'Both branches of the `try` write `verified`, the call has no deadline, every `RpcError` is treated alike, and the worker drains an unbounded list on a fixed 60 s sleep.',
+    'Pass `timeout=DEADLINE_S`; on `DEADLINE_EXCEEDED` call `queue_retry(email, attempt + 1)` and set `unverified`; on `hard_bounce` call `suppress`; write `verified` only from `ConfirmVerification.confirmed`; bound retries with `MAX_ATTEMPTS` and `backoff_seconds`.',
   ],
   checks: [
     {
@@ -181,9 +179,7 @@ retry_queue: list[str] = []
 
 
 def send_verification(email: str) -> None:
-    # TODO: give the provider call the 3 s deadline, keep the account unverified on a timeout and
-    # queue the retry, treat a hard bounce as terminal with the address suppressed for signup, and
-    # grant "verified" only from the provider confirmation — never from the send result.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     try:
         provider.SendVerification(identity_pb2.SendRequest(email=email))
         accounts.set_status(email, "verified")
@@ -309,9 +305,7 @@ const provider = new identity.Verification('verify-provider:9000', grpc.credenti
 const retryQueue: string[] = [];
 
 export async function sendVerification(email: string): Promise<void> {
-  // TODO: give the provider call the 3 s deadline, keep the account unverified on a timeout and
-  // queue the retry, treat a hard bounce as terminal with the address suppressed for signup, and
-  // grant 'verified' only from the provider confirmation — never from the send result.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   try {
     await new Promise<void>((resolve, reject) => {
       provider.SendVerification({email}, error => (error ? reject(error) : resolve()));
@@ -463,9 +457,7 @@ import (
 	pb "identity/verifypb"
 )
 
-// TODO: give the provider call the 3 s deadline, keep the account unverified on a timeout and
-// queue the retry, treat a hard bounce as terminal with the address suppressed for signup, and
-// grant "verified" only from the provider confirmation — never from the send result.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 type Client struct {
 	provider   pb.VerificationClient
 	accounts   Accounts
@@ -648,9 +640,7 @@ object VerificationClient {
   val provider = VerificationGrpc.blockingStub(ManagedChannelBuilder.forAddress("verify-provider", 9000).usePlaintext().build())
   val retryQueue = mutable.ArrayBuffer.empty[String]
 
-  // TODO: give the provider call the 3 s deadline, keep the account unverified on a timeout and
-  // queue the retry, treat a hard bounce as terminal with the address suppressed for signup, and
-  // grant "verified" only from the provider confirmation — never from the send result.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def sendVerification(email: String): Unit = {
     try {
       provider.sendVerification(SendRequest(email = email))
@@ -763,9 +753,7 @@ object VerificationClient {
 #include <string>
 #include <thread>
 
-// TODO: give the provider call the 3 s deadline, keep the account unverified on a timeout and
-// queue the retry, treat a hard bounce as terminal with the address suppressed for signup, and
-// grant "verified" only from the provider confirmation — never from the send result.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void send_verification(Verification::Stub* provider, const std::string& email) {
   while (true) {
     grpc::ClientContext ctx;
@@ -876,5 +864,7 @@ void retry_worker() {
 `,
     },
   },
-  debrief: `One question sits under all five checks: what does the system believe when the provider is unavailable? The starter answers “that the address is verified”, because a send that timed out looked, to a hurried author, like a send that succeeded — and the account row is what every later login trusts. The fix separates three things the starter merged: the *send* (best effort, bounded, retried with backoff), the *address’s standing* (unverified until the provider confirms, suppressed after a hard bounce) and the *proof* (only the \`ConfirmVerification\` reply may write \`verified\`). A timeout therefore queues work and changes nothing about the user’s status; a bounce stops the retries and bars the address from signup, because the provider has told you it will never be deliverable; and the confirmation path is the single writer of \`verified\`, which is what makes “verified email” mean something at login time. The starter is indistinguishable from the fix while the provider is healthy, which is exactly why the failure paths are the interview. Real services add a jittered backoff, a signed single-use confirmation token with its own expiry, a bounce/complaint webhook from the provider that feeds the same suppression list, and a dashboard for addresses stuck unverified longer than a day.`,
+  debrief: `The fix separates three things the starter merged: the *send* (best effort, bounded by a deadline, retried with backoff), the *address's standing* (unverified until the provider confirms, suppressed after a hard bounce) and the *proof* (only the \`ConfirmVerification\` reply may write \`verified\`). That split is why a timeout queues work and changes nothing about the user's status, why a bounce stops the retries and bars the address from signup, and why the confirmation path is the single writer of \`verified\`, which is what makes "verified email" mean something at login time. The starter is indistinguishable from the fix while the provider is healthy; the failure paths are where it diverges.
+
+Production services add a jittered backoff, a signed single-use confirmation token with its own expiry, a bounce and complaint webhook from the provider that feeds the same suppression list, and a dashboard for addresses stuck unverified longer than a day.`,
 };

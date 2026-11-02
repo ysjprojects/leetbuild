@@ -8,40 +8,26 @@ export const cacheEndpointStep: Step = {
   focus: ['client', 'cache', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it hashes the prefix, looks the
-hash up, and returns a completion the moment it finds one. The demo never shows the bug because the
-demo has one tenant and one prompt version. Three things are missing from the key — the tenant, the
-prompt version and the raw text's exclusion — and each of them is a leak on its own. Debug the starter
-as the owner of the cache, fix it, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/completions/cached\` with body
+\`{"prefix": "…", "prompt_version": 7, "temperature": 0}\`: it hashes the prefix, looks the hash up in
+Redis and answers \`"hit"\` when it finds a record. It serves the demo and hides five flaws.
 
-Implement \`POST /v1/completions/cached\` with body
-\`{"prefix": "…", "prompt_version": 7, "temperature": 0}\`.
+**Failure mode the checks target.** The key is a function of the prompt only, so the first tenant to
+warm a popular prefix serves everybody, and old-template output survives a version bump. A cache key
+is a security boundary and must carry every dimension the answer depends on.
 
-- The tenant comes from the authenticated request, not the body: read the \`x-tenant-id\` header and
-  answer **401** with \`{"error": "tenant_required"}\` when it is absent. A tenant taken from the body
-  is a tenant the caller can choose, which is the same as having no tenant at all.
-- \`prefix\` is a non-empty UTF-8 string of at most **8 KiB** (\`8 * 1024\` bytes); a larger prefix is
-  **413** and the error body must **never** echo a slice of the prefix — an error body is copied into
-  logs, traces and client crash reports.
-- The cache key is \`pc:{tenant}:{version}:{digest}\` where \`digest\` is a **SHA-256** hex digest of
-  the prefix. Build it with one helper, \`cache_key(tenant, version, prefix)\`, so every caller of the
-  cache has to pass all three. The starter builds \`cache:{sha256(prefix)}\` — a prefix hash alone — so
-  two tenants that both send \`"You are a helpful assistant…"\` share one entry, and a prompt-template
-  change keeps serving completions produced by the old template.
-- A hit is returned **only when all three match**. Re-read the stored record's \`tenant\` and
-  \`version\` and compare them with the caller's before answering \`"hit"\`; a stored record whose tenant
-  or version disagrees is a **miss**. The key already scopes the entry, and the re-check is what keeps
-  a stale or hand-seeded value from crossing the boundary anyway.
-- A version bump must invalidate the whole namespace **without a manual purge**: because the version
-  is part of the key, version 8 simply has no entries yet. Never scan, \`KEYS\` or \`SCAN\`-and-delete to
-  invalidate — that is an outage waiting for a big keyspace.
-- The response is \`{"status", "completion"}\` with \`status\` one of \`"hit"\` or \`"miss"\`. Log the
-  **key**, never the prefix.
-
-**Failure mode the checks target.** The starter's key is a function of the prompt only, so the cache
-boundary is the prompt's popularity instead of the tenant's identity: the first tenant to warm a
-popular prefix serves everybody, and old-template output never expires. A cache key is a security
-boundary, and it must be built from every dimension the answer depends on.`,
+- The tenant is the \`x-tenant-id\` header, not a body field; absent means **401**
+  \`{"error": "tenant_required"}\`.
+- \`prefix\` is at most **8 KiB** (\`8 * 1024\` bytes); over that is **413** with a body that does not
+  echo any of the prefix, because error bodies end up in logs and crash reports.
+- The key is \`pc:{tenant}:{version}:{digest}\` with a **SHA-256** hex digest, built by one helper,
+  \`cache_key(tenant, version, prefix)\`, so every caller has to pass all three.
+- A hit requires the stored record's \`tenant\` and \`version\` to equal the caller's; a disagreement
+  is a miss.
+- A version bump invalidates the namespace by itself (version 8 has no entries yet); no \`KEYS\` or
+  \`SCAN\`-and-delete.
+- The response is \`{"status", "completion"}\` with \`status\` \`"hit"\` or \`"miss"\`. Log the **key**,
+  not the prefix.`,
   sequence: {
     participants: ['Client', 'Prompt Cache', 'Redis'],
     messages: [
@@ -59,9 +45,9 @@ boundary, and it must be built from every dimension the answer depends on.`,
     ],
   },
   hints: [
-    'Write the key as one format string — `pc:{tenant}:{version}:{digest}` — and one helper that fills all three parts. If a cache key can be built by passing only a prefix, someone eventually will. The digest is `sha256(prefix)`, never the prefix itself: keys show up in `MONITOR`, in slow logs and in dashboards.',
-    'The tenant is the authenticated identity, so it comes from the header, and a missing header is a 401 rather than a default. A version that is not part of the key cannot be invalidated except by a purge, and a purge is a self-inflicted outage; making the prompt version part of the key turns "bump the template" into "write a new namespace".',
-    'Cheap belt-and-braces: even though the key is scoped, compare the stored record’s `tenant` and `version` before you call it a hit. Hand-seeded entries, a migration that rewrote keys and a bug in a future refactor all produce records that the key alone would trust.',
+    "Two tenants that share a system prompt get each other's completions, a template bump keeps serving old output, and customer prompt text shows up in the log stream and in 413 error reports.",
+    'The key is `cache:{sha256(prefix)}`: no tenant, no version, so any record found by prefix is trusted. The tenant is read from the body, and `prefix` is logged and sliced into the 413 body.',
+    "Read `x-tenant-id` (401 when absent), build `pc:{tenant}:{version}:{digest}` in one `cache_key` helper, log only the key, drop `sample` from the 413 body, and compare the record's tenant and version before answering hit.",
   ],
   checks: [
     {
@@ -167,9 +153,7 @@ store = Redis.from_url("redis://cache:6379/0")
 
 @app.post("/v1/completions/cached")
 async def completions_cached(request: Request) -> JSONResponse:
-    # TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
-    # prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
-    # slice of it in the 413 body.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = await request.json()
     tenant = payload["tenant"]
     prefix = payload["prefix"]
@@ -251,9 +235,7 @@ interface CompletionBody {
 }
 
 app.post('/v1/completions/cached', async (request, reply) => {
-  // TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
-  // prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
-  // slice of it in the 413 body.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const body = request.body as CompletionBody;
   if (Buffer.byteLength(body.prefix, 'utf8') > 8 * 1024) {
     return reply.code(413).send({error: 'prefix_too_large', sample: body.prefix.slice(0, 64)});
@@ -340,9 +322,7 @@ type completionBody struct {
 	PromptVersion int    \`json:"prompt_version"\`
 }
 
-// TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
-// prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
-// slice of it in the 413 body.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func completionsCached(w http.ResponseWriter, r *http.Request) {
 	var body completionBody
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -436,9 +416,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 
 object PromptCacheApi {
-  // TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
-  // prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
-  // slice of it in the 413 body.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   val routes: Route = post {
     path("v1" / "completions" / "cached") {
       entity(as[CompletionBody]) { body =>
@@ -521,9 +499,7 @@ using json = nlohmann::json;
 
 std::string sha256_hex(const std::string& value);
 
-// TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
-// prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
-// slice of it in the 413 body.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void register_cached_completions(httplib::Server& server) {
   server.Post("/v1/completions/cached", [](const httplib::Request& request, httplib::Response& response) {
     const json body = json::parse(request.body);
@@ -593,5 +569,5 @@ void register_cached_completions(httplib::Server& server) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand that a cache key is an isolation boundary, not an optimisation detail. The starter’s key hashes the prompt and nothing else, so the entry that a hit selects is "whoever asked this prefix first" — which is a cross-tenant leak the moment a shared system prompt makes prefixes identical, and a stale-template bug the moment a prompt version bumps without a purge. Naming the three dimensions (tenant, version, prefix digest) and building the key in exactly one helper is what makes the boundary auditable: nobody can add a fourth call site that forgets a dimension when there is only one call site. The digest instead of the text keeps the boundary out of \`MONITOR\` output and slow logs, the header instead of the body keeps the tenant out of the caller’s reach, and the record re-check is the cheap belt to the key’s braces.`,
+  debrief: `The fix has the shape of a boundary: every dimension the answer depends on (tenant, prompt version, prefix digest) goes into the key, and the key is built in exactly one helper so no later call site can forget a dimension. The record re-check is cheap insurance against hand-seeded or migrated entries that the key alone would trust; taking the tenant from the header keeps identity out of the caller's reach; the digest keeps prompts out of \`MONITOR\` output and slow logs. Production caches go further and bind the key to the model id and decoding parameters too, since the same prefix under a different model is a different answer, and some hash with a per-deployment salt so a key dump cannot become a prefix oracle.`,
 };

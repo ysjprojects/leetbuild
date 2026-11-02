@@ -43,33 +43,27 @@ export const readStep: Step = {
   },
   task: `## Task
 
-**Starting point.** You are the AI platform engineer on call. A model version that shipped an hour ago
-already shows a healthy satisfaction score, because the endpoint aggregated all time and inherited the
-previous model's reputation. The handler below also serves a cached score that never
-refreshes after a bad release, and it lets the caller pass \`?window=all\` to choose whatever sample set
-flatters the number.
+**Starting point.** \`read\` serves \`GET /v1/models/{version}/satisfaction\`. It returns
+\`SCORE_CACHE[version]\` when present, otherwise calls \`satisfaction.all_time_totals(version)\`,
+divides positives by total, stores the body in \`SCORE_CACHE\` with no expiry, and echoes whatever
+\`?window=\` the caller sent (default \`all\`). It serves the demo and hides four flaws.
 
-Debug \`read\` and make the score honest.
+**Failure mode the checks target.** A model version that shipped an hour ago already shows a healthy
+score because it inherited the previous model's all-time votes, the cached score stays frozen after a
+bad release, and a caller can pick the window that flatters the number.
 
-- Route \`GET /v1/models/{version}/satisfaction\`. The window comes from a documented set — \`1h\`, \`24h\`,
-  \`7d\` (default \`24h\`) — and anything else is \`400\`; a caller must not be able to shrink the sample
-  set to cherry-pick.
-- Refuse to publish a score below \`MIN_SAMPLES = 50\`. A fresh version answers with its sample count and
-  \`insufficient_data\` rather than a number built on three votes.
-- Aggregate only the recent window: compute \`since = now − WINDOW_SECONDS[window]\` and count the ratings
-  inside it, so a fresh version cannot inherit an old model's reputation.
-- Cache the aggregate for a short TTL (\`CACHE_TTL_SECONDS = 60\`) keyed by version and window, and track
-  \`cached_at\`, so the score reflects feedback up to the last minute instead of a value frozen at the
-  bad release.
-
-**Failure mode the checks target.** An all-time aggregate plus an eternal cache is how a fresh model
-inherits the last one's score, and an open window parameter is how the sample set becomes a choice
-rather than a fact. The checks below require the honesty floor, the constrained window, the recent
-aggregate and the expiring cache.`,
+- The window comes from \`ALLOWED_WINDOWS\` (\`1h\`, \`24h\`, \`7d\`, default \`24h\`); anything else is
+  \`400\`.
+- Aggregate only the recent window: \`since = now - WINDOW_SECONDS[window]\` and count ratings inside
+  it. Remove the \`all_time\` path.
+- Below \`MIN_SAMPLES = 50\`, answer with the sample count and \`insufficient_data\` instead of a
+  score.
+- Cache the aggregate for \`CACHE_TTL_SECONDS = 60\`, keyed by version and window, with a
+  \`cached_at\` stamp so the score reflects feedback up to the last minute.`,
   hints: [
-    'The window is a whitelist, not a free parameter: keep the documented set in `ALLOWED_WINDOWS` and answer `400` for anything else. Default to `24h`, never to `all`.',
-    'Compute `since` from `WINDOW_SECONDS[window]` and ask the store for counts inside that window — the aggregate must not be able to fall back to all time.',
-    'Refuse to publish below `MIN_SAMPLES = 50`: report `samples` and `insufficient_data`. Cache the result with `CACHE_TTL_SECONDS = 60` and a `cached_at` stamp so a bad release cannot freeze the score forever.',
+    'A version released an hour ago shows 0.91 on the dashboard with eleven votes, and the number did not move after a rollback.',
+    '`all_time_totals(version)` folds in every vote ever recorded under that version string, and `SCORE_CACHE[version]` is written once and read forever; `?window=` only labels the body.',
+    'Compute `since` from `WINDOW_SECONDS[window]`, validate against `ALLOWED_WINDOWS`, and cache with `CACHE_TTL_SECONDS = 60` plus `cached_at`. The checks cover the `MIN_SAMPLES` floor.',
   ],
   checks: [
     {
@@ -163,9 +157,7 @@ satisfaction = SatisfactionStore()
 
 @app.get("/v1/models/{version}/satisfaction")
 def read_satisfaction(version: str, window: str = "all") -> JSONResponse:
-    # TODO: this starter serves a cache that never expires after a bad release, aggregates over all
-    # time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-    # sample set. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     if version in SCORE_CACHE:
         return JSONResponse(SCORE_CACHE[version])
     counts = satisfaction.all_time_totals(version)
@@ -271,9 +263,7 @@ export class SatisfactionStore {
 export const satisfaction = new SatisfactionStore();
 
 app.get('/v1/models/:version/satisfaction', async (request, reply) => {
-  // TODO: this starter serves a cache that never expires after a bad release, aggregates over all
-  // time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-  // sample set. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {version} = request.params as {version: string};
   const window = (request.query as {window?: string}).window ?? 'all';
   const hit = SCORE_CACHE.get(version);
@@ -386,9 +376,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readSatisfaction(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter serves a cache that never expires after a bad release, aggregates over all
-	// time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-	// sample set. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	version := r.PathValue("version")
 	window := r.URL.Query().Get("window")
 	if window == "" {
@@ -527,9 +515,7 @@ object SatisfactionApi {
     path("v1" / "models" / Segment / "satisfaction") { version =>
       get {
         parameter("window".?) { windowOpt =>
-          // TODO: this starter serves a cache that never expires after a bad release, aggregates over
-          // all time so a fresh version inherits an old model's reputation, and lets ?window=
-          // shrink the sample set. Fix all three.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           scoreCache.get(version) match {
             case Some(body) =>
               complete(StatusCodes.OK, body)
@@ -641,9 +627,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/models/([^/]+)/satisfaction)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter serves a cache that never expires after a bad release, aggregates over all
-    // time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-    // sample set. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const std::string version = req.matches[1];
     const auto hit = scoreCache.find(version);
     if (hit != scoreCache.end()) {
@@ -739,15 +723,13 @@ int main() {
 `,
     },
   },
-  debrief: `A satisfaction number is a claim, and the honesty floor is what makes it one: below 50 samples
-the only truthful answer is the sample count, because a score over three votes is noise wearing a
-decimal point. The window is the other half — an all-time aggregate lets a fresh model inherit the
-previous model's reputation, and an open \`window\` parameter lets the caller pick whichever sample set
-flatters the number.
+  debrief: `A satisfaction number is a claim, and the sample floor is what makes it one: below 50 samples
+the only truthful answer is the sample count, because a score over three votes is noise with a decimal
+point. An all-time aggregate lets a fresh model inherit the previous model's reputation, and an open
+\`window\` parameter lets the caller pick whichever sample set flatters the number.
 
 The cache is a correctness problem, not a performance one: a score cached without an expiry keeps
 serving the pre-release value until someone clears it by hand. A short TTL keyed by version and window
-bounds how stale the number can be. Real systems separate "the score for the window" from "the
-confidence in it", and often expose the unattributed share beside the score so a big attribution gap is
-visible instead of being averaged away.`,
+bounds the staleness. Production dashboards show a confidence interval and the unattributed share
+beside the score, so a large attribution gap is visible rather than averaged away.`,
 };

@@ -8,11 +8,11 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'outbox'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes an event per
-partition, then a completion event, and the demo shows a table light up in the consumer. It keyed the
-topic wrong, announced the load before it finished, reported the plan instead of the result, and
-dropped the event when the broker was unhappy. Debug it like the service owner, fix it, and prove
-the fix.
+**Starting point.** The starter's \`publish\` produces to \`load.event\` with a default
+\`confluent_kafka.Producer\`: when the partition id is the last one it sends \`load_completed\` first,
+then sends \`partition_committed\` for the partition, both keyed by manifest id and carrying
+\`rows_planned\` as the written count, and flushes after each produce. It serves the demo, where a
+table lights up in the consumer, and hides 5 flaws.
 
 Implement the \`load.event\` publisher that runs after each partition write.
 
@@ -54,9 +54,9 @@ ordering the consumer's offset assumes.`,
     ],
   },
   hints: [
-    'Order the calls in the function, not in your head: `state.commitPartition(...)` first, then the produce. If the event goes out first, a crash in between leaves the consumer announcing a partition that the progress set does not have.',
-    'The key is the target table — `key=table`, `Key: []byte(table)`, `ProducerRecord(Topic, table, payload)`. Hashing on the table is what keeps one table’s partitions in one Kafka partition and therefore in order.',
-    'Take the counts from the caller (which read them off the warehouse reply in step 3), not from the manifest. And wrap the produce: on a broker error write an outbox row with the topic, key and payload so the relay can publish it after the broker recovers.',
+    'Symptom: a dashboard shows a table as loaded, then watches partitions trickle in afterwards; after a broker restart, a load that finished has no event at all, and the counts always equal the plan.',
+    'Mechanism: the completion produce runs before the final commit, the key is the manifest id so one table spreads across partitions, `rows_planned` is copied into `rows_written`, and a produce error is uncaught.',
+    'Fix: configure `enable.idempotence` and `"acks": "all"`, call `state.commit_partition(...)` before `producer.produce(..., key=table)`, pass the warehouse count as `rows_written`, and on `except` write `outbox.put(...)`.',
   ],
   checks: [
     {
@@ -139,9 +139,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish(producer, state, manifest_id, target, partition_id, total_partitions, rows_planned):
-    # TODO: this starter keys the event by manifest, publishes the completion event before the final
-    # partition commits, reports the manifest's planned row count, and drops the event when the
-    # broker rejects the produce. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if partition_id == f"{total_partitions - 1}":
         producer.produce(
             TOPIC,
@@ -254,9 +252,7 @@ export async function publish(
   totalPartitions: number,
   rowsPlanned: number,
 ): Promise<void> {
-  // TODO: this starter keys the event by manifest, publishes the completion event before the final
-  // partition commits, reports the manifest's planned row count, and drops the event when the
-  // broker rejects the produce. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   connected ??= producer.connect();
   await connected;
   const value = JSON.stringify({type: 'partition_committed', manifest_id: manifestId, partition_id: partitionId, target, rows_written: rowsPlanned});
@@ -383,9 +379,7 @@ type LoadEvent struct {
 
 // Publish announces a partition commit (and the load completion) on load.event.
 func Publish(ctx context.Context, state LoadState, manifestID, target, partitionID string, totalPartitions int, rowsPlanned int64) error {
-	// TODO: this starter keys the event by manifest, publishes the completion event before the final
-	// partition commits, reports the manifest's planned row count, and drops the event when the
-	// broker rejects the produce. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	completion, _ := json.Marshal(LoadEvent{Type: "load_completed", ManifestID: manifestID, Target: target, RowsWritten: rowsPlanned})
 	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(manifestID), Value: completion}); err != nil {
 		log.Printf("dropping event: %v", err)
@@ -506,9 +500,7 @@ object LoadEvents {
 
   def publish(state: LoadState, manifestId: String, target: String, partitionId: String, totalPartitions: Int,
               rowsPlanned: Long): Unit = {
-    // TODO: this starter keys the event by manifest, publishes the completion event before the final
-    // partition commits, reports the manifest's planned row count, and drops the event when the
-    // broker rejects the produce. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"type":"partition_committed","manifest_id":"$manifestId","partition_id":"$partitionId","target":"$target","rows_written":$rowsPlanned}"""
     try {
       producer.send(new ProducerRecord[String, String](Topic, manifestId, payload)).get()
@@ -591,9 +583,7 @@ struct LoadState {
 // Announces a partition commit (and the load completion) on load.event.
 void publish(LoadState& state, const std::string& manifestId, const std::string& target,
              const std::string& partitionId, int totalPartitions, long rowsPlanned) {
-  // TODO: this starter keys the event by manifest, publishes the completion event before the final
-  // partition commits, reports the manifest's planned row count, and drops the event when the
-  // broker rejects the produce. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const std::string payload = "{\\"type\\":\\"partition_committed\\",\\"manifest_id\\":\\"" + manifestId +
                               "\\",\\"partition_id\\":\\"" + partitionId + "\\",\\"target\\":\\"" + target +
                               "\\",\\"rows_written\\":" + std::to_string(rowsPlanned) + "}";
@@ -677,14 +667,13 @@ void emit(const std::string& table, const LoadEvent& event) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand what a load event is *for*. It is not a
-notification; it is the ordered record of a table's loads, and three of the four defects follow from
-that. Keying by target table is what puts one table's events in one partition, so the consumer's
-offsets mean what it thinks they mean. Committing before publishing is what makes the event true: the
-produce is the last step of a commit, not an announcement of an intention, and \`load_completed\` must
-never overtake the final \`partition_committed\`. The counts must be the warehouse's counts, because the
-report in step 5 reconciles exactly those against the source and flags the difference — a plan
-smuggled into that field hides the very delta the platform exists to surface. And the outbox exists
-because the load already happened: the event is the only evidence of it, so a broker hiccup must
-delay it, never erase it.`,
+  debrief: `The fix follows from what a load event is for: it is the ordered record of a table's loads, not a
+notification. Keying by target table puts one table's events in one partition, so the consumer's
+offsets mean what it thinks they mean. Committing before publishing makes the event true: the produce
+is the last step of a commit, so \`load_completed\` cannot overtake the final \`partition_committed\`.
+The counts are the warehouse's, because step 5 reconciles exactly those against the source. The
+outbox exists because the load already happened and the event is the only evidence of it, so a
+broker hiccup delays it rather than erasing it. Production publishers also run the outbox relay as a
+separate process with its own offset, dedupe on \`(manifest id, partition id)\` at the consumer, and
+emit a schema version in every payload.`,
 };

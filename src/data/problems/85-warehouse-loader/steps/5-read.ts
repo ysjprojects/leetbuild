@@ -8,16 +8,15 @@ export const readStep: Step = {
   focus: ['reader', 'api', 'db', 'warehouse'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, looks
-the load up and answers with a body of counts, and the demo's numbers look right because the demo
-loads cleanly. It reports the plan instead of the result, hides the rows that were rejected, and reads
-freshness from whichever process happens to answer. Debug it like the analyst who has to close the
-month on those numbers, fix it, and prove the fix.
+**Starting point.** The starter registers \`GET /v1/loads/{load_id}\`, takes the tenant from
+\`X-Tenant-Id\`, fetches the load record and answers \`200\` with \`rows_read\` and \`rows_written\`
+both copied from the record's \`rows_planned\`, plus a \`freshness\` value read from
+\`freshness:{WORKER_ID}\` in Redis. It serves the demo, whose loads are clean, and hides 4 flaws.
 
-Implement \`GET /v1/loads/{id}\` — the report a finance or ops reader consults after a load.
+Implement \`GET /v1/loads/{id}\` as the report a finance or ops reader consults after a load.
 
-- **401** when \`X-Tenant-Id\` is missing, **404** when the load is not this tenant's. Never report
-  another tenant's load.
+- **401** when \`X-Tenant-Id\` is missing, **404** when the load is not this tenant's; another
+  tenant's load is not reported.
 - \`rows_read\`: the source rows the loader actually **read** (recorded when partitions were read,
   not the count the manifest *planned*).
 - \`rows_written\`: the rows the **warehouse** holds for this load, read back from the warehouse —
@@ -55,9 +54,9 @@ The delta flag is the report's contract with its reader: reconcile, or say so.`,
     ],
   },
   hints: [
-    'Each number has one honest source: `rows_read` from the load record, `rows_written` from the warehouse query, `rows_rejected` from the reject log. The manifest’s plan is only useful as the thing the delta is measured against, and it never goes in the response.',
-    'Surface the rejections instead of summing them away: map each entry to `{partition_id, reason, rows}`, sum them into `rows_rejected`, and keep the list in the body. A reader who cannot see the reason cannot fix the feed.',
-    'Freshness is a property of the **table**, so the key is `freshness:{target}` (or the table-scoped registry your stack exposes). Then `delta = rows_read - rows_written - rows_rejected` and `flagged` is `delta != 0` — the report never hides a difference it cannot explain.',
+    'Symptom: finance closes the month on a report that says 1,000,000 rows read and 1,000,000 written, while the table holds 940,000. The same load reports a different freshness depending on which replica answers.',
+    'Mechanism: both counts are `load["rows_planned"]`, so the delta is zero by construction; the reject log is not consulted; and `freshness:{WORKER_ID}` is a per-process key, not a property of the table.',
+    'Fix: `rows_written = warehouse.rows_written(load_id)`, map rejects to `{partition_id, reason, rows}` and sum `rows_rejected`, read `freshness.table_freshness(target)`, then `delta = rows_read - rows_written - rows_rejected` and `flagged = delta != 0`.',
   ],
   checks: [
     {
@@ -150,8 +149,7 @@ r = redis.Redis(host="redis", port=6379)
 
 @app.get("/v1/loads/{load_id}")
 def read_load(load_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
-    # freshness from a per-process key, so a lagging table looks fresh. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     load = store.get(tenant, load_id)
     return JSONResponse(
         {
@@ -246,8 +244,7 @@ export const app = Fastify();
 export const redis = new Redis('redis://redis:6379');
 
 app.get('/v1/loads/:loadId', async (request, reply) => {
-  // TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
-  // freshness from a per-process key, so a lagging table looks fresh. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const {loadId} = request.params as {loadId: string};
   const record = await store.get(tenant, loadId);
@@ -367,8 +364,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readLoad(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
-	// freshness from a per-process key, so a lagging table looks fresh. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	tenant := r.Header.Get("X-Tenant-Id")
 	loadID := r.PathValue("load_id")
 	record, err := store.Get(r.Context(), tenant, loadID)
@@ -526,8 +522,7 @@ object LoadReportApi {
     path("v1" / "loads" / Segment) { loadId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this starter reports the manifest's planned counts, hides the rejected rows, and
-          // reads freshness from a per-process key, so a lagging table looks fresh. Fix all three.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val record = store.get(tenant, loadId)
           complete(
             StatusCodes.OK,
@@ -656,8 +651,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/loads/([A-Za-z0-9-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
-    // freshness from a per-process key, so a lagging table looks fresh. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto loadId = req.matches[1].str();
     const auto record = store.get(tenant, loadId);
@@ -769,14 +763,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether a report can be trusted, which is a different question from
-whether it is correct. The starter compiles, the numbers are integers, and the demo's table is fresh —
-but every field is sourced from the wrong place. Written counts must come back from the warehouse,
-because the plan was the loader's intention and the delta exists precisely to compare the two;
-rejected rows must surface with their reasons, because the only way a reader can repair a feed is to
-see which partition refused which rows; freshness belongs to the table, so a replica that never
-touched the load cannot report a fresher number than the data; and the delta has to be computed and
-flagged, so an unexplained difference is the report's headline rather than something a finance analyst
-discovers three days later. Real platforms add a per-partition drill-down, a diff against the previous
-manifest, and an alert when \`flagged\` persists across two consecutive loads.`,
+  debrief: `The fix moves every field to the source that can contradict the plan. Written counts come back from
+the warehouse, because the plan was the loader's intention and the delta exists to compare the two.
+Rejected rows surface with their reasons, because the only way a reader can repair a feed is to see
+which partition refused which rows. Freshness belongs to the table, so a replica that touched nothing
+cannot report a fresher number than the data. And the delta is computed and flagged in the response,
+so an unexplained difference is the report's headline rather than something an analyst discovers three
+days later. Production reports also offer a per-partition drill-down, a diff against the previous
+manifest for the same table, and an alert when \`flagged\` stays true across consecutive loads.`,
 };

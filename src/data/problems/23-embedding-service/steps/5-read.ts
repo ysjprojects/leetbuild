@@ -8,25 +8,21 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it looks up a key and returns
-what it finds. Three things are wrong, and each one leaks data or a wrong vector. Find them and fix
-them.
+**Starting point.** The starter registers \`GET /v1/embeddings/{content_hash}\`, the read the indexer
+and the retriever both use: it looks up \`vector:{content_hash}\`, returns the stored entry on a hit
+and \`200 {"vector": []}\` on a miss. It compiles, serves the demo, and hides 4 flaws.
 
-Implement \`GET /v1/embeddings/{content_hash}\`, the read the indexer and the retriever both use:
+**Failure mode the checks target.** One tenant reading another's vector by guessing a hash, a \`v2\`
+request served the \`v1\` vector, and an empty 200 that every caller caches as if it were real.
 
-- Resolve the **tenant from auth first**; a missing \`X-Tenant-Id\` is **401**. The starter looks the
-  vector up before it knows who is asking, so one tenant can read another's vector by guessing a hash.
+Requirements:
+
+- Resolve the **tenant from auth first**; a missing \`X-Tenant-Id\` is **401**.
 - Serve the vector **for the requested model version**. The key is the same
-  \`(tenant, model version, content hash)\` the write path used; the starter returns the first hit
-  regardless of version, so a \`v2\` request serves the \`v1\` vector.
-- A **miss is a 404** that points at the write path, not a 200 with an empty vector. The starter answers
-  \`200 {"vector": []}\`, so callers cache an empty embedding as if it were real.
-- The response carries the **model version and the dimension** alongside the vector, so the caller can
-  verify the shape instead of trusting it.
-
-**Failure mode the checks target.** The read path is where a cache's key discipline is proven: lookup
-before auth leaks across tenants, dropping the version from the key serves stale vectors, and an empty
-200 teaches every caller that a missing vector is a valid one.`,
+  \`(tenant, model version, content hash)\` the write path used.
+- A **miss is a 404** that points at the write path, not a 200 with an empty vector.
+- The response carries the **model version and the dimension** alongside the vector, so the caller
+  can verify the shape instead of trusting it.`,
   sequence: {
     participants: ['Client', 'Embedding API', 'Vector cache'],
     messages: [
@@ -39,9 +35,9 @@ before auth leaks across tenants, dropping the version from the key serves stale
     ],
   },
   hints: [
-    'Read the tenant from `X-Tenant-Id` and reject an empty one before the cache is touched — the tenant is part of the key, not a filter applied afterwards.',
-    'Build the same key the write path built: tenant, model version and content hash. A request for another version must miss, not serve the old vector.',
-    'A miss is a 404 that names the write path; never answer 200 with an empty vector, because callers cache it as if it were real.',
+    "A tenant reports seeing vectors for text it never embedded; after the model upgrade, reads return the old model's vectors; the retriever ranks documents with an empty embedding.",
+    'The lookup runs before anyone checks the header, and the key is the bare hash, so any tenant and any version hit the same entry. A miss returns 200 with an empty list.',
+    'Return 401 before the Redis call when `X-Tenant-Id` is empty; build `read_key(tenant, model_version, content_hash)`; on a miss return 404 with `write_path`; include `model_version` and `dimension` on a hit.',
   ],
   checks: [
     {
@@ -111,7 +107,7 @@ before auth leaks across tenants, dropping the version from the key serves stale
   ],
   code: {
     python: {
-      starter: `"""Draft: GET /v1/embeddings/{content_hash} — lookup first, first hit wins, empty 200 on a miss."""
+      starter: `"""GET /v1/embeddings/{content_hash}: serves a cached vector by content hash."""
 import json
 
 from fastapi import FastAPI
@@ -124,9 +120,7 @@ MODEL_VERSION = "text-embedding-v1"
 
 @app.get("/v1/embeddings/{content_hash}")
 def read_embedding(content_hash: str) -> JSONResponse:
-    # TODO: check the tenant first (the starter looks the vector up first), keep the model version in
-    # the key (the starter returns the first hit regardless of version) and answer 404 on a miss
-    # instead of 200 with an empty vector.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     entry = r.get(f"vector:{content_hash}")
     if entry is None:
         return JSONResponse({"vector": []}, status_code=200)
@@ -174,7 +168,7 @@ def read_embedding(
 `,
     },
     typescript: {
-      starter: `/** Draft: GET /v1/embeddings/{content_hash} — lookup first, first hit wins, empty 200 on a miss. */
+      starter: `/** GET /v1/embeddings/{content_hash}: serves a cached vector by content hash. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -184,9 +178,7 @@ const r = new Redis({host: 'redis', port: 6379});
 const MODEL_VERSION = 'text-embedding-v1';
 
 app.get('/v1/embeddings/:contentHash', async (request, reply) => {
-  // TODO: check the tenant first (the starter looks the vector up first), keep the model version in
-  // the key (the starter returns the first hit regardless of version) and answer 404 on a miss
-  // instead of 200 with an empty vector.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {contentHash} = request.params as {contentHash: string};
   const entry = await r.get(\`vector:\${contentHash}\`);
   if (entry === null) return reply.code(200).send({vector: []});
@@ -226,7 +218,7 @@ app.get('/v1/embeddings/:contentHash', async (request, reply) => {
 `,
     },
     go: {
-      starter: `// Draft: GET /v1/embeddings/{content_hash} — lookup first, first hit wins, empty 200 on a miss.
+      starter: `// GET /v1/embeddings/{content_hash}: serves a cached vector by content hash.
 package main
 
 import (
@@ -237,9 +229,7 @@ import (
 const modelVersion = "text-embedding-v1"
 
 func handleRead(w http.ResponseWriter, r *http.Request) {
-	// TODO: check the tenant first (the starter looks the vector up first), keep the model version in
-	// the key (the starter returns the first hit regardless of version) and answer 404 on a miss
-	// instead of 200 with an empty vector.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	contentHash := r.PathValue("contentHash")
 	entry, err := rdb.Get(r.Context(), "vector:"+contentHash).Result()
 	if err != nil {
@@ -302,7 +292,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `// Draft: GET /v1/embeddings/{content_hash} — lookup first, first hit wins, empty 200 on a miss.
+      starter: `// GET /v1/embeddings/{content_hash}: serves a cached vector by content hash.
 import org.apache.pekko.http.scaladsl.model.StatusCodes
 import org.apache.pekko.http.scaladsl.server.Directives._
 
@@ -312,9 +302,7 @@ object ReadEndpoint {
   val route =
     path("v1" / "embeddings" / Segment) { contentHash =>
       get {
-        // TODO: check the tenant first (the starter looks the vector up first), keep the model version
-        // in the key (the starter returns the first hit regardless of version) and answer 404 on a
-        // miss instead of 200 with an empty vector.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         store.get("vector:" + contentHash) match {
           case Some(stored) => complete(StatusCodes.OK, stored)
           case None         => complete(StatusCodes.OK, """{"vector":[]}""")
@@ -366,7 +354,7 @@ object ReadEndpoint {
 `,
     },
     cpp: {
-      starter: `// Draft: GET /v1/embeddings/{content_hash} — lookup first, first hit wins, empty 200 on a miss.
+      starter: `// GET /v1/embeddings/{content_hash}: serves a cached vector by content hash.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -377,9 +365,7 @@ constexpr char kModelVersion[] = "text-embedding-v1";
 int main() {
   httplib::Server svr;
   svr.Get(R"(/v1/embeddings/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: check the tenant first (the starter looks the vector up first), keep the model version in
-    // the key (the starter returns the first hit regardless of version) and answer 404 on a miss
-    // instead of 200 with an empty vector.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const std::string contentHash = req.matches[1];
     auto entry = redis.get("vector:" + contentHash);
     if (!entry) {
@@ -440,8 +426,13 @@ int main() {
 `,
     },
   },
-  debrief: `The read path is where the cache's key discipline is proven. Resolve the tenant before the lookup —
-the tenant is part of the key, not a filter — or a guessed hash reads across tenants. Keep the model
-version in the key or an upgrade serves the old vector. And make a miss a 404: an empty 200 teaches
-every caller that a missing vector is a valid one.`,
+  debrief: `The read path is where the cache's key discipline is proven, because a read that builds a different
+key than the write silently serves the wrong thing. The tenant is resolved before the lookup because
+it is part of the key, not a filter applied to the result; a guessed hash then misses instead of
+reading across tenants. The model version stays in the key so an upgrade is a miss, and a miss is a
+404 because an empty 200 is indistinguishable from a real vector to a caller that caches responses.
+
+This step trusts \`X-Model-Version\` as sent. A production read validates the version against the
+models actually deployed, sets \`Vary\` so an intermediate cache keys on tenant and version, and
+serves vectors as base64 or float16 to cut the payload.`,
 };

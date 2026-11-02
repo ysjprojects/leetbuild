@@ -8,29 +8,24 @@ export const dependencyStep: Step = {
   focus: ['registry', 'validator', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the validator client: it
-calls the validator, reads the result and promotes on a pass. It compiles, it passes the demo
-because the validator is fast and the object is small, and it hides three production flaws. Debug it like the owner of the gate in front of every promotion.
-
-Implement \`POST /v1/datasets/{dataset}/versions/{version}/validate\`.
-
-- The validator call carries a **30000 ms (30 s) deadline** — a call timeout, a context with
-  timeout, \`withDeadlineAfter\`, \`set_deadline\`. Without it a stuck validator holds the request
-  open and the candidate is never decided.
-- A **timeout never promotes.** On \`DEADLINE_EXCEEDED\` mark the candidate \`pending\`, keep the
-  previous version as latest, and answer \`202\`. The starter promotes on timeout, so unvalidated data
-  reaches training under a clean version name.
-- The report must say **how much of the object was covered**: \`rows_scanned\` and \`rows_total\`, or
-  an explicit coverage figure. A check that only ever inspected the first 1000 rows is not a check
-  of the dataset, and the caller has to be able to see that.
-- Review comments **create a new candidate version** (\`next_candidate_version\` → \`-r2\`, \`-r3\`, …)
-  through \`rework_candidate\`. The starter edits the reviewed candidate in place, so the artifact the
-  reviewer approved is not the artifact that gets promoted.
+**Starting point.** The starter serves \`POST /v1/datasets/{dataset}/versions/{version}/validate\`
+with a candidate body (\`dataset\`, \`version\`, \`content_sha256\`, \`rows_total\`, \`notes\`). It calls
+the validator stub with a 1000-row limit and no deadline, promotes on a pass or on an RPC error,
+marks the candidate pending on a fail, and \`apply_review\` writes comments onto the candidate it was
+given. It compiles, it passes the demo because the validator is fast, and it hides four flaws.
 
 **Failure mode the checks target.** A deadline that promotes on expiry is worse than no deadline:
-it converts "I do not know" into "validated". An in-place edit after review is the quiet one — the
-version hash still describes the bytes, but nobody can say which review the promoted artifact
-actually passed.`,
+it converts "I do not know" into "validated". An in-place edit after review is subtler: the hash
+still describes the bytes, but nobody can say which review the promoted artifact passed.
+
+- The validator call carries a **30000 ms (30 s) deadline** (a call timeout, a context with
+  timeout, \`withDeadlineAfter\`, \`set_deadline\`).
+- A **timeout does not promote.** On \`DEADLINE_EXCEEDED\` mark the candidate \`pending\`, keep the
+  previous version as latest, and answer \`202\`.
+- The report says **how much of the object was covered**: \`rows_scanned\` and \`rows_total\`, or an
+  explicit coverage figure. A 1000-row prefix is not a check of the dataset.
+- Review comments **create a new candidate version** (\`next_candidate_version\` → \`-r2\`, \`-r3\`, …)
+  through \`rework_candidate\`, so the approved artifact is the promoted artifact.`,
   sequence: {
     participants: ['Registry API', 'Validator (gRPC)', 'registry store'],
     messages: [
@@ -156,8 +151,7 @@ channel = grpc.insecure_channel("validator:50051")
 
 
 def validate_candidate(stub, candidate: Candidate) -> dict:
-    # TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
-    # candidate in place after review comments. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     request = registry_pb2.ValidateRequest(
         dataset=candidate.dataset, version=candidate.version, limit=VALIDATOR_SAMPLE_ROWS
     )
@@ -334,8 +328,7 @@ interface Candidate {
 const stub = new registry.registry.ValidatorClient('validator:50051', grpc.credentials.createInsecure());
 
 function validateCandidate(candidate: Candidate): Promise<{checked: number; passed: boolean}> {
-  // TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
-  // candidate in place after review comments. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {promise, resolve, reject} = Promise.withResolvers<{checked: number; passed: boolean}>();
   stub.Validate(
     {dataset: candidate.dataset, version: candidate.version, limit: VALIDATOR_SAMPLE_ROWS},
@@ -506,8 +499,7 @@ type ValidationReport struct {
 }
 
 func validateCandidate(ctx context.Context, client registrypb.ValidatorClient, candidate Candidate) (ValidationReport, error) {
-	// TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
-	// candidate in place after review comments. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	response, err := client.Validate(ctx, &registrypb.ValidateRequest{
 		Dataset: candidate.Dataset,
 		Version: candidate.Version,
@@ -708,8 +700,7 @@ object Client {
   )
 
   def validateCandidate(candidate: Candidate): ValidationReport = {
-    // TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
-    // candidate in place after review comments. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val response = stub.validate(ValidateRequest(candidate.dataset, candidate.version, SampleRows))
     ValidationReport(SampleRows, response.passed)
   }
@@ -848,8 +839,7 @@ struct ValidationReport {
 
 static ValidationReport validateCandidate(Registry::Validator::Stub& stub, const std::string& dataset,
                                           const std::string& version) {
-  // TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
-  // candidate in place after review comments. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   ValidateRequest request;
   request.set_dataset(dataset);
   request.set_version(version);
@@ -992,9 +982,9 @@ int main() {
     },
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline: Date.now() + …`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). It is 30 seconds, and it exists so a stuck validator produces a decision instead of an open request.',
-    'On `DEADLINE_EXCEEDED` the candidate is `pending` and the previous version is still latest: return 202 with the held version. Promoting on timeout turns "I do not know" into "validated" — exactly the failure this gate exists to prevent.',
-    'A report without `rows_scanned`/`rows_total` hides a prefix scan. And review comments are a new artifact: `rework_candidate` derives `-r2`; editing the reviewed candidate in place means the approved bytes are not the promoted bytes.',
+    'The validator hangs on a 40 GB object; the request sits open, and when the stub finally errors the candidate is promoted anyway. Every report says `checked: 1000` whatever the dataset size.',
+    '`stub.Validate` is called with no timeout and a 1000-row `limit`; the `except grpc.RpcError` branch calls `store.promote`; the report never carries the total; `apply_review` mutates the candidate it reviewed.',
+    'Pass `timeout=VALIDATION_DEADLINE_S` (30), map `DEADLINE_EXCEEDED` to `ValidationTimedOut` and `mark_pending` with 202, return `rows_scanned` and `rows_total`, and add `rework_candidate` using `next_candidate_version`.',
   ],
-  debrief: `The interviewer is testing the gate in front of a promotion, not the gRPC call itself. The starter looks right because the validator is fast, the object is small and nobody has left review comments yet. Three defects are checked: a missing deadline, a timeout that promotes, and a report with no coverage — a 1000-row sample presented as a pass. The fourth idea is version identity: review feedback has to create a new candidate, because a version name that can be edited after approval cannot be relied on by anyone downstream. Real registries add schema conformance and license compatibility to the same report, cache the report by (content hash, validator version), and require the validator's own version in the promotion record so a validator upgrade can invalidate old passes.`,
+  debrief: `The gate's shape comes from one asymmetry: a promotion that should not have happened is far more expensive than one that waited. The deadline makes a stuck validator produce a decision, and the only decision a timeout may produce is "pending", because promoting on uncertainty is the exact failure the gate exists to stop. Coverage in the report keeps a 1000-row prefix from passing for a full scan, and a new candidate per review round keeps the approved artifact and the promoted artifact the same bytes. Production registries fold schema conformance and license compatibility into the same report, cache reports by (content hash, validator version), and record the validator's own version in the promotion so an upgraded validator can invalidate earlier passes.`,
 };

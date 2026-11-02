@@ -8,31 +8,27 @@ export const dependencyStep: Step = {
   focus: ['engine', 'fallback', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the period total and flushes it to
-billing. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the period flush that hands metered usage to billing over gRPC:
+\`flush_period(account, period)\` tries \`ClosePeriod\` up to three times, minting a fresh UUID close
+id on each attempt, with no deadline and no total, and returns "closed" whether or not any attempt
+succeeded. It compiles, serves the demo and hides four flaws.
 
-Implement the period flush that hands metered usage to the billing service over gRPC.
+**Failure mode the checks target.** Two defects compound. A timeout is treated as success, so the
+period stops being retried even though billing never saw it; and the retry mints a new close id, so
+the attempt that does land is a *different* period close from billing's point of view. The first
+half under-bills, the second half double-bills.
 
 - The close id is **derived**, not minted: \`close:{account}:{period}\`. Billing dedupes on it, so a
-  retry after a timeout must carry the *same* id — a fresh id per attempt is a second close, and a
-  second close is a double bill.
+  retry after a timeout carries the *same* id.
 - The \`ClosePeriod\` call carries a **5-second deadline** (\`DEADLINE_SECONDS\`). A call without a
   deadline hangs the worker and the period it was closing.
-- A deadline leaves the period **open**, not closed: \`DEADLINE_EXCEEDED\` means the close may or may
-  not have landed, so the only safe answer is to keep the period open and let the retry reuse the
-  close id. The starter marks the period closed on a timeout, so a period billing never received is
-  silently dropped — under-billing the account.
+- \`DEADLINE_EXCEEDED\` leaves the period **open**: the close may or may not have landed, so the period
+  stays open and the retry reuses the close id.
 - The total sent is read from the Redis counters, and the reply is **reconciled** against those same
   counters to the unit; a mismatch leaves the period open rather than reporting a close that does not
   tie out.
 - Return \`PERIOD_OPEN\` while the period is not confirmed closed, and \`PERIOD_CLOSED\` only when
-  billing has accepted a total that matches the counters.
-
-**Failure mode the checks target.** Two defects compound. A timeout is treated as success, so the
-period stops being retried even though billing never saw it; and the retry mints a new close id, so
-the attempt that does land is a *different* period close from billing's point of view — the first
-half under-bills, the second half double-bills.`,
+  billing has accepted a total that matches the counters.`,
   sequence: {
     participants: ['Metering worker', 'Billing service', 'Usage records'],
     messages: [
@@ -134,10 +130,7 @@ billing = billing_pb2_grpc.BillingStub(channel)
 
 
 def flush_period(account: str, period: str) -> str:
-    # TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
-    # period under a different id and double-bills; it calls billing with no deadline; and it marks
-    # the period closed even when the call times out, so a period billing never received is dropped.
-    # Fix all of it.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     for _ in range(3):
         close_id = str(uuid.uuid4())
         request = billing_pb2.ClosePeriodRequest(close_id=close_id, account=account, period=period)
@@ -207,10 +200,7 @@ import {billing} from './billing_client';
 const r = new Redis('redis://redis:6379');
 
 export async function flushPeriod(account: string, period: string): Promise<string> {
-  // TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
-  // period under a different id and double-bills; it calls billing with no deadline; and it marks
-  // the period closed even when the call times out, so a period billing never received is dropped.
-  // Fix all of it.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const closeId = randomUUID();
     try {
@@ -270,10 +260,7 @@ import (
 )
 
 func flushPeriod(ctx context.Context, billing BillingClient, account, period string) string {
-	// TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
-	// period under a different id and double-bills; it calls billing with no deadline; and it marks
-	// the period closed even when the call times out, so a period billing never received is dropped.
-	// Fix all of it.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	for attempt := 0; attempt < 3; attempt++ {
 		closeID := uuid.NewString()
 		if _, err := billing.ClosePeriod(ctx, &ClosePeriodRequest{CloseId: closeID, Account: account, Period: period}); err != nil {
@@ -347,10 +334,7 @@ import io.grpc.Status
 
 object Client {
   def flushPeriod(billing: BillingGrpc.BillingBlockingStub, account: String, period: String): String = {
-    // TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
-    // period under a different id and double-bills; it calls billing with no deadline; and it marks
-    // the period closed even when the call times out, so a period billing never received is dropped.
-    // Fix all of it.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     var attempt = 0
     while (attempt < 3) {
       val closeId = UUID.randomUUID().toString
@@ -405,10 +389,7 @@ object Client {
 
 std::string flushPeriod(std::shared_ptr<grpc::Channel> channel, const std::string& account,
                         const std::string& period) {
-  // TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
-  // period under a different id and double-bills; it calls billing with no deadline; and it marks
-  // the period closed even when the call times out, so a period billing never received is dropped.
-  // Fix all of it.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   auto stub = Billing::NewStub(channel);
   for (int attempt = 0; attempt < 3; ++attempt) {
     uuid_t raw;
@@ -475,17 +456,15 @@ std::string flushPeriod(std::shared_ptr<grpc::Channel> channel, const std::strin
     },
   },
   hints: [
-    'The close id is a name, not a nonce: `close:{account}:{period}`. Billing dedupes on that name, so every retry of the same period must present the same string. If you mint a new one after a timeout, billing sees a second period close and bills the account twice.',
-    'A timeout is not a success. `DEADLINE_EXCEEDED` means the request may have landed or may not; the only safe state is "still open", with the retry carrying the same close id so billing can drop the duplicate.',
-    'Reconcile before you report closed: send the total you read from Redis, and compare the reply against the same counters. A close whose total does not tie out is not a close.',
+    'Stall the billing stub for a minute: the worker hangs, then reports the period closed although billing has nothing for it. Let two attempts land and the invoice shows the period twice.',
+    'Each loop iteration builds a new `uuid4()` close id, calls with no timeout, swallows every `RpcError` and falls through to "closed". Nothing is read from Redis and nothing in the reply is compared.',
+    'Compute `close_id(account, period)` as `close:{account}:{period}`, pass `timeout=DEADLINE_SECONDS`, return `PERIOD_OPEN` on `DEADLINE_EXCEEDED`, send `window_total(account, period)` and compare the reply `total_units` before `PERIOD_CLOSED`.',
   ],
-  debrief: `The interviewer is testing idempotency across a network boundary. The starter's two defects are the
-classic pair: it confuses "the call finished" with "billing accepted the close", and it treats the
-close id as a per-attempt nonce instead of a per-period name. The first half under-bills — the period
-stops being retried after a timeout — and the second half double-bills when the retry lands under a
-different id. The fix is to make the close id a pure function of what is being closed, to translate a
-deadline into "still open", and to reconcile the reply against the same counters that produced the
-number. Real systems add a durable outbox row per period, a reconciliation job that compares billing's
-period totals with the gateway's counters nightly, and an alert on any period open longer than one
-window.`,
+  debrief: `The close id is a pure function of what is being closed because that is the only way a retry
+can tell billing "this is the same close again". A deadline translates into "still open" rather than
+"closed" because the worker cannot know which side of the timeout the request landed on, and open is
+the state a retry can recover from while closed is not. Reconciling the reply against the counters
+that produced the number closes the loop: a period is closed when billing agrees on the total, not
+when the RPC returns. Production flushes usually write a durable outbox row per period so a worker
+crash does not lose the attempt, and alert on any period that stays open longer than one window.`,
 };

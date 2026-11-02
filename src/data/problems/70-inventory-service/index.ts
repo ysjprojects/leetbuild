@@ -15,7 +15,7 @@ import {readStep} from './steps/5-read';
 export const inventoryServiceProblem: Problem = {
   id: 'inventory-service',
   title: 'Inventory Service',
-  tagline: 'Reserve stock without overselling, with holds that release cleanly.',
+  tagline: 'Reserve stock with one atomic decrement and holds that expire on time.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -29,19 +29,19 @@ number the storefront believes.
 
 ## The real system
 
-Production inventory receives reservation requests from every storefront and queue at once, and the
-last unit of a hot sku is contended by thousands of buyers in the same second. A read, a comparison
-and a write in three steps is an oversell waiting for load: both writers read 1, both compare 1 >=
-1, both write 0, and the same unit is sold twice. Real services make the check and the decrement one
-operation, keep a floor at zero inside the store, and let the loser fail cleanly with a conflict
-rather than silently going negative. A reservation is a *hold*: it expires, it is mirrored with a
-TTL, and a warehouse that never answers must not destroy the sale the customer already made — a
-timeout keeps the reservation pending and retries with the same id, while a terminal rejection
-releases the hold exactly once. Stock movement is an append-only ledger: events are keyed by sku so
-one sku's history stays ordered, deltas and reservation ids travel together, the hold is cleared
-before the release is published, and a broker outage drops the event into an outbox instead of
-losing it. And the stock endpoint reads the same counter the reservation path decrements, reports
-reserved and on-hand with explicit staleness, and never leaks another tenant's sku.
+Shopify's Admin API exposes the oversell problem directly: \`inventorySetQuantities\` takes a
+\`changeFromQuantity\` (the \`compareQuantity\` it replaces) so a write only lands if the current
+available quantity still equals the value the caller read, and a concurrent change comes back as a
+user error the caller retries with the fresh number. That compare-and-swap is the same shape as
+this course's Lua script: the check and the write are one operation, and the loser fails cleanly
+with a conflict instead of silently going negative. The rest of a production inventory path
+follows from it. A reservation is a *hold* that expires, mirrored with a TTL. A warehouse that does
+not answer must not destroy the sale the customer already made: a timeout keeps the reservation
+pending and retries with the same id, while a terminal rejection releases the hold exactly once.
+Stock movement is an append-only ledger keyed by sku, so one sku's history stays ordered, with an
+outbox for broker outages. And the stock endpoint reads the same counter the reservation path
+decrements, reports reserved and on-hand with explicit staleness, and keeps one tenant's sku out of
+another tenant's response.
 
 ## What you build here
 
@@ -51,13 +51,13 @@ One service, **inventoryd**, with five pieces:
    rejecting unknown skus and quantities over the per-order cap before any decrement, so a negative
    quantity cannot quietly increase stock and a replayed key returns the original reservation.
 2. A **Redis** counter decremented by one Lua script that refuses when the result would be negative,
-   with the reservation's TTL mirrored on a hold key — the check and the write are one atomic unit,
+   with the reservation's TTL mirrored on a hold key: the check and the write are one atomic unit,
    so two flash-sale buyers against the last unit yield exactly one success.
 3. A **gRPC** warehouse client: \`ConfirmReservation\` under a 2-second deadline, a timeout that
    leaves the reservation *pending* and retries once with the same reservation id, and a terminal
    rejection that releases the Redis hold exactly once.
 4. A **Kafka** \`inventory.event\` stream keyed by **sku**, carrying quantity deltas and reservation
-   ids, publishing reserve/confirm/release in order with an outbox for the broker outages — so a
+   ids, publishing reserve/confirm/release in order with an outbox for the broker outages, so a
    sku's movement stream is ordered and the ledger is rebuildable.
 5. \`GET /v1/skus/{id}/stock\`: \`available\`, \`reserved\` and \`on-hand\` computed through the same
    counter the reservation path decrements, with staleness reported when the warehouse sync is
@@ -67,7 +67,7 @@ One service, **inventoryd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real inventory platform: debug
-it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+it against the failure modes, find the subtle one, fix it, optimize what is wasteful, and prove the
 fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose

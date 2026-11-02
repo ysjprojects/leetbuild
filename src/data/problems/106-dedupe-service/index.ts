@@ -8,56 +8,61 @@ import {readStep} from './steps/5-read';
 
 /**
  * Deduplication: the course is not "call a similarity API", it is the debugging you owe a dedupe
- * layer before it merges a tenant's records. A tenant-scoped check → one atomic Redis
- * insert-and-check per key set → a similarity call with a deadline that degrades to exact-only →
- * dataset-keyed events carrying key hashes with an outbox → a cluster read that refuses to bridge
+ * layer before it merges a tenant's records. A tenant-scoped check, one atomic Redis
+ * insert-and-check per key set, a similarity call with a deadline that degrades to exact-only,
+ * dataset-keyed events carrying key hashes with an outbox, and a cluster read that refuses to bridge
  * weak pairs without review and returns evidence for every link.
  */
 export const dedupeServiceProblem: Problem = {
   id: 'dedupe-service',
   title: 'Deduplication',
-  tagline: 'Find duplicates by exact and fuzzy keys without cross-tenant leakage.',
+  tagline: 'Tenant-scoped exact and fuzzy duplicate checks with evidence behind every merge.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Deduplication
 
 Deduplication is the piece of an AI platform that decides whether a record a caller is about to
-create already exists — and, when it might, whether the records should be merged. The visible part
+create already exists and, when it might, whether the records should be merged. The visible part
 is a boolean in a response; the parts that decide whether the platform is safe are the comparison
 scope, the atomicity of the key sets, the failure policy of the similarity service, the events the
 service publishes, and the evidence behind every merge.
 
 ## The real system
 
-Production dedupe services receive records from many tenants and must never let one tenant's corpus
-leak into another's comparison. A check takes the candidate's exact keys (an email hash, a content
-hash) and optional fuzzy keys, looks them up inside the caller's tenant only, and reports whether a
-match exists. Exact keys live in per-tenant sets where the insert-and-check is a single atomic
-operation, so two concurrent submissions of the same record agree on one winner instead of both
-creating a row. Fuzzy matching calls a similarity service under a deadline, and a timeout degrades to
-exact-only matching rather than silently claiming a match or a miss. Check and merge events are
-published keyed by dataset so one dataset's dedupe stream stays ordered, carrying hashed keys and
-outcomes — never record contents. And a cluster read returns the member records, the evidence per
-pair and the merge history, refusing to present a cluster whose links depend on a pair below the
-confidence floor.
+Zingg, the open source entity-resolution engine, shows what the read side of this service owes its
+operators: every cluster it emits carries a \`Z_MINSCORE\`, the score of the weakest pair in the
+cluster, and its documentation tells you to gate automation on it. Clusters whose weakest link clears
+the floor flow into a golden record; clusters with a low \`Z_MINSCORE\` go to a human review queue,
+because A matching B and B matching C does not mean A matches C. The same documentation calls out
+that a transitively joined cluster can carry a minimum score of zero. Step 5 here is that rule as a
+handler: a weak pair cannot bridge two clusters on its own, and the evidence per pair is part of the
+response.
+
+The service side is the same shape in any multi-tenant dedupe layer. A check takes the candidate's
+exact keys (an email hash, a content hash) and optional fuzzy text, looks them up inside the caller's
+tenant only, and reports whether a match exists. Exact keys live in per-tenant sets where
+insert-and-check is one atomic operation, so two concurrent submissions of the same record agree on
+one winner. Fuzzy matching calls a similarity service under a deadline, and a timeout degrades to
+exact-only matching, marked as such. Check and merge events go out keyed by dataset so one dataset's
+stream stays ordered, carrying hashed keys and outcomes rather than record contents.
 
 ## What you build here
 
 One service, **dedupd**, with five pieces:
 
 1. \`POST /v1/dedupe/check\`: an authenticated tenant, validated key types and hashed values, and a
-   comparison scoped to the caller's tenant — a check must never reveal whether another tenant holds
+   comparison scoped to the caller's tenant. A check must not reveal whether another tenant holds
    the same record, nor name another tenant's record id.
 2. A **Redis** exact-key index: per-tenant sets where one atomic Lua script inserts a key and returns
    whether it already existed, so concurrent duplicate submissions agree on one winner. Namespaces
    are disjoint per tenant and the sets are rebuildable from the durable record store.
 3. A **gRPC** similarity client: a 200 ms deadline per attempt, no retry inside the request path, and
-   a failure that degrades to exact-only comparison marked as such — a degraded result never
-   silently claims thoroughness.
+   a failure that degrades to exact-only comparison marked as such, so a degraded result does not
+   silently claim thoroughness.
 4. A **Kafka** dedupe path: one \`dedupe.event\` per check or merge keyed by dataset id, carrying key
-   hashes and outcomes, never record contents or raw keys, with an outbox row when the broker rejects
-   the produce.
+   hashes and outcomes rather than record contents or raw keys, with an outbox row when the broker
+   rejects the produce.
 5. \`GET /v1/clusters/{id}\`: the member records, the per-pair merge evidence and the merge history,
    where a weak pair cannot bridge clusters without review and a foreign cluster is **404**.
 

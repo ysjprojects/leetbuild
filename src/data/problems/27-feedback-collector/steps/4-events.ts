@@ -45,31 +45,27 @@ export const eventsStep: Step = {
   },
   task: `## Task
 
-**Starting point.** You are the AI platform engineer on call. The analytics team noticed that one
-tenant's quality counters jump around — a sign that the tenant's events are scattered across
-partitions — and that the retained \`feedback.recorded\` topic now contains raw comment text. The
-producer below keys by rating value, copies the comment into the payload, and returns
-success before the broker confirms, with no outbox for the rejected produce.
+**Starting point.** \`events\` exposes \`publish(tenant, record)\`. It builds a payload with
+\`request_id\`, \`rating\` and the raw \`comment\`, calls \`producer.send(TOPIC, key=rating, ...)\` on
+the \`feedback.recorded\` topic, logs, and returns without waiting for the broker. It serves the demo
+and hides five flaws.
 
-Debug \`events\` and publish a feedback event that is ordered, content-free and lossless.
+**Failure mode the checks target.** One tenant's quality counters jump around because its events are
+spread across partitions, the retained topic contains comment text the retention policy cannot reach,
+and a broker rejection loses the rating.
 
-- Produce to \`feedback.recorded\` with the **tenant as the message key**, so every event for one tenant
-  shares a partition and the consumer sees them in order. Never key by the rating value.
-- The payload carries \`request_id\`, \`rating\` and a \`comment_fingerprint\` — a hash of the comment, not
-  the comment. No comment text may appear in the event.
-- Configure the producer with \`acks=all\` and wait for the broker's confirmation before treating the
-  write as done; an early ack loses ratings whenever the broker rejects the produce.
-- When the produce is rejected, write an \`outbox\` row so the rating can be republished later — never
-  drop it.
-
-**Failure mode the checks target.** Keying by rating scatters a tenant's stream, so the consumer's
-counters race and a rollback's ordering guarantees evaporate. Copying the comment into a retained,
-replicated topic puts tenant content where the retention policy cannot reach it, and acking before the
-broker confirms turns a transient broker rejection into a silently lost rating.`,
+- Produce with \`key=tenant\`, so every event for one tenant shares a partition and the consumer
+  reads it in order. The rating is payload, not key.
+- The payload carries \`request_id\`, \`rating\` and \`comment_fingerprint\`, a \`hashlib.sha256\` of
+  salt plus comment. No \`"comment"\` field in the event.
+- Configure the producer with \`acks="all"\` and use \`send_and_wait\` so the write is done only when
+  the broker confirms.
+- When the produce is rejected, write an \`outbox\` row after the send attempt so the rating can be
+  republished later.`,
   hints: [
-    'The Kafka message key decides the partition, so the key is the ordering control: `key=tenant` (Python), `key: tenant` (Node), `Key: []byte(tenant)` (Go). Rating is payload, never key.',
-    'Hash the comment before it reaches the topic: `comment_fingerprint = sha256(salt + comment)`. The event schema carries request id, rating and the fingerprint — the comment stays in the database row only.',
-    'Treat the produce as unfinished until the broker confirms it (`send_and_wait`, `await producer.send`, `WriteMessages`, `acks=all`). On rejection, insert an outbox row inside the same unit of work so a retry can republish it.',
+    'A tenant\u2019s satisfaction counter moves up and down between refreshes, and a privacy audit finds verbatim user comments in a topic retained for 90 days.',
+    'The partition is chosen by the message key, and the key here is the rating value, so one tenant\u2019s events land on three partitions. The payload copies `record["comment"]` in; `send` returns before the broker answers.',
+    'Use `producer.send_and_wait(TOPIC, key=tenant, value=payload)` with `acks="all"`, replace `comment` with `comment_fingerprint = hashlib.sha256(...)`. On rejection, `outbox.put` the record. The checks cover the rest.',
   ],
   checks: [
     {
@@ -158,8 +154,7 @@ outbox = Outbox()
 
 
 async def publish(tenant: str, record: dict) -> None:
-    # TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
-    # before the broker confirms with no outbox. Fix all three.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = {
         "request_id": record["request_id"],
         "rating": record["rating"],
@@ -229,8 +224,7 @@ export class Outbox {
 export const outbox = new Outbox();
 
 export async function publish(tenant: string, record: {request_id: string; rating: number; comment: string}) {
-  // TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
-  // before the broker confirms with no outbox. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const payload = {
     request_id: record.request_id,
     rating: record.rating,
@@ -305,8 +299,7 @@ func (o *Outbox) Put(ctx context.Context, record map[string]any) error {
 var outbox = &Outbox{}
 
 func publish(ctx context.Context, writer *kafka.Writer, tenant string, record map[string]any) {
-	// TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
-	// before the broker confirms with no outbox. Fix all three.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{
 		"request_id": record["request_id"],
 		"rating":     record["rating"],
@@ -389,8 +382,7 @@ object FeedbackEvents {
   val Topic = "feedback.recorded"
 
   def publish(producer: KafkaProducer[String, String], tenant: String, record: Map[String, String]): Unit = {
-    // TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
-    // before the broker confirms with no outbox. Fix all three.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val payload = JsObject(
       "request_id" -> JsString(record("request_id")),
       "rating" -> JsString(record("rating")),
@@ -451,8 +443,7 @@ Outbox outbox;
 
 void publish(RdKafka::Producer* producer, const std::string& tenant, const std::string& requestId, int rating,
              const std::string& comment) {
-  // TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
-  // before the broker confirms with no outbox. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const std::string payload =
       "{"request_id":"" + requestId + "","rating":" + std::to_string(rating) + ","comment":"" + comment + ""}";
   const std::string key = std::to_string(rating);
@@ -520,14 +511,14 @@ void publish(RdKafka::Producer* producer, const std::string& tenant, const std::
     },
   },
   debrief: `The Kafka message key is the ordering control: key by tenant and every event for that tenant
-shares a partition, so the quality consumer sees a tenant's ratings in the order they happened. Key by
-rating value and the stream scatters, which is exactly the "counters jump around" symptom that started
-this investigation.
+shares a partition, so the quality consumer sees a tenant's ratings in order. Key by rating value and
+the stream scatters, which is the "counters jump around" symptom.
 
-The comment is tenant content. Once it is in a retained topic it outlives the feedback row, the
-request and the retention policy that governs the database, so the event carries a salted fingerprint
-instead — enough to dedupe and to correlate, not enough to read. And "produced" is not "stored": the
-producer waits for the broker's confirmation, and a rejection writes an outbox row so the rating can be
-republished. Real systems run the outbox drain with the same idempotent producer so a retry cannot
-double-publish.`,
+The comment is tenant content. In a retained topic it outlives the feedback row and the database's
+retention policy, so the event carries a salted fingerprint instead: enough to dedupe and correlate,
+not enough to read. "Produced" is not "stored": the producer waits for the broker's confirmation, and
+a rejection writes an outbox row so the rating can be republished.
+
+Production pipelines write the outbox row in the same transaction as the feedback row and drain it
+with an idempotent producer so retries cannot double-publish.`,
 };

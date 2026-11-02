@@ -8,33 +8,27 @@ export const policyCacheStep: Step = {
   focus: ['guard', 'redis', 'policy'],
   task: `## Task
 
-**Starting point.** The starter is working code: the policy loads, decisions
-are cached, strikes count up, and the demo is fast on the second request. It hides four production
-flaws, the first of which means a legal team's stop-list update never reaches production. Debug
-it, fix it, and prove the fix.
+**Starting point.** The starter's \`get_policy\` reads one key, \`POLICY_KEY\`, and on a miss loads
+\`store.load_policy("current")\` and sets it with no TTL. \`publish\` writes the store only.
+\`cached_decision\` and \`cache_decision\` use \`fh:decision:{text}\` with no TTL, and
+\`record_strike\` is a bare \`INCR\`. It serves the demo and hides five flaws.
 
-Implement the Redis layer the guard reads on every request:
+**Failure mode the checks target.** A legal team publishes a new stop list, the dashboard says it
+is live, and every running reader keeps the first policy it loaded until Redis is flushed. The
+decision cache turns the most sensitive strings the service sees into Redis keys, visible to
+\`SCAN\` and every dump, and a policy change does not invalidate them. Strikes without a TTL turn
+one bad week into a permanent flag.
 
-- **Policy per version.** The policy (thresholds and stop phrases) is cached under
-  \`fh:policy:{version}\` with \`POLICY_TTL_S = 3600\`; a miss loads \`store.load_policy(version)\`
-  and writes it back with the same TTL. The active version lives under \`fh:policy:active\`.
-- **Atomic publish.** \`publish(version, policy)\` saves to the store, then in **one transaction**
-  (\`MULTI\`/\`EXEC\`: a transactional pipeline, \`multi().exec()\`, \`TxPipelined\`, \`multi()\`,
-  \`transaction()\`) writes \`fh:policy:{version}\` with its TTL and sets \`fh:policy:active\`.
-  Readers either see the old version or the new one, never a version whose policy is not cached.
-- **Decision cache keyed by version.** A decision is cached under
-  \`fh:decision:{version}:{text_hash}\` where \`text_hash\` is the hex SHA-256 of the text, with
-  \`DECISION_TTL_S = 86400\`. A client retry or a repeated question never re-runs the tiers; a new
-  policy version never serves a decision made under the old one. Raw text never appears in a key.
-- **Strikes expire.** \`record_strike(conversation_id)\` increments
-  \`fh:strikes:{conversation_id}\` and sets \`STRIKE_TTL_S = 86400\` on the first increment, so a
-  conversation's count resets after a day instead of living forever.
-
-**Failure mode the checks target.** The starter caches the policy under a version-less key with no
-TTL, and \`publish\` only writes the store — every reader keeps the first policy it ever loaded until
-Redis is flushed. The decision cache uses the raw text as the key: the most sensitive strings the
-service sees are now Redis keys, visible in \`KEYS\`, \`SCAN\` and every dump, and a policy change
-does not invalidate them. Strikes without a TTL turn one bad week into a permanent flag.`,
+- Cache the policy under \`fh:policy:{version}\` with \`POLICY_TTL_S = 3600\` (\`ex=POLICY_TTL_S\`);
+  on a miss load \`store.load_policy(version)\` and write it back. The active version lives under
+  \`fh:policy:active\`.
+- \`publish(version, policy)\` saves to the store, then writes \`fh:policy:{version}\` and
+  \`fh:policy:active\` in one \`pipeline(transaction=True)\` ... \`execute()\`, so a reader sees
+  the old version or the new one, not a version whose policy is missing.
+- Cache decisions under \`fh:decision:{version}:{text_hash}\` (\`hashlib.sha256\` hex) with
+  \`DECISION_TTL_S = 86400\`; raw text must not appear in a key.
+- \`record_strike\` increments \`fh:strikes:{conversation_id}\` and calls \`expire\` with
+  \`STRIKE_TTL_S = 86400\` on the first increment.`,
   sequence: {
     participants: ['fhguard', 'Redis', 'policy store'],
     messages: [
@@ -48,9 +42,9 @@ does not invalidate them. Strikes without a TTL turn one bad week into a permane
     ],
   },
   hints: [
-    'Put the version in every key the policy touches: `fh:policy:{version}` with a TTL, `fh:policy:active` pointing at it. `get_policy` reads active, then the versioned key, and only loads from the store on a miss. Versions are immutable, so the TTL is about memory, not freshness.',
-    'A publish is two writes that must be seen together: the versioned policy and the active pointer. Wrap them in a transaction — redis-py `pipeline(transaction=True)…execute()`, ioredis `multi()…exec()`, go-redis `TxPipelined`, Jedis `multi()…exec()`, redis-plus-plus `transaction()…exec()` — so no reader resolves a version whose policy is not there yet.',
-    'Hash the text (`hashlib.sha256`, `createHash("sha256")`, `sha256.Sum256`, `MessageDigest "SHA-256"`, `sha256Hex`) and key the decision by `(version, hash)` with a one-day TTL. For strikes, `INCR` returns the new count: when it is 1, `EXPIRE` the key for a day.',
+    'Legal publishes a stop-list update, `publish` returns without error, and an hour later the assistant still answers phrases the new policy forbids. `redis-cli SCAN` shows user questions as key names.',
+    'The reader resolves one fixed key that was set once without a TTL, and `publish` only touches the store, so nothing in Redis changes; decision keys embed the text and carry no version.',
+    'Key the policy by `fh:policy:{version}` with `ex=POLICY_TTL_S`, point `fh:policy:active` at it inside `pipeline(transaction=True)`; the hashed, versioned decision key and the strike `expire` are covered by the remaining checks.',
   ],
   checks: [
     {
@@ -154,8 +148,7 @@ store = PolicyStore()
 
 
 def get_policy() -> dict:
-    # TODO: the policy key has no version and no TTL, publish never touches the cache, the
-    # decision key is the raw text with no version and no TTL, and strikes never expire.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     raw = r.get(POLICY_KEY)
     if raw is not None:
         return json.loads(raw)
@@ -260,7 +253,7 @@ def record_strike(conversation_id: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** Policy and decision cache: flawed code with version-less keys and no TTLs. */
+      starter: `/** Policy and decision cache backed by Redis. */
 import {Redis} from 'ioredis';
 
 import {store} from './policy_store';
@@ -284,8 +277,7 @@ export interface Decision {
 }
 
 export async function getPolicy(): Promise<Policy> {
-  // TODO: the policy key has no version and no TTL, publish never touches the cache, the
-  // decision key is the raw text with no version and no TTL, and strikes never expire.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const raw = await r.get(POLICY_KEY);
   if (raw !== null) return JSON.parse(raw) as Policy;
   const policy = await store.loadPolicy('current');
@@ -425,8 +417,7 @@ func (s *PolicyStore) SavePolicy(ctx context.Context, version string, policy Pol
 
 var store = &PolicyStore{}
 
-// TODO: the policy key has no version and no TTL, publish never touches the cache, the decision
-// key is the raw text with no version and no TTL, and strikes never expire.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func getPolicy(ctx context.Context) (Policy, error) {
 	var policy Policy
 	raw, err := rdb.Get(ctx, policyKey).Result()
@@ -606,8 +597,7 @@ object PolicyCache {
   val PolicyKey = "fh:policy"
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: the policy key has no version and no TTL, publish never touches the cache, the decision
-  // key is the raw text with no version and no TTL, and strikes never expire.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def getPolicy(): Policy = {
     Option(jedis.get(PolicyKey)) match {
       case Some(raw) => raw.parseJson.convertTo[Policy]
@@ -713,8 +703,7 @@ struct PolicyStore {
 PolicyStore store;
 sw::redis::Redis redis("tcp://redis:6379");
 
-// TODO: the policy key has no version and no TTL, publish never touches the cache, the decision
-// key is the raw text with no version and no TTL, and strikes never expire.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 json getPolicy() {
   const auto raw = redis.get(kPolicyKey);
   if (raw) return json::parse(*raw);
@@ -808,5 +797,5 @@ long long recordStrike(const std::string& conversationId) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you see a cache as part of the control plane. A guard's policy is edited by lawyers and must reach production when they publish it; the starter's version-less, TTL-less key makes every publish a no-op, which is the worst kind of bug because the dashboard says the new stop list is live. Four defects are being checked: the version in the policy key with a TTL and a store fallback; the publish as one transaction so the active pointer never leads to a missing policy; the decision cache keyed by version and hash so a retry is free but a policy change is not silently ignored; and the strike expiry, because "flagged forever" is a product and fairness problem of its own. The raw-text key is the one candidates miss: the most sensitive strings this service handles must not be enumerable with \`SCAN\`. Real systems add a policy checksum in the audit event, a pre-warm of the new version before the swap, and a per-version decision-cache purge on emergency rollback.`,
+  debrief: `The cache is part of the control plane: a policy edited by lawyers has to reach every reader when they publish it. Versioned keys make that cheap, because a version is immutable, so the TTL is about memory rather than freshness, and the active pointer is the only thing that changes. Writing the policy and the pointer in one MULTI/EXEC means a reader cannot resolve a version whose policy is not cached yet. Keying decisions by (version, hash) makes a retry free while old keys simply stop being read after a publish, and the hash keeps protected-class queries out of \`SCAN\`. Production deployments pre-warm the new version before the swap, keep the previous version cached for rollback, and publish an event so readers refresh before the TTL.`,
 };

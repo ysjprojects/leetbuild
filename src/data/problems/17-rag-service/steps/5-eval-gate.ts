@@ -8,29 +8,29 @@ export const evalGateStep: Step = {
   focus: ['events', 'eval', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it compiles and passes the
-happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
-flaw, fix it, and prove the fix with the checks below.
+**Starting point.** The starter consumes \`answer.events\` in group \`rag-eval-v2\` with auto-commit
+on. For each event whose \`grounded\` field is below 0.95 it writes a record with the versions, the
+score and the raw question to the metrics store and to \`eval.metrics\`. It compiles and hides 5
+flaws.
 
-Consume \`answer.events\` in consumer group **\`rag-eval\`**. Each event carries answer metadata and
-golden labels, never the raw question or answer text:
+**Failure mode the checks target.** The starter gates on one event, lets auto-commit acknowledge it
+before the metrics are durable, and copies the raw question into the metrics topic. A single lucky
+answer can therefore "approve" a release, and the audit trail leaks user content.
+
+Consume in consumer group **\`rag-eval\`**. Each event carries answer metadata and golden labels, not
+the raw question or answer text:
 \`{answer_id, prompt_version, model_version, grounded, has_citation, recall_at_k, refused, should_refuse}\`.
 
 - Compute **groundedness** (fraction of answers with a supported citation), **recall@k** (mean of
   the per-sample labels) and **refusal correctness** (fraction of refusals that should have been
   refusals).
-- Require at least **200 samples** before a metric can gate anything. One passing example is a demo,
-  not an eval.
+- Require at least **200 samples** before a metric can gate anything.
 - Block the \`prompt_version\`/\`model_version\` when groundedness is below **0.95**, recall@k is
   below **0.90**, or groundedness drops by more than **1%** versus the previous release.
 - Store the metrics **before** committing the consumer offset. A crash after commit but before the
   store loses the evidence for the answers already acknowledged.
 - Publish \`eval.metrics\` with aggregate counts and verdicts only. No raw question, answer text,
   email or other PII.
-
-**Failure mode the checks target.** The starter gates on one event, lets auto-commit acknowledge it
-before the metrics are durable, and copies the raw question into the metrics topic. A single lucky
-answer can therefore "approve" a release, and the audit trail leaks user content.
 
 :::widget delivery-semantics {}
 
@@ -203,8 +203,7 @@ def main() -> None:
         if msg is None or msg.error():
             continue
         event = json.loads(msg.value())
-        # TODO: one sample is not an eval, auto-commit can acknowledge a sample before its
-        # metrics are stored, and the raw question is copied into eval.metrics.
+        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         if event["grounded"] < 0.95:
             record = {
                 "prompt_version": event["prompt_version"],
@@ -352,8 +351,7 @@ async function main(): Promise<void> {
     autoCommit: true,
     eachMessage: async ({message}) => {
       const event = JSON.parse(message.value!.toString()) as AnswerEvent;
-      // TODO: one sample is not an eval, auto-commit can acknowledge a sample before its
-      // metrics are stored, and the raw question is copied into eval.metrics.
+      // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
       if (event.grounded < 0.95) {
         const record = {
           prompt_version: event.prompt_version,
@@ -506,8 +504,7 @@ func main() {
 		}
 		var event map[string]any
 		json.Unmarshal(msg.Value, &event)
-		// TODO: one sample is not an eval, the offset is committed before metrics are durable,
-		// and the raw question is copied into eval.metrics.
+		// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 		if event["grounded"].(float64) < 0.95 {
 			record := map[string]any{
 				"prompt_version": event["prompt_version"],
@@ -693,8 +690,7 @@ object EvalGate {
       val records = consumer.poll(Duration.ofSeconds(1))
       records.forEach { record =>
         val event = parse(record.value())
-        // TODO: one sample is not an eval, auto-commit acknowledges before metrics are durable,
-        // and the raw question is copied into eval.metrics.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         if (event.grounded < 0.95) {
           val metrics = Map(
             "prompt_version" -> event.promptVersion,
@@ -825,8 +821,7 @@ int main() {
     auto* msg = consumer->consume(1000);
     if (msg->err() == RdKafka::ERR_NO_ERROR) {
       const auto event = json::parse(static_cast<const char*>(msg->payload()));
-      // TODO: one sample is not an eval, auto-commit acknowledges before metrics are durable,
-      // and the raw question is copied into eval.metrics.
+      // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
       if (event.value("grounded", 0.0) < 0.95) {
         const auto record = json{
             {"prompt_version", event["prompt_version"]},
@@ -958,9 +953,11 @@ int main() {
     },
   },
   hints: [
-    'Disable auto-commit and buffer samples. Only when the buffer reaches `MIN_SAMPLES` do you compute a window, and only after the window is stored do you call `commit`.',
-    'Groundedness is not “the model said grounded”: require both `grounded` and `has_citation` from the joined golden record. Keep recall as the mean of `recall_at_k` over the window.',
-    'Read the previous release’s groundedness before deciding. A metric at 0.96 can still be a regression if the last release was 0.99; the 1% rule catches that.',
+    'A prompt release was approved on one lucky answer. After a consumer restart the window that blocked the previous release has no stored metrics, and the metrics topic contains customer questions.',
+    'The starter judges every event alone, so one sample is a verdict. Auto-commit in group `rag-eval-v2` acknowledges before `store.put` runs, and the record copies `event["question"]` straight through.',
+    'Group `rag-eval`, auto-commit off. Buffer 200 samples, compute groundedness, recall@k and refusal correctness, compare with the previous release, `store.put` the window, then `commit`. Emit versions, aggregates and verdicts only.',
   ],
-  debrief: `The interviewer learns whether you can turn a product claim into a release contract. The starter is the classic first-pass eval: it treats one event as a result, lets Kafka acknowledge before the verdict is durable, and leaks the raw question into an analytics topic. The corrected version is a windowed job with a minimum sample size, three metrics that are computed rather than asserted, a comparison against the previous release, and an evidence-before-acknowledgement commit order. Thresholds are policy, so they live as named constants and the blocked reasons are emitted with the metrics for audit. Real eval systems add stratified slices (tenant, language, document type), confidence intervals so a 200-sample window is not treated as exact, offline golden-set refresh, and a human review step before a blocked prompt is rewritten.`,
+  debrief: `The window exists because a metric needs a denominator: one grounded answer is an anecdote, and 200 samples is the smallest set on which a 0.95 threshold means anything. The metrics are computed rather than copied from the event so the verdict comes from labels the model did not write. The commit order is evidence first, offset second, because the offset is the acknowledgement; a replay recomputes a window cheaply, whereas a committed-but-unstored window is gone. Raw questions stay out of the topic because an analytics topic has different retention and readers.
+
+This step did not slice by tenant, language or document type, did not attach confidence intervals to a 200-sample estimate, and did not add a human review step before a blocked prompt is rewritten.`,
 };

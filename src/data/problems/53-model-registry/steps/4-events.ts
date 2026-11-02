@@ -8,37 +8,26 @@ export const eventsStep: Step = {
   focus: ['registry', 'kafka', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event on the
-happy path and the demo shows it in the topic. Its key, its payload and its durability are all
-wrong. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** \`emit(model, version, digest, report)\` builds an event with the model, the
+version, the digest and the eval report's \`report_body\` and \`samples\`, produces it to
+\`model.event\` with \`key=digest\` through a \`Producer\` configured with only
+\`bootstrap.servers\`, flushes, then calls \`store.commit\`. It compiles and hides five flaws.
 
-Implement the \`model.event\` path behind every registry write (register, stage, promote, rollback):
+**Failure mode the checks target.** A consumer that sees a promote before the registration that
+created the version, or acts on a promotion whose registry write later failed, and a retained
+topic that carries test-set samples long after the eval store expired them.
 
-- Every event publishes to \`model.event\` **keyed by model name**. Kafka orders within a partition,
-  not within a topic, so the key decides which events can be reordered. The starter keys by artifact
-  digest, scattering one model's history across partitions — a consumer then sees a promote before
-  the registration that created the version.
-- The payload carries **ids, not report bodies**: \`{event_id, model, version, artifact_digest,
-  eval_id, pool, stage}\`. The starter copies the eval report body, including test-set samples, into
-  the topic, which is retained and replicated far past the eval store's retention.
-- The producer is **idempotent with \`acks=all\`** (KafkaJS \`idempotent: true\` + \`acks: -1\`,
-  \`enable.idempotence\` + \`acks: all\`, \`RequiredAcks: kafka.RequireAll\` with a hash balancer, or
-  the C++ \`set("enable.idempotence", "true")\` / \`set("acks", "all")\`). A retry of a produce must
-  not duplicate a record.
-- **Publish after the registry write commits.** The commit is durable first; only then does the
-  event go out, so a consumer can never act on an uncommitted promotion. The starter produces and acks
-  before the registry write commits.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
-  failing the caller; a relay republishes outbox rows when the broker recovers.
-
-**Failure mode the checks target.** Two events for one model must share a partition, the payload
-must carry no report body or test samples, a retry must not duplicate, and a consumer must never see
-an event whose write is not yet durable.
-
-## What to keep
-
-The topic name and the produce call are fine. The fix is the key, the payload, the acknowledgement
-level, and the order of commit and publish.`,
+- Every event is produced to \`model.event\` with \`key=model\`, so one model's history stays in
+  one partition.
+- The payload is \`{event_id, model, version, artifact_digest, eval_id, pool, stage}\`; no
+  \`report_body\`, no \`samples\`.
+- Producer config includes \`enable.idempotence\` and \`"acks": "all"\` (KafkaJS
+  \`idempotent: true\` + \`acks: -1\`; kafka-go \`RequiredAcks: kafka.RequireAll\` with
+  \`Balancer: &kafka.Hash{}\`; C++ \`set("enable.idempotence", "true")\` and \`set("acks", "all")\`).
+- \`store.commit\` runs before \`producer.produce\`.
+- A rejected produce (\`except KafkaException\`) writes the event with \`insert_outbox\` for a relay
+  to republish; the caller does not fail and the event is not dropped.
+- The topic name and the produce call stay as they are.`,
   sequence: {
     participants: ['Registry write', 'model.event', 'Event consumer'],
     messages: [
@@ -143,10 +132,7 @@ store = RegistryStore()
 
 
 def emit(model: str, version: str, digest: str, report: dict) -> None:
-    # TODO: the starter keys by artifact digest, publishes the eval report body with test-set
-    # samples, leaves the producer at its default acks, and produces before the registry write
-    # commits. Key by model, publish ids instead of the report, configure an idempotent producer
-    # with acks=all, commit first, and write an outbox row when the broker rejects the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {
         "model": model,
         "version": version,
@@ -218,7 +204,7 @@ def registered(model: str, version: str, digest: str, eval_id: str, lineage_tag:
 `,
     },
     typescript: {
-      starter: `/** model.event: flawed code that keys by digest and acks before the commit. */
+      starter: `/** model.event: produces one event per registry write. */
 import {Kafka} from 'kafkajs';
 
 import {store} from './registry';
@@ -234,10 +220,7 @@ interface EvalReport {
 }
 
 export async function emit(model: string, version: string, digest: string, report: EvalReport): Promise<void> {
-  // TODO: the starter keys by artifact digest, publishes the eval report body with test-set samples,
-  // leaves the producer at its default acks, and produces before the registry write commits. Key
-  // by model, publish ids instead of the report, configure an idempotent producer with acks=all,
-  // commit first, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {
     model,
     version,
@@ -312,10 +295,7 @@ func (s *RegistryStore) Commit(ctx context.Context, model, version string, event
 var store = &RegistryStore{}
 
 func Emit(ctx context.Context, model, version, digest string, report map[string]any) error {
-	// TODO: the starter keys by artifact digest, publishes the eval report body with test-set
-	// samples, leaves acks at the default, and produces before the registry write commits. Key by
-	// model, publish ids instead of the report, set RequiredAcks and a hash balancer, commit
-	// first, and write an outbox row when the broker rejects the produce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"model":           model,
 		"version":         version,
@@ -397,10 +377,7 @@ object ModelEvents {
     def commit(model: String, version: String, event: Map[String, String]): Unit = ()
   }
 
-  // TODO: the starter keys by artifact digest, publishes the eval report body with test-set samples,
-  // leaves acks at the default, and produces before the registry write commits. Key by model,
-  // publish ids instead of the report, configure an idempotent producer with acks=all, commit
-  // first, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def emit(model: String, version: String, digest: String, report: Map[String, String]): Unit = {
     val event = Map("model" -> model, "artifact_digest" -> digest, "report_body" -> report("report_body"))
     producer.send(new ProducerRecord("model.event", digest, event.toJson.compactPrint))
@@ -469,10 +446,7 @@ RegistryStore store;
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: the starter keys by artifact digest, publishes the eval report body with test-set samples,
-// leaves acks at the default, and produces before the registry write commits. Key by model,
-// publish ids instead of the report, configure an idempotent producer with acks=all, commit first,
-// and write an outbox row when the broker rejects the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void emit(const std::string& model, const std::string& version, const std::string& digest, const json& report) {
   const json event = {{"model", model}, {"artifact_digest", digest}, {"report_body", report}};
   const auto payload = event.dump();
@@ -545,9 +519,9 @@ void emit(const std::string& model, const std::string& version, const json& even
     },
   },
   hints: [
-    'The message key is the partition key, and a model’s history is what must stay ordered: `key=model`, `key: model`, `Key: []byte(model)`, `ProducerRecord("model.event", model, …)`. Keyed by digest, a promote can be consumed before the registration that created the version.',
-    'The topic is retained and replicated: publish `{event_id, model, version, artifact_digest, eval_id, stage}` and never the eval report body or its test samples. Anything you write there outlives the eval store it came from.',
-    'Two orderings matter. Idempotence is producer configuration (`enable.idempotence` + `acks: all`), and durability is commit-then-publish: the registry write must be durable before the event is produced, with an outbox row when the broker rejects it, so a consumer never acts on a promotion that was never committed.',
+    'A consumer that mirrors promotions into the traffic router received a `promoted` event for a version it had no registration for, then the registration arrived two seconds later.',
+    'Kafka orders within a partition and the key picks the partition. `key=digest` sends each version of one model to a different partition, so events for one model race each other.',
+    'Use `key=model`; payload `{event_id, model, version, artifact_digest, eval_id, pool, stage}`; producer `enable.idempotence` + `"acks": "all"`; `store.commit` before `producer.produce`; `except KafkaException` calls `insert_outbox`. The checks cover each.',
   ],
-  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the key is an ordering contract: partition by model and a model’s history arrives in order; partition by digest and it does not. Second, exactly-once *looking* code is not exactly-once: idempotence plus acks=all is what makes a retry safe, and the outbox is what makes a broker outage a delay rather than a hole in the history. Third, the order of commit and publish is a correctness property, not a performance one — publish first and a consumer can act on a promotion the registry never durably recorded. Real platforms add a schema registry so a producer cannot smuggle a report body in, per-tenant topics for stricter isolation, and a consumer that validates the event against the committed version before it changes traffic.`,
+  debrief: `The key changes because ordering is the one guarantee a consumer builds on, and Kafka only gives it per partition. Commit moves ahead of produce because a published event is a promise the registry must already be able to keep; the outbox row covers the opposite case, a durable write whose event the broker refused. Note that a synchronous exception from produce() reports only local enqueue failures; a broker rejection arrives in the delivery callback, which production code also routes to the outbox. Platforms further protect the topic with a schema registry so a payload with a report body is rejected at produce time, and with a relay that drains the outbox in commit order.`,
 };

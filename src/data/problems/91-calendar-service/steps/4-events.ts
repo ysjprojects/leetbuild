@@ -8,39 +8,25 @@ export const eventsStep: Step = {
   focus: ['api', 'store', 'kafka', 'sync'],
   task: `## Task
 
-**Starting point.** The starter is working code: the event write lands in the
-store, a change record lands in the topic, and the sync consumer moves, so the demo looks right. It
-compiles, it serves the demo, and it hides five production flaws. Debug it like the service owner,
-fix it, and prove the fix with the checks below.
-
-Implement the change stream behind the event write:
-
-- Every accepted change publishes **one** \`calendar.event\` record **keyed by the calendar id**.
-  Kafka orders within a partition, not within a topic, so the key decides what can be reordered:
-  partition by calendar and the changes of one calendar arrive in revision order. The starter keys by
-  the first attendee, so a calendar’s revisions scatter across partitions and a consumer can apply
-  revision 7 before revision 4.
-- The topic comes from a **named constant** holding \`calendar.event\`; the starter inlines the
-  string at the produce call and again at the subscription.
-- The payload carries \`{event_id, revision, kind}\` and nothing else: never the event body or its
-  title and description, never an attendee address. The topic is retained and replicated, so
-  content written there outlives the event, the RSVP, and every delete path the service has.
-- The event store **commit happens before the produce**. Publish first and a rollback still leaves
-  the change in the stream: every consumer applies a revision the store never accepted.
-- The producer is **idempotent with \`acks=all\`** (the stack’s equivalent: \`enable.idempotence\`
-  plus required acks \`all\`). When the broker rejects the produce, the same payload is written to
-  an \`outbox\` row that a relay republishes. The starter is fire-and-forget, so a rejected produce
-  is a silently lost change.
-- The \`calendar-sync\` **consumer applies each change to the store and only then commits the
-  offset**. Commit first and a crash between the two loses the apply forever, because the offset
-  already moved past the record.
+**Starting point.** The starter's \`POST /v1/events\` produces one \`calendar.event\` record keyed
+by the first attendee with title, body and attendees as payload, then commits the store; a
+\`calendar-sync\` consumer commits its offset and then applies the change. It compiles, serves the
+demo, and hides five flaws.
 
 **Failure mode the checks target.** An attendee key breaks the ordering the sync consumer depends
-on; a payload with the body and the addresses is a leak with the retention of the topic; publishing
-before the commit makes the stream claim revisions the store rolled back; and a fire-and-forget
-producer with a commit-first consumer loses changes on two different paths. The key is the quiet
-one: with four hundred attendees the per-attendee fan-out looks like a feature until the sync
-consumer applies a stale revision last.`,
+on: with four hundred attendees the fan-out looks like a feature until revision 7 is applied before
+revision 4. A payload with the body and the addresses is a leak with the retention of the topic.
+Publishing before the commit makes the stream claim revisions the store rolled back. A
+fire-and-forget producer and a commit-first consumer lose changes on two different paths.
+
+- Every accepted change publishes **one** record **keyed by the calendar id**; Kafka orders within
+  a partition, so the key decides what can be reordered.
+- The topic name comes from a **named constant**, used at the produce call and the subscription.
+- The payload is \`{event_id, revision, kind}\` and nothing else.
+- The store **commit happens before the produce**.
+- The producer is **idempotent with \`acks=all\`**; a rejected produce writes the same payload to
+  an \`outbox\` row that a relay republishes.
+- The consumer **applies each change and only then commits the offset**.`,
   sequence: {
     participants: ['Calendar API', 'Postgres', 'calendar.event', 'Sync consumer'],
     messages: [
@@ -199,10 +185,7 @@ store = CalendarStore()
 
 @app.post("/v1/events")
 def create_event(change: EventWrite, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: key by the calendar id instead of the first attendee, publish only event_id, revision
-    # and kind (never the body or the attendee addresses), commit the store before the produce,
-    # configure the idempotent producer with acks=all plus an outbox fallback, and make the consumer
-    # apply each change before it commits the offset.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     attendees = change.event["attendee_emails"]
     logger.info("change tenant=%s calendar=%s title=%r", tenant, change.calendar_id, change.event["title"])
     payload = {
@@ -304,10 +287,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/**
- * calendar.event: flawed code that keys by attendee and publishes before the commit,
- * so one calendar's revisions scatter across partitions and a rollback still reaches the stream.
- */
+      starter: `/** calendar.event: change stream behind the calendard event write. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -327,10 +307,7 @@ interface EventChange {
 }
 
 app.post('/v1/events', async (request, reply) => {
-  // TODO: key by the calendar id instead of the first attendee, publish only event_id, revision
-  // and kind (never the body or the attendee addresses), commit the store before the produce,
-  // configure the idempotent producer with acks=all plus an outbox fallback, and make the consumer
-  // apply each change before it commits the offset.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const change = request.body as EventChange;
   if (typeof change.calendar_id !== 'string' || change.calendar_id === '')
     return reply.code(422).send({error: 'calendar_id is required'});
@@ -467,10 +444,7 @@ var store = &CalendarStore{}
 func createEvent(rw http.ResponseWriter, r *http.Request) {
 	change := EventChange{}
 	_ = json.NewDecoder(r.Body).Decode(&change)
-	// TODO: key by the calendar id instead of the first attendee, publish only event_id, revision
-	// and kind (never the body or the attendee addresses), commit the store before the produce,
-	// configure acks=all with a hash balancer plus an outbox fallback, and make the consumer apply
-	// each change before it commits the offset.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(change)
 	_ = changeWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(change.Attendees[0]), Value: payload})
 	_ = store.Commit(r.Context(), change)
@@ -629,10 +603,7 @@ object CalendarEventApi {
     path("v1" / "events") {
       post {
         entity(as[EventChange]) { change =>
-          // TODO: key by the calendar id instead of the first attendee, publish only event_id,
-          // revision and kind (never the body or the attendee addresses), commit the store before
-          // the produce, configure enable.idempotence with acks=all plus an outbox fallback, and
-          // make the consumer apply each change before it commits the offset.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val payload = s"""{"event_id":"\${change.event_id}","revision":\${change.revision},"kind":"\${change.kind}","title":"\${change.title}","body":"\${change.body}"}"""
           producer.send(new ProducerRecord("calendar.event", change.attendee_emails.head, payload))
           conn.commit(change)
@@ -765,10 +736,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: key by the calendar id instead of the first attendee, publish only event_id, revision and
-// kind (never the body or the attendee addresses), commit the store before the produce, configure
-// enable.idempotence with acks=all plus an outbox fallback, and make the consumer apply each change
-// before it commits the offset.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void commitAndPublish(const std::string& calendar_id, const json& event) {
   const json record = {{"event_id", event["event_id"]},
                        {"revision", event["revision"]},
@@ -866,9 +834,9 @@ void consume(const std::string& group) {
     },
   },
   hints: [
-    'The message key is the partition key: `key=calendar_id` (or `Key: []byte(calendarID)`, `key: calendarId`, `ProducerRecord(CalendarEventTopic, calendarId, …)`, the key bytes in `producer->produce`). Keyed by an attendee, one calendar’s changes land in different partitions and revision order is no longer guaranteed.',
-    'Ids only, never content: build the record from `{event_id, revision, kind}`. The topic is retained and replicated, so an event body or an attendee address written there outlives the event, the RSVP and every delete path the service has.',
-    'Commit, then publish: `store.commit(change)` before `producer.produce(...)`; make the producer idempotent with `acks=all` and write an `outbox` row when the broker rejects the produce; in the consumer, `applyChange` before `commitSync` so a crash replays the record instead of losing the apply.',
+    'A mobile client syncing a shared calendar shows a meeting at its old time after a reschedule, and a support export of the topic contains attendee email addresses and meeting descriptions.',
+    'The record is keyed by the first attendee, so one calendar spreads across partitions; the payload is the whole event; the produce runs before the commit and nothing waits for the broker ack.',
+    'Use `key=calendar_id` and `CALENDAR_EVENT_TOPIC`, send only `{event_id, revision, kind}`, call `store.commit` before `produce`, enable idempotence with `acks=all` plus an outbox, and `apply_change` before `consumer.commit`.',
   ],
-  debrief: `The interviewer is checking the four contracts a Kafka snippet gets wrong, plus the topic constant that keeps producer and consumer in sync. First, the message key is an ordering contract: partition by calendar and one calendar’s changes arrive in revision order; key by attendee and a four-hundred-person event fans its revisions across partitions, so the sync consumer applies a stale revision last. Second, the payload is a retention contract: the topic keeps and replicates whatever you write into it, so the record carries ids, the revision and the change kind — never the body or the addresses, which have their own delete semantics in the store. Third, publish-after-commit is what makes the stream honest: produce first and a rollback leaves a change consumers apply even though the store never accepted it, which is why real systems write an outbox row inside the transaction and let a relay publish it. Fourth, exactly-once *looking* code is not exactly-once: idempotence plus acks=all on the producer, one key per partition, and apply-before-commit on the consumer, or a crash in either place loses work silently. Real platforms add schema-registry validation, per-calendar partition budgets, and dead-letter topics for changes that can never be applied.`,
+  debrief: `The message key is an ordering contract: partition by calendar and one calendar's changes arrive in revision order, the only guarantee the sync consumer can lean on. The payload is a retention contract: the topic keeps and replicates whatever is written, so the record carries ids, revision and kind, while bodies and addresses stay in the store where they have delete semantics. Publish-after-commit keeps the stream from claiming a revision the store rolled back. Idempotence plus \`acks=all\` on the producer and apply-before-commit on the consumer close the two paths where a crash would lose work without a trace. Production platforms write the outbox row inside the store transaction and let a relay publish it, validate records against a schema registry, and route unapplicable changes to a dead-letter topic.`,
 };

@@ -8,32 +8,28 @@ export const publishClassifiedStep: Step = {
   focus: ['metasense', 'classified', 'catalog', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: a verification produces an
-event and the metadata store consumer applies it, so the demo shows the tier changing in the
-catalogue. It hides five production flaws. Debug it like the team whose access-control policies
-read this topic, fix it, and prove the fix.
-
-After a verification is recorded, \`publish_classified(entity, tier, tags, verified_by, version)\`
-tells every downstream platform; the \`metadata-store\` consumer applies the event to the catalogue
-that access control reads.
-
-- Publish **one** \`entity.classified\` event per verification with the **entity** as the message
-  key — partition by entity so an entity's versions stay in order. The payload carries \`entity\`,
-  \`tier\`, \`tags\`, \`verified_by\` and \`version\`; the event id is \`{entity}:{version}\`.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus hashed, stable keys), so a retried produce cannot duplicate a record.
-- When the broker rejects the produce, write the event to the **outbox** (\`store.insert_outbox\`)
-  instead of dropping it or failing the verification; a relay republishes it.
-- The consumer (group \`metadata-store\`, auto-commit off) reads \`store.current_version(entity)\`
-  and **skips** events whose \`version\` is not greater — a replayed or reordered event must never
-  roll a Tier 1 back to the Tier 4 it was before the owner's edit.
-- The consumer **upserts the catalogue and only then commits** the offset. Commit first and one
-  crash loses the tier change the owner just made — until someone notices the table is still open.
+**Starting point.** The starter's \`publish_classified(entity, tier, tags, verified_by, version)\`
+produces one \`entity.classified\` event keyed by \`{entity}:{version}\` from a producer with only
+\`bootstrap.servers\` set and no handling for a rejected produce; its \`consume()\` loop in group
+\`metadata-store\` commits the offset, then calls \`store.upsert\` with every event it reads. The
+demo shows the tier changing in the catalogue; it hides five flaws.
 
 **Failure mode the checks target.** Keying by event id scatters one entity's versions across
-partitions; an unconfigured producer can duplicate on retry; a failed produce silently loses the
-event that would have closed a table; an unversioned upsert lets a replay undo a verification; and
-commit-before-write trades correctness for exactly-once *looking* code.`,
+partitions; an unconfigured producer can duplicate on retry; a failed produce loses the event that
+would have closed a table; an unversioned upsert lets a replay undo a verification; and
+commit-before-write trades correctness for exactly-once *looking* code.
+
+- Publish **one** event per verification with the **entity** as the message key, so an entity's
+  versions stay in order. The payload carries \`entity\`, \`tier\`, \`tags\`, \`verified_by\` and
+  \`version\`; the event id is \`{entity}:{version}\`.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent), so a retried produce
+  cannot duplicate a record.
+- When the broker rejects the produce, write the event to the **outbox** (\`store.insert_outbox\`)
+  instead of dropping it; a relay republishes it.
+- The consumer (group \`metadata-store\`, auto-commit off) reads \`store.current_version(entity)\`
+  and **skips** events whose \`version\` is not greater, so a replay cannot roll a Tier 1 back to
+  Tier 4.
+- The consumer **upserts the catalogue and only then commits** the offset.`,
   sequence: {
     participants: ['metasense', 'entity.classified', 'Metadata store', 'catalogue'],
     messages: [
@@ -47,9 +43,9 @@ commit-before-write trades correctness for exactly-once *looking* code.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=entity` (or `Key: []byte(entity)`, `key: entity`, `ProducerRecord(topic, entity, …)`). Keyed by the event id, two versions of one entity land in different partitions and can be applied out of order.',
-    'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, or required acks `all` with hashed routing. Wrap the produce and, when the broker rejects it, insert the event into the outbox.',
-    'In the consumer, read `store.current_version(entity)` first and `continue` when the event is not newer; then `store.upsert(...)`, then `commit`. A crash between upsert and commit replays the event, and the version guard makes the replay a no-op.',
+    'An owner edits a table from Tier 4 to Tier 1; a minute later the catalogue shows Tier 4 again, and a different table never got its tier at all after the broker blipped.',
+    'Versions of one entity hash to different partitions by event id, the consumer applies whatever arrives (no version compare) after it has already committed, and a produce error has no path except the exception.',
+    '`key=entity`; producer config `enable.idempotence=True`, `acks="all"`; `try: produce()` then `store.insert_outbox` on `KafkaException`; consumer: `enable.auto.commit=False`, skip when `version <= store.current_version(entity)`, `upsert`, then `commit`.',
   ],
   checks: [
     {
@@ -139,8 +135,7 @@ store = CatalogueStore()
 
 
 def publish_classified(entity: str, tier: int, tags: dict[str, str], verified_by: str, version: int) -> None:
-    # TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when
-    # the broker fails, and its consumer commits before the write and applies replays. Fix all five.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event_id = f"{entity}:{version}"
     event = {"id": event_id, "entity": entity, "tier": tier, "tags": tags, "version": version}
     producer.produce(TOPIC, key=event_id, value=json.dumps(event))
@@ -250,8 +245,7 @@ export async function publishClassified(
   verifiedBy: string,
   version: number,
 ): Promise<void> {
-  // TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when
-  // the broker fails, and its consumer commits before the write and applies replays. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const id = \`\${entity}:\${version}\`;
   const event: Classified = {id, entity, tier, tags, version};
   await producer.send({topic: TOPIC, messages: [{key: id, value: JSON.stringify(event)}]});
@@ -359,8 +353,7 @@ func (s *CatalogueStore) Upsert(ctx context.Context, entity string, tier int, ta
 
 var store = &CatalogueStore{}
 
-// TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when the
-// broker fails, and its consumer commits before the write and applies replays. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func publishClassified(ctx context.Context, entity string, tier int, tags map[string]string, verifiedBy string, version int) {
 	id := fmt.Sprintf("%s:%d", entity, version)
 	event := Classified{ID: id, Entity: entity, Tier: tier, Tags: tags, Version: version}
@@ -497,8 +490,7 @@ object PublishClassified {
   val producer = new KafkaProducer[String, String](new Properties())
   val store = CatalogueStore.open()
 
-  // TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when the
-  // broker fails, and its consumer commits before the write and applies replays. Fix all five.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publishClassified(entity: String, tier: Int, tags: Map[String, String], verifiedBy: String, version: Int): Unit = {
     val id = s"$entity:$version"
     val payload = JsObject(
@@ -614,8 +606,7 @@ struct CatalogueStore {
 CatalogueStore store;
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when the
-// broker fails, and its consumer commits before the write and applies replays. Fix all five.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void publishClassified(const std::string& entity, int tier, const std::map<std::string, std::string>& tags,
                        const std::string& verifiedBy, int version) {
   const std::string id = entity + ":" + std::to_string(version);
@@ -721,5 +712,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking what a Kafka snippet almost always gets wrong, plus the one thing a governance topic adds. The message key is an ordering contract: partition by entity and an entity's versions arrive in order; key by event id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must apply its write before the offset commit or a crash loses it. A broker is not a database: the durable path on a failed produce is an outbox row, the same pattern the source's downstream platforms rely on to consume predictions reliably. The governance-specific piece is the version guard: this topic decides who can read a table, so a replayed Tier 4 event must never overwrite the Tier 1 the owner set a minute later. Real platforms add schema registry validation for the event, a dead-letter topic for permanently unprocessable records, and a reconciliation job that compares the catalogue against the latest version per entity.`,
+  debrief: `The message key is an ordering contract: partition by entity and an entity's versions arrive in order; key by event id and they do not, which is why the fix changes one argument and nothing about the payload. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must apply its write before the offset commit or a crash loses it, with the version guard turning the replay into a no-op. A broker is not a database, so the durable path on a failed produce is an outbox row a relay drains. The version guard matters here because this topic decides who can read a table. Production platforms also validate the event against a schema registry and reconcile the catalogue against the latest version per entity.`,
 };

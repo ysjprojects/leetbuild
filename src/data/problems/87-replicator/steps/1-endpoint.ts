@@ -8,38 +8,26 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers both routes,
-parses the body and returns a replication row. It compiles, it serves the demo, and it hides four
-production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/replications\` and \`PATCH /v1/replications/{id}\`
+with body \`{"source_region", "target_region", "shards": [0, 1], "conflict_policy"}\`, checks the
+operator header, stores the row and returns it. It compiles, it serves the demo, and it hides 4
+flaws.
 
-Implement \`POST /v1/replications\` and \`PATCH /v1/replications/{id}\` with body
-\`{"source_region": "…", "target_region": "…", "shards": [0, 1], "conflict_policy": "…"}\`.
+**Failure mode the checks target.** The starter accepts any pair of regions, so a typo copies data
+into a region nobody approved. It defaults an absent policy to \`last-write-wins\` without measuring
+skew, which reorders writes when a clock drifts. And its \`PATCH\` overwrites the policy of a
+running replication, so rows merged under the old rule stay wrong.
 
-- The operator comes from the authenticated \`X-Operator-Id\` header; a missing operator is **401**.
-- \`source_region\` and \`target_region\` must form an **approved ordered pair** — the allowlist of
-  region pairs this platform is allowed to replicate between; any other pair is **400**.
-- \`shards\` is a non-empty list of at most **64** unique shard ids in \`0..1023\` (**400** otherwise).
-- \`conflict_policy\` is **required** and must be one of \`source-wins\`, \`version-vector\`,
-  \`manual\` or \`last-write-wins\` (**400** when absent or unknown). There is deliberately no
-  server-side default: the policy decides how two writes to the same key are ordered, so the caller
-  must name it instead of inheriting whatever the server picked last.
-- \`last-write-wins\` orders writes by raw wall-clock timestamps, so it is only sound while the two
-  regions' clocks agree: measure the skew with \`clock_skew_ms(source, target)\` and refuse the
-  policy with **400** when it exceeds the documented bound \`SKEW_BOUND_MS\` (250 ms). Every other
-  policy is accepted regardless of skew.
-- The policy is **immutable for the replication's life**: \`PATCH /v1/replications/{id}\` may carry
-  a policy, but when it differs from the frozen one the answer is **409** — a conflict, not a silent
-  overwrite, because the target has already merged rows under the old rule and a mid-flight change
-  makes the two regions permanently disagree.
-- The response is the stored replication: id, owner, both regions, the shard set and the frozen
-  policy. A replication the caller does not own is **404**.
-
-**Failure mode the checks target.** The starter accepts any pair of regions, so a typo or a malicious
-caller starts copying data into a region nobody approved. It defaults an absent policy to
-\`last-write-wins\` on raw timestamps without ever measuring skew, which silently reorders writes
-whenever one region's clock drifts past the bound. And its \`PATCH\` handler overwrites the policy
-of a running replication, which is the quiet one: the rows already merged under the old rule stay
-wrong forever, and no later read can tell which regions applied which policy.`,
+- A missing \`X-Operator-Id\` header is **401**.
+- \`source_region\` and \`target_region\` must form an **approved ordered pair** from the
+  allowlist; any other pair is **400**.
+- \`shards\` is a non-empty list of at most **64** unique ids in \`0..1023\` (**400** otherwise).
+- \`conflict_policy\` is **required** and one of \`source-wins\`, \`version-vector\`, \`manual\` or
+  \`last-write-wins\` (**400** when absent or unknown). No server-side default.
+- \`last-write-wins\` is only sound while the two clocks agree: measure \`clock_skew_ms(source,
+  target)\` and refuse it with **400** above \`SKEW_BOUND_MS\` (250 ms).
+- The policy is **immutable**: a \`PATCH\` whose policy differs from the frozen one is **409**.
+- The response is the stored replication; a replication the caller does not own is **404**.`,
   sequence: {
     participants: ['Operator', 'Replicator API', 'region clocks', 'Postgres'],
     messages: [
@@ -167,10 +155,7 @@ store = ReplicationStore()
 
 @app.post("/v1/replications", status_code=201)
 def create_replication(body: ReplicationRequest, x_operator_id: str | None = Header(default=None)):
-    # TODO: the starter accepts any region pair, defaults an absent conflict_policy to
-    # "last-write-wins" on raw wall-clock timestamps without measuring the clock skew between the
-    # two regions, never bounds the shard set, and the PATCH handler below overwrites the policy of
-    # a replication that is already running.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if not x_operator_id:
         raise HTTPException(status_code=401, detail="missing X-Operator-Id")
     replication = {
@@ -334,9 +319,7 @@ app.post('/v1/replications', async (request, reply) => {
   const operator = request.headers['x-operator-id'];
   if (typeof operator !== 'string' || operator === '') return reply.code(401).send({error: 'missing X-Operator-Id'});
   const body = request.body as ReplicationBody;
-  // TODO: the starter accepts any region pair, defaults an absent conflict_policy to
-  // 'last-write-wins' without measuring the clock skew between the two regions, never bounds the
-  // shard set, and the PATCH handler below overwrites the policy of a running replication.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const replication: Replication = {
     id: \`rep-\${randomUUID()}\`,
     owner: operator,
@@ -511,9 +494,7 @@ func createReplication(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: the starter accepts any region pair, defaults an absent conflict_policy to
-	// "last-write-wins" without measuring the clock skew between the two regions, never bounds the
-	// shard set, and updateReplication below overwrites the policy of a running replication.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	policy := body.ConflictPolicy
 	if policy == "" {
 		policy = "last-write-wins"
@@ -732,10 +713,7 @@ object ReplicationApi {
       post {
         headerValueByName("X-Operator-Id") { operator =>
           entity(as[ReplicationRequest]) { body =>
-            // TODO: the starter accepts any region pair, defaults an absent conflict_policy to
-            // "last-write-wins" without measuring the clock skew between the two regions, never
-            // bounds the shard set, and the patch route below overwrites the policy of a
-            // replication that is already running.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val replication = Replication(
               id = s"rep-\${System.currentTimeMillis()}",
               owner = operator,
@@ -893,9 +871,7 @@ int main() {
       return;
     }
     json body = json::parse(req.body, nullptr, false);
-    // TODO: the starter accepts any region pair, defaults an absent conflict_policy to
-    // "last-write-wins" without measuring the clock skew between the two regions, never bounds the
-    // shard set, and the PATCH handler below overwrites the policy of a running replication.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const json replication = {
         {"id", "rep-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count())},
         {"owner", operatorId},
@@ -1045,9 +1021,9 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses in cost order: operator, approved pair, policy whitelist, skew probe, shard set. Each one returns before anything is stored, so a malformed request can never start a replication.',
-    'The skew probe belongs inside the policy branch, not in the happy path: `last-write-wins` is the only policy that reads a wall clock, so it is the only one whose soundness depends on the two regions agreeing within `SKEW_BOUND_MS`.',
-    'Policy immutability is a comparison, not a delete: store the policy at create time, and let the update path answer **409** when the requested value differs. A `PUT`-style overwrite is what makes the two regions permanently disagree about what the ordering rule was.',
+    'Start a replication from `us-east-1` to a region that is not on the allowlist, or omit `conflict_policy`: the starter answers 201 both times, and a later `PATCH` quietly changes the policy.',
+    'Nothing in the create path consults an allowlist or a policy set, `conflict_policy or "last-write-wins"` fills the gap, and the update handler assigns whatever policy the body carries.',
+    'Add `APPROVED_REGION_PAIRS`, `CONFLICT_POLICIES` and `SKEW_BOUND_MS`; reject unapproved pairs, missing policies and last-write-wins above the skew with 400; make `PATCH` compare and answer 409 `immutable`.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a data-copying service. The starter reads fine because the demo starts one replication between two regions the operator happens to own. Four defects are being checked: the approved-pair allowlist (a replication is a data-movement permission, not a destination string), a required policy from a documented set (no silent server default), the skew gate that makes wall-clock ordering defensible, and immutability of the policy once the target has merged rows under it. The immutability check is the one candidates miss: they fix validation and leave the update handler overwriting the rule that the already-applied rows were merged with, which no later read can detect. Real platforms add a policy version recorded on every applied batch, a region catalogue with health, and an audit trail for who started and who stopped a replication.`,
+  debrief: `The fixes are guard clauses placed before anything is stored, in cost order: operator, approved pair, policy set, skew probe, shard set. The skew probe sits inside the last-write-wins branch because that is the only policy that reads a wall clock, so it is the only one whose soundness depends on the two clocks agreeing. Immutability is a comparison rather than a delete: the create path records the policy, the update path answers 409 when the requested value differs, and rows already merged under the old rule stay consistent with the rule on record. Production replicators go further: they record a policy version on every applied batch, keep a region catalogue with residency rules, and audit who started and stopped each replication.`,
 };

@@ -8,35 +8,31 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: an event reaches the topic and
-the trail consumer writes it down, so the demo shows approvals flowing through Kafka. The key, the
-payload and the order of the two writes are all wrong. Debug it, fix it, and prove the fix.
+**Starting point.** The starter's \`publish_event(request_id, kind, step, actor, actor_role, why,
+attachments, decision)\` builds a JSON event from every argument, produces it to \`approval.event\`
+keyed by the actor with a plain \`Producer\`, falls back to \`insert_outbox\` on \`KafkaException\`,
+and then calls \`state.commit_step\` for decisions. A trail consumer commits its offset and writes
+the event into \`approval:{request_id}:trail\`. It serves the demo and hides 4 flaws.
 
-Implement the event path for submit, decision, delegation and completion events. \`publish_event(
-request_id, kind, step, actor, actor_role, decision)\` is the one code path they all take.
+**Failure mode the checks target.** Keyed by approver, one request's events are spread over as
+many partitions as it has approvers, so a consumer sees step 1 before step 0. The \`why\` text and
+the attachment list land in a retained, replicated topic, a leak with a very long tail. A retried
+produce can duplicate a record. And the broker is acked before the state commit, so a crash between
+the two leaves a step in the trail that the state does not have.
 
-- **One topic**, \`approval.event\`, and **one key: the request id**. Partitioning by request id is
-  what keeps a single request's chain — submit, step 0, delegation, step 1, completion — in order.
-  Keying by the approver scatters one chain across partitions, and a consumer then sees step 1
-  before step 0.
+- **One topic**, \`approval.event\`, and **one key: the request id**, so a single request's chain
+  (submit, step 0, delegation, step 1, completion) stays in one partition and in order.
 - The payload carries **ids and enums only**: \`request_id\`, \`kind\`, \`step\`, \`actor\`,
-  \`actor_role\`, \`decision\`. **Never** the \`why\` text and never attachments. The topic is
-  retained for days and replicated across brokers, so anything written there outlives the request,
+  \`actor_role\`, \`decision\`. No \`why\` text and no attachments: the topic outlives the request,
   the tenant and every retention policy the request path has.
 - The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
-  plus hashed, stable keys), so a retry of a produce cannot duplicate a record.
-- When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
+  plus hashed, stable keys).
+- When the broker rejects the produce, the event goes to the **outbox** rather than being dropped or
   failing the caller; a relay republishes outbox rows when the broker recovers.
 - **A decision publishes only after the state commit**: \`state.commit_step\` runs first, then the
-  produce. Acknowledging the produce first means the broker can announce a step that a crash a
-  millisecond later never committed — an approval that exists in the trail and not in the state.
+  produce.
 - The trail consumer writes the step into \`approval:{request_id}:trail\` and commits its offset
-  after that write, so a crash between the two replays the record instead of losing it.
-
-**Failure mode the checks target.** The starter keys by approver, so one request's events are ordered
-only within a partition that no longer corresponds to the request. It copies the \`why\` text and the
-attachment list into a retained topic, which is a data leak with a very long tail. And it acks the
-produce before the state commit, so the trail can contain a step the state never recorded.`,
+  after that write, so a crash between the two replays the record instead of losing it.`,
   sequence: {
     participants: ['Approval API', 'approval.event', 'Trail consumer', 'Redis'],
     messages: [
@@ -50,9 +46,9 @@ produce before the state commit, so the trail can contain a step the state never
     ],
   },
   hints: [
-    'The key is the ordering contract: `key=request_id` (`Key: []byte(requestID)`, `key: request_id`, `ProducerRecord("approval.event", requestId, …)`). Partitioned by approver, one request’s chain is spread over as many partitions as it has approvers and the trail can be assembled out of order.',
-    'Build the event from ids and enums only — `request_id`, `kind`, `step`, `actor`, `actor_role`, `decision`. The `why` text and the attachments stay where they belong: in the request record and the object store. A topic is a retained, replicated, replicated-again data store, not a log line.',
-    'Idempotence is producer configuration (`enable.idempotence` + `acks=all`, `idempotent: true`, required acks `all` with hashed routing), and the outbox is the durability half: catch the produce error and insert the event as an outbox row. Ordering is the third half: commit the step in state, then publish.',
+    'Submit a three-approver request and read the trail: step 1 sometimes appears before step 0, the trail rows contain the full `why` paragraph and file names, and a decision that crashed mid-handler shows up in the trail but not in the state.',
+    'The produce call uses `key=actor`, so partition assignment follows the approver; the event dict is built from every argument including `why` and `attachments`; the `Producer` config has no idempotence; and `commit_step` runs after the produce.',
+    'Drop `why` and `attachments` from the event, produce with `key=request_id`, configure `enable.idempotence` and `"acks": "all"`, and move `state.commit_step` ahead of `producer.produce`; keep `insert_outbox` in the `except` branch.',
   ],
   checks: [
     {
@@ -163,8 +159,7 @@ def publish_event(
     attachments: list[str],
     decision: str = "",
 ) -> dict:
-    # TODO: this starter keys by the approver, copies the why text and the attachments into the
-    # payload, and acknowledges the broker before the step is committed in state. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     event = {
         "request_id": request_id,
         "kind": kind,
@@ -310,8 +305,7 @@ export async function publishEvent(
   attachments: string[],
   decision = '',
 ): Promise<Record<string, unknown>> {
-  // TODO: this starter keys by the approver, copies the why text and the attachments into the
-  // payload, and acknowledges the broker before the step is committed in state. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const event = {
     request_id: requestId,
     kind,
@@ -460,8 +454,7 @@ type EventBody struct {
 }
 
 func publishEvent(ctx context.Context, body EventBody) (map[string]any, error) {
-	// TODO: this starter keys by the approver, copies the why text and the attachments into the
-	// payload, and acknowledges the broker before the step is committed in state. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"request_id":  body.RequestID,
 		"kind":        body.Kind,
@@ -608,8 +601,7 @@ object Events {
   }
 
   def publishEvent(event: ApprovalEvent): Unit = {
-    // TODO: this starter keys by the approver, copies the why text and the attachments into the
-    // payload, and acknowledges the broker before the step is committed in state. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val payload = event.toJson.compactPrint
     try {
       producer.send(new ProducerRecord[String, String](Topic, event.actor, payload))
@@ -729,8 +721,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: this starter keys by the approver, copies the why text and the attachments into the payload,
-// and acknowledges the broker before the step is committed in state. Fix all three.
+// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 void publishEvent(
     const std::string& requestId,
     const std::string& kind,
@@ -847,15 +838,5 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `Three Kafka contracts are being tested here, and each one is invisible until production. The
-  message key decides ordering: keyed by the request id, one request's submit, decisions, delegation
-  and completion events land in the same partition and are consumed in the order they happened;
-  keyed by the approver, the chain is spread across partitions and the trail is assembled by luck.
-  The payload decides the blast radius of a leak: an id and an enum can live in a retained topic, but
-  the \`why\` text and the attachment list cannot — the topic outlives the request and every retention
-  policy around it. The order of the two writes decides durability: commit the step in state, then
-  publish; acking first lets a crash between the two announce an approval the state never recorded.
-  Real platforms add a schema registry that makes the payload shape a compile-time contract, a relay
-  that drains the outbox with the same idempotent producer, and a dead-letter topic for records the
-  consumer can never apply.`,
+  debrief: `The fix is three contracts on one produce call. The key decides ordering: keyed by the request id, a request's submit, decisions, delegation and completion land in one partition and are consumed in the order they happened; keyed by the approver, the trail is assembled by luck. The payload decides the blast radius of a leak: an id and an enum can live in a retained topic, the \`why\` text and the attachment list cannot, because the topic outlives the request and every retention policy around it. The order of the two writes decides durability: commit the step, then publish, so a crash between them replays a decision rather than announcing one that was not recorded. Production event paths also pin the payload shape in a schema registry, drain the outbox with the same idempotent producer, and route records the consumer cannot apply to a dead-letter topic.`,
 };

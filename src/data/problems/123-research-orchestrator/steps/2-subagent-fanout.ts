@@ -8,33 +8,26 @@ export const subagentFanoutStep: Step = {
   focus: ['lead', 'subagent'],
   task: `## Task
 
-**Starting point.** The starter is working code: it asks the planner for
-subtasks, runs each through \`Subagent.Run\` and synthesises the replies. It compiles, it answers the
-demo query, and it hides four production flaws — the four the source names when it describes what
-went wrong with its early lead agents. Debug it, fix it, and prove the fix.
+**Starting point.** The starter implements \`run_research(job_id, query, budget)\` for the lead
+agent: it asks the planner for subtasks, sends each one through \`Subagent.Run\` with a bare
+objective, waits for the reply, appends the transcript to its notes and synthesises. It compiles,
+it answers the demo query, and it hides five flaws.
 
-Implement \`run_research(job_id, query, budget)\` for the lead agent:
+**Failure mode the checks target.** A sequential loop makes a ten-subagent job ten times slower;
+an uncapped plan lets the lead spawn as many subagents as the planner invents; a call without a
+deadline lets one stuck subagent hold the job open; a bare objective makes subagents duplicate each
+other's searches; and the raw transcript fills the lead's context with pages, so the synthesis
+degrades without an error.
 
-- The plan is a list of subtasks; take at most \`budget.max_subagents\` of them. Each
-  \`Subagent.Run\` request carries the **objective**, the **output format**, the **tools** the
-  subagent may use and its **boundaries** — the source found that a bare "research X" makes
-  subagents duplicate each other's searches and leave gaps.
-- Run subagents **in parallel**, in batches of at most \`min(MAX_PARALLEL_SUBAGENTS, budget.max_subagents)\`
-  where \`MAX_PARALLEL_SUBAGENTS = 5\`. The source's lead agent spins up 3–5 subagents at once
-  instead of serially; that change alone cut research time by up to 90%.
+- The plan is a list of subtasks; take at most \`budget.max_subagents\`. Each \`Subagent.Run\`
+  request carries the **objective**, **output format**, **tools** and **boundaries**.
+- Run subagents **in parallel**, in batches of at most
+  \`min(MAX_PARALLEL_SUBAGENTS, budget.max_subagents)\` with \`MAX_PARALLEL_SUBAGENTS = 5\`.
 - Every \`Run\` carries a **120 s** deadline (\`SUBAGENT_DEADLINE_S\`). A subagent that times out
-  or fails contributes a one-line "no result" note for its task; it never blocks the batch.
-- Only the subagent's condensed \`findings\` reach synthesis, capped at **4 000** characters
-  (\`MAX_FINDINGS_CHARS\`). The reply's \`transcript\` — every search and every page it read — stays
-  with the subagent. Subagents exist to compress; forwarding the transcript puts the whole corpus
-  back into the lead's context window.
-
-**Failure mode the checks target.** A sequential loop makes a ten-subagent job ten times slower
-than it needs to be; an uncapped plan lets the lead spawn as many subagents as the planner invents
-(the source's early agents spawned fifty for a simple query); a call without a deadline lets one
-stuck subagent hold the job open indefinitely; and the raw transcript is the quiet one: the lead's
-context fills with pages instead of findings, the plan it wrote at the top is truncated away, and
-the synthesis degrades without any error being raised.`,
+  or fails contributes a one-line "no result" note and does not block the batch.
+- Only the condensed \`findings\` reach synthesis, capped at **4 000** characters
+  (\`MAX_FINDINGS_CHARS\`). The \`transcript\` stays with the subagent: forwarding it puts the whole
+  corpus back into the lead's context window.`,
   sequence: {
     participants: ['Lead agent', 'Planner', 'Subagent A', 'Subagent B'],
     messages: [
@@ -49,9 +42,9 @@ the synthesis degrades without any error being raised.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). Put one subagent call in its own function that returns a string either way — findings or a "no result" note — so a failure never rejects the batch.',
-    'Parallelism is a batch, not a free-for-all: slice the plan into windows of `min(MAX_PARALLEL_SUBAGENTS, budget.max_subagents)` and run each window with `asyncio.gather` / `Promise.all` / a `WaitGroup` / `Future.sequence` / `std::async`. Cap the plan at `budget.max_subagents` before the first window.',
-    'Compression is the point: read `reply.findings`, slice it to `MAX_FINDINGS_CHARS`, and never touch `reply.transcript`. The request needs all four task fields — `objective`, `output_format`, `tools`, `boundaries` — straight from the planner’s task.',
+    'A `deep` job takes ten times longer than a `fact` job with the same subagent latency, a simple query shows thirty subagents in the trace, and one hung subagent keeps the job running for hours.',
+    'The loop awaits `subagents.Run` one task at a time with no deadline, takes every task the planner returns, fills the request from `task["objective"]` only, and appends `reply.transcript`, so the lead reads whole corpora.',
+    'Slice the plan to `budget.max_subagents`, run windows of `min(MAX_PARALLEL_SUBAGENTS, budget.max_subagents)` with `asyncio.gather`, pass `timeout=SUBAGENT_DEADLINE_S` to `Run`, fill `objective`, `output_format`, `tools`, `boundaries`, keep `reply.findings[:MAX_FINDINGS_CHARS]`.',
   ],
   checks: [
     {
@@ -148,8 +141,7 @@ def synthesize(query: str, notes: list[str]) -> str:
 
 
 async def run_research(job_id: str, query: str, budget: dict) -> str:
-    # TODO: this starter runs subagents one after another with no deadline, lets the planner decide
-    # how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     notes: list[str] = []
     for task in plan(query):
         request = agents_pb2.RunRequest(job_id=job_id, task_id=task["id"], objective=task["objective"])
@@ -242,8 +234,7 @@ export interface Budget {
 }
 
 export async function runResearch(jobId: string, query: string, budget: Budget): Promise<string> {
-  // TODO: this starter runs subagents one after another with no deadline, lets the planner decide
-  // how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const notes: string[] = [];
   for (const task of plan(query)) {
     const reply = await new Promise<RunReply>((resolve, reject) => {
@@ -364,8 +355,7 @@ type Task struct {
 func plan(ctx context.Context, query string) ([]Task, error)      { return nil, nil }
 func synthesize(ctx context.Context, query string, notes []string) (string, error) { return "", nil }
 
-// TODO: this starter runs subagents one after another with no deadline, lets the planner decide
-// how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func runResearch(ctx context.Context, client pb.SubagentClient, jobID, query string, budget Budget) (string, error) {
 	tasks, err := plan(ctx, query)
 	if err != nil {
@@ -480,8 +470,7 @@ object LeadAgent {
   def plan(query: String): List[Task] = ???
   def synthesize(query: String, notes: List[String]): String = ???
 
-  // TODO: this starter runs subagents one after another with no deadline, lets the planner decide
-  // how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def runResearch(jobId: String, query: String, budget: Budget): String = {
     val notes = plan(query).map { task =>
       val reply = subagents.run(RunRequest(jobId = jobId, taskId = task.id, objective = task.objective))
@@ -569,8 +558,7 @@ struct Task {
 std::vector<Task> plan(const std::string& query);
 std::string synthesize(const std::string& query, const std::vector<std::string>& notes);
 
-// TODO: this starter runs subagents one after another with no deadline, lets the planner decide
-// how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::string runResearch(Subagent::Stub* subagents, const std::string& jobId, const std::string& query, const Budget& budget) {
   std::vector<std::string> notes;
   for (const auto& task : plan(query)) {
@@ -653,5 +641,5 @@ std::string runResearch(Subagent::Stub* subagents, const std::string& jobId, con
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand why the source's architecture works at all: subagents exist to spend tokens in parallel, in their own context windows, and hand back a compressed result. Four defects break that. The sequential loop throws away the parallelism (the source measured up to 90% of the time saved by running 3–5 subagents at once); the uncapped plan is the fifty-subagents-for-a-simple-query failure the source names, and the budget from step 1 is what bounds it; the missing deadline lets one subagent hold a stateful, expensive job open with no exit; and forwarding the transcript undoes the compression — the lead's context fills with pages, its plan is truncated away, and the synthesis quietly degrades. The task spec is the fourth, and the one that is not a bug in the code: the source found that subagents given only "research X" duplicate each other's searches, so objective, output format, tools and boundaries are part of the request contract. Real leads add a second round — spawn more subagents when the synthesis finds gaps — write the plan to external memory before the first fan-out, and let subagents write large artefacts to a store and return references instead of text.`,
+  debrief: `The fix keeps the lead's context window small and its wall clock short, which is why subagents exist: they spend tokens in parallel in their own windows and hand back a compressed result. Batches of five restore the parallelism the loop threw away; the budget cap bounds how many are spawned; the deadline gives an expensive job an exit when one subagent hangs; and reading \`findings\` instead of \`transcript\` preserves the compression. The task spec is not a code bug: a subagent given only "research X" cannot know what its siblings are doing, so objective, output format, tools and boundaries are part of the request contract. Production leads also run a second round when the synthesis finds gaps and let subagents return references to stored artefacts.`,
 };

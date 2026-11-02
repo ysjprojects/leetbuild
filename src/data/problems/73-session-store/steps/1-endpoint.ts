@@ -8,28 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'auth', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, reads
-the body and returns a session id. It compiles, it serves the demo, and it hides three production
-flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/sessions\` with body \`{"user_id": "…", "device_class": "…"}\`.
-
-- The \`user_id\` comes from the **completed auth flow**; the endpoint never invents one. A request
-  without a completed auth assertion is **401**.
-- The \`device_class\` is **trusted metadata from the token**, not the request body. A caller may
-  label their own device in the body, but the record keeps the class the auth service asserted.
-- Creating a session with no prior id mints a **fresh session id**. Elevating an existing session
-  (a request carrying \`X-Session-Id\`) mints a **new id and invalidates the old one in the same
-  request**, so a pre-login id can never become authenticated. The response returns the new id.
-- The session record is written under \`session:{id}\` before the response; the old record is removed
-  before the response as well. A client that keeps using the old id is rejected on its next request.
+**Starting point.** The starter registers \`POST /v1/sessions\` with body
+\`{"user_id": "…", "device_class": "…"}\`, reads the body, stores a record under the session id it
+was handed in \`X-Session-Id\` and returns that id. It compiles and hides 4 flaws.
 
 **Failure mode the checks target.** Reusing the incoming session id across elevation is session
 fixation: the attacker plants an id, the victim logs in on it, and the attacker's id is now
 authenticated. Trusting \`device_class\` from the body lets a caller forge the metadata the audit
 trail is built on. Accepting a request with no auth assertion turns an unauthenticated call into a
-session. Three separate defects, all invisible while the demo sends well-formed requests from one
-device.`,
+session. All of it is invisible while the demo sends well-formed requests from one device.
+
+Requirements:
+
+- The \`user_id\` comes from the **completed auth flow**; the endpoint does not invent one. A request
+  without a completed auth assertion is **401** and creates nothing.
+- The \`device_class\` is **trusted metadata from the token**, not the request body. A caller may
+  label their own device in the body, but the record keeps the class the auth service asserted.
+- Creating a session with no prior id mints a **fresh session id**. Elevating an existing session
+  (a request carrying \`X-Session-Id\`) mints a **new id and invalidates the old one in the same
+  request**, so a pre-login id cannot become authenticated. The response returns the new id.
+- The session record is written under \`session:{id}\` before the response; the old record is removed
+  before the response as well. A client that keeps using the old id is rejected on its next request.`,
   sequence: {
     participants: ['Client', 'Session API', 'Auth Service', 'Session Store'],
     messages: [
@@ -111,9 +110,9 @@ device.`,
     },
   ],
   hints: [
-    'A session id that arrives in a request is an *input*, not an identity. On elevation the id must change.',
-    'The auth service already told you the device class — read it from the validated claims instead of the body.',
-    'Order matters: mint the new id and write its record first, then retire the old id, so a failure between the two leaves the new session valid and the old one gone.',
+    'A user who elevates from a pre-login page keeps the same session id, and anyone who planted that id before the login now holds an authenticated session.',
+    'The handler treats the incoming `X-Session-Id` as the identity to store under, trusts the body for `device_class`, and creates a record for any caller with no auth check.',
+    'Return 401 when `request.state.auth_assertion` is missing, take `device_class` from `request.state.claims`, mint `new_session_id = str(uuid4())`, write it, then delete `session:{old_id}`.',
   ],
   code: {
     python: {
@@ -127,7 +126,7 @@ r = redis.Redis()
 
 @app.post("/v1/sessions")
 async def create_session(request: Request):
-    # TODO: the starter trusts the body's device class and reuses the incoming session id.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     body = await request.json()
     user_id = body.get("user_id")
     device_class = body.get("device_class")
@@ -167,7 +166,7 @@ const redis = new Redis();
 
 export async function sessionRoutes(app: FastifyInstance) {
   app.post('/v1/sessions', async (req, reply) => {
-    // TODO: the starter trusts the body's device class and reuses the incoming session id.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const body = req.body as {user_id?: string; device_class?: string};
     const device_class = body.device_class;
     const sessionId = req.headers['x-session-id'] as string;
@@ -224,7 +223,7 @@ func RegisterRoutes(mux *http.ServeMux, rdb *redis.Client) {
 	mux.HandleFunc("POST /v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		var body createBody
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		// TODO: the starter trusts the body's device class and reuses the incoming session id.
+		// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 		sessionID := r.Header.Get("X-Session-Id")
 		record, _ := json.Marshal(map[string]string{"user_id": body.UserID, "device_class": body.DeviceClass})
 		rdb.Set(r.Context(), "session:"+sessionID, record, 0)
@@ -285,7 +284,7 @@ object SessionRoutes {
     path("v1" / "sessions") {
       post {
         entity(as[CreateBody]) { body =>
-          // TODO: the starter trusts the body's device class and reuses the incoming session id.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val sessionId = "x-session-id"
           redis.set(s"session:$sessionId", s"""{"user_id":"\${body.user_id}","device_class":"\${body.device_class}"}""")
           complete(StatusCodes.OK, s"""{"session_id":"$sessionId","device_class":"\${body.device_class}"}""")
@@ -338,7 +337,7 @@ using json = nlohmann::json;
 
 void register_session_routes(httplib::Server& svr, RedisClient& redis) {
     svr.Post("/v1/sessions", [&redis](const httplib::Request& req, httplib::Response& res) {
-        // TODO: the starter trusts the body's device class and reuses the incoming session id.
+        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
         json body = json::parse(req.body);
         std::string device_class = body["device_class"];
         std::string session_id = req.get_header_value("X-Session-Id");
@@ -381,5 +380,5 @@ void register_session_routes(httplib::Server& svr, RedisClient& redis) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one device and never elevates. Three separate defects are being checked: the id handed in by the client is never an identity, so elevation must mint a new id and retire the old one in the same request; the device class must come from the validated claims, not from the body the caller controls; and a session cannot exist without a completed auth assertion. Real session layers add a rotation counter to the record, keep the old id in a short-lived tombstone so a mid-flight request is not broken, and bind the id to the auth service's rotation epoch.`,
+  debrief: `The fix has this shape because a handler at the trust boundary can only use what the auth service asserted: the auth assertion gates the request, the claims supply the device class, and the session id is minted by the server rather than taken from the client. Writing the new record before deleting the old one means a crash between the two leaves one valid id and no window in which an attacker's planted id authenticates. Production session layers go further: they keep a rotation counter in the record, hold the retired id in a short-lived tombstone so a request already in flight on it is not broken, and bind each id to the auth service's rotation epoch so a stale id is rejected even if the delete was lost.`,
 };

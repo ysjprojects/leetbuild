@@ -8,33 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it authenticates the tenant,
-registers the route and returns a tool record from Redis. It runs, and it serves the demo — one
-catalog, one trusted caller — while hiding three production flaws. Debug it like the platform
-owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is \`GET /v1/tools/{name}\`, the resolve endpoint an agent calls
+before it uses a tool. It authenticates the tenant and returns a tool record from Redis. It serves
+the demo (one catalog, one trusted caller) while hiding 4 flaws.
 
-Implement \`GET /v1/tools/{name}\`, the resolve endpoint an agent calls before it uses a tool:
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**. The
-  caller's allowlist comes from that authenticated context too — never from the path, the body or
-  the query string.
-- The version served is the one the caller is entitled to: the caller's \`X-Catalog-Version\` pin when
-  it pinned a catalog, otherwise the active catalog pointer (\`catalog:active\`). The entry is read
-  with one \`HGET\` against the version’s hash, \`catalog:version:{version}\` — resolution is a lookup,
-  not a scan.
-- A tool that is not on the caller's allowlist is **404**, the same answer as a tool that does not
-  exist. A 403 would confirm that the tool exists and turn the endpoint into an enumeration oracle.
-- The response is the public contract and nothing else: \`name\`, \`version\` (the version served),
-  \`side_effect\` (\`read\`, \`write\` or \`irreversible\`) and \`definition\` (the JSON Schema). No
-  owner-team endpoint or base URL, no credential reference, no internal schema blob.
+- A missing \`X-Tenant-Id\` is **401**. The caller's allowlist comes from that authenticated
+  context too, not from the path, body or query string.
+- The version served is the caller's \`X-Catalog-Version\` pin when it pinned one, otherwise
+  \`catalog:active\`. The entry is read with one \`HGET\` against \`catalog:version:{version}\`.
+- A tool outside the allowlist is **404**, the same answer as a missing tool; a 403 would turn the
+  endpoint into an enumeration oracle.
+- The response is the public contract only: \`name\`, \`version\` (the version served),
+  \`side_effect\` and \`definition\` (the JSON Schema). No owner endpoint, credential reference or
+  internal schema blob.
 
 **Failure mode the checks target.** The starter serves whatever the active catalog holds, so an agent
 that pinned a catalog to keep a reviewed definition is silently flipped onto the newest one
-mid-plan. It never consults the allowlist, so any authenticated caller can resolve any tool —
-including the irreversible ones it was never granted. And it returns the stored record field by
-field, shipping the owner team's internal endpoint and credential reference to every caller. All
-three stay invisible in the demo because the demo has one catalog, one caller, and no secret worth
-leaking.`,
+mid-plan. It skips the allowlist, so any authenticated caller can resolve any tool, including the
+irreversible ones it was not granted. And it returns the stored record field by field, shipping the
+owner team's endpoint and credential reference to every caller under the internal field names.
+None of it shows in a demo with one catalog, one caller and no secret worth leaking.`,
   sequence: {
     participants: ['Client', 'Tool Registry', 'Redis'],
     messages: [
@@ -66,9 +59,9 @@ leaking.`,
     ],
   },
   hints: [
-    'Resolve the version before you touch the snapshot: read `X-Catalog-Version` off the request and fall back to the `catalog:active` pointer only when it is absent, then answer the entry with one `HGET catalog:{version} {name}`. The starter reads the pointer unconditionally, so the pin never gets a chance to matter.',
-    'Authorize with the caller’s context, not the request: the allowlist arrives with the authenticated caller, so check membership after authentication and answer the same **404** you answer for a missing tool. The starter never looks at it, so every caller can resolve every tool.',
-    'Build the reply field by field instead of echoing the stored record: the record carries `owner_endpoint`, `credentials_ref` and `internal_schema` for the platform’s own use, and the public contract calls the served schema `definition`, not `schema`. The starter ships the internal names verbatim.',
+    'Symptom: an agent that pinned catalog `a1b2` for its run starts getting `payments.charge` from the newest catalog, a tenant with no grant resolves it anyway, and the reply contains `credentials_ref`.',
+    'Mechanism: the handler reads `catalog:active` unconditionally, so the pin header is dead; it checks only that a tenant exists; and it returns the Redis record as-is, internal fields and stored names included.',
+    'Fix: read `X-Catalog-Version` and fall back to `catalog:active`, load `allowed_tools` in `authenticate` and answer 404 outside it, then build `{name, version, side_effect, definition}` by hand from the record.',
   ],
   checks: [
     {
@@ -116,7 +109,7 @@ leaking.`,
       id: 'allowlist',
       title: 'Answers 404 for a tool outside the caller’s allowlist',
       detail:
-        'The allowlist comes from the authenticated caller’s context — never the path, body or query string — and a tool it does not name is **404**, the same answer as a missing tool, so the endpoint cannot be used to enumerate the catalog. The starter serves any authenticated caller any tool.',
+        'The allowlist comes from the authenticated caller’s context, not the path, body or query string, and a tool it does not name is **404**, the same answer as a missing tool, so the endpoint cannot be used to enumerate the catalog. The starter serves any authenticated caller any tool.',
       match: {
         python: {all: [/def authenticate\(/, /allowed_tools/, /404/]},
         typescript: {all: [/function authenticate\(/, /allowedTools/, /404/]},
@@ -169,10 +162,7 @@ def latest_catalog() -> str:
 
 @app.get("/v1/tools/{name}")
 def resolve(name: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
-    # TODO: debug this starter before it ships. It resolves against whatever the active catalog
-    # holds and ignores the caller's pin, never consults the caller's allowlist, and returns the
-    # stored record field by field — owner endpoint, credential reference and internal schema
-    # included.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if tenant is None or tenant == "":
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
     latest = latest_catalog()
@@ -273,9 +263,7 @@ async function latestCatalog(): Promise<string> {
 app.get('/v1/tools/:name', async (request, reply) => {
   const {name} = request.params as {name: string};
   const tenant = request.headers['x-tenant-id'];
-  // TODO: debug this starter before it ships. It resolves against whatever the active catalog holds
-  // and ignores the caller's pin, never consults the caller's allowlist, and returns the stored
-  // record field by field — owner endpoint, credential reference and internal schema included.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   if (typeof tenant !== 'string' || tenant === '')
     return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const latest = await latestCatalog();
@@ -402,10 +390,7 @@ func latestCatalog(ctx context.Context) string {
 func resolve(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	tenant := r.Header.Get("X-Tenant-Id")
-	// TODO: debug this starter before it ships. It resolves against whatever the active catalog
-	// holds and ignores the caller's pin, never consults the caller's allowlist, and returns the
-	// stored record field by field — owner endpoint, credential reference and internal schema
-	// included.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	if tenant == "" {
 		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
 		return
@@ -573,10 +558,7 @@ object ToolReadApi {
     path("v1" / "tools" / Segment) { name =>
       get {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: debug this starter before it ships. It resolves against whatever the active
-          // catalog holds and ignores the caller's pin, never consults the caller's allowlist, and
-          // returns the stored record field by field — owner endpoint, credential reference and
-          // internal schema included.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           tenantOpt.filter(_.nonEmpty) match {
             case None => complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
             case Some(_) =>
@@ -694,10 +676,7 @@ int main() {
 
   svr.Get("/v1/tools/:name", [](const httplib::Request& req, httplib::Response& res) {
     const auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: debug this starter before it ships. It resolves against whatever the active catalog
-    // holds and ignores the caller's pin, never consults the caller's allowlist, and returns the
-    // stored record field by field — owner endpoint, credential reference and internal schema
-    // included.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if (tenant.empty()) {
       res.status = 401;
       res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
@@ -834,5 +813,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question is what the endpoint is allowed to reveal, and under which entitlement. Resolution is two decisions and one lookup: which catalog the caller may see (its pin, with the active pointer only as the fallback) and which tools the caller may see (the allowlist from its authenticated context), then a single HGET on the snapshot that serves both. The allowlist answers 404 rather than 403 for the same reason a missing entry does: a resolver must not confirm that a tool exists to a caller who cannot use it, or it becomes an enumeration oracle for the whole catalog. The response is a contract, not a record dump — the stored entry exists for the platform’s own use and carries the owner team’s internal wiring, while the caller gets the version it was entitled to and the fields it can act on. Real registries go further: signature verification on the pinned catalog, per-tool scopes inside the allowlist, and an audit event for every resolution of an irreversible tool.`,
+  debrief: `The fix has the shape of two decisions and one lookup: which catalog the caller may see (its pin, with the active pointer only as the fallback) and which tools it may see (the allowlist from its authenticated context), then a single HGET on the snapshot that serves both. The allowlist answers 404 rather than 403 for the same reason a missing entry does: confirming that a tool exists to a caller who cannot use it turns the resolver into an enumeration oracle. The response is a contract, not a record dump. Production resolvers add signature verification on the pinned catalog, per-tool scopes inside the allowlist, a short local cache keyed by version, and an audit event for every resolution of an irreversible tool.`,
 };

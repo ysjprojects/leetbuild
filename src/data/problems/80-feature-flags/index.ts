@@ -18,67 +18,55 @@ import {readStep} from './steps/5-read';
 export const featureFlagsProblem: Problem = {
   id: 'feature-flags',
   title: 'Feature Flags',
-  tagline: 'Flags that evaluate deterministically, roll out safely and cannot be flipped by drift.',
+  tagline:
+    'A flag service with a schema registry, one atomic snapshot, a kill switch that outruns stale caches, and an explain endpoint that matches what was served.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Feature Flags
 
-A feature-flag service is the piece of a platform that decides which users see which behavior,
-without a deploy. The visible part is a boolean in a response; the parts that decide whether the
-platform is safe are the validation funnel at creation, the atomic versioned snapshot every
-evaluation reads, the kill switch that must land everywhere in bounded time, the event stream that
-keeps a flag's history ordered, and the explanation endpoint that must never contradict what was
-served.
+A feature-flag service decides which users see which behavior, without a deploy. The visible part is
+a boolean in a response; the parts that keep the platform safe are the validation funnel at
+creation, the snapshot every evaluation reads, the kill switch, the event stream that keeps a flag's
+history ordered, and the explanation endpoint that must agree with what was served.
 
 ## The real system
 
-Production flag services are read on every request in every service, so correctness is measured in
-flips and staleness, not in throughput. A flag is a rule set with a schema: a key, a value type, an
-explicit default, and rules whose attributes and operators must exist in a registry, or a rule is
-dead — it looks configured and silently never matches. Evaluations read one versioned snapshot
-swapped atomically, so a reader never sees half a rule set mid-update, and per-user bucketing uses a
-deterministic hash of the flag key, the user id and a salt, so a user lands in the same bucket for
-the same flag on every instance. A kill switch carries an effective-immediately marker and propagates
-over gRPC with a deadline, and a stale snapshot may never overwrite a newer kill memo. Events are
-keyed by flag key so a flag's history stays ordered, carry a version, a rule digest and an actor but
-never a user id from a test evaluation, and are published only after the snapshot commits. The
-explain endpoint returns which rule matched, the bucket value and the version that produced the
-decision for one user, and it must not recompute with a fresh salt — the explanation has to agree
-with the served value bit-for-bit.
+LaunchDarkly's percentage rollouts hash the context key and context kind into 100,000 buckets and
+assign bucket ranges to variations in order, so raising a rollout from 50% to 70% adds buckets
+50,001 to 70,000 without moving anyone already in. Different flags bucket contexts independently
+even when their rules are identical; two flags that must target the same people have to share a
+segment. This course asks the same of \`bucket(flag key, user id, salt)\`: each flag splits users on
+its own, and an unchanged version never re-buckets a user. The rest follows from treating a flag as
+a rule set with a schema, read on every request.
 
 ## What you build here
 
 One service, **flagd**, with five pieces:
 
-1. \`POST /v1/flags\`: a key, a value type, an explicit default and rules validated against the
-   schema registry — an unknown attribute or operator is \`422\`, a missing default is rejected, and
-   an \`Idempotency-Key\` makes a replayed create return the original flag version.
-2. A **Redis** evaluation cache holding a single versioned snapshot object swapped atomically; every
-   evaluation reads one full version, and bucketing is \`hash(flag key, user id, salt)\` so each flag
-   splits users independently and an unchanged version never re-buckets a user.
-3. A **gRPC** kill-switch path: an emergency disable propagates to every evaluator within a 1-second
-   deadline and is effective immediately, while normal changes may lag up to 5 seconds; pushes are
-   deduped by version and an older snapshot can never overwrite a newer kill memo.
-4. A **Kafka** event stream \`flag.event\` keyed by flag key, carrying version, rule digest and actor,
-   no user ids, an outbox row when the broker rejects the produce, and publish only after the
-   snapshot commit.
-5. \`GET /v1/flags/{key}/evaluations\`: the explain view for one user — which rule matched, the bucket
-   value, and the exact snapshot version — agreeing with the served evaluation and exposing only the
-   caller's own user.
+1. \`POST /v1/flags\`: a key, a type, an explicit default and rules validated against the schema
+   registry; an unknown attribute or operator is \`422\`, and an \`Idempotency-Key\` makes a replayed
+   create return the original version.
+2. A **Redis** cache holding one versioned snapshot object swapped atomically, with bucketing by
+   \`hash(flag key, user id, salt)\` so each flag splits users independently.
+3. A **gRPC** kill-switch path: an emergency disable reaches every evaluator within a 1-second
+   deadline, normal changes may lag up to 5 seconds, pushes are deduped by version, and an older
+   snapshot cannot overwrite a newer kill memo.
+4. A **Kafka** stream \`flag.event\` keyed by flag key, carrying version, rule digest and actor but no
+   user ids, published after the snapshot commits, with an outbox row when the broker rejects.
+5. \`GET /v1/flags/{key}/evaluations\`: the explain view for one user, naming the matched rule, the
+   bucket and the exact snapshot version, agreeing with the served evaluation.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real flag feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
-with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the happy path, and
+looks right. In every step you debug the starter against the failure modes the task names, fix it,
+and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Flag authoring UIs, per-environment promotion workflows, SDK packaging, targeting by arbitrary
-expressions, experiment statistics, and billing. The five pieces above are the ones that decide
-whether the flag service is correct, isolated and shippable.`,
+expressions, experiment statistics, and billing.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client / SDK', sub: 'evaluate · explain', x: 8, y: 50},

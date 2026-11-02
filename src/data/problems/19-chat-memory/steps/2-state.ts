@@ -8,27 +8,22 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-The starter is working code: a turn is pushed onto a list and the demo shows
-it. Two appends in flight and one colliding session id break it. Find the flaws, fix them, and
-prove the fix.
-
-Implement the recent-turn buffer behind the append endpoint:
-
-- Recent turns live in **one Redis list per (tenant, session)**:
-  \`turns:{tenant}:{session_id}\`. The tenant in the key is not cosmetic — two tenants can pick the
-  same session id, and the starter's \`turns:{session_id}\` key puts them in one buffer where they
-  read each other's turns.
-- The list holds the **last 50 turns**: push the new turn, then trim to the most recent 50. The
-  trim keeps the newest end (\`LTRIM 0 49\`) and drops the oldest.
-- The list **expires 24 hours after the last write** (\`EXPIRE 86400\`), so an abandoned session
-  frees itself instead of living forever.
-- Append, trim and expiry are **one atomic script**. The starter issues \`LPUSH\` and then a
-  client-side \`LTRIM\`; two concurrent appends can interleave them, and whichever trim runs last
-  may drop the turn the other append just added.
+**Starting point.** The starter accepts a turn on \`POST /v1/sessions/{id}/turns\`, \`LPUSH\`es it
+onto \`turns:{id}\`, then issues a second command, \`LTRIM 0 49\`, from the client, and answers
+with the session and turn ids. It serves the demo and hides four flaws.
 
 **Failure mode the checks target.** Under a small cap a concurrent pair of appends must lose
-nothing: exactly one turn is trimmed past the cap, never an appended turn. The starter also leaks
-memory because nothing ever expires, and it lets one tenant's session id collide with another's.
+nothing: the one turn trimmed past the cap is an old one, not a turn that was just appended. An
+idle session must free its memory on its own, and two tenants that pick the same session id must
+land in different lists.
+
+- Recent turns live in **one Redis list per (tenant, session)**: \`turns:{tenant}:{session_id}\`.
+- The list holds the **last 50 turns**: push, then trim to the most recent 50 (\`LTRIM 0 49\` keeps
+  the newest end). Name the cap.
+- The list **expires 24 hours after the last write** (\`EXPIRE 86400\`), so an abandoned session
+  frees itself.
+- Append, trim and expiry are **one atomic script**, so two concurrent appends cannot interleave a
+  push with the other's trim.
 
 ## What to keep
 
@@ -50,9 +45,9 @@ key scope and the atomicity: one Lua script that pushes, trims to the cap and re
     ],
   },
   hints: [
-    'One script, not three commands. `LPUSH` followed by a client-side `LTRIM` leaves a gap: a second append can land between them, and whichever trim runs last can drop the newer turn. `EVAL` runs the whole sequence as one step.',
-    'The key is a scope, not a label: `turns:{tenant}:{session}`. Two tenants that pick the same session id must never share a list, and the tenant comes from the authenticated context, not the payload.',
-    'An unbounded list is a memory leak with a latency story attached. Put `EXPIRE` in the same script, 86400 seconds, refreshed on every write, so an idle session disappears without a background reaper.',
+    'Symptoms: during a burst of appends a turn that was acknowledged is missing from the list, Redis memory climbs for weeks, and a tenant reads turns it did not write.',
+    'Mechanism: `LPUSH` and `LTRIM` are two round trips, so a second append can land between them and the later trim drops it. No command sets a TTL, and `turns:{id}` ignores the tenant.',
+    'Fix: one `EVAL` of a `BUFFER_LUA` script that does `LPUSH`, `LTRIM 0 MAX_TURNS-1` and `EXPIRE 86400` on `turns:{tenant}:{id}`, with `MAX_TURNS = 50` named in code.',
   ],
   checks: [
     {
@@ -140,8 +135,7 @@ class Turn(BaseModel):
 
 @app.post("/v1/sessions/{id}/turns")
 def append_turn(id: str, turn: Turn) -> dict:
-    # TODO: build the key from the (tenant, session) pair, and keep the append, the trim and the
-    # expiry inside one atomic script so a concurrent pair of appends cannot lose a turn.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     r.lpush(f"turns:{id}", json.dumps(turn.model_dump()))
     r.ltrim(f"turns:{id}", 0, 49)
     return {"session_id": id, "turn_id": turn.turn_id}
@@ -180,7 +174,7 @@ def append_turn(id: str, turn: Turn, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/turns: flawed code that trims from the client. */
+      starter: `/** POST /v1/sessions/:id/turns: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -196,8 +190,7 @@ interface Turn {
 app.post('/v1/sessions/:id/turns', async (request, reply) => {
   const {id} = request.params as {id: string};
   const turn = request.body as Turn;
-  // TODO: build the key from the (tenant, session) pair, and keep the append, the trim and the
-  // expiry inside one atomic script so a concurrent pair of appends cannot lose a turn.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   await r.lpush(\`turns:\${id}\`, JSON.stringify(turn));
   await r.ltrim(\`turns:\${id}\`, 0, 49);
   return reply.code(201).send({session_id: id, turn_id: turn.turn_id});
@@ -264,8 +257,7 @@ func appendTurn(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var turn map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&turn)
-	// TODO: build the key from the (tenant, session) pair, and keep the append, the trim and the
-	// expiry inside one atomic script so a concurrent pair of appends cannot lose a turn.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(turn)
 	key := "turns:" + id
 	rdb.LPush(ctx, key, payload)
@@ -343,8 +335,7 @@ object StateApi {
     path("v1" / "sessions" / Segment / "turns") { id =>
       post {
         entity(as[String]) { payload =>
-          // TODO: build the key from the (tenant, session) pair, and keep the append, the trim and
-          // the expiry inside one atomic script so a concurrent pair of appends cannot lose a turn.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           jedis.lpush(s"turns:$id", payload)
           jedis.ltrim(s"turns:$id", 0, 49)
           complete(StatusCodes.Created, s"""{"session_id":"$id"}""")
@@ -412,8 +403,7 @@ int main() {
 
   svr.Post("/v1/sessions/:id/turns", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto id = req.path_params.at("id");
-    // TODO: build the key from the (tenant, session) pair, and keep the append, the trim and the
-    // expiry inside one atomic script so a concurrent pair of appends cannot lose a turn.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     redis.lpush("turns:" + id, req.body);
     redis.ltrim("turns:" + id, 0, 49);
     res.status = 201;
@@ -461,12 +451,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is atomicity plus scope. A push-then-trim buffer looks
-correct in every serial test and loses a turn exactly when two appends overlap, which is when a
-real conversation is busiest. One Lua script makes push, trim and expire a single step, and it can
-refresh the TTL in the same call, so there is no path where a turn is appended but never trimmed or
-a list lives forever. The key is the second half: a session id is chosen by the client, and two
-tenants can collide on it, so the key must carry the authenticated tenant. Interviewers listen for
-the bounded-write argument too — a list that only grows is a memory leak with a latency story
-attached, and the fix belongs at the write path, not in a reaper that runs hours later.`,
+  debrief: `A push-then-trim buffer passes every serial test and loses a turn exactly when two appends
+overlap, which is when a conversation is busiest. The fix is one Lua script because Redis runs a
+script without interleaving other commands: push, trim and expire become a single step and the TTL
+is refreshed in the same call, so no window exists in which a turn is pushed but not yet trimmed.
+The tenant in the key is the other half: a session id is chosen by the client, and two tenants can
+collide on it, so the key carries the authenticated tenant. Production buffers also load the script
+once with \`SCRIPT LOAD\` and call it by SHA, and they hash-tag the key so a cluster keeps one
+session on one node.`,
 };

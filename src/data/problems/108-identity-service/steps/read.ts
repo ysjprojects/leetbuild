@@ -8,15 +8,12 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db', 'support'],
   task: `## Task
 
-**Starting point.** The starter is working code for the profile read: it resolves the id,
-authenticates the caller and returns a profile, so the demo looks finished. It answers with the
-same payload for every authenticated caller — the owner's contact data goes to anyone who asks —
-the projection it builds for the world carries the email, the phone and the name, and it never
-reports the verification state, so an account that has not proved its address reads as complete as
-a verified one. It also has no support path: nothing records who looked at whose record. Debug it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`GET /v1/users/{id}\`, the read behind the profile page and
+the support console: it requires \`X-User-Id\`, loads the account, answers **404** for an unknown id
+and returns one profile payload to every authenticated caller. It compiles, it serves the demo
+(one user viewing their own profile) and hides 4 flaws.
 
-Implement \`GET /v1/users/{id}\`, the read behind the profile page and the support console:
+Requirements:
 
 - The caller comes from \`X-User-Id\` (**401** when missing) and the role from \`X-Role\` (default
   \`member\`). An unknown id is **404**.
@@ -60,16 +57,16 @@ as a verified one.`,
     ],
   },
   hints: [
-    'Split the read by viewer before you build anything: compare the caller to the path id in `is_owner(caller_id, user_id)` and return the owner’s copy only on that branch. The owner’s copy is the stored row, so the projection stays the one place where a field name is chosen.',
-    'Give the public projection an allowlist (`PUBLIC_FIELDS`) and one builder (`public_projection(account)`), so contact data cannot appear in it by accident — and add the verification state there as well as in the owner’s copy, because it has to be in every payload. A projection without it makes an unverified account look finished.',
-    'Support reads are audited reads: gate the branch on `SUPPORT_ROLES`, require `X-Support-Reason`, and call `audit_lookup(caller_id, user_id, reason)` **before** the record leaves the service. The audit record is what makes a support lookup answerable later.',
+    "Any member with a token can fetch another member's email and phone, an unverified account looks identical to a verified one, and nobody can say which support agent looked at whose record.",
+    'One `profilePayload` serves every caller, it is built from the row rather than an allowlist, no field reports verification, and there is no support branch or audit write.',
+    'Branch on `is_owner(caller_id, user_id)` to `owner_view`; build `public_projection` from `PUBLIC_FIELDS`; add `verification_state(account)` to both; gate `SUPPORT_ROLES` on `X-Support-Reason` and `audit_lookup` before returning.',
   ],
   checks: [
     {
       id: 'read-route',
       title: 'Registers GET /v1/users/{id}',
       detail:
-        'The profile read exists on `GET /v1/users/{id}` and its response carries the projection the console renders. The starter already answers this route, so this check passes on it — the four below are where it fails.',
+        'The profile read exists on `GET /v1/users/{id}` and its response carries the projection the console renders. The starter already answers this route, so this check passes on it; the four below are where it fails.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/users\/\{user_id\}["']/, /"user"/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/users\/:userId['"]/, /user:/]},
@@ -184,9 +181,7 @@ def profile_payload(account: dict) -> dict:
 
 @app.get("/v1/users/{user_id}")
 def read_user(user_id: str, caller_id: str = Header(default="", alias="X-User-Id")) -> JSONResponse:
-    # TODO: this starter hands the same payload to every caller: the owner's contact data goes to
-    # anyone who asks, the email and the phone sit in the "public" projection, and the verification
-    # state is never reported. Fix all three flaws.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     if not caller_id:
         raise HTTPException(status_code=401, detail="missing X-User-Id")
     account = store.get_user(user_id)
@@ -287,9 +282,7 @@ function profilePayload(account: Record<string, unknown>): Record<string, unknow
 }
 
 app.get('/v1/users/:userId', async (request, reply) => {
-  // TODO: this starter hands the same payload to every caller: the owner's contact data goes to
-  // anyone who asks, the email and the phone sit in the "public" projection, and the verification
-  // state is never reported. Fix all three flaws.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const {userId} = request.params as {userId: string};
   const callerId = (request.headers['x-user-id'] as string | undefined) ?? '';
   if (callerId === '') return reply.code(401).send({error: 'missing X-User-Id'});
@@ -383,9 +376,7 @@ func profilePayload(account map[string]any) map[string]any {
 }
 
 func readUser(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter hands the same payload to every caller: the owner's contact data goes to
-	// anyone who asks, the email and the phone sit in the "public" projection, and the verification
-	// state is never reported. Fix all three flaws.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	userID := r.PathValue("id")
 	callerID := r.Header.Get("X-User-Id")
 	if callerID == "" {
@@ -554,9 +545,7 @@ object UserReadApi {
     path("v1" / "users" / Segment) { userId =>
       get {
         headerValueByName("X-User-Id") { _ =>
-          // TODO: this starter hands the same payload to every caller: the owner's contact data goes to
-          // anyone who asks, the email and the phone sit in the "public" projection, and the
-          // verification state is never reported. Fix all three flaws.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           store.get(userId) match {
             case Some(account) => complete(StatusCodes.OK, JsObject("user" -> profilePayload(account)))
             case None          => complete(StatusCodes.NotFound, """{"error":"no such user"}""")
@@ -680,9 +669,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/users/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter hands the same payload to every caller: the owner's contact data goes to
-    // anyone who asks, the email and the phone sit in the "public" projection, and the verification
-    // state is never reported. Fix all three flaws.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto user_id = req.matches[1].str();
     const auto caller_id = req.get_header_value("X-User-Id");
     if (caller_id.empty()) {
@@ -799,5 +786,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you debug a read endpoint as a disclosure decision, not as a lookup. The starter is convincing because the demo has one user looking at their own profile, so the scoping bug never fires. Three defects are being checked, and each one is a different answer to "who may see what". First, the viewer: a profile has exactly one owner, and the comparison that decides it — \`is_owner(caller_id, user_id)\` — is the difference between an identity service and an enumeration endpoint. Second, the projection: the owner's copy is the stored row, so it may carry everything; the public copy is an allowlist (\`PUBLIC_FIELDS\`) with a single builder, because a projection built by subtraction (take the row, drop the password) silently grows a field the day someone adds one to the row. Third, the verification state: it belongs in *every* payload, owner or public, because it is the field the rest of the platform keys its decisions on — an account that never proved its address must not read as complete. Support is the fourth contract and the one candidates forget: the people who legitimately need to read someone else's record are exactly the people whose access must be attributable, so the support branch is gated on \`SUPPORT_ROLES\` and goes through \`audit_lookup\` *before* the record leaves the service. Real systems add more: field-level access rules keyed to scopes rather than roles, response signing so a cached projection cannot be edited, per-viewer rate limits so enumeration is visible, and an audit record written to an append-only store with the reason code and the request id so a lookup can be replayed years later. The habit to take away is the one this step is built on: the read path is where a service's disclosure policy actually lives, so name every viewer, build every payload from an allowlist, and audit every exception.`,
+  debrief: `The fix has the shape of a disclosure decision rather than a lookup, with a different answer for each viewer. \`is_owner(caller_id, user_id)\` decides the one caller who may see the stored row; everyone else gets \`public_projection\`, built from the \`PUBLIC_FIELDS\` allowlist by a single builder, because a projection built by subtraction silently grows a field the day someone adds one to the row. \`verification_state\` goes into both payloads because it is the field the rest of the platform keys its decisions on. The support branch is gated on \`SUPPORT_ROLES\` and goes through \`audit_lookup\` *before* the record leaves the service, so a legitimate lookup is attributable and an unattributed one is impossible.
+
+Production systems add field-level access rules keyed to scopes rather than roles, response signing so a cached projection cannot be edited, per-viewer rate limits so enumeration is visible, and audit records in an append-only store with the reason code and request id so a lookup can be replayed years later.`,
 };

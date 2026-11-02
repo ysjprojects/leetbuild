@@ -8,33 +8,31 @@ export const securityEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: every decision becomes an
-event and the consumer counts something, so the dashboard shows numbers. Five production contracts
-are broken. Find them, fix them, prove the fix.
-
-\`publish(user, document_hash, signals, decision)\` is how promptguard reports each decision, and
-the consumer turns those events into attack-signature counts per hour.
-
-- Publish **one** \`prompt.security\` event per decision with the **user** as the message key, so
-  one user's events stay ordered on one partition. The payload carries the event id, user,
-  document hash, signal names, the decision (\`served\` / \`refused\`), the signature and a
-  timestamp.
-- **Never** put the question, the answer or the document text in the event or in a log line: the
-  topic is retained and replicated, and the whole point of the signature is to count incidents
-  without storing what was said.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
-  \`all\` plus a stable hash balancer), so a retried produce cannot duplicate a record.
-- The consumer (group \`signatures\`) buckets each refusal by hour — \`HOUR_S = 3600\`,
-  key \`signatures:{hour}\` — and \`HINCRBY\` the signature's count; a bucket expires after seven
-  days. Served decisions are not counted.
-- The consumer commits the offset **after** the Redis write. Commit first and a crash between the
-  two loses the count forever, because the offset already moved past the record.
+**Starting point.** The starter's \`publish(user, question, answer, signals, decision)\` produces
+one \`prompt.security\` record per decision, keyed by a fresh event id and carrying the question and
+answer text, through a producer with default settings; the consumer in group \`signatures\` commits
+each offset, then \`HINCRBY\`s a single global \`signatures\` hash. It serves the demo and hides
+five flaws.
 
 **Failure mode the checks target.** Keying by event id scatters one user's events across
 partitions; an unconfigured producer duplicates on retry; the question and the answer in the event
 are a retained copy of exactly the text the guard refused to log; a single global counter cannot
 show when an attack started; and commit-before-write trades correctness for code that looks
-exactly-once.`,
+exactly-once.
+
+- Publish **one** event per decision with the **user** as the message key, so one user's events
+  stay ordered on one partition. The payload carries the event id, user, document hash, signal
+  names, the decision (\`served\` / \`refused\`), the signature and a timestamp.
+- The question, the answer and the document text stay out of the event and out of every log line:
+  the topic is retained and replicated, and the whole point of the signature is to count incidents
+  without storing what was said.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
+  \`all\` plus a stable hash balancer), so a retried produce cannot duplicate a record.
+- The consumer buckets each refusal by hour (\`HOUR_S = 3600\`, key \`signatures:{hour}\`) and
+  \`HINCRBY\`s the signature's count; a bucket expires after seven days. Served decisions are not
+  counted.
+- The consumer commits the offset **after** the Redis write. Commit first and a crash between the
+  two loses the count forever, because the offset already moved past the record.`,
   sequence: {
     participants: ['promptguard', 'prompt.security', 'Signature consumer', 'Redis'],
     messages: [
@@ -57,9 +55,9 @@ exactly-once.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=user` (or `Key: []byte(user)`, `key: user`, `ProducerRecord(topic, user, …)`). The payload is ids, hashes, names and a decision — drop every field that is text the user or the model wrote.',
-    'Idempotence is producer configuration: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. It needs the same key on every retry, which is the same fix as the user key.',
-    'In the consumer, derive `hour = ts // 3600`, `HINCRBY signatures:{hour} signature 1`, `EXPIRE` the bucket, and only then commit. A crash between the write and the commit replays the record — an over-count of one is recoverable, a lost record is not.',
+    "The hourly attack chart is flat because every count lands in one key, a user's refusals arrive out of order, and a consumer restart quietly drops the counts it was about to write.",
+    'The starter keys each record by `event_id`, builds the producer with only `bootstrap.servers`, copies `question` and `answer` into the payload and log, counts into a global `signatures` hash, and calls `commit` before `hincrby`.',
+    'Key by `user`, set `enable.idempotence` and `acks=all`, send ids, hashes, signal names and the signature only, then in the consumer `HINCRBY signatures:{ts // 3600}`, `EXPIRE` it, and commit afterwards.',
   ],
   checks: [
     {
@@ -143,9 +141,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def publish(user: str, question: str, answer: str, signals: list[str], decision: str) -> None:
-    # TODO: key by user instead of the event id, configure the idempotent producer with acks=all,
-    # keep the question and the answer out of the event and the logs, bucket the counts by hour,
-    # and commit only after the Redis write.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event_id = str(uuid.uuid4())
     logger.info("security user=%s question=%r answer=%r", user, question, answer)
     event = {
@@ -253,9 +249,7 @@ export async function publish(
   signals: string[],
   decision: string,
 ): Promise<void> {
-  // TODO: key by user instead of the event id, configure the idempotent producer with acks=all,
-  // keep the question and the answer out of the event and the logs, bucket the counts by hour,
-  // and commit only after the Redis write.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const eventId = randomUUID();
   console.info('security', {user, question, answer});
   const event = {id: eventId, user, question, answer, signals, decision};
@@ -366,9 +360,7 @@ var (
 	rdb            *redis.Client
 )
 
-// TODO: key by user instead of the event id, configure acks=all with a hash balancer, keep the
-// question and the answer out of the event and the logs, bucket the counts by hour, and commit
-// only after the Redis write.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func publish(ctx context.Context, user, question, answer string, signals []string, decision string) error {
 	eventID := uuid.NewString()
 	log.Printf("security user=%s question=%q answer=%q", user, question, answer)
@@ -518,9 +510,7 @@ object SecurityEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key by user instead of the event id, configure the idempotent producer with acks=all,
-  // keep the question and the answer out of the event and the logs, bucket the counts by hour,
-  // and commit only after the Redis write.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publish(user: String, question: String, answer: String, signals: Seq[String], decision: String): Unit = {
     val eventId = UUID.randomUUID().toString
     log.info(s"security user=$user question=$question answer=$answer")
@@ -643,9 +633,7 @@ std::unique_ptr<RdKafka::Producer> producer;
 std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
 std::string uuidString();
 
-// TODO: key by user instead of the event id, configure the idempotent producer with acks=all, keep
-// the question and the answer out of the event and the logs, bucket the counts by hour, and commit
-// only after the Redis write.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publish(const std::string& user, const std::string& question, const std::string& answer,
              const std::vector<std::string>& signals, const std::string& decision) {
   const auto eventId = uuidString();
@@ -750,5 +738,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking the three things a Kafka snippet almost always gets wrong, plus the one this course is about. The key is an ordering contract: partition by user and a user's incidents arrive in order; key by event id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer applies its write before the commit, or a crash between the two loses the count. The hour bucket is what turns counts into a timeline — the source's point about attacks evolving after each patch is only visible if you can see when a signature appeared. And the text rule is the course's own: the guard refused to log the question and the answer for a reason, and an event topic that retains and replicates them undoes it. Real pipelines add a schema registry, a dead-letter topic for unparseable events, and an alert when one signature's hourly count crosses a threshold.`,
+  debrief: `The key is an ordering contract: partition by user and a user's incidents arrive in order; key by event id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer applies its write before the commit, or a crash between the two loses the count. The hour bucket is what turns counts into a timeline; the source's observation that attacks evolve after each fix is only visible if you can see when a signature appeared. The text rule is the course's own: the guard kept the question and the answer out of its log for a reason, and an event topic that retains and replicates them undoes that. Production pipelines typically put a dead-letter topic behind the consumer for unparseable events, and alert when one signature's hourly count crosses a threshold.`,
 };

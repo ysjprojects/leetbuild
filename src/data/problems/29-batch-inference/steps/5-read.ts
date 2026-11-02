@@ -8,26 +8,24 @@ export const readStep: Step = {
   focus: ['client', 'batchd', 'db', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it answers with a status and a
-completed count, so a finished batch looks finished. It hides a stale number, a premature success and
-a missing tenant check. Find them, fix them, and prove the fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/batches/{id}\`: it reads a \`progress\` counter from
+Redis, sets \`status\` to \`succeeded\` as soon as that counter is above zero, lists the bare output keys
+and returns them to whoever asks, with no tenant header read. A finished batch looks finished in the
+demo. It hides 5 flaws.
 
-Implement \`GET /v1/batches/{id}\`.
+**Failure mode the checks target.** A status endpoint that cannot be trusted: a cached counter is a
+second source of truth and it drifts from the workers; a success status while shards are pending is the
+bug the whole course is about; and an unscoped batch id lets one tenant read another tenant's outputs.
 
-- The tenant comes from \`X-Tenant-Id\`; the batch is looked up by id and a batch that does not exist
-  — **or belongs to another tenant** — is a **404**. The starter hands out any batch's outputs.
+- The tenant comes from \`X-Tenant-Id\`; the batch is looked up by id and a batch that does not exist,
+  or belongs to another tenant, is a **404**.
 - Progress is derived from the **live shard set**, not a cached counter: \`completed\` from the done
-  shards, \`failed\` from the failed shards, and \`pending = total − completed − failed\`. A counter
-  written somewhere else lags the shard set and the endpoint ends up disagreeing with the workers.
+  shards, \`failed\` from the failed shards, and \`pending = total − completed − failed\`.
 - **Success requires every shard terminal.** The status is \`succeeded\` only when \`pending == 0\`
   and \`failed == 0\`; while any shard is pending the answer is **not** a success, no matter how many
-  shards have landed. The starter reports success as soon as the first shard completes.
+  shards have landed.
 - Return the manifest of output objects, each with its **checksum**, so a consumer can verify what it
-  downloads. The starter hands out bare output keys with no checksum.
-
-**Failure mode the checks target.** A cached counter is a second source of truth and it drifts; a
-success status with pending shards is the lie the whole course is about; and an unscoped batch id
-lets one tenant read another tenant's outputs.`,
+  downloads.`,
   sequence: {
     participants: ['Client', 'Batch Service', 'batch · outbox', 'work set'],
     messages: [
@@ -40,9 +38,9 @@ lets one tenant read another tenant's outputs.`,
     ],
   },
   hints: [
-    'Read the live set, not a summary: `SCARD batch:{id}:shards:done` and `SCARD batch:{id}:shards:failed`. A counter written on the side is a cache with no invalidation, and it will disagree with the work set at exactly the wrong moment.',
-    'Terminal means terminal: `pending = total - completed - failed`, and `succeeded` only when `pending == 0 && failed == 0`. While a shard is pending the honest answer is `running`, whatever the completed count says.',
-    'The tenant check comes before the data: look the job up by id and answer 404 unless it exists and belongs to the caller. Outputs are tenant data; a bare id must not be enough to read them.',
+    'A CI job polls the endpoint, sees `succeeded` after the first shard lands, downloads a manifest with most outputs missing; a second tenant can fetch the same manifest by guessing the id.',
+    'The handler trusts `batch:{id}:progress`, a counter written elsewhere that lags the shard set; `completed > 0` is the whole success test; and no tenant is read, so any id is a capability.',
+    'Read `X-Tenant-Id`, 404 unless `jobs.find` returns a job owned by the caller; `scard` the `shards:done` and `shards:failed` sets, `pending = total - completed - failed`, succeeded only when both are zero; emit checksums.',
   ],
   checks: [
     {
@@ -122,8 +120,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/batches/{batch_id}")
 def read(batch_id: str) -> dict:
-    # TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
-    # lands, and hands out output URLs without checking the tenant.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     completed = int(r.get(f"batch:{batch_id}:progress") or 0)
     status = "succeeded" if completed > 0 else "running"
     outputs = r.smembers(f"batch:{batch_id}:outputs")
@@ -164,7 +161,7 @@ def read(batch_id: str, tenant: str | None = Header(default=None, alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** GET /v1/batches/{id}: flawed code that trusts a cached counter. */
+      starter: `/** GET /v1/batches/{id}: batch status. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -172,8 +169,7 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/batches/:batchId', async (request, reply) => {
-  // TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
-  // lands, and hands out output URLs without checking the tenant.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const {batchId} = request.params as {batchId: string};
   const completed = Number((await r.get('batch:' + batchId + ':progress')) ?? 0);
   const status = completed > 0 ? 'succeeded' : 'running';
@@ -222,8 +218,7 @@ import (
 )
 
 func readBatch(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
-	// lands, and hands out output URLs without checking the tenant.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	batchID := r.PathValue("batch_id")
 	completed, _ := rdb.Get(r.Context(), "batch:"+batchID+":progress").Int64()
 	status := "running"
@@ -301,8 +296,7 @@ object BatchReadApi {
   val route: Route =
     path("v1" / "batches" / Segment) { batchId =>
       get {
-        // TODO: this starter reads a cached counter that lags, reports success as soon as the first
-        // shard lands, and hands out output URLs without checking the tenant.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         val completed = Option(jedis.get(s"batch:$batchId:progress")).map(_.toInt).getOrElse(0)
         val status = if (completed > 0) "succeeded" else "running"
         val outputs = jedis.smembers(s"batch:$batchId:outputs").asScala.toList
@@ -392,8 +386,7 @@ int main() {
   Redis redis("tcp://redis:6379");
 
   svr.Get("/v1/batches/([^/]+)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
-    // lands, and hands out output URLs without checking the tenant.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const auto batchId = req.matches[1].str();
     const auto cached = redis.get("batch:" + batchId + ":progress");
     const int completed = cached ? std::stoi(*cached) : 0;
@@ -467,14 +460,15 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is asking whether the status endpoint can be trusted, because every downstream
-decision — a CI job, an invoice, a retry — reads it. Three things make it honest. First, one source of
-truth: progress is counted from the live shard set the workers mutate, not from a counter written
-somewhere else that lags by a worker crash. Second, terminal means terminal: \`succeeded\` requires
-\`pending == 0 && failed == 0\`, and while a shard is pending the answer must not be success. Third,
-the tenant boundary: a batch id is not a capability, so the lookup returns 404 unless the caller owns
-the batch. The \`failed\` count and the checksummed output manifest are what turn a status into
-something a consumer can act on. Real services add a \`Retry-After\` hint while pending, pagination
-for large output manifests, and signed short-lived URLs so the checksum and the object come from the
+  debrief: `The fix makes the status a pure function of the state the workers actually mutate. Counting
+\`SCARD\` on the done and failed sets removes the second source of truth, so there is nothing to lag or
+drift. Deriving \`pending\` and requiring it to be zero turns success into a statement about every shard
+rather than about the first one. Checking tenant ownership before any Redis read is what makes a
+batch id an identifier instead of a capability; the 404 (not 403) keeps the existence of other
+tenants' batches from leaking. The checksummed output manifest is why a consumer can act on the
+answer without trusting the transport.
+
+Not covered here: a \`Retry-After\` hint while the batch is running, pagination for output manifests
+with thousands of shards, and short-lived signed URLs so the object and its checksum come from the
 same record.`,
 };

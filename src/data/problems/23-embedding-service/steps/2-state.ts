@@ -8,25 +8,24 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'model'],
   task: `## Task
 
-**Starting point.** The starter is working code: compute the vector, \`SET\` it,
-give the key a TTL. The demo is fast and the cache is warm. It hides a lost version, a race and a
-two-command write. Find them, fix them, and prove the fix.
+**Starting point.** The starter implements \`store_vector(tenant, text, compute)\`, the cache the
+write and read paths share: it builds a key from the tenant and the SHA-256 of the text, calls
+\`compute\`, \`SET\`s the vector and then \`EXPIRE\`s the key. The demo is fast and the cache is warm.
+It compiles and hides 5 flaws.
 
-Implement \`store_vector(tenant, model_version, text, compute)\`, the cache the write and read paths share:
+**Failure mode the checks target.** An upgraded model that serves the previous model's vectors, and
+two workers that compute the same input, both miss, and leave the later stochastic result in the
+cache while a crash between two commands leaves an immortal key.
 
-- The key is **\`(tenant, model version, content hash)\`**, where the content hash is the SHA-256 of the
-  input text. The starter drops the model version, so a new model is a hit on an old vector.
+Requirements for \`store_vector(tenant, model_version, text, compute)\`:
+
+- The key is **\`(tenant, model version, content hash)\`**, where the content hash is the SHA-256 of
+  the input text.
 - The write is a single **\`SET … NX EX 604800\`** command: the first writer wins deterministically,
-  and the seven-day TTL travels in the same command. The starter \`SET\`s first and \`EXPIRE\`s second, so
-  a crash between them leaves an immortal key, and a concurrent compute overwrites the first.
+  and the seven-day TTL travels in the same command.
 - On a lost \`NX\` the winner's vector is read back and returned, so two workers that compute the same
   input **converge on one cached vector** instead of returning two stochastic ones.
-- A cache hit returns the stored vector **without** calling \`compute\`.
-
-**Failure mode the checks target.** The content hash alone means an upgraded model serves the previous
-model's vectors forever. The separate \`SET\`-\`EXPIRE\` plus the unconditional write is the race: two
-workers computing the same input both miss, both compute, and the later stochastic result overwrites
-the first.`,
+- A cache hit returns the stored vector **without** calling \`compute\`.`,
   sequence: {
     participants: ['Embedding API', 'Redis', 'Concurrent worker'],
     messages: [
@@ -40,9 +39,9 @@ the first.`,
     ],
   },
   hints: [
-    'Put the tenant, the model version and the content hash all in the key — the version is what makes an upgrade invalidate the old entries instead of reusing them.',
-    'Write with `SET … NX EX ttl` in one command: `NX` makes the first writer win, and the TTL cannot be lost between two calls.',
-    "When the `NX` write loses, read the key back and return the winner's vector — that is what makes concurrent computes converge on one value.",
+    'The day after the model upgrade, every lookup is still a hit on old vectors; under load, two workers embedding the same text return two different vectors; some keys outlive their TTL.',
+    'The key has no model version, so v2 reads v1 entries. A plain SET lets the last writer win, and the EXPIRE after it is a second round trip a crash can skip.',
+    'Build `cache_key(tenant, model_version, content_hash)`, write with `SET key value NX EX 604800`, and when NX returns nil, GET the key and return the winner instead of your own vector.',
   ],
   checks: [
     {
@@ -113,7 +112,7 @@ the first.`,
   ],
   code: {
     python: {
-      starter: `"""Draft: the vector cache — content hash alone, two commands, last writer wins."""
+      starter: `"""The vector cache: a content-addressed Redis entry with a TTL in front of compute()."""
 import hashlib
 import json
 
@@ -130,8 +129,7 @@ def cache_key(tenant: str, content_hash: str) -> str:
 
 
 def store_vector(tenant: str, text: str, compute) -> list[float]:
-    # TODO: the key omits the model version, the write is a plain SET (a concurrent compute
-    # overwrites the first) and the TTL is a second command.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     key = cache_key(tenant, content_hash)
     vector = compute(text)
@@ -179,7 +177,7 @@ def store_vector(
 `,
     },
     typescript: {
-      starter: `/** Draft: the vector cache — content hash alone, two commands, last writer wins. */
+      starter: `/** The vector cache: a content-addressed Redis entry with a TTL in front of compute(). */
 import {createHash} from 'node:crypto';
 
 import Redis from 'ioredis';
@@ -203,8 +201,7 @@ export async function storeVector(
   text: string,
   compute: (text: string) => Promise<number[]>,
 ): Promise<number[]> {
-  // TODO: the key omits the model version, the write is a plain SET (a concurrent compute
-  // overwrites the first) and the TTL is a second command.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const key = cacheKey(tenant, contentHash(text));
   const vector = await compute(text);
   await redis.set(key, JSON.stringify({vector}));
@@ -251,7 +248,7 @@ export async function storeVector(
 `,
     },
     go: {
-      starter: `// Draft: the vector cache — content hash alone, two commands, last writer wins.
+      starter: `// The vector cache: a content-addressed Redis entry with a TTL in front of compute().
 package main
 
 import (
@@ -277,9 +274,7 @@ func contentHash(text string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// TODO: the key omits the model version, the write is a plain SET (a concurrent compute
-// overwrites the first) and the TTL is a second command.
-// storeVector computes first and writes afterwards, so a concurrent compute overwrites it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func storeVector(ctx context.Context, tenant, text string, compute func(string) []float32) []float32 {
 	vector := compute(text)
 	payload, _ := json.Marshal(map[string]any{"vector": vector})
@@ -346,7 +341,7 @@ func decodeVector(payload string) []float32 {
 `,
     },
     scala: {
-      starter: `// Draft: the vector cache — content hash alone, two commands, last writer wins.
+      starter: `// The vector cache: a content-addressed Redis entry with a TTL in front of compute().
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
@@ -366,9 +361,7 @@ object VectorCache {
       .map("%02x".format(_))
       .mkString
 
-  // TODO: the key omits the model version, the write is a plain SET (a concurrent compute
-  // overwrites the first) and the TTL is a second command.
-  // storeVector computes first and writes afterwards, so a concurrent compute overwrites it.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def storeVector(tenant: String, text: String, compute: String => Vector[Float]): Vector[Float] = {
     val key = cacheKey(tenant, contentHash(text))
     val vector = compute(text)
@@ -423,7 +416,7 @@ object VectorCache {
 `,
     },
     cpp: {
-      starter: `// Draft: the vector cache — content hash alone, two commands, last writer wins.
+      starter: `// The vector cache: a content-addressed Redis entry with a TTL in front of compute().
 #include <sw/redis++/redis++.h>
 
 #include <chrono>
@@ -439,9 +432,7 @@ std::string cache_key(const std::string& tenant, const std::string& content_hash
   return "vector:" + tenant + ":" + content_hash;
 }
 
-// TODO: the key omits the model version, the write is a plain SET (a concurrent compute
-// overwrites the first) and the TTL is a second command.
-// store_vector computes first and writes afterwards, so a concurrent compute overwrites it.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 std::vector<float> store_vector(
     const std::string& tenant,
     const std::string& text,
@@ -490,8 +481,13 @@ std::vector<float> store_vector(
 `,
     },
   },
-  debrief: `One command decides the race: \`SET … NX EX 604800\` makes the first writer win and keeps the TTL
-from being lost between two calls. The namespace decides the upgrade: the model version belongs in the
-key, so shipping a new model invalidates every old entry instead of reusing it. And the configurable
-fallback on a lost \`NX\` is what lets two concurrent workers agree on one vector.`,
+  debrief: `One command decides the race: \`SET … NX EX 604800\` makes the first writer win and carries the TTL
+with the value, so there is no window in which the key exists without an expiry. The model version
+belongs in the key because a cache entry is only valid for the model that produced it; shipping a new
+model then invalidates every old entry without a flush. Reading the winner back on a lost \`NX\` is
+what lets two concurrent workers agree on one vector.
+
+This step caches per tenant, so two tenants embedding the same text pay for the model twice. A
+production cache decides whether vectors are tenant data or shared, sizes the TTL from the model's
+release cadence, and evicts old versions explicitly.`,
 };

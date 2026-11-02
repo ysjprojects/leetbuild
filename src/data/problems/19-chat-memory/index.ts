@@ -16,34 +16,35 @@ import {readStep} from './steps/5-read';
 export const chatMemoryProblem: Problem = {
   id: 'chat-memory',
   title: 'Chat Memory Service',
-  tagline: 'Bounded, tenant-scoped, crash-safe conversation memory, debugged until it is safe to ship.',
+  tagline:
+    'Conversation memory with a capped buffer per tenant, a summarizer on a deadline and a content-free event log.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Chat Memory Service
 
-A chat memory service is the piece of an AI platform that keeps a conversation alive across
-requests: it appends each turn, keeps the recent window small enough to be fast, compresses what
-falls out of the window, publishes the events other services live on, and assembles the context a
-model call actually reads. The visible part is a conversation that remembers; the parts that decide
-whether the service is safe are the validation funnel, the bounded and expiring buffer, the
-deadline-bounded summarizer call, the content-free event, and the tenant-scoped read.
+A chat memory service keeps a conversation alive across requests: it appends each turn, keeps the
+recent window small enough to be fast, compresses what falls out of the window, publishes the
+events other services depend on, and assembles the context a model call reads. The visible part is
+a conversation that remembers; the parts that decide whether the service is safe are the validation
+funnel, the bounded and expiring buffer, the deadline-bounded summarizer call, the content-free
+event, and the tenant-scoped read.
 
 ## The real system
 
-Production memory layers receive turns from many tenants, and every field a client sends is a claim:
-the session id in the path, the role string, the size of the content, the idempotency key. They
-answer a retried append with the turn they already wrote instead of appending it twice. They keep
-the recent window in one structure per (tenant, session) and mutate it in one atomic step, so a
-concurrent pair of appends cannot lose a turn and a trim cannot race an append. They cap the window
-and expire it, because an unbounded buffer is a memory leak with a latency story attached. When the
-window overflows they summarize the oldest span under a deadline and a bounded retry, and they give
-the span a deterministic identity so two workers race on one key instead of writing two summaries.
-They publish what other services need — ids and token counts — and never the message text, because
-the topic is retained and replicated far past any buffer TTL. And they serve the read path with the
-same tenant scope as the write path, a token budget, and a cache key that changes when the
-conversation does.
+LangGraph's Redis checkpointer (\`langgraph-checkpoint-redis\`) stores each conversation thread's
+state under its \`thread_id\` and takes a \`ttl\` configuration with a \`default_ttl\` in minutes and
+a \`refresh_on_read\` flag, so an idle thread expires on its own and an active one keeps renewing
+its lease. That is the decision this course asks for at the write path: one window per
+conversation, expired by the store rather than by a reaper. A multi-tenant memory layer adds the
+rest. Every field a client sends is a claim: the session id in the path, the role, the content
+size, the idempotency key. A retried append answers with the turn already written. The window is
+mutated in one atomic step, so concurrent appends cannot lose a turn. An overflowing span is
+summarized under a deadline with a deterministic identity, so two workers race on one key. Events
+carry ids and token counts rather than text, because the topic outlives any buffer TTL. The read
+path shares the write path's tenant scope and carries a cache key that changes with the
+conversation.
 
 ## What you build here
 
@@ -63,15 +64,15 @@ One service, **memd**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+and it looks right. In every step you debug it against the failure modes, name the subtle one, fix
+it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
+your version.
 
 ## Left out on purpose
 
 Model tokenizers per provider, embedding-based retrieval, multi-region replication, conversation
-search, PII redaction, billing for stored tokens, and the UI. The five pieces above are the ones
-that decide whether memory is correct, isolated and shippable.`,
+search, PII redaction, billing for stored tokens, and the UI. The five pieces above decide whether
+memory is correct, isolated and shippable.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'chat UI · retries', x: 8, y: 50},

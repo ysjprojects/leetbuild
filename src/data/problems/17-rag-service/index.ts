@@ -16,7 +16,8 @@ import {evalGateStep} from './steps/5-eval-gate';
 export const ragServiceProblem: Problem = {
   id: 'rag-service',
   title: 'RAG Service',
-  tagline: 'Ingest, chunk, retrieve and answer over tenant documents — then gate releases on evals, not vibes.',
+  tagline:
+    'Ingest, chunk, retrieve and answer over tenant documents, with an eval gate in front of every prompt release.',
   difficulty: 'hard',
   concepts: ['http', 'grpc', 'redis', 'kafka'],
   tag: 'ai-systems',
@@ -29,13 +30,13 @@ the tenant boundary on retrieval, and the eval gate in front of every release.
 
 ## The real system
 
-Production RAG platforms ingest documents continuously, keep multiple versions of the same
-document, and serve many tenants from one index. They use hybrid retrieval because embeddings miss
-exact identifiers that keyword search catches, and keyword search misses paraphrases that embeddings
-catch. They attach citations that point at character offsets a UI can highlight. They treat every
-retrieved string as untrusted input, because one poisoned document can otherwise steer every answer
-in the tenant. And they do not ship a prompt "because it looked better in the demo": they score it
-against golden labels and block regressions.
+Azure AI Search runs hybrid queries: a BM25 keyword pass and a vector pass execute in parallel and
+the two ranked lists are merged with reciprocal rank fusion, so a chunk ranks higher when both
+retrievers agree on it. The same reasoning applies here: embeddings miss exact identifiers that
+keyword search catches, and keyword search misses paraphrases that embeddings catch. A production
+RAG platform ingests continuously, keeps several versions of one document, serves many tenants from
+one index, attaches citations a UI can highlight by character offset, treats every retrieved string
+as untrusted input, and scores a prompt against golden labels before shipping it.
 
 ## What you build here
 
@@ -57,9 +58,9 @@ One service, **ragd**, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path,
-and it looks right. Your job in every step is the job you will have on a real feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+and it looks right. In every step you debug it against the failure modes, name the subtle one, fix
+it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
+your version.
 
 ## Left out on purpose
 

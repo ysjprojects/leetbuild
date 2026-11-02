@@ -8,18 +8,15 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the manifest and answers \`202\` with a new load id, so the demo reads a file into a table. It hides
-four production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
-below.
-
-Implement \`POST /v1/loads\` with body
-\`{"source": {"dataset": "orders", "version": "2026-10-20"}, "target": "wh_acme.orders", "mode": "merge", "transform": "dedupe"}\`.
+**Starting point.** The starter registers \`POST /v1/loads\` with body
+\`{"source": {"dataset": "orders", "version": "2026-10-20"}, "target": "wh_acme.orders", "mode": "merge", "transform": "dedupe"}\`,
+takes the tenant from \`X-Tenant-Id\`, builds a load record from the body as sent, stores it under
+its own fresh id and answers \`202\`. It serves the demo and hides 4 flaws.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - The rendered manifest is at most **64 KiB** (\`1 << 16\` bytes) of JSON; a larger one is **413**.
 - \`mode\` is one of \`append\`, \`merge\`, \`replace\` (**400** otherwise) — the load mode decides
-  whether a re-run may replace a partition or must add to it, so it is never guessed.
+  whether a re-run may replace a partition or must add to it, so it is not guessed.
 - \`transform\` must be the **name** of a registered transform: the registry maps \`identity\`,
   \`dedupe\`, \`cast_types\`, \`mask_pii\` to SQL compiled server-side. A caller-supplied SQL
   string is **400** — a raw transform would run caller-authored SQL in the warehouse under the
@@ -28,14 +25,15 @@ Implement \`POST /v1/loads\` with body
   in another tenant's schema is **403**, and so is a malformed target.
 - \`Idempotency-Key\` is required (**400** when missing). It is keyed **by the manifest**: the same
   \`(tenant, key)\` with the same manifest returns the original load (**200**) instead of starting a
-  second one; the same key with a *different* manifest is **409**, because two different loads can
-  never share one idempotency key.
+  second one; the same key with a *different* manifest is **409**, because two different loads
+  cannot share one idempotency key.
 - A new load answers **202** with \`load_id\`, \`status\`, \`target\`, \`mode\` and \`rows_planned\`.
 
 **Failure mode the checks target.** A raw \`transform\` is remote code execution with the loader's
 warehouse credentials; a \`target\` that defaults to a shared schema silently writes one tenant's rows
-into another tenant's table; and an un-keyed retry starts a second load of the same manifest, which is
-exactly how a table ends up with the same day counted twice.`,
+into another tenant's table; an un-keyed retry starts a second load of the same manifest, which is
+exactly how a table ends up with the same day counted twice; and an unchecked manifest size or mode
+lets the planner start work it should have refused.`,
   sequence: {
     participants: ['Loader client', 'Load API', 'catalog', 'loads store'],
     messages: [
@@ -50,9 +48,9 @@ exactly how a table ends up with the same day counted twice.`,
     ],
   },
   hints: [
-    'Validate in cost order before touching the store: tenant, Idempotency-Key, manifest size, mode, transform, target schema. Every rejection is cheap and happens before any warehouse work can be planned.',
-    'The transform is a *name*: `sql = REGISTERED_TRANSFORMS[body.transform]` after a membership test. If the caller can put SQL in the body, it runs with your credentials; the registry is the whole trust boundary between the API and the warehouse.',
-    'Key idempotency by `(tenant, key)` and store the manifest fingerprint beside the load. A hit with the same fingerprint returns the stored load; a hit with a different one is a 409 — reusing one key for two manifests would otherwise answer the wrong load.',
+    'Symptom: a client that retried its POST sees two load ids for one manifest, and the day shows up twice in the table. A second tenant finds rows it did not load inside `shared.loads`.',
+    'Mechanism: the starter stores every call under a fresh uuid and copies `body.transform` and `body.target` straight into the record, so the header, the registry and the tenant schema are all bypassed.',
+    'Fix: require `Idempotency-Key`, store under `(tenant, key)` with a manifest fingerprint (replay 200, mismatch 409), look the transform up in `REGISTERED_TRANSFORMS`, derive the schema with `schema_for`, and check size and mode first.',
   ],
   checks: [
     {
@@ -166,9 +164,7 @@ store = LoadStore()
 
 @app.post("/v1/loads")
 def create_load(body: LoadRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
-    # schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-    # the manifest size or the load mode. Fix all four.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     load = {
         "load_id": str(uuid.uuid4()),
         "status": "queued",
@@ -312,9 +308,7 @@ interface LoadBody {
 }
 
 app.post('/v1/loads', async (request, reply) => {
-  // TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
-  // schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-  // the manifest size or the load mode. Fix all four.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as LoadBody;
   const load = {
@@ -485,9 +479,7 @@ func createLoad(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
-	// schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-	// the manifest size or the load mode. Fix all four.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	target := body.Target
 	if target == "" {
 		target = "shared.loads"
@@ -704,9 +696,7 @@ object LoadApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[Manifest]) { body =>
-            // TODO: this starter takes the raw transform the caller sent, lets the target default to
-            // a shared schema, ignores Idempotency-Key so a client retry starts a second load, and
-            // never validates the manifest size or the load mode. Fix all four.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             val load = Map(
               "load_id" -> java.util.UUID.randomUUID().toString,
               "status" -> "queued",
@@ -877,9 +867,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
-    // schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-    // the manifest size or the load mode. Fix all four.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const json load = {
         {"load_id", uuidString()},
         {"status", "queued"},
@@ -1019,13 +1007,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a load endpoint at the trust boundary the
-warehouse hands you. The starter reads fine because the demo loads one well-formed manifest from one
-tenant and never retries. Four separate defects are being checked: the transform is a registry lookup,
-not a string the caller controls (raw SQL here runs with the loader's credentials); the target schema
-is derived from the authenticated tenant, so a cross-tenant write is a 403 and not a default; the
-idempotency key is stored with the manifest fingerprint, so a replay answers the original load and a
-key reused for a different manifest is a conflict instead of a silent mix-up; and the manifest is
-bounded and its mode is one of three known values. Real loaders add per-tenant transform policies,
-manifest signing, and a plan step that returns the compiled SQL for review before it ever runs.`,
+  debrief: `The fix has the shape of a trust boundary: every field the caller sent is replaced by something the
+service derives. The transform becomes a registry lookup, so the SQL that runs is the platform's and not
+the body's; the target schema is computed from the authenticated tenant, so a cross-tenant write is a
+403 rather than a default; the idempotency key is stored with the manifest fingerprint, so a replay
+answers the original load and a key reused for a different manifest is a conflict rather than a silent
+mix-up; and the size and mode checks run before any of that, because rejecting is cheaper than
+planning. Production loaders go further with per-tenant transform policies, signed manifests, and a
+plan step that returns the compiled SQL for inspection before it runs.`,
 };

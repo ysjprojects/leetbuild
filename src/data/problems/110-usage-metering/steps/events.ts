@@ -8,27 +8,24 @@ export const eventsStep: Step = {
   focus: ['kafka', 'api', 'store', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a rollup event per report. It
-compiles, it serves the demo, and it hides three production flaws. Debug it like the service owner,
-fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the rollup publisher for \`usage.rollup\`: \`publish_rollup\` builds
+an event with the account, the gateway, the query string and the units, produces it keyed by the
+gateway, and then calls \`apply_usage\` to commit the counters. It compiles, serves the demo and
+hides four flaws.
 
-Implement the rollup publisher for \`usage.rollup\`.
+**Failure mode the checks target.** Keying by the gateway scatters one account's events across
+partitions, so a rollup consumer sees them out of order; the query string in the value puts user
+data into a topic that outlives the request; and producing before the counters commit means a
+crash between the two leaves an event for usage the meter has no record of, so the analytics total
+cannot tie out against billing.
 
-- Events are **keyed by account**, so one account's usage stream stays in one partition and arrives in
-  order. Keying by the gateway scatters an account's events across partitions and lets a rollup be
-  computed from events in the wrong order.
-- The event carries the **account, the period, the units and the cap state** — and nothing else.
-  Request payloads and endpoint arguments (query strings, paths) are user data and must never be
-  copied into a retained, replicated topic.
-- The event is published **after** the counters commit: \`apply_usage\` first, \`produce\` second. An
-  event that describes usage the meter never recorded is worse than no event, because the analytics
-  rollup will disagree with billing forever.
-- The topic is \`usage.rollup\` and the producer waits for all in-sync replicas.
-
-**Failure mode the checks target.** The starter keys by the gateway, so ordering is lost; it copies the
-query string into the event, so user data lands in a topic that outlives the request; and it produces
-before the counters commit, so a crash between the two leaves an event for usage that was never
-counted — an analytics total that can never tie out against the meter.`,
+- Events are **keyed by account**, so one account's usage stream stays in one partition and arrives
+  in order.
+- The event carries the **account, the period, the units and the cap state** and nothing else.
+  Request payloads and endpoint arguments (query strings, paths) are user data and do not belong in
+  a retained, replicated topic.
+- The event is published **after** the counters commit: \`apply_usage\` first, \`produce\` second.
+- The topic is \`usage.rollup\` and the producer waits for all in-sync replicas.`,
   sequence: {
     participants: ['Metering worker', 'Redis counters', 'usage.rollup'],
     messages: [
@@ -128,10 +125,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 def publish_rollup(
     account: str, period: str, units: int, route: str, gateway: str, query_string: str
 ) -> None:
-    # TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
-    # rollup loses ordering; it publishes the query string for product analytics, copying user data
-    # into a retained topic; and it produces before the counters commit, so an event can describe
-    # usage the meter never recorded. Fix all three.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     event = {"account": account, "gateway": gateway, "query": query_string, "units": units}
     producer.produce(TOPIC, key=gateway, value=json.dumps(event).encode("utf-8"))
     producer.poll(0)
@@ -182,10 +176,7 @@ export async function publishRollup(
   gateway: string,
   queryString: string,
 ): Promise<void> {
-  // TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
-  // rollup loses ordering; it publishes the query string for product analytics, copying user data
-  // into a retained topic; and it produces before the counters commit, so an event can describe
-  // usage the meter never recorded. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const event = {account, gateway, query: queryString, units};
   await producer.send({topic: TOPIC, messages: [{key: gateway, value: JSON.stringify(event)}]});
   await applyUsage(account, period, route, units, gateway);
@@ -246,10 +237,7 @@ var producer = &kafka.Writer{
 }
 
 func PublishRollup(ctx context.Context, account, period string, units int, route, gateway, queryString string) error {
-	// TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
-	// rollup loses ordering; it publishes the query string for product analytics, copying user data
-	// into a retained topic; and it produces before the counters commit, so an event can describe
-	// usage the meter never recorded. Fix all three.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{"account": account, "gateway": gateway, "query": queryString, "units": units}
 	value, err := json.Marshal(event)
 	if err != nil {
@@ -321,10 +309,7 @@ object Events {
   val producer = new KafkaProducer[String, String](props)
 
   def publishRollup(account: String, period: String, units: Int, route: String, gateway: String, queryString: String): Unit = {
-    // TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
-    // rollup loses ordering; it publishes the query string for product analytics, copying user data
-    // into a retained topic; and it produces before the counters commit, so an event can describe
-    // usage the meter never recorded. Fix all three.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     val payload = s"""{"account":"$account","gateway":"$gateway","query":"$queryString","units":$units}"""
     producer.send(new ProducerRecord[String, String](Topic, gateway, payload))
     MeteringState.applyUsage(account, period, route, units, gateway)
@@ -366,10 +351,7 @@ const std::string kTopic = "usage.rollup";
 void publishRollup(RdKafka::Producer* producer, const std::string& account, const std::string& period,
                    int units, const std::string& route, const std::string& gateway,
                    const std::string& queryString) {
-  // TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
-  // rollup loses ordering; it publishes the query string for product analytics, copying user data
-  // into a retained topic; and it produces before the counters commit, so an event can describe
-  // usage the meter never recorded. Fix all three.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const std::string key = gateway;
   const std::string payload = "{\\"account\\":\\"" + account + "\\",\\"query\\":\\"" + queryString +
                               "\\",\\"units\\":" + std::to_string(units) + "}";
@@ -398,17 +380,16 @@ void publishRollup(RdKafka::Producer* producer, const std::string& account, cons
     },
   },
   hints: [
-    'The key decides the partition, and the partition decides the order. Key by the account so a rollup for one account is computed from a single ordered stream; key by the gateway and the same account’s events land wherever the gateway count happens to hash.',
-    'The topic is retained and replicated. Anything you put in the value outlives the request, so copy ids and counters — period, units, cap state — never payloads or endpoint arguments. If analytics needs a path, aggregate it before the event.',
-    'Produce after the counter commit. `apply_usage` first, `produce` second: an event for usage the meter never recorded can never be reconciled, and the rollup will disagree with billing forever.',
+    'An account served by two gateways shows a rollup that jumps backwards, a customer’s search terms turn up in the analytics topic, and after a worker crash analytics reports units billing has no row for.',
+    'Look at the produce call: its key is `gateway`, its value includes `query_string` and lacks `period` and `cap_state`, and it runs before `apply_usage`, so the event exists before the counters do.',
+    'Call `apply_usage` first and read the cap state from its result; then produce with `key=account` and a value of account, `period`, `units` and `cap_state`, dropping the query string and the gateway.',
   ],
-  debrief: `The interviewer is testing the ordering and content rules of an event pipeline. Three defects, all
-quiet: keying by the gateway loses per-account order, so a rollup consumer can compute an average from
-events that arrived out of order; the query string in the value puts user data into a topic with
-retention and replication, where it outlives the request and the tenant; and producing before the
-counters commit means the event and the meter can disagree after a crash. The fix is to key by the
-account, to keep the event to ids and counters, and to publish only after the counter commit — the
-same outbox discipline as the read path. Real systems add a schema registry so the event shape is
-versioned, an outbox row when the broker rejects the produce, and a rollup consumer that commits its
-offset only after it has written the aggregate.`,
+  debrief: `The key is the account because Kafka orders within a partition and nowhere else; the partition
+is chosen from the key, so the key has to be the thing whose order matters. The value is ids and
+counters only, because retention and replication make the topic the longest-lived copy of anything
+written to it, and a query string is user data with no reason to live that long. Producing after
+\`apply_usage\` makes the event a description of state that exists, which is the only kind a rollup
+consumer can reconcile. Production publishers usually version the event shape through a schema
+registry and fall back to an outbox row when the broker rejects the produce, so the counters and the
+event cannot drift apart under a broker outage either.`,
 };

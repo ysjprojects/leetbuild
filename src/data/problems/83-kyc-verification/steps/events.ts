@@ -8,24 +8,28 @@ export const eventsStep: Step = {
   focus: ['api', 'db', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it publishes a \`kyc.decided\` event for every new
-decision and the status consumer turns those events into counters, so the demo looks finished. Four
-production contracts around the event are broken, and each one is only visible when you read the
-starter against the failure mode it was supposed to prevent.
+**Starting point.** The starter handles the reviewer's decision call, builds a \`kyc.decided\` event
+from the case, produces it to Kafka, writes the decision record, and runs the status consumer that
+turns those events into per-tenant counters. It serves the demo and hides five flaws, each visible
+only when you read the starter against the failure mode it was supposed to prevent.
+
+**Failure mode the checks target.** A downstream system replays one applicant's history and sees
+their decisions out of order. A replicated, long-retained topic turns out to hold names and document
+numbers nobody can delete. A process dies mid-request and the topic announces a decision the audit
+trail never recorded. A produce is acknowledged while the message is still only in the client's
+buffer. And the consumers that need to act on a refusal cannot tell why it happened.
 
 \`kyc.decided\` is the only record most downstream systems ever read about a decision, so the event
 is an interface contract:
 
-- Key every event by the **applicant reference** — the key is the partition key, and one applicant's
-  history has to stay ordered end to end. Keyed by the reviewer, an applicant's events interleave
-  with every other case that reviewer touched.
-- The payload carries the **decision and its reason codes** plus one **digest per document** — enough
+- Key every event by the **applicant reference**: the key is the partition key, and one applicant's
+  history has to stay ordered end to end.
+- The payload carries the **decision and its reason codes** plus one **digest per document**, enough
   for downstream systems to act and audit without opening the case store. It carries no document
-  images, names or numbers: the topic is retained and replicated, so identity data written there
-  outlives every retention policy the case store has.
+  images, names or numbers, because identity data written to a retained topic outlives every
+  retention policy the case store has.
 - Publish the event **only after the decision record commits**. A produce before the commit puts a
-  decision on the topic that the audit trail never recorded; when the process dies between the two,
-  the topic and the case store disagree forever.
+  decision on the topic that the audit trail did not record.
 - Configure the producer for **durable delivery** (\`acks=all\` or the stack's equivalent), so an
   acknowledged produce is replicated rather than merely buffered in the client.`,
   sequence: {
@@ -51,9 +55,9 @@ is an interface contract:
     ],
   },
   hints: [
-    'The message key is the partition key: `key=applicant` (or `Key: []byte(applicant)`, `key: applicant`, `ProducerRecord("kyc.decided", applicant, …)`). Keyed by the reviewer, one applicant’s history interleaves with every other case that reviewer touched.',
-    'Carry what the contract needs and nothing more: the decision, the `reasons`, and a `digest` per document. Names, document numbers and image references stay in tenant storage — the topic is retained and replicated, so whatever you write there is copied, indexed and hard to delete.',
-    'Order the durable half first: commit the decision record (`store.put(...)`, the transaction `commit`) before `producer.produce(...)` / `send`, and configure the producer for durability (`"acks": "all"`, `acks: -1`, `kafka.RequireAll`) so an acknowledged produce is replicated, not just queued.',
+    "Compliance replays an applicant's history from the topic and the approval arrives before the submission; a privacy request cannot be honoured because the topic holds the applicant's name and document number.",
+    'The event is keyed by the reviewer, embeds the extracted fields and no reasons, is produced before `store.put`, and the producer runs with default acks, so the broker acknowledges before replication.',
+    'Key by `applicant`; carry `decision`, `reasons` and a `digest` per document, nothing extracted; call `store.put(...)` before `producer.produce(...)`; set `"acks": "all"` (`acks: -1`, `kafka.RequireAll`).',
   ],
   checks: [
     {
@@ -154,8 +158,7 @@ store = DecisionStore()
 
 @app.post("/v1/verifications/{applicant}/decision")
 def decide(applicant: str, decision: DecisionRecord, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: key the event by the applicant, configure acks=all, carry reasons plus document digests
-    # instead of the extracted fields, and put the decision record before the produce.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     event = {
         "tenant": tenant,
         "applicant": decision.applicant,
@@ -256,7 +259,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** kycd decision events: flawed code that keys by reviewer and embeds extracted fields. */
+      starter: `/** kycd decision events: the starter. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -286,8 +289,7 @@ export const store: DecisionStore = {
 app.post('/v1/verifications/:applicant/decision', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'] as string;
   const decision = request.body as DecisionRecord;
-  // TODO: key the event by the applicant, set acks: -1, carry reasons plus document digests instead
-  // of the extracted fields, and put the decision record before the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const event = {
     tenant,
     applicant: decision.applicant,
@@ -427,8 +429,7 @@ func decide(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	record := DecisionRecord{}
 	_ = json.NewDecoder(r.Body).Decode(&record)
-	// TODO: key the event by the applicant, set RequiredAcks: kafka.RequireAll, carry reasons plus
-	// document digests instead of the extracted fields, and put the record before the produce.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	event := map[string]any{
 		"tenant":    tenant,
 		"applicant": record.Applicant,
@@ -565,8 +566,7 @@ object KycEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key the event by the applicant, configure acks=all, carry reasons plus document digests
-  // instead of the extracted fields, and put the decision record before the produce.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def decide(tenant: String, record: DecisionRecord): Unit = {
     val extracted = Map(
       "documentNumber" -> "X1234567",
@@ -681,8 +681,7 @@ DecisionStore store;
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: key the event by the applicant, configure acks=all, carry reasons plus document digests
-// instead of the extracted fields, and put the decision record before the produce.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void decide(const std::string& tenant, const std::string& applicant, const std::string& reviewer,
             const std::string& decision) {
   const json extracted = {
@@ -772,15 +771,14 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking the contract of the decision event, not the shape of the produce
-call. First, the message key is an ordering contract: partition by applicant and one applicant’s
-history arrives in order; key by the reviewer and the reviewer’s whole queue interleaves. Second,
-the topic is the wrong place for identity data: it is retained, replicated and read by systems with
-weaker access control than the case store, so the event carries the decision, the reason codes and
-document digests — never images, names or numbers. Third, the commit and the produce are a dual write
-with no transaction across them: publish after the record commits and an idempotent retry replays the
-produce instead of announcing a decision that was never recorded. The producer configuration is the
-durability half — \`acks=all\` before the produce is worth anything. Real platforms add a schema
-registry so this contract is enforced, an outbox relay for produce failures, and a per-topic
-retention policy.`,
+  debrief: `The decision event is a contract, which is why the fix touches the key, the payload and the
+order of writes rather than the shape of the produce call. The message key is an ordering contract:
+partition by applicant and one applicant's history arrives in order; key by the reviewer and the
+reviewer's whole queue interleaves. The topic is the wrong place for identity data: it is retained,
+replicated and read by systems with weaker access control than the case store, so the event carries
+the decision, the reason codes and document digests only. The commit and the produce are a dual
+write with no transaction across them: publish after the record commits, and an idempotent retry
+replays the produce instead of announcing a decision that was never recorded. \`acks=all\` is the
+durability half; without it the produce is worth little. What this step did not do: enforce the
+contract through a schema registry, or relay failed produces through an outbox.`,
 };

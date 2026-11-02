@@ -8,32 +8,30 @@ export const endpointStep: Step = {
   focus: ['client', 'ingest', 'db', 'objects'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers an asset, returns
-a pending record and serves the demo. It compiles, and it hides three production flaws. Debug it
-like the service owner, fix it, and prove the fix with the checks below.
-
-Implement \`POST /v1/assets\` — the registration half of ingest. The bytes never travel through this
-endpoint: it registers metadata under a content hash, and the client then uploads with a signed PUT.
-
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- Body: \`{"mime": "image/png", "byte_size": 812345, "caption": "a red bicycle"}\`.
-- \`mime\` is checked against the allowlist \`image/png\`, \`image/jpeg\`, \`image/webp\`,
-  \`image/gif\`, \`image/avif\`; anything else is **415**. The client's declaration is not evidence.
-- \`byte_size\` must be at least 1 and at most **20 MiB** (\`20 << 20\`); a larger size is **413**.
-- \`caption\` is optional and capped at **4 KiB** (\`4 << 10\`) of UTF-8 — the vision model's input
-  budget — and a longer one is **413**.
-- \`Idempotency-Key\` is required and must be the content hash of the bytes as \`sha256:<64 hex>\`
-  (**400** otherwise). It keys the registration: re-registering the same content hash for the same
-  tenant returns the **original** \`asset_id\` with **200** instead of creating a second asset.
-- The stored record carries \`asset_id\`, \`checksum\`, \`mime\`, \`byte_size\`, \`caption\` and
-  \`state: "pending"\`, and that record is the response body.
+**Starting point.** The starter serves \`POST /v1/assets\`: it takes \`{"mime", "byte_size",
+"caption"}\` from an \`X-Tenant-Id\` tenant, stores the record under the mime type and answers
+**201** with \`state: "pending"\`. It compiles, serves the demo and hides four flaws.
 
 **Failure mode the checks target.** Trusting the client's \`mime\` puts an SVG or a polyglot file in
-front of the indexer; an uncapped caption turns one request into an unbounded vision bill; and a
+front of the indexer; an uncapped caption turns one request into an unbounded vision bill; a
 registration that ignores the content hash duplicates the asset *and its embeddings* on every retry,
-so search returns the same image twice with two different scores. The starter also writes
-\`store.put(tenant, body.mime, …)\` — keyed by a value the caller controls, which is how one tenant's
-re-upload can collide with another's.`,
+so search returns the same image twice with two scores; and a response without \`asset_id\` or
+\`checksum\` leaves the client nothing to upload against.
+
+The bytes do not travel through this endpoint: it registers metadata under a content hash, and the
+client then uploads with a signed PUT.
+
+- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
+- \`mime\` is checked against the allowlist \`image/png\`, \`image/jpeg\`, \`image/webp\`,
+  \`image/gif\`, \`image/avif\`; anything else is **415**.
+- \`byte_size\` is at least 1 and at most **20 MiB** (\`20 << 20\`); larger is **413**.
+- \`caption\` is optional and capped at **4 KiB** (\`4 << 10\`) of UTF-8, the vision model's input
+  budget; longer is **413**.
+- \`Idempotency-Key\` is required and carries the content hash as \`sha256:<64 hex>\` (**400**
+  otherwise). Re-registering the same hash for the same tenant returns the **original** \`asset_id\`
+  with **200** instead of creating a second asset.
+- The stored record carries \`asset_id\`, \`checksum\`, \`mime\`, \`byte_size\`, \`caption\` and
+  \`state: "pending"\`, and that record is the response body.`,
   sequence: {
     participants: ['Client', 'Ingest API', 'assets DB', 'Object store'],
     messages: [
@@ -52,9 +50,9 @@ re-upload can collide with another's.`,
     ],
   },
   hints: [
-    'Order the guard clauses by cost: tenant, Idempotency-Key shape, mime allowlist, byte cap, caption cap. Each one returns before the store is touched, so a malformed request can never register anything.',
-    'The content hash is the identity of the bytes, not of the request. Look the hash up under `(tenant, hash)` before you mint an id; a hit returns the stored record with 200, so a retry answers without writing a second asset or a second set of embeddings.',
-    'A caption is a vision-model input, so it gets a byte budget like a prompt does: measure it in UTF-8 bytes, not characters, or a 4 KiB cap becomes 16 KiB of emoji.',
+    'A tenant uploads the same photo twice after a timeout and search shows it twice, with two scores; meanwhile an SVG "image" reached the indexer and a 60 KB caption went to the vision model.',
+    'The starter keys `store.put` by `body.mime`, so every PNG a tenant registers overwrites one record and the response carries no `asset_id`; nothing reads `Idempotency-Key`, the allowlist or the caps.',
+    'Guard in order: tenant, `Idempotency-Key` shape, mime allowlist, `20 << 20` bytes, `4 << 10` UTF-8 caption bytes. Then `store.get(tenant, hash)`; hit returns 200, miss mints `asset_id`, puts and returns 201.',
   ],
   checks: [
     {
@@ -154,9 +152,7 @@ store = AssetStore()
 
 @app.post("/v1/assets")
 def create_asset(body: AssetRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
-    # the registration by the mime type instead of the content hash, so re-uploading the same bytes
-    # registers a second asset and a second set of embeddings.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     store.put(tenant, body.mime, {"mime": body.mime, "byte_size": body.byte_size, "caption": body.caption})
     return JSONResponse(
         {"state": "pending", "mime": body.mime, "byte_size": body.byte_size},
@@ -252,9 +248,7 @@ interface AssetBody {
 }
 
 app.post('/v1/assets', async (request, reply) => {
-  // TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
-  // the registration by the mime type instead of the content hash, so re-uploading the same bytes
-  // registers a second asset and a second set of embeddings.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as AssetBody;
   await store.put(tenant, body.mime, {mime: body.mime, byte_size: body.byte_size, caption: body.caption ?? null});
@@ -382,9 +376,7 @@ func createAsset(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
-	// the registration by the mime type instead of the content hash, so re-uploading the same bytes
-	// registers a second asset and a second set of embeddings.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	asset := Asset{Mime: body.Mime, ByteSize: body.ByteSize, Caption: body.Caption}
 	if err := store.Put(r.Context(), tenant, body.Mime, asset); err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
@@ -542,9 +534,7 @@ object AssetApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[AssetRequest]) { body =>
-            // TODO: this starter trusts the client-declared mime, accepts a caption of any length,
-            // and keys the registration by the mime type instead of the content hash, so a
-            // re-upload registers a second asset and a second set of embeddings.
+            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
             store.put(tenant, body.mime, body)
             complete(StatusCodes.Created, s"""{"state":"pending","mime":"\${body.mime}"}""")
           }
@@ -656,9 +646,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
-    // the registration by the mime type instead of the content hash, so re-uploading the same
-    // bytes registers a second asset and a second set of embeddings.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto mime = body.value("mime", std::string());
     store.put(tenant, mime, body);
     res.status = 201;
@@ -761,13 +749,12 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing the trust boundary of an upload path. The starter reads fine because the
-demo uploads one PNG with no caption and never retries; four defects sit underneath. The mime
-allowlist is a security control, not a nicety — SVG and polyglot files are how an "image" becomes a
-script. The two caps are cost controls: a caption is a model input and a byte size is a bill. The
-idempotency key is the one candidates miss: the client's retry after a timeout must not create a
-second asset, and since the bytes are identical, their hash is the natural key — the endpoint has to
-key on it rather than on anything the caller can vary. Real systems also verify the declared
-\`byte_size\` against what object storage actually received, presign the PUT with the same tenant
-scope, and reject an upload whose content hash does not match the bytes it wrote.`,
+  debrief: `The mime allowlist is a security control, not a nicety: SVG and polyglot files are how an "image"
+becomes a script in the browser that renders search results. The two caps are cost controls, because
+a caption is a model input and a byte size is a bill. The content hash is the natural idempotency
+key: a client that retries after a timeout sends identical bytes, so their hash identifies the asset
+regardless of anything the caller can vary, and keying the store by it turns the retry into a 200
+with the original id. Production ingest also verifies the declared \`byte_size\` against what object
+storage received and rejects bytes that do not hash to the registered checksum, which this step
+cannot do because the bytes have not arrived yet.`,
 };

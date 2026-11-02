@@ -8,26 +8,27 @@ export const rerankClientStep: Step = {
   focus: ['api', 'reranker'],
   task: `## Task
 
-**Starting point.** The starter is working code: it slices the candidates, calls the reranker over
-gRPC and concatenates the scores. It serves the happy path and it hides three production flaws.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`rerank_passages\` slices the candidates into batches of 128,
+calls the reranker stub with a 5-second timeout, retries a deadline forever, and on any other gRPC
+error pads the batch with \`NEUTRAL_SCORE\` and returns an empty list. It serves the happy path and
+hides 5 flaws.
 
-Call the reranker model over gRPC in **batches of 64** with a **700 ms deadline per batch**. The call
-is allowed to fail without failing the request:
+**Failure mode the checks target.** When the model degrades, the list does not look broken, it
+looks reordered: a batch that timed out comes back as a row of 0.5s that outrank genuinely low
+passages, a malformed batch spins in a hot loop, and one bad batch throws away every score the
+request already paid for.
 
-- A batch that fails (deadline, unavailable, transport) yields **unscored** markers for exactly those
-  passages, and the original retrieval order is kept for them. Never substitute a neutral score:
-  **unscored is not a score**, and a fake mid-tier number silently reorders the list.
-- A **malformed** batch — \`INVALID_ARGUMENT\` — is terminal: it is a bug in the request or the model
-  contract, not a transient failure, so it is never retried and it ends the call with an error.
-- A failure in one batch must not abort the request. The remaining batches still run and return their
-  scores, so a partial outage degrades one slice of the list instead of the whole response.
-- The returned scores must model "no score" in the type: an optional per passage, not a magic value.
+Requirements:
 
-**Failure mode the checks target.** The starter retries every error forever inside \`while\`/\`for\`
-until it succeeds, assigns \`NEUTRAL_SCORE\` to a failed batch so infra failures look like genuine
-relevance and silently reorder results, and on a non-retryable error it returns an empty list — one
-bad batch discards every good score the request had already paid for.`,
+- Call the model in **batches of 64** with a **700 ms deadline per batch**.
+- A batch that fails (deadline, unavailable, transport) yields **unscored** markers for exactly
+  those passages, keeping the original retrieval order for them. No neutral-score constant: unscored
+  is not a score.
+- A **malformed** batch (\`INVALID_ARGUMENT\`) is terminal: it is a bug in the request or the model
+  contract, so it is not retried and ends the call with an error.
+- A failure in one batch must not abort the request; the remaining batches still run and return
+  their scores.
+- Model "no score" in the type: an optional per passage, not a magic value.`,
   sequence: {
     participants: ['Rerank API', 'Reranker model'],
     messages: [
@@ -130,9 +131,7 @@ def rerank_passages(query, candidates, model_version, stub):
             except grpc.RpcError as exc:
                 if exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
                     continue
-                # TODO: this starter retries every error forever, assigns a neutral score to failed
-                # batches so unscored passages outrank real ones, and aborts the whole request when
-                # one batch fails. Make a malformed batch terminal and mark failures unscored.
+                # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
                 scores.extend([NEUTRAL_SCORE for _ in batch])
                 return []
     return scores
@@ -185,9 +184,7 @@ export async function rerankPassages(
         break;
       } catch (err) {
         if ((err as grpc.ServiceError).code === grpc.status.DEADLINE_EXCEEDED) continue;
-        // TODO: this starter retries every error forever, assigns a neutral score to failed batches
-        // so unscored passages outrank real ones, and aborts the whole request when one batch
-        // fails. Make a malformed batch terminal and mark failures unscored.
+        // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
         scores.push(...batch.map(() => NEUTRAL_SCORE));
         return [];
       }
@@ -259,9 +256,7 @@ func rerankPassages(ctx context.Context, query string, candidates []Candidate, m
 			if status.Code(err) == codes.DeadlineExceeded {
 				continue
 			}
-			// TODO: this starter retries every error forever, assigns a neutral score to failed
-			// batches so unscored passages outrank real ones, and aborts the whole request when one
-			// batch fails. Make a malformed batch terminal and mark failures unscored.
+			// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 			for range batch {
 				scores = append(scores, NEUTRAL_SCORE)
 			}
@@ -339,9 +334,7 @@ object RerankerClient {
         } catch {
           case _: DeadlineExceeded => ()
           case _: Throwable =>
-            // TODO: this starter retries every error forever, assigns a neutral score to failed
-            // batches so unscored passages outrank real ones, and aborts the whole request when one
-            // batch fails. Make a malformed batch terminal and mark failures unscored.
+            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
             scores ++= batch.map(_ => NeutralScore)
             return Seq.empty
         }
@@ -411,9 +404,7 @@ std::vector<double> rerankPassages(const std::string& query, const std::vector<C
         break;
       }
       if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) continue;
-      // TODO: this starter retries every error forever, assigns a neutral score to failed batches so
-      // unscored passages outrank real ones, and aborts the whole request when one batch fails.
-      // Make a malformed batch terminal and mark failures unscored.
+      // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
       for (std::size_t i = 0; i < batch.size(); ++i) scores.push_back(NEUTRAL_SCORE);
       return std::vector<double>{};
     }
@@ -460,16 +451,16 @@ std::vector<std::optional<double>> rerankPassages(const std::string& query, cons
     },
   },
   hints: [
-    'Model the missing score in the type first: an optional per passage. Once "unscored" is a value, a neutral number has nowhere to hide and the caller can tell a failure from a low score.',
-    'Sort the error codes by what they mean. `INVALID_ARGUMENT` says the request is wrong and retrying will never fix it; deadline and unavailable say try again, but only inside the deadline budget.',
-    'A batch failure is a slice, not the request. Catch it, record unscored markers for that batch, `continue` to the next one, and return the mixed list — partial results beat a blank page.',
+    'During a model brownout, relevance dashboards stay green while users see mid-ranked passages that no one scored; one bad request pins a worker at 100% CPU, and other requests come back empty.',
+    'The except branch treats every code the same: deadline retries without a budget, everything else pads with `NEUTRAL_SCORE` and then returns `[]`, discarding the batches that already succeeded.',
+    'Set `BATCH_SIZE = 64`, a 700 ms deadline, make `INVALID_ARGUMENT` raise, append `None`/unscored for a failed batch and `continue` to the next one; delete `NEUTRAL_SCORE`.',
   ],
-  debrief: `The interviewer is testing whether you can keep a partial failure from becoming a silent quality change.
-The starter reads fine because the demo's model never fails. Three defects are being checked: a
-neutral score standing in for a failure (so a down model looks like mid-tier relevance), an unbounded
-retry around a malformed batch (so a bad request becomes a hot loop), and an abort that discards the
-scores already computed (so one bad batch costs the whole response). The optional score type is the
-part candidates skip: if "unscored" is expressible, it cannot be confused with a number. Real systems
-add a per-batch budget so the total deadline is bounded, a circuit breaker so a failing model is not
-hammered batch after batch, and a metric for the unscored share — the number the next step surfaces.`,
+  debrief: `The fix changes the return type before it changes the control flow: once "unscored" is a value a
+passage can carry, a neutral number has nowhere to hide and the caller can tell a failure from a low
+score. Error codes are then sorted by meaning rather than caught together, because \`INVALID_ARGUMENT\`
+says the request is wrong and a retry cannot help, while a deadline says try again inside the budget.
+A batch failure is a slice, not the request, so the loop records markers and moves on; partial
+results beat a blank page. A production client would also bound the total deadline across batches,
+put a circuit breaker in front of a model that is failing every batch, and emit the unscored share
+as a metric, which is the number the read step surfaces.`,
 };

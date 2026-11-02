@@ -8,37 +8,28 @@ export const traceEventsStep: Step = {
   focus: ['lead', 'kafka', 'evaluator', 'judge'],
   task: `## Task
 
-**Starting point.** The starter is working code: every decision produces an
-event, and a consumer marks finished jobs good or bad, so the dashboard shows numbers moving. Four
-production contracts are broken. Find them, fix them, and prove the fix.
-
-\`trace(...)\` is how the lead and the subagents report every decision — a subagent spawned, a tool
-called, a job finished — and the end-state evaluation consumer turns finished jobs into scores.
-
-- Publish one \`research.trace\` event per decision with the **job id as the message key**, so one
-  job's decisions stay ordered on one partition. The payload is **ids and numbers only**: job id,
-  agent id, tool, latency, tokens, outcome and the service version. The source traces agent
-  decision patterns and interaction structure precisely so that it can debug failures **without
-  reading the contents of conversations**; the query, the findings and any tool text never enter the
-  event or a log line.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent), so a retried
-  produce cannot duplicate a decision.
-- The consumer (group \`end-state-eval\`) reacts to \`job.completed\` events only. It asks the
-  judge to score the job's final report against the **rubric** — \`factual_accuracy\`,
-  \`citation_accuracy\`, \`completeness\`, \`source_quality\`, \`tool_efficiency\`, each 0.0–1.0 with
-  a pass/fail grade — writes the scores to \`research:{job_id}:eval\` and **only then** commits the
-  offset. The judge reads the report from the job store by id; the report is not in the event.
-- The job record carries the **service version** that started it (\`SERVICE_VERSION\`), the trace
-  event repeats it, and \`claim_job\` refuses a job pinned to another version. That is the rainbow
-  deployment the source describes: old and new versions run side by side and an in-flight job
-  finishes on the code that started it instead of being handed to a worker that may read its
-  checkpoints differently.
+**Starting point.** The starter's \`trace(...)\` reports every decision: it logs the findings,
+builds an event that includes the query and findings, and produces it to \`research.trace\` keyed
+by agent id from a default producer. \`claim_job\` returns true for every job, and the
+\`end-state-eval\` consumer commits each offset, then asks the judge for a yes/no on completed jobs.
+It compiles and hides five flaws.
 
 **Failure mode the checks target.** Keying by agent id scatters one job's decisions across
-partitions; the query and findings in the event are retained and replicated for as long as the
-topic is, far beyond the job; an unconfigured producer duplicates on retry; commit-before-write
-loses the evaluation on a crash and the job is never scored; and a job without a version pin is
-silently picked up by whichever worker restarts first after a deploy.`,
+partitions; the query and findings are retained and replicated as long as the topic is; an
+unconfigured producer duplicates on retry; commit-before-write loses the evaluation on a crash; a
+job without a version pin is picked up by whichever worker restarts first after a deploy.
+
+- One \`research.trace\` event per decision with the **job id as the message key**. The payload is
+  **ids and numbers only**: job id, agent id, tool, latency, tokens, outcome, service version. The
+  query, the findings and tool text do not enter the event or a log line.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent).
+- The consumer (group \`end-state-eval\`) handles \`job.completed\` events only: it scores the final
+  report with the judge against the **rubric** (\`factual_accuracy\`, \`citation_accuracy\`,
+  \`completeness\`, \`source_quality\`, \`tool_efficiency\`, each 0.0–1.0 plus pass/fail), writes
+  \`research:{job_id}:eval\` and **only then** commits the offset.
+- The job record carries \`SERVICE_VERSION\`, every event repeats it, and \`claim_job\` refuses a
+  job pinned to another version, so an in-flight job finishes on the code that started it through a
+  rainbow deployment.`,
   sequence: {
     participants: ['Lead agent', 'research.trace', 'End-state eval', 'LLM judge', 'Redis'],
     messages: [
@@ -58,9 +49,9 @@ silently picked up by whichever worker restarts first after a deploy.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=job_id` (or `Key: []byte(jobID)`, `key: jobId`, `ProducerRecord(topic, jobId, …)`). Idempotence is producer configuration: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, kafka-go’s `RequireAll` with a hash balancer.',
-    'The event schema is a contract: job id, agent id, tool, latency, tokens, outcome, version — delete the two text fields and the log line that prints them. If a word for conversation content appears anywhere in this file, it is leaking.',
-    'In the consumer: `judge.score(job_id, RUBRIC)`, `HSET research:{job_id}:eval`, then `commit`. `claim_job` is one comparison — `job["version"] == SERVICE_VERSION` — and the version goes into every event so the trace can tell which code made the decision.',
+    "One job's decisions land on three partitions and replay out of order, the trace topic contains customer queries, a consumer crash leaves a completed job unscored, and a deploy moves in-flight jobs onto new code.",
+    '`trace` produces with `key=agent_id` from a default producer and copies two text fields into the event and the log line; `evaluate` commits before `hset`; `claim_job` never looks at a version.',
+    'Produce with `key=job_id` and `enable.idempotence` plus `acks=all`, drop the two text fields, call `judge.score(job_id, RUBRIC)`, `hset research:{job_id}:eval`, then `consumer.commit`, and make `claim_job` compare `job["version"]` with `SERVICE_VERSION`.',
   ],
   checks: [
     {
@@ -162,9 +153,7 @@ def trace(
     query: str,
     findings: str,
 ) -> None:
-    # TODO: key by job id from an idempotent producer with acks=all, keep the query and the
-    # findings out of the event and the logs, score completed jobs with the rubric before the
-    # commit, and pin jobs to the service version. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     logger.info("trace job=%s agent=%s findings=%r", job_id, agent_id, findings)
     event = {
         "job_id": job_id,
@@ -293,9 +282,7 @@ export interface Decision {
 }
 
 export async function trace(decision: Decision): Promise<void> {
-  // TODO: key by job id from an idempotent producer with acks=all, keep the query and the
-  // findings out of the event and the logs, score completed jobs with the rubric before the
-  // commit, and pin jobs to the service version. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   console.log(\`trace job=\${decision.jobId} agent=\${decision.agentId} findings=\${decision.findings}\`);
   const event = {
     job_id: decision.jobId,
@@ -427,9 +414,7 @@ func (j *Judge) LooksGood(ctx context.Context, jobID string) (bool, error) { ret
 
 var judge = &Judge{}
 
-// TODO: key by job id from an idempotent producer with acks=all, keep the query and the
-// findings out of the event and the logs, score completed jobs with the rubric before the
-// commit, and pin jobs to the service version. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 func trace(ctx context.Context, jobID, agentID, tool string, latencyMS, tokens int, outcome, query, findings string) {
 	log.Printf("trace job=%s agent=%s findings=%q", jobID, agentID, findings)
 	event := map[string]any{
@@ -596,9 +581,7 @@ object TraceEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: key by job id from an idempotent producer with acks=all, keep the query and the
-  // findings out of the event and the logs, score completed jobs with the rubric before the
-  // commit, and pin jobs to the service version. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def trace(
       jobId: String,
       agentId: String,
@@ -737,9 +720,7 @@ Judge judge;
 std::unique_ptr<RdKafka::Producer> producer;
 std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
 
-// TODO: key by job id from an idempotent producer with acks=all, keep the query and the
-// findings out of the event and the logs, score completed jobs with the rubric before the
-// commit, and pin jobs to the service version. Fix all four.
+// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 void trace(const std::string& jobId, const std::string& agentId, const std::string& tool, long latencyMs, long tokens, const std::string& outcome, const std::string& query, const std::string& findings) {
   std::cerr << "trace job=" << jobId << " agent=" << agentId << " findings=" << findings << "\\n";
   const json event = {
@@ -862,5 +843,5 @@ void evaluate() {
 `,
     },
   },
-  debrief: `The interviewer is checking four things a tracing snippet gets wrong, and all four come straight from the source's production chapter. First, the message key is an ordering contract: keyed by job, one job's decisions arrive in order and can be replayed as a story; keyed by agent they cannot. Second, observability without content: the source monitors decision patterns and interaction structures and deliberately not the contents of conversations, because a trace topic is retained, replicated and read by people the user never agreed to share with — ids, counts and latencies explain a bad answer, the text does not need to be there. Third, exactly-once-looking code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must write the evaluation before the commit, or a crash between the two loses the only score that job will ever get. Fourth, the version pin is what makes a rainbow deployment safe: old and new workers run together, and a job keeps running on the version whose checkpoints it wrote. The end-state evaluation is the source's answer to grading agents that take different valid paths — judge the final report with one rubric call, not the steps. Real systems add schema registries for the event, a sampled copy of the full trace for debugging under explicit consent, and a drift alarm when the pass rate of a new version falls below the old one.`,
+  debrief: `The fix protects what a trace is for: explaining a bad answer without exposing the conversation. The message key is an ordering contract: keyed by job, one job's decisions replay as a story; keyed by agent they cannot. The payload stays ids, counts and latencies because a trace topic is retained, replicated and read by people the user did not agree to share with. Exactly-once-looking code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must write the evaluation before the commit or a crash loses the only score that job gets. The version pin makes a rainbow deployment safe: a job keeps running on the version whose checkpoints it wrote. Production systems add a schema registry and an alarm when a new version's pass rate drops.`,
 };

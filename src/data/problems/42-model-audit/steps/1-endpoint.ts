@@ -8,36 +8,29 @@ export const endpointStep: Step = {
   focus: ['client', 'auditd', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses
-the body and inserts a row. It compiles, it serves the demo, and it hides three production flaws —
-one that turns the trail into a copy of tenant content, one that offers corrections, and one that
-lets the caller choose when history happened. Debug it, fix it, and prove the fix.
+**Starting point.** The starter serves \`POST /v1/audit/decisions\` with body
+\`{"model_version": "…", "policy_id": "…", "input_digest": "…", "decision_digest": "…"}\`: it reads
+the tenant header, copies the body into a row (including \`prompt\` and the caller's \`timestamp\`),
+inserts it, and also registers a \`PATCH\` route that runs \`UPDATE audit_decisions\`. It compiles,
+serves the demo and hides 4 flaws.
 
-Implement \`POST /v1/audit/decisions\` with body
-\`{"model_version": "…", "policy_id": "…", "input_digest": "…", "decision_digest": "…"}\`.
+**Failure mode the checks target.** The trail must be evidence: it must hold digests rather than
+content, it must not carry a clock the caller controls, it must refuse malformed records, and its
+correctness includes the routes it does not have.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - Every field is required and non-empty (**400** otherwise). \`input_digest\` and
-  \`decision_digest\` are lowercase hex digests of exactly **64** characters — anything else is
+  \`decision_digest\` are lowercase hex digests of exactly **64** characters; anything else is
   **400**.
-- **Prompts never enter the store.** The record holds the model version, the policy id and the two
-  digests; the caller's inputs and the decision itself are never read from the body, never logged
-  and never persisted. The starter stores \`body["prompt"]\` "for replayability", which makes the audit
-  trail a second, less-guarded copy of exactly the content this system exists to avoid keeping.
-- **The record is immutable.** There is no update route and no delete route; an update attempt on an
-  existing record is answered **405** by design, never \`200\`. The starter registers a \`PATCH\` route
-  that runs \`UPDATE audit_decisions …\`, because "corrections" sounds reasonable until an auditor
-  asks who edited the evidence.
-- **Timestamps are server-set and monotonic per tenant.** The timestamp field is \`recorded_at\`,
-  written from the server clock as \`max(now_ms, last_recorded_at + 1)\`, and the caller's own
-  timestamp is never read. The starter trusts \`body["timestamp"]\`, so a client can backdate or reorder
-  history.
+- Prompts do not enter the store. The record holds the model version, the policy id and the two
+  digests; the caller's inputs and the decision itself are not read from the body, logged or
+  persisted.
+- The record is immutable. There is no update route and no delete route; an update attempt on an
+  existing record is answered **405** by design.
+- Timestamps are server-set and monotonic per tenant: the field is \`recorded_at\`, written from the
+  server clock as \`max(now_ms, last_recorded_at + 1)\`; the caller's own timestamp is never read.
 - Answer **201** with the stored record: \`id\`, \`tenant\`, \`model_version\`, \`policy_id\`,
-  \`input_digest\`, \`decision_digest\` and \`recorded_at\`.
-
-**Failure mode the checks target.** Two of the three flaws are about trust: content that must not be
-persisted, and a clock the caller must not control. The third is the shape of the API itself — the
-absence of an edit route is a feature you have to prove, not a route you forgot to write.`,
+  \`input_digest\`, \`decision_digest\` and \`recorded_at\`.`,
   sequence: {
     participants: ['Client', 'Audit Service', 'Postgres'],
     messages: [
@@ -144,9 +137,7 @@ def now_ms() -> int:
 
 @app.post("/v1/audit/decisions")
 def append_decision(body: dict, cur=None) -> JSONResponse:
-    # TODO: the starter keeps the whole prompt "for replayability", trusts the caller's timestamp and
-    # registers a PATCH route for corrections. Store the digests only, timestamp from the server
-    # clock, and answer an edit attempt with 405 instead of offering one.
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     record = {
         "model_version": body["model_version"],
         "policy_id": body["policy_id"],
@@ -244,9 +235,7 @@ import Fastify from 'fastify';
 export const app = Fastify();
 
 app.post('/v1/audit/decisions', async (request, reply) => {
-  // TODO: the starter stores the whole prompt "for replayability", trusts the caller's timestamp and
-  // registers a PATCH route for corrections. Keep the digests only, timestamp on the server, and
-  // answer an edit attempt with 405.
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const body = request.body as Record<string, unknown>;
   const tenant = (request.headers['x-tenant-id'] as string) ?? 'anonymous';
   const {rows} = await db.query(
@@ -334,9 +323,7 @@ type appendRequest struct {
 }
 
 func appendDecision(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the starter stores the whole prompt "for replayability", trusts the caller's timestamp and
-	// registers a PATCH route for corrections. Keep the digests only, timestamp on the server, and
-	// answer an edit attempt with 405.
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
 	var in appendRequest
 	_ = json.NewDecoder(r.Body).Decode(&in)
 	tenant := r.Header.Get("X-Tenant-Id")
@@ -482,8 +469,7 @@ object AuditApi {
     path("v1" / "audit" / "decisions") {
       post {
         entity(as[AppendRequest]) { request =>
-          // TODO: the starter stores the whole prompt "for replayability" and trusts the caller's
-          // timestamp. Keep the digests only, timestamp on the server, and answer an edit with 405.
+          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
           val recordedAt = request.timestamp
           val id = db.insert(tenant, request.model_version, request.prompt, recordedAt)
           complete(StatusCodes.Created, s"""{"id":"$id","timestamp":$recordedAt}""")
@@ -594,9 +580,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post(R"(/v1/audit/decisions)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the starter stores the whole prompt "for replayability", trusts the caller's timestamp
-    // and registers a PATCH route for corrections. Keep the digests only, timestamp on the server,
-    // and answer an edit attempt with 405.
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
     const auto body = json::parse(req.body);
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto id = db_insert(tenant, body["model_version"], body["prompt"], body["timestamp"]);
@@ -700,9 +684,9 @@ int main() {
     },
   },
   hints: [
-    'Digests are the whole point: `input_digest` and `decision_digest` let an auditor prove *what* was decided without the trail ever holding the content. If the starter reads `body["prompt"]`, delete the read — the safest record is the one whose content was never parsed.',
-    'Immutability is a route table decision. Register only `POST` on the collection and let every other method fall through to a `405` handler: `@app.api_route(..., methods=["PUT","PATCH","DELETE"])`, `app.route({method: ["PUT","PATCH","DELETE"]})`, or the `put | patch | delete` alternative in Pekko HTTP. Never delete a row either.',
-    'The clock belongs to the server. Write `recorded_at`, compute it as `max(now, last_recorded_at + 1)` inside the tenant, and stop reading the caller’s field entirely — monotonicity is what lets the verifier order entries later, and a caller-supplied timestamp is what lets them be reordered.',
+    'An auditor pulls a record and finds the prompt text and a timestamp from last year, then discovers a PATCH that would let anyone rewrite it. The service accepts anything the body says.',
+    'The handler copies body fields straight into the row: `prompt`, the caller `timestamp`, unvalidated digests. The PATCH route exists because the code offers corrections instead of refusing them.',
+    'Validate tenant (401), fields and 64-char hex digests (400); drop `prompt`; write `recorded_at = max(now_ms, last + 1)`; replace the PATCH route with a 405 handler and remove the UPDATE.',
   ],
-  debrief: `The interviewer is testing whether you can debug a handler at the evidence boundary. Two flaws are about trust: the record must not contain the content it audits, and it must not carry a clock the caller controls. The third is subtler and often missed: an audit API’s correctness includes the routes it *does not* have. A \`PATCH\` for "corrections" looks like good citizenship until you ask who edited the evidence — which is why the fix registers a 405 handler rather than a route, and why the storage layer has no \`UPDATE\` at all. Real audit services add a per-record signature or Merkle proof over the append batch, a policy id that resolves to an immutable policy version, and a hash-only index so an auditor can look a decision up by its input digest without the service ever holding the input.`,
+  debrief: `The fix has the shape of a boundary: everything the row contains is either validated or produced by the server. Digests stand in for content so the trail can prove what was decided without holding it; \`recorded_at\` comes from the server clock and is advanced past the tenant's last record so the verifier can order entries later; the 405 handler is registered deliberately, because the absence of an edit route is a property you have to assert, not a route you forgot. Production audit services go further: a per-record signature or Merkle proof over each append batch, a policy id that resolves to an immutable policy version, and a hash-only index so an auditor can look a decision up by its input digest without the service ever seeing the input.`,
 };

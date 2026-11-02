@@ -8,33 +8,27 @@ export const endpointStep: Step = {
   focus: ['client', 'crawler', 'registry', 'robots'],
   task: `## Task
 
-**Starting point.** The starter is working code: it takes a URL, fetches it and
-registers a target, so the demo crawls the one host it was pointed at. It trusts the caller with the
-whole internet. Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/crawl/targets\` with body
+\`{"job_id": "nightly", "url": "https://blog.example.com/posts", "rate_per_minute": 30}\`: it reads
+the tenant header, fetches the URL, inserts a target row and answers
+\`{"target_id", "status": "accepted"}\`. It serves the demo and hides four flaws.
 
-Implement \`POST /v1/crawl/targets\` with body
-\`{"job_id": "nightly", "url": "https://blog.example.com/posts", "rate_per_minute": 30}\`.
+**Failure mode the checks target.** A crawler that fetches before it decides is an SSRF with a queue
+in front of it: whatever the caller sends, including the cluster metadata address, gets resolved.
+Skipping robots makes it impolite from the first request, and an unconditional insert turns every
+client retry into a duplicate frontier entry.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- Only \`http\` and \`https\` targets are accepted (**400** otherwise) — \`file://\`, \`ftp://\` and
-  \`gopher://\` are how a crawler is pointed at something that is not a web page.
+- Only \`http\` and \`https\` targets are accepted (**400** otherwise).
 - The host must be on the \`ALLOWED_HOSTS\` allowlist and must not be an **internal address**
   (\`localhost\`, \`*.internal\`, \`*.local\`, loopback, private and link-local IP literals):
-  **400**, and the rejection happens **before any fetch** — the target is refused, the network is
-  never touched. The starter fetches whatever URL it is handed, which is how a crawler becomes the
-  comfortable way into the cluster's metadata service.
-- The host's **robots rules** are fetched before the target is accepted. If the URL's path is
-  disallowed, answer **403** with the matching rule quoted in the body
-  (\`disallowed by robots: /private\`). Rules are the \`Disallow\` prefixes; \`*\` means everything.
-- The target is only enqueued **after** the policy and robots checks pass, and registration is
-  **idempotent per \`(job_id, url)\`**: a replayed registration returns the original
-  \`target_id\` instead of inserting a second copy. The starter inserts unconditionally, so a client
-  retry doubles the frontier.
-
-**Failure mode the checks target.** Fetching before validating is the SSRF hole: the starter resolves
-whatever the caller sent, including \`http://169.254.169.254/latest/meta-data/\`. Skipping robots
-makes the crawler a bad citizen on the first request. Inserting without a lookup means every retry
-duplicates work the frontier then has to discover and deduplicate.`,
+  **400**, decided **before any fetch**.
+- The host's **robots rules** are fetched before the target is accepted. A disallowed path is
+  **403** with the matching rule quoted (\`disallowed by robots: /private\`). Rules are the
+  \`Disallow\` prefixes; \`*\` means everything.
+- Registration is **idempotent per \`(job_id, url)\`**: a replay returns the original
+  \`target_id\` instead of inserting a second copy, and the insert happens only after the policy
+  and robots checks pass.`,
   sequence: {
     participants: ['Client', 'Crawl service', 'target registry', 'robots.txt'],
     messages: [
@@ -55,9 +49,9 @@ duplicates work the frontier then has to discover and deduplicate.`,
     ],
   },
   hints: [
-    'Order the guards by cost: tenant, scheme, host shape, allowlist, then the network. Parse the URL once and keep the parsed host and path — re-parsing the raw string in every guard is how a check and a fetch end up looking at different things.',
-    'An internal address is more than `localhost`: check the `.internal`/`.local` suffixes, and parse IP literals so `10.x`, `172.16–31.x`, `192.168.x`, `127.x`, `169.254.x`, `::1`, `fc00::/7` and `fe80::/10` are all rejected. The allowlist does that for you too — a host that is not on it never gets fetched — but the explicit check is what the interviewer looks for.',
-    'Register under `(job_id, url)`: look the target up first and return its stored id on a replay, then fetch robots, then insert. A `robots.txt` the host does not serve is not permission to crawl everything; treat an unreachable rules file as deny-all.',
+    'Point the demo at `http://169.254.169.254/latest/meta-data/` and the service fetches it before answering. Register the same seed twice and the frontier holds two copies of it.',
+    'The handler calls `fetch_page(body.url)` first and `targets.insert` last, with nothing in between: no scheme or host guard, no `robots.txt` read, no lookup for an existing `(job_id, url)`.',
+    'Before any fetch: check `ALLOWED_SCHEMES`, `ALLOWED_HOSTS` and `is_internal_host` (400). Then `targets.find(job_id, url)` and return its id on a hit, then `fetch_robots` (403 with the rule), then insert.',
   ],
   checks: [
     {
@@ -170,10 +164,7 @@ def fetch_page(url: str) -> str:
 
 @app.post("/v1/crawl/targets")
 def register(body: TargetRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter fetches any URL the caller sends - including http://169.254.169.254/ and
-    # internal hostnames - skips robots.txt entirely, and inserts the same target twice so the
-    # frontier doubles. Validate the scheme and host before any fetch, fetch the robots rules
-    # before accepting the target, and return the original target id on a replay.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     fetch_page(body.url)
     target = targets.insert(body.job_id, body.url)
     return {"target_id": target["target_id"], "status": "accepted"}
@@ -303,10 +294,7 @@ async function fetchPage(url: string): Promise<string> {
 }
 
 app.post('/v1/crawl/targets', async (request, reply) => {
-  // TODO: this starter fetches any URL the caller sends - including http://169.254.169.254/ and
-  // internal hostnames - skips robots.txt entirely, and inserts the same target twice so the
-  // frontier doubles. Validate the scheme and host before any fetch, fetch the robots rules
-  // before accepting the target, and return the original target id on a replay.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const body = request.body as TargetBody;
   await fetchPage(body.url);
   const target = await targets.insert(body.job_id, body.url);
@@ -466,10 +454,7 @@ func registerTarget(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter fetches any URL the caller sends - including http://169.254.169.254/ and
-	// internal hostnames - skips robots.txt entirely, and inserts the same target twice so the
-	// frontier doubles. Validate the scheme and host before any fetch, fetch the robots rules
-	// before accepting the target, and return the original target id on a replay.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	if _, err := fetchPage(body.URL); err != nil {
 		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "seed fetch failed"})
 		return
@@ -684,11 +669,7 @@ object CrawlApi {
       post {
         headerValueByName("X-Tenant-Id") { _ =>
           entity(as[TargetRequest]) { body =>
-            // TODO: this starter fetches any URL the caller sends - including
-            // http://169.254.169.254/ and internal hostnames - skips robots.txt entirely, and
-            // inserts the same target twice so the frontier doubles. Validate the scheme and host
-            // before any fetch, fetch the robots rules before accepting the target, and return
-            // the original target id on a replay.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             fetchPage(body.url)
             val target = targets.insert(body.job_id, body.url)
             complete(StatusCodes.OK, s"""{"target_id":"\${target.target_id}","status":"accepted"}""")
@@ -846,10 +827,7 @@ int main() {
       res.set_content(R"({"error":"job_id and url are required"})", "application/json");
       return;
     }
-    // TODO: this starter fetches any URL the caller sends - including http://169.254.169.254/ and
-    // internal hostnames - skips robots.txt entirely, and inserts the same target twice so the
-    // frontier doubles. Validate the scheme and host before any fetch, fetch the robots rules
-    // before accepting the target, and return the original target id on a replay.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto rawUrl = body["url"].get<std::string>();
     fetchPage(rawUrl);
     const auto target = targets.insert(body.value("job_id", std::string()), rawUrl);
@@ -1017,5 +995,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a registration endpoint at the trust boundary. The starter reads fine because the demo points it at one cooperating host and never retries. Three defects are being checked: the fetch happens before any policy decision (so an internal address reaches the cluster network), \`robots.txt\` is never consulted (so the crawl is impolite from the first request), and registration is not keyed by target (so every client retry doubles the frontier). Real crawlers also normalise the URL before keying it, keep a per-host rules cache with a TTL, and record the rejection reason on the target so an operator can explain why a URL was never fetched.`,
+  debrief: `The guards run in cost order, cheapest and safest first, because the property being protected is that no byte leaves the service toward a host the policy has not already approved. Scheme, allowlist and internal-address checks cost nothing and decide most of the outcome; the robots fetch is the first network call and happens only for a host that passed them; the insert is last and keyed, so a client retry lands on the stored row. Production crawlers go further: they canonicalise the URL before keying it, cache a host's robots rules with a TTL, pin the resolved IP so DNS rebinding cannot swap the host after the check, and store the rejection reason on the target so an operator can answer "why was this never fetched".`,
 };

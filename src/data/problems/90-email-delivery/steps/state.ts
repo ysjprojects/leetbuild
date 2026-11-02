@@ -8,31 +8,25 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'relay'],
   task: `## Task
 
-**Starting point.** The starter is working code: a recipient with no
-suppression flag and budget left gets its mail through, so the demo passes. It hides two flaws that
-only appear after the first hour or the first burst. Find them, fix them, and prove the fix.
+**Starting point.** The starter calls \`relay.send\` first, then reads a \`suppression:{recipient}\`
+string key (written by \`suppress\` with \`ex=3600\`) and finally runs \`check_rate\`, which does a
+\`GET\` on \`rate:{recipient}:{window}\` and a separate \`INCR\` with no expiry. It compiles and it hides five flaws.
 
-Implement the admission check every send runs before the relay:
+**Failure mode the checks target.** A bounced or unsubscribed address is mailed again once the
+one-hour key lapses; concurrent sends read the same count and all pass the cap; the counter key lives
+forever; and the refusal arrives after the relay already has the message.
 
-- Suppression and the per-recipient minute counter are decided in **one atomic Redis script**
-  (a Lua \`EVAL\`): a read followed by a separate increment lets two concurrent sends both pass the
-  same check.
-- Suppression is **durable**: it lives in a set (\`suppression:list\`) with no per-member expiry, so a
-  bounced address stays suppressed after lunch. The starter writes a \`suppression:{recipient}\` cache
-  key with \`ex=3600\`, so the unsubscribe is forgotten when the TTL lapses.
-- The rate window **expires**: the counter key \`rate:{recipient}:{window}\` gets \`EXPIRE 60\` on its
-  first write (\`window = floor(unix_seconds / 60)\`), so the window rolls over instead of living
-  forever.
-- An **unsubscribe** path (\`suppress(recipient)\`) writes the durable set and takes effect within
-  seconds — the next admission sees it, with no TTL to wait out.
-- A suppressed recipient is refused with **409** and an over-limit recipient with **429**, and the
-  admission verdict runs **before** the relay call so a refused send never reaches the relay. The
-  starter sends first and checks afterwards.
+Requirements:
 
-**Failure mode the checks target.** Suppression in an expiring cache means a bounced or unsubscribed
-address is mailed again after the TTL; a check-then-send split means a burst of concurrent sends all
-observe the same count and slips past the cap; and admitting after the relay means the mail is
-already gone when the check refuses.`,
+- Suppression and the minute counter are decided in one Lua script \`ADMIT_LUA\` run with
+  \`r.eval\`: \`SISMEMBER\` on the set, then \`INCR\` on the counter.
+- Suppression is durable: a set named by \`SUPPRESSED_SET\` (\`suppression:list\`), written with
+  \`r.sadd\` and no per-member expiry.
+- The counter \`rate:{recipient}:{window}\` gets \`EXPIRE WINDOW_S\` (60 seconds) on its first write,
+  with \`window = floor(unix_seconds / 60)\`.
+- \`def suppress(recipient)\` writes the set with \`r.sadd\`, so the next admission sees it at once.
+- \`admit(...)\` runs before \`relay.send\`; suppressed is **409**, over the limit is **429**, and a
+  refused send does not reach the relay.`,
   sequence: {
     participants: ['Email API', 'Redis', 'Relay'],
     messages: [
@@ -144,8 +138,7 @@ relay = Relay()
 
 
 def is_suppressed(recipient: str) -> bool:
-    # TODO: this starter keeps suppression in a 1-hour cache key, so a bounce is forgotten after
-    # lunch, and it checks the rate then sends in two steps so a burst slips through.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     return bool(r.get(f"suppression:{recipient}"))
 
 
@@ -263,8 +256,7 @@ const relay: Relay = {
 };
 
 async function isSuppressed(recipient: string): Promise<boolean> {
-  // TODO: this starter keeps suppression in a 1-hour cache key, so a bounce is forgotten after
-  // lunch, and it checks the rate then sends in two steps so a burst slips through.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   return Boolean(await r.get(\`suppression:\${recipient}\`));
 }
 
@@ -383,8 +375,7 @@ type Relay interface {
 }
 
 func IsSuppressed(ctx context.Context, recipient string) bool {
-	// TODO: this starter keeps suppression in a 1-hour cache key, so a bounce is forgotten after
-	// lunch, and it checks the rate then sends in two steps so a burst slips through.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	value, _ := Rdb.Get(ctx, "suppression:"+recipient).Result()
 	return value != ""
 }
@@ -516,8 +507,7 @@ object State {
   }
 
   def isSuppressed(redis: Redis, recipient: String): Boolean =
-    // TODO: this starter keeps suppression in a 1-hour cache key, so a bounce is forgotten after
-    // lunch, and it checks the rate then sends in two steps so a burst slips through.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     redis.get(s"suppression:$recipient").isDefined
 
   def suppress(redis: Redis, recipient: String): Unit =
@@ -625,8 +615,7 @@ class Relay {
 };
 
 bool isSuppressed(redisContext* ctx, const std::string& recipient) {
-  // TODO: this starter keeps suppression in a 1-hour cache key, so a bounce is forgotten after
-  // lunch, and it checks the rate then sends in two steps so a burst slips through.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   redisReply* reply = (redisReply*)redisCommand(ctx, "GET suppression:%s", recipient.c_str());
   const bool found = reply != nullptr && reply->type != REDIS_REPLY_NIL;
   freeReplyObject(reply);
@@ -746,9 +735,9 @@ void Register(httplib::Server& svr, redisContext* ctx, Relay& relay) {
     },
   },
   hints: [
-    'Suppression is a set, not a cache entry: `SADD suppression:list {recipient}` has no TTL, so a bounce or an unsubscribe stays suppressed. A `SET ... EX 3600` key forgets the address when the hour is up.',
-    'The suppression read and the rate increment must be one script. A client-side `GET` followed by a separate `INCR` leaves a gap where two concurrent sends both read the same count and both pass.',
-    'The minute counter needs an `EXPIRE` set on its first write, and the handler must read the verdict before it calls the relay — a suppressed or over-limit send never reaches the relay.',
+    'A customer who unsubscribed in the morning gets the afternoon campaign, and a burst of twenty sends to one address all return 202 although the limit is five.',
+    '`suppress` writes a string key with `ex=3600`, so the flag vanishes after an hour, and `check_rate` reads the count in one round trip and increments in another, so concurrent calls all see the old value.',
+    'Store suppression with `r.sadd(SUPPRESSED_SET, recipient)` and decide both in one `ADMIT_LUA` script (`SISMEMBER`, `INCR`, `EXPIRE WINDOW_S`) called by `admit` before `relay.send`. The remaining checks follow from that.',
   ],
-  debrief: `The interviewer is testing whether you can debug a Redis-backed admission path for durability and atomicity. The starter reads fine because the demo suppresses an address and sends one message. Two defects are being checked: suppression stored with a TTL, so an unsubscribe is forgotten when the cache expires; and a check-then-send split, so a burst of concurrent sends all observe the same count. The durable set and the single Lua script are the fix. Real senders keep suppression in durable storage with an audit trail, scope rate limits per campaign as well as per recipient, and alert when the suppression set is written outside the unsubscribe path.`,
+  debrief: `The fix moves the decision into Redis because that is the only place it can be atomic: one \`EVAL\` sees the set membership, increments the counter and sets its expiry while no other client can interleave, which a client-side \`GET\` then \`INCR\` cannot promise. Suppression goes into a set without a TTL because the promise behind it has no expiry; a cache key with \`EX 3600\` encodes the wrong lifetime. The counter gets its expiry inside the same script so a crash between \`INCR\` and \`EXPIRE\` cannot leave an immortal key. Production senders also keep the suppression list in durable storage with an audit trail of who added each address and why, and scope rate limits per campaign and per sending domain as well as per recipient.`,
 };

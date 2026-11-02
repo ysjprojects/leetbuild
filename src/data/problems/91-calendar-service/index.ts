@@ -7,81 +7,69 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Calendar service: the course is not "store an event", it is the debugging you owe a calendar
- * before it re-invites four hundred people. Recurrence rules that provably terminate →
- * generation-stamped Redis caches where an exception can never be read against a stale expansion
- * → gRPC notifications that carry their change kind and one idempotency token per change → a
- * calendar-keyed change stream published after the commit → a read endpoint that bounds the
- * window it expands and returns each overridden instance exactly once.
+ * Calendar service: recurrence rules that provably terminate → generation-stamped Redis caches
+ * where an exception is read against the expansion it modifies → gRPC notifications that carry
+ * their change kind and one idempotency token per change → a calendar-keyed change stream
+ * published after the commit → a read endpoint that bounds the window it expands and returns each
+ * overridden instance exactly once.
  */
 export const calendarServiceProblem: Problem = {
   id: 'calendar-service',
   title: 'Calendar Service',
-  tagline: 'Recurring events that expand correctly, notify once and never loop forever.',
+  tagline: 'Recurrence rules with an end, a generation-stamped expansion cache, and one invite per change.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Calendar Service
 
-A calendar service is the piece of a productivity platform that decides whether an event exists once
-or ten thousand times, whether four hundred attendees are invited once or twice, and whether one
-tenant's rule can still be expanding when the on-call shift changes. The visible part is a row in a
-week view; the parts that decide whether the service is safe are the recurrence contract, the cache
-overlay, the notification semantics, the change stream, and the range read.
+A calendar service decides whether an event exists once or ten thousand times, whether four hundred
+attendees are invited once or twice, and whether one tenant's rule is still expanding when the
+on-call shift changes. The visible part is a row in a week view; the parts that decide whether the
+service is safe are the recurrence contract, the cache overlay, the notification semantics, the
+change stream, and the range read.
 
 ## The real system
 
-Production calendars store an event once and derive its occurrences, either on read or through an
-expansion worker. The recurrence rule is a program, so it is validated before it is stored: a rule
-that can generate occurrences forever without an end or a count is refused, because expansion would
-never return. Time is the other half of that contract — an occurrence is a moment in a timezone, so
-a naive local string cannot be the representation that survives a DST boundary or a tenant that
-travels.
+CalDAV servers such as Nextcloud (built on sabre/dav) store a recurring event once as a VEVENT with
+an RRULE and derive its occurrences on read: a \`calendar-query\` REPORT with a \`time-range\` filter
+and the \`CALDAV:expand\` element returns the instances inside the window, with RECURRENCE-ID
+overrides applied in place of the occurrences they replace. Expansion is not cheap, so the rule is
+validated before it is stored: a frequency with no \`UNTIL\` and no \`COUNT\` is a program that does
+not halt, and an occurrence is an instant in a timezone, so a naive local string does not survive a
+DST boundary.
 
-Expansion is expensive, so it is cached per calendar, per range and per generation, and instance
-exceptions (a moved or cancelled occurrence) are overlaid on top of it. The overlay and the
-expansion must change together: a reader that sees a cancellation against a stale slice ships an
-occurrence that no longer exists.
-
-Notifications are a side effect with a budget, so every call declares what changed and carries an
-idempotency token: a timezone-only correction is not a new invitation, and a retry reuses the token
-instead of minting one. Downstream sync is a stream, not a scatter: change events are keyed so a
-calendar's stream stays ordered, they carry ids and revisions rather than attendees and bodies, and
-they are published only after the event store has committed.
+Expansion is cached per calendar, range and generation, with instance exceptions overlaid on it;
+the two must change together or a reader ships an occurrence that no longer exists. Notifications
+carry a change kind and an idempotency token, so a timezone-only correction is not a new invitation
+and a retry reuses the token. Downstream sync is a stream keyed per calendar, carrying ids and
+revisions rather than attendees and bodies, published only after the store has committed.
 
 ## What you build here
 
 One service, **calendard**, with five pieces:
 
 1. \`POST /v1/events\`: an authenticated create that validates the RRULE for termination and the
-   datetimes for timezone offsets, refuses unknown rule parts instead of dropping them, and stores
-   the event with a revision.
-2. A **Redis** expansion and exception cache: expansion slices cached per
-   \`(calendar, range, generation)\`, exceptions overlaid atomically under a generation bump so no
-   read can mix generations, and every key expired with the event's changes.
+   datetimes for timezone offsets, refuses unknown rule parts, and stores the event with a revision.
+2. A **Redis** expansion and exception cache: slices cached per \`(calendar, range, generation)\`,
+   exceptions overlaid atomically under a generation bump, every key expired.
 3. A **gRPC** notification client: a 3-second deadline per call, a declared change kind, one
-   idempotency token per change so a retry never duplicates an invite, and cancels that pair only
-   with delivered creates.
-4. A **Kafka** \`calendar.event\` stream: keyed by calendar id for per-calendar order, carrying
-   event id, revision and kind only — never attendee addresses or event bodies — and published
-   after the store commits.
+   idempotency token per change, and cancels that pair only with delivered creates.
+4. A **Kafka** \`calendar.event\` stream: keyed by calendar id, carrying event id, revision and kind
+   only, published after the store commits.
 5. \`GET /v1/calendars/{id}/events\`: a range read capped at 90 days, expanded server-side with a
-   per-occurrence revision id, returning each overridden instance once, and refusing private
-   calendars to non-members.
+   per-occurrence id and revision, each overridden instance once, private calendars refused to
+   non-members.
 
 ## The debugging habit
 
-Every starter in this course is working code with a flaw: it compiles, it serves the demo, and it
-looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, serves the demo, and looks
+right. Debug it against the failure modes the task names, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-UI rendering, free/busy aggregation across tenants, resource rooms and equipment, ICS import and
-export, push notification transport, reminder scheduling, and calendar sharing permissions beyond
-the membership check. The five pieces above are the ones that decide whether the calendar is
-correct, isolated and shippable.`,
+UI rendering, free/busy aggregation, resource rooms, ICS import and export, push transport,
+reminder scheduling, and sharing permissions beyond the membership check.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Calendar client', sub: 'invites · RSVP · ranges', x: 8, y: 50},

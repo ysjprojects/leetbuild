@@ -8,29 +8,24 @@ export const dependencyStep: Step = {
   focus: ['api', 'store', 'redis'],
   task: `## Task
 
-The starter is working code: it opens a gRPC channel to the object store, sends
-the part and marks it stored. The demo works because the store accepts everything. Three defects hide
-behind that acceptance. Find them, fix them, and prove the fix.
+**Starting point.** The starter is the part writer: \`write_part(stub, upload_id, part)\` opens a
+gRPC channel to the object store, sends a \`WritePartRequest\` with the part's bytes and marks the
+part stored as soon as the call returns. The demo works because the store accepts everything. It
+hides five flaws.
 
-Implement the part writer that moves one part from the API to the object store over gRPC.
+**Failure mode the checks target.** Marking a part stored when the store *accepted* the request
+rather than when the checksum *verified* moves the discovery of corruption to finalize, after every
+part has been uploaded. Retrying the whole upload on one part's failure multiplies the bytes sent on
+a flaky network, and without a deadline a stuck store turns one part into a hung request.
 
 - Every \`WritePart\` call carries a **30-second deadline** (\`WRITE_DEADLINE_S\`); a store that hangs
-  must not hold the request open. The starter calls \`WritePart\` with no deadline at all.
-- The store returns the **checksum it computed** for the bytes it received. The writer must compare
-  that against the checksum the client computed and mark the part stored **only on a match**
-  (**stored requires a checksum match**). The starter marks stored as soon as the call returns, so a
-  part the store corrupted is discovered only at finalize — and the whole upload is retried.
-- A failed or mismatched part is retried **alone**, at most \`MAX_PART_ATTEMPTS\` (3) times. The starter
-  retries the entire upload on one part's failure, so a 5 GiB upload re-sends 4.99 GiB to recover a
-  64 MiB part.
+  must not hold the request open.
+- The store returns the **checksum it computed** for the bytes it received. The writer compares it
+  against the client's checksum and marks the part stored **only on a match**.
+- A failed or mismatched part is retried **alone**, at most \`MAX_PART_ATTEMPTS\` (3) times, so a
+  5 GiB upload does not re-send 4.99 GiB to recover a 64 MiB part.
 - \`resume_list(upload_id, part_count, manifest)\` returns the **exact part numbers** still missing,
-  in order, so the client re-sends only those. The starter's callers get a percentage, not a list.
-
-**Failure mode the checks target.** Marking a part stored when the store *accepted* the request — not
-when the checksum *verified* — moves the discovery of corruption to finalize, after the client has
-uploaded every part. Retrying the whole upload on one part's failure multiplies the bytes sent by the
-part count on a flaky network. And without a deadline, a stuck store turns one part into a hung
-request.`,
+  in order, so the client re-sends only those.`,
   sequence: {
     participants: ['Upload API', 'Object store', 'Part manifest'],
     messages: [
@@ -42,9 +37,9 @@ request.`,
     ],
   },
   hints: [
-    'The deadline belongs on the call: `stub.WritePart(request, timeout=WRITE_DEADLINE_S)`, or a `context.WithTimeout` on the Go side. Without it a stuck store holds the request open until the client gives up and retries the part anyway.',
-    'The store echoes the checksum it computed. Compare it to the client’s before `mark_stored`, and on a mismatch retry just that part — the loop is per part, bounded by `MAX_PART_ATTEMPTS`. Retrying the whole upload turns one bad part into a full re-send.',
-    'The resume list is the contract with the client: `[n for n in 1..part_count if n not in manifest]`. A percentage cannot be acted on; an ordered list of missing numbers can, and it is what lets a flaky client resume without restarting.',
+    'A store node wedges and one upload request hangs until the client gives up; another upload finishes, then finalize reports a checksum mismatch and the client has to send all 5 GiB again.',
+    "The call has no deadline, the reply's checksum is thrown away before `mark_stored`, and the only retry loop wraps the whole upload rather than the part that failed.",
+    'In `write_part`: call `stub.WritePart(request, timeout=WRITE_DEADLINE_S)` inside a `for attempt in range(MAX_PART_ATTEMPTS)` loop, compare `reply.checksum` to `part.checksum`, and call `mark_stored` only on a match; add `resume_list`.',
   ],
   checks: [
     {
@@ -131,8 +126,7 @@ class Part:
 
 
 def write_part(stub, upload_id: str, part: Part) -> None:
-    # TODO: this starter marks each part stored when the store accepts the request, retries the whole
-    # upload when a single part fails, and never checks the checksum the store returns.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     request = WritePartRequest(upload_id=upload_id, part_number=part.number, data=part.data)
     stub.WritePart(request)
     mark_stored(upload_id, part.number)
@@ -212,8 +206,7 @@ export async function writePart(
   uploadId: string,
   part: Part,
 ): Promise<void> {
-  // TODO: this starter marks each part stored when the store accepts the request, retries the whole
-  // upload when a single part fails, and never checks the checksum the store returns.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await new Promise<void>((resolve, reject) => {
     client.writePart(
       {upload_id: uploadId, part_number: part.number, data: part.data},
@@ -301,8 +294,7 @@ import (
 const writeDeadlineS = 30
 
 func WritePart(ctx context.Context, client StoreClient, uploadID string, part Part) error {
-	// TODO: this starter marks each part stored when the store accepts the request, retries the whole
-	// upload when a single part fails, and never checks the checksum the store returns.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	_, err := client.WritePart(ctx, &WritePartRequest{
 		UploadId:   uploadID,
 		PartNumber: part.Number,
@@ -386,8 +378,7 @@ object PartWriter {
   val WriteDeadlineS: Long = 30
 
   def writePart(stub: StoreGrpc.StoreBlockingStub, uploadId: String, part: Part): Unit = {
-    // TODO: this starter marks each part stored when the store accepts the request, retries the whole
-    // upload when a single part fails, and never checks the checksum the store returns.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val request = WritePartRequest(uploadId = uploadId, partNumber = part.number, data = part.data)
     stub.writePart(request)
     markStored(uploadId, part.number, "")
@@ -454,8 +445,7 @@ object PartWriter {
 constexpr int kWriteDeadlineS = 30;
 
 void WritePart(std::shared_ptr<grpc::Channel> channel, const std::string& uploadId, const Part& part) {
-  // TODO: this starter marks each part stored when the store accepts the request, retries the whole
-  // upload when a single part fails, and never checks the checksum the store returns.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   auto stub = Store::NewStub(channel);
   grpc::ClientContext context;
   WritePartRequest request;
@@ -518,5 +508,5 @@ std::vector<long long> ResumeList(
 `,
     },
   },
-  debrief: `The part writer is where the upload's integrity is actually decided. Marking a part stored when the store *accepted the request* is the subtle defect the interviewer is looking for: the store can accept bytes and compute a different checksum, and the client finds out only at finalize, when the fix costs a full re-upload. The correct order is write, compare the echoed checksum, then mark stored — and on a mismatch, retry that part alone. The deadline turns a stuck store into a bounded failure instead of a hung request. The resume list is the piece the client actually consumes: an ordered list of missing part numbers, not a percentage. Real clients keep the checksum of each part locally, so they can verify the store's echo without re-reading the bytes.`,
+  debrief: `The fix orders the writer as write, compare the echoed checksum, then mark stored, because the property it protects is that "stored" in the manifest means the bytes in the store are the bytes the client sent. The store can accept a request and still compute a different checksum, and discovering that at finalize costs a full re-upload. Retrying the single part keeps the cost of a bad part proportional to that part, and the deadline turns a stuck store into a bounded failure. The resume list is what the client consumes: ordered missing part numbers, not a percentage. Production writers also keep each part's checksum on the client so the echo can be verified without re-reading the bytes, and surface the store's ETag so finalize can cross-check the multipart metadata.`,
 };

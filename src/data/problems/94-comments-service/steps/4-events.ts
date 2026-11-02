@@ -8,37 +8,29 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it serialises the comment,
-produces one event to \`comment.event\` and lets read models rebuild themselves. It compiles, the
-analytics pipeline fills up, and it hides three production flaws. Debug it like the service owner,
-fix it, and prove the fix with the checks below.
+**Starting point.** The starter's \`publish\` serialises \`{id, author_id, body}\`, produces it to
+\`comment.event\` keyed by the author id, flushes, and only then inserts the comment. It compiles, the
+analytics pipeline fills up, and it hides five flaws.
 
-Publish comment lifecycle events to the topic \`comment.event\`.
+**Failure mode the checks target.** One thread's events scatter across partitions and arrive
+interleaved with every other thread the author touches, so a read model can apply an edit before the
+comment it edits exists; a crash between the produce and the insert leaves the topic advertising a
+comment the store never wrote; and the comment text sits in a retained, replicated log that every
+consumer now holds a copy of.
 
 - Every event is **keyed by the thread id** (\`key: comment.thread_id\` /
-  \`Key: []byte(comment.ThreadID)\` / \`ProducerRecord(Topic, comment.thread_id, payload)\`). The key
-  is the ordering contract: one thread's events must land on one partition so a read model never
-  applies an edit before the create it edits.
-- Events are published **after the change commits** at the durable store. Write the comment (or the
-  edit, or the tombstone) first, then produce: an event for a change that does not exist yet is an
-  event a consumer cannot act on.
-- The payload carries identity and revision only — \`id\`, \`parent_id\`, \`revision\`,
-  \`event_type\` — declared as one explicit field list (\`EVENT_FIELDS\`) so a future field cannot
-  be added by accident. **Never the body**: a topic is retained and replicated, and a body in it
-  turns every consumer into another copy of your tenant's content.
+  \`Key: []byte(comment.ThreadID)\` / \`ProducerRecord(Topic, comment.thread_id, payload)\`), so one
+  thread's events land on one partition in order.
+- Events are published **after the change commits** at the durable store: write the comment, the
+  edit or the tombstone first, then produce.
+- The payload carries identity and revision only, \`id\`, \`parent_id\`, \`revision\`,
+  \`event_type\`, declared as one explicit field list (\`EVENT_FIELDS\`) so a future field cannot be
+  added by accident. The body stays out of the topic.
 - All three lifecycle events are published by explicit functions:
   \`publish_created\`, \`publish_edited\`, \`publish_deleted\`, each writing its own
   \`event_type\` (\`created\` / \`edited\` / \`deleted\`) after its own durable write.
 - Edits carry the new **revision**, so a consumer can drop an out-of-order or duplicate edit
-  instead of overwriting newer text with older text.
-
-**Failure mode the checks target.** The starter gets the key, the moment and the payload wrong at
-once. Keying by the **author** scatters one thread's events across partitions, so a thread's stream
-arrives interleaved with every other thread that author touches and a read model can apply an edit
-before the comment it edits exists. It **produces before the insert**, so a crash between the two
-leaves the topic advertising a comment the store never wrote. And it **ships the body** in the event
-"so read models avoid a fetch" — the fetch is exactly what a read model should do, because the body
-is the one field that must not be copied into a retained, replicated, long-lived log.`,
+  instead of overwriting newer text with older text.`,
   sequence: {
     participants: ['Comments API', 'comment.event', 'Read model'],
     messages: [
@@ -84,7 +76,7 @@ is the one field that must not be copied into a retained, replicated, long-lived
       id: 'payload-shape',
       title: 'Carries comment id, parent id and revision',
       detail:
-        'The event is built from one explicit field list (`EVENT_FIELDS`) and carries `id`, `parent_id`, `revision` and `event_type` — ids the read model can fetch with and a revision it can compare.',
+        'The event is built from one explicit field list (`EVENT_FIELDS`) and carries `id`, `parent_id`, `revision` and `event_type`: ids the read model can fetch with and a revision it can compare.',
       match: {
         python: {all: [/EVENT_FIELDS/, /"parent_id": comment\[/, /"revision": comment\[/]},
         typescript: {all: [/EVENT_FIELDS/, /parent_id: comment\.parentId/, /revision: comment\.revision/]},
@@ -95,7 +87,7 @@ is the one field that must not be copied into a retained, replicated, long-lived
     },
     {
       id: 'no-body',
-      title: 'Never puts the body in the event',
+      title: 'Keeps the body out of the event',
       detail:
         'No payload field carries comment text. The starter ships the body into a retained, replicated topic, so every consumer holds a copy of tenant content.',
       match: {
@@ -110,7 +102,7 @@ is the one field that must not be copied into a retained, replicated, long-lived
       id: 'event-types',
       title: 'Publishes created, edited and deleted',
       detail:
-        'Three explicit publishers — `publish_created`, `publish_edited`, `publish_deleted` — each with its own `event_type`, so a delete is a tombstone event rather than silence.',
+        'Three explicit publishers, `publish_created`, `publish_edited` and `publish_deleted`, each with its own `event_type`, so a delete is a tombstone event rather than silence.',
       match: {
         python: {all: [/def publish_created\(/, /def publish_edited\(/, /def publish_deleted\(/]},
         typescript: {all: [/export async function publishCreated\(/, /publishEdited\(/, /publishDeleted\(/]},
@@ -139,8 +131,7 @@ store = CommentStore()
 
 
 def publish(comment: dict) -> None:
-    # TODO: this starter keys by the author, publishes before the comment commits, and ships the body
-    # so read models avoid a fetch. Fix all three.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     payload = json.dumps(
         {"id": comment["id"], "author_id": comment["author_id"], "body": comment["body"]}
     ).encode()
@@ -227,8 +218,7 @@ interface Comment {
 }
 
 export async function publish(comment: Comment): Promise<void> {
-  // TODO: this starter keys by the author, publishes before the comment commits, and ships the body
-  // so read models avoid a fetch. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   await producer.send({
     topic: 'comment.event',
     messages: [{key: comment.author_id, value: JSON.stringify({id: comment.id, body: comment.text})}],
@@ -323,8 +313,7 @@ func (s *CommentStore) Insert(ctx context.Context, comment *Comment) error { ret
 
 var store = &CommentStore{}
 
-// TODO: this starter keys by the author, publishes before the comment commits, and ships the text so
-// read models avoid a fetch. Fix all three.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func publish(ctx context.Context, comment *Comment) error {
 	payload, _ := json.Marshal(map[string]any{"id": comment.ID, "body": comment.Text})
 	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(comment.AuthorID), Value: payload}); err != nil {
@@ -416,8 +405,7 @@ object CommentEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val store = CommentStore.open()
 
-  // TODO: this starter keys by the author, publishes before the comment commits, and ships the text
-  // so read models avoid a fetch. Fix all three.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def publish(comment: Comment): Unit = {
     val payload = Map("id" -> comment.id, "body" -> comment.text).toJson.compactPrint
     producer.send(new ProducerRecord("comment.event", comment.authorId, payload))
@@ -499,8 +487,7 @@ struct Comment {
 CommentStore store;
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this starter keys by the author, publishes before the comment commits, and ships the text so
-// read models avoid a fetch. Fix all three.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 void publish(const Comment& comment) {
   const json event = {{"id", comment.id}, {"body", comment.text}};
   const auto payload = event.dump();
@@ -590,9 +577,9 @@ void publishDeleted(const Comment& comment) {
     },
   },
   hints: [
-    'The key is a routing decision, not metadata: Kafka maps the key to a partition, so `key = thread_id` puts one thread’s stream on one partition and in order. Keying by the author mixes every thread that author writes in and a read model can apply an edit before the create it edits.',
-    'Order the statements, not just the calls: write to the store, then `producer.send(...)`. An event published first is a promise about a row that a crash can take away, and a consumer will fail on a comment that does not exist.',
-    'Build the payload from one explicit list of fields (`EVENT_FIELDS`) — `id`, `parent_id`, `revision`, `event_type` — and add an assertion that the keys still match. The body has no place in a retained, replicated topic: consumers fetch by id when they need the text, which keeps content in the store that owns its retention.',
+    'A read model shows an edit to a comment it has not created yet; after a crash, consumers ask the store for an id that was never inserted; a data export of the topic contains every comment body.',
+    'Kafka maps the key to a partition, and `author_id` spreads one thread over many. `producer.send` runs before `store.insert`, and the payload is an ad-hoc dict with `body` in it.',
+    'Key with `comment["thread_id"]`, move `producer.send` after `store.insert`, build the payload from `EVENT_FIELDS` (`id`, `parent_id`, `revision`, `event_type`), and split into `publish_created`, `publish_edited`, `publish_deleted`.',
   ],
-  debrief: `The interviewer is asking what an event stream is for. It is not a copy of the database: it is the ordered log of what happened, so consumers can rebuild derived views. Three properties follow. The key decides order — by thread, because a thread is the unit whose order matters. The publish moment decides truth — after the commit, because a consumer that follows a failed write will ask for a comment that does not exist. And the payload decides exposure — ids and revisions only, because a topic is retained, replicated and read by teams who never needed your tenant’s text. The revision field is what makes the stream idempotent in practice: a consumer comparing revisions can drop duplicates and out-of-order edits instead of trusting arrival order. Real platforms add a schema registry, an outbox row so a produce failure is retried rather than lost, and a tombstone retention policy for delete events.`,
+  debrief: `The fix follows from what an event stream is for: not a copy of the database but the ordered log of what happened, so consumers can rebuild derived views. The key decides order, so it is the thread, the unit whose order matters. The publish moment decides truth, so it comes after the commit, because a consumer that follows a failed write asks for a comment that does not exist. The payload decides exposure, so it is ids and revisions only, because a topic is retained, replicated and read by teams who have no business with a tenant's text. The revision field is what makes the stream idempotent in practice: a consumer comparing revisions drops duplicates and out-of-order edits instead of trusting arrival order. Production platforms add a schema registry, an outbox row so a failed produce is retried rather than lost, and a retention policy for tombstone events.`,
 };

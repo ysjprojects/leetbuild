@@ -8,37 +8,29 @@ export const endpointStep: Step = {
   focus: ['client', 'recsvc', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route,
-decodes the body and answers \`200\` with a ranked list. It compiles, it serves the demo, and it
-lets the caller pick whose recommendations come back. Debug it like the service owner, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/recommendations\` with body
+\`{"surface": "home", "candidate_ids": ["…"]}\`, reads the tenant from \`X-Tenant-Id\`, picks the
+user from the body when one is present, ranks every candidate and answers \`200\` with the full
+ranked list. It compiles, it serves the demo, and it hides four flaws.
 
-Implement \`POST /v1/recommendations\` with body
-\`{"surface": "home", "candidate_ids": ["…"]}\`.
+**Failure mode the checks target.** A personalized list fetched for the wrong person, a candidate
+list large enough to stall the ranking pool, a response that grows with the request, and two
+releases whose output cannot be told apart in the numbers the release gate reads.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header and the user from \`X-User-Id\`; a
-  missing header is **401**. \`user_id\` is not a request field: a body that carries one is ignored,
-  never preferred, because the personalized list belongs to the caller and to nobody else.
-- \`surface\` is a required non-empty name and must exist in the catalog, so an unknown surface is
-  **404** before the ranker is called — a surface nobody configured would rank with the wrong
-  version and the wrong fallback anyway.
+  missing header is **401**. \`user_id\` is not a request field: the personalized list belongs to
+  the caller and to nobody else.
+- \`surface\` is a required non-empty name and must exist in the catalog; an unknown surface is
+  **404** before the ranker is called.
 - \`candidate_ids\` is required and bounded by \`MAX_CANDIDATES = 500\`; an empty or oversized list is
-  **400**. The starter caps nothing, so one request can hand the ranking pool a list big enough to
-  stall it.
-- The response holds at most \`MAX_ITEMS = 30\` items — the top of the order, trimmed after ranking —
+  **400**.
+- The response holds at most \`MAX_ITEMS = 30\` items, the top of the order trimmed after ranking,
   and each item carries its \`id\`, its \`score\` and its zero-based \`position\`.
-- The response carries \`model_version\`: the ranking model version that produced this order, read
-  from the ranking result. Without it an A/B read of the list cannot attribute the ranking.
+- The response carries \`model_version\`, read from the ranking result, so an A/B read can attribute
+  the order to the model that produced it.
 - Validate everything before the ranker is called: headers, body shape, surface, candidate list,
-  catalog. A rejected request never reaches the ranking pool.
-- Log the decision with tenant, user, surface and counts — not the candidate array.
-
-**Failure mode the checks target.** The starter resolves the user from the body, so any caller can ask
-for another user's personalized list and the mistake stays invisible until someone reads the
-impressions; it accepts an unbounded candidate list, so one request can stall ranking for everyone
-behind it; it returns as many items as the ranker produced, so a demo list becomes a 500-item
-payload; and it never says which model version ranked, so two releases are indistinguishable in the
-numbers the release gate reads.`,
+  catalog. A rejected request does not reach the ranking pool.
+- Log the decision with tenant, user, surface and counts, not the candidate array.`,
   sequence: {
     participants: ['Client', 'Recommendation API', 'surface catalog', 'Ranking model'],
     messages: [
@@ -165,8 +157,7 @@ def recommend(
     tenant: str = Header(alias="X-Tenant-Id"),
     header_user: str | None = Header(default=None, alias="X-User-Id"),
 ) -> JSONResponse:
-    # TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
-    # and never says which model produced the order. Fix all three before it ships.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     user_id = body.user_id or header_user or tenant
     items = ranker.rank(tenant, user_id, body.surface, body.candidate_ids)
     return JSONResponse({"items": items}, status_code=200)
@@ -259,7 +250,7 @@ def recommend(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/recommendations: flawed code that trusts whatever the caller sends. */
+      starter: `/** POST /v1/recommendations: the starter. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -289,8 +280,7 @@ async function rank(
 }
 
 app.post('/v1/recommendations', async (request, reply) => {
-  // TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
-  // and never says which model produced the order. Fix all three before it ships.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const headerUser = request.headers['x-user-id'] as string | undefined;
   const body = request.body as RecommendBody;
@@ -436,8 +426,7 @@ func recommend(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
-	// and never says which model produced the order. Fix all three before it ships.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	userID := r.Header.Get("X-User-Id")
 	if body.UserID != "" {
 		userID = body.UserID
@@ -601,8 +590,7 @@ object RecApi {
       post {
         optionalHeaderValueByName("X-User-Id") { headerUser =>
           entity(as[RecommendRequest]) { body =>
-            // TODO: this starter lets the body pick the user, caps neither the candidate list nor the
-            // result, and never says which model produced the order. Fix all three before it ships.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val userId = body.user_id.getOrElse(headerUser.getOrElse(""))
             complete(StatusCodes.OK, RankingBody(rank("", userId, body.surface, body.candidate_ids)))
           }
@@ -714,8 +702,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
-    // and never says which model produced the order. Fix all three before it ships.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     auto userId = body.value("user_id", std::string());
     if (userId.empty()) userId = headerUser;
     const auto items = rank(tenant, userId, body.value("surface", std::string()),
@@ -828,9 +815,11 @@ int main() {
     },
   },
   hints: [
-    'Write the guard clauses first, cheapest rejection first: `X-Tenant-Id`, then `X-User-Id`, then the body shape, the surface, the candidate cap and the catalog lookup. Each one returns before the ranker is called, so a rejected request never occupies the ranking pool.',
-    'Identity is the whole point of this endpoint: the user is `X-User-Id` and nothing else. Do not "prefer the header over the body" — drop `user_id` from the request model entirely, so a body that carries one cannot reach the ranking call even by accident.',
-    'Trim on the way out, not before ranking: rank all accepted candidates, then `items[:MAX_ITEMS]` (or the language equivalent) and number what remains. Stamp `model_version` from the ranking result into the same response — the trimmed order plus its version is the record the A/B read compares.',
+    'A support ticket: a user saw a list that was clearly built for someone else, and a load spike traced back to one request with thousands of candidate ids. The release gate also cannot tell which model ranked.',
+    'The handler fills the user from the body before falling back to the header, passes the candidate list through unmeasured, and returns the ranker output as-is, so the response and the ranking cost scale with the caller.',
+    'Drop `user_id` from the request model and require `X-User-Id` (401 if absent); reject lists outside 1..`MAX_CANDIDATES` with 400; rank, then slice to `MAX_ITEMS`, number positions and copy `result.model_version` into the response.',
   ],
-  debrief: `The interviewer is testing the intake boundary of a personalization service, where the caller is untrusted and the expensive thing is one call away. The starter reads fine because the demo always posts the caller's own id and a short candidate list. Four defects are being checked: identity (the user comes from the authenticated \`X-User-Id\` header, and a body \`user_id\` is not a weaker source but no source at all), intake caps (an unbounded candidate list lets one request stall the ranking pool for everyone behind it), output caps (the product contract is at most 30 items, and truncating after ranking keeps the top of the order instead of the first 30 candidates), and attribution (\`model_version\` in the response is what makes two releases comparable offline). Real services add candidate dedupe before ranking, per-tenant surface grants, a request-level deadline shared with the ranker (step 3), and surfacing the caps through the surface config (step 5) instead of hardcoding them — but the guard order at the edge is the part that never moves.`,
+  debrief: `The fix is a chain of guard clauses that run before the ranker is called, ordered cheapest first: headers, body shape, surface, candidate cap, catalog. The user comes from the authenticated header because a body field is not a weaker source but no source at all. The output cap is applied after ranking because trimming before it would keep the first 30 candidates instead of the best 30. \`model_version\` sits in the response because it is the only thing that makes two releases comparable offline.
+
+Production rankers go further: candidates are deduped before ranking, the caps come from the surface config (step 5) instead of constants, the request deadline is shared with the ranking call (step 3), and per-tenant surface grants decide which surfaces a tenant may even ask for.`,
 };

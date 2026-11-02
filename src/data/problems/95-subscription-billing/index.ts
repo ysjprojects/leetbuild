@@ -9,16 +9,16 @@ import {invoiceLedgerStep} from './steps/5-read';
 /**
  * Subscription billing: the course is not "charge a customer every month", it is the debugging you
  * owe a billing path before it moves real money. A validated plan change prorated over the actual
- * days of the period → one atomic Redis run marker per (subscription, period) claimed before the
- * charge and confirmed after → a processor call with a deadline, an invoice-scoped idempotency key
- * and reconciliation instead of blind retries → invoice events keyed by subscription published
- * after confirmation, failures included, with an outbox → a ledger read that ties out against the
- * processor and never shows another tenant's invoices.
+ * days of the period; one atomic Redis run marker per (subscription, period) claimed before the
+ * charge and confirmed after; a processor call with a deadline, an invoice-scoped idempotency key
+ * and reconciliation instead of blind retries; invoice events keyed by subscription published
+ * after confirmation, failures included, with an outbox; a ledger read that ties out against the
+ * processor and keeps other tenants' invoices out of the response.
  */
 export const subscriptionBillingProblem: Problem = {
   id: 'subscription-billing',
   title: 'Subscription Billing',
-  tagline: 'Plans and invoices that prorate correctly, charge once and reconcile.',
+  tagline: 'Plan changes prorated over real days, with a billing run that charges each period once.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
@@ -33,23 +33,21 @@ a charge, the ordering of the events it publishes, and whether a ledger can be r
 
 ## The real system
 
-Production billing systems treat a plan change as an interval problem, not a monthly one. A period is
-whatever its two timestamps say — 28, 30 or 31 days — and a change splits that period into an old-plan
-sliver and a new-plan sliver whose day counts sum to the period exactly, so the day of the switch is
-charged once, by one plan, at one rate. An effective date that is neither now nor the next period
-boundary is rejected, because a proration the platform cannot compute is a proration it must not
-guess. The billing run itself is idempotent per (subscription, period): it claims a marker in Redis
-atomically *before* it charges and confirms it with the charge reference *after*, so a crash in
-between leaves evidence a retry can reconcile instead of a customer who is charged twice. Once a
-period is closed, it refuses further charges unless an explicit adjustment action says otherwise —
-markers that expire with the month cannot tell a closed period from a new one. The processor call
-carries a deadline and the invoice id as its idempotency key, a timeout is followed by reading the
-processor's invoice state rather than by a fresh charge, and a hard decline is terminal: bounced
-cards do not become healthy because you tried four times. Every invoice, charged or failed, is
-published keyed by subscription so a subscription's history stays ordered, and events are published
-only after the processor confirms, with an outbox row when the broker refuses. The read side is a
-ledger: amounts come from stored invoices, credits are always shown as their own lines, the totals tie
-out against the processor's records for the same period, and another tenant's subscription is a 404.
+Stripe Billing treats a plan change as an interval problem. When a subscription's price changes
+mid-period, it uses the current billing period's start and end times to credit the unused time on
+the old price and debit the remaining time on the new price, prorating down to the second by
+default, and the \`proration_behavior\` parameter decides whether those items are created at all.
+A billing run in a system like that is idempotent per (subscription, period): it claims a marker
+atomically before it charges and confirms it with the charge reference after, so a crash in between
+leaves evidence a retry can reconcile rather than a customer who is charged twice. A closed period
+refuses further charges unless an explicit adjustment says otherwise, because a marker that expires
+with the month cannot tell a closed period from a new one. The processor call carries a deadline and
+the invoice id as its idempotency key, a timeout is followed by reading the processor's invoice state
+rather than by a fresh charge, and a hard decline is terminal. Every invoice, charged or failed, is
+published keyed by subscription so a subscription's history stays ordered, only after the processor
+confirms, with an outbox row when the broker refuses. The read side is a ledger: amounts come from
+stored invoices, credits are shown as their own lines, totals tie out against the processor's records
+for the same period, and another tenant's subscription is a 404.
 
 ## What you build here
 
@@ -57,7 +55,7 @@ One service, **billingd**, with five pieces:
 
 1. \`POST /v1/subscriptions\`: an authenticated tenant, a plan change carrying the new plan, an
    effective date that is \`now\` or the next period boundary, and a proration policy the platform
-   implements — with an invoice schedule prorated over the **actual** days of the period and a switch
+   implements, with an invoice schedule prorated over the **actual** days of the period and a switch
    day charged exactly once.
 2. A **Redis** billing run for each (subscription, period): a generation marker claimed atomically
    with \`SET NX\` before the charge, confirmed with the invoice reference after it, a closed period
@@ -78,7 +76,7 @@ One service, **billingd**, with five pieces:
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
 it looks right. Your job in every step is the job you will have on a real billing path: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+against the failure modes, find the subtle one, fix it, optimize what is wasteful, and prove the fix
 with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose

@@ -8,36 +8,31 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code: it returns "the next 20
-comments", it is one query, and it works perfectly until the thread is busy. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/threads/{thread_id}/comments\`, reads an integer
+\`offset\`, runs one \`store.page(thread_id, offset, PAGE_SIZE)\` query, returns the rows as they are
+and \`next_offset = offset + PAGE_SIZE\`. It compiles, works perfectly on a quiet thread, and hides
+four flaws.
 
-Implement \`GET /v1/threads/{id}/comments\` — top-level comments of a thread, one page at a time.
+**Failure mode the checks target.** Post three comments while a reader is on page 2 and everything
+shifts: one comment is skipped and another served again, the bug users describe as "the thread showed
+the same comment twice". A deleted reply keeps rendering with its text intact, and the UI has to guess
+how many comments a thread has.
 
 - Pagination is a **cursor** on \`(created_at, comment id)\`: \`encode_cursor\` turns the last row
   of the page into an opaque token, \`decode_cursor\` turns a token back into the position to resume
-  after (the epoch and an empty id for the first page). Offset is never used: \`OFFSET\` re-counts
-  rows every request, so an insert or delete above the window shifts it.
+  after (the epoch and an empty id for the first page). \`OFFSET\` re-counts rows every request, so
+  an insert or delete above the window shifts it.
 - The query is a **keyset** predicate, not a count:
   \`... WHERE thread_id = $1 AND parent_id IS NULL AND (created_at, id) > ($2, $3)
   ORDER BY created_at, id LIMIT $4\`. \`next_cursor\` is set only when the page came back full, so
   the last page terminates instead of looping.
 - The page carries the **thread's comment count** from the same Redis counter the write path keeps
   (\`thread:{tenant}:{thread_id}:count\`) and each item's **reply count** from the per-comment
-  counters (\`thread:{tenant}:{thread_id}:replies:{comment_id}\`), so the numbers the UI shows are
-  the numbers the write path committed.
+  counters (\`thread:{tenant}:{thread_id}:replies:{comment_id}\`).
 - Deleted comments stay in the page as **tombstones**: identity, parent and reply count, and
   \`deleted: true\`, with **no text**. Dropping the row would break the reply tree; returning its
   text would resurrect content the author deleted.
-- The first page is what a new reader sees, and the same comment must never appear twice across a
-  page walk, whatever is written while they read.
-
-**Failure mode the checks target.** The starter paginates by **offset**, which is not a position but a
-count: post three comments while the reader is on page 2 and everything shifts, so one comment is
-skipped entirely and another is served again — the bug users describe as "the thread showed the same
-comment twice". It also returns **deleted comments with their text intact**, so a deleted reply keeps
-rendering, and it reports no counts at all, leaving the UI to guess how many comments a thread has
-instead of reading the counter the write path keeps.`,
+- The same comment must not appear twice across a page walk, whatever is written while they read.`,
   sequence: {
     participants: ['Client', 'Comments API', 'comment store', 'Redis'],
     messages: [
@@ -98,7 +93,7 @@ instead of reading the counter the write path keeps.`,
       id: 'tombstone',
       title: 'Returns deleted comments as tombstones without text',
       detail:
-        'A deleted row serialises to identity, parent, reply count and `deleted: true` — the text is never included. The starter returns deleted comments with their bodies intact.',
+        'A deleted row serialises to identity, parent, reply count and `deleted: true`, with no text field. The starter returns deleted comments with their bodies intact.',
       match: {
         python: {all: [/def serialize_comment\(/, /if row\["deleted"\]/, /"deleted": True/]},
         typescript: {all: [/function serializeComment\(/, /if \(row\.deleted\)/, /deleted: true/]},
@@ -148,9 +143,7 @@ def list_comments(
     tenant: str = Header(default="", alias="X-Tenant-Id"),
     offset: int = Query(default=0),
 ) -> JSONResponse:
-    # TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
-    # window: one comment is skipped and another is shown twice. It also returns deleted comments
-    # with their text and reports no counters at all. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     rows = store.page(thread_id, offset, PAGE_SIZE)
     return JSONResponse({"comments": [serialize_comment(row) for row in rows], "next_offset": offset + PAGE_SIZE})
 
@@ -272,9 +265,7 @@ interface CommentRow {
 }
 
 app.get('/v1/threads/:id/comments', async (request, reply) => {
-  // TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
-  // window: one comment is skipped and another is shown twice. It also returns deleted comments
-  // with their text and reports no counters at all. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {id} = request.params as {id: string};
   const offset = Number((request.query as {offset?: string}).offset ?? 0);
   const rows = await store.page(id, offset, PAGE_SIZE);
@@ -394,9 +385,7 @@ func (s *CommentStore) Page(ctx context.Context, threadID string, offset, limit 
 var store = &CommentStore{}
 
 func listComments(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
-	// window: one comment is skipped and another is shown twice. It also returns deleted comments
-	// with their text and reports no counters at all. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	threadID := r.PathValue("id")
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	rows := store.Page(r.Context(), threadID, offset, pageSize)
@@ -540,9 +529,7 @@ object CommentRead {
   val PageSize = 20
   val store = CommentStore.open()
 
-  // TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
-  // window: one comment is skipped and another is shown twice. It also returns deleted comments
-  // with their text and reports no counters at all. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   def list(threadId: String, offset: Long): String = {
     val rows = store.page(threadId, offset, PageSize)
     s"""{"comments":\${rows.map(_.toJson.compactPrint).mkString("[", ",", "]")},"next_offset":\${offset + PageSize}}"""
@@ -659,9 +646,7 @@ using json = nlohmann::json;
 
 constexpr int kPageSize = 20;
 
-// TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
-// window: one comment is skipped and another is shown twice. It also returns deleted comments with
-// their text and reports no counters at all. Fix all three.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 void listComments(CommentStore& store, const httplib::Request& req, httplib::Response& res) {
   const auto threadId = req.matches[1];
   const int offset = req.has_param("offset") ? std::stoi(req.get_param_value("offset")) : 0;
@@ -791,9 +776,9 @@ int main() {
     },
   },
   hints: [
-    'A cursor is a position, not a count: encode `(created_at, id)` of the last row, decode it into the `WHERE (created_at, id) > ($2, $3)` predicate, and order by the same pair. `OFFSET` re-counts rows on every request, so any insert above the window moves what "20" means.',
-    'Reply counts and the thread total are not page arithmetic. Read `thread:{tenant}:{thread_id}:count` and `thread:{tenant}:{thread_id}:replies:{comment_id}` from Redis — the same keys the write path commits with — so the numbers the UI shows cannot drift from the counters the service keeps.',
-    'Deleted comments must not vanish from a page: a missing row breaks the reply tree, and its text is content the author retracted. Serialise a tombstone — id, parent, reply count, `deleted: true` — and prove the walk never repeats a comment while new ones land.',
+    'On a busy thread the reader sees one comment twice and misses another; a reply the author deleted still shows its text; the "N comments" badge and the page disagree.',
+    '`offset` is a count of rows, and rows move as people post. `serialize_comment` returns the row untouched, deleted or not, and nothing reads the counters the write path committed.',
+    'Add `encode_cursor`/`decode_cursor` on `(created_at, id)`, query `WHERE (created_at, id) > ($2, $3) ... LIMIT $4`, serialise deleted rows as `deleted: True` without text, and read `thread_count`/`reply_counts` from `counters.get`.',
   ],
-  debrief: `The interviewer is asking whether you can keep a promise across a page walk. Offset pagination has no way to do it: the offset is a count of rows, and rows move, so a busy thread serves one comment twice and skips another — exactly the bug users report. A keyset cursor is stable because it names a position, and it also gives the database an index range scan instead of a sort-and-skip. The two other contracts belong to the read path because that is where they are visible: a deleted comment has to stay in the tree as a tombstone without its text, and the totals the UI shows have to come from the counters the write path committed, or the page and the badge will disagree forever. Real services add a stable secondary sort for ties, a snapshot revision so a long scroll is self-consistent, and precomputed reply counts for the first page of a popular thread.`,
+  debrief: `The fix is a keyset cursor because the read path has to keep a promise across a page walk, and offset pagination cannot: an offset is a count of rows, rows move, so a busy thread serves one comment twice and skips another. A cursor names a position, and as a bonus it turns the query into an index range scan instead of a sort-and-skip. The two other contracts belong to the read path because that is where they are visible: a deleted comment stays in the tree as a tombstone without its text, and the totals the UI shows come from the counters the write path committed, or the page and the badge disagree for good. Production services add a snapshot revision so a long scroll is self-consistent and precomputed reply counts for the first page of a popular thread.`,
 };

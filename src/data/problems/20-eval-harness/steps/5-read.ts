@@ -8,30 +8,30 @@ export const readStep: Step = {
   focus: ['client', 'harness', 'redis'],
   task: `## Task
 
-The starter is working code: a run report comes back and the demo shows a
-green badge. It authorizes nothing, it rewards a handful of samples, and it serves a stale copy.
-Find the flaws, fix them, and prove the fix.
+**Starting point.** The starter implements \`GET /v1/evals/runs/{id}\`, the endpoint the release
+pipeline reads before it ships: it returns a cached report under \`report:{id}\` when one exists,
+otherwise reads the counters from \`evals:run:{id}\`, computes the pass rate, compares it with a
+\`threshold\` query parameter defaulting to 0.9, labels the run \`passed\` or \`failed\`, and caches
+the body for 60 s. It compiles, serves the demo and hides 5 flaws.
 
-Implement \`GET /v1/evals/runs/{id}\`, the endpoint the release pipeline reads before it ships:
+**Failure mode the checks target.** The report is the artifact a release decision is made from,
+so every flaw here is a release bug: any tenant can read any run, a run is declared green on twelve
+samples, the caller chooses the bar its own release must clear, and a report cached early in the
+run hides the failures of the last batch from the person clicking ship.
 
-- The run is looked up for the **authenticated tenant**; a run that belongs to another tenant, or
-  does not exist, answers **404**. The starter serves any run id it is handed.
-- A run is only judged once it has at least **200 scored samples** (\`MIN_SCORED_SAMPLES\`); below
-  that the report is **\`pending\`**. Twelve samples out of five hundred cannot pass a release.
+Requirements:
+
+- The run is looked up for the **authenticated tenant** (\`assert_tenant_owns\`); a run that
+  belongs to another tenant, or does not exist, answers **404**.
+- A run is judged only once it has at least **200 scored samples** (\`MIN_SCORED_SAMPLES\`); below
+  that the status is **\`pending\`**, with the floor and the current count in the body.
 - Above the floor the run **passes** only when the pass rate clears \`RELEASE_THRESHOLD\` **and**
-  beats the previous release's pass rate by more than nothing: a version that merely ties the
-  incumbent has not earned a rollout. Otherwise it is **\`failed\`**.
-- The threshold comes from **server config** (\`RELEASE_THRESHOLD\`). A \`threshold\` in the query
-  string is ignored — the caller does not get to choose the bar its own release must clear.
+  beats the previous release's pass rate; a version that merely ties the incumbent has not earned
+  a rollout. Otherwise it is **\`failed\`**.
+- The threshold comes from **server config** (\`RELEASE_THRESHOLD\`); a \`threshold\` in the query
+  string is ignored.
 - The cache key includes the **scored count**: \`report:{tenant}:{run_id}:{scored}\`, so the report
-  changes the moment the last sample lands instead of for the rest of the TTL. The starter caches per
-  run and serves the copy taken when the run was at 12 samples.
-
-**Failure mode the checks target.** The report is the artifact a release decision is made from, so
-all three flaws are release bugs rather than display bugs: a caller who can lower the bar, a run
-declared green on a sample it never scored, and a cached report that hides the failures of the last
-batch. The subtle one is the cache key — it looks like a performance detail and is actually the
-reason the last failures never reach the person clicking ship.`,
+  changes the moment the last sample lands instead of at the end of the TTL.`,
   sequence: {
     participants: ['Client', 'Eval Harness', 'Redis'],
     messages: [
@@ -51,9 +51,9 @@ reason the last failures never reach the person clicking ship.`,
     ],
   },
   hints: [
-    'Authorize the read like the write: fetch the run record under the authenticated tenant first and answer `404` for anything else, so a foreign run id is indistinguishable from a missing one.',
-    'Compare the counters with the floor before you compare the rate: below `MIN_SCORED_SAMPLES` the only honest answer is `pending`, and the body should carry the floor and the current `scored` so the caller knows how far along the run is.',
-    'Put the scored count in the cache key: `report:{tenant}:{run_id}:{scored}` is a different key the moment a sample lands, so the read after the last batch misses the stale entry. Ignore any `threshold` the caller passes — the constant in the config is what the pipeline was told to trust.',
+    'Symptom: a release shipped on a run that read `passed` at 12 of 500 samples, and a minute later the same URL still showed that report while the counters said 480 scored and 60 failed.',
+    'Mechanism: the status is computed from whatever `scored` happens to be, `threshold` is a query parameter the caller sets, the cache key is the run id alone, and no tenant check runs before the read.',
+    'Fix: `assert_tenant_owns(tenant, id)` else 404; read `latest_scored`; return `pending` below `MIN_SCORED_SAMPLES`; compare with `RELEASE_THRESHOLD`; cache under `report:{tenant}:{id}:{latest_scored}`; drop the `threshold` parameter.',
   ],
   checks: [
     {
@@ -140,9 +140,7 @@ class Report(BaseModel):
 
 @app.get("/v1/evals/runs/{id}")
 def read_run(id: str, tenant: str = Header(alias="X-Tenant-Id"), threshold: float = 0.9) -> dict:
-    # TODO: ignore the caller-supplied threshold, require a minimum number of scored samples before
-    # any verdict, authorize the run against the tenant, and key the cache on the scored count so
-    # the report is current.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     cached = r.get(f"report:{id}")
     if cached is not None:
         return json.loads(cached)
@@ -245,9 +243,7 @@ interface Report {
 
 app.get('/v1/evals/runs/:id', async (request, reply) => {
   const {id} = request.params as {id: string};
-  // TODO: ignore the caller-supplied threshold, require a minimum number of scored samples before
-  // any verdict, authorize the run against the tenant, and key the cache on the scored count so the
-  // report is current.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const query = request.query as {threshold?: string};
   const threshold = Number(query.threshold ?? 0.9);
   const cached = await r.get(\`report:\${id}\`);
@@ -365,9 +361,7 @@ var rdb *redis.Client
 func readRun(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	id := r.PathValue("id")
-	// TODO: ignore the caller-supplied threshold, require a minimum number of scored samples before
-	// any verdict, authorize the run against the tenant, and key the cache on the scored count so
-	// the report is current.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	threshold, _ := strconv.ParseFloat(r.URL.Query().Get("threshold"), 64)
 	if cached, err := rdb.Get(ctx, "report:"+id).Result(); err == nil {
 		rw.Header().Set("Content-Type", "application/json")
@@ -509,9 +503,7 @@ object ReportApi {
     path("v1" / "evals" / "runs" / Segment) { id =>
       get {
         parameter("threshold".?) { thresholdOpt =>
-          // TODO: ignore the caller-supplied threshold, require a minimum number of scored samples
-          // before any verdict, authorize the run against the tenant, and key the cache on the
-          // scored count so the report is current.
+          // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
           val threshold = thresholdOpt.map(_.toDouble).getOrElse(0.9)
           complete {
             Option(r.get(s"report:$id")) match {
@@ -626,9 +618,7 @@ int main() {
 
   svr.Get("/v1/evals/runs/:id", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto id = req.path_params.at("id");
-    // TODO: ignore the caller-supplied threshold, require a minimum number of scored samples before
-    // any verdict, authorize the run against the tenant, and key the cache on the scored count so
-    // the report is current.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     const double threshold = req.has_param("threshold") ? std::stod(req.get_param_value("threshold")) : 0.9;
     if (auto cached = redis.get("report:" + id)) {
       res.status = 200;
@@ -731,5 +721,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question is what makes a report trustworthy: the gate, the scope and the freshness. The gate needs a floor, because a pass rate over twelve samples is noise with a decimal point, and it needs to beat the incumbent rather than tie it, because a rollout that changes nothing is a cost with a risk. The scope needs the tenant, or one team reads another team’s release record. The freshness needs the scored count in the cache key: it looks like a cache detail and it is the difference between shipping on the last batch and shipping on the batch before it. And the threshold must come from config the pipeline trusts, not from the query string of whoever is clicking ship. Real harnesses add per-slice gates (a run can pass overall and fail on one language), a confidence bound instead of a bare rate, and a signed report the pipeline can verify after the fact.`,
+  debrief: `The fix puts the three things a release reads under the server's control rather than the caller's: the scope comes from the tenant on the request, the bar comes from config, and the floor is a named constant, because a pass rate over twelve samples is noise with a decimal point. The cache key carrying the scored count looks like a performance detail and is the difference between shipping on the last batch and shipping on the batch before it: a new key the moment a sample lands means the stale copy is simply not found. Production harnesses gate per slice as well, since a run can pass overall and fail on one language, and replace the bare rate with a confidence bound so a run that barely clears the threshold on 200 samples is treated as the coin flip it is.`,
 };

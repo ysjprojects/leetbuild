@@ -8,31 +8,26 @@ export const eventsStep: Step = {
   focus: ['kafka', 'api'],
   task: `## Task
 
-**Starting point.** The starter is working code for the event publisher: it produces a lifecycle
-event when a job changes. It compiles, the happy path shows an event, and it leaks the training
-recipe and a slice of the loss curve into a topic that is retained and replicated. Debug it like
-the data owner, fix it, and prove the fix with the checks below.
-
-Publish lifecycle events to the topic \`finetune.job\`.
-
-- **Key by job id.** Every event carries \`key = job_id\`, so all events for one job land on one
-  partition and stay in order. The starter keys by team.
-- **Reference, not a copy.** The payload carries the \`config_hash\`, the \`dataset_version\`, the
-  \`checkpoint_ids\` and the \`status\` — enough to find the job, never enough to reproduce the data
-  from the topic.
-- **Never the recipe or the logs.** The hyperparameter block and any sample of the loss log stay in
-  the datastore; a topic is retained, replicated and often mirrored, so it is the wrong place for
-  either.
-- **Publish after commit.** The job record is committed **before** the produce, so an event can never
-  announce a state that is not durable. The starter acknowledges the produce first.
-- **Idempotent producer.** The producer is configured idempotent with \`acks=all\`, so a retried
-  produce does not duplicate an event.
+**Starting point.** The starter is the event publisher: \`publish\` builds a payload with the
+event name, job id, team, the full hyperparameter block and the first five loss-log entries and
+produces it to \`finetune.job\` keyed by team through a producer built from defaults, without
+committing the job record at all. The happy path shows an event in the topic, and it hides five flaws.
 
 **Failure mode the checks target.** Keying by team interleaves jobs on one partition, so a consumer
 rebuilding one job's history reads another job's events between them. Copying the hyperparameter
-block into the topic turns a retained log into a second, unmanaged copy of the recipe — and the loss
-sample ships model internals nobody meant to retain. The ordering flaw is the quiet one: producing
-before the commit means a consumer can act on a transition that the datastore later rolls back.`,
+block and a loss sample into a retained, replicated topic creates a second, unmanaged copy of the
+recipe. Producing before the commit announces a transition the datastore may roll back, and a
+default producer can duplicate an event on retry.
+
+- **Key by job id.** Every event carries \`key = job_id\`, so one job's events stay on one
+  partition, in order.
+- **Reference, not a copy.** The payload carries \`config_hash\`, \`dataset_version\`,
+  \`checkpoint_ids\` and \`status\`: enough to find the job, not enough to reproduce it.
+- **No recipe, no logs.** The hyperparameter block and any slice of the loss log stay in the
+  datastore.
+- **Publish after commit.** The job record commits before the produce.
+- **Idempotent producer.** Configured idempotent with \`acks=all\`, so a retried produce does not
+  duplicate an event.`,
   sequence: {
     participants: ['Orchestrator', 'Kafka', 'Events consumer'],
     messages: [
@@ -133,8 +128,7 @@ class EventPublisher:
         self._jobs = jobs
 
     def publish(self, job: dict, event: str, checkpoint_ids: list[str]) -> None:
-        # TODO: key by job id, send only the config hash, dataset version and checkpoint ids, and
-        # produce after the job record commits instead of before it.
+        # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         payload = {
             "event": event,
             "job_id": job["id"],
@@ -207,8 +201,7 @@ export class EventPublisher {
   }
 
   async publish(job: Job, event: string, checkpointIds: string[]): Promise<void> {
-    // TODO: key by job id, send only the config hash, dataset version and checkpoint ids, and
-    // produce after the job record commits instead of before it.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     await this.producer.send({
       topic: 'finetune.job',
       messages: [
@@ -286,8 +279,7 @@ func NewPublisher(bootstrap string, jobs *JobStore) *Publisher {
 }
 
 func (p *Publisher) Publish(ctx context.Context, job *Job, event string, checkpointIDs []string) error {
-	// TODO: key by job id, send only the config hash, dataset version and checkpoint ids, and
-	// produce after the job record commits instead of before it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	value, _ := json.Marshal(map[string]any{
 		"event":           event,
 		"job_id":          job.ID,
@@ -372,8 +364,7 @@ object Events {
     private val producer = new KafkaProducer[String, String](props)
 
     def publish(job: Job, event: String, checkpointIds: List[String]): Unit = {
-      // TODO: key by job id, send only the config hash, dataset version and checkpoint ids, and
-      // produce after the job record commits instead of before it.
+      // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
       val value =
         s"""{"event":"$event","job_id":"\${job.id}","team":"\${job.team}","hyperparameters":\${job.hyperparametersJson},"loss_log":\${job.lossLogJson}}"""
       producer.send(new ProducerRecord[String, String]("finetune.job", job.team, value))
@@ -431,8 +422,7 @@ class EventPublisher {
   }
 
   void Publish(const Job& job, const std::string& event, const std::vector<std::string>& checkpoint_ids) {
-    // TODO: key by job id, send only the config hash, dataset version and checkpoint ids, and
-    // produce after the job record commits instead of before it.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const std::string value = "{\\"job_id\\":\\"" + job.id + "\\",\\"team\\":\\"" + job.team +
                               "\\",\\"hyperparameters\\":" + job.hyperparameters_json +
                               ",\\"loss_log\\":" + job.loss_log_json + "}";
@@ -496,9 +486,9 @@ class EventPublisher {
     },
   },
   hints: [
-    'Key by `job_id`, not by team: all events for one job must land on one partition so a consumer reads them in order.',
-    'The payload is a pointer to the job — `config_hash`, `dataset_version`, `checkpoint_ids`, `status`. The recipe and the loss curve stay in the datastore.',
-    'Commit the job record first, then produce with an idempotent `acks=all` producer, so no event announces a state that is not durable.',
+    "A dashboard replaying one job's history shows another team's learning rate and loss curve in between, and once showed a `completed` event for a job the database still lists as running.",
+    '`publish` serialises `hyperparameters` and `loss_log` into the value, uses `job["team"]` as the key, never commits the record it announces, and the `Producer` config sets no idempotence or acks.',
+    'Build the payload from `config_hash`, `dataset_version`, `checkpoint_ids` and `status`; key with `job["id"]`; call `commit()` before `produce()`; configure `enable.idempotence` and `"acks": "all"`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an event path against ordering, payload hygiene and durability. The starter reads fine because the topic shows a healthy-looking event. Four separate defects are being checked: the key must be the job id so per-job order holds; the payload must carry hashes and ids rather than the recipe and the loss curve; the produce must follow the commit so a consumer cannot act on a rolled-back transition; and the producer must be idempotent with acks=all so a retry does not duplicate. The payload flaw is the one candidates miss: a retained topic is a second, unmanaged copy of whatever you put in it. Real systems also carry an event id so consumers can dedupe redeliveries.`,
+  debrief: `The fix has this shape because a Kafka topic is a durable, replicated, often mirrored log, and whatever lands in it has to be true, ordered and safe to retain. Keying by job id gives each job a single partition and therefore a single order; carrying hashes and ids instead of the recipe keeps the datastore the one place the recipe lives; committing before producing means an event can only describe a state that survived; the idempotent producer makes a retried send land once. Production event paths add an outbox table written in the same transaction as the job record, with a relay that produces from it, so a crash between commit and produce cannot lose the event.`,
 };

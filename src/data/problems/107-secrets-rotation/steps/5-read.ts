@@ -8,36 +8,27 @@ export const readStep: Step = {
   focus: ['ops', 'api', 'db', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code for the versions read: it resolves the name, lists
-the versions and answers 200. It compiles, it serves the console, and it hides three production
-flaws — an \`include_material\` flag that returns plaintext to admin callers, consumer acceptance
-that only the secret owner may see, and no scope check at all. Debug it like the service owner, fix
-it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`GET /v1/secrets/{name}/versions\`, reads the operator
+from \`X-Operator-Id\`, looks up the owner, copies each stored version record into the response,
+adds material when \`include_material=true\` and the caller is the owner, adds consumers for the
+owner alone, and answers 200. It compiles, it serves the console, and it hides four flaws.
 
-Implement \`GET /v1/secrets/{name}/versions\`.
+**Failure mode the checks target.** A material flag gated on a role still makes the vault a read
+path whose plaintext lands in proxy logs and browser caches. Gating consumer acceptance on
+ownership hides the data retirement needs while the owner is on holiday. No scope check lets any
+authenticated principal enumerate every secret. An unprojected record shows neither when a version
+was live nor whether it is overdue.
 
-- The caller comes from the authenticated \`X-Operator-Id\` header (**401** when missing) and the
-  token's grants come from \`X-Scopes\`; a caller without the **\`secrets\`** scope is **403**. Every
-  read of a secret's lifecycle requires that scope — there is no operator-only path.
+- \`X-Operator-Id\` missing: **401**. \`X-Scopes\` without **\`secrets\`**: **403**.
 - The query string is parsed against an **allowlist**: \`limit\`, \`state\`, \`cursor\`. Anything else
-  is **400**, so no flag can ever be added later that surfaces more than metadata — in particular
-  there is no material flag, under any name, for any role.
-- \`limit\` is an integer from **1** to **200** (default **50**) and \`state\` is one of \`pending\`,
-  \`active\`, \`retired\`, \`revoked\` — **400** otherwise. The response is
-  \`{"name": …, "versions": [...], "next_cursor": …}\`.
-- Every version entry is built by one projection — \`version_view\` — carrying \`version_id\`,
-  \`fingerprint\`, \`state\`, the activation window (\`activated_at\`, \`retired_at\`),
-  \`rotation_seconds\`, the acceptance counts (\`acceptance.verified\` / \`acceptance.pending\`) and
-  the per-consumer list (\`consumers\`: id and whether that consumer verified the version).
-- Consumer acceptance is **operator-visible**: any caller holding the \`secrets\` scope sees which
-  consumers still lag behind, because the engineer retiring a version is rarely the secret's owner.
-
-**Failure mode the checks target.** An \`include_material\` parameter looks harmless — the flag
-"only returns material to admins" — but it makes the vault a read path, so every future caller with
-an admin role can exfiltrate plaintext through a GET, and it lands in proxy logs and browser caches.
-Gating consumer acceptance on ownership hides exactly the data retirement needs: the owner may be on
-holiday while a fleet is stuck on the old version. And a lifecycle read with no scope check lets any
-authenticated principal enumerate every secret's versions, fingerprints and windows.`,
+  is **400**, so no later flag can surface more than metadata.
+- \`limit\` is **1** to **200** (default **50**) and \`state\` is one of \`pending\`, \`active\`,
+  \`retired\`, \`revoked\`, **400** otherwise. Response: \`{"name", "versions", "next_cursor"}\`.
+- Every entry is built by one projection, \`version_view\`: \`version_id\`, \`fingerprint\`,
+  \`state\`, \`activated_at\`, \`retired_at\`, \`rotation_seconds\`, \`acceptance.verified\` /
+  \`acceptance.pending\`, and \`consumers\` (id and whether that consumer verified the version).
+- Consumer acceptance is **operator-visible** to any caller holding the \`secrets\` scope, because
+  the engineer retiring a version is rarely the secret's owner.`,
   sequence: {
     participants: ['Ops console', 'Secrets API', 'secret store', 'Redis'],
     messages: [
@@ -152,8 +143,7 @@ def list_versions(
     request: Request,
     operator: str = Header(default="", alias="X-Operator-Id"),
 ) -> JSONResponse:
-    # TODO: this starter accepts an include_material flag, returns the material to admin callers, and
-    # shows lagging consumers to the secret owner only. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     owner = store.owner_of(name)
     entries = []
     for version in store.list_versions(name):
@@ -240,7 +230,7 @@ def list_versions(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/secrets/:name/versions: flawed code with a material flag. */
+      starter: `/** GET /v1/secrets/:name/versions: the starter. */
 import Fastify from 'fastify';
 
 import {store} from './secret_store';
@@ -251,8 +241,7 @@ app.get('/v1/secrets/:name/versions', async (request, reply) => {
   const operator = request.headers['x-operator-id'];
   const {name} = request.params as {name: string};
   const query = request.query as Record<string, string | undefined>;
-  // TODO: this starter accepts an include_material flag, returns the material to admin callers, and
-  // shows lagging consumers to the secret owner only. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const owner = await store.ownerOf(name);
   const versions = await store.listVersions(name);
   const entries: Record<string, unknown>[] = [];
@@ -356,8 +345,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func listVersions(rw http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	operator := r.Header.Get("X-Operator-Id")
-	// TODO: this starter accepts an include_material flag, returns the material to admin callers, and
-	// shows lagging consumers to the secret owner only. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	owner := store.OwnerOf(r.Context(), name)
 	versions, err := store.ListVersions(r.Context(), name)
 	if err != nil {
@@ -523,8 +511,7 @@ object SecretReadApi {
       get {
         optionalHeaderValueByName("X-Operator-Id") { operatorOpt =>
           parameterMap { params =>
-            // TODO: this starter accepts an include_material flag, returns the material to admin
-            // callers, and shows lagging consumers to the secret owner only. Fix all three.
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
             val operator = operatorOpt.getOrElse("")
             val owner = store.ownerOf(name)
             val entries = store.listVersions(name).map { version =>
@@ -673,8 +660,7 @@ int main() {
   svr.Get(R"(/v1/secrets/([a-z0-9_-]+)/versions)", [](const httplib::Request& req, httplib::Response& res) {
     const auto name = req.matches[1].str();
     const auto operatorId = req.get_header_value("X-Operator-Id");
-    // TODO: this starter accepts an include_material flag, returns the material to admin callers, and
-    // shows lagging consumers to the secret owner only. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto owner = store.ownerOf(name);
     json entries = json::array();
     for (const auto& version : store.listVersions(name)) {
@@ -803,9 +789,9 @@ int main() {
     },
   },
   hints: [
-    'Parse the query string against an allowlist before you touch the store: `for key in query: if key not in ALLOWED_QUERY: 400`. A closed parameter set is what makes "no flag can ever surface material" provable — an unknown parameter is rejected, so nobody can add one later without changing the allowlist in review.',
-    'Give the response one projection function (`version_view`) and build every entry through it. Then the material can only appear if someone edits that function, which is the single place a reviewer has to read.',
-    'Consumer acceptance is an operational signal, not a private one: the caller retiring the version needs to see which consumers have not verified it, and that caller is usually not the owner. Gate on the `secrets` scope, never on ownership.',
+    'Symptom: any logged-in principal can list every secret, a proxy log holds plaintext from a console request, and the engineer retiring a version cannot see which consumers still lag.',
+    'Mechanism: the handler checks no `X-Scopes`, honours an `include_material` query key, copies raw store records with no window or policy, and attaches `consumers` only when `operator == owner`.',
+    'Change: require `SECRETS_SCOPE` (401/403), reject any key outside `ALLOWED_QUERY` with 400, build each entry through `version_view` with the activation window and `acceptance`, and drop the ownership gate.',
   ],
-  debrief: `The interviewer is testing the read side of a secret store, where the temptation is to make one endpoint serve everyone. Three defects are being checked. The \`include_material\` flag is the classic: it is described as an admin convenience, and it converts a vault into a read path whose plaintext lands in proxy logs, browser caches and incident screenshots; the fix is not a stricter role check but a closed parameter set and one projection that cannot carry material. The ownership gate on consumer acceptance is subtler — the data is not sensitive, so it is easy to justify, but it hides exactly the signal retirement depends on, from exactly the people who do the retiring. The missing scope check is the smallest diff and the biggest exposure: version ids, fingerprints and activation windows are enough to map an org's whole secret inventory. Real secret stores add per-secret audit trails, cursor-based pagination that cannot skip a version, and a "who read this" report for every access to a lifecycle.`,
+  debrief: `The fix has its shape because the read side of a vault must be closed by construction, not by role. A closed query allowlist means a material flag cannot be added later without changing the allowlist in review, and a single \`version_view\` projection means material can only appear if someone edits that one function. The scope check is the smallest diff and the largest exposure: version ids, fingerprints and activation windows are enough to map an organisation's whole secret inventory. The ownership gate on consumer acceptance is easy to justify, but it hides the signal retirement depends on from the people who do the retiring. Production stores go further than this step: a per-secret audit trail of every lifecycle read, and cursor pagination that cannot skip a version mid-rotation.`,
 };

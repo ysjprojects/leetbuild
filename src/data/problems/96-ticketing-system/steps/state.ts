@@ -8,35 +8,28 @@ export const stateStep: Step = {
   focus: ['agent', 'api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code for the Redis layer: an agent
-takes a ticket, replies, and the requester's badge moves. With one agent and no failures it is
-right. It hides a double-ownership race, a lease that never comes back, and a badge that can drift
-from the thread. Debug it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is the Redis layer behind assignment and unread badges: \`POST
+/v1/tickets/{id}/assign\` writes \`lease:{ticket_id}\` with a plain \`SET\`, \`DELETE
+/v1/tickets/{id}/assign\` answers OK, and \`POST /v1/tickets/{id}/messages\` persists the message row,
+then \`RPUSH\`es the thread and \`HINCRBY\`s the requester's counter. With one agent and no failures it
+is right. It serves the demo and hides 5 flaws.
 
-Implement the assignment and unread layer the ticket API and the support agents share:
+**Failure mode the checks target.** A plain \`SET\` lets two agents own one ticket, and a lease with
+no TTL stays with a crashed agent forever. A release that leaves the key behind strands the ticket.
+An append followed by a separate \`HINCRBY\` leaves the badge one message behind when the process
+dies between the calls.
 
-- **The assignment is a lease, one per ticket.** The key is \`lease:{ticket_id}\` and it is taken in
-  one round trip: \`SET ... EX LEASE_S NX\` (Python/TypeScript, \`LEASE_S = 120\`),
-  \`SetNX\`/\`SetArgs\` with \`leaseTTL\` (Go), \`SetParams.nx().ex(LeaseSeconds)\` (Scala), TTL +
-  \`UpdateType::NOT_EXIST\` (C++, \`kLeaseSeconds\`). The starter assigns with a plain \`SET\`, so a
-  second agent overwrites the first and both believe they own the ticket.
-- **A second owner is refused.** \`POST /v1/tickets/{id}/assign\` that loses the race answers
-  **409** with the current owner; the lease's TTL is what frees a ticket when its agent stops
-  heartbeating.
-- **Release returns the ticket to the queue.** \`DELETE /v1/tickets/{id}/assign\` checks the
-  holder, \`DEL\`s \`lease:{ticket_id}\` and pushes the ticket back onto \`assign:queue\`
-  (\`LPUSH\`/\`ZADD\`); taking the ticket again removes it from the queue. The starter has no release
-  path at all, so a ticket an agent puts down is stranded.
-- **The unread badge moves with the message.** \`POST /v1/tickets/{id}/messages\` persists the
-  message row and then updates the Redis pair — \`RPUSH ticket:{ticket_id}:thread\` and
-  \`HINCRBY unread:{requester} {ticket_id} 1\` — in **one atomic unit** (one \`EVAL\`; a
-  \`MULTI\`/\`EXEC\` pipeline is equivalent). The starter issues the append and the counter as two
-  separate calls, so a crash between them leaves a message the badge never counted.
+Requirements:
 
-**Failure mode the checks target.** A plain \`SET\` lets two agents own one ticket; a lease with no
-TTL is never released by a crashed agent, and no release path strands a ticket even when the agent
-does put it down; and an append followed by a separate \`HINCRBY\` leaves the requester's badge one
-message behind the moment the process dies between the two calls.`,
+- **The assignment is a lease.** \`lease:{ticket_id}\` is taken in one round trip: \`SET ... EX
+  LEASE_S NX\` (\`LEASE_S = 120\`), \`SetNX\`/\`SetArgs\` with \`leaseTTL\` (Go),
+  \`SetParams.nx().ex(LeaseSeconds)\` (Scala), TTL + \`UpdateType::NOT_EXIST\` (C++, \`kLeaseSeconds\`).
+- **A second owner is refused.** An assign that loses the race answers **409** with the current owner.
+- **Release returns the ticket to the queue.** Release checks the holder, \`DEL\`s the lease and
+  pushes the ticket back onto \`assign:queue\` (\`LPUSH\`/\`ZADD\`); taking it again removes it.
+- **The badge moves with the message.** \`RPUSH ticket:{ticket_id}:thread\` and \`HINCRBY
+  unread:{requester} {ticket_id} 1\` run in one atomic unit (one \`EVAL\`, or a \`MULTI\`/\`EXEC\`
+  pipeline).`,
   sequence: {
     participants: ['Agent', 'Ticket API', 'Redis', 'Ticket store'],
     messages: [
@@ -162,15 +155,13 @@ def unread_key(requester: str) -> str:
 
 @app.post("/v1/tickets/{ticket_id}/assign")
 def assign(ticket_id: str, agent: str = Header(alias="X-Agent-Id")) -> dict:
-    # TODO: this SET has no NX and no TTL, so a second agent overwrites the current owner and both
-    # of them believe they own the ticket.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     r.set(lease_key(ticket_id), agent)
     return {"ticket": ticket_id, "agent": agent}
 
 
 @app.delete("/v1/tickets/{ticket_id}/assign")
 def release(ticket_id: str, agent: str = Header(alias="X-Agent-Id")) -> dict:
-    # TODO: release is a no-op — the lease is never deleted and the ticket never returns to the queue.
     return {"ticket": ticket_id, "released": True}
 
 
@@ -178,7 +169,6 @@ def release(ticket_id: str, agent: str = Header(alias="X-Agent-Id")) -> dict:
 def add_message(ticket_id: str, message: Message, agent: str = Header(alias="X-Agent-Id")) -> dict:
     ticket = store.get_ticket(ticket_id)
     message_id = store.append_message(ticket_id, agent, message.body, message.visibility)
-    # TODO: the append and the unread counter are two round trips — a crash between them loses the badge.
     r.rpush(thread_key(ticket_id), message_id)
     r.hincrby(unread_key(ticket["requester"]), ticket_id, 1)
     return {"message_id": message_id}
@@ -268,15 +258,13 @@ const unreadKey = (requester: string): string => \`unread:\${requester}\`;
 app.post('/v1/tickets/:id/assign', async (request, reply) => {
   const ticketId = (request.params as {id: string}).id;
   const agent = request.headers['x-agent-id'] as string;
-  // TODO: this SET has no NX and no TTL, so a second agent overwrites the current owner and both
-  // of them believe they own the ticket.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   await r.set(leaseKey(ticketId), agent);
   return reply.code(200).send({ticket: ticketId, agent});
 });
 
 app.delete('/v1/tickets/:id/assign', async (request, reply) => {
   const ticketId = (request.params as {id: string}).id;
-  // TODO: release is a no-op — the lease is never deleted and the ticket never returns to the queue.
   return reply.code(200).send({ticket: ticketId, released: true});
 });
 
@@ -286,7 +274,6 @@ app.post('/v1/tickets/:id/messages', async (request, reply) => {
   const body = request.body as {body: string; visibility?: string};
   const ticket = await store.getTicket(ticketId);
   const messageId = await store.appendMessage(ticketId, agent, body.body, body.visibility ?? 'public');
-  // TODO: the append and the unread counter are two round trips — a crash between them loses the badge.
   await r.rpush(threadKey(ticketId), messageId);
   await r.hincrby(unreadKey(ticket.requester), ticketId, 1);
   return reply.code(201).send({message_id: messageId});
@@ -387,15 +374,13 @@ func assign(rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	ticketID := req.PathValue("id")
 	agent := req.Header.Get("X-Agent-Id")
-	// TODO: this SET has no NX and no TTL, so a second agent overwrites the current owner and both
-	// of them believe they own the ticket.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	_ = rdb.Set(ctx, leaseKey(ticketID), agent, 0)
 	writeJSON(rw, http.StatusOK, map[string]string{"ticket": ticketID, "agent": agent})
 }
 
 func release(rw http.ResponseWriter, req *http.Request) {
 	ticketID := req.PathValue("id")
-	// TODO: release is a no-op — the lease is never deleted and the ticket never returns to the queue.
 	writeJSON(rw, http.StatusOK, map[string]any{"ticket": ticketID, "released": true})
 }
 
@@ -418,7 +403,6 @@ func addMessage(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	// TODO: the append and the unread counter are two round trips — a crash between them loses the badge.
 	_ = rdb.RPush(ctx, threadKey(ticketID), messageID)
 	_ = rdb.HIncrBy(ctx, unreadKey(ticket.Requester), ticketID, 1)
 	writeJSON(rw, http.StatusCreated, map[string]any{"message_id": messageID})
@@ -571,14 +555,12 @@ object TicketState {
   def unreadKey(requester: String): String = s"unread:$requester"
 
   def claim(ticketId: String, agent: String): Unit = {
-    // TODO: this SET has no NX and no TTL, so a second agent overwrites the current owner and both
-    // of them believe they own the ticket.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     jedis.set(leaseKey(ticketId), agent)
     ()
   }
 
   def release(ticketId: String, agent: String): Unit = {
-    // TODO: release is a no-op — the lease is never deleted and the ticket never returns to the queue.
     ()
   }
 
@@ -601,7 +583,6 @@ object TicketState {
           post {
             entity(as[Message]) { message =>
               val messageId = store.appendMessage(ticketId, agent, message.body)
-              // TODO: the append and the unread counter are two round trips — a crash between them loses the badge.
               jedis.rpush(threadKey(ticketId), messageId)
               jedis.hincrby(unreadKey(store.requesterOf(ticketId)), ticketId, 1)
               complete(StatusCodes.Created, s"""{"message_id":"$messageId"}""")
@@ -757,8 +738,7 @@ int main() {
   svr.Post(R"(/v1/tickets/([\\w-]+)/assign)", [&redis](const httplib::Request& req, httplib::Response& res) {
     const std::string ticket_id = req.matches[1];
     const std::string agent = req.get_header_value("X-Agent-Id");
-    // TODO: this SET has no NX and no TTL, so a second agent overwrites the current owner and both
-    // of them believe they own the ticket.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     redis.set(leaseKey(ticket_id), agent);
     res.status = 200;
     res.set_content(json{{"ticket", ticket_id}, {"agent", agent}}.dump(), "application/json");
@@ -766,7 +746,6 @@ int main() {
 
   svr.Delete(R"(/v1/tickets/([\\w-]+)/assign)", [](const httplib::Request& req, httplib::Response& res) {
     const std::string ticket_id = req.matches[1];
-    // TODO: release is a no-op — the lease is never deleted and the ticket never returns to the queue.
     res.status = 200;
     res.set_content(json{{"ticket", ticket_id}, {"released", true}}.dump(), "application/json");
   });
@@ -775,7 +754,6 @@ int main() {
     const std::string ticket_id = req.matches[1];
     const std::string agent = req.get_header_value("X-Agent-Id");
     const auto message_id = store.append_message(ticket_id, agent, req.body);
-    // TODO: the append and the unread counter are two round trips — a crash between them loses the badge.
     redis.rpush(threadKey(ticket_id), message_id);
     redis.hincrby(unreadKey(store.requester_of(ticket_id)), ticket_id, 1);
     res.status = 201;
@@ -874,9 +852,11 @@ int main() {
     },
   },
   hints: [
-    'The lease is one command: `SET lease:{ticket_id} {agent} EX 120 NX`. A `GET` followed by a `SET`, or a `SET` with no `NX`, is check-then-act — two agents both read the ticket as free and both write it, and last-writer-wins silently fires the previous owner. Only the caller the command answers `OK` to owns the ticket.',
-    'Release is a compare-and-delete on the same key, then a push back onto `assign:queue`, because a ticket nobody owns must be offerable again. Keep the TTL: it is the only thing that frees a ticket whose agent stopped heartbeating. In the starter the release handler answers `OK` while the key stays behind, so the ticket is stranded.',
-    "The append and the badge are two writes to two keys, and two keys are two round trips unless one script carries them: `RPUSH` the message id and `HINCRBY` the requester's counter inside one `EVAL`. A crash between the calls leaves a message in the thread that the badge never counted — and the badge is the only place that fact is stored.",
+    'Two agents open the same ticket and both see themselves as owner; a ticket an agent puts down never reappears in the queue; a requester’s badge says 2 while the thread holds 3 replies.',
+    'The assign `SET` has no `NX` and no TTL, so the second writer wins silently; release returns OK without touching the key; the append and the counter are two round trips with a crash window between.',
+    'Use `SET lease:{id} {agent} EX 120 NX` and answer **409** on `nil`; on release check the holder, `DEL` the key and `ZADD`/`LPUSH` onto `assign:queue`; move `RPUSH` + `HINCRBY` into one `EVAL` script.',
   ],
-  debrief: `The interview question behind this step is ownership under failure: a lease is the only honest way to say "this one agent owns this one ticket right now". A plain \`SET\` looks equivalent because it always writes, but it has no notion of "already taken" and no notion of "taken until", so the ticket ends up with two owners and no way back to the queue. The same instinct produces \`GET\`-then-\`SET\` and the bare \`DEL\` release — a delete can remove a lease that now belongs to someone else, which is why the release path checks the holder first (or does the compare-and-delete in Lua). Candidates also miss the two-key write: the append and the unread badge are separate commands, so a crash between them leaves a message nobody is told about, and the badge is the only place that fact lives. Real systems go further: a heartbeat extends the lease while the agent is actually working, an expired lease escalates instead of quietly returning to the queue, the unread badge is derived from an append-only thread plus a per-requester pointer so it cannot drift, and the lease value carries the holder plus a fencing token so a stale agent's writes can be rejected after its lease expired.`,
+  debrief: `The fix is a lease because ownership under failure needs two facts a plain \`SET\` cannot express: "already taken" and "taken until". \`NX\` answers the first in the same round trip that writes, so the loser of the race gets \`nil\` instead of a second ownership; the TTL answers the second, so a crashed agent's ticket frees itself. Release checks the holder before \`DEL\` because a bare delete can remove a lease that now belongs to someone else, and pushes the ticket back on the queue because a ticket nobody owns must be offerable again. The two-key write goes into one script because the badge is the only place "unread" is stored, and two round trips have a crash window between them.
+
+Production systems add a heartbeat that extends the lease while the agent is active, escalation when a lease expires instead of a quiet return to the queue, and a fencing token in the lease value so a stale agent's writes are rejected after expiry.`,
 };

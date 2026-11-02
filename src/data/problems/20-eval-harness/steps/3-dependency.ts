@@ -8,28 +8,28 @@ export const dependencyStep: Step = {
   focus: ['harness', 'judge', 'fallback'],
   task: `## Task
 
-The starter is working code: while the judge is healthy every sample gets a
-score and the dashboard moves. Every failure path is wrong. Find them, fix them, and prove the fix.
+**Starting point.** The starter implements \`score_sample(sample)\`, the judge call a worker makes
+for one golden sample: it builds a \`ScoreRequest\` from the model version, input and expected label,
+calls \`judge.Score\` with no deadline inside \`while True\`, returns the score on success and
+\`continue\`s on any exception. It compiles, serves the demo and hides 5 flaws.
 
-Implement \`score_sample(sample)\`, the judge call the workers make for one golden sample:
+**Failure mode the checks target.** While the judge is healthy every sample gets a score. The
+moment the judge is redeployed, the loop becomes a hot loop against a service that is already down,
+one malformed sample spins a worker forever on \`INVALID_ARGUMENT\`, and with no fallback an outage
+fails every sample of the run instead of scoring it cheaply.
 
-- Each attempt carries an **800 ms** deadline. A call without one lets one slow judge pin a worker
-  for the whole run.
-- At most **3 attempts**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retryable. A
-  malformed sample — \`INVALID_ARGUMENT\` — is returned to the caller immediately: retrying it three
-  times wastes the budget and still fails.
-- When the attempts are exhausted, the sample is scored by the **deterministic string metric**
-  (\`fallbackExactMatch\`: 1.0 when the output matches the label, 0.0 otherwise) instead of failing
-  the run. A judge outage must degrade the score, not lose the sample.
-- A **circuit breaker** opens after **5** retryable failures and stays open for **30 s**; while it
-  is open, skip the judge and go straight to the fallback.
-- The fallback result is marked as such in the run record, so a report built mostly from fallbacks
-  can be rejected later.
+Requirements:
 
-**Failure mode the checks target.** The starter catches every error and loops forever: a permanent
-\`INVALID_ARGUMENT\` spins the worker, a judge deployment gone bad becomes a hot loop against the
-service that is already down, and there is no fallback at all, so every sample of the run fails with
-it. Each of those is silent in a demo and loud during a release eval.`,
+- Each attempt carries an **800 ms** deadline (\`DEADLINE_S = 0.8\`, set on the call itself).
+- At most **3 attempts** (\`MAX_ATTEMPTS\`); only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
+  retried. \`INVALID_ARGUMENT\` is returned at once; no blanket \`except Exception\` loops.
+- When the attempts are exhausted, the sample is scored by the deterministic string metric
+  \`fallback_exact_match\` (1.0 when the output equals the label, 0.0 otherwise).
+- A circuit breaker opens after **5** retryable failures (\`BREAKER_FAILURES\`) for **30 s**
+  (\`BREAKER_COOLDOWN_S\`); \`allow()\` is checked before each attempt, and an open breaker goes
+  straight to the fallback.
+- The fallback result is marked as such in the run record, so a report built mostly from
+  fallbacks can be rejected later.`,
   sequence: {
     participants: ['Eval worker', 'Judge model', 'String metric'],
     messages: [
@@ -48,9 +48,9 @@ it. Each of those is silent in a demo and loud during a release eval.`,
     ],
   },
   hints: [
-    'The deadline belongs on the call itself — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline` — not around it. Bound the attempts with a constant and a counted loop; the starter’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
-    'Retryability is a property of the status, not of “it threw”: capture the error, compare its code, and return anything outside `UNAVAILABLE` / `DEADLINE_EXCEEDED` at once. A malformed sample will never succeed on the third try, so those two retries are pure spend.',
-    'The breaker is a failure counter per dependency: record only retryable failures, check `allow()` before each attempt, and open it for 30 s after five. When it is open — or the attempts run out — call the deterministic metric, so the run finishes with a real, reproducible number instead of an outage.',
+    'Symptom: the judge is being redeployed, worker CPU pins at 100%, the run count freezes for twenty minutes, and one sample with a broken label is retried thousands of times.',
+    'Mechanism: `while True` with `except Exception: continue` has no exit for a permanent status and no deadline on `judge.Score`, so a slow judge holds the worker and a malformed sample loops forever.',
+    'Fix: `judge.Score(request, timeout=DEADLINE_S)` in a `for` over `MAX_ATTEMPTS`, catch `grpc.RpcError`, return at once unless `code()` is retryable, record failures on the breaker, then `fallback_exact_match`.',
   ],
   checks: [
     {
@@ -158,9 +158,7 @@ attempts = 0
 
 
 def score_sample(sample: dict) -> float:
-    # TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-    # DEADLINE_EXCEEDED, score with the deterministic string metric when the judge stays down, open
-    # a breaker after five failures, and never retry a malformed sample.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     global attempts
     while True:
         attempts += 1
@@ -272,9 +270,7 @@ const {judge} = grpc.loadPackageDefinition(protoLoader.loadSync('judge.proto')) 
 const client = new judge.Judge('judge:9000', grpc.credentials.createInsecure());
 
 export async function scoreSample(sample: Sample): Promise<number> {
-  // TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-  // DEADLINE_EXCEEDED, score with the deterministic string metric when the judge stays down, open
-  // a breaker after five failures, and never retry a malformed sample.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const reply = await new Promise<{score: number}>((resolve, reject) => {
@@ -395,9 +391,7 @@ type Sample struct {
 }
 
 func scoreSample(ctx context.Context, sample Sample) (float64, error) {
-	// TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-	// DEADLINE_EXCEEDED, score with the deterministic string metric when the judge stays down, open
-	// a breaker after five failures, and never retry a malformed sample.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := judge.Score(ctx, &pb.ScoreRequest{
 			ModelVersion: sample.ModelVersion,
@@ -517,9 +511,7 @@ object Scorer {
   )
 
   def scoreSample(sample: Sample): Double = {
-    // TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-    // DEADLINE_EXCEEDED, score with the deterministic string metric when the judge stays down, open
-    // a breaker after five failures, and never retry a malformed sample.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     while (true) {
       try {
         val reply = judge.score(
@@ -621,9 +613,7 @@ struct Sample {
 };
 
 double scoreSample(const Sample& sample) {
-  // TODO: add the 800 ms deadline, bound the attempts to 3 and retry only UNAVAILABLE /
-  // DEADLINE_EXCEEDED, score with the deterministic string metric when the judge stays down, open
-  // a breaker after five failures, and never retry a malformed sample.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     ScoreRequest request;
@@ -716,5 +706,5 @@ double scoreSample(const Sample& sample) {
 `,
     },
   },
-  debrief: `The interview question is failure policy on a dependency you do not control. The starter passes every serial test with a healthy judge and fails exactly when a release eval runs but the judge is being redeployed: an unbounded retry loop turns a bad deploy into a hot loop, one malformed sample burns the whole budget, and there is no fallback, so an outage silently invalidates every sample instead of scoring them cheaply. The fixes are the four contracts every outbound call needs — a deadline, bounded attempts over a status whitelist, a deterministic degradation path, and a breaker so the dependency gets room to recover. Real harnesses add a judge-version pin so the fallback and the judge are comparable, a per-run fallback share that fails the gate when too many samples degraded, and hedged requests for the long tail.`,
+  debrief: `The fix is four contracts around one call rather than one clever retry: a deadline on the call so a stuck judge costs 800 ms, a bounded loop over a status whitelist so a permanent error is returned on the first attempt, a deterministic fallback so an outage degrades the score instead of losing the sample, and a breaker so the judge gets room to recover. The whitelist matters more than the count: three retries of \`INVALID_ARGUMENT\` are three wasted calls that end in the same error. Production harnesses also pin the judge version in the run record so fallback and judge scores stay comparable, and fail the gate when the share of fallback-scored samples passes a limit, because a run scored mostly by string equality is measuring something else.`,
 };

@@ -8,25 +8,23 @@ export const dependencyStep: Step = {
   focus: ['worker', 'model'],
   task: `## Task
 
-**Starting point.** The starter is working code: it calls the model server and
-returns the output, so a healthy provider makes the shard pass. One bad shard, however, takes the
-whole batch down. Find the three defects, fix them, and prove the fix with the checks below.
+**Starting point.** The starter implements \`generate\`, which calls \`model.Generate(shard_id)\` in a
+\`while True\` loop with no deadline, calls \`cancel_all()\` on any exception and tries again; and
+\`run_batch\`, which maps \`generate\` over the shards and returns \`status: "succeeded"\`. A healthy
+model server makes the demo pass. It hides 5 flaws.
 
-Implement the model client each shard calls.
+**Failure mode the checks target.** One hung or poisoned shard taking the batch down: a call with no
+deadline pins the worker, an unbounded retry on a timeout hammers a provider that is already slow, a
+shared abort turns one bad record into a failed batch, and the result reports success for a batch that
+dropped a shard.
 
-- **One deadline per attempt: 5 seconds.** A call that never returns must be abandoned, not waited
-  on; a batch of a million records cannot block on one hung shard.
-- **Retry at most twice, and only \`UNAVAILABLE\`.** Timeout is not "retry harder": the starter retries
-  \`DEADLINE_EXCEEDED\` forever, which turns a slow provider into a hot loop. The retryable set
-  contains exactly \`UNAVAILABLE\`.
+- **One deadline per attempt: 5 seconds.** A call that does not return is abandoned, not waited on.
+- **Retry at most twice, and only \`UNAVAILABLE\`.** The retryable set contains exactly
+  \`UNAVAILABLE\`; \`DEADLINE_EXCEEDED\` is not retried.
 - **Contain the failure to its own shard.** A shard that still fails after the retries is recorded
-  as failed and the batch continues; it must never cancel the other in-flight shards.
-- **Report the failed count.** The batch result is not a blanket success: it carries the completed
-  and \`failed_shards\` counts so the status endpoint and the events can tell the truth.
-
-**Failure mode the checks target.** A shared abort turns one poisoned record into a failed batch; an
-unbounded retry loop on a timeout hammers a provider that is already slow; and reporting "succeeded"
-for a batch that dropped a shard is the bug the whole course is about.
+  as failed and the batch continues; the other in-flight shards are not cancelled.
+- **Report the failed count.** The batch result carries the completed and \`failed_shards\` counts so
+  the status endpoint and the events can report the real state.
 
 :::widget deadline-retry {"base": 200, "deadline": 5000, "attempts": 3}`,
   sequence: {
@@ -40,9 +38,9 @@ for a batch that dropped a shard is the bug the whole course is about.
     ],
   },
   hints: [
-    'The deadline belongs on the call, not the batch: `timeout=DEADLINE_S` / `context.WithTimeout` / `withDeadlineAfter`. Without it a stuck stream pins the worker forever.',
-    'Bound the loop with `for _ in range(MAX_ATTEMPTS)` and break when `error.code() not in RETRYABLE`. Retrying `DEADLINE_EXCEEDED` is the starter’s bug: a timeout means the provider is already struggling.',
-    'A shard failure is data, not control flow: catch it per shard, append the id to `failed`, and let the loop continue. Never call a batch-wide cancel or re-raise past the loop.',
+    'A provider brownout and one worker pegs a CPU retrying the same shard for an hour; one malformed record and the operator sees every sibling shard cancelled with the batch still marked succeeded.',
+    'No timeout on the call, `while True` with a bare `except Exception` that retries every status, `cancel_all()` on each failure, and `run_batch` hard-codes the status string.',
+    'Call with `timeout=DEADLINE_S`, loop `for _ in range(MAX_ATTEMPTS)`, break unless `error.code() in RETRYABLE`; per shard catch, append to `failed`, continue; return `failed_shards` in the summary.',
   ],
   checks: [
     {
@@ -119,8 +117,7 @@ attempts = 0
 
 
 def generate(shard_id: str) -> str:
-    # TODO: this starter retries every error forever with no deadline, and one failed shard cancels
-    # every other in-flight shard instead of being contained.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     global attempts
     while True:
         attempts += 1
@@ -172,12 +169,11 @@ def run_batch(batch_id: str, shards: list[str]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Per-shard model call: flawed code that retries forever and cancels siblings. */
+      starter: `/** Per-shard model call. */
 import * as grpc from '@grpc/grpc-js';
 
 export async function generate(shardID: string): Promise<string> {
-  // TODO: this starter retries every error forever with no deadline, and one failed shard cancels
-  // every other in-flight shard instead of being contained.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       return await callModel(shardID);
@@ -247,8 +243,7 @@ import (
 )
 
 func Generate(client ModelClient, shardID string) (string, error) {
-	// TODO: this starter retries every error forever with no deadline, and one failed shard cancels
-	// every other in-flight shard instead of being contained.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := client.Generate(context.Background(), &ShardRequest{ShardId: shardID})
 		if err == nil {
@@ -324,8 +319,7 @@ func RunBatch(client ModelClient, batchID string, shards []string) map[string]an
 
 object ShardRunner {
   def generate(stub: ModelGrpc.ModelBlockingStub, shardId: String): String = {
-    // TODO: this starter retries every error forever with no deadline, and one failed shard cancels
-    // every other in-flight shard instead of being contained.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     var done = false
     var output = ""
     while (!done) {
@@ -395,8 +389,7 @@ object ShardRunner {
 #include <vector>
 
 std::string generate(Model::Stub& stub, const std::string& shardId) {
-  // TODO: this starter retries every error forever with no deadline, and one failed shard cancels
-  // every other in-flight shard instead of being contained.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   bool done = false;
   std::string output;
   while (!done) {
@@ -474,13 +467,14 @@ json run_batch(Model::Stub& stub, const std::string& batchId, const std::vector<
 `,
     },
   },
-  debrief: `The interviewer is testing whether a client can fail in bounded time and in bounded scope. A
-deadline bounds one attempt; a fixed attempt count bounds the call; the retryable set decides which
-failures are worth another attempt — and a timeout is not one of them, because retrying a deadline
-turns a slow provider into a hot loop. Containment is the subtle one: a poisoned shard is data, so
-it is caught per shard, appended to \`failed\`, and the loop continues; a batch-wide cancel is how one
-record fails a million. The result then has to say so: a completed count plus \`failed_shards\` is
-what lets the status endpoint avoid the blanket "succeeded". Real clients add jittered backoff,
-per-endpoint concurrency limits, and de-duplication so a retried shard does not bill the model
-twice.`,
+  debrief: `The fix bounds the call in time and in scope. A deadline bounds one attempt; a fixed attempt count
+bounds the call; the retryable set decides which failures deserve another try, and a timeout is not
+one of them because retrying a deadline turns a slow provider into a hot loop. Containment is why the
+failure is caught per shard: a poisoned record is data, so it goes into \`failed\` and the loop
+continues, where a batch-wide cancel lets one record fail a million. The summary has to carry
+\`failed_shards\` or the status endpoint has nothing to report but a blanket success.
+
+What this step did not do: jittered backoff between the two retries, a per-endpoint concurrency
+limit so a thousand workers retrying at once do not finish the provider off, and a request id on each
+attempt so a retried shard is not billed twice.`,
 };

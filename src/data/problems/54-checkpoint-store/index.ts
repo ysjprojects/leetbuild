@@ -7,79 +7,66 @@ import {checkpointEventsStep} from './steps/4-events';
 import {readCheckpointStep} from './steps/5-read';
 
 /**
- * Checkpoint store: the course is not "write a chunk to a bucket", it is the debugging you owe a
- * checkpoint path before a training run resumes from it. Chunked, resumable writes whose replays
- * are idempotent → an atomic Redis commit marker written only for a complete chunk set →
- * object-store calls that verify before acknowledging → run-keyed checkpoint events with an
- * outbox → a read endpoint that serves only committed, verified checkpoints.
+ * Checkpoint store: chunked, resumable writes whose replays are idempotent, an atomic Redis commit
+ * marker written only for a complete chunk set, object-store calls that verify before
+ * acknowledging, run-keyed checkpoint events with an outbox, and a read endpoint that serves only
+ * committed, verified checkpoints.
  */
 export const checkpointStoreProblem: Problem = {
   id: 'checkpoint-store',
   title: 'Checkpoint Store',
-  tagline: 'Checkpoints that are cheap to write, safe to read and correct after crashes.',
+  tagline: 'Chunked weight uploads behind a commit marker a resumed training run can trust.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
   minutes: 70,
   statement: `# Checkpoint Store
 
-A checkpoint store is the piece of a training platform that decides whether a crashed job resumes
-from its weights or from garbage, and the only thing that makes that decision is what the store
-proves before it says yes. The visible part is a chunk upload; the parts that decide whether the
-system is safe are the chunk ordering rule, the commit marker, the acknowledgment contract with the
-object store, and the read that a resumed run trusts.
+A checkpoint store decides whether a crashed training job resumes from its weights or from garbage.
+The visible part is a chunk upload; the parts that make it safe are the chunk ordering rule, the
+commit marker, the acknowledgment contract with the object store, and the read a resumed run
+trusts.
 
 ## The real system
 
-Production checkpoint paths stream weights in fixed-size chunks under an upload id, so a run that
-loses its connection re-sends one chunk instead of a hundred gigabytes. They accept a chunk only at
-its expected position, treat a redelivered chunk as a no-op, and never let a chunk written out of
-order reorder the weights. Upload state lives in Redis with a TTL, because an abandoned upload that
-never expires pins memory and blocks the reuse of its id. A commit marker — one key, written by one
-atomic script, after the complete chunk set has arrived — is the only state a reader checks, so a
-reader can never observe half a checkpoint as a checkpoint. Chunks go to an object store over gRPC
-under a deadline, and a chunk is acknowledged only once the store confirms its checksum: an
-acknowledgment that runs ahead of verification is a promise the platform cannot keep. Events are
-keyed by training run, so a run's checkpoints stay ordered, and the commit event leaves the service
-only after the marker is durable. The read endpoint returns the latest *committed* checkpoint of
-the caller's run, refuses to serve one whose verification has not passed, and hands out a URL that
-expires.
+Amazon S3 multipart upload is the shape most checkpoint paths copy. A client opens an upload id,
+sends parts under consecutive part numbers, and can attach a per-part SHA-256 checksum that S3
+verifies before storing the part; a part re-sent under the same number replaces the earlier one.
+The object does not exist for readers until \`CompleteMultipartUpload\` lists every part, and a
+bucket lifecycle rule aborts uploads that were never completed. Training frameworks layer a
+manifest, a step number and a verification record on top, and hand out pre-signed download URLs
+that expire.
 
 ## What you build here
 
-One service, the checkpoint store, with five pieces:
+Five pieces of one service:
 
 1. \`POST /v1/checkpoints\`: a chunk of at most **8 MiB** under an upload id, accepted only at its
-   expected index, stored at its index so a replay **overwrites** rather than appends, digested with
-   sha256, and never completing an upload on a caller-declared byte count.
-2. A **Redis** upload state: the received chunk indexes as a set, an \`EXPIRE\` on first write so
-   abandoned uploads expire, and one atomic \`EVAL\` that writes the commit marker only when the
-   stored set covers every expected chunk.
-3. A **gRPC** object-store client: a **30-second** deadline on every call, the chunk acknowledged
-   only after the store confirms its checksum, at most three attempts, only
-   \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\` retried, and a \`PERMISSION_DENIED\` that stops the upload
-   with a visible reason.
-4. A **Kafka** event path: one \`checkpoint.event\` per chunk accept, commit and verification keyed
-   by **training run**, carrying step number, chunk counts and digests, published after the commit
-   marker is durable, durable through an outbox when the broker rejects the produce.
-5. \`GET /v1/runs/{id}/checkpoints/latest\`: the latest committed checkpoint of the caller's run, its
-   step number, verification status and last verified chunk, a signed URL that expires in
+   expected index, stored at its index so a replay **overwrites**, digested with sha256, and
+   complete only when the stored chunk set says so.
+2. A **Redis** upload state: received indexes as a set with an \`EXPIRE\` on first write, and one
+   atomic \`EVAL\` that writes the commit marker only for a complete set.
+3. A **gRPC** object-store client: a **30-second** deadline per call, acknowledgment only after the
+   store confirms the checksum, at most three attempts and only \`UNAVAILABLE\`/\`DEADLINE_EXCEEDED\`
+   retried, and a \`PERMISSION_DENIED\` that stops the upload with a visible reason.
+4. A **Kafka** event path: one \`checkpoint.event\` per accept, commit and verification, keyed by
+   **training run**, carrying step number, chunk count and digest, published after the marker is
+   durable, written to an outbox when the broker rejects the produce.
+5. \`GET /v1/runs/{id}/checkpoints/latest\`: the latest committed checkpoint of the caller's run,
+   its step, verification status and last verified chunk, a signed URL that expires in
    **15 minutes**, and a **404** for an uncommitted, missing or foreign run.
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real feature: debug it against
-the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
-checks that fail on the starter and pass on your version.
+Every starter is working code with flaws: it compiles, serves the happy path, and looks right. Your
+job in every step is to debug it against the failure modes, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Model architecture and optimizer state formats, multi-region replication of the object store,
-lifecycle policies for old checkpoints, resumable download of a chunk range to the trainer, cost
-accounting per storage class, and garbage collection of superseded checkpoints. The five pieces
-above are the ones that decide whether a checkpoint is written cheaply, read safely and correct
-after a crash.`,
+Optimizer state formats, multi-region replication, lifecycle policies for old checkpoints, resumable
+download of a chunk range, cost accounting per storage class, and garbage collection of superseded
+checkpoints.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Training job', sub: 'chunk · resume', x: 8, y: 50},

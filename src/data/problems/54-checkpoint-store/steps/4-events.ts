@@ -8,31 +8,26 @@ export const checkpointEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: it produces an event on the
-happy path and the topic fills up, so the demo shows checkpoints arriving. Three production
-contracts are broken. Find them, fix them, and prove the fix with the checks below.
+**Starting point.** The starter serves \`POST /v1/runs/{run_id}/checkpoints\`: it produces one
+\`checkpoint.event\` keyed by \`upload_id\` with a payload of \`{id, index}\`, flushes, and answers
+\`committed\`. The producer runs with default settings, no commit marker exists before the produce,
+and a broker error escapes the request. It compiles, fills the topic in the demo, and hides five flaws.
 
-\`POST /v1/runs/{run_id}/checkpoints\` commits a checkpoint, and every chunk accept, commit and
-verification publishes one \`checkpoint.event\`.
+**Failure mode the checks target.** A run-keyed topic is what makes per-run ordering possible;
+publishing the commit before the marker lets a consumer act on a checkpoint a crash rolled back;
+a produce path with no outbox turns every broker hiccup into a missing checkpoint record. All of it
+is invisible while the broker is up.
 
-- Every event is keyed by the **training run**, not by the upload id. The key is the partition key,
-  so a run's checkpoints and verifications stay ordered; keyed by upload id, one run's events scatter
-  across partitions and "the last commit" becomes a guess.
-- The event carries the **step number, chunk count and digest** — enough for a consumer to reason
-  about a checkpoint without reading the weights.
-- The commit event is published **only after the commit marker is durable**: the marker is what a
-  resume trusts, so an event announcing a commit that never persisted is a lie the topic keeps
-  forever.
-- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
-  plus a stable key), so a retry of a produce cannot duplicate a record.
-- When the broker rejects the produce, the event goes to the **outbox** instead of being dropped. The
-  starter lets the exception escape and the event is lost, which is exactly the case an outage makes
-  common.
-
-**Failure mode the checks target.** A run-keyed topic is what makes per-run ordering possible at
-all; publishing the commit before the marker means a consumer can act on a checkpoint that a crash
-rolled back; and a produce path with no outbox turns every broker hiccup into a missing checkpoint
-record. All three are invisible in a demo where the broker is up and the process never crashes.`,
+- Every event is keyed by the **training run** (\`key=run_id\`), not the upload id, so a run's
+  checkpoints and verifications share a partition and stay ordered.
+- The event carries the **step number, chunk count and digest**, enough for a consumer to act
+  without reading the weights.
+- The commit event is published **only after the commit marker is durable**:
+  \`write_commit_marker\` runs before \`publish_event\`.
+- The producer is **idempotent with \`acks=all\`** (or the stack's equivalent), so a retried produce
+  cannot duplicate a record.
+- When the broker rejects the produce, the event goes to the **outbox** (\`insert_outbox\`) instead
+  of being dropped.`,
   sequence: {
     participants: ['Checkpoint API', 'checkpoint.event', 'Event consumer'],
     messages: [
@@ -135,10 +130,7 @@ class ChunkEvent(BaseModel):
 
 @app.post("/v1/runs/{run_id}/checkpoints")
 def commit(run_id: str, body: ChunkEvent, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this starter keys by upload id instead of the training run, publishes the commit event
-    # before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
-    # publish after the marker, carry the step, chunk count and digest, and write an outbox row when
-    # the produce fails.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     producer.produce(
         "checkpoint.event",
         key=body.upload_id,
@@ -211,7 +203,7 @@ def commit(run_id: str, body: CheckpointEvent, tenant: str = Header(alias="X-Ten
 `,
     },
     typescript: {
-      starter: `/** checkpoint.event: flawed code that keys by upload id and publishes early. */
+      starter: `/** checkpoint.event: keys by upload id and publishes early. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -228,10 +220,7 @@ interface ChunkEvent {
 }
 
 app.post('/v1/runs/:runId/checkpoints', async (request, reply) => {
-  // TODO: this starter keys by upload id instead of the training run, publishes the commit event
-  // before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
-  // publish after the marker, carry the step, chunk count and digest, and write an outbox row when
-  // the produce fails.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'] as string;
   const {runId} = request.params as {runId: string};
   const body = request.body as ChunkEvent;
@@ -333,10 +322,7 @@ func commit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter keys by upload id instead of the training run, publishes the commit event
-	// before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
-	// publish after the marker, carry the step, chunk count and digest, and write an outbox row when
-	// the produce fails.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	payload, _ := json.Marshal(map[string]any{"id": body.UploadID, "index": body.Index})
 	if err := writer.WriteMessages(r.Context(), kafka.Message{Key: []byte(body.UploadID), Value: payload}); err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
@@ -447,10 +433,7 @@ object Events {
   val producer = new KafkaProducer[String, String](props)
 
   def commit(runId: String, uploadId: String, index: Int): Unit = {
-    // TODO: this starter keys by upload id instead of the training run, publishes the commit event
-    // before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
-    // publish after the marker, carry the step, chunk count and digest, and write an outbox row when
-    // the produce fails.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     val record = new ProducerRecord[String, String]("checkpoint.event", uploadId, s"""{"id":"$uploadId","index":$index}""")
     producer.send(record)
     producer.flush()
@@ -499,10 +482,7 @@ object Events {
 using json = nlohmann::json;
 
 void Commit(const std::string& runId, const std::string& uploadId, int index, RdKafka::Producer& producer) {
-  // TODO: this starter keys by upload id instead of the training run, publishes the commit event
-  // before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
-  // publish after the marker, carry the step, chunk count and digest, and write an outbox row when
-  // the produce fails.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const json event = {{"id", uploadId}, {"index", index}};
   const auto payload = event.dump();
   producer.produce("checkpoint.event", RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
@@ -551,9 +531,9 @@ void Commit(const std::string& runId, int step, int chunks, const std::string& d
     },
   },
   hints: [
-    'The message key is the partition key. Key it by the training run (`key=run_id`, `key: runId`, `Key: []byte(runID)`, `new ProducerRecord("checkpoint.event", runId, …)`) so a run’s commit and verification events share a partition and stay ordered.',
-    'Order the two writes: the marker is what a resume trusts, so `writeCommitMarker(...)` runs first and `publishEvent(...)` after it. An event is a notification about durable state, never a substitute for it.',
-    'Durability is three separate things: an idempotent producer with `acks=all` so a retry cannot duplicate a record, a key that stays the same across retries, and an outbox row when the broker rejects the produce. The outbox is what makes a broker outage a delay instead of a missing checkpoint record.',
+    'A consumer sees a verification before the commit it belongs to, acts on a commit the API crashed before persisting, and after a short broker outage has no record of several checkpoints at all.',
+    'The key is the upload id, so one run spans partitions; the produce happens before any marker exists; the payload has no step or digest; and a rejected produce raises straight out of the handler.',
+    'Call `write_commit_marker` first, then `publish_event` with `key=run_id` and `step`, `chunks`, `digest` in the value; configure `enable.idempotence` and `acks: all`; on a broker error call `insert_outbox`.',
   ],
-  debrief: `The interviewer is testing whether you can debug an event path for ordering and durability. The starter produces a record and the topic fills up, which is all a demo needs; what a platform needs is that the topic is a truthful, ordered log of committed state. That gives three rules: partition by the entity whose order matters (the run), publish after the durable state rather than before it, and never let a broker rejection delete an event. Real platforms add a schema registry so the payload cannot drift, a per-run event id for consumer-side deduplication, a relay that drains the outbox in key order, and retention per topic because checkpoint events outlive the checkpoints they describe.`,
+  debrief: `The fix treats the topic as a truthful, ordered log of committed state rather than a notification channel. Partitioning by the run is what makes "the latest commit for this run" a question with one answer, because Kafka orders only within a partition. Writing the marker before producing means the event describes state that already survived: a crash between the two leaves a committed checkpoint without an event, which is recoverable, instead of an event without a checkpoint. The idempotent producer and the outbox close the remaining gaps: a retried produce cannot duplicate, and a rejected one is deferred rather than lost. Production platforms add a schema registry so the payload cannot drift, a per-run event id for consumer-side deduplication, and a relay that drains the outbox in key order.`,
 };

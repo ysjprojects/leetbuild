@@ -8,31 +8,28 @@ export const eventsStep: Step = {
   focus: ['runner', 'kafka', 'audit'],
   task: `## Task
 
-The starter is working code: it publishes an event per stage and the audit
-consumer shows a stream, so the demo looks complete. Three contracts are broken — the key, the
-payload, and the failure path. Find them, fix them, and prove the fix.
+**Starting point.** The starter’s \`publish(job_id, tenant, stage, run)\` builds an event with
+\`id\`, \`tenant\`, \`stage\`, \`profile\` and \`output_tail\`, logs the output tail, produces it
+to \`sandbox.job\` keyed by the profile with a default producer configuration, and flushes without
+looking at the result. It compiles and hides five flaws.
 
-Publish the runner’s lifecycle events to \`sandbox.job\`, one per stage (\`started\`, \`progress\`,
-\`finished\`):
+**Failure mode the checks target.** A profile-keyed topic scatters one job’s stages across
+partitions and packs unrelated jobs into one, the output tail copies tenant data into a retained,
+replicated topic and into the log pipeline, and a rejected produce leaves a finished job with no
+trace anywhere.
 
-- The message **key is the job id**, so every event of one job lands in one partition and a
-  consumer sees a job’s lifecycle **in order**. The starter keys by the isolation profile, which mixes
-  unrelated jobs into the same partition and scatters one job’s events across all of them.
-- The payload is **provenance, not content**: \`id\`, \`seq\` (the stage index), \`stage\`,
-  \`tenant\`, \`profile\`, \`exit_code\`, \`usage\` (\`cpu_ms\`, \`mem_mb\`), \`code_digest\` and
-  \`output_digest\`. The **code and the output bodies are never published** — an \`output_tail\`
-  copied "for debugging" ships a tenant’s program output into a retained, replicated topic.
-- Never log the code or the output either: the same tail that reaches the topic reaches the log
-  pipeline, where it outlives the retention policy.
-- The producer is **idempotent with \`acks=all\`**, and the **key is stable across retries** — a
-  retry of a stage must not duplicate the record in another partition.
-- When the broker **rejects** the produce, insert an **outbox row** for the event instead of
-  dropping it: the relay republishes outbox rows when the broker recovers, so no job result is
-  invisible.
+Publish one event per stage (\`started\`, \`progress\`, \`finished\`) with:
 
-**Failure mode the checks target.** A profile-keyed topic loses per-job ordering exactly when
-someone has to reconstruct what happened; the output tail turns the audit topic into a second copy
-of the tenant’s data; and a dropped produce leaves a job that finished with no trace of it anywhere.`,
+- \`key=job_id\` on the \`sandbox.job\` produce, so a consumer sees one job’s lifecycle in order and
+  a retry lands in the same partition.
+- A payload of provenance, not content: \`id\`, \`seq\`, \`stage\`, \`tenant\`, \`profile\`,
+  \`exit_code\`, \`usage\` (\`cpu_ms\`, \`mem_mb\`), \`code_digest\`, \`output_digest\`. No
+  \`output_tail\` and no \`code_body\`.
+- A \`logger.info\` line with the job id, stage and exit status, and no output or code in any log
+  call.
+- A producer configured idempotent with \`acks=all\`.
+- When the produce raises \`KafkaException\`, call \`store.insert_outbox(job_id, event)\` instead
+  of dropping the event; the relay republishes outbox rows when the broker recovers.`,
   sequence: {
     participants: ['Runner', 'sandbox.job', 'Audit consumer'],
     messages: [
@@ -44,9 +41,9 @@ of the tenant’s data; and a dropped produce leaves a job that finished with no
     ],
   },
   hints: [
-    'The key is the partition key, and the partition is what orders a job’s events: `key=job_id`, `key: jobId`, `Key: []byte(jobID)`, `ProducerRecord(topic, jobId, payload)`. Keyed by profile, two unrelated jobs share a partition and one job’s three stages land in three different ones.',
-    'Publish digests, not bodies: `code_digest` and `output_digest` are enough for the auditor to prove *which* code and *which* output the result describes, and they cannot leak the tenant’s program or its output into a topic that is retained and replicated.',
-    'Idempotence is producer configuration plus a stable key — `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true`, or `RequiredAcks: RequireAll` with a hash balancer. And wrap the produce: on failure write the outbox row instead of letting a finished job vanish.',
+    'An auditor pulls one job’s events and gets `finished` before `started`; the same topic, grepped, returns a tenant’s program output; after a broker outage some finished jobs have no events at all.',
+    'The partition key is `run["profile"]`, so partitions group by profile rather than job; the event and the log line both copy `output_tail`; `produce` and `flush` run with default acks and no error handling.',
+    '`key=job_id`; replace `output_tail` with `code_digest`, `output_digest`, `exit_code` and `usage`; log only id, stage and exit; set `enable.idempotence` with `acks=all`; `except KafkaException: store.insert_outbox(job_id, event)`.',
   ],
   checks: [
     {
@@ -139,9 +136,7 @@ store = EventStore()
 
 
 def publish(job_id: str, tenant: str, stage: str, run: dict) -> None:
-    # TODO: key by the job id, carry profile/exit status/usage and digests instead of the output
-    # tail, keep the code and output out of the logs, configure an idempotent producer with
-    # acks=all, and write an outbox row when the broker rejects the produce.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     event = {
         "id": job_id,
         "tenant": tenant,
@@ -211,7 +206,7 @@ def publish(job_id: str, tenant: str, stage: str, run: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** sandbox.job: flawed code that keys by profile and ships the output tail. */
+      starter: `/** sandbox.job: publishes one lifecycle event per stage. */
 import {Kafka} from 'kafkajs';
 
 import {logger} from './log';
@@ -228,9 +223,7 @@ interface RunRecord {
 }
 
 export async function publish(jobId: string, tenant: string, stage: string, run: RunRecord): Promise<void> {
-  // TODO: key by the job id, carry profile/exit status/usage and digests instead of the output
-  // tail, keep the code and output out of the logs, configure an idempotent producer with acks=all,
-  // and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const event = {id: jobId, tenant, stage, profile: run.profile, output_tail: run.outputTail};
   await producer.send({topic: TOPIC, messages: [{key: run.profile, value: JSON.stringify(event)}]});
   logger.info({job: jobId, output_tail: run.outputTail}, 'sandbox event');
@@ -310,9 +303,7 @@ type JobEvent struct {
 }
 
 func publish(ctx context.Context, jobID, tenant, stage string, run RunRecord) error {
-	// TODO: key by the job id, carry profile/exit status/usage and digests instead of the output
-	// tail, keep the code and output out of the logs, configure acks=all / idempotence, and write
-	// an outbox row when the broker rejects the produce.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	event := JobEvent{ID: jobID, Stage: stage, Tenant: tenant, Profile: run.Profile, OutputTail: run.OutputTail}
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -425,9 +416,7 @@ object EventsApi {
   val producer = new KafkaProducer[String, String](new Properties())
   private val logger = Logger.getLogger("sandbox")
 
-  // TODO: key by the job id, carry profile/exit status/usage and digests instead of the output
-  // tail, keep the code and output out of the logs, configure an idempotent producer with acks=all,
-  // and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   def publish(jobId: String, tenant: String, stage: String, run: RunRecord): Unit = {
     val event =
       Map("id" -> jobId, "tenant" -> tenant, "stage" -> stage, "profile" -> run.profile, "output_tail" -> run.outputTail)
@@ -510,9 +499,7 @@ struct RunRecord {
 std::unique_ptr<RdKafka::Producer> producer;
 
 void publish(const std::string& jobId, const std::string& tenant, const std::string& stage, const RunRecord& run) {
-  // TODO: key by the job id, carry profile/exit status/usage and digests instead of the output
-  // tail, keep the code and output out of the logs, configure an idempotent producer with acks=all,
-  // and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const json event = {{"id", jobId}, {"tenant", tenant}, {"stage", stage}, {"profile", run.profile}, {"output_tail", run.outputTail}};
   const auto payload = event.dump();
   std::clog << "sandbox event job=" << jobId << " output=" << run.outputTail << std::endl;
@@ -582,15 +569,12 @@ void publish(const std::string& jobId, const std::string& tenant, const std::str
 `,
     },
   },
-  debrief: `The interview question is "what does the audit stream actually have to contain?" A job’s
-lifecycle is only reconstructable if the events of that job arrive in order, which is a partition
-key decision: key by job id and one partition holds the whole story, key by profile and the story is
-scattered while unrelated jobs share a partition. The payload decision is the second half — an
-auditor needs to prove *which* code and *which* output a result describes, and a digest proves
-exactly that without copying tenant content into a topic that is retained for days and replicated
-across brokers; the output tail that felt helpful in a demo is the leak that outlives every
-retention policy the pipeline has. The third contract is durability on the failure path: a producer
-error is not an excuse to forget a finished job, so the event goes to an outbox row and a relay
-republishes it. Real platforms add a schema registry, per-tenant topic prefixes or ACLs, and a
-consumer that rebuilds job history into the platform’s audit warehouse.`,
+  debrief: `A job’s lifecycle is only reconstructable if its events arrive in order, and order is a partition
+decision: keyed by job id, one partition holds the whole story. The payload carries digests because
+an auditor needs to prove which code and which output a result describes, and a digest does that
+without copying tenant content into a topic that is retained for days and replicated across
+brokers; the output tail that helps in a demo outlives every retention policy. On the failure path
+the event goes to an outbox row and a relay republishes it, so a producer error does not erase a
+finished job. Production platforms register the event schema, isolate tenants with topic prefixes
+and ACLs, and run a consumer that folds the stream into an audit warehouse.`,
 };

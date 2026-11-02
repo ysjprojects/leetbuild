@@ -8,29 +8,23 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db'],
   task: `## Task
 
-The starter is working code: it produces to \`upload.event\`, the topic exists and
-the happy path emits events. Four defects hide in how and when it publishes. Find them, fix them, and
-prove the fix.
+**Starting point.** The starter is the event publisher: \`publish_part_stored\` and
+\`publish_upload_completed\` produce to the \`upload.event\` topic keyed by client id, the part event
+carries the part's bytes as \`payload\`, and the completion is sent before \`commit_object\` runs. The
+topic exists and the happy path emits events. It hides four flaws.
 
-Implement the upload event publisher. Three events are published to the \`upload.event\` topic:
-\`part.stored\`, \`session.expired\` and \`upload.completed\`.
+**Failure mode the checks target.** Keying by client scatters one upload's events across partitions,
+so a consumer sees \`upload.completed\` before the \`part.stored\` events that precede it; publishing
+before the commit lets a consumer act on an upload that is not there; a missing outbox means a broker
+blip loses the completion event; and copying part bytes into the event ships tenant content into a
+retained, replicated log.
 
 - Every event is keyed by the **upload id**, so all events for one upload land in the same partition
-  and their history stays ordered. The starter keys by client, so one upload's events scatter and a
-  consumer sees \`upload.completed\` before the \`part.stored\` events that precede it.
-- The \`upload.completed\` event is published **after the object commits**, not before. The starter
-  publishes first and commits afterwards, so a consumer can react to an upload whose object does not
-  exist yet — an upload that is invisible downstream is worse than a late event.
+  and their history stays ordered.
+- The \`upload.completed\` event is published **after the object commits**, not before.
 - When the broker rejects the produce, an **outbox row** is written so the event can be replayed.
-  The starter drops the event on the floor.
-- The event carries **part numbers and checksums**, never content: \`{"event":"part.stored",
-  "upload_id": …, "part_number": …, "size": …, "checksum": …}\`. The starter puts the part bytes in
-  the event, so the topic retains and replicates tenant content.
-
-**Failure mode the checks target.** Keying by client scatters one upload's events across partitions, so
-ordering is lost; publishing \`upload.completed\` before the object commits lets a consumer act on an
-upload that is not there; a missing outbox means a broker blip loses the completion event; and copying
-part bytes into the event ships tenant content into a retained, replicated log.`,
+- The event carries **part numbers and checksums**, not content: \`{"event":"part.stored",
+  "upload_id": …, "part_number": …, "size": …, "checksum": …}\`.`,
   sequence: {
     participants: ['Upload API', 'Object store', 'upload.event'],
     messages: [
@@ -42,9 +36,9 @@ part bytes into the event ships tenant content into a retained, replicated log.`
     ],
   },
   hints: [
-    'The key is the ordering guarantee: `key: uploadId` (or `Key: []byte(uploadID)`, or the first argument after the topic in the Java client). Key by client and one upload’s history splits across partitions; key by upload id and it stays in order.',
-    'Sequence the completion event after the object commit — `await commitObject(uploadId)` then the produce. If the object is not committed, the event describes something that does not exist yet, and a consumer that fans out on it races the commit.',
-    'Events carry part metadata, never bytes. If the produce fails, write an outbox row so a replay can publish later; dropping the event means a completed upload is invisible downstream. An idempotent producer keeps a retry from duplicating.',
+    'A thumbnail consumer reads `upload.completed`, fetches the object and gets a 404; later it sees `part.stored` events for the same upload arrive after the completion. Topic retention now holds raw tenant bytes.',
+    'Kafka orders only within a partition and the key chooses the partition; the produce runs before `commit_object`, the payload copies `data.hex()`, and a rejected produce has nowhere to land.',
+    'Produce with `key=upload_id`, move `producer.send` after `commit_object(upload_id)`, drop `payload` from the event dict, and on a produce exception insert an `outbox` row with the serialized event.',
   ],
   checks: [
     {
@@ -123,9 +117,7 @@ producer = KafkaProducer(bootstrap_servers="kafka:9092", acks="all")
 def publish_part_stored(
     client_id: str, upload_id: str, part_number: int, checksum: str, data: bytes
 ) -> None:
-    # TODO: this starter keys by client so one upload's events scatter across partitions, publishes
-    # upload.completed before the object commits, carries the part bytes in the event, and writes no
-    # outbox row when the broker rejects.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {
         "event": "part.stored",
         "upload_id": upload_id,
@@ -205,9 +197,7 @@ export async function publishPartStored(
   checksum: string,
   data: Buffer,
 ): Promise<void> {
-  // TODO: this starter keys by client so one upload's events scatter across partitions, publishes
-  // upload.completed before the object commits, carries the part bytes in the event, and writes no
-  // outbox row when the broker rejects.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const event: PartStoredEvent = {
     event: 'part.stored',
     upload_id: uploadId,
@@ -303,9 +293,7 @@ func PublishPartStored(
 	checksum string,
 	data []byte,
 ) error {
-	// TODO: this starter keys by client so one upload's events scatter across partitions, publishes
-	// upload.completed before the object commits, carries the part bytes in the event, and writes no
-	// outbox row when the broker rejects.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	value, _ := json.Marshal(map[string]any{
 		"event":       "part.stored",
 		"upload_id":   uploadID,
@@ -400,9 +388,7 @@ object UploadEvents {
       checksum: String,
       data: Array[Byte],
   ): Unit = {
-    // TODO: this starter keys by client so one upload's events scatter across partitions, publishes
-    // upload.completed before the object commits, carries the part bytes in the event, and writes no
-    // outbox row when the broker rejects.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val event =
       s"""{"event":"part.stored","upload_id":"$uploadId","part_number":$partNumber,"checksum":"$checksum","payload":"\${data.map("%02x".format(_)).mkString}"}"""
     producer.send(new ProducerRecord[String, String]("upload.event", clientId, event))
@@ -467,9 +453,7 @@ void PublishPartStored(
     long long partNumber,
     const std::string& checksum,
     const std::string& data) {
-  // TODO: this starter keys by client so one upload's events scatter across partitions, publishes
-  // upload.completed before the object commits, carries the part bytes in the event, and writes no
-  // outbox row when the broker rejects.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const auto event = "{\\"event\\":\\"part.stored\\",\\"upload_id\\":\\"" + uploadId +
                      "\\",\\"part_number\\":" + std::to_string(partNumber) +
                      ",\\"checksum\\":\\"" + checksum + "\\",\\"payload\\":\\"" + data + "\\"}";
@@ -535,5 +519,5 @@ void SendEvent(RdKafka::Producer* producer, const std::string& uploadId, const s
 `,
     },
   },
-  debrief: `The event path is where an upload's history becomes a contract with every downstream consumer. Keying by client is the subtle defect: Kafka orders within a partition, not across the topic, so a client-keyed topic delivers \`upload.completed\` before the \`part.stored\` events that produced it. Publishing the completion event before the object commits is the second one — the event describes a state that does not exist yet, and a consumer that fans out on it races the commit. The outbox is what makes the event durable when the broker blinks, and keeping the part bytes out of the event keeps tenant content out of a retained, replicated log. Real pipelines add a schema registry so a future producer cannot smuggle content in, and a consumer that commits its offset only after it has applied the event.`,
+  debrief: `The fix keys by upload id and publishes after the commit because the property it protects is that a consumer can replay one upload's history in order and every event it reads describes an object that exists. Kafka orders within a partition, not across the topic, so the key is the ordering guarantee; sequencing the produce after \`commit_object\` removes the race between the fan-out and the commit. The outbox makes the event durable when the broker blinks, and keeping part bytes out of the payload keeps tenant content out of a retained, replicated log. Production pipelines go further than this step: a schema registry so a future producer cannot smuggle content in, an idempotent producer so an outbox replay does not duplicate, and consumers that commit offsets only after applying the event.`,
 };

@@ -8,36 +8,24 @@ export const stateStep: Step = {
   focus: ['broker', 'redis'],
   task: `## Task
 
-**Starting point.** The starter is working code: it reads the window hash,
-decides there is room, increments the counter, and the demo shows a reservation. It compiles, it
-passes every serial test, and it oversells the window the moment two reserves overlap. Debug it,
-fix it, and prove the fix.
+**Starting point.** The starter serves the reserve route against Redis: it reads \`reserved\` from
+the hash \`quota:{team}\` with \`HGET\`, compares \`reserved + amount\` with a fixed \`LIMIT\` of
+64, then \`HINCRBY\`s the counter and returns a fresh uuid as the reservation id. It compiles and
+hides five flaws.
 
-Implement the reservation ledger behind the reserve endpoint:
+**Failure mode the checks target.** Two reserves that overlap both read \`reserved = 4\`, both pass
+the comparison and both increment, so the window oversells by the concurrency. The ledger also
+has no window in its key, no expiry, no reservation record and no release.
 
-- Reservations live in **one Redis hash per (team, window)**: \`quota:{team}:{window}\`, with the
-  fields \`limit\`, \`reserved\` and \`consumed\`, plus **one key per reservation**:
-  \`reservation:{team}:{reservation_id}\` holding its \`window\`, \`resource_class\` and \`amount\`.
-  The window belongs in the key — the cap is per window, and reservations from one window must never
-  be counted against the next.
-- **Take, release and expiry setup happen in one Lua script.** The starter calls \`HGET\` and then
-  \`HINCRBY\` from the client, so two callers both read \`reserved = 4\` against a limit of 8 and
-  both increment: the window oversells by exactly the concurrency. \`EVAL\` reads the counter,
-  compares and increments as a single step, so the loser sees the winner’s write.
-- The window key **expires**, set on the **first write** (and refreshed on every take), so the
-  ledger is not immortal. When the window closes, its key vanishes — which is the mechanism by which
-  unconsumed reservations return to the pool; the reservation keys expire with it.
-- A **released reservation refunds its own window**: the release script reads the reservation’s
-  recorded window and decrements that window’s \`reserved\` counter in the same script, so capacity
-  is available to the next caller immediately. A release that names a different window must be
-  refused instead of decrementing somebody else’s counter.
-
-**Failure mode the checks target.** Three things have to hold: the take is atomic (two concurrent
-reservations can never exceed the window’s limit), an expired window’s keys are gone rather than
-counted forever, and a release makes the capacity reservable again on the next call.
-
-**What to keep.** The hash-of-counters shape and the per-reservation key are right. The fix is the
-atomicity, the key scope and the expiry.`,
+- Key the hash by team and window: \`quota:{team}:{window}\` with fields \`limit\`, \`reserved\`,
+  \`consumed\`. Store each reservation under \`reservation:{team}:{reservation_id}\` with its
+  \`window\`, \`resource_class\` and \`amount\`.
+- Do the read, the compare, the increment and the \`EXPIRE\` in one Lua script \`RESERVE_LUA\` run
+  through \`eval\`. The TTL is \`TTL_S\`, set on the first write and refreshed on every take.
+- Add \`release(team, reservation_id, window)\` backed by \`RELEASE_LUA\`: in one script it reads
+  the reservation's recorded window, decrements that window's \`reserved\` and deletes the
+  reservation key. When the caller names a different window the script answers
+  \`WINDOW_MISMATCH\` and changes nothing.`,
   sequence: {
     participants: ['Quota Broker', 'Second Quota Broker', 'Redis'],
     messages: [
@@ -123,7 +111,7 @@ atomicity, the key scope and the expiry.`,
   ],
   code: {
     python: {
-      starter: `"""Reservation ledger: flawed code that reads and increments from the client."""
+      starter: `"""Reservation ledger behind the reserve endpoint."""
 import uuid
 
 import redis
@@ -144,10 +132,7 @@ class ReserveRequest(BaseModel):
 
 @app.post("/v1/quotas/{team}/reserve")
 def reserve(team: str, body: ReserveRequest) -> dict:
-    # TODO: this starter reads the counter and increments it in two separate commands, so two
-    # concurrent reserves both see the same free capacity; and it keys by team alone, so a
-    # reservation from an expired window still counts against the next one. Move the take, the
-    # check and the expiry into one Lua script and read (release) the reservation back out of it.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     key = f"quota:{team}"
     reserved = int(r.hget(key, "reserved") or 0)
     if reserved + body.amount > LIMIT:
@@ -251,7 +236,7 @@ def reserve_endpoint(team: str, body: ReserveRequest, caller: str = Header(alias
 `,
     },
     typescript: {
-      starter: `/** Reservation ledger: flawed code that reads and increments from the client. */
+      starter: `/** Reservation ledger behind the reserve endpoint. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {randomUUID} from 'node:crypto';
@@ -270,10 +255,7 @@ interface ReserveBody {
 app.post('/v1/quotas/:team/reserve', async (request, reply) => {
   const {team} = request.params as {team: string};
   const body = request.body as ReserveBody;
-  // TODO: this starter reads the counter and increments it in two separate commands, so two
-  // concurrent reserves both see the same free capacity; and it keys by team alone, so a
-  // reservation from an expired window still counts against the next one. Move the take, the
-  // check and the expiry into one Lua script and read (release) the reservation back out of it.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   const key = \`quota:\${team}\`;
   const reserved = Number((await r.hget(key, 'reserved')) ?? 0);
   if (reserved + body.amount > LIMIT) return reply.code(409).send({error: 'quota_exhausted'});
@@ -408,10 +390,7 @@ func reserve(rw http.ResponseWriter, r *http.Request) {
 	team := r.PathValue("team")
 	var body reserveRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter reads the counter and increments it in two separate commands, so two
-	// concurrent reserves both see the same free capacity; and it keys by team alone, so a
-	// reservation from an expired window still counts against the next one. Move the take, the
-	// check and the expiry into one Lua script and read (release) the reservation back out of it.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := "quota:" + team
 	reserved, _ := rdb.HGet(ctx, key, "reserved").Int()
 	if reserved+body.Amount > limit {
@@ -590,10 +569,7 @@ object StateApi {
     path("v1" / "quotas" / Segment / "reserve") { team =>
       post {
         entity(as[ReserveRequest]) { body =>
-          // TODO: this starter reads the counter and increments it in two separate commands, so two
-          // concurrent reserves both see the same free capacity; and it keys by team alone, so a
-          // reservation from an expired window still counts against the next one. Move the take,
-          // the check and the expiry into one Lua script and read (release) the reservation back.
+          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
           val key = s"quota:$team"
           val reserved = Option(jedis.hget(key, "reserved")).map(_.toInt).getOrElse(0)
           if (reserved + body.amount > Limit) {
@@ -739,10 +715,7 @@ int main() {
     const auto team = req.path_params.at("team");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this starter reads the counter and increments it in two separate commands, so two
-    // concurrent reserves both see the same free capacity; and it keys by team alone, so a
-    // reservation from an expired window still counts against the next one. Move the take, the
-    // check and the expiry into one Lua script and read (release) the reservation back out of it.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const auto key = "quota:" + team;
     auto reserved_raw = redis.hget(key, "reserved");
     const long long reserved = reserved_raw ? std::stoll(*reserved_raw) : 0;
@@ -874,19 +847,16 @@ int main() {
     },
   },
   hints: [
-    'One script, not three commands. `HGET` then compare then `HINCRBY` from the client leaves a window between the read and the write where a second reserve sees the same free capacity; `EVAL` makes the read, the compare and the increment a single step.',
-    'The window is part of the key, not a field. `quota:{team}:{window}` means a reservation can only be counted against the window it was taken from, and `EXPIRE` on that key — set on the first write — is what returns the pool when the window closes.',
-    'Release is a write, so it needs the same treatment: read the reservation’s own `window` from `reservation:{team}:{reservation_id}`, decrement that window’s counter and delete the reservation in one script. Refusing a release that names another window keeps an expired window from borrowing the next one’s capacity.',
+    "Serial tests pass. Under a concurrent reserve test the hash ends at `reserved = 72` against a limit of 64, and a reservation from last week's window still counts against today's.",
+    '`HGET`, compare, `HINCRBY` are three round trips; every caller in flight reads the same counter before any write lands. The key `quota:{team}` also has no window, so counters accumulate forever.',
+    'Move read, compare, `HINCRBY` and `EXPIRE` (`TTL_S`) into `RESERVE_LUA` on `quota:{team}:{window}`. Then `RELEASE_LUA` with `WINDOW_MISMATCH` and the `reservation:{team}:{reservation_id}` record cover the remaining checks.',
   ],
-  debrief: `The interview question behind this step is where the invariant lives. A quota check performed in
-the application is a read followed by a write, and the gap between them is proportional to
-concurrency — which is exactly when the check matters. Moving the take into Redis as one script
-makes the check and the mutation indivisible, so the second caller observes the first one’s
-reservation rather than the state before it. The key layout is the second half: capacity is per
-(team, window), so the window belongs in the key, and a TTL set on the first write is what makes
-abandoned reservations return to the pool without a reaper. The release path is the third: it must
-refund the window the reservation actually recorded, because a reservation whose window has expired
-has already been returned and must never decrement the next window’s counter. Real brokers add an
-in-flight counter for requests holding capacity across a call, a maximum hold time, and a durable
-replay of grants so a Redis flush cannot silently free everything.`,
+  debrief: `The invariant "reserved stays within limit" has to live where the write happens. A check in the
+application is a read followed by a write, and the gap between them is where concurrent callers
+land. One Lua script makes the compare and the increment indivisible, so the second caller observes
+the first one's take. The key layout follows from what the cap is per: capacity is per (team,
+window), so the window goes in the key, and a TTL on that key is how abandoned reservations return
+to the pool without a reaper. Release refunds the window the reservation recorded, not the one the
+caller names. Production ledgers also persist grants outside Redis so a flush cannot silently free
+every reservation, and bound how long one reservation may be held before it is reclaimed.`,
 };

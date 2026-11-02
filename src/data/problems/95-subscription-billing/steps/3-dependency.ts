@@ -8,13 +8,17 @@ export const processorClientStep: Step = {
   focus: ['billing', 'processor', 'db'],
   task: `## Task
 
-**Starting point.** The starter is working code for the processor client: it
-charges the invoice, loops three times over anything that throws, and returns a charge reference
-when the processor is healthy. The happy path bills correctly, so the demo passes and every defect
-sits in a branch a healthy processor never takes. Debug it like the billing owner and fix it.
+**Starting point.** The starter is the processor client of the billing run: it sends \`Charge\` for
+an invoice on the gRPC stub, loops over attempts when a call throws, and stores the charge reference
+on the invoice row when the processor answers. It compiles, the happy path bills correctly, and it
+hides five flaws.
 
-Implement the charge of one invoice against the payment processor's gRPC service — \`Charge\` and
-\`GetInvoice\` on the same stub:
+**Failure mode the checks target.** Every flaw sits in a branch a healthy processor never takes. The
+demo's processor answers at once and approves every card, so a stalled call, a lost reply and a
+declined card are never exercised. The first slow afternoon at the processor turns the same loop
+into duplicate charges, pinned workers and bounced cards hammered three times.
+
+The charge of one invoice uses \`Charge\` and \`GetInvoice\` on the same stub:
 
 - Every processor call carries a **5-second** deadline (\`PROCESSOR_DEADLINE_S\` /
   \`PROCESSOR_DEADLINE_MS\` / \`processorDeadline\` / \`ProcessorDeadlineS\` /
@@ -25,21 +29,14 @@ Implement the charge of one invoice against the payment processor's gRPC service
 - A \`DEADLINE_EXCEEDED\` is an unknown outcome, not a failure. Read the processor's invoice state
   with \`GetInvoice\` for the same invoice id **before** deciding anything, and adopt the charge
   reference it reports when the charge already landed instead of sending another one.
-- A hard decline — \`HARD_DECLINE\`, \`CARD_DECLINED\`, \`INSUFFICIENT_FUNDS\` — is terminal: one
+- A hard decline (\`HARD_DECLINE\`, \`CARD_DECLINED\`, \`INSUFFICIENT_FUNDS\`) is terminal: one
   attempt, then the invoice is marked \`failed\` with the decline code as its \`reason\`. A bounced
   card does not become healthy because you asked again.
-- Attempts are bounded by \`MAX_ATTEMPTS = 3\`, and only the failures a retry can change — the
-  deadline and an unavailable processor — may be retried. A decline is a business answer, not a
+- Attempts are bounded by \`MAX_ATTEMPTS = 3\`, and only the failures a retry can change, the
+  deadline and an unavailable processor, may be retried. A decline is a business answer, not a
   transport error.
 - Store the outcome on the invoice: the reference when the charge landed, \`failed\` and the reason
-  when the issuer refused it. Log the invoice id and the outcome, never card data.
-
-**Failure mode the checks target.** Every defect is invisible while the processor is healthy: three
-attempts over every error, a fresh \`uuid\` key minted inside the loop (so a retry is a brand-new
-charge and the customer is billed twice), no \`GetInvoice\` reconciliation after a timeout, a hard
-decline retried three times at the customer's issuer, no deadline at all, and a \`pending\` return
-with no reason when the loop runs out — an invoice that actually failed looking like one still on its
-way.`,
+  when the issuer refused it. Log the invoice id and the outcome, no card data.`,
   sequence: {
     participants: ['Billing Service', 'Payment processor', 'billing db'],
     messages: [
@@ -206,10 +203,7 @@ def charge(body: dict) -> dict:
 
 
 def charge_invoice(invoice: Invoice) -> dict:
-    # TODO: flawed code. It retries DECLINE_RETRIES times over every error, mints a
-    # fresh uuid as the idempotency key inside the loop, sets no deadline, never reconciles a
-    # timeout with GetInvoice, retries a hard decline at the customer's issuer and returns
-    # {"status": "pending"} with no reason once the attempts run out.
+    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     for attempt in range(DECLINE_RETRIES):
         try:
             reply = processor.Charge(
@@ -338,7 +332,7 @@ def confirm(invoice: Invoice, reference: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Billing run: charge an invoice on the payment processor (flawed). */
+      starter: `/** Billing run: charge an invoice on the payment processor. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
@@ -398,10 +392,7 @@ function unary<R>(
 }
 
 export async function chargeInvoice(invoice: Invoice): Promise<Record<string, string>> {
-  // TODO: flawed code. It retries declineRetries times over every error, mints a fresh
-  // randomUUID inside the loop as the key, sets no deadline, never reconciles a timeout with
-  // GetInvoice, retries a hard decline at the customer's issuer and reports 'pending' with no
-  // reason once the attempts run out.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   for (let attempt = 0; attempt < declineRetries; attempt++) {
     try {
       const reply = await unary<ChargeReply>((options, callback) =>
@@ -591,10 +582,7 @@ func (s *InvoiceStore) Save(invoice *Invoice) { s.rows[invoice.ID] = invoice }
 
 var store = &InvoiceStore{rows: map[string]*Invoice{}}
 
-// TODO: flawed code. It retries declineRetries times over every error, mints a fresh
-// uuid as the idempotency key inside the loop, sets no deadline, never reconciles a timeout with
-// GetInvoice, retries a hard decline at the customer's issuer and leaves the row pending with no
-// reason.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 func ChargeInvoice(ctx context.Context, client pb.ProcessorClient, invoice *Invoice) error {
 	for attempt := 0; attempt < declineRetries; attempt++ {
 		reply, err := client.Charge(ctx, &pb.ChargeRequest{
@@ -751,10 +739,7 @@ object ProcessorClient {
     def save(invoice: Invoice): Unit = rows(invoice.id) = invoice
   }
 
-  // TODO: flawed code. It retries DeclineRetries times over every error, mints a fresh
-  // UUID inside the loop as the idempotency key, sets no deadline, never reconciles a timeout with
-  // getInvoice, retries a hard decline at the customer's issuer and reports "pending" with no
-  // reason once the attempts run out.
+  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
   def chargeInvoice(invoice: Invoice): ChargeOutcome = {
     var attempt = 0
     while (attempt < DeclineRetries) {
@@ -901,9 +886,7 @@ ChargeOutcome outcome_for(const Invoice& invoice, const std::string& status) {
   return outcome;
 }
 
-// TODO: flawed code. It retries kDeclineRetries times over every error, mints a fresh
-// uuid inside the loop as the idempotency key, sets no deadline, never reconciles a timeout with
-// GetInvoice, retries a hard decline at the customer's issuer and reports "pending" with no reason.
+// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 ChargeOutcome ChargeInvoice(Processor::Stub* stub, const Invoice& invoice) {
   for (int attempt = 0; attempt < kDeclineRetries; attempt++) {
     ChargeRequest request;
@@ -1020,9 +1003,9 @@ std::string Reconcile(Processor::Stub* stub, const std::string& invoice_id) {
     },
   },
   hints: [
-    'The deadline and the key are the two things this client forgot. The deadline is an argument on the call itself (`timeout=`, `deadline: Date.now() + …`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) and the key has to be derived from the invoice (`invoice.id`), never minted — a freshly minted key is a new charge to the processor on every attempt.',
-    'A timeout is an unknown outcome, not a failure: the processor may have charged and lost the reply. Read its state with `GetInvoice` for the same invoice id first, adopt the reference it reports when the charge already landed, and only then decide whether another attempt is allowed — with the same key, so the processor can collapse it.',
-    'A decline is a business answer, not a transient error. `HARD_DECLINE`, `CARD_DECLINED` and `INSUFFICIENT_FUNDS` stop after the first attempt and mark the invoice `failed` with the code as its `reason`; only the deadline and an unavailable processor are worth another attempt, and `MAX_ATTEMPTS` bounds even those.',
+    'During a slow afternoon at the processor, customers whose charge timed out were billed twice, a declined card was hit three times in a row, and one billing worker sat on a stalled call for an hour.',
+    'The loop treats every exception the same, mints a new `uuid` key on each pass so the processor sees three distinct charges, sends no deadline, and reports `pending` with no reason when the attempts run out.',
+    'Key by `invoice.id`, call with the 5 s deadline, follow `DEADLINE_EXCEEDED` with `GetInvoice` before any retry, stop on `TERMINAL_DECLINES` and store `failed` plus the `decline_code`, bounded by `MAX_ATTEMPTS`.',
   ],
-  debrief: `All five checks are one question: what does this call know when it comes back empty-handed? A retry assumes the first attempt did nothing; a deadline means it may have done everything, which is why reconciliation beats retrying — \`GetInvoice\` for the same invoice id tells the client whether a charge exists and lets it adopt that reference instead of creating a second one. That is also why the invoice id, not a generated uuid, is the idempotency unit: a key only protects a customer if it survives the retry, the process restart and the reconciler that runs hours later, and the invoice is the only identifier stable across all three. A key minted per attempt does not make the retry safe, it makes it a new charge. Real processors add the rest of the picture: webhooks for the charges whose reply was lost, pending/authorized states a run must not treat as settled, settlement and payout files that reconcile the ledger days later, per-issuer retry windows that make a decline and a busy processor different answers, and a dunning workflow for soft declines — none of which belongs inside the client, and all of which start from the invoice-scoped key and the reconciliation read.`,
+  debrief: `All five checks are one question: what does this call know when it comes back empty-handed? A retry assumes the first attempt did nothing; a deadline means it may have done everything, which is why reconciliation beats retrying: \`GetInvoice\` for the same invoice id tells the client whether a charge exists and lets it adopt that reference instead of creating a second one. The invoice id is the idempotency unit because it survives the retry, the process restart and the reconciler that runs hours later; a key minted per attempt is a new charge. Production processors supply the rest: webhooks for charges whose reply was lost, pending and authorized states a run must not treat as settled, settlement files that reconcile the ledger days later, and dunning for soft declines, all of which start from the invoice-scoped key.`,
 };

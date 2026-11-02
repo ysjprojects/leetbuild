@@ -8,32 +8,28 @@ export const dependencyStep: Step = {
   focus: ['api', 'summarizer', 'redis'],
   task: `## Task
 
-The starter is working code: a summary eventually appears, so the demo passes.
-It has no deadline, no attempt bound, no shared span identity and no write guard. Find the flaws,
-fix them, and prove the fix.
+**Starting point.** The starter's \`summarize\` calls the \`Summarize\` RPC for the oldest span
+inside an open-ended loop, catches every \`RpcError\` and tries again, writes the reply to
+\`summary:{session}\` with a plain \`SET\`, and returns it to \`POST /v1/sessions/{id}/summaries\`.
+It serves the demo and hides four flaws.
 
-Implement the summarizer call the append path makes once the buffer overflows:
+**Failure mode the checks target.** A retry after a timeout must store exactly one summary, not two
+conflicting ones. A summarizer that stops answering must fail within a deadline instead of looping
+forever, and a worker that loses the race must return the winner's summary rather than its own.
 
-- The oldest span is summarized over **gRPC**. Every attempt carries a **1.5-second deadline**. The
-  starter has none, so one slow summarizer pins the worker and everything queued behind it.
-- At most **2 attempts** per span. The starter retries every error forever, so a provider outage
-  becomes a hot loop; a bounded retry fails fast and lets the next worker try.
+- Every attempt carries a **1.5-second deadline**, so one slow summarizer cannot pin the worker.
+- At most **2 attempts** per span; a bounded retry fails fast and lets the next worker try.
 - The span identity is deterministic:
-  \`summary:{tenant}:{session}:{first_turn_id}:{last_turn_id}\`. Two workers that pick up the same
-  span must address the same key, and the key must name the exact turns being summarized. A random
-  id lets both summarizers write and neither dedupe.
+  \`summary:{tenant}:{session}:{first_turn_id}:{last_turn_id}\`, so two workers that pick up the
+  same span address the same key, and the key names the exact turns being summarized.
 - The write is guarded with **\`SET ... NX\`**: the first writer wins, and a retry reads the stored
   summary instead of overwriting a newer one with a stale result.
 
-**Failure mode the checks target.** A retry after a timeout must store exactly one summary, not two
-conflicting ones. A summarizer that never answers must fail within the deadline instead of looping
-forever, and a worker that loses the race must return the winner's summary rather than its own.
-
 ## What to keep
 
-The span (the oldest turns plus the first and last turn id) and the gRPC reply shape are fine. The
-fix is the failure policy and the identity: a bounded, deadline-carrying retry under a
-deterministic key with a guarded write.`,
+The span (the oldest turns plus the first and last turn id) and the gRPC reply shape. The fix is
+the failure policy and the identity: a bounded, deadline-carrying retry under a deterministic key
+with a guarded write.`,
   sequence: {
     participants: ['Memory worker', 'Summarizer', 'Redis'],
     messages: [
@@ -47,9 +43,9 @@ deterministic key with a guarded write.`,
     ],
   },
   hints: [
-    'Bound both axes: a deadline per attempt and a cap on attempts. `withDeadlineAfter(1500, MILLISECONDS)` plus a loop that stops after 2 tries turns a provider outage from a hot loop into a fast, reportable failure.',
-    'The span identity is the dedupe key. `{session}:{first_turn_id}:{last_turn_id}` names exactly the turns being summarized, so two workers race on one key and a single `SET NX` decides the winner.',
-    'Read after the guarded write: `SET NX` returns false when the other worker won, so `GET key` and return the stored summary instead of the reply you just computed — that is what makes a retry store one summary, not two conflicting ones.',
+    'Symptoms: a summarizer outage pins every worker at 100% CPU with no error surfacing, and one span sometimes ends up with two different summaries after a retry.',
+    'Mechanism: `while True` plus `except RpcError: continue` has no clock and no counter; the key `summary:{session}` names no span, so a retry or a second worker overwrites whatever is there.',
+    'Fix: `for attempt in range(MAX_ATTEMPTS)` with `timeout=DEADLINE_MS / 1000`, a `span_identity` built from session, `first_turn_id` and `last_turn_id`, then `SET nx=True` and `GET` the key when it returns false.',
   ],
   checks: [
     {
@@ -142,9 +138,7 @@ class Span(BaseModel):
 
 
 def summarize(tenant: str, span: Span) -> str:
-    # TODO: give every attempt a 1.5-second deadline and stop after two attempts; derive the span
-    # identity from the session and the first and last turn id; write the summary with SET NX so a
-    # retry stores one summary instead of overwriting a newer one.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     while True:
         try:
             reply = summarizer.Summarize(
@@ -210,7 +204,7 @@ def make_summary(id: str, span: Span, tenant: str = Header(alias="X-Tenant-Id"))
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/summaries: flawed code that retries every RPC forever. */
+      starter: `/** POST /v1/sessions/:id/summaries: the starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -227,9 +221,7 @@ interface Span {
 }
 
 async function summarize(tenant: string, span: Span): Promise<string> {
-  // TODO: give every attempt a 1.5-second deadline and stop after two attempts; derive the span
-  // identity from the session and the first and last turn id; write the summary with SET NX so a
-  // retry stores one summary instead of overwriting a newer one.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   for (;;) {
     try {
       const reply = await summarizer.Summarize({tenant, session_id: span.session_id, turns: span.turns});
@@ -325,9 +317,7 @@ type span struct {
 }
 
 func summarize(ctx context.Context, tenant string, s span) (string, error) {
-	// TODO: give every attempt a 1.5-second deadline and stop after two attempts; derive the span
-	// identity from the session and the first and last turn id; write the summary with SetNX so a
-	// retry stores one summary instead of overwriting a newer one.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	for {
 		reply, err := summarizer.Summarize(ctx, &pb.SummarizeRequest{Tenant: tenant, SessionId: s.SessionID, Turns: s.Turns})
 		if err != nil {
@@ -449,9 +439,7 @@ object SummariesApi {
   val jedis = new Jedis("redis", 6379)
 
   def summarize(tenant: String, span: Span): Future[String] = {
-    // TODO: give every attempt a 1.5-second deadline and stop after two attempts; derive the span
-    // identity from the session and the first and last turn id; write the summary with NX so a
-    // retry stores one summary instead of overwriting a newer one.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     def attempt(): Future[String] =
       stub
         .summarize(SummarizeRequest(tenant, span.session_id, span.turns))
@@ -556,9 +544,7 @@ using json = nlohmann::json;
 std::unique_ptr<Summarizer::Stub> summarizer;
 
 std::string summarize(sw::redis::Redis& redis, const std::string& tenant, const json& body) {
-  // TODO: give every attempt a 1.5-second deadline and stop after two attempts; derive the span
-  // identity from the session and the first and last turn id; write the summary with SET NX so a
-  // retry stores one summary instead of overwriting a newer one.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   while (true) {
     grpc::ClientContext ctx;
     SummarizeRequest request;
@@ -656,13 +642,11 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is the failure policy of a dependent call. A summarizer
-is a slow, failure-prone dependency: it can be late, it can be down, and two workers can ask it the
-same thing at once. The starter handles none of the three. A per-attempt deadline stops one slow
-reply from pinning a worker; an attempt cap stops an outage from becoming a hot loop; a
-deterministic span identity makes concurrent summarizers collide on one key instead of producing
-two summaries for one span; and a guarded write makes the loser of the race read the winner's
-result instead of overwriting it with a stale one. The subtle part is the last: \`SET NX\` returning
-false is not an error, it is the correct outcome of a lost race, and the handler must return what is
-stored rather than what it computed.`,
+  debrief: `A summarizer can be late, it can be down, and two workers can ask it the same thing at once. The
+fix bounds the call on both axes and gives the span an identity: the deadline stops one slow reply
+from pinning a worker, the attempt cap stops an outage from becoming a hot loop, the key built from
+the first and last turn id makes concurrent summarizers collide, and the guarded write makes the
+loser read the winner's result. \`SET NX\` returning false is not an error but a lost race, so the
+handler returns what is stored. Production workers also back off with jitter between attempts and
+open a circuit when the summarizer fails for a whole window.`,
 };

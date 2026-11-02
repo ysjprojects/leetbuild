@@ -8,24 +8,22 @@ export const eventsStep: Step = {
   focus: ['kafka', 'consumer', 'store'],
   task: `## Task
 
-**Starting point.** A flag's history — created, updated, killed, rollout stage — is an event stream
-downstream consumers project. The starter is working code: it publishes an event to \`flag.event\`
-before the snapshot commits. It works on the demo and hides three flaws.
+**Starting point.** The starter's \`publish\` builds an event with the environment, the raw rule
+expression and the \`user_ids\` from a dry-run evaluation, produces it to \`flag.event\` keyed by
+environment, and only then calls \`store.commit\`. It serves the demo and hides four flaws.
 
-Publish \`flag.event\` for every flag change, after the change is durable.
+**Failure mode the checks target.** A flag's history (created, updated, killed, rollout stage) is an
+event stream downstream consumers project. A consumer can act on an update the store never
+committed, a flag's events scatter across partitions so its order is lost, a rejected produce
+disappears silently, and user ids from a test evaluation land in a retained, replicated topic.
 
-- The event is **keyed by the flag key**, so a flag's history stays ordered in one partition. The
-  starter keys by environment, so a flag's events scatter across partitions.
-- The payload carries the **version**, a **rule digest** and the **actor**; it must not carry **user
-  ids** or raw user values from a test evaluation. The starter ships \`user_ids\` from a dry run.
-- The event is published **after the snapshot commits** — a consumer must never see an event that
-  describes a snapshot the store does not have.
+- The event is **keyed by the flag key**, so a flag's history stays ordered in one partition.
+- The payload carries the **version**, a **rule digest** and the **actor**; it must not carry user
+  ids or raw user values.
+- The event is published **after the snapshot commits**, so a consumer only ever sees events whose
+  snapshot the store has.
 - When the broker rejects the produce, the event goes to an **outbox** row so it can be republished
-  without duplicating a committed change.
-
-**The subtle flaw.** The starter produces before \`store.commit\`, so a consumer can observe an update
-the store never committed; it keys by environment, so per-flag order is lost; and its payload leaks
-the user ids from the dry-run evaluation.`,
+  without duplicating a committed change.`,
   sequence: {
     participants: ['Flag API', 'Flag Store', 'Kafka', 'Consumer'],
     messages: [
@@ -111,8 +109,7 @@ TOPIC = "flag.event"
 
 
 def publish(producer, store, flag_key: str, environment: str, rules: list, user_ids: list) -> None:
-    # TODO: this starter produces before the snapshot commits, keys the event by environment, and
-    # publishes the rule expression together with the user ids from a test evaluation.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {
         "environment": environment,
         "rules": rules,
@@ -169,8 +166,7 @@ async function publish(
   rules: unknown,
   userIds: string[],
 ): Promise<void> {
-  // TODO: this starter produces before the snapshot commits, keys the event by environment, and
-  // publishes the rule expression together with the user ids from a test evaluation.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const event: FlagEvent = {environment, rules, userIds};
   await producer.send({topic: TOPIC, messages: [{key: environment, value: JSON.stringify(event)}]});
   await store.commit(flagKey);
@@ -234,8 +230,7 @@ type Event struct {
 }
 
 func Publish(ctx context.Context, writer *kafka.Writer, store SnapshotStore, flagKey string, environment string, rules string, userIds []string) error {
-	// TODO: this starter produces before the snapshot commits, keys the event by environment, and
-	// publishes the rule expression together with the user ids from a test evaluation.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	event := Event{Environment: environment, Rules: rules, UserIds: userIds}
 	payload, _ := json.Marshal(event)
 	if err := writer.WriteMessages(ctx, kafka.Message{Topic: Topic, Key: []byte(environment), Value: payload}); err != nil {
@@ -293,8 +288,7 @@ object Topic {
 }
 
 def publish(producer: KafkaProducer[String, String], flagKey: String, environment: String, rules: String, userIds: List[String]): Unit = {
-  // TODO: this starter produces before the snapshot commits, keys the event by environment, and
-  // publishes the rule expression together with the user ids from a test evaluation.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   val key = environment
   val payload = s"""{"environment":"$environment","rules":$rules,"userIds":\${userIds.mkString("[", ",", "]")}}"""
   producer.send(new ProducerRecord[String, String](Topic.name, key, payload))
@@ -333,8 +327,7 @@ using json = nlohmann::json;
 
 static const std::string topic = "flag.event";
 
-// TODO: this starter produces before the snapshot commits, keys the event by environment, and
-// publishes the rule expression together with the user ids from a test evaluation.
+// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 void publish(KafkaProducer& producer, SnapshotStore& store, const std::string& flag_key, const std::string& environment, const std::string& rules, const json& user_ids) {
   json event = {
       {"environment", environment},
@@ -376,9 +369,9 @@ void publish(KafkaProducer& producer, SnapshotStore& store, Outbox& outbox, cons
     },
   },
   hints: [
-    'Key the event by **flag key**, not by environment. A flag history only stays ordered when one flag always lands in one partition.',
-    'Commit the snapshot first, then produce. If you produce first, a consumer can act on a change the store never committed — and a failed produce needs an **outbox** row, not a silent drop.',
-    'The payload carries a version, a **rule digest** and the actor. It must never carry user ids or user values, even from a dry run: the event topic is retained and replicated.',
+    'A projection shows a flag at version 7 while the store still says 6, its history replays out of order after a rebalance, and a privacy audit finds test user ids in the topic.',
+    'The produce runs before `store.commit`, the message key is `environment` so one flag spans partitions, a broker rejection is not caught anywhere, and the payload copies `user_ids` straight in.',
+    'Commit first, then produce with `key=flag_key`, send `version`, a `rule_digest` and the `actor` instead of rules and user ids, and write a rejected produce to the `outbox`.',
   ],
-  debrief: `The interviewer is testing the ordering and privacy contract of a change feed. Three defects are checked: producing before the snapshot commits (a consumer sees an event the store lacks), keying by environment (per-flag order is lost across partitions), and leaking user ids from a dry-run evaluation into a retained topic. The rule digest lets a consumer detect a rule change without parsing an expression, and the outbox makes the produce recoverable without duplicating a committed change.`,
+  debrief: `Commit-then-produce is the shape because a change feed may lag the store but must not lead it; the outbox closes the gap on the other side, turning a rejected produce into a retry rather than a lost event. Keying by flag key uses Kafka's per-partition ordering to keep one flag's history in sequence, and a rule digest gives consumers a cheap "did the rules change" signal without an expression parser in every projection. Dropping user ids is less about this payload than about retention: a topic outlives the dry run that produced it. What the step did not do is drain the outbox; production services run a relay that republishes outbox rows in order and marks them sent.`,
 };

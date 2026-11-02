@@ -8,12 +8,13 @@ export const experimentClientStep: Step = {
   focus: ['api', 'stats'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the ramp route,
-validates the target, and asks the stats service before the percentage moves. It works on a demo
-whose metrics are green, and it removes the gate exactly when the gate matters. Debug it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/experiments/{id}/ramp\` with body
+\`{"to_percent": 60}\`, validates the target, and asks the stats service before the percentage moves.
+It works on a demo whose metrics are green. It serves the demo and hides 5 flaws.
 
-Implement \`POST /v1/experiments/{id}/ramp\` with body \`{"to_percent": 60}\`:
+**Failure mode the checks target.** The gate disappears exactly when it matters: a breached metric
+is retried until it clears, a stuck stats service holds the request open, the body can switch the
+check off, and a paused experiment is ramped without earning a fresh pass.
 
 - The tenant comes from \`X-Tenant-Id\`; a missing tenant is **401**. \`to_percent\` must be an
   integer, greater than the experiment's current percentage and at most **100**; anything else is
@@ -21,29 +22,20 @@ Implement \`POST /v1/experiments/{id}/ramp\` with body \`{"to_percent": 60}\`:
 - Before the new percentage is applied, ask the stats service over gRPC:
   \`CheckGuardrails(experiment_id, metric_bounds)\` with a **2 000 ms deadline**
   (\`timeout=2.0\` / \`{deadline: Date.now() + 2000}\` / \`context.WithTimeout(..., 2*time.Second)\` /
-  a Scala deadline of 2 seconds / \`ClientContext.set_deadline(..., milliseconds(2000))\`). The starter
-  gives the call five seconds, so a stuck stats service holds the ramp request open.
+  a Scala deadline of 2 seconds / \`ClientContext.set_deadline(..., milliseconds(2000))\`).
 - A breached bound **pauses** the ramp: persist the experiment \`paused\`, do **not** apply the new
-  percentage, and answer **409** with the offending metric —
+  percentage, and answer **409** with the offending metric:
   \`{"status": "paused", "metric": "error_rate", "limit": 0.05, "observed": 0.12}\`. The check runs
-  *before* the percentage moves, so a breach can never leak into the store as a ramp.
-- A \`PAUSED\` verdict is terminal for that request: it is never retried. Only a transient failure
-  — \`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\` — may be retried, at most once (\`MAX_GUARDRAIL_ATTEMPTS\`
-  = 2 attempts), and a check that never succeeds never applies the ramp.
+  *before* the percentage moves.
+- A \`PAUSED\` verdict is terminal for that request. Only a transient failure (\`UNAVAILABLE\`,
+  \`DEADLINE_EXCEEDED\`) may be retried, at most once (\`MAX_GUARDRAIL_ATTEMPTS\` = 2 attempts), and a
+  check that does not succeed does not apply the ramp.
 - Nothing in the body may override the gate: \`skip_guardrails\`, \`override\` or \`force\` is
-  **400**, and the bounds come from service config (\`GUARDRAIL_BOUNDS\`), never from the request.
-  A guardrail a caller can switch off is not a guardrail.
-- A \`paused\` experiment is not resumed by the stored flag: a ramp request re-runs the check for
-  that request, stays \`paused\` and answers **409** again while the breach is present, and only a
-  fresh pass lifts the pause and applies the percentage.
-- Log the experiment id, the metric and the observed value — never the raw request body.
-
-**Failure mode the checks target.** Two failures hide behind the happy path. The loud one is the
-retry: \`PAUSED\` is the stats service's *answer*, so looping on it until it clears deletes the gate
-while the metric is still breached, and every attempt pays the deadline again. The quiet one is the
-stored pause: a resume must earn a fresh check for *this* request, so the status is consulted but
-never substitutes for the call — otherwise an operator's pause is a flag the next cron ignores. And
-the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
+  **400**, and the bounds come from service config (\`GUARDRAIL_BOUNDS\`), not from the request.
+- A \`paused\` experiment is not resumed by the stored flag: a ramp request re-runs the check, stays
+  \`paused\` and answers **409** again while the breach is present, and only a fresh pass lifts the
+  pause and applies the percentage.
+- Log the experiment id, the metric and the observed value, not the raw request body.`,
   sequence: {
     participants: ['Ramp caller', 'Experiment API', 'Stats service'],
     messages: [
@@ -97,7 +89,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'deadline',
       title: 'Guardrail RPC carries a 2 s deadline',
       detail:
-        'Every `CheckGuardrails` attempt is created with an explicit 2 000 ms deadline — `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)` with `2 * time.Second`, `withDeadlineAfter(GuardrailDeadlineS, SECONDS)` or `ctx.set_deadline(..., milliseconds(kGuardrailDeadlineMs))`. The starter gives the call five seconds, so a stuck stats service holds the ramp request past the budget the platform promised.',
+        'Every `CheckGuardrails` attempt is created with an explicit 2 000 ms deadline: `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)` with `2 * time.Second`, `withDeadlineAfter(GuardrailDeadlineS, SECONDS)` or `ctx.set_deadline(..., milliseconds(kGuardrailDeadlineMs))`. The starter gives the call five seconds, so a stuck stats service holds the ramp request past the budget the platform promised.',
       match: {
         python: {all: [/GUARDRAIL_DEADLINE_S\s*=\s*2\.0/, /timeout\s*=\s*GUARDRAIL_DEADLINE_S/]},
         typescript: {
@@ -140,7 +132,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'no-override',
       title: 'A caller-supplied override is rejected',
       detail:
-        'A body field such as `skip_guardrails`, `override` or `force` is a **400** — rejected, never honoured — and the guardrail input (the bounds and the verdict) never comes from the request. The starter reads `skip_guardrails` from the body and skips the check, which turns the gate into a suggestion.',
+        'A body field such as `skip_guardrails`, `override` or `force` is a **400**, and the guardrail input (the bounds and the verdict) does not come from the request. The starter reads `skip_guardrails` from the body and skips the check, which turns the gate into a suggestion.',
       match: {
         python: {
           all: [/skip_guardrails/, /OVERRIDE_FIELDS/, /status_code\s*=\s*400/],
@@ -172,7 +164,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'no-retry-paused',
       title: 'A PAUSED verdict is terminal',
       detail:
-        'The verdict is read once: a `PAUSED` answer ends the request, and only `UNAVAILABLE` / `DEADLINE_EXCEEDED` are retried — at most `MAX_GUARDRAIL_ATTEMPTS = 2` attempts, never an unbounded `while`/`for` around the check. The starter loops until the check passes, holding the request open and ramping on a metric that is still breached.',
+        'The verdict is read once: a `PAUSED` answer ends the request, and only `UNAVAILABLE` / `DEADLINE_EXCEEDED` are retried, at most `MAX_GUARDRAIL_ATTEMPTS = 2` attempts, with no unbounded `while`/`for` around the check. The starter loops until the check passes, holding the request open and ramping on a metric that is still breached.',
       match: {
         python: {
           all: [/VERDICT_PAUSED/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_GUARDRAIL_ATTEMPTS/],
@@ -200,7 +192,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'fresh-check',
       title: 'A paused experiment needs a fresh pass',
       detail:
-        'The stored `paused` status is consulted for this request but never substitutes for the check: the ramp re-runs the guardrail call, stays `paused` and answers **409** while the breach is present, and only a fresh passing check lifts the pause and applies the percentage. The order matcher keeps the status ahead of the percentage. The starter never reads the stored status at all.',
+        'The stored `paused` status is consulted for this request but does not substitute for the check: the ramp re-runs the guardrail call, stays `paused` and answers **409** while the breach is present, and only a fresh passing check lifts the pause and applies the percentage. The order matcher keeps the status ahead of the percentage. The starter does not read the stored status at all.',
       match: {
         python: {
           all: [/experiment\[["']status["']\]\s*==\s*["']paused["']/, /status_code\s*=\s*409/],
@@ -265,10 +257,7 @@ store = ExperimentStore()
 
 @app.post("/v1/experiments/{experiment_id}/ramp")
 def ramp(experiment_id: str, body: dict, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
-    # PAUSED, gives the call a five-second deadline, and honours body["skip_guardrails"]. Make a
-    # breach pause the experiment with the metric named, retry only transient failures, and take
-    # no guardrail input from the request body.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     if tenant is None or tenant == "":
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
     experiment = store.get(experiment_id)
@@ -439,10 +428,7 @@ function callCheckGuardrails(experimentId: string): Promise<{verdict: string}> {
 }
 
 app.post('/v1/experiments/:id/ramp', async (request, reply) => {
-  // TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
-  // PAUSED, gives the call a five-second budget, and honours body.skip_guardrails. Make a breach
-  // pause the experiment with the metric named, retry only transient failures, and read no
-  // guardrail input from the request body.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
   if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const body = request.body as RampBody;
@@ -613,10 +599,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func ramp(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
-	// PAUSED, gives the call a five-second deadline, and honours body.SkipGuardrails. Make a breach
-	// pause the experiment with the metric named, retry only transient failures, and take no
-	// guardrail input from the request body.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	if r.Header.Get("X-Tenant-Id") == "" {
 		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
 		return
@@ -869,10 +852,7 @@ object RampRoutes {
       post {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
           entity(as[String]) { payload =>
-            // TODO: the starter ramps on a cron, retries the stats service until the verdict stops
-            // saying PAUSED, gives the call a five-second deadline, and honours the body's
-            // skip_guardrails field. Make a breach pause the experiment with the metric named,
-            // retry only transient failures, and read no guardrail input from the request body.
+            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
             if (!tenantOpt.exists(_.nonEmpty)) {
               complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
             } else {
@@ -1098,10 +1078,7 @@ int main() {
       res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
       return;
     }
-    // TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
-    // PAUSED, gives the call a five-second deadline, and honours body["skip_guardrails"]. Make a
-    // breach pause the experiment with the metric named, retry only transient failures, and take
-    // no guardrail input from the request body.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -1274,21 +1251,19 @@ int main() {
     },
   },
   hints: [
-    'The deadline belongs on the call, not around it: `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)`, `withDeadlineAfter(...)`, `ctx.set_deadline(...)`. Every retry pays that deadline again, and the loop in the starter has no exit at all.',
-    'Sort the outcomes by who decides. `PAUSED` is the stats service answering — terminal: persist `paused`, name the `metric` in a 409 and return before `applyPercent`. Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` mean "ask again", at most `MAX_GUARDRAIL_ATTEMPTS` (2) times, and a check that never succeeds leaves the percentage where it was.',
-    'The stored status is not the check. A ramp on a `paused` experiment must run the guardrail call for *this* request: a fresh pass lifts the pause, a breach keeps it `paused` and answers 409 again. And the body never decides any of it — `skip_guardrails` is a 400, not a shortcut; the bounds live in service config.',
+    'An experiment whose error rate has been over its bound for an hour still ramped to 60 % last night, and the ramp request that did it hung for twenty seconds before answering 200.',
+    'The starter loops on `CheckGuardrails` until the verdict stops saying `PAUSED`, with a five-second deadline per attempt; `skip_guardrails` in the body bypasses the loop, and the stored `paused` status is not read.',
+    'Treat `PAUSED` as terminal: persist `paused`, answer 409 naming the `metric`, and return before `apply_percent`. Retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED` up to `MAX_GUARDRAIL_ATTEMPTS`; reject `OVERRIDE_FIELDS` with 400.',
   ],
-  debrief: `The interviewer is testing whether you can debug the gate in front of traffic. A ramp step is
-not a schedule, it is a decision, and the decision belongs to the stats service: \`PAUSED\` is an
-answer, so retrying it until it clears is not resilience — it is deleting the gate while the metric
-is still breached, and every attempt pays the deadline again. Retry only what means "ask again"
-(\`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`, bounded at two attempts inside the 2 s budget the platform
-promised) and make every failure path return before the percentage moves, so a check that never
-succeeds leaves the experiment where it was. The stored \`paused\` status is the second half: a
-resume must earn a fresh pass for that request, never the flag alone, and the 409 that names the
-metric is what lets an operator see why traffic stopped. The override fields are the trust
-boundary: bounds live in config, and a caller who can skip the check holds an unauthenticated
-control plane. Real platforms add a cooldown between ramp attempts, an alert when an experiment
-stays paused, an audit record of every ramp decision with the metric that blocked it, and automatic
+  debrief: `The fix sorts outcomes by who decides. \`PAUSED\` is the stats service's answer, so the request
+ends there: persist \`paused\`, name the metric in the 409, and return before the percentage moves.
+Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` mean "ask again", and they are bounded at two attempts
+inside the 2 s budget because every retry pays the deadline again. The stored \`paused\` flag is
+consulted but does not stand in for the call, so a resume has to earn a fresh pass for this request.
+The override fields are the trust boundary: bounds live in config, and a caller who can skip the
+check holds an unauthenticated control plane.
+
+Production platforms add a cooldown between ramp attempts, an alert when an experiment stays
+paused, an audit record of every ramp decision with the metric that blocked it, and automatic
 resume only after a metric has held its bound for a full evaluation window.`,
 };

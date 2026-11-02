@@ -38,31 +38,26 @@ export const stateStep: Step = {
   },
   task: `## Task
 
-**Starting point.** You are the AI platform engineer on call. A double-clicked thumbs-up produced two
-ratings on the same answer, a scripted client flipped a score from \`-1\` to \`1\` by posting twice, and
-a support team found that "alice" on one tenant was blocking "alice" on another because the dedupe key
-dropped the tenant. The module below checks membership and then adds in two separate
-round trips, so two concurrent submits both read "not seen" and both write.
+**Starting point.** \`state\` exposes \`Dedupe.is_duplicate(tenant, user_id, request_id)\`: it builds
+a \`feedback:{user_id}:{request_id}\` member, runs \`SISMEMBER\` on the shared \`feedback:seen\` set,
+then \`SADD\` and \`EXPIRE\` in separate round trips. It serves the demo and hides five flaws.
 
-Debug \`state\` and make the ballot reservation impossible to race, then make it prove the fix.
+**Failure mode the checks target.** A double-clicked thumbs-up lands two ratings because both
+submits read "not seen" before either writes, and the same user id on two tenants blocks the other
+tenant's vote because the key drops the tenant.
 
-- The check and the add must be one atomic operation. Express it as a Lua script and run it with
-  \`EVAL\` — a \`SISMEMBER\` read followed by an \`SADD\` write is the bug, not the fix.
-- The dedupe key must be scoped by tenant, user and request id, so the same user id on two tenants
-  cannot collide and one user cannot re-vote on the same request.
-- The reservation must carry its own 30-day expiry. Set it with the set-if-absent (\`NX\` + \`EX\`) inside
-  the script, so a crash between "add" and "expire" cannot leave an immortal key.
-- The module must report whether *this* caller claimed the slot, so the caller writes exactly one row.
-- A second submit for the same key must be answered as a duplicate without storing another rating.
-
-**Failure mode the checks target.** A two-step "is it there? then add" lets concurrent duplicate submits
-store two ratings, and a key without the tenant lets user ids from different tenants block each other.
-The checks below require the one-script reservation, the tenant-scoped key, the atomic 30-day TTL, and a
-claim result the caller can branch on.`,
+- The check and the add are one atomic operation: a Lua script \`DEDUPE_SCRIPT\` run with
+  \`redis.eval\`, no \`SISMEMBER\` or \`SADD\`.
+- The key comes from \`dedupe_key(tenant, user_id, request_id)\` and reads
+  \`feedback:dedupe:{tenant}:{user_id}:{request_id}\`.
+- The script sets the key with \`'NX'\` and \`'EX'\` \`TTL_SECONDS\` (30 days), so a crash between add
+  and expire cannot leave an immortal key.
+- Rename the method to \`claim\` and \`return claimed == 1\`, so the endpoint writes a row only when
+  this caller took the slot and answers a repeat as a duplicate without another read.`,
   hints: [
-    'Two commands are not one operation. Write the reservation as a Lua script that does the set-if-absent and the expiry together, and run it with `redis.eval` / `script.Run` in a single round trip.',
-    'Build the key from all three parts — `feedback:dedupe:{tenant}:{user_id}:{request_id}` — so a user id means nothing without its tenant, and keep the key builder in its own named function so the scope is visible in review.',
-    'The script should answer `1` when it claimed the slot and `0` when the slot was already taken. `SET key value NX EX 2592000` gives you both the atomicity and the 30-day TTL; `claim` should return that result so the endpoint stores a row only on `1`.',
+    'Two users double-click a thumbs-up and the dashboard shows two votes on one answer; a tenant reports that its user "alice" cannot rate because another tenant has an "alice".',
+    '`SISMEMBER` and `SADD` are separate round trips, so both concurrent submits read "not seen" before either writes; the key `feedback:{user_id}:{request_id}` has no tenant in it.',
+    'Put `SET key value NX EX ttl` in `DEDUPE_SCRIPT`, run it with `redis.eval`, key by `dedupe_key(tenant, user_id, request_id)`, and have `claim` return `claimed == 1`. The checks cover the rest.',
   ],
   checks: [
     {
@@ -150,8 +145,7 @@ class Dedupe:
         self.redis = redis
 
     def is_duplicate(self, tenant: str, user_id: str, request_id: str) -> bool:
-        # TODO: this starter checks membership and then adds in two round trips, so a double click
-        # lands two ratings, and the key forgets the tenant so user ids collide across tenants.
+        # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
         key = f"feedback:{user_id}:{request_id}"
         if self.redis.sismember(SEEN_KEY, key):
             return True
@@ -205,8 +199,7 @@ export class Dedupe {
   constructor(private readonly redis: Redis) {}
 
   async isDuplicate(tenant: string, userId: string, requestId: string): Promise<boolean> {
-    // TODO: this starter checks membership and then adds in two round trips, so a double click
-    // lands two ratings, and the key forgets the tenant so user ids collide across tenants.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const key = \`feedback:\${userId}:\${requestId}\`;
     if (await this.redis.sismember(SEEN_KEY, key)) return true;
     await this.redis.sadd(SEEN_KEY, key);
@@ -267,8 +260,7 @@ func NewDedupe(client *redis.Client) *Dedupe {
 }
 
 func (d *Dedupe) isDuplicate(ctx context.Context, tenant, userID, requestID string) bool {
-	// TODO: this starter checks membership and then adds in two round trips, so a double click
-	// lands two ratings, and the key forgets the tenant so user ids collide across tenants.
+	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
 	key := "feedback:" + userID + ":" + requestID
 	if d.redis.SIsMember(ctx, seenKey, key).Val() {
 		return true
@@ -337,8 +329,7 @@ final class Dedupe(jedis: Jedis) {
 
   /** True when this (user, request) already voted. */
   def isDuplicate(tenant: String, userId: String, requestId: String): Boolean = {
-    // TODO: this starter checks membership and then adds in two round trips, so a double click
-    // lands two ratings, and the key forgets the tenant so user ids collide across tenants.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     val key = dedupeKey(userId, requestId)
     if (jedis.sismember(SeenKey, key)) {
       true
@@ -400,8 +391,7 @@ class Dedupe {
   explicit Dedupe(redisContext* ctx) : ctx_(ctx) {}
 
   bool isDuplicate(const std::string& tenant, const std::string& userId, const std::string& requestId) {
-    // TODO: this starter checks membership and then adds in two round trips, so a double click
-    // lands two ratings, and the key forgets the tenant so user ids collide across tenants.
+    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
     const std::string key = keyFor(userId, requestId);
     auto* member = redisCommand(ctx_, "SISMEMBER %s %s", kSeenKey.c_str(), key.c_str());
     const long long seen = member->integer;
@@ -456,11 +446,11 @@ class Dedupe {
   },
   debrief: `The ballot has to be reserved in one operation: \`SET key value NX EX ttl\` inside a script is a
 single atomic step, while \`SISMEMBER\` followed by \`SADD\` is two steps with a gap where a double click
-wins. Folding the expiry into the same step removes the other race — a key added but never expired —
+wins. Folding the expiry into the same step removes the other race, a key added but not expired,
 and scoping the key by tenant keeps "alice" on one tenant from silencing "alice" on another.
 
-Real systems keep the reservation result as the single source of truth: the endpoint writes a row only
-when the script answered \`1\`, so retries and duplicate submits are answered without a second read. The
-30-day TTL bounds how long the memory of a vote lasts; anything longer is a privacy decision, not a
-dedupe decision.`,
+Production collectors treat the script's answer as the only source of truth: the endpoint writes a
+row when the script returned \`1\` and answers a retry from the \`0\` without a second read. The 30-day
+TTL bounds how long the memory of a vote lasts; keeping it longer is a retention decision that lives
+outside this module.`,
 };

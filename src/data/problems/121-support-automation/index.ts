@@ -39,24 +39,14 @@ export const supportAutomationProblem: Problem = {
   ],
   statement: `# Support Automation Platform
 
-A guest asks the support assistant where their next reservation is. The model cannot know; it has to
-ask the platform to fetch the reservation, read the result, and only then answer. You own the
-platform in between: the thing that decides what context the model sees, which tools it may call,
-how many times it may think, what happens when a guardrail says no, and what gets recorded when a
-turn costs more than it should.
+A guest asks where their next reservation is. The model asks the platform to fetch it, then
+answers. You own the platform in between.
 
 ## The real system
 
-Airbnb's **Automation Platform** started as a workflow engine for conversational products: every
-support flow was a predefined, step-by-step workflow that product teams designed by hand. Version 2
-keeps those workflows and adds an LLM runtime around them. A **Chain of Thought workflow** uses the
-model as the reasoning engine that decides which tools to run and in which order; tools are the
-same actions and workflows v1 already ran, now behind a unified interface and a managed execution
-environment. **Context management** lets a product declare the context it needs instead of dumping
-everything it has. A **Guardrails Framework** runs reusable guardrails against what the model says
-and what it wants to do. **Observability** records latency and token usage for every LLM
-interaction. And the sensitive flows — claims, anything with strict validation — stay on
-traditional workflows, because an LLM is not yet predictable enough for them.
+Airbnb's **Automation Platform v2** wraps an LLM runtime around its v1 workflow engine; its
+Guardrails Framework runs reusable guardrails in parallel, including tool guardrails that block
+updating a listing with an invalid configuration.
 
 ## From the source
 
@@ -81,43 +71,18 @@ vocabulary, not numbers: the caps, TTLs, deadlines and iteration limits below ar
 
 ## What you build here
 
-One service, **apv2**, with five pieces:
-
-1. \`POST /v1/conversations/{id}/messages\`: the actor and role come from the verified bearer
-   token (**401** otherwise), never from the body; a non-empty \`text\` of at most **8 KiB**
-   (**413** above); a required \`Idempotency-Key\` so a client retry returns the same turn; the
-   turn is enqueued for the workflow and answered with **202** and a \`turn_id\`.
-2. **Context management** in Redis: the conversation's runtime context under
-   \`ctx:{tenant}:{conversation}\`, at most **40** items, a **24-hour** TTL refreshed on write,
-   appended and trimmed in one transaction; static context loaded only for the keys the product
-   declares; dynamic retrievers fetched per turn and cached for **5 minutes**, never written into
-   the conversation.
-3. The **Chain of Thought loop** over gRPC: \`Reason\` on the LLM Adapter with a **5 s** deadline,
-   at most **6** iterations, tools resolved through a registry (an unknown name is an outcome fed
-   back to the model, never a call), \`Invoke\` on the Tool Manager with a **3 s** deadline, and
-   write tools keyed by \`{turn}:{iteration}\` so a retry cannot apply the same change twice.
-4. The **guardrails framework**: \`relevance\`, \`groundedness\` and \`pii\` run in parallel under
-   one **2 s** deadline; a timeout is a failed verdict; any failed verdict blocks the answer and
-   hands the conversation to a human agent with the verdicts attached.
-5. **Observability** on Kafka: one \`assistant.trace\` event per LLM or tool call, keyed by
-   conversation, carrying ids, latency, token counts and guardrail verdicts and never message
-   text; an idempotent producer with \`acks=all\`; an outbox row when the broker rejects; a consumer
-   that updates the Redis metrics before it commits.
+One service, **apv2**: the turn endpoint (verified role, 8 KiB cap, \`Idempotency-Key\`, 202);
+the Redis context store (40 items, 24-hour TTL, declared context, cached retrievers); the
+reasoning loop (deadlines, 6 iterations, tool registry, keyed writes); the guardrail gate (parallel,
+2 s, fail closed, escalate); the trace topic (keyed by conversation, outbox, metrics before commit).
 
 ## The debugging habit
 
-Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
-it looks right. Your job in every step is the job you will have on a real AI feature: debug it
-against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
-fix with checks that fail on the starter and pass on your version.
+Each starter serves the happy path. Debug it, fix it, prove it.
 
 ## Left out on purpose
 
-The prompt store and prompt editor, the playground, point-in-time context for offline evaluation,
-tool registration and publishing, the LLM adapters themselves, the traditional workflows that
-sensitive flows still run on, and the human agent's console. The five pieces above are the ones
-that decide whether an LLM-driven support turn is bounded, grounded, safe to act on and
-accountable afterwards.`,
+Prompt store, playground, tool publishing, LLM adapters, agent console.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Guest · agent app', sub: 'POST …/messages', x: 6, y: 50},

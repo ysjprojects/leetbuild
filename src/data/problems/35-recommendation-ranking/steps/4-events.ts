@@ -8,42 +8,33 @@ export const eventsStep: Step = {
   focus: ['recsvc', 'kafka', 'consumer'],
   task: `## Task
 
-**Starting point.** The starter is working code: every ranked response publishes
-an impression and the counters move, so the exposure dashboard fills in. It also copies the raw
-feature values that ranked the items into a topic that is retained and replicated, keys the produce by
-the first item, and treats the produce as fire-and-forget. Debug it like the service owner, fix it,
-and prove the fix with the checks below.
+**Starting point.** The starter implements \`publish_impression(tenant, user_id, items,
+model_version, fallback)\`, how the Recommendation API reports what it showed after a ranking;
+\`items\` is the ranked list the response carried (at most \`MAX_ITEMS = 30\`, each with its \`id\`,
+\`score\` and zero-based \`position\`). It builds one event per response, produces it to
+\`recsys.impression\` through an idempotent producer, and the Impression consumer folds each event
+into per-item counters, so the exposure dashboard fills in. It serves the demo and hides four
+flaws.
 
-\`publish_impression(tenant, user_id, items, model_version, fallback)\` is how the Recommendation API
-reports what it showed after a ranking; \`items\` is the ranked list the response carried (at most
-\`MAX_ITEMS = 30\`, each item with its \`id\`, \`score\` and zero-based \`position\`). The Impression
-consumer folds each event into per-item counters.
+**Failure mode the checks target.** A replay that cannot reconstruct the order one user saw, a
+retained and replicated topic that quietly becomes a feature store nobody owns, an exposure row that
+cannot say which slot an item sat in or whether the list was degraded, and a served impression that
+the broker rejected and nobody will ever re-capture.
 
 - The produce key is the **user id** (\`key=user_id\`, \`key: userId\`, \`Key: []byte(userID)\`), so
-  every impression of one user lands on one partition in order — a user's exposure stream is only
-  replayable while it keeps that order. The starter keys by the id of the first item.
+  every impression of one user lands on one partition in order.
 - The payload carries identifiers and rendition facts only: \`candidate_ids\` (the candidates that
   were shown, in rank order), the \`positions\` they were rendered at, the \`model_version\` that
-  ranked them, and \`fallback\` when the ranking was degraded. Ids alone cannot say which slot an item
-  was seen in, and a degraded response is invisible in the counters without the flag.
-- Never a raw feature value (no \`features\`/\`vector\`/\`embedding\` array) and never user PII
-  (\`email\`, \`name\`): the topic is retained and replicated, so whatever is published there outlives
-  the request and the join the trainer was trying to skip.
+  ranked them, and \`fallback\` when the ranking was degraded.
+- No raw feature value (no \`features\`/\`vector\`/\`embedding\` array) and no user PII (\`email\`,
+  \`name\`): whatever is published there outlives the request.
 - The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\` with \`acks\`, KafkaJS's
   \`idempotent: true\`, \`RequireAll\` with the hash balancer), so a retried produce cannot publish the
   same impression twice.
-- When the broker rejects the produce, write the event as an **outbox** row
-  (\`outbox.put(...)\`) instead of dropping it; a relay republishes outbox rows when the broker
-  recovers. An impression that was served but never recorded cannot be re-captured.
+- When the broker rejects the produce, write the event as an **outbox** row (\`outbox.put(...)\`)
+  instead of dropping it; a relay republishes outbox rows when the broker recovers.
 - The consumer folds the event into the counters (\`HINCRBY impressions:{tenant}:{candidate_id} shown\`)
-  and **only then** commits the offset; commit first and a crash between the two loses the fold
-  forever.
-
-**Failure mode the checks target.** Keyed by the first item, one user's impressions scatter across
-partitions and the order the counters are reconciled against is gone; the feature values in a retained
-topic turn an event log into a training-time free-for-all, and no join has to be declared for a leak;
-the produce that the broker rejected is acknowledged anyway, so exposure that was actually served is
-missing from the counters and nothing will ever re-capture it.`,
+  and **only then** commits the offset.`,
   sequence: {
     participants: ['Recommendation API', 'recsys.impression', 'Impression consumer', 'Redis'],
     messages: [
@@ -213,8 +204,7 @@ outbox = OutboxStore()
 def publish_impression(
     tenant: str, user_id: str, items: list[RankedItem], model_version: str, fallback: bool
 ) -> None:
-    # TODO: key the produce by the user id, keep the feature values out of the payload, carry every
-    # item's position and the fallback flag, and write an outbox row when the broker rejects.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     event = {
         "id": str(uuid.uuid4()),
         "tenant": tenant,
@@ -358,8 +348,7 @@ export async function publishImpression(
   modelVersion: string,
   fallback: boolean,
 ): Promise<void> {
-  // TODO: key the produce by the user id, keep the feature values out of the payload, carry every
-  // item's position and the fallback flag, and write an outbox row when the broker rejects.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const event = {
     id: randomUUID(),
     tenant,
@@ -525,8 +514,7 @@ func (s *OutboxStore) Put(ctx context.Context, tenant, userID string, payload []
 var outbox = &OutboxStore{}
 
 func publishImpression(ctx context.Context, tenant, userID string, items []RankedItem, modelVersion string, fallback bool) {
-	// TODO: key the message by the user id, keep the feature values out of the payload, carry every
-	// item's position and the fallback flag, and store an outbox row when the broker rejects.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	candidateIDs := make([]string, 0, len(items))
 	features := make([][]float64, 0, len(items))
 	for _, item := range items {
@@ -708,8 +696,7 @@ object Impressions {
       modelVersion: String,
       fallback: Boolean
   ): Unit = {
-    // TODO: key the record by the user id, keep the feature values out of the payload, carry every
-    // item's position and the fallback flag, and write an outbox row when the broker rejects.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     val event = ImpressionEvent(
       id = java.util.UUID.randomUUID().toString,
       tenant = tenant,
@@ -867,8 +854,7 @@ auto producer = makeProducer();
 
 void publishImpression(const std::string& tenant, const std::string& userId, const std::vector<RankedItem>& items,
                        const std::string& modelVersion, bool fallback) {
-  // TODO: key the produce by userId, keep the feature values out of the payload, carry every item's
-  // position and the fallback flag, and write an outbox row when the broker rejects the produce.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   json candidateIds = json::array();
   json features = json::array();
   for (const auto& item : items) {
@@ -996,9 +982,11 @@ void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
     },
   },
   hints: [
-    'The message key is the partition key: `key=user_id`, `key: userId`, `Key: []byte(userID)`. Keyed by the first item, one user’s impressions land on different partitions and interleave with everyone else’s — the replay order the counters and the trainer both rely on is gone.',
-    'The payload is a join key, not a data dump. The trainer can join on `candidate_ids` against the feature store it already owns; copying the feature values into a retained, replicated topic only means the event becomes a de-facto feature store with no schema, no owner and no way to expire a value. Ids, `positions`, `model_version` and the `fallback` flag are what an exposure row needs.',
-    'The outbox is the durability half: catch the broker failure (`except KafkaException`, `catch`, `err != nil`) and write the event as a row the relay republishes. Without it a rejected produce is an impression that was served but never recorded, and nothing re-captures it — the counters just under-report.',
+    "A data engineer replaying one user's exposure stream gets items out of order, finds float arrays in a topic retained for days, cannot tell slot 1 from slot 30, and sees counters that under-report during a broker incident.",
+    "The record key is the first item id, so a user's events spread across partitions; the payload copies each item's feature values and omits positions and the fallback flag; the produce failure is logged and the event is discarded.",
+    'Produce with `key=user_id`; build the payload from `candidate_ids`, `positions`, `model_version` and `fallback` only; wrap the produce in `except KafkaException` (or the language equivalent) and call `outbox.put(event)` there.',
   ],
-  debrief: `The interviewer is testing whether you can debug a publish path that looks fire-and-forget and actually decides what the training pipeline can prove later. Three decisions are being checked, and each is invisible in the happy path. First the key: partitioning by user is what makes an exposure stream ordered and replayable; partitioning by item looks natural because every event is about items, and silently reorders a user’s shows. Second the payload: an event is a join key, not a transport for the features that produced it — publishing raw feature values into a topic retained for days turns a convenience into a data-retention problem, and the same payload is the obvious place a future edit adds an email. Third durability: \`acks=all\` and an idempotent producer protect against the client’s own retry duplicating an event, but only an outbox protects the impression the broker refused, and an impression no one recorded can never be reconstructed. Real pipelines add a schema registry so a producer cannot smuggle a new field into the topic, an event id the consumer dedupes on so a replay is idempotent, and a retention/compaction policy per topic; the counters themselves are folded before the offset is committed, so a crash replays the event instead of losing it.`,
+  debrief: `A publish path that looks fire-and-forget decides what the training pipeline can prove later. The key is the user because partitioning by user is what makes an exposure stream ordered and replayable; partitioning by item looks natural because every event is about items, and silently reorders a user's shows. The payload is a join key, not a transport for the features that produced it: raw feature values in a topic retained for days become a retention problem, and the same payload is where a future edit adds an email. \`acks=all\` with an idempotent producer protects against the client's own retry duplicating an event, but only an outbox protects the impression the broker refused.
+
+Production pipelines put a schema registry in front of the topic so a producer cannot smuggle in a new field, dedupe on an event id so a replay is idempotent, and set a retention or compaction policy per topic. The counters are folded before the offset is committed, so a crash replays the event instead of losing it.`,
 };

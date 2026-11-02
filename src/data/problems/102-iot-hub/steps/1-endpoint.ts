@@ -8,35 +8,28 @@ export const endpointStep: Step = {
   focus: ['client', 'hub', 'gateway'],
   task: `## Task
 
-**Starting point.** The starter is working code: it registers the route, parses the body and
-answers with a command id. It compiles, it serves the demo, and it hides three production flaws.
-Debug it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter registers \`POST /v1/devices/{id}/commands\`, parses
+\`{"idempotency_id", "action", "validity_s", "ack_required"}\`, mints a fresh \`command_id\` with
+\`uuid4\`, records \`{command_id, action}\` through \`command_store.record\` and answers
+\`state: "executed"\` with \`200\`. It compiles and hides four flaws.
 
-Implement \`POST /v1/devices/{id}/commands\`, the only way a command enters the fleet.
+**Failure mode the checks target.** A retried delivery with the same \`idempotency_id\` executes the
+action a second time; a command accepted for a device that is offline for days fires when it
+reconnects; one integration can enqueue unbounded work onto a single device; and the response
+claims execution the device has not confirmed.
 
-- The body is \`{"idempotency_id": "…", "action": "unlock", "validity_s": 300, "ack_required": true}\`;
-  the device id comes from the path and the caller's tenant from \`X-Tenant-Id\`.
-- \`idempotency_id\` identifies the **command**, not the request: a replay with the same
-  \`(device_id, idempotency_id)\` must return the recorded command and **never execute it a second
-  time** — a door that unlocks twice is the failure this field exists to prevent. Look the command up
-  before you execute anything and store it under the same pair.
-- The **validity window** bounds the command's life: store \`expires_at = now + validity_s\` (accept
-  \`validity_s\` in **1..3600**, \`400\` otherwise) and discard a command whose window has closed
-  **unexecuted** — replaying it after the window reports \`state: "expired"\` (\`410\`), not a second
-  execution. The starter keeps no window, so a command accepted for a device that is offline for days
-  fires long after the operator changed their mind.
-- The command rate is **per device**, not per caller: at most **10** commands per device per
-  **60-second** window, counted in a window key, with \`429\` when the device's budget is spent —
-  before the command reaches the gateway. One integration must not be able to flood a device.
-- The command carries an expected **acknowledgment**: record \`ack_required\` and return the command
-  in \`state: "pending_ack"\` (\`queued\` when no acknowledgment is expected), so "accepted" is never
-  confused with "executed".
+Requirements:
 
-**Failure mode the checks target.** The starter mints a fresh \`command_id\` per request and ignores the
-caller's idempotency id, so a retried delivery executes the side effect twice; it stores no validity
-window, so a command for an offline device fires days late; and it applies no per-device limit, so one
-misbehaving integration can enqueue unbounded work onto a single device. Each defect is invisible in a
-demo that sends one well-formed request and never retries.`,
+- The device id comes from the path, the caller's tenant from \`X-Tenant-Id\`.
+- Look the command up under \`(device_id, idempotency_id)\` with \`command_store.get\` before doing
+  anything else and store it with \`command_store.put\` under the same pair; a replay returns the
+  recorded command.
+- Store \`expires_at = now + validity_s\` (\`validity_s\` in 1..3600, \`400\` otherwise). A replay after
+  the window reports \`state: "expired"\` with \`410\` instead of executing.
+- Rate limit per device: at most \`COMMAND_RATE_LIMIT = 10\` commands per device per 60-second
+  window, counted in a window key, \`429\` when the budget is spent, before any gateway work.
+- Record \`ack_required\` and answer \`202\` with \`state: "pending_ack"\` (\`queued\` when no
+  acknowledgment is expected).`,
   sequence: {
     participants: ['Operator', 'IoT Hub', 'Command Store'],
     messages: [
@@ -65,9 +58,9 @@ demo that sends one well-formed request and never retries.`,
     ],
   },
   hints: [
-    'The idempotency id is the command’s identity, not a convenience: look it up under `(device_id, idempotency_id)` **before** you execute anything. A hit returns the recorded command; a miss stores the new one. Keying by a generated `command_id` — or by nothing — makes every retry a fresh command.',
-    'The validity window is a deadline, not a suggestion: compute `expires_at = now + validity_s`, store it with the command, and compare against it before execution. A command whose window has closed is discarded unexecuted, and a replay after the window reports `expired` instead of executing again.',
-    'Rate limiting is per device, not per caller: count commands in a window key (`commands:{device_id}:{window}` with `window = floor(now / 60)`), set its expiry with the window, and answer `429` when the device’s budget is spent — before the command reaches the gateway.',
+    'An operator app times out on a slow network and retries the unlock. The door unlocks twice and the hub reports both as `executed`.',
+    'Every request mints a new `command_id` with `uuid4` and records it, so the caller’s `idempotency_id` is read from the body and then discarded.',
+    'Call `command_store.get(device_id, idempotency_id)` first and `put` under the same pair; store `expires_at` and `ack_required`, answer `pending_ack`. The checks also cover `COMMAND_RATE_LIMIT` and `429`.',
   ],
   checks: [
     {
@@ -168,9 +161,7 @@ def submit_command(
     body: CommandRequest,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
-    # validity window so an old command fires days late, and applies no per-device rate limit so one
-    # caller can flood the device. Fix all three.
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     command_id = str(uuid.uuid4())
     command_store.record(device_id, {"command_id": command_id, "action": body.action})
     return JSONResponse({"command_id": command_id, "state": "executed"}, status_code=200)
@@ -255,7 +246,7 @@ def submit_command(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/devices/{id}/commands: flawed code that trusts the caller. */
+      starter: `/** POST /v1/devices/{id}/commands: accepts a command for one device. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -280,9 +271,7 @@ const commandStore: CommandStore = {
 };
 
 app.post('/v1/devices/:id/commands', async (request, reply) => {
-  // TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
-  // validity window so an old command fires days late, and applies no per-device rate limit so one
-  // caller can flood the device. Fix all three.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const deviceId = request.params['id'] as string;
   const body = request.body as CommandBody;
   const commandId = randomUUID();
@@ -422,9 +411,7 @@ func submitCommand(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
-	// validity window so an old command fires days late, and applies no per-device rate limit so one
-	// caller can flood the device. Fix all three.
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
 	commandID := uuid.NewString()
 	_ = commandStore.Record(deviceID, map[string]any{"command_id": commandID, "action": body.Action})
 	writeJSON(rw, http.StatusOK, map[string]any{"command_id": commandID, "state": "executed"})
@@ -584,9 +571,7 @@ object Api {
     path("v1" / "devices" / Segment / "commands") {
       post {
         entity(as[CommandRequest]) { body =>
-          // TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
-          // validity window so an old command fires days late, and applies no per-device rate limit so
-          // one caller can flood the device. Fix all three.
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
           complete(StatusCodes.OK, Command(java.util.UUID.randomUUID().toString, body.action, "executed"))
         }
       }
@@ -699,9 +684,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
-    // validity window so an old command fires days late, and applies no per-device rate limit so one
-    // caller can flood the device. Fix all three.
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     const auto deviceId = req.matches[1].str();
     const auto commandId = uuidString();
     commandStore.record(deviceId, json{{"command_id", commandId}, {"action", body.value("action", "")}});
@@ -806,14 +789,13 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a fleet.
-The starter reads fine because the demo sends one command from one operator and never retries.
-Three separate defects are being checked: command identity (the idempotency id makes a replay a no-op
-instead of a second unlock), the validity window (a command has a lifetime, and the hub must be able
-to drop one that outlived its usefulness without executing it), and per-device rate limiting (the
-device is the scarce resource, so the limit belongs to the device, not the caller). The acknowledgment
-field is the quiet one: "accepted" and "executed" are different promises, and only the device can turn
-the first into the second. Real hubs add per-device command quotas from device policy, signed command
-envelopes so the device trusts the sender, and a dead-letter path for commands that expire while they
-are still queued.`,
+  debrief: `The fix moves the lookup in front of the side effect: \`command_store.get(device_id,
+idempotency_id)\` runs before anything executes and the record is written under the same pair, so a
+retry finds the first command instead of minting a second one. The validity window lives in the
+stored record as \`expires_at\`, which is why a late replay can answer \`410\` without consulting the
+device. The rate limit counts per device because the device is the scarce resource; a per-caller
+limit would let two integrations flood one lock. \`pending_ack\` keeps "accepted" distinct from
+"executed" until the device reports back. A production hub also signs the command envelope so the
+device can verify the sender, and routes a command that expires while queued to a dead-letter topic
+for the operator to inspect.`,
 };

@@ -8,35 +8,27 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter is working code: it lists the calendar's events, expands each one,
-memoises the expansion and drops the instances the caller has cancelled. It compiles, it serves the
-demo, and it hides the production flaws behind one cache key. Debug it like the service owner, fix
-it, and prove the fix with the checks below.
-
-Implement the expansion and exception cache behind \`GET /v1/calendars/{id}/occurrences\` and
-\`POST /v1/calendars/{id}/exceptions\`:
-
-- Expansion slices are cached per **\`(calendar, range, generation)\`**: the key is
-  \`exp:{calendar}:{start}:{end}:{generation}\` and nothing else may key an expansion. A slice
-  cached by event id has no range and no generation to invalidate, so a modification of one
-  instance freezes every range that was ever asked for.
-- Every key expires: the slice is written with \`EXPIRE ... EXPANSION_TTL_S\` and the exceptions
-  hash with \`EXPIRE ... EXCEPTION_TTL_S\`, so no cache entry outlives the events it was derived
-  from.
-- The read path resolves the current generation, reads the slice of **that** generation and
-  overlays the exceptions hash in the **same atomic step** (one Lua \`EVAL\`): a \`cancelled\`
-  instance is never returned, a moved instance serves its overridden start, and the answer stamps
-  the generation it was served under.
-- Every change bumps the per-calendar generation first (\`INCR gen:{calendar}\`), then drops every
-  \`exp:{calendar}:*\` slice of the old generations, then writes the exception — one bump
-  invalidates all range slices at once.
-- The read path must never mix generations: the generation the script read is the generation the
-  answer carries, even when the slice had to be expanded and populated on a miss.
+**Starting point.** The starter serves \`GET /v1/calendars/{id}/occurrences\` and
+\`POST /v1/calendars/{id}/exceptions\`: it lists the calendar's events, expands each one, memoises
+the expansion in Redis under the event id and drops the instances the caller has cancelled. It
+compiles, serves the demo, and hides five flaws.
 
 **Failure mode the checks target.** A cache keyed by event id cannot distinguish ranges or
-generations, so a modification invalidates nothing; an overlay applied after the expansion has been
-read from Redis lets a cancellation land between the two commands, and one reader still ships the
-cancelled occurrence; and a key with no TTL serves state that outlives the events it came from.`,
+generations, so a modification invalidates nothing. An overlay applied in a second command after
+the expansion is read lets a cancellation land between the two, and that reader ships the
+cancelled occurrence. A key with no TTL outlives the events it came from.
+
+- Slices are cached per **\`(calendar, range, generation)\`** under
+  \`exp:{calendar}:{start}:{end}:{generation}\`; nothing else may key an expansion.
+- Every key expires: the slice with \`EXPIRE ... EXPANSION_TTL_S\`, the exceptions hash with
+  \`EXPIRE ... EXCEPTION_TTL_S\`.
+- The read path resolves the current generation, reads the slice of **that** generation and
+  overlays the exceptions hash in one Lua \`EVAL\`: a \`cancelled\` instance is dropped, a moved
+  instance serves its overridden start, and the answer stamps the generation it was served under,
+  even when the slice was populated on a miss.
+- Every change bumps the generation first (\`INCR gen:{calendar}\`), drops every
+  \`exp:{calendar}:*\` slice of the old generations, then writes the exception, so one bump
+  invalidates all range slices at once.`,
   sequence: {
     participants: ['Calendar client', 'Calendar API', 'Redis', 'Expansion worker'],
     messages: [
@@ -180,9 +172,7 @@ def expand_event(event: dict, start: str, end: str) -> list[dict]:
 
 @app.get("/v1/calendars/{calendar}/occurrences")
 def read_occurrences(calendar: str, start: str = Query(), end: str = Query()) -> dict:
-    # TODO: this starter caches each event's expansion by event id with no range bounds and no
-    # generation, filters the exceptions in a separate command after the expansion is read, and
-    # never expires anything. Fix all four.
+    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     occurrences: list[dict] = []
     for event in store.list_events(calendar):
         key = f"expansion:{event['id']}"
@@ -315,7 +305,7 @@ def apply_exception(calendar: str, body: ExceptionBody) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET occurrences + POST exceptions: flawed code that caches by event id. */
+      starter: `/** GET occurrences + POST exceptions: expansion cache for calendard. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -340,9 +330,7 @@ async function expandEvent(event: {id: string; rrule: string}, from: string, to:
 app.get('/v1/calendars/:calendar/occurrences', async (request, reply) => {
   const {calendar} = request.params as {calendar: string};
   const {start, end} = request.query as {start: string; end: string};
-  // TODO: this starter caches each event's expansion by event id with no range bounds and no
-  // generation, filters the exceptions in a separate command after the expansion is read, and
-  // never expires anything. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   const occurrences: Occurrence[] = [];
   for (const event of await store.listEvents(calendar)) {
     const key = \`expansion:\${event.id}\`;
@@ -535,9 +523,7 @@ func readOccurrences(rw http.ResponseWriter, r *http.Request) {
 	from := r.URL.Query().Get("start")
 	to := r.URL.Query().Get("end")
 	ctx := r.Context()
-	// TODO: this starter caches each event's expansion by event id with no range bounds and no
-	// generation, filters the exceptions in a separate command after the expansion is read, and
-	// never expires anything. Fix all four.
+	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
 	events, _ := (&store{}).listEvents(ctx, calendar)
 	occurrences := []occurrence{}
 	for _, event := range events {
@@ -781,9 +767,7 @@ object StateApi {
 
   def expandEvent(event: String, from: String, to: String): List[Occurrence] = Nil
 
-  // TODO: this starter caches each event's expansion by event id with no range bounds and no
-  // generation, filters the exceptions in a separate command after the expansion is read, and
-  // never expires anything. Fix all four.
+  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
   val route: Route =
     path("v1" / "calendars" / Segment / "occurrences") { calendar =>
       get {
@@ -999,9 +983,7 @@ int main() {
     const auto calendar = req.matches[1].str();
     const auto from = req.get_param_value("start");
     const auto to = req.get_param_value("end");
-    // TODO: this starter caches each event's expansion by event id with no range bounds and no
-    // generation, filters the exceptions in a separate command after the expansion is read, and
-    // never expires anything. Fix all four.
+    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
     json occurrences = json::array();
     for (const auto& event : store.listEvents(calendar)) {
       const auto key = "expansion:" + event;
@@ -1190,9 +1172,9 @@ int main() {
     },
   },
   hints: [
-    'Start with the key: one expansion slice belongs to `(calendar, start, end, generation)` — `exp:{calendar}:{start}:{end}:{generation}`. If the key is the event id, two ranges share one slice and a new generation has nothing to point at.',
-    'Do the overlay where the generation is read: one Lua script that `GET`s `gen:{calendar}`, `HGETALL`s the slice of that generation and `HGETALL`s the exceptions hash, drops `cancelled` instances and lets a moved one override its start. A separate `HGETALL` after the expansion read is exactly the race this step is about.',
-    'Close the write path: `INCR` the generation, sweep `exp:{calendar}:*`, then write the exception — and expire both the slice (`EXPANSION_TTL_S`) and the overlay (`EXCEPTION_TTL_S`). A cache without a TTL keeps serving a generation that no longer exists.',
+    'A user cancels next Tuesday, refreshes, and the instance is still in the week view; a day later a colleague on a different range sees it too, and it stays there until Redis restarts.',
+    'The slice is keyed by event id with no range, no generation and no TTL, and the exception is read in a second command, so a mid-read cancellation is missed and nothing invalidates the slice.',
+    'Key slices by `exp:{calendar}:{start}:{end}:{generation}`, `INCR gen:{calendar}` and sweep `exp:{calendar}:*` before each `hset`, overlay exceptions inside one `eval` of `READ_LUA`, and `expire` both keys.',
   ],
-  debrief: `The interview question behind this step is cache invalidation with a generation stamp. A cached expansion is only as good as the key that names it: per (calendar, range, generation) means one counter bump makes every slice of the old generation unreachable and the sweep reclaims them, while per-event keys silently freeze every range that was ever asked for. The second piece is the overlay: the exception and the slice it modifies must be read under one generation, which is why the read is a single Lua script — drop the cancelled instance and let the moved instance carry its new start before the answer leaves Redis. TTLs close the loop: every key is stamped with the generation that produced it and expires with the change budget, so a slow reader cannot resurrect a generation that no longer exists. Real calendar caches shard by calendar, cap the slices they keep per generation, and let the expansion worker publish a slice with a compare-and-set on the generation.`,
+  debrief: `A cached expansion is only as good as the key that names it: per (calendar, range, generation) means one counter bump makes every slice of the old generation unreachable and the sweep reclaims them, while per-event keys freeze every range ever asked for. The overlay lives inside one Lua script because the exception and the slice it modifies must be read under the same generation; dropping the cancelled instance and applying the moved start before the answer leaves Redis closes the window a second command opens. TTLs bound the damage of anything the sweep misses. Calendar caches at scale shard by calendar, cap the slices kept per generation, and let the expansion worker publish a slice with a compare-and-set on the generation.`,
 };

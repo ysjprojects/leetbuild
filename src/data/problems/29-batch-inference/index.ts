@@ -18,7 +18,8 @@ import {readStep} from './steps/5-read';
 export const batchInferenceProblem: Problem = {
   id: 'batch-inference',
   title: 'Batch Inference Service',
-  tagline: 'Big batch jobs that survive one bad shard and report honest partial progress.',
+  tagline:
+    'A million-record batch: idempotent submit, leased shards, contained failures, a status endpoint that counts live shards.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   tag: 'ai-systems',
@@ -27,23 +28,21 @@ export const batchInferenceProblem: Problem = {
 
 Batch inference is how most model work actually runs: a tenant hands over a manifest of a million
 records, a fleet of workers runs the model over shards of it, and someone polls a status endpoint
-for the result. The interesting parts are never the model call — they are whether the job started
+for the result. The interesting parts are not the model call. They are whether the job started
 twice, whether a worker that died took its shard with it, whether one poisoned record can fail the
-whole batch, and whether the status endpoint tells the truth while shards are still running.
+whole batch, and whether the status endpoint reports the real state while shards are still running.
 
 ## The real system
 
-Production batch services are exercises in honesty and idempotency under partial failure. A submit is
-keyed by an \`Idempotency-Key\` so a client retry returns the same job instead of minting a second
-one. The input manifest is validated and made durably readable *before* any shard is enqueued, so a
-worker never races a half-written input. Shards are claimed from a work set with a lease and a
-heartbeat, so a worker crash expires its claim and the shard is retried by someone else rather than
-silently lost. Each shard calls the model under a deadline with a bounded retry policy, and a shard
-that still fails is recorded as failed without cancelling its siblings; the batch finishes with an
-explicit failed count instead of a blanket success. Completed shards publish one event keyed by the
-batch, only after the output is flushed and checksummed, with an outbox row when the broker rejects
-the produce. And the status endpoint derives progress from the live shard set — it never reports
-success while any shard is still pending, and it never hands one tenant another tenant's outputs.
+OpenAI's Batch API is the documented shape of this service. A batch is created from an uploaded JSONL
+file of at most 50,000 requests and 200 MB, with a fixed 24-hour completion window. The batch object
+moves through \`validating\`, \`in_progress\`, \`finalizing\` and then \`completed\`, \`failed\`, \`expired\` or
+\`cancelled\`, and carries \`request_counts\` with \`total\`, \`completed\` and \`failed\`. Successful outputs
+land in one file (\`output_file_id\`) and failed requests in a separate error file (\`error_file_id\`),
+so a partial batch is reported as partial rather than as a success. Internally the same mechanics
+apply: an idempotent submit, a validated input before any work starts, shards claimed under a lease
+so a crashed worker's work is retried, per-record failures contained to their record, and progress
+derived from what the workers have actually finished.
 
 ## What you build here
 
@@ -69,9 +68,9 @@ One service, **batchd**, and its workers, with five pieces:
 ## The debugging habit
 
 Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
-looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
-failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
-that fail on the starter and pass on your version.
+looks right. Your job in every step is to debug it against the failure modes, find the subtle one, fix
+it, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
+your version.
 
 ## Left out on purpose
 
