@@ -19,10 +19,10 @@ export const fairHousingGuardrailProblem: Problem = {
   id: 'fair-housing-guardrail',
   title: 'Fair Housing Guardrail',
   tagline:
-    "Zillow's Fair Housing guardrail for an LLM assistant: stop list, classifier and judge tuned for recall, versioned policy, a steer-away reply and an audit trail — reviewed like production.",
+    "Zillow's Fair Housing guardrail for an LLM assistant: stop list, classifier and judge tuned for recall, versioned policy, a steer-away reply and an audit trail.",
   difficulty: 'hard',
   concepts: ['http', 'grpc', 'redis', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 75,
   company: ZILLOW,
   sources: [
@@ -112,12 +112,12 @@ One service, **fhguard**, with five pieces:
    score, reasons, policy version and a text hash, never the text — from an idempotent producer with
    an outbox, consumed into an append-only audit store before the offset commit.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

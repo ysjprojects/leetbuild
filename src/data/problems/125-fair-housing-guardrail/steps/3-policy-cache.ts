@@ -8,9 +8,9 @@ export const policyCacheStep: Step = {
   focus: ['guard', 'redis', 'policy'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the policy loads, decisions
+**Starting point.** The starter is working code: the policy loads, decisions
 are cached, strikes count up, and the demo is fast on the second request. It hides four production
-flaws, the first of which means a legal team's stop-list update never reaches production. Review
+flaws, the first of which means a legal team's stop-list update never reaches production. Debug
 it, fix it, and prove the fix.
 
 Implement the Redis layer the guard reads on every request:
@@ -30,7 +30,7 @@ Implement the Redis layer the guard reads on every request:
   \`fh:strikes:{conversation_id}\` and sets \`STRIKE_TTL_S = 86400\` on the first increment, so a
   conversation's count resets after a day instead of living forever.
 
-**Failure mode the checks target.** The draft caches the policy under a version-less key with no
+**Failure mode the checks target.** The starter caches the policy under a version-less key with no
 TTL, and \`publish\` only writes the store — every reader keeps the first policy it ever loaded until
 Redis is flushed. The decision cache uses the raw text as the key: the most sensitive strings the
 service sees are now Redis keys, visible in \`KEYS\`, \`SCAN\` and every dump, and a policy change
@@ -57,7 +57,7 @@ does not invalidate them. Strikes without a TTL turn one bad week into a permane
       id: 'versioned-policy',
       title: 'Caches the policy per version with a one-hour TTL',
       detail:
-        'The policy is cached under `fh:policy:{version}` with `POLICY_TTL_S = 3600`, loaded from the store on a miss. The draft uses one version-less key without a TTL, so no publish ever reaches a running reader.',
+        'The policy is cached under `fh:policy:{version}` with `POLICY_TTL_S = 3600`, loaded from the store on a miss. The starter uses one version-less key without a TTL, so no publish ever reaches a running reader.',
       match: {
         python: {all: [/fh:policy:\{version\}/, /POLICY_TTL_S\s*=\s*3600/, /ex=POLICY_TTL_S/, /store\.load_policy\(/]},
         typescript: {
@@ -79,7 +79,7 @@ does not invalidate them. Strikes without a TTL turn one bad week into a permane
       id: 'atomic-publish',
       title: 'Publishes the version and swaps the active pointer in one transaction',
       detail:
-        '`publish` writes `fh:policy:{version}` and `fh:policy:active` inside one MULTI/EXEC transaction. The draft only writes the store, so the cache never changes; two separate writes would let a reader resolve a version that is not cached yet.',
+        '`publish` writes `fh:policy:{version}` and `fh:policy:active` inside one MULTI/EXEC transaction. The starter only writes the store, so the cache never changes; two separate writes would let a reader resolve a version that is not cached yet.',
       match: {
         python: {all: [/fh:policy:active/, /pipeline\(transaction=True\)/, /\.execute\(\)/]},
         typescript: {all: [/fh:policy:active/, /\.multi\(\)/, /\.exec\(\)/]},
@@ -92,7 +92,7 @@ does not invalidate them. Strikes without a TTL turn one bad week into a permane
       id: 'versioned-decision',
       title: 'Caches decisions by (version, text hash) for a day',
       detail:
-        'A decision is stored under `fh:decision:{version}:{text_hash}` with `DECISION_TTL_S = 86400`. The draft’s key has no version, so a policy change keeps serving stale verdicts, and no TTL, so the cache grows forever.',
+        'A decision is stored under `fh:decision:{version}:{text_hash}` with `DECISION_TTL_S = 86400`. The starter’s key has no version, so a policy change keeps serving stale verdicts, and no TTL, so the cache grows forever.',
       match: {
         python: {all: [/fh:decision:\{version\}:\{text_hash\}/, /DECISION_TTL_S\s*=\s*86_?400/, /ex=DECISION_TTL_S/]},
         typescript: {
@@ -107,7 +107,7 @@ does not invalidate them. Strikes without a TTL turn one bad week into a permane
       id: 'hash-not-text',
       title: 'Hashes the text; raw text never becomes a key',
       detail:
-        'The decision key uses the SHA-256 of the text. The draft puts the raw user text in the key — protected-class queries become Redis keys, visible to `SCAN` and every dump.',
+        'The decision key uses the SHA-256 of the text. The starter puts the raw user text in the key — protected-class queries become Redis keys, visible to `SCAN` and every dump.',
       match: {
         python: {all: [/hashlib\.sha256\(/], none: [/fh:decision:\{text\}/]},
         typescript: {all: [/createHash\(\s*'sha256'\s*\)/], none: [/fh:decision:\$\{text\}/]},
@@ -120,7 +120,7 @@ does not invalidate them. Strikes without a TTL turn one bad week into a permane
       id: 'strikes-expire',
       title: 'Strike counters expire after a day',
       detail:
-        '`fh:strikes:{conversation_id}` is incremented and given `STRIKE_TTL_S = 86400` on its first increment. The draft increments without an expiry, so a conversation is flagged forever.',
+        '`fh:strikes:{conversation_id}` is incremented and given `STRIKE_TTL_S = 86400` on its first increment. The starter increments without an expiry, so a conversation is flagged forever.',
       match: {
         python: {all: [/fh:strikes:\{conversation_id\}/, /STRIKE_TTL_S\s*=\s*86_?400/, /\.expire\(/]},
         typescript: {all: [/fh:strikes:\$\{conversationId\}/, /STRIKE_TTL_S\s*=\s*86_?400/, /\.expire\(/]},
@@ -260,7 +260,7 @@ def record_strike(conversation_id: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** Policy and decision cache: a model-generated draft with version-less keys and no TTLs. */
+      starter: `/** Policy and decision cache: flawed code with version-less keys and no TTLs. */
 import {Redis} from 'ioredis';
 
 import {store} from './policy_store';
@@ -808,5 +808,5 @@ long long recordStrike(const std::string& conversationId) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you see a cache as part of the control plane. A guard's policy is edited by lawyers and must reach production when they publish it; the draft's version-less, TTL-less key makes every publish a no-op, which is the worst kind of bug because the dashboard says the new stop list is live. Four defects are being checked: the version in the policy key with a TTL and a store fallback; the publish as one transaction so the active pointer never leads to a missing policy; the decision cache keyed by version and hash so a retry is free but a policy change is not silently ignored; and the strike expiry, because "flagged forever" is a product and fairness problem of its own. The raw-text key is the one candidates miss: the most sensitive strings this service handles must not be enumerable with \`SCAN\`. Real systems add a policy checksum in the audit event, a pre-warm of the new version before the swap, and a per-version decision-cache purge on emergency rollback.`,
+  debrief: `The interviewer is testing whether you see a cache as part of the control plane. A guard's policy is edited by lawyers and must reach production when they publish it; the starter's version-less, TTL-less key makes every publish a no-op, which is the worst kind of bug because the dashboard says the new stop list is live. Four defects are being checked: the version in the policy key with a TTL and a store fallback; the publish as one transaction so the active pointer never leads to a missing policy; the decision cache keyed by version and hash so a retry is free but a policy change is not silently ignored; and the strike expiry, because "flagged forever" is a product and fairness problem of its own. The raw-text key is the one candidates miss: the most sensitive strings this service handles must not be enumerable with \`SCAN\`. Real systems add a policy checksum in the audit event, a pre-warm of the new version before the swap, and a per-version decision-cache purge on emergency rollback.`,
 };

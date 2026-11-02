@@ -8,7 +8,7 @@ import {completionTelemetryStep} from './steps/4-completion-telemetry';
 
 /**
  * GitHub Copilot's completion context, rebuilt as the service behind an editor's ghost text and
- * reviewed like production: a request that fits the ~6,000-character window → neighboring-tab
+ * debugged like production: a request that fits the ~6,000-character window → neighboring-tab
  * snippets cached per session and ranked with a very low bar → a fill-in-the-middle call under a
  * keystroke deadline that shows at most the n it generated → shown/accepted telemetry that carries
  * ids and sizes and never code.
@@ -17,10 +17,10 @@ export const copilotContextProblem: Problem = {
   id: 'copilot-context',
   title: 'Completion Context',
   tagline:
-    "GitHub Copilot's prompt path: a 6,000-character window, neighboring-tab snippets, fill-in-the-middle under a keystroke deadline, and acceptance telemetry without the code — reviewed like production.",
+    "GitHub Copilot's prompt path: a 6,000-character window, neighboring-tab snippets, fill-in-the-middle under a keystroke deadline, and acceptance telemetry without the code — debugged like production.",
   difficulty: 'easy',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 45,
   company: GITHUB,
   sources: [
@@ -112,12 +112,12 @@ One service, **completiond**, with four pieces:
    idempotent producer with \`acks=all\`, and a consumer that updates
    \`HINCRBY acceptance:{language}\` before it commits.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['api', 'db', 'kafka', 'projection'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a scan arrives, an event goes
+**Starting point.** The starter is working code: a scan arrives, an event goes
 out, a projector consumes it and the timeline grows. Three contracts of the topic are broken, and
-none of them shows in a demo where one carrier scans one parcel in order. Review it, fix it, and
+none of them shows in a demo where one carrier scans one parcel in order. Debug it, fix it, and
 prove the fix with the checks below.
 
 Your job is \`publish_status_change(shipment, scan)\`, called after the state store accepted a scan.
@@ -56,7 +56,7 @@ own history instead of a projection of it.`,
       id: 'shipment-key',
       title: 'Publishes keyed by shipment id',
       detail:
-        'The message key is the shipment id, so one shipment’s events share a partition and its timeline stays ordered. The draft keys by carrier, which scatters one shipment’s events across partitions and lets the projector apply a delivery before the scans that preceded it.',
+        'The message key is the shipment id, so one shipment’s events share a partition and its timeline stays ordered. The starter keys by carrier, which scatters one shipment’s events across partitions and lets the projector apply a delivery before the scans that preceded it.',
       match: {
         python: {all: [/key=shipment_id/, /\.produce\(/]},
         typescript: {all: [/key:\s*shipmentId/, /producer\.send\(/]},
@@ -69,7 +69,7 @@ own history instead of a projection of it.`,
       id: 'city-granularity',
       title: 'Carries the scan city, nothing finer',
       detail:
-        'The event’s location is the scan city (`scan_city`), not a street address: the timeline needs "which city, when", and the last-mile detail stays in the carrier’s system. The draft copies the recipient’s full address into the topic.',
+        'The event’s location is the scan city (`scan_city`), not a street address: the timeline needs "which city, when", and the last-mile detail stays in the carrier’s system. The starter copies the recipient’s full address into the topic.',
       match: {
         python: {all: [/scan_city/, /"scan_city"/]},
         typescript: {all: [/scan_city:|"scan_city"/, /scan\.scan_city/]},
@@ -82,7 +82,7 @@ own history instead of a projection of it.`,
       id: 'no-address',
       title: 'No recipient address or name in the event or the logs',
       detail:
-        'Neither the payload nor any log line carries a recipient address, street, postcode or name. The topic is retained for days and replicated, so the draft’s last-mile address outlives every retention policy the request pipeline has.',
+        'Neither the payload nor any log line carries a recipient address, street, postcode or name. The topic is retained for days and replicated, so the starter’s last-mile address outlives every retention policy the request pipeline has.',
       match: {
         python: {none: [/\baddress/i, /\bstreet/i, /\bpostal/i, /\bzip\b/i, /\brecipient\b/i]},
         typescript: {none: [/\baddress/i, /\bstreet/i, /\bpostal/i, /\bzip\b/i, /\brecipient\b/i]},
@@ -95,7 +95,7 @@ own history instead of a projection of it.`,
       id: 'publish-after-commit',
       title: 'Produces only after the state store commits',
       detail:
-        'The state store commits the scan first and the event is produced after it, so the event describes a state that already exists. The draft produces first and commits afterwards, which invents timeline entries for statuses the store never accepted.',
+        'The state store commits the scan first and the event is produced after it, so the event describes a state that already exists. The starter produces first and commits afterwards, which invents timeline entries for statuses the store never accepted.',
       match: {
         python: {order: [/store\.commit_status\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.commitStatus\(/, /producer\.send\(/]},
@@ -108,7 +108,7 @@ own history instead of a projection of it.`,
       id: 'envelope',
       title: 'Carries state, carrier reference and timestamp',
       detail:
-        'The event envelope carries the shipment id, the status, the scan city, a carrier reference (`carrier_ref`) and `occurred_at` on `shipment.event`. The draft’s event has none of the fields the projector and the reconciliation job need.',
+        'The event envelope carries the shipment id, the status, the scan city, a carrier reference (`carrier_ref`) and `occurred_at` on `shipment.event`. The starter’s event has none of the fields the projector and the reconciliation job need.',
       match: {
         python: {all: [/shipment\.event/, /carrier_ref/, /occurred_at/]},
         typescript: {all: [/shipment\.event/, /carrier_ref/, /occurred_at/]},
@@ -140,7 +140,7 @@ store = StateStore()
 
 
 def publish_status_change(shipment: dict, scan: dict) -> None:
-    # TODO: this draft keys the event by the carrier so one shipment's timeline lands on many
+    # TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
     # partitions, publishes the recipient's full address for last-mile routing, and produces before
     # the state store has committed the scan. Key by shipment id, publish the scan city instead of
     # the address, and produce only after the commit.
@@ -202,7 +202,7 @@ def publish_status_change(shipment: dict, scan: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** shipment.event: a model-generated draft keyed by carrier, carrying the address. */
+      starter: `/** shipment.event: flawed code keyed by carrier, carrying the address. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'shipments', brokers: ['kafka:9092']});
@@ -232,7 +232,7 @@ class StateStore {
 const store = new StateStore();
 
 export async function publishStatusChange(shipment: Shipment, scan: Scan): Promise<void> {
-  // TODO: this draft keys the event by the carrier so one shipment's timeline lands on many
+  // TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
   // partitions, publishes the recipient's full address for last-mile routing, and produces before
   // the state store has committed the scan. Key by shipment id, publish the scan city instead of
   // the address, and produce only after the commit.
@@ -336,7 +336,7 @@ func (s *stateStore) CommitStatus(ctx context.Context, shipmentID, status string
 var store = &stateStore{}
 
 func publishStatusChange(ctx context.Context, shipment Shipment, scan Scan) error {
-	// TODO: this draft keys the event by the carrier so one shipment's timeline lands on many
+	// TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
 	// partitions, publishes the recipient's full address for last-mile routing, and produces before
 	// the state store has committed the scan. Key by shipment id, publish the scan city instead of
 	// the address, and produce only after the commit.
@@ -427,7 +427,7 @@ object ShipmentEvents {
   /** Persist the accepted scan; the timeline event follows the store, never precedes it. */
   def commitStatus(shipmentId: String, status: String, scanAt: Long): Unit = ()
 
-  // TODO: this draft keys the event by the carrier so one shipment's timeline lands on many
+  // TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
   // partitions, publishes the recipient's full address for last-mile routing, and produces before
   // the state store has committed the scan. Key by shipment id, publish the scan city instead of
   // the address, and produce only after the commit.
@@ -514,7 +514,7 @@ struct StateStore {
 StateStore store;
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this draft keys the event by the carrier so one shipment's timeline lands on many
+// TODO: this starter keys the event by the carrier so one shipment's timeline lands on many
 // partitions, publishes the recipient's full address for last-mile routing, and produces before
 // the state store has committed the scan. Key by shipment id, publish the scan city instead of the
 // address, and produce only after the commit.
@@ -608,5 +608,5 @@ void publishStatusChange(const Shipment& shipment, const Scan& scan) {
 `,
     },
   },
-  debrief: `The interview question is what a topic is allowed to be: a projection of durable state, ordered per entity, carrying only what consumers need. The draft breaks all three. Keying by carrier scatters a shipment’s timeline, so ordering is lost exactly where it matters. Publishing before the commit makes the topic the source of truth for scans the store never accepted. And the address is the quiet one: a retained, replicated topic is the worst place in the system for recipient data, and no consumer of the timeline needs a house number. Real platforms add a topic schema with city-level location types, an outbox so a broker rejection cannot lose an event, and a reconciliation job that replays the store into the projector.`,
+  debrief: `The interview question is what a topic is allowed to be: a projection of durable state, ordered per entity, carrying only what consumers need. The starter breaks all three. Keying by carrier scatters a shipment’s timeline, so ordering is lost exactly where it matters. Publishing before the commit makes the topic the source of truth for scans the store never accepted. And the address is the quiet one: a retained, replicated topic is the worst place in the system for recipient data, and no consumer of the timeline needs a house number. Real platforms add a topic schema with city-level location types, an outbox so a broker rejection cannot lose an event, and a reconciliation job that replays the store into the projector.`,
 };

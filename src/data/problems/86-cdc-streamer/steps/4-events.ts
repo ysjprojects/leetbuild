@@ -8,10 +8,10 @@ export const changeEventsStep: Step = {
   focus: ['replicator', 'kafka', 'outbox', 'sink'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it takes the change the
+**Starting point.** The starter is working code: it takes the change the
 replicator read from the log, digests nothing, json-encodes the row it just read, produces it to
 \`cdc.change\` and flushes. It compiles, it delivers the happy path, and it hides three production
-flaws. Review it like the owner of the stream, fix it, and prove the fix with the checks below.
+flaws. Debug it like the owner of the stream, fix it, and prove the fix with the checks below.
 
 Implement the publish path every committed change goes through
 (\`publish_change\` / \`publishChange\` / \`publish\`), and return the message key it used.
@@ -32,7 +32,7 @@ Implement the publish path every committed change goes through
   \`InsertOutbox\`) inside the error branch. A relay republishes it under the same key; the change is
   never dropped.
 
-**Failure mode the checks target.** The draft keys by table only, so concurrent modifications to many
+**Failure mode the checks target.** The starter keys by table only, so concurrent modifications to many
 rows of one table interleave and a consumer replaying the partition reorders one row's history — the
 last change it applies is not the row's last state. It publishes the raw before and after column
 values, so a sink can read the change without a lookup, which turns the retained, replicated topic
@@ -71,7 +71,7 @@ and an outbox row on rejection.`,
       id: 'row-key',
       title: 'Keyed by row_key(table, primary_key) on cdc.change',
       detail:
-        "The produce goes to `cdc.change` with `row_key(table, primary_key)` as the message key, so every change of one row lands in one partition in commit order. The draft keys by table, which leaves the row's history to interleave with every other row of that table.",
+        "The produce goes to `cdc.change` with `row_key(table, primary_key)` as the message key, so every change of one row lands in one partition in commit order. The starter keys by table, which leaves the row's history to interleave with every other row of that table.",
       match: {
         python: {all: [/cdc\.change/, /def row_key\(/, /primary_key/]},
         typescript: {all: [/cdc\.change/, /function rowKey\(/, /primaryKey/]},
@@ -84,7 +84,7 @@ and an outbox row on rejection.`,
       id: 'before-after-digests',
       title: 'Payload carries before/after digests and the LSN',
       detail:
-        "`digest(...)` is the sha256 of the canonical JSON of a row, and the event carries `before_digest`, `after_digest` and the change's `lsn`. The draft ships the rows themselves and no position in the log.",
+        "`digest(...)` is the sha256 of the canonical JSON of a row, and the event carries `before_digest`, `after_digest` and the change's `lsn`. The starter ships the rows themselves and no position in the log.",
       match: {
         python: {all: [/def digest\(/, /before_digest/, /after_digest/, /lsn/]},
         typescript: {all: [/function digest\(/, /before_digest/, /after_digest/, /lsn/]},
@@ -97,7 +97,7 @@ and an outbox row on rejection.`,
       id: 'no-raw-values',
       title: 'No raw column values in the payload',
       detail:
-        "The payload never carries the raw before/after column values — the sink compares digests and re-reads the row when it needs contents. The draft's payload carries exactly that identifier, so every PII fix becomes a data-removal project on a retained, replicated topic.",
+        "The payload never carries the raw before/after column values — the sink compares digests and re-reads the row when it needs contents. The starter's payload carries exactly that identifier, so every PII fix becomes a data-removal project on a retained, replicated topic.",
       match: {
         python: {none: [/raw_values/]},
         typescript: {none: [/rawValues/]},
@@ -110,7 +110,7 @@ and an outbox row on rejection.`,
       id: 'outbox-on-reject',
       title: 'An outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox` / `InsertOutbox`) inside the error branch, so a relay can republish it under the same key. The draft ignores the produce result entirely.',
+        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox` / `InsertOutbox`) inside the error branch, so a relay can republish it under the same key. The starter ignores the produce result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except Exception/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -154,7 +154,7 @@ class Change(BaseModel):
 
 def publish_change(change: Change) -> str:
     """Publish one committed change to cdc.change and return the message key."""
-    # TODO: this draft keys by table alone, so concurrent modifications to many rows of one table
+    # TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
     # interleave and a consumer replays one row's history out of order; it publishes the raw
     # before/after column values and ignores whether the broker accepted the produce.
     event = {
@@ -232,7 +232,7 @@ async def publish_change(change: Change) -> str:
 `,
     },
     typescript: {
-      starter: `/** cdc.change: a model-generated draft that keys by table and ships raw column values. */
+      starter: `/** cdc.change: flawed code that keys by table and ships raw column values. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'cdcd', brokers: ['kafka:9092']});
@@ -249,7 +249,7 @@ interface Change {
 }
 
 export async function publishChange(change: Change): Promise<string> {
-  // TODO: this draft keys by table alone, so concurrent modifications to many rows of one table
+  // TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
   // interleave and a consumer replays one row's history out of order; it publishes the raw
   // before/after column values and ignores whether the broker accepted the produce.
   const event = {
@@ -351,7 +351,7 @@ type Change struct {
 }
 
 func publishChange(ctx context.Context, change Change) string {
-	// TODO: this draft keys by table alone, so concurrent modifications to many rows of one table
+	// TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
 	// interleave and a consumer replays one row's history out of order; it publishes the raw
 	// before/after column values and ignores whether the broker accepted the produce.
 	event := map[string]any{
@@ -458,7 +458,7 @@ final case class Change(
 object ChangeReplicator {
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: this draft keys by table alone, so concurrent modifications to many rows of one table
+  // TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
   // interleave and a consumer replays one row's history out of order; it publishes the raw
   // before/after column values and ignores whether the broker accepted the produce.
   def publish(change: Change): String = {
@@ -564,7 +564,7 @@ std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
 std::string publish(const std::string& table, const std::string& primaryKey, const std::string& op,
                     const json& before, const json& after, const std::string& lsn) {
-  // TODO: this draft keys by table alone, so concurrent modifications to many rows of one table
+  // TODO: this starter keys by table alone, so concurrent modifications to many rows of one table
   // interleave and a consumer replays one row's history out of order; it publishes the raw
   // before/after column values and ignores whether the broker accepted the produce.
   const json event = {
@@ -667,5 +667,5 @@ std::string publish(const std::string& table, const std::string& primaryKey, con
     'The payload is digests plus position, not contents: `digest(row)` is the sha256 of the canonical JSON — sorted keys, no whitespace — so `before_digest` and `after_digest` name a revision while the `lsn` says where it came from. Anything that copies a column value into the topic is the leak the third check looks for; a sink that needs contents re-reads the row.',
     'Idempotence is producer configuration plus a stable key: `enable.idempotence` with `acks=all` (`idempotent: true` with `acks: -1` in KafkaJS, `RequiredAcks: kafka.RequireAll` with `Balancer: &kafka.Hash{}` in kafka-go, `set("acks", "all")` in librdkafka). Then wrap the produce: when the broker rejects it, `insert_outbox(key, event)` and let the relay resend it under the same key — dropping the change or failing the batch silently are the two ways it disappears.',
   ],
-  debrief: `The interviewer is testing whether you can review the key and the payload of a generated CDC topic, which is where ordering and privacy in a stream are actually decided. The draft reads fine because the demo changes one row of one table at a time. Three defects are being checked. The message key is the ordering contract: keying by table gives one partition per table but no per-row serialization once the replicator produces concurrently or retries, so a consumer can apply a row's history out of order and settle on a state that never committed — row_key(table, primary_key) is what makes the row's changes a log. The payload is the second one: shipping the raw before and after rows means the retained, replicated topic holds every column of every tenant's table, and the sink gets to skip a lookup it was never entitled to; digests plus the LSN let the sink decide whether it is behind without copying the data. The ignored produce result is the quiet third one every generated snippet has: a broker rejection has to land in the outbox inside the error branch, with the same key, because at-least-once delivery plus an idempotent producer and a stable key is what makes the eventual resend safe. Real pipelines add a schema registry with the digest's canonicalization versioned alongside it, tombstones for deletes, per-table compaction policy, and a relay that drains the outbox in order.`,
+  debrief: `The interviewer is testing whether you can debug the key and the payload of a CDC topic, which is where ordering and privacy in a stream are actually decided. The starter reads fine because the demo changes one row of one table at a time. Three defects are being checked. The message key is the ordering contract: keying by table gives one partition per table but no per-row serialization once the replicator produces concurrently or retries, so a consumer can apply a row's history out of order and settle on a state that never committed — row_key(table, primary_key) is what makes the row's changes a log. The payload is the second one: shipping the raw before and after rows means the retained, replicated topic holds every column of every tenant's table, and the sink gets to skip a lookup it was never entitled to; digests plus the LSN let the sink decide whether it is behind without copying the data. The ignored produce result is the quiet third one almost every producer snippet has: a broker rejection has to land in the outbox inside the error branch, with the same key, because at-least-once delivery plus an idempotent producer and a stable key is what makes the eventual resend safe. Real pipelines add a schema registry with the digest's canonicalization versioned alongside it, tombstones for deletes, per-table compaction policy, and a relay that drains the outbox in order.`,
 };

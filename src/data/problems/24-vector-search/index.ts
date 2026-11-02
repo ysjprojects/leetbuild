@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Vector search on the AI-era track: the course is not "call a nearest-neighbor library", it is the
- * review a model-generated search service owes its tenants before it serves one more query. A
- * server-resolved tenant, cap and index version → a cache keyed by all three with a short TTL → a
- * scatter-gather across shards under a deadline with a quorum and bounded retries → search events
- * that carry a fingerprint instead of the query → a neighbors read that reports the version that
- * actually produced the results.
+ * Vector search: the course is not "call a nearest-neighbor library", it is the debugging a
+ * search service owes its tenants before it serves one more query. A server-resolved tenant, cap
+ * and index version → a cache keyed by all three with a short TTL → a scatter-gather across
+ * shards under a deadline with a quorum and bounded retries → search events that carry a
+ * fingerprint instead of the query → a neighbors read that reports the version that actually
+ * produced the results.
  */
 export const vectorSearchProblem: Problem = {
   id: 'vector-search',
@@ -20,7 +20,7 @@ export const vectorSearchProblem: Problem = {
   tagline: 'Tenant-filtered nearest-neighbor search with scatter-gather limits and honest results.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Vector Search Service
 
@@ -65,12 +65,12 @@ One service, **searchd**, with five pieces:
    a document that belongs to another tenant, and labeled with the index version the results were
    actually read from.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path,
+and it looks right. Your job in every step is the job you will have on a real feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

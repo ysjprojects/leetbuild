@@ -8,15 +8,15 @@ export const userLimitsStep: Step = {
   focus: ['api', 'redis', 'model'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a user with questions left
+**Starting point.** The starter is working code: a user with questions left
 gets through, a question that made the model misbehave is remembered, and the session grows with
 each turn — so the demo passes. The Redis layer hides a wrong key, a race, and three keys that never
-die. Review it, fix it, and prove the fix.
+die. Debug it, fix it, and prove the fix.
 
 Implement the Redis state used by every \`POST /v1/ask\`:
 
 - Each **user** gets **30 questions** per **60-second window**. The key is
-  \`limits:{user}:{window}\` where \`window\` is \`floor(unix_seconds / 60)\`. The draft keys the
+  \`limits:{user}:{window}\` where \`window\` is \`floor(unix_seconds / 60)\`. The starter keys the
   limit by document, so one shared document's budget is spent by whoever asks first, and one user
   can ask without limit across documents.
 - One atomic Lua \`EVAL\` reads the counter, rejects when the window is full, increments with
@@ -26,10 +26,10 @@ Implement the Redis state used by every \`POST /v1/ask\`:
   \`X-RateLimit-Remaining\`, **before** the model is called.
 - A question that made the model leak (the model layer raises \`Rejected\`) is remembered by its
   SHA-256 under \`flagged:{hash}\` with a **24-hour** TTL (\`FLAG_TTL_S = 86400\`), and the same
-  question is answered **422** without a model call while the key lives. The draft sets the key
+  question is answered **422** without a model call while the key lives. The starter sets the key
   without a TTL, so a block-list of attacks grows forever and a false positive is permanent.
 - The session \`session:{user}:{document_id}\` keeps the hashes of the last 20 questions and is
-  refreshed to a **30-minute** TTL (\`SESSION_TTL_S = 1800\`) on every write. The draft's sessions
+  refreshed to a **30-minute** TTL (\`SESSION_TTL_S = 1800\`) on every write. The starter's sessions
   never expire.
 
 **Failure mode the checks target.** Keyed by document, the limit is neither a user limit nor a
@@ -59,7 +59,7 @@ locked out, keeps an attack signature forever, and keeps every conversation ever
       id: 'user-window-key',
       title: 'Keys the limit by user and window',
       detail:
-        'The key is `limits:{user}:{window}` built from the authenticated user and the 60-second bucket (`WINDOW_S = 60`). The draft keys by document, so one document’s budget is shared by everyone and a user is unlimited across documents.',
+        'The key is `limits:{user}:{window}` built from the authenticated user and the 60-second bucket (`WINDOW_S = 60`). The starter keys by document, so one document’s budget is shared by everyone and a user is unlimited across documents.',
       match: {
         python: {all: [/limits:\{user\}:\{window\}/, /WINDOW_S\s*=\s*60/], none: [/limits:\{document/]},
         typescript: {all: [/limits:\$\{user\}:\$\{window\}/, /WINDOW_S\s*=\s*60/], none: [/limits:\$\{document/]},
@@ -85,7 +85,7 @@ locked out, keeps an attack signature forever, and keeps every conversation ever
       id: 'window-ttl',
       title: 'Window expires on first write; 429 carries Retry-After',
       detail:
-        'The script sets `EXPIRE` when it creates the key and returns the remaining `TTL`; a full window answers **429** with `Retry-After` built from that TTL. The draft’s counter never resets, so one busy minute locks the user out for good.',
+        'The script sets `EXPIRE` when it creates the key and returns the remaining `TTL`; a full window answers **429** with `Retry-After` built from that TTL. The starter’s counter never resets, so one busy minute locks the user out for good.',
       match: {
         python: {all: [/EXPIRE/, /TTL/, /Retry-After/, /status_code\s*=\s*429/]},
         typescript: {all: [/EXPIRE/, /TTL/, /Retry-After/, /\.code\(\s*429\s*\)/]},
@@ -98,7 +98,7 @@ locked out, keeps an attack signature forever, and keeps every conversation ever
       id: 'flag-ttl',
       title: 'Block-list entries live 24 hours',
       detail:
-        'A question that made the model leak is stored under `flagged:{sha256}` with `FLAG_TTL_S = 86400` (`SETEX` / `SET … EX`). The draft writes the key without an expiry, so the block-list grows forever and a false positive never clears.',
+        'A question that made the model leak is stored under `flagged:{sha256}` with `FLAG_TTL_S = 86400` (`SETEX` / `SET … EX`). The starter writes the key without an expiry, so the block-list grows forever and a false positive never clears.',
       match: {
         python: {all: [/FLAG_TTL_S\s*=\s*86400/, /\.setex\(/]},
         typescript: {all: [/FLAG_TTL_S\s*=\s*86400/, /['"]EX['"],\s*FLAG_TTL_S/]},
@@ -111,7 +111,7 @@ locked out, keeps an attack signature forever, and keeps every conversation ever
       id: 'session-ttl',
       title: 'Sessions expire after 30 minutes of silence',
       detail:
-        'Every write to `session:{user}:{document_id}` is followed by `EXPIRE` with `SESSION_TTL_S = 1800`, so an active conversation stays alive and an abandoned one disappears. The draft’s sessions live forever.',
+        'Every write to `session:{user}:{document_id}` is followed by `EXPIRE` with `SESSION_TTL_S = 1800`, so an active conversation stays alive and an abandoned one disappears. The starter’s sessions live forever.',
       match: {
         python: {all: [/SESSION_TTL_S\s*=\s*1800/, /\.expire\(/]},
         typescript: {all: [/SESSION_TTL_S\s*=\s*1800/, /\.expire\(/]},
@@ -277,7 +277,7 @@ def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ask: a model-generated draft that limits per document and never expires a key. */
+      starter: `/** POST /v1/ask: flawed code that limits per document and never expires a key. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';

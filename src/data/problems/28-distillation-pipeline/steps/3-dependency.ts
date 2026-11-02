@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['api', 'teacher'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it calls the teacher, skips outputs it cannot use,
+**Starting point.** The starter is working code: it calls the teacher, skips outputs it cannot use,
 and keeps trying until something comes back. It works against a healthy teacher and falls apart
 against a real one. Three flaws, one deadline, one retry policy, one budget check.
 
@@ -54,7 +54,7 @@ which is why a refusal has to be *recorded*, not retried.`,
       id: 'attempt-deadline',
       title: 'Four-second deadline on every attempt',
       detail:
-        'Each attempt carries its own four-second deadline (`DEADLINE_S` passed as `timeout=`, a JS `deadline: Date.now() + DEADLINE_MS`, a `context.WithTimeout`, `withDeadlineAfter`, or `set_deadline`). The draft has no per-call deadline, so a hung teacher holds the worker.',
+        'Each attempt carries its own four-second deadline (`DEADLINE_S` passed as `timeout=`, a JS `deadline: Date.now() + DEADLINE_MS`, a `context.WithTimeout`, `withDeadlineAfter`, or `set_deadline`). The starter has no per-call deadline, so a hung teacher holds the worker.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -67,7 +67,7 @@ which is why a refusal has to be *recorded*, not retried.`,
       id: 'retry-unavailable',
       title: 'Retries only UNAVAILABLE, at most twice',
       detail:
-        'Only `UNAVAILABLE` is retried, bounded by `MAX_ATTEMPTS` (three attempts, two retries) with a backoff between them. The draft retries whatever comes back until its wall clock expires.',
+        'Only `UNAVAILABLE` is retried, bounded by `MAX_ATTEMPTS` (three attempts, two retries) with a backoff between them. The starter retries whatever comes back until its wall clock expires.',
       match: {
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/]},
@@ -80,7 +80,7 @@ which is why a refusal has to be *recorded*, not retried.`,
       id: 'refusal-recorded',
       title: 'Records a refusal or an empty output instead of retrying it',
       detail:
-        'A refusal or an empty completion returns a **rejected** sample with its reason (`refusal`/`empty`) and the attempt count — it is never retried. The draft retries it, so a teacher that refuses a prompt burns the job’s budget on answers it will never give.',
+        'A refusal or an empty completion returns a **rejected** sample with its reason (`refusal`/`empty`) and the attempt count — it is never retried. The starter retries it, so a teacher that refuses a prompt burns the job’s budget on answers it will never give.',
       match: {
         python: {all: [/refus/i, /reject/i, /reason/i]},
         typescript: {all: [/refus/i, /reject/i, /reason/i]},
@@ -93,7 +93,7 @@ which is why a refusal has to be *recorded*, not retried.`,
       id: 'hung-call-cut',
       title: 'Marks a hung call timed out',
       detail:
-        'A call that runs past its deadline comes back as `DEADLINE_EXCEEDED` and the sample is recorded as `timed_out` with reason `deadline` — not retried inside the same sample. The draft swallows the error and loops.',
+        'A call that runs past its deadline comes back as `DEADLINE_EXCEEDED` and the sample is recorded as `timed_out` with reason `deadline` — not retried inside the same sample. The starter swallows the error and loops.',
       match: {
         python: {all: [/grpc\.StatusCode\.DEADLINE_EXCEEDED/, /timed_out/]},
         typescript: {all: [/status\.DEADLINE_EXCEEDED/, /timed_out/]},
@@ -106,7 +106,7 @@ which is why a refusal has to be *recorded*, not retried.`,
       id: 'budget-before-call',
       title: 'Checks the budget before each attempt',
       detail:
-        'Every attempt asks the job state whether it is affordable (`can_spend`) **before** the teacher call, and stops with reason `budget` when it is not. The draft never consults the budget, so its retries can spend past the cap.',
+        'Every attempt asks the job state whether it is affordable (`can_spend`) **before** the teacher call, and stops with reason `budget` when it is not. The starter never consults the budget, so its retries can spend past the cap.',
       match: {
         python: {order: [/can_spend\(/, /stub\.Generate\(/]},
         typescript: {order: [/canSpend\(/, /generateAsync\(/]},
@@ -124,8 +124,8 @@ MAX_SHARD_SECONDS = 30
 
 
 def generate(stub, job_id: str, prompt_id: str, prompt: str) -> dict:
-    # TODO: this draft has no per-attempt deadline, retries a refusal or an empty completion until
-    # the shard's wall clock runs out, and never asks whether the job still has budget. Review all
+    # TODO: this starter has no per-attempt deadline, retries a refusal or an empty completion until
+    # the shard's wall clock runs out, and never asks whether the job still has budget. Fix all
     # three: a teacher that refuses one prompt can hold a worker for half a minute.
     deadline = time.monotonic() + MAX_SHARD_SECONDS
     while time.monotonic() < deadline:
@@ -184,7 +184,7 @@ def generate(stub, state, job_id: str, prompt_id: str, prompt: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Teacher generation: a model-generated draft that retries until its wall clock expires. */
+      starter: `/** Teacher generation: flawed code that retries until its wall clock expires. */
 import type {Client, ServiceError} from '@grpc/grpc-js';
 import {promisify} from 'node:util';
 
@@ -205,8 +205,8 @@ export interface Sample {
 }
 
 export async function generate(stub: Client, jobId: string, promptId: string, prompt: string): Promise<Sample> {
-  // TODO: this draft has no per-attempt deadline, retries a refusal or an empty completion until the
-  // shard's wall clock runs out, and never asks whether the job still has budget. Review all three.
+  // TODO: this starter has no per-attempt deadline, retries a refusal or an empty completion until the
+  // shard's wall clock runs out, and never asks whether the job still has budget. Fix all three.
   const generateAsync = promisify(stub.generate.bind(stub)) as (request: {
     job_id: string;
     prompt_id: string;
@@ -305,8 +305,8 @@ type Sample struct {
 }
 
 func Generate(ctx context.Context, stub TeacherClient, jobID, promptID, prompt string) (Sample, error) {
-	// TODO: this draft has no per-attempt deadline, retries a refusal or an empty completion until
-	// the shard's wall clock runs out, and never asks whether the job still has budget. Review all
+	// TODO: this starter has no per-attempt deadline, retries a refusal or an empty completion until
+	// the shard's wall clock runs out, and never asks whether the job still has budget. Fix all
 	// three: a teacher that refuses one prompt can hold a worker for half a minute.
 	until := time.Now().Add(maxShardSeconds * time.Second)
 	for time.Now().Before(until) {
@@ -402,8 +402,8 @@ object TeacherClient {
       promptId: String,
       prompt: String
   ): Sample = {
-    // TODO: this draft has no per-attempt deadline, retries a refusal or an empty completion until
-    // the shard's wall clock runs out, and never asks whether the job still has budget. Review all
+    // TODO: this starter has no per-attempt deadline, retries a refusal or an empty completion until
+    // the shard's wall clock runs out, and never asks whether the job still has budget. Fix all
     // three: a teacher that refuses one prompt can hold a worker for half a minute.
     val until = Instant.now().plusSeconds(MaxShardSeconds)
     while (Instant.now().isBefore(until)) {
@@ -489,8 +489,8 @@ struct Sample {
 
 Sample generate(teacher::Teacher::Stub& stub, const std::string& jobId, const std::string& promptId,
                 const std::string& prompt) {
-  // TODO: this draft has no per-attempt deadline, retries a refusal or an empty completion until the
-  // shard's wall clock runs out, and never asks whether the job still has budget. Review all three:
+  // TODO: this starter has no per-attempt deadline, retries a refusal or an empty completion until the
+  // shard's wall clock runs out, and never asks whether the job still has budget. Fix all three:
   // a teacher that refuses one prompt can hold a worker for half a minute.
   const auto until = std::chrono::system_clock::now() + std::chrono::seconds(kMaxShardSeconds);
   while (std::chrono::system_clock::now() < until) {
@@ -557,5 +557,5 @@ Sample generate(teacher::Teacher::Stub& stub, const JobState& state, const std::
 `,
     },
   },
-  debrief: `This step is where an interviewer sees whether you can tell a transient failure from an answer. The draft is generous — it keeps trying and never gives up — and that generosity is the bug: retrying a refusal, retrying past the deadline, and retrying someone else's budget. The four contracts to say out loud are a per-attempt deadline, a bounded retry policy over the retryable status codes only, a budget check before every attempt, and a recorded outcome (with reason and attempt count) for every sample. Real pipelines add a circuit breaker per teacher endpoint, hedged requests to a second replica, and separate deadlines for the first token and the whole completion.`,
+  debrief: `This step is where an interviewer sees whether you can tell a transient failure from an answer. The starter is generous — it keeps trying and never gives up — and that generosity is the bug: retrying a refusal, retrying past the deadline, and retrying someone else's budget. The four contracts to say out loud are a per-attempt deadline, a bounded retry policy over the retryable status codes only, a budget check before every attempt, and a recorded outcome (with reason and attempt count) for every sample. Real pipelines add a circuit breaker per teacher endpoint, hedged requests to a second replica, and separate deadlines for the first token and the whole completion.`,
 };

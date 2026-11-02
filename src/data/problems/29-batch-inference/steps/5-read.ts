@@ -8,22 +8,22 @@ export const readStep: Step = {
   focus: ['client', 'batchd', 'db', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it answers with a status and a
+**Starting point.** The starter is working code: it answers with a status and a
 completed count, so a finished batch looks finished. It hides a stale number, a premature success and
 a missing tenant check. Find them, fix them, and prove the fix with the checks below.
 
 Implement \`GET /v1/batches/{id}\`.
 
 - The tenant comes from \`X-Tenant-Id\`; the batch is looked up by id and a batch that does not exist
-  — **or belongs to another tenant** — is a **404**. The draft hands out any batch's outputs.
+  — **or belongs to another tenant** — is a **404**. The starter hands out any batch's outputs.
 - Progress is derived from the **live shard set**, not a cached counter: \`completed\` from the done
   shards, \`failed\` from the failed shards, and \`pending = total − completed − failed\`. A counter
   written somewhere else lags the shard set and the endpoint ends up disagreeing with the workers.
 - **Success requires every shard terminal.** The status is \`succeeded\` only when \`pending == 0\`
   and \`failed == 0\`; while any shard is pending the answer is **not** a success, no matter how many
-  shards have landed. The draft reports success as soon as the first shard completes.
+  shards have landed. The starter reports success as soon as the first shard completes.
 - Return the manifest of output objects, each with its **checksum**, so a consumer can verify what it
-  downloads. The draft hands out bare output keys with no checksum.
+  downloads. The starter hands out bare output keys with no checksum.
 
 **Failure mode the checks target.** A cached counter is a second source of truth and it drifts; a
 success status with pending shards is the lie the whole course is about; and an unscoped batch id
@@ -49,7 +49,7 @@ lets one tenant read another tenant's outputs.`,
       id: 'live-shard-set',
       title: 'Progress comes from the live shard set',
       detail:
-        'The counts are derived from the live shard set (`SCARD`/`SMEMBERS` on `batch:{id}:shards:*`), not from a cached counter. The draft reads a counter that lags shard completion.',
+        'The counts are derived from the live shard set (`SCARD`/`SMEMBERS` on `batch:{id}:shards:*`), not from a cached counter. The starter reads a counter that lags shard completion.',
       match: {
         python: {all: [/smembers\(|scard\(|sismember\(|hgetall\(/, /shards/]},
         typescript: {all: [/smembers\(|scard\(|sismember\(|hgetall\(/, /shards/]},
@@ -62,7 +62,7 @@ lets one tenant read another tenant's outputs.`,
       id: 'terminal-success',
       title: 'Success only when every shard is terminal',
       detail:
-        'The response reports `pending` and `failed` alongside `completed`, and the status is `succeeded` only when nothing is pending. The draft reports success as soon as the first shard lands.',
+        'The response reports `pending` and `failed` alongside `completed`, and the status is `succeeded` only when nothing is pending. The starter reports success as soon as the first shard lands.',
       match: {
         python: {all: [/pending/, /failed/, /succeeded/]},
         typescript: {all: [/pending/, /failed/, /succeeded/]},
@@ -75,7 +75,7 @@ lets one tenant read another tenant's outputs.`,
       id: 'tenant-404',
       title: 'A foreign batch id is 404',
       detail:
-        'The batch must exist and belong to the caller; anything else is **404**. The draft answers any id and leaks another tenant’s outputs.',
+        'The batch must exist and belong to the caller; anything else is **404**. The starter answers any id and leaks another tenant’s outputs.',
       match: {
         python: {all: [/X-Tenant-Id/, /404/]},
         typescript: {all: [/x-tenant-id/i, /404/]},
@@ -88,7 +88,7 @@ lets one tenant read another tenant's outputs.`,
       id: 'failed-count',
       title: 'Reports the failed shard count',
       detail:
-        'The response carries the number of failed shards, so a batch that finished with failures is distinguishable from a clean one. The draft omits it.',
+        'The response carries the number of failed shards, so a batch that finished with failures is distinguishable from a clean one. The starter omits it.',
       match: {
         python: {all: [/failed/, /count|shards/]},
         typescript: {all: [/failed/, /count|shards/]},
@@ -101,7 +101,7 @@ lets one tenant read another tenant's outputs.`,
       id: 'output-manifest',
       title: 'Returns outputs with their checksums',
       detail:
-        'The output manifest lists each object with its checksum so a consumer can verify what it reads. The draft returns bare keys.',
+        'The output manifest lists each object with its checksum so a consumer can verify what it reads. The starter returns bare keys.',
       match: {
         python: {all: [/checksum/, /output|objects|manifest/]},
         typescript: {all: [/checksum/, /output|objects|manifest/]},
@@ -122,7 +122,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/batches/{batch_id}")
 def read(batch_id: str) -> dict:
-    # TODO: this draft reads a cached counter that lags, reports success as soon as the first shard
+    # TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
     # lands, and hands out output URLs without checking the tenant.
     completed = int(r.get(f"batch:{batch_id}:progress") or 0)
     status = "succeeded" if completed > 0 else "running"
@@ -164,7 +164,7 @@ def read(batch_id: str, tenant: str | None = Header(default=None, alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** GET /v1/batches/{id}: a model-generated draft that trusts a cached counter. */
+      starter: `/** GET /v1/batches/{id}: flawed code that trusts a cached counter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -172,7 +172,7 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/batches/:batchId', async (request, reply) => {
-  // TODO: this draft reads a cached counter that lags, reports success as soon as the first shard
+  // TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
   // lands, and hands out output URLs without checking the tenant.
   const {batchId} = request.params as {batchId: string};
   const completed = Number((await r.get('batch:' + batchId + ':progress')) ?? 0);
@@ -222,7 +222,7 @@ import (
 )
 
 func readBatch(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reads a cached counter that lags, reports success as soon as the first shard
+	// TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
 	// lands, and hands out output URLs without checking the tenant.
 	batchID := r.PathValue("batch_id")
 	completed, _ := rdb.Get(r.Context(), "batch:"+batchID+":progress").Int64()
@@ -301,7 +301,7 @@ object BatchReadApi {
   val route: Route =
     path("v1" / "batches" / Segment) { batchId =>
       get {
-        // TODO: this draft reads a cached counter that lags, reports success as soon as the first
+        // TODO: this starter reads a cached counter that lags, reports success as soon as the first
         // shard lands, and hands out output URLs without checking the tenant.
         val completed = Option(jedis.get(s"batch:$batchId:progress")).map(_.toInt).getOrElse(0)
         val status = if (completed > 0) "succeeded" else "running"
@@ -392,7 +392,7 @@ int main() {
   Redis redis("tcp://redis:6379");
 
   svr.Get("/v1/batches/([^/]+)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reads a cached counter that lags, reports success as soon as the first shard
+    // TODO: this starter reads a cached counter that lags, reports success as soon as the first shard
     // lands, and hands out output URLs without checking the tenant.
     const auto batchId = req.matches[1].str();
     const auto cached = redis.get("batch:" + batchId + ":progress");

@@ -8,9 +8,9 @@ export const summarizerEventsStep: Step = {
   focus: ['api', 'kafka', 'store', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds a producer, assembles
-a payload and publishes the completion event. It works until the broker blinks or someone reads the
-topic. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it builds a producer, assembles a payload and
+publishes the completion event. It works until the broker blinks or someone reads the topic. Debug
+it like the service owner, fix it, and prove the fix with the checks below.
 
 Publish one \`summary.done\` event per completed summary:
 
@@ -30,7 +30,7 @@ Publish one \`summary.done\` event per completed summary:
   \`commit\`). Committing first turns a crash into data loss; committing after the write turns it into
   a redelivery the handler can absorb.
 
-**Failure mode the checks target.** The draft keys by tenant, so one tenant's events are ordered
+**Failure mode the checks target.** The starter keys by tenant, so one tenant's events are ordered
 against each other only by accident and one source's updates can be consumed out of order. It
 publishes \`summary_text\` — the tenant's document, abstracted — into a retained topic. It produces
 fire-and-forget with no acks, no idempotence and no outbox, so a broker blip loses the event. And it
@@ -52,7 +52,7 @@ topic believes it was delivered.`,
       id: 'key-source-hash',
       title: 'Keys every event by the source hash',
       detail:
-        'The record published to `summary.done` is keyed by the source hash, so one source’s events share a partition and stay ordered. The draft keys by tenant, which orders unrelated sources against each other.',
+        'The record published to `summary.done` is keyed by the source hash, so one source’s events share a partition and stay ordered. The starter keys by tenant, which orders unrelated sources against each other.',
       match: {
         python: {all: [/summary\.done/, /event_key\(/, /source_hash/]},
         typescript: {all: [/summary\.done/, /eventKey\(/, /source_hash/]},
@@ -65,7 +65,7 @@ topic believes it was delivered.`,
       id: 'payload-numbers',
       title: 'The payload carries lengths, model version and compression ratio',
       detail:
-        '`event_payload` assembles `source_bytes`, `summary_chars`, `compression_ratio`, `model_version`, `band` and `chunks_done` — the numbers that let a consumer check how much a summary compressed its source and which model version produced it. The draft stores counters as text fields.',
+        '`event_payload` assembles `source_bytes`, `summary_chars`, `compression_ratio`, `model_version`, `band` and `chunks_done` — the numbers that let a consumer check how much a summary compressed its source and which model version produced it. The starter stores counters as text fields.',
       match: {
         python: {all: [/event_payload\(/, /compression_ratio/, /model_version/, /source_bytes/, /summary_chars/]},
         typescript: {all: [/eventPayload\(/, /compression_ratio/, /model_version/, /source_bytes/, /summary_chars/]},
@@ -78,7 +78,7 @@ topic believes it was delivered.`,
       id: 'no-text-in-event',
       title: 'Neither the summary nor the source text reaches the topic',
       detail:
-        'The payload builder takes text fields out of the record: no `summary_text`, no `source_text`. The draft publishes the summary "for quality review", which copies tenant content into a retained, replicated topic.',
+        'The payload builder takes text fields out of the record: no `summary_text`, no `source_text`. The starter publishes the summary "for quality review", which copies tenant content into a retained, replicated topic.',
       match: {
         python: {all: [/event_payload\(/], none: [/summary_text/, /source_text/]},
         typescript: {all: [/eventPayload\(/], none: [/summary_text/, /source_text/]},
@@ -91,7 +91,7 @@ topic believes it was delivered.`,
       id: 'persist-before-commit',
       title: 'The summary record is persisted before the offset commits',
       detail:
-        'The consumer stores the record with `store.put` and only then commits the offset, so a crash between the two re-delivers instead of losing the summary. The draft commits first and writes afterwards.',
+        'The consumer stores the record with `store.put` and only then commits the offset, so a crash between the two re-delivers instead of losing the summary. The starter commits first and writes afterwards.',
       match: {
         python: {order: [/store\.put\(/, /\.commit\(/]},
         typescript: {order: [/store\.put\(/, /commitOffsets\(/]},
@@ -104,7 +104,7 @@ topic believes it was delivered.`,
       id: 'idempotent-producer',
       title: 'The producer is durable and idempotent, with an outbox on failure',
       detail:
-        '`acks=all` and idempotence are configured, and a rejected produce lands in the outbox (`outbox.put`) instead of being dropped. The draft produces fire-and-forget and has no outbox at all.',
+        '`acks=all` and idempotence are configured, and a rejected produce lands in the outbox (`outbox.put`) instead of being dropped. The starter produces fire-and-forget and has no outbox at all.',
       match: {
         python: {all: [/acks/, /enable\.idempotence/, /outbox\.put\(/]},
         typescript: {all: [/acks/, /idempotent/, /outbox\.put\(/]},
@@ -137,9 +137,9 @@ store = SummaryStore()
 
 
 def publish_summary(summary: dict, tenant: str) -> None:
-    # TODO: this draft keys the event by tenant, publishes the summary text "for quality review"
+    # TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
     # with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-    # commits the offset before the record is stored. Review all four.
+    # commits the offset before the record is stored. Fix all four.
     payload = {
         "summary_id": summary["summary_id"],
         "source_id": summary["source_ref"],
@@ -149,7 +149,7 @@ def publish_summary(summary: dict, tenant: str) -> None:
 
 
 def consume_summary(value: bytes, offset_committer: object) -> None:
-    """The draft: commit the offset first, then try to store the summary."""
+    """The starter: commit the offset first, then try to store the summary."""
     offset_committer.commit()
     store.put(json.loads(value))
 `,
@@ -227,7 +227,7 @@ def consume_summary(value: bytes, offset_committer: object) -> None:
 `,
     },
     typescript: {
-      starter: `/** Publish summary.done: a model-generated draft that publishes the summary text. */
+      starter: `/** Publish summary.done: flawed code that publishes the summary text. */
 import {Kafka} from 'kafkajs';
 
 const SUMMARY_DONE = 'summary.done';
@@ -246,9 +246,9 @@ interface SummaryRecord {
 }
 
 export async function publishSummary(summary: SummaryRecord, tenant: string): Promise<void> {
-  // TODO: this draft keys the event by tenant, publishes the summary text "for quality review"
+  // TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
   // with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-  // commits the offset before the record is stored. Review all four.
+  // commits the offset before the record is stored. Fix all four.
   await producer.send({
     topic: SUMMARY_DONE,
     messages: [
@@ -362,12 +362,12 @@ type SummaryRecord struct {
 	ModelVersion string \`json:"model_version"\`
 }
 
-// publishSummary publishes one summary.done event. The model-generated draft keys by tenant and
+// publishSummary publishes one summary.done event. The starter keys by tenant and
 // publishes the summary text.
 func publishSummary(ctx context.Context, tenant string, summary SummaryRecord) error {
-	// TODO: this draft keys the event by tenant, publishes the summary text "for quality review"
+	// TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
 	// with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-	// commits the offset before the record is stored. Review all four.
+	// commits the offset before the record is stored. Fix all four.
 	value, err := json.Marshal(map[string]any{"summary_id": summary.SummaryID, "summary_text": summary.Summary})
 	if err != nil {
 		return err
@@ -375,7 +375,7 @@ func publishSummary(ctx context.Context, tenant string, summary SummaryRecord) e
 	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(tenant), Value: value})
 }
 
-// consumeSummary stores the record. The draft commits the offset first.
+// consumeSummary stores the record. The starter commits the offset first.
 func consumeSummary(ctx context.Context, reader *kafka.Reader, msg kafka.Message) error {
 	if err := reader.CommitMessages(ctx, msg); err != nil {
 		return err
@@ -487,11 +487,11 @@ object SummaryEvents extends DefaultJsonProtocol {
 
   val producer = new KafkaProducer[String, String](new Properties())
 
-  /** Publish one summary.done event. The draft keys by tenant and publishes the summary text. */
+  /** Publish one summary.done event. The starter keys by tenant and publishes the summary text. */
   def publishSummary(summary: SummaryRecord, tenant: String): Unit = {
-    // TODO: this draft keys the event by tenant, publishes the summary text "for quality review"
+    // TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
     // with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-    // commits the offset before the record is stored. Review all four.
+    // commits the offset before the record is stored. Fix all four.
     val payload = JsObject("summary_id" -> JsString(summary.summaryId), "summary_text" -> JsString(summary.summary))
     producer.send(new ProducerRecord[String, String](SummaryDone, tenant, payload.compactPrint))
   }
@@ -587,13 +587,13 @@ using json = nlohmann::json;
 
 const char* kSummaryDone = "summary.done";
 
-// publish_summary publishes one summary.done event. The model-generated draft keys by tenant and
+// publish_summary publishes one summary.done event. The starter keys by tenant and
 // publishes the summary text.
 void publish_summary(RdKafka::Producer& producer, const std::string& tenant, const std::string& summary_id,
                      const std::string& summary_text) {
-  // TODO: this draft keys the event by tenant, publishes the summary text "for quality review"
+  // TODO: this starter keys the event by tenant, publishes the summary text "for quality review"
   // with a fire-and-forget producer (no acks, no idempotence, no outbox), and the consumer
-  // commits the offset before the record is stored. Review all four.
+  // commits the offset before the record is stored. Fix all four.
   const auto payload = json{{"summary_id", summary_id}, {"summary_text", summary_text}}.dump();
   producer.produce(kSummaryDone, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                    const_cast<char*>(payload.data()), payload.size(), tenant.data(), tenant.size(), 0, nullptr);

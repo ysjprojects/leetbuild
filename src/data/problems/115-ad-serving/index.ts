@@ -7,9 +7,9 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Ad serving on the AI-era track: the course is not "return an ad from an endpoint", it is the
- * review you owe a model-generated serving path before it spends an advertiser's budget and one
- * user's patience. Eligibility before relevance → one atomic Redis decision per serve → an exchange
+ * Ad serving: the course is not "return an ad from an endpoint", it is the debugging you owe a
+ * serving path before it spends an advertiser's budget and one user's patience.
+ * Eligibility before relevance → one atomic Redis decision per serve → an exchange
  * call with a deadline and a house fallback → render-confirmed impressions keyed by campaign with
  * an outbox → a delivery read that reconciles against the same counters.
  */
@@ -19,7 +19,6 @@ export const adServingProblem: Problem = {
   tagline: 'Serve ads within frequency caps and budget pacing, and count impressions once.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Ad Serving
 
@@ -59,12 +58,12 @@ One service, **adserved**, with five pieces:
 5. \`GET /v1/campaigns/{id}/delivery\`: paced spend, render-counted impressions, cap-exhausted
    time and an under-delivery projection, scoped to the calling advertiser.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real ad
-platform: read the draft against the failure modes, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real ad platform: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

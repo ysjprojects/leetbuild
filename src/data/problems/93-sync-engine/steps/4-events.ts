@@ -8,7 +8,7 @@ export const changeEventsStep: Step = {
   focus: ['sync', 'kafka', 'audit'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes an event after a
+**Starting point.** The starter is working code: it publishes an event after a
 batch and applies the changes, so the demo shows messages in the topic and documents moving. Three
 contracts are broken, and each of them only matters when someone needs the stream later. Find them,
 fix them, and prove the fix.
@@ -60,7 +60,7 @@ for. And an ignored produce result loses the event with no trace anywhere.`,
       id: 'document-key',
       title: 'Keyed by document, so one document’s revisions stay ordered',
       detail:
-        'The produce uses the document id as the message key, so a document’s revision stream lands in one partition. The draft keys by device, which serialises every document of a device and makes a per-document replay impossible.',
+        'The produce uses the document id as the message key, so a document’s revision stream lands in one partition. The starter keys by device, which serialises every document of a device and makes a per-document replay impossible.',
       match: {
         python: {all: [/key=change_outcome\["doc_id"\]/, /"doc_id"/]},
         typescript: {all: [/key:\s*changeOutcome\.doc_id/]},
@@ -73,7 +73,7 @@ for. And an ignored produce result loses the event with no trace anywhere.`,
       id: 'publish-after-apply',
       title: 'Publishes only after the apply has committed',
       detail:
-        'The batch is applied first and the events are published second. The draft publishes before it applies, so the topic can carry a revision that never became durable.',
+        'The batch is applied first and the events are published second. The starter publishes before it applies, so the topic can carry a revision that never became durable.',
       match: {
         python: {order: [/store\.apply_batch\(device, changes\)/, /publish_change\(change_outcome\)/]},
         typescript: {order: [/store\.applyBatch\(device, changes\)/, /publishChange\(changeOutcome\)/]},
@@ -86,7 +86,7 @@ for. And an ignored produce result loses the event with no trace anywhere.`,
       id: 'payload-revision-hash',
       title: 'Carries the revision and the content hash',
       detail:
-        'The event payload names the revision and the content hash of the applied state, so a replay can verify what it rebuilt. The draft sends a device and a count instead.',
+        'The event payload names the revision and the content hash of the applied state, so a replay can verify what it rebuilt. The starter sends a device and a count instead.',
       match: {
         python: {all: [/"revision"/, /"content_hash"/]},
         typescript: {all: [/revision/, /content_hash/]},
@@ -99,7 +99,7 @@ for. And an ignored produce result loses the event with no trace anywhere.`,
       id: 'outbox-on-reject',
       title: 'Falls back to the outbox when the broker rejects the produce',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox` / `InsertOutbox`) instead of dropping the event. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox` / `InsertOutbox`) instead of dropping the event. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -112,7 +112,7 @@ for. And an ignored produce result loses the event with no trace anywhere.`,
       id: 'conflicted-published',
       title: 'Publishes conflicted documents like any other state change',
       detail:
-        'The published status set includes `conflicted`: a conflict is state, and filtering it out of the stream hides how a document got there. The draft publishes only `applied` outcomes.',
+        'The published status set includes `conflicted`: a conflict is state, and filtering it out of the stream hides how a document got there. The starter publishes only `applied` outcomes.',
       match: {
         python: {all: [/PUBLISH_STATUSES/, /"conflicted"/]},
         typescript: {all: [/PUBLISH_STATUSES/, /conflicted/]},
@@ -221,7 +221,7 @@ def apply_and_publish(device: str, changes: list[dict]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** sync.change: a model-generated draft that publishes before the apply, keyed by device. */
+      starter: `/** sync.change: flawed code that publishes before the apply, keyed by device. */
 import {Kafka} from 'kafkajs';
 
 import {store} from './revisions';

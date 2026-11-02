@@ -7,11 +7,10 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Ticketing system on the AI-era track: the course is not "write a CRUD endpoint for tickets", it
- * is the review you owe a model-generated support backend before agents trust it. Guarded state
- * transitions → an assignment lease and atomic unread counters in Redis → an idempotent CRM sync
- * over gRPC → a ticket-keyed event timeline that never carries note bodies → a read whose
- * visibility rules actually apply.
+ * Ticketing system: the course is not "write a CRUD endpoint for tickets", it is the debugging you
+ * owe a support backend before agents trust it. Guarded state transitions → an assignment lease and
+ * atomic unread counters in Redis → an idempotent CRM sync over gRPC → a ticket-keyed event timeline
+ * that never carries note bodies → a read whose visibility rules actually apply.
  */
 export const ticketingSystemProblem: Problem = {
   id: 'ticketing-system',
@@ -19,7 +18,6 @@ export const ticketingSystemProblem: Problem = {
   tagline: 'Support tickets with guarded transitions, scoped notes and no duplicate CRM writes.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Ticketing System
 
@@ -61,12 +59,12 @@ One service, **ticketd**, with five pieces:
 5. \`GET /v1/tickets/{id}\`: a timeline that hides internal notes from requesters, includes them for
    agents, and paginates by cursor so a busy ticket does not shift pages.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real support
-platform: read the draft against the failure modes, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real support platform: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

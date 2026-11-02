@@ -12,17 +12,17 @@ export const readStep: Step = {
   focus: ['exchange', 'bidding', 'redis', 'consumer'],
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. The dashboard says a bidder has a 94% win
+**Starting point.** You are the bidding platform engineer on call. The dashboard says a bidder has a 94% win
 rate and is "healthy", yet the bidder won almost nothing last week: the rate is computed against the
 auctions it won and lost, and the bids that timed out were never counted at all. On top of that, any
 advertiser can read any other advertiser's numbers by editing the id in the URL.
 
-Review \`read\` and make the stats tell the truth.
+Debug \`read\` and make the stats tell the truth.
 
 Implement \`GET /v1/bidders/{id}/stats?window=day\`.
 
 - The caller comes from the authenticated \`X-Bidder-Id\` header (**401** when missing) and may read
-  **only its own** stats: a foreign bidder id is **403**. The draft serves anyone.
+  **only its own** stats: a foreign bidder id is **403**. The starter serves anyone.
 - \`window\` is one of \`hour\` or \`day\` (**400** otherwise) and defaults to \`day\`; it selects the
   counter bucket, not the response shape.
 - \`win_rate\` is wins against **every auction the bidder saw** (\`auctions_seen\`, which includes
@@ -35,7 +35,7 @@ Implement \`GET /v1/bidders/{id}/stats?window=day\`.
 - Report **spend versus cap** for the same window: \`spend_cents\` from the counters and \`cap_cents\`
   from the spend ledger, so an operator can see how close the bidder is to its daily limit.
 
-**Failure mode the checks target.** The draft omits timeouts and degradation entirely, so the two
+**Failure mode the checks target.** The starter omits timeouts and degradation entirely, so the two
 symptoms that matter most — bids that never made the deadline and bids that are only conservative —
 are invisible. Its win rate divides by wins plus losses, which flatters exactly the bidder in the
 briefing: the more auctions it timed out on, the better its reported rate. And it treats the path
@@ -84,7 +84,7 @@ parameter as an identifier rather than an authorization decision.`,
       id: 'timeout-share',
       title: 'Timeout and degradation shares are reported',
       detail:
-        'The response carries `timeout_rate` (auctions that ran out of budget) and `degraded_share` (bids placed from a degraded tier). The draft omits both, so a bidder whose bids never land looks healthy.',
+        'The response carries `timeout_rate` (auctions that ran out of budget) and `degraded_share` (bids placed from a degraded tier). The starter omits both, so a bidder whose bids never land looks healthy.',
       match: {
         python: {all: [/"timeout_rate"/, /"degraded_share"/]},
         typescript: {all: [/timeout_rate/, /degraded_share/]},
@@ -97,7 +97,7 @@ parameter as an identifier rather than an authorization decision.`,
       id: 'win-rate-denominator',
       title: 'Win rate is against every auction seen',
       detail:
-        'A named `win_rate` / `winRate` divides wins by `auctions_seen` — including the auctions lost to a timeout or a no-bid — and returns 0 for a bidder that has seen nothing. The draft divides by wins plus losses, which flatters a bidder that mostly times out.',
+        'A named `win_rate` / `winRate` divides wins by `auctions_seen` — including the auctions lost to a timeout or a no-bid — and returns 0 for a bidder that has seen nothing. The starter divides by wins plus losses, which flatters a bidder that mostly times out.',
       match: {
         python: {all: [/def win_rate\(/, /auctions_seen/], none: [/"wins"\]\s*\+\s*counters\["losses"\]/]},
         typescript: {all: [/function winRate\(/, /auctions_seen/], none: [/counters\.wins\s*\+\s*counters\.losses/]},
@@ -110,7 +110,7 @@ parameter as an identifier rather than an authorization decision.`,
       id: 'foreign-403',
       title: 'A bidder cannot read another bidder’s stats',
       detail:
-        'The authenticated `X-Bidder-Id` must match the bidder in the path: a foreign bidder is **403**, a missing caller **401**. The draft reads whatever id the URL happens to contain.',
+        'The authenticated `X-Bidder-Id` must match the bidder in the path: a foreign bidder is **403**, a missing caller **401**. The starter reads whatever id the URL happens to contain.',
       match: {
         python: {all: [/X-Bidder-Id/, /status_code\s*=\s*403/]},
         typescript: {all: [/x-bidder-id/, /code\(403\)/]},
@@ -123,7 +123,7 @@ parameter as an identifier rather than an authorization decision.`,
       id: 'spend-window',
       title: 'Spend versus cap is reported for the window',
       detail:
-        'The response reports `spend_cents` from the counters and `cap_cents` for the same `window`, so spend is readable next to the limit it consumes. The draft reports neither.',
+        'The response reports `spend_cents` from the counters and `cap_cents` for the same `window`, so spend is readable next to the limit it consumes. The starter reports neither.',
       match: {
         python: {all: [/"spend_cents"/, /"cap_cents"/, /window/]},
         typescript: {all: [/spend_cents/, /cap_cents/, /window/]},
@@ -156,9 +156,9 @@ stats_store = StatsStore()
 
 @app.get("/v1/bidders/{bidder_id}/stats")
 def stats(bidder_id: str, window: str = Query(default="day")) -> JSONResponse:
-    # TODO: this draft omits the timeout and degradation shares, computes the win rate against wins
+    # TODO: this starter omits the timeout and degradation shares, computes the win rate against wins
     # and losses only (so a bidder whose bids never land looks perfect), and serves any bidder's
-    # stats to any caller. Review all three.
+    # stats to any caller. Fix all three.
     counters = stats_store.counters(bidder_id, window)
     wins = counters.get("wins", 0)
     losses = counters.get("losses", 0)
@@ -240,7 +240,7 @@ def stats(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/bidders/{id}/stats: a model-generated draft that flatters the bidder. */
+      starter: `/** GET /v1/bidders/{id}/stats: flawed code that flatters the bidder. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -252,9 +252,9 @@ interface StatsStore {
 const statsStore = {} as StatsStore;
 
 app.get('/v1/bidders/:bidderId/stats', async (request, reply) => {
-  // TODO: this draft omits the timeout and degradation shares, computes the win rate against wins
+  // TODO: this starter omits the timeout and degradation shares, computes the win rate against wins
   // and losses only (so a bidder whose bids never land looks perfect), and serves any bidder's
-  // stats to any caller. Review all three.
+  // stats to any caller. Fix all three.
   const {bidderId} = request.params as {bidderId: string};
   const window = (request.query as {window?: string}).window ?? 'day';
   const counters = await statsStore.counters(bidderId, window);
@@ -351,9 +351,9 @@ func stats(rw http.ResponseWriter, r *http.Request) {
 	if window == "" {
 		window = "day"
 	}
-	// TODO: this draft omits the timeout and degradation shares, computes the win rate against
+	// TODO: this starter omits the timeout and degradation shares, computes the win rate against
 	// wins and losses only (so a bidder whose bids never land looks perfect), and serves any
-	// bidder's stats to any caller. Review all three.
+	// bidder's stats to any caller. Fix all three.
 	counters := statsStore.Counters(bidderID, window)
 	writeJSON(rw, http.StatusOK, map[string]any{
 		"bidder_id": bidderID,
@@ -481,9 +481,9 @@ object ReadApi {
       get {
         parameters("window".?) { windowOpt =>
           val window = windowOpt.getOrElse("day")
-          // TODO: this draft omits the timeout and degradation shares, computes the win rate
+          // TODO: this starter omits the timeout and degradation shares, computes the win rate
           // against wins and losses only (so a bidder whose bids never land looks perfect), and
-          // serves any bidder's stats to any caller. Review all three.
+          // serves any bidder's stats to any caller. Fix all three.
           val counters = statsStore.counters(bidderId, window)
           val wins = counters.getOrElse("wins", 0)
           val losses = counters.getOrElse("losses", 0)
@@ -589,9 +589,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/bidders/([A-Za-z0-9_-]+)/stats)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft omits the timeout and degradation shares, computes the win rate against
+    // TODO: this starter omits the timeout and degradation shares, computes the win rate against
     // wins and losses only (so a bidder whose bids never land looks perfect), and serves any
-    // bidder's stats to any caller. Review all three.
+    // bidder's stats to any caller. Fix all three.
     const std::string bidderId = req.matches[1];
     const std::string window = req.has_param("window") ? req.get_param_value("window") : "day";
     const auto counters = statsStore.counters(bidderId, window);
@@ -693,7 +693,7 @@ int main() {
     'Fix the denominator first: `win_rate = wins / auctions_seen`, where `auctions_seen` counts every auction the bidder received a request for — the ones it lost on price, the ones it lost to a timeout and the ones it never answered. Dividing by wins plus losses makes a slow bidder look perfect.',
     'Report latency and degradation next to the money: `timeout_rate` over auctions seen, `degraded_share` over bids placed, and `spend_cents` beside `cap_cents` for the same `window`. Those four numbers are what tell an operator whether the bidder is slow, timid or simply out of budget.',
   ],
-  debrief: `The interviewer is testing whether you can review a read path for honesty. Reads are boring to
+  debrief: `The interviewer is testing whether you can debug a read path for honesty. Reads are boring to
 write and easy to get subtly wrong, and the wrong read makes every later decision wrong: the polling
 loop, the on-call runbook, the cap increase.
 

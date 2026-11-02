@@ -7,11 +7,11 @@ import {groundedAnswerStep} from './steps/4-grounded-answer';
 import {evalGateStep} from './steps/5-eval-gate';
 
 /**
- * RAG service on the AI-era track: the course is not "wire an LLM to a vector store", it is the
- * review you owe a model-generated draft before it touches a tenant's documents. Idempotent
- * ingest with a transactional outbox → deterministic chunking and bounded embedding retries →
- * tenant-scoped hybrid retrieval with real citation offsets → grounded answers that treat
- * retrieved text as data → an eval gate that can block a prompt or model release.
+ * RAG service: the course is not "wire an LLM to a vector store", it is the debugging you owe a
+ * retrieval pipeline before it touches a tenant's documents. Idempotent ingest with a
+ * transactional outbox → deterministic chunking and bounded embedding retries → tenant-scoped
+ * hybrid retrieval with real citation offsets → grounded answers that treat retrieved text as
+ * data → an eval gate that can block a prompt or model release.
  */
 export const ragServiceProblem: Problem = {
   id: 'rag-service',
@@ -19,7 +19,7 @@ export const ragServiceProblem: Problem = {
   tagline: 'Ingest, chunk, retrieve and answer over tenant documents — then gate releases on evals, not vibes.',
   difficulty: 'hard',
   concepts: ['http', 'grpc', 'redis', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# RAG Service
 
@@ -54,12 +54,12 @@ One service, **ragd**, with five pieces:
    correctness over at least 200 samples, blocks releases below threshold or more than 1% worse
    than the previous release, and stores metrics before committing offsets.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path,
+and it looks right. Your job in every step is the job you will have on a real feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

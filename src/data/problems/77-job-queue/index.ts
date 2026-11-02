@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Job queue on the AI-era track: the course is not "put a job in a list and run it", it is the
- * review you owe a model-generated queue before it owns a tenant's side effects. A registry-checked
- * submission with a real dedupe key → one atomic Redis claim under a visibility timeout whose
- * return is idempotent → a worker call that retries only what is retryable and buries poison pills
- * with their history → job-keyed events with the completion published after the effect commits and
- * an outbox under pressure → a status read reconciled against the queue's own sets.
+ * Job queue: the course is not "put a job in a list and run it", it is the debugging you owe a queue
+ * before it owns a tenant's side effects. A registry-checked submission with a real dedupe key → one
+ * atomic Redis claim under a visibility timeout whose return is idempotent → a worker call that
+ * retries only what is retryable and buries poison pills with their history → job-keyed events with
+ * the completion published after the effect commits and an outbox under pressure → a status read
+ * reconciled against the queue's own sets.
  */
 export const jobQueueProblem: Problem = {
   id: 'job-queue',
@@ -20,7 +20,6 @@ export const jobQueueProblem: Problem = {
   tagline: 'Background jobs that run at least once, dedupe side effects and bury poison pills.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Job Queue
 
@@ -64,12 +63,12 @@ One service, **jobqd**, with five pieces:
 5. \`GET /v1/jobs/{id}\`: state, attempt history, next retry time and any dead-letter reason, with a
    stranded job surfaced as stalled with its claim age and another tenant's job answered \`404\`.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real queue: read
-the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks that
-fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real queue: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

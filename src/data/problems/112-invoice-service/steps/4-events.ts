@@ -12,24 +12,24 @@ export const invoiceEventsStep: Step = {
 **paid** are published to one topic so that a consumer — the ledger — sees one invoice's history in
 order, carrying totals and per-line digests instead of the customer's own words.
 
-The starter is a plausible model-generated draft: it publishes all four event types on the right
+**Starting point.** The starter is working code: it publishes all four event types on the right
 topic, so replaying the happy path reproduces the lifecycle. Four production contracts are broken,
 and one of them is an order-of-effects bug that no happy-path test can see.
 
 - **One topic, keyed by invoice.** Every record is produced to \`invoice.event\` with the **invoice
   id** as the message key, so the invoice is the unit of partition, order and per-key retention. The
-  draft keys by the customer id: one customer's interleaved invoices share a partition, and an
+  starter keys by the customer id: one customer's interleaved invoices share a partition, and an
   invoice whose key changes (a merged account, a reassigned tenant) scatters across partitions, where
   a consumer can apply \`paid\` before \`finalized\` and reconstruct a history that never happened.
 - **Digests travel, text does not.** The payload is built from \`line_digests\` — one SHA-256 digest
-  per line — plus \`total_cents\` and the tax figure. The draft copies the raw line objects and the
+  per line — plus \`total_cents\` and the tax figure. The starter copies the raw line objects and the
   customer's name and email into the payload of a topic that is retained for days and replicated to
   every broker; what lands there outlives every retention policy the invoice's own store has.
 - **Four event types on one topic.** \`created\`, \`finalized\`, \`sent\` and \`paid\` all carry
   \`event_type\`, \`invoice_id\`, \`occurred_at\`, \`total_cents\` and the tax figure, so a consumer can
   rebuild one invoice's history from one subscription.
 - **Publish after the claim commits.** The \`finalized\` event is produced only once the per-tenant
-  number claim has committed, and it is skipped entirely when the claim fails. The draft publishes
+  number claim has committed, and it is skipped entirely when the claim fails. The starter publishes
   it first and reads the claim afterwards, so a consumer can observe an invoice the sequence later
   rolls back — an issued number that never existed in the tenant's books.
 - **Delivery guarantees.** The producer is idempotent with \`acks=all\`, so a retry of a produce
@@ -116,7 +116,7 @@ service can still refuse.`,
       id: 'publish-after-claim',
       title: 'The finalized event is published only after the number claim commits',
       detail:
-        'The per-tenant claim is committed first and the finalize returns without publishing when the claim fails; only then is the `finalized` event produced. The draft produces the event before it reads the claim, so a consumer can observe — and a ledger can post — a finalization the sequence later rolls back: an event that outran its commit.',
+        'The per-tenant claim is committed first and the finalize returns without publishing when the claim fails; only then is the `finalized` event produced. The starter produces the event before it reads the claim, so a consumer can observe — and a ledger can post — a finalization the sequence later rolls back: an event that outran its commit.',
       match: {
         python: {order: [/claim_and_commit\(/, /if not claim\.ok/, /publish\(\s*["']finalized["']/]},
         typescript: {order: [/claimAndCommit\(/, /if \(!claim\.ok\)/, /publish\(\s*'finalized'/]},
@@ -371,7 +371,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** invoice.event: a model draft that keys by customer, ships line text and publishes early. */
+      starter: `/** invoice.event: a first version that keys by customer, ships line text and publishes early. */
 import {Kafka} from 'kafkajs';
 
 const topicInvoiceEvent = 'invoice.event';

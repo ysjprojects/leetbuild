@@ -7,12 +7,12 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Form service on the AI-era track: the course is not "render a form and save the fields", it is the
- * review you owe a model-generated intake pipeline before a public form is pointed at the internet.
- * A submission validates against the form's *published* schema, is rate-limited on form and IP and
- * gated by a one-time captcha → its delivery to downstream handlers is keyed by the submission id →
- * its event is keyed by the form and carries hashes, not values → and the read side redacts by
- * default with an audited, generated export.
+ * Form service: the course is not "render a form and save the fields", it is the debugging you owe
+ * an intake pipeline before a public form is pointed at the internet. A submission validates
+ * against the form's *published* schema, is rate-limited on form and IP and gated by a one-time
+ * captcha → its delivery to downstream handlers is keyed by the submission id → its event is keyed
+ * by the form and carries hashes, not values → and the read side redacts by default with an
+ * audited, generated export.
  */
 export const formServiceProblem: Problem = {
   id: 'form-service',
@@ -20,7 +20,6 @@ export const formServiceProblem: Problem = {
   tagline: 'Public forms that resist spam, validate precisely and deliver submissions once.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Form Service
 
@@ -32,7 +31,7 @@ validation contract, the abuse controls, the delivery key, and the read path.
 ## The real system
 
 Production form services receive submissions from anyone, so every request is hostile until proven
-otherwise. They validate against the schema version the author *published*, not the draft still
+otherwise. They validate against the schema version the author *published*, not the starter still
 being edited, because a published form is a contract with the people submitting to it. They reject
 unknown fields and oversized values field by field so the client learns what to fix. They assume a
 public endpoint will be scraped: a captcha token is consumed exactly once, and submissions are
@@ -63,12 +62,12 @@ One service, **formd**, with five pieces:
 5. \`GET /v1/forms/{id}/submissions\` and its export: owner-only, redacted by default, cursor-paged,
    with a generated export filename and an audit record for the PII export.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

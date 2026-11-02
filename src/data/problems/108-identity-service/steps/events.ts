@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the lifecycle endpoint answers
-**202**, a record lands on \`identity.event\` and the demo shows the topic filling up. Three production
-contracts are broken. It keys the record by the **email address** instead of the user id, it copies
-the **address and the number** into the payload "for downstream dedupe", and it lets the producer
+**Starting point.** The starter is working code: the lifecycle endpoint answers **202**, a record
+lands on \`identity.event\` and the demo shows the topic filling up. Three production contracts are
+broken. It keys the record by the **email address** instead of the user id, it copies the
+**address and the number** into the payload "for downstream dedupe", and it lets the producer
 acknowledge the record **before the account write commits**, so the topic can announce a state the
 database never stored. On top of that the producer is a bare one with no idempotence, and any
 \`kind\` string a caller sends is published as-is.
@@ -60,7 +60,7 @@ retried; and an open \`kind\` lets typo events into a topic consumers switch on.
       id: 'user-key',
       title: 'Produced to identity.event keyed by the user id',
       detail:
-        'The record goes to `identity.event` with the **user id** as its key, so one user’s lifecycle stays ordered in one partition. The draft keys by the email address, so the ordering guarantee follows a handle that can change instead of the identity itself.',
+        'The record goes to `identity.event` with the **user id** as its key, so one user’s lifecycle stays ordered in one partition. The starter keys by the email address, so the ordering guarantee follows a handle that can change instead of the identity itself.',
       match: {
         python: {
           all: [
@@ -78,7 +78,7 @@ retried; and an open \`kind\` lets typo events into a topic consumers switch on.
       id: 'no-contact-pii',
       title: 'Payload carries the kind and the reason only',
       detail:
-        'The event body is projected through an allow-list (`ALLOWED_EVENT_FIELDS` / `kAllowedEventFields`) that names exactly `kind` and `reason`, and the module never mentions `email`, `phone` or `name`. The draft copies the address and the number into the payload for downstream dedupe — retained and replicated with the topic.',
+        'The event body is projected through an allow-list (`ALLOWED_EVENT_FIELDS` / `kAllowedEventFields`) that names exactly `kind` and `reason`, and the module never mentions `email`, `phone` or `name`. The starter copies the address and the number into the payload for downstream dedupe — retained and replicated with the topic.',
       match: {
         python: {
           all: [/ALLOWED_EVENT_FIELDS\s*=\s*\(\s*"kind"\s*,\s*"reason"\s*\)/],
@@ -106,7 +106,7 @@ retried; and an open \`kind\` lets typo events into a topic consumers switch on.
       id: 'commit-before-publish',
       title: 'The account write commits before the produce',
       detail:
-        'The committed account row comes first (`store.commit_state` / `commitState`, `conn.commit()`), and only then the record is produced. The draft produces, flushes and *then* commits the write, so a rolled-back transaction has already been announced to every consumer.',
+        'The committed account row comes first (`store.commit_state` / `commitState`, `conn.commit()`), and only then the record is produced. The starter produces, flushes and *then* commits the write, so a rolled-back transaction has already been announced to every consumer.',
       match: {
         python: {order: [/store\.commit_state\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.commitState\(/, /producer\.send\(/]},
@@ -119,7 +119,7 @@ retried; and an open \`kind\` lets typo events into a topic consumers switch on.
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` (`enable.idempotence` plus `acks`, KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a hashed balancer), so a retry of a produce cannot duplicate a record. The draft runs a default producer and takes whatever the broker does.',
+        'The producer is configured for idempotence and `acks=all` (`enable.idempotence` plus `acks`, KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a hashed balancer), so a retry of a produce cannot duplicate a record. The starter runs a default producer and takes whatever the broker does.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -132,7 +132,7 @@ retried; and an open \`kind\` lets typo events into a topic consumers switch on.
       id: 'lifecycle-enum',
       title: 'The lifecycle kinds are a closed set',
       detail:
-        '`created`, `verified` and `suspended` are the whole vocabulary (`LIFECYCLE_EVENTS` / `kLifecycleEvents`) and `kind` is validated against it before anything is written or produced, so an unknown kind can never be published. The draft publishes whatever string arrives, including typos consumers switch on.',
+        '`created`, `verified` and `suspended` are the whole vocabulary (`LIFECYCLE_EVENTS` / `kLifecycleEvents`) and `kind` is validated against it before anything is written or produced, so an unknown kind can never be published. The starter publishes whatever string arrives, including typos consumers switch on.',
       match: {
         python: {
           all: [/LIFECYCLE_EVENTS\s*=\s*\(\s*"created"\s*,\s*"verified"\s*,\s*"suspended"\s*\)/, /raise ValueError/],
@@ -253,7 +253,7 @@ def record_event(user_id: str, event: LifecycleEvent) -> dict:
 `,
     },
     typescript: {
-      starter: `/** identity.event: a model-generated draft that keys by the address and acks before the commit. */
+      starter: `/** identity.event: flawed code that keys by the address and acks before the commit. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -348,7 +348,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// identity.event: a model-generated draft that keys by the address and acks before the commit.
+// identity.event: flawed code that keys by the address and acks before the commit.
 var eventWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "identity.event"}
 
 // AccountStore is the accounts table; CommitState writes the row and commits the transaction.
@@ -496,7 +496,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-// identity.event: a model-generated draft that keys by the address and acks before the commit.
+// identity.event: flawed code that keys by the address and acks before the commit.
 object Events {
   private val producer = new KafkaProducer[String, String](new Properties())
 
@@ -603,7 +603,7 @@ object Events {
 
 using json = nlohmann::json;
 
-// identity.event: a model-generated draft that keys by the address and acks before the commit.
+// identity.event: flawed code that keys by the address and acks before the commit.
 struct User {
   std::string id;
   std::string email;

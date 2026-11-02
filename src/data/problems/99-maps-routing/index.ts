@@ -7,11 +7,11 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Maps routing on the AI-era track: the course is not "call a routing engine from an endpoint", it
- * is the review you owe a model-generated navigation path before drivers follow it. Validated,
- * coverage-checked route requests → one cell- and epoch-keyed Redis entry per route → a
- * deadline-bounded engine call with an honest straight-line fallback → region-keyed route events
- * with an outbox and no user positions → a provenance-bearing, tenant-scoped route read.
+ * Maps routing: the course is not "call a routing engine from an endpoint", it is the debugging you
+ * owe a navigation path before drivers follow it. Validated, coverage-checked route requests → one
+ * cell- and epoch-keyed Redis entry per route → a deadline-bounded engine call with an honest
+ * straight-line fallback → region-keyed route events with an outbox and no user positions → a
+ * provenance-bearing, tenant-scoped route read.
  */
 export const mapsRoutingProblem: Problem = {
   id: 'maps-routing',
@@ -19,7 +19,6 @@ export const mapsRoutingProblem: Problem = {
   tagline: 'Routes that cache by geography, degrade honestly and never trust coordinates.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Maps Routing
 
@@ -64,12 +63,12 @@ One service, **mapsd**, with five pieces:
    under, the engine version and the degraded marker if any, never restamped with the current epoch
    and never a substitute for a fresh computation.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,14 +8,14 @@ export const readStep: Step = {
   focus: ['admin', 'api', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: an admin opens the submissions list and sees the
+**Starting point.** The starter is working code: an admin opens the submissions list and sees the
 data. It compiles, it serves the demo, and it turns an admin screen into a data-export tool with no
-role check, no redaction and a filename built from user input. Review it, fix it, and prove the fix.
+role check, no redaction and a filename built from user input. Debug it, fix it, and prove the fix.
 
 Implement \`GET /v1/forms/{id}/submissions\` and the export beside it:
 
 - The read requires the **owner role**. A tenant member who is not the form's owner gets **403**;
-  the draft answers any tenant member with the full payload.
+  the starter answers any tenant member with the full payload.
 - The default view is **redacted**: PII fields (\`email\`, \`phone\`) come back as \`[redacted]\`.
   Reading the real values requires the **export** path, and that path writes an **audit record**
   naming the tenant, the form and the generated file.
@@ -25,7 +25,7 @@ Implement \`GET /v1/forms/{id}/submissions\` and the export beside it:
   and its values into a name lets a submitted \`../../etc/passwd\` become a path traversal the moment
   the export tool writes the file to disk.
 
-**Failure mode the checks target.** The draft answers every tenant member with the full payload, so
+**Failure mode the checks target.** The starter answers every tenant member with the full payload, so
 redaction is not the default; it exports PII with no audit trail; it pages by offset, so concurrent
 submissions make pages repeat; and it builds the filename out of user-supplied values, which is a
 path-traversal primitive waiting for the first tool that writes the file.`,
@@ -53,7 +53,7 @@ path-traversal primitive waiting for the first tool that writes the file.`,
       id: 'owner-role',
       title: 'Requires the owner role and answers 403 otherwise',
       detail:
-        'A caller without the owner role gets **403**. The draft answers any tenant member with the full payload, so an admin screen doubles as a bulk export.',
+        'A caller without the owner role gets **403**. The starter answers any tenant member with the full payload, so an admin screen doubles as a bulk export.',
       match: {
         python: {all: [/"owner"/, /status_code\s*=\s*403/]},
         typescript: {all: [/'owner'/, /code\(\s*403\s*\)/]},
@@ -92,7 +92,7 @@ path-traversal primitive waiting for the first tool that writes the file.`,
       id: 'generated-filename',
       title: 'Generates export filenames instead of deriving them from values',
       detail:
-        'The export filename is generated; no field value is concatenated into a path. The draft builds the name from the submission id and its values, so a malicious value becomes a path traversal.',
+        'The export filename is generated; no field value is concatenated into a path. The starter builds the name from the submission id and its values, so a malicious value becomes a path traversal.',
       match: {
         python: {all: [/"export_"/], none: [/filename_from_values/]},
         typescript: {all: [/'export_'/], none: [/filenameFromValues/]},
@@ -130,7 +130,7 @@ def filename_from_values(submission_id: str, fields: dict) -> str:
 
 @app.get("/v1/forms/{form_id}/submissions")
 def list_submissions(form_id: str, tenant: str = Header(alias="X-Tenant-Id"), offset: int = 0) -> dict:
-    # TODO: this draft returns the full payloads to any tenant member, builds the export filename by
+    # TODO: this starter returns the full payloads to any tenant member, builds the export filename by
     # concatenating field values (so a malicious value becomes a path traversal), pages by offset,
     # and writes no audit record when PII is exported.
     rows = [row for row in submissions.values() if row["form_id"] == form_id]
@@ -208,7 +208,7 @@ def export(
 `,
     },
     typescript: {
-      starter: `/** Submissions read and export — a model-generated draft. */
+      starter: `/** Submissions read and export — flawed code. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -220,7 +220,7 @@ function filenameFromValues(submissionId: string, fields: Record<string, string>
 }
 
 app.get('/v1/forms/:id/submissions', async (req, reply) => {
-  // TODO: this draft returns the full payloads to any tenant member, builds the export filename by
+  // TODO: this starter returns the full payloads to any tenant member, builds the export filename by
   // concatenating field values (so a malicious value becomes a path traversal), pages by offset,
   // and writes no audit record when PII is exported.
   const {id} = req.params as {id: string};
@@ -316,7 +316,7 @@ func filenameFromValues(submissionID string, fields map[string]string) string {
 }
 
 func ListSubmissions(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft returns the full payloads to any tenant member, builds the export filename by
+	// TODO: this starter returns the full payloads to any tenant member, builds the export filename by
 	// concatenating field values (so a malicious value becomes a path traversal), pages by offset,
 	// and writes no audit record when PII is exported.
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
@@ -431,7 +431,7 @@ object Read {
 
   val routes: Route = path("v1" / "forms" / Segment / "submissions") { _ =>
     get {
-      // TODO: this draft returns the full payloads to any tenant member, builds the export filename
+      // TODO: this starter returns the full payloads to any tenant member, builds the export filename
       // by concatenating field values (so a malicious value becomes a path traversal), pages by
       // offset, and writes no audit record when PII is exported.
       parameter("offset".as[Int].withDefault(0)) { offset =>
@@ -508,7 +508,7 @@ static std::string FilenameFromValues(const std::string& submissionId, const jso
 
 void RegisterRoutes(httplib::Server& svr, const json& submissions) {
   svr.Get("/v1/forms/([^/]+)/submissions", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft returns the full payloads to any tenant member, builds the export filename by
+    // TODO: this starter returns the full payloads to any tenant member, builds the export filename by
     // concatenating field values (so a malicious value becomes a path traversal), pages by offset,
     // and writes no audit record when PII is exported.
     const int offset = std::stoi(req.get_param_value("offset"));

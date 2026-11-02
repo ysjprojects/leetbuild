@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['server', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the counter layer: it builds
+**Starting point.** The starter is working code for the counter layer: it builds
 the keys, increments, compares and returns a reservation. It hides two production flaws that only
-appear under load or under a crash. Review it like the service owner, fix it, and prove the fix with
+appear under load or under a crash. Debug it like the service owner, fix it, and prove the fix with
 the checks below.
 
 Implement the reservation the serve path uses, one call per serve:
@@ -33,7 +33,7 @@ reserve(campaign, user_hash, price_micros) -> {"allowed": bool, "seen": int, "sp
   the campaign's \`freq_window_s\`, so caps roll off at the end of the window instead of leaking keys
   forever.
 
-**Failure mode the checks target.** The draft \`INCR\`s the user counter before it knows whether the
+**Failure mode the checks target.** The starter \`INCR\`s the user counter before it knows whether the
 serve will happen, then updates the pacing counter in a second command and compares afterwards. A
 crashed request still burns an impression, and a burst all reads the same \`spent\` value, so every
 request in the burst passes the remaining budget. The missing \`EXPIRE\` is the slow one: without it
@@ -55,7 +55,7 @@ the counter never resets, and a user who was capped last month is still capped t
       id: 'keys',
       title: 'Scopes one counter per user and one per campaign',
       detail:
-        'The per-user frequency counter is `freq:{campaign_id}:{user_hash}` and the pacing counter is `pace:{campaign_id}`; the draft already builds both keys this way, so only the atomicity, ordering and TTL around them are wrong.',
+        'The per-user frequency counter is `freq:{campaign_id}:{user_hash}` and the pacing counter is `pace:{campaign_id}`; the starter already builds both keys this way, so only the atomicity, ordering and TTL around them are wrong.',
       match: {
         python: {all: [/FREQ_KEY_PREFIX/, /PACE_KEY_PREFIX/]},
         typescript: {all: [/FREQ_KEY_PREFIX/, /PACE_KEY_PREFIX/]},
@@ -68,7 +68,7 @@ the counter never resets, and a user who was capped last month is still capped t
       id: 'atomic',
       title: 'One Lua script decides and writes both counters',
       detail:
-        'The cap check, the pacing check, the user increment and the pacing increment all live in one script that is loaded once and invoked with `EVALSHA` per serve. The draft uses separate `INCR`/`INCRBY`/`GET` commands, so two serves can both read the same remaining budget.',
+        'The cap check, the pacing check, the user increment and the pacing increment all live in one script that is loaded once and invoked with `EVALSHA` per serve. The starter uses separate `INCR`/`INCRBY`/`GET` commands, so two serves can both read the same remaining budget.',
       match: {
         python: {all: [/RESERVE_SCRIPT/, /script_load/, /evalsha/]},
         typescript: {all: [/RESERVE_SCRIPT/, /script\(\s*['"]load['"]/, /evalsha/]},
@@ -81,7 +81,7 @@ the counter never resets, and a user who was capped last month is still capped t
       id: 'cap-before-increment',
       title: 'Reads the cap before it increments the allowance',
       detail:
-        'Inside the script the user counter is read and compared with the cap **before** `INCR`, and the increment happens only on the allowed path. The draft increments first and decides afterwards, so a request that never returns an ad still burns an impression.',
+        'Inside the script the user counter is read and compared with the cap **before** `INCR`, and the increment happens only on the allowed path. The starter increments first and decides afterwards, so a request that never returns an ad still burns an impression.',
       match: {
         python: {order: [/redis\.call\(\s*'get'\s*,\s*cap_key\)/, /redis\.call\(\s*'incr'\s*,\s*cap_key\)/]},
         typescript: {order: [/redis\.call\(\s*'get'\s*,\s*cap_key\)/, /redis\.call\(\s*'incr'\s*,\s*cap_key\)/]},
@@ -94,7 +94,7 @@ the counter never resets, and a user who was capped last month is still capped t
       id: 'ttl',
       title: 'Expires the cap key at the frequency window',
       detail:
-        'The user counter is given a TTL when it is first written: the script runs `EXPIRE cap_key window_s` on the increment that returns `1`. The draft writes the key with no expiry, so the cap never rolls off.',
+        'The user counter is given a TTL when it is first written: the script runs `EXPIRE cap_key window_s` on the increment that returns `1`. The starter writes the key with no expiry, so the cap never rolls off.',
       match: {
         python: {
           all: [/\bwindow_s\b/],
@@ -122,7 +122,7 @@ the counter never resets, and a user who was capped last month is still capped t
       id: 'no-overspend',
       title: 'Refuses the serve when the remaining budget is short',
       detail:
-        'The script compares `spent + price > paced_budget` and returns `allowed = false` before any `INCRBY`, so a burst cannot spend past the budget; the increment only happens on the allowed path. The draft increments the pacing counter and compares afterwards.',
+        'The script compares `spent + price > paced_budget` and returns `allowed = false` before any `INCRBY`, so a burst cannot spend past the budget; the increment only happens on the allowed path. The starter increments the pacing counter and compares afterwards.',
       match: {
         python: {
           all: [/spent\s*\+\s*price\s*>\s*paced_budget/, /redis\.call\(\s*'incrby'\s*,\s*pace_key\s*,\s*price\)/],
@@ -159,9 +159,9 @@ class PacingStore:
         self._client = client
 
     def reserve(self, campaign: dict, user_hash: str, price_micros: int) -> dict:
-        # TODO: this draft increments the user's counter before it decides, updates the pacing
+        # TODO: this starter increments the user's counter before it decides, updates the pacing
         # counter in a second command and compares after the fact, and never sets a TTL on the
-        # cap key. Review all three flaws.
+        # cap key. Fix all three flaws.
         cap_key = freq_key(campaign["campaign_id"], user_hash)
         charge_key = pace_key(campaign["campaign_id"])
         seen = int(self._client.incr(cap_key))
@@ -229,7 +229,7 @@ class PacingStore:
 `,
     },
     typescript: {
-      starter: `/** Frequency and pacing counters: a model-generated draft with three flaws. */
+      starter: `/** Frequency and pacing counters: flawed code with three flaws. */
 import Redis from 'ioredis';
 
 export const FREQ_KEY_PREFIX = 'freq:';
@@ -256,9 +256,9 @@ export class PacingStore {
   constructor(private readonly redis: Redis) {}
 
   async reserve(campaign: Campaign, userHash: string, priceMicros: number): Promise<Reservation> {
-    // TODO: this draft increments the user's counter before it decides, updates the pacing
+    // TODO: this starter increments the user's counter before it decides, updates the pacing
     // counter in a second command and compares after the fact, and never sets a TTL on the cap
-    // key. Review all three flaws.
+    // key. Fix all three flaws.
     const seen = await this.redis.incr(freqKey(campaign.campaign_id, userHash));
     const spent = await this.redis.incrby(paceKey(campaign.campaign_id), priceMicros);
     const allowed = seen <= campaign.freq_cap_impressions && spent <= campaign.paced_budget_micros;
@@ -380,9 +380,9 @@ func NewPacingStore(client *redis.Client) *PacingStore {
 }
 
 func (s *PacingStore) Reserve(ctx context.Context, campaign Campaign, userHash string, priceMicros int64) (Reservation, error) {
-	// TODO: this draft increments the user's counter before it decides, updates the pacing
+	// TODO: this starter increments the user's counter before it decides, updates the pacing
 	// counter in a second command and compares after the fact, and never sets a TTL on the cap
-	// key. Review all three flaws.
+	// key. Fix all three flaws.
 	capKey := freqKey(campaign.CampaignID, userHash)
 	spendKey := paceKey(campaign.CampaignID)
 	seen, err := s.client.Incr(ctx, capKey).Result()
@@ -508,9 +508,9 @@ class PacingStore(client: Jedis) {
   def paceKey(campaignId: String): String = s"$PaceKeyPrefix$campaignId"
 
   def reserve(campaign: Campaign, userHash: String, priceMicros: Long): Reservation = {
-    // TODO: this draft increments the user's counter before it decides, updates the pacing
+    // TODO: this starter increments the user's counter before it decides, updates the pacing
     // counter in a second command and compares after the fact, and never sets a TTL on the cap
-    // key. Review all three flaws.
+    // key. Fix all three flaws.
     val seen = client.incr(freqKey(campaign.campaign_id, userHash))
     val spent = client.incrBy(paceKey(campaign.campaign_id), priceMicros)
     val allowed = seen <= campaign.freq_cap_impressions && spent <= campaign.paced_budget_micros
@@ -619,9 +619,9 @@ class PacingStore {
   explicit PacingStore(sw::redis::Redis& client) : client_(client) {}
 
   Reservation reserve(const Campaign& campaign, const std::string& userHash, long priceMicros) {
-    // TODO: this draft increments the user's counter before it decides, updates the pacing
+    // TODO: this starter increments the user's counter before it decides, updates the pacing
     // counter in a second command and compares after the fact, and never sets a TTL on the cap
-    // key. Review all three flaws.
+    // key. Fix all three flaws.
     const long seen = client_.incr(freqKey(campaign.campaign_id, userHash));
     const long spent = client_.incrby(paceKey(campaign.campaign_id), priceMicros);
     const bool allowed = seen <= campaign.freq_cap_impressions && spent <= campaign.paced_budget_micros;
@@ -718,5 +718,5 @@ class PacingStore {
     'Write the guard before the increment: only the path that returns `allowed = 1` reaches `INCR cap_key` and `INCRBY pace_key price`. Then set the TTL on the increment that returns `1` — that is the first write of the window, and the only one that needs `EXPIRE`.',
     'Return the three values the caller needs (`allowed`, `seen`, `spent_micros`) so the serve path can log and the delivery read can convert them back to money without a second Redis call.',
   ],
-  debrief: `The interviewer is testing whether you can keep a counter honest under concurrency, and every flaw in the draft is an ordering flaw. Incrementing before the decision means the counter reflects requests rather than impressions; pacing in a second command means the read-modify-write race is visible to the whole burst; missing the TTL means the window never rolls. One Lua script fixes all three because Redis runs it to completion without interleaving: the checks and both writes are a single atomic step, and the TTL is set exactly once, at the first write. Real pacing layers go beyond a single budget: smooth spend against a diurnal curve, separate reservation from confirmation for a cancelled render, guard the script against a clock skew in the window bucket, and keep the pacing key's TTL aligned with the flight end so counters cannot outlive the campaign.`,
+  debrief: `The interviewer is testing whether you can keep a counter honest under concurrency, and every flaw in the starter is an ordering flaw. Incrementing before the decision means the counter reflects requests rather than impressions; pacing in a second command means the read-modify-write race is visible to the whole burst; missing the TTL means the window never rolls. One Lua script fixes all three because Redis runs it to completion without interleaving: the checks and both writes are a single atomic step, and the TTL is set exactly once, at the first write. Real pacing layers go beyond a single budget: smooth spend against a diurnal curve, separate reservation from confirmation for a cancelled render, guard the script against a clock skew in the window bucket, and keep the pacing key's TTL aligned with the flight end so counters cannot outlive the campaign.`,
 };

@@ -8,23 +8,23 @@ export const eventsStep: Step = {
   focus: ['broker', 'kafka', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a \`quota.event\` lands in the
-topic and the demo shows it. Its ordering, its payload and its durability are all wrong. Review it,
+**Starting point.** The starter is working code: a \`quota.event\` lands in the
+topic and the demo shows it. Its ordering, its payload and its durability are all wrong. Debug it,
 fix it, and prove the fix.
 
 Implement the quota-event path behind the reserve, release and deny paths:
 
 - Every reserve, release and deny publishes a \`quota.event\` **keyed by team**. Kafka orders within
   a partition, not within a topic, so the key decides which events can be reordered relative to one
-  another — and a team’s ledger is only readable in order. The draft keys by **resource class**, so
+  another — and a team’s ledger is only readable in order. The starter keys by **resource class**, so
   every team that reserves a \`gpu-a100\` shares one partition and their events interleave.
 - The payload carries the **resource class, the window, the amount and the reservation id**, plus
   the event kind. It never carries **who** asked: no user id, no email, no request metadata. The
   topic is retained and replicated far past any request, and the ledger it rebuilds needs amounts,
-  not identities. The draft copies the caller’s \`user_id\` into every event.
+  not identities. The starter copies the caller’s \`user_id\` into every event.
 - The producer uses **\`acks=all\`**, so an acknowledged produce is replicated rather than buffered
   on a single broker.
-- The handler returns only **after the broker confirms**. The draft fires the produce and answers
+- The handler returns only **after the broker confirms**. The starter fires the produce and answers
   immediately, so a produce that fails after the response is a lost event nobody can replay.
 - When the produce is rejected, the same payload is written to an **outbox** row, so a broker outage
   delays the event instead of dropping it and the ledger can be rebuilt by draining the outbox.
@@ -55,7 +55,7 @@ acknowledgement level and the failure path.`,
       id: 'team-key',
       title: 'Keys the event by team',
       detail:
-        'The record key is the team, so every event of one team lands in the same partition and stays ordered. The draft keys by resource class and interleaves every team that shares a class.',
+        'The record key is the team, so every event of one team lands in the same partition and stays ordered. The starter keys by resource class and interleaves every team that shares a class.',
       match: {
         python: {all: [/key=team/]},
         typescript: {all: [/key:\s*team/]},
@@ -68,7 +68,7 @@ acknowledgement level and the failure path.`,
       id: 'amounts-not-identities',
       title: 'Publishes amounts and ids, never the requester',
       detail:
-        'The payload carries the resource class, the window, the amount and the reservation id, and no user identifier of any kind. The draft copies the caller’s `user_id` into the retained topic.',
+        'The payload carries the resource class, the window, the amount and the reservation id, and no user identifier of any kind. The starter copies the caller’s `user_id` into the retained topic.',
       match: {
         python: {all: [/resource_class/, /amount/, /reservation_id/], none: [/\buser_id\b/]},
         typescript: {all: [/resource_class/, /amount/, /reservation_id/], none: [/\buser_id\b/]},
@@ -81,7 +81,7 @@ acknowledgement level and the failure path.`,
       id: 'acks-all',
       title: 'Produce with acks=all',
       detail:
-        'The producer acknowledges only after all in-sync replicas have the record. The draft leaves the acknowledgement level at its default.',
+        'The producer acknowledges only after all in-sync replicas have the record. The starter leaves the acknowledgement level at its default.',
       match: {
         python: {all: [/ACKS_ALL/]},
         typescript: {all: [/ACKS_ALL/]},
@@ -94,7 +94,7 @@ acknowledgement level and the failure path.`,
       id: 'broker-confirmed',
       title: 'Waits for the broker before answering',
       detail:
-        'The handler waits on the delivery report before it returns. The draft produces and answers immediately, so a produce that fails after the response leaves a hole in the ledger nobody can replay.',
+        'The handler waits on the delivery report before it returns. The starter produces and answers immediately, so a produce that fails after the response leaves a hole in the ledger nobody can replay.',
       match: {
         python: {all: [/producer\.send\(/, /\.get\(/]},
         typescript: {all: [/await producer\.send\(/]},
@@ -107,7 +107,7 @@ acknowledgement level and the failure path.`,
       id: 'outbox',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce stores the same payload in an outbox so the ledger can be rebuilt by replaying it. The draft drops the event when the broker rejects it.',
+        'A rejected produce stores the same payload in an outbox so the ledger can be rebuilt by replaying it. The starter drops the event when the broker rejects it.',
       match: {
         python: {all: [/outbox/i, /rpush\(/]},
         typescript: {all: [/outbox/i, /INSERT/i]},
@@ -119,7 +119,7 @@ acknowledgement level and the failure path.`,
   ],
   code: {
     python: {
-      starter: `"""quota.event: a model-generated draft that keys by resource class and describes the requester."""
+      starter: `"""quota.event: flawed code that keys by resource class and describes the requester."""
 import json
 
 from fastapi import FastAPI
@@ -144,7 +144,7 @@ class QuotaEvent(BaseModel):
 
 @app.post("/v1/quotas/{team}/reserve")
 def reserve(team: str, event: QuotaEvent) -> dict:
-    # TODO: this draft keys the event by resource class, includes the requester's user id, produces
+    # TODO: this starter keys the event by resource class, includes the requester's user id, produces
     # without acks=all and answers before the broker confirms, and has no outbox. Key by team,
     # publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
     # payload in an outbox when the produce is rejected.
@@ -213,7 +213,7 @@ def reserve(team: str, event: QuotaEvent) -> dict:
 `,
     },
     typescript: {
-      starter: `/** quota.event: a model-generated draft that keys by class and answers before the ack. */
+      starter: `/** quota.event: flawed code that keys by class and answers before the ack. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -233,7 +233,7 @@ interface QuotaEvent {
 
 app.post('/v1/quotas/:team/reserve', async (request, reply) => {
   const event = request.body as QuotaEvent;
-  // TODO: this draft keys the event by resource class, includes the requester's user id, produces
+  // TODO: this starter keys the event by resource class, includes the requester's user id, produces
   // without acks=all and answers before the broker confirms, and has no outbox. Key by team,
   // publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
   // payload in an outbox when the produce is rejected.
@@ -336,7 +336,7 @@ type quotaEvent struct {
 func reserve(rw http.ResponseWriter, r *http.Request) {
 	var event quotaEvent
 	_ = json.NewDecoder(r.Body).Decode(&event)
-	// TODO: this draft keys the event by resource class, includes the requester's user id, produces
+	// TODO: this starter keys the event by resource class, includes the requester's user id, produces
 	// without acks=all and answers before the broker confirms, and has no outbox. Key by team,
 	// publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
 	// payload in an outbox when the produce is rejected.
@@ -457,7 +457,7 @@ object EventsApi {
     path("v1" / "quotas" / Segment / "reserve") { team =>
       post {
         entity(as[QuotaEvent]) { event =>
-          // TODO: this draft keys the event by resource class, includes the requester's user id,
+          // TODO: this starter keys the event by resource class, includes the requester's user id,
           // produces without acks=all and answers before the broker confirms, and has no outbox.
           // Key by team, publish kind/window/resource_class/amount/reservation_id only, wait for
           // the ack, and park the payload in an outbox when the produce is rejected.
@@ -554,7 +554,7 @@ int main() {
   svr.Post("/v1/quotas/:team/reserve", [&](const httplib::Request& req, httplib::Response& res) {
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this draft keys the event by resource class, includes the requester's user id, produces
+    // TODO: this starter keys the event by resource class, includes the requester's user id, produces
     // without acks=all and answers before the broker confirms, and has no outbox. Key by team,
     // publish kind/window/resource_class/amount/reservation_id only, wait for the ack, and park the
     // payload in an outbox when the produce is rejected.

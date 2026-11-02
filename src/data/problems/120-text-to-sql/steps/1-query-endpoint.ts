@@ -8,9 +8,9 @@ export const queryEndpointStep: Step = {
   focus: ['analyst', 'api', 'agents', 'workspaces'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, asks
+**Starting point.** The starter is working code: it registers the route, asks
 the intent agent for a workspace, asks the table agent for tables and returns SQL. It compiles, it
-serves the demo, and it hides four production flaws. Review it like the service owner, fix it, and
+serves the demo, and it hides four production flaws. Debug it like the service owner, fix it, and
 prove the fix with the checks below.
 
 Implement \`POST /v1/queries\` with body \`{"question": "…", "workspace": "mobility"}\` (\`workspace\`
@@ -34,7 +34,7 @@ optional).
 curated set of tables and samples, including custom workspaces that are not theirs; a missing cap
 turns one pasted document into a 60-second chain of model calls; an un-keyed endpoint runs the whole
 chain again on every client retry. Generating before the ACK is the quiet one: the table agent
-exists because users saw the wrong tables picked, and a draft that generates first makes the ACK a
+exists because users saw the wrong tables picked, and a handler that generates first makes the ACK a
 formality on SQL that already exists.`,
   sequence: {
     participants: ['Analyst', 'querygen', 'Agents', 'query store'],
@@ -73,7 +73,7 @@ formality on SQL that already exists.`,
       id: 'auth-idempotency',
       title: 'Authenticates the user and keys retries by (user, Idempotency-Key)',
       detail:
-        'A missing `X-User-Id` is **401**; `Idempotency-Key` is required and the record is stored under `(user, key)` so a replay returns it instead of running the agents again. The draft takes the header as given and ignores the key.',
+        'A missing `X-User-Id` is **401**; `Idempotency-Key` is required and the record is stored under `(user, key)` so a replay returns it instead of running the agents again. The starter takes the header as given and ignores the key.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/code\(\s*401\s*\)/, /idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -86,7 +86,7 @@ formality on SQL that already exists.`,
       id: 'question-cap',
       title: 'Caps the question at 2000 characters',
       detail:
-        'An empty question is **400** and one over `MAX_QUESTION_CHARS = 2000` is **413**, before any agent is called. The draft forwards whatever arrives, so one pasted document becomes a chain of oversized model calls.',
+        'An empty question is **400** and one over `MAX_QUESTION_CHARS = 2000` is **413**, before any agent is called. The starter forwards whatever arrives, so one pasted document becomes a chain of oversized model calls.',
       match: {
         python: {all: [/MAX_QUESTION_CHARS\s*=\s*2000/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_QUESTION_CHARS\s*=\s*2000/, /code\(\s*413\s*\)/]},
@@ -99,7 +99,7 @@ formality on SQL that already exists.`,
       id: 'workspace-allowlist',
       title: 'Resolves the workspace against the system allow-list',
       detail:
-        'A caller-supplied `workspace` must be in `SYSTEM_WORKSPACES` (**400** otherwise), and the intent agent’s answer is checked against the same set in `resolve_workspace`. The draft passes the caller’s string straight to the agents.',
+        'A caller-supplied `workspace` must be in `SYSTEM_WORKSPACES` (**400** otherwise), and the intent agent’s answer is checked against the same set in `resolve_workspace`. The starter passes the caller’s string straight to the agents.',
       match: {
         python: {all: [/SYSTEM_WORKSPACES/, /def resolve_workspace\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/SYSTEM_WORKSPACES/, /function resolveWorkspace\(/, /code\(\s*400\s*\)/]},
@@ -112,7 +112,7 @@ formality on SQL that already exists.`,
       id: 'pending-ack',
       title: 'Proposes tables for ACK and does not generate yet',
       detail:
-        'The response carries `tables_proposed` with `status: "pending_ack"` and the handler never calls `Generate`; SQL is produced only after the user ACKs the table list. The draft generates immediately with whatever the table agent picked.',
+        'The response carries `tables_proposed` with `status: "pending_ack"` and the handler never calls `Generate`; SQL is produced only after the user ACKs the table list. The starter generates immediately with whatever the table agent picked.',
       match: {
         python: {all: [/pending_ack/, /\.PickTables\(/], none: [/\.Generate\(/]},
         typescript: {all: [/pending_ack/, /\.PickTables\(/], none: [/\.Generate\(/]},
@@ -161,8 +161,8 @@ store = QueryStore()
 
 @app.post("/v1/queries")
 def create_query(body: QueryRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
-    # TODO: this draft trusts the caller's workspace string, caps nothing, ignores
-    # Idempotency-Key, and generates SQL before the user ACKs the tables. Review all four.
+    # TODO: this starter trusts the caller's workspace string, caps nothing, ignores
+    # Idempotency-Key, and generates SQL before the user ACKs the tables. Fix all four.
     workspace = body.workspace
     if workspace is None:
         workspace = agents.Intent(agents_pb2.IntentRequest(question=body.question)).workspace
@@ -269,7 +269,7 @@ def create_query(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/queries: a model-generated draft that generates SQL before anyone ACKs the tables. */
+      starter: `/** POST /v1/queries: flawed code that generates SQL before anyone ACKs the tables. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -284,8 +284,8 @@ interface QueryBody {
 }
 
 app.post('/v1/queries', async (request, reply) => {
-  // TODO: this draft trusts the caller's workspace string, caps nothing, ignores
-  // Idempotency-Key, and generates SQL before the user ACKs the tables. Review all four.
+  // TODO: this starter trusts the caller's workspace string, caps nothing, ignores
+  // Idempotency-Key, and generates SQL before the user ACKs the tables. Fix all four.
   const user = request.headers['x-user-id'] as string;
   const body = request.body as QueryBody;
   const workspace = body.workspace ?? (await agents.Intent({question: body.question})).workspace;
@@ -419,8 +419,8 @@ func createQuery(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts the caller's workspace string, caps nothing, ignores
-	// Idempotency-Key, and generates SQL before the user ACKs the tables. Review all four.
+	// TODO: this starter trusts the caller's workspace string, caps nothing, ignores
+	// Idempotency-Key, and generates SQL before the user ACKs the tables. Fix all four.
 	workspace := body.Workspace
 	if workspace == "" {
 		intent, _ := agents.Intent(r.Context(), &pb.IntentRequest{Question: body.Question})
@@ -616,7 +616,7 @@ object QueriesApi {
       post {
         headerValueByName("X-User-Id") { user =>
           entity(as[QueryRequest]) { body =>
-            // TODO: this draft trusts the caller's workspace string, caps nothing, ignores
+            // TODO: this starter trusts the caller's workspace string, caps nothing, ignores
             // Idempotency-Key, and generates SQL before the user ACKs the tables.
             val workspace = body.workspace.getOrElse(agents.intent(IntentRequest(question = body.question)).workspace)
             val picked = agents.pickTables(PickTablesRequest(question = body.question, workspace = workspace))
@@ -757,8 +757,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft trusts the caller's workspace string, caps nothing, ignores
-    // Idempotency-Key, and generates SQL before the user ACKs the tables. Review all four.
+    // TODO: this starter trusts the caller's workspace string, caps nothing, ignores
+    // Idempotency-Key, and generates SQL before the user ACKs the tables. Fix all four.
     const auto question = body.value("question", std::string());
     auto workspace = body.value("workspace", std::string());
     if (workspace.empty()) {
@@ -931,5 +931,5 @@ int main() {
     'Put workspace resolution in one function: a requested workspace is checked against `SYSTEM_WORKSPACES` and returns 400 when unknown; otherwise the intent agent is asked, and *its* answer is checked against the same set (422 when nothing matches). The agents only ever see a workspace the service vouches for.',
     'The handler ends at the table agent. Store `{query_id, workspace, tables_proposed, status: "pending_ack"}` under `(user, key)`, return it with 202, and delete the `Generate` call — the next step of the product is the user’s ACK, not SQL.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of an LLM pipeline. The draft reads fine because the demo sends a short question from one user, names a real workspace and never retries. Four defects are being checked: authentication (the user is never optional), the question cap (cheap rejection before a chain of model calls), workspace resolution on the server (the caller names a workspace from the allow-list or the intent agent picks one — either way the service checks it), and idempotency keyed by user so a retry cannot run the agents twice. The pending ACK is the one candidates skip: QueryGPT added the table agent because users saw the wrong tables picked, so the product contract is *propose, ACK, then generate*; a handler that generates first has already spent the expensive call on tables the user may reject. Real services add custom workspaces owned by users, a prompt enhancer that rewrites five-word questions before the intent agent sees them, and a trace id that follows the query through every agent.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of an LLM pipeline. The starter reads fine because the demo sends a short question from one user, names a real workspace and never retries. Four defects are being checked: authentication (the user is never optional), the question cap (cheap rejection before a chain of model calls), workspace resolution on the server (the caller names a workspace from the allow-list or the intent agent picks one — either way the service checks it), and idempotency keyed by user so a retry cannot run the agents twice. The pending ACK is the one candidates skip: QueryGPT added the table agent because users saw the wrong tables picked, so the product contract is *propose, ACK, then generate*; a handler that generates first has already spent the expensive call on tables the user may reject. Real services add custom workspaces owned by users, a prompt enhancer that rewrites five-word questions before the intent agent sees them, and a trace id that follows the query through every agent.`,
 };

@@ -8,15 +8,14 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'output'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds a small JSON object
-and produces it, so the dashboard shows events. It hides four flaws that only matter once a job is
-long, or once a customer reads their own topic. Review it, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter is working code: it builds a small JSON object and produces it, so
+the dashboard shows events. It hides four flaws that only matter once a job is long, or once a
+customer reads their own topic. Debug it, fix it, and prove the fix with the checks below.
 
 Implement the event path on topic \`transcode.event\`:
 
 - Every event is **keyed by the job id**, so one job's events land on one partition and stay ordered.
-  The draft keys by worker, so a job's events interleave with every other job that worker touched and
+  The starter keys by worker, so a job's events interleave with every other job that worker touched and
   the consumer sees "segment 40 done" before "segment 39 done".
 - An event carries a **segment index range** — \`segment_start\`, \`segment_end\` and \`outcome\` —
   rather than a single blob or a whole-file duration. A range is what lets the consumer update
@@ -25,7 +24,7 @@ Implement the event path on topic \`transcode.event\`:
   (\`finalize_manifest(job_id, manifest)\` writes the row, then the produce runs). Publishing first
   means a consumer can announce a finished job that a reader cannot yet describe.
 - Output references are **signed and short-lived** (\`SIGNED_URL_TTL_S = 900\`, an
-  \`expires_at\`/\`expiresAt\`/\`ExpiresAt\` on every reference). The draft embeds a permanent output
+  \`expires_at\`/\`expiresAt\`/\`ExpiresAt\` on every reference). The starter embeds a permanent output
   URL that is retained and replicated with the topic for everyone who can read it, forever.
 - The producer is **idempotent with \`acks=all\`** (\`enable.idempotence\`,
   \`idempotent: true\` + \`acks: -1\`, \`RequireAll\` + a hash balancer), so a retried produce does
@@ -67,7 +66,7 @@ is an access leak that survives every deletion of the video behind it.`,
       id: 'job-key',
       title: 'Keyed by job id',
       detail:
-        'The record key is the job id (`key=job_id`, `key: jobId`, `Key: []byte(jobID)`, `ProducerRecord(Topic, jobId, …)`), so a job’s events share a partition and keep their order. The draft keys by worker id, which interleaves every job that worker touched.',
+        'The record key is the job id (`key=job_id`, `key: jobId`, `Key: []byte(jobID)`, `ProducerRecord(Topic, jobId, …)`), so a job’s events share a partition and keep their order. The starter keys by worker id, which interleaves every job that worker touched.',
       match: {
         python: {all: [/key=job_id/, /job_id/]},
         typescript: {all: [/key:\s*jobId/, /jobId/]},
@@ -80,7 +79,7 @@ is an access leak that survives every deletion of the video behind it.`,
       id: 'ranges',
       title: 'Carries segment index ranges and an outcome',
       detail:
-        'Events carry `segment_start`, `segment_end` and `outcome` instead of a whole-file blob. The draft publishes a bare segment index and a permanent URL, so the consumer cannot describe which part of the file finished.',
+        'Events carry `segment_start`, `segment_end` and `outcome` instead of a whole-file blob. The starter publishes a bare segment index and a permanent URL, so the consumer cannot describe which part of the file finished.',
       match: {
         python: {all: [/segment_start/, /segment_end/, /outcome/]},
         typescript: {all: [/segmentStart/, /segmentEnd/, /outcome/]},
@@ -93,7 +92,7 @@ is an access leak that survives every deletion of the video behind it.`,
       id: 'after-manifest',
       title: 'Completion is published after the manifest is final',
       detail:
-        'The manifest is finalized before the completion event is produced. The draft produces first, so a consumer can announce a job that the read endpoint cannot describe yet.',
+        'The manifest is finalized before the completion event is produced. The starter produces first, so a consumer can announce a job that the read endpoint cannot describe yet.',
       match: {
         python: {order: [/finalize_manifest\(/, /producer\.produce\(/]},
         typescript: {order: [/finalizeManifest\(/, /producer\.send\(/]},
@@ -106,7 +105,7 @@ is an access leak that survives every deletion of the video behind it.`,
       id: 'signed-refs',
       title: 'Signed short-lived references, never permanent URLs',
       detail:
-        'Output references are signed and expiring (`SIGNED_URL_TTL_S`, `sign_url`/`signUrl`, `expires_at`/`expiresAt`). The draft embeds a permanent output URL — the topic is retained and replicated, so that grant outlives the video.',
+        'Output references are signed and expiring (`SIGNED_URL_TTL_S`, `sign_url`/`signUrl`, `expires_at`/`expiresAt`). The starter embeds a permanent output URL — the topic is retained and replicated, so that grant outlives the video.',
       match: {
         python: {all: [/SIGNED_URL_TTL_S/, /sign_url\(/, /expires_at/], none: [/public_url/]},
         typescript: {all: [/SIGNED_URL_TTL_S/, /signUrl\(/, /expiresAt/], none: [/publicUrl/]},
@@ -144,9 +143,9 @@ manifests: dict = {}
 
 
 def publish_segment(job_id: str, worker_id: str, index: int, output_url: str) -> None:
-    # TODO: this draft keys events by worker, publishes completion before the manifest is final,
+    # TODO: this starter keys events by worker, publishes completion before the manifest is final,
     # embeds a permanent output URL, carries no segment range, and configures neither idempotence
-    # nor acks. Review all five.
+    # nor acks. Fix all five.
     event = {"job_id": job_id, "worker_id": worker_id, "segment": index, "output_url": output_url}
     producer.produce(TOPIC, key=worker_id, value=json.dumps(event))
 
@@ -222,7 +221,7 @@ def publish_completion(job_id: str, manifest: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** Job events: a model-generated draft that keys by worker and leaks a permanent URL. */
+      starter: `/** Job events: flawed code that keys by worker and leaks a permanent URL. */
 import {Kafka} from 'kafkajs';
 
 export const TOPIC = 'transcode.event';
@@ -235,9 +234,9 @@ export async function publishSegment(
   index: number,
   outputUrl: string,
 ): Promise<void> {
-  // TODO: this draft keys events by worker, publishes completion before the manifest is final,
+  // TODO: this starter keys events by worker, publishes completion before the manifest is final,
   // embeds a permanent output URL, carries no segment range, and configures neither idempotence
-  // nor acks. Review all five.
+  // nor acks. Fix all five.
   const event = {job_id: jobId, worker_id: workerId, segment: index, output_url: outputUrl};
   await producer.send({topic: TOPIC, messages: [{key: workerId, value: JSON.stringify(event)}]});
 }
@@ -341,9 +340,9 @@ var producer = &kafka.Writer{
 }
 
 func publishSegment(ctx context.Context, jobID, workerID string, index int, outputURL string) error {
-	// TODO: this draft keys events by worker, publishes completion before the manifest is final,
+	// TODO: this starter keys events by worker, publishes completion before the manifest is final,
 	// embeds a permanent output URL, carries no segment range, and configures neither idempotence
-	// nor acks. Review all five.
+	// nor acks. Fix all five.
 	value, err := json.Marshal(map[string]any{
 		"job_id":     jobID,
 		"worker_id":  workerID,
@@ -460,9 +459,9 @@ object Events {
   props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: this draft keys events by worker, publishes completion before the manifest is final,
+  // TODO: this starter keys events by worker, publishes completion before the manifest is final,
   // embeds a permanent output URL, carries no segment range, and configures neither idempotence
-  // nor acks. Review all five.
+  // nor acks. Fix all five.
   def publishSegment(jobId: String, workerId: String, index: Int, outputUrl: String): Unit = {
     val event = s"""{"job_id":"$jobId","worker_id":"$workerId","segment":$index,"output_url":"$outputUrl"}"""
     producer.send(new ProducerRecord(Topic, workerId, event))
@@ -550,9 +549,9 @@ class EventProducer {
     delete conf;
   }
 
-  // TODO: this draft keys events by worker, publishes completion before the manifest is final,
+  // TODO: this starter keys events by worker, publishes completion before the manifest is final,
   // embeds a permanent output URL, carries no segment range, and configures neither idempotence
-  // nor acks. Review all five.
+  // nor acks. Fix all five.
   void publishSegment(const std::string& job_id, const std::string& worker_id, int index,
                       const std::string& output_url) {
     const std::string event = "{\\"job_id\\":\\"" + job_id + "\\",\\"worker_id\\":\\"" + worker_id +
@@ -664,5 +663,5 @@ class EventProducer {
     'Finalize the manifest before the completion produce, and carry `segment_start`/`segment_end`/`outcome` on every event. Publishing first lets a consumer announce a finished job that the read endpoint still cannot describe, which is exactly the bug the dashboard never reproduces locally.',
     'Never put a permanent output URL in a topic: it is retained, replicated and readable by every consumer. Put a signed reference with an `expires_at` in the payload, and configure the producer with `enable.idempotence` and `acks=all` so a retried produce cannot duplicate the completion announcement.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated event path as a contract with consumers you do not own. The draft is fine on a single-worker demo with one listener. Four defects are being checked: the key (job id, so one job’s events stay on one partition and ordered — a worker key interleaves every job the worker touched), publish-after-manifest (a completion event that outruns the manifest row makes the job briefly look done and unreadable), signed short-lived references (a permanent URL in a retained, replicated topic is an access grant that survives the video it points at), and idempotent acks (a retried produce must not duplicate the record a consumer counts). Ranged events are what let the consumer update progress counters without asking the API for the whole manifest. Real platforms add a schema registry with a compatibility policy, a consumer group per downstream, and an outbox for produces that fail while the broker is away.`,
+  debrief: `The interviewer is testing whether you can debug an event path as a contract with consumers you do not own. The starter is fine on a single-worker demo with one listener. Four defects are being checked: the key (job id, so one job’s events stay on one partition and ordered — a worker key interleaves every job the worker touched), publish-after-manifest (a completion event that outruns the manifest row makes the job briefly look done and unreadable), signed short-lived references (a permanent URL in a retained, replicated topic is an access grant that survives the video it points at), and idempotent acks (a retried produce must not duplicate the record a consumer counts). Ranged events are what let the consumer update progress counters without asking the API for the whole manifest. Real platforms add a schema registry with a compatibility policy, a consumer group per downstream, and an outbox for produces that fail while the broker is away.`,
 };

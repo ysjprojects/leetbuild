@@ -12,13 +12,13 @@ export const stateStep: Step = {
   focus: ['bidding', 'redis'],
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. Three bidders hit their daily cap before
+**Starting point.** You are the bidding platform engineer on call. Three bidders hit their daily cap before
 noon on a quiet day, one bidder's spend went negative in a dashboard, and a load test showed four bids
-in the same millisecond all passing the cap check with room for one. The model-generated module below
+in the same millisecond all passing the cap check with room for one. The module below
 reads the counter with \`GET\` and then decrements it in a second round trip, never returns a claim
 when the auction is lost, and keys the counter without a day bucket.
 
-Review \`state\` and make the cap correct under concurrency, then prove the fix.
+Debug \`state\` and make the cap correct under concurrency, then prove the fix.
 
 - Reserve spend with **one atomic operation**: a Lua script run through \`EVAL\`. Inside the script,
   read the usage, compare \`current + cost > cap\`, and only then increment. A \`GET\` followed by a
@@ -34,9 +34,9 @@ Review \`state\` and make the cap correct under concurrency, then prove the fix.
   \`EXPIREAT\` to the next UTC midnight on the first write of the window, so the cap resets with the
   day instead of living forever.
 
-**Failure mode the checks target.** The draft's claim is a read and a write, so it cannot hold a cap
+**Failure mode the checks target.** The starter's claim is a read and a write, so it cannot hold a cap
 under load: every concurrent bid that arrives in the same millisecond sees the same remaining budget.
-The missing release is the quiet one — the draft charges at bid time and keeps the charge even when
+The missing release is the quiet one — the starter charges at bid time and keeps the charge even when
 the auction is lost, so a bidder that loses 90% of its auctions burns its whole daily cap in minutes
 while winning almost nothing. The missing day bucket turns a bad afternoon into a permanently
 exhausted account.`,
@@ -61,7 +61,7 @@ exhausted account.`,
       id: 'atomic-claim',
       title: 'The claim is one Lua script, not a read then a write',
       detail:
-        'Reserve the spend with a single Lua script run through `EVAL`, and never read the counter with a client-side `GET` first. The draft’s `GET`-then-`DECRBY` pair lets two concurrent bids both pass the last unit.',
+        'Reserve the spend with a single Lua script run through `EVAL`, and never read the counter with a client-side `GET` first. The starter’s `GET`-then-`DECRBY` pair lets two concurrent bids both pass the last unit.',
       match: {
         python: {all: [/CLAIM_SCRIPT/, /\.eval\(/], none: [/\.get\(/]},
         typescript: {all: [/CLAIM_SCRIPT/, /\.eval\(/], none: [/\.get\(/]},
@@ -74,7 +74,7 @@ exhausted account.`,
       id: 'cap-guard',
       title: 'The cap is decided inside the script',
       detail:
-        'The script itself compares `current + cost > cap` and returns 0 without incrementing, so the cap cannot be exceeded by any interleaving. The draft compares in the client, where the check and the write can be separated.',
+        'The script itself compares `current + cost > cap` and returns 0 without incrementing, so the cap cannot be exceeded by any interleaving. The starter compares in the client, where the check and the write can be separated.',
       match: {
         python: {all: [/current \+ cost > cap/]},
         typescript: {all: [/current \+ cost > cap/]},
@@ -87,7 +87,7 @@ exhausted account.`,
       id: 'release-on-loss',
       title: 'A lost auction returns its claim',
       detail:
-        'A `release` exists and the settlement runs it when the auction result is `"lost"` — a win keeps the charge. The draft has no release at all, so losing auctions still consume the daily cap.',
+        'A `release` exists and the settlement runs it when the auction result is `"lost"` — a win keeps the charge. The starter has no release at all, so losing auctions still consume the daily cap.',
       match: {
         python: {all: [/def release\(/, /def settle\(/, /"lost"/]},
         typescript: {all: [/async release\(/, /function settle\(/, /'lost'/]},
@@ -142,7 +142,7 @@ class SpendCap:
         self.cap_cents = cap_cents
 
     def claim(self, bidder: str, cost_cents: int) -> int:
-        # TODO: this draft reads the counter and decrements it in a second round trip, so two
+        # TODO: this starter reads the counter and decrements it in a second round trip, so two
         # concurrent bids both pass the last unit; the key has no day bucket, so the cap never
         # resets; and nothing ever returns a claim when the auction is lost, so a bidder that
         # loses most of its auctions drains the cap while winning almost nothing.
@@ -238,7 +238,7 @@ export class SpendCap {
   ) {}
 
   async claim(bidder: string, costCents: number): Promise<number> {
-    // TODO: this draft reads the counter and decrements it in a second round trip, so two
+    // TODO: this starter reads the counter and decrements it in a second round trip, so two
     // concurrent bids both pass the last unit; the key has no day bucket, so the cap never
     // resets; and nothing ever returns a claim when the auction is lost, so a bidder that loses
     // most of its auctions drains the cap while winning almost nothing.
@@ -343,7 +343,7 @@ func NewSpendCap(rdb *redis.Client) *SpendCap {
 }
 
 func (c *SpendCap) Claim(ctx context.Context, bidder string, costCents int) int {
-	// TODO: this draft reads the counter and decrements it in a second round trip, so two
+	// TODO: this starter reads the counter and decrements it in a second round trip, so two
 	// concurrent bids both pass the last unit; the key has no day bucket, so the cap never
 	// resets; and nothing ever returns a claim when the auction is lost, so a bidder that loses
 	// most of its auctions drains the cap while winning almost nothing.
@@ -456,7 +456,7 @@ object SpendCap {
 class SpendCap(redis: Jedis, capCents: Int = SpendCap.CapCentsPerDay) {
 
   def claim(bidder: String, costCents: Int): Int = {
-    // TODO: this draft reads the counter and decrements it in a second round trip, so two
+    // TODO: this starter reads the counter and decrements it in a second round trip, so two
     // concurrent bids both pass the last unit; the key has no day bucket, so the cap never
     // resets; and nothing ever returns a claim when the auction is lost, so a bidder that loses
     // most of its auctions drains the cap while winning almost nothing.
@@ -557,7 +557,7 @@ class SpendCap {
   explicit SpendCap(sw::redis::Redis& redis, int capCents = kCapCentsPerDay) : redis_(redis), capCents_(capCents) {}
 
   int claim(const std::string& bidder, int costCents) {
-    // TODO: this draft reads the counter and decrements it in a second round trip, so two
+    // TODO: this starter reads the counter and decrements it in a second round trip, so two
     // concurrent bids both pass the last unit; the key has no day bucket, so the cap never
     // resets; and nothing ever returns a claim when the auction is lost, so a bidder that loses
     // most of its auctions drains the cap while winning almost nothing.
@@ -662,8 +662,8 @@ void settle(SpendCap& cap, const std::string& bidder, int claimCents, const std:
     'Have the claim return the amount it reserved (`cost_cents`, or the granted value) instead of a bool, so `release` can subtract exactly what was taken and a double release is visible.',
     'Daily means a bucket: `spend:cap:{bidder}:{day}` with `EXPIREAT` at the next UTC midnight, set on the first write of the window. A counter without a day key never resets, and a counter without a TTL outlives the bidder.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated spend limiter under concurrency and
-whether you understand that a cap is only as good as its accounting. The draft reads fine because the
+  debrief: `The interviewer is testing whether you can debug a spend limiter under concurrency and
+whether you understand that a cap is only as good as its accounting. The starter reads fine because the
 demo bids once, wins, and never reloads the counter.
 
 Three defects are being checked. Atomicity: a client-side read then write cannot hold a cap, because

@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'purge', 'tenant'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route,
+**Starting point.** The starter is working code: it registers the route,
 reads the body and hands the paths to the provider. It compiles, it purges the demo domain, and
-it hides three production flaws. Review it like the service owner, fix it, and prove the fix with
+it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with
 the checks below.
 
 Implement \`POST /v1/purges\` with body \`{"domain": "shop.example.com", "paths": ["/pricing", "/img/*"], "reason": "…"}\`.
@@ -36,7 +36,7 @@ Implement \`POST /v1/purges\` with body \`{"domain": "shop.example.com", "paths"
 
 :::widget idempotency {}
 
-**Failure mode the checks target.** The draft treats the wildcard as ordinary input, so one
+**Failure mode the checks target.** The starter treats the wildcard as ordinary input, so one
 request from a normal token fans a domain-wide purge out to every edge POP and stamps the origin.
 It never bounds \`paths\`, so a single body can hold a whole year of URLs. And it re-runs the
 whole purge on every retry of the same \`Idempotency-Key\`, doubling provider calls in exactly the
@@ -59,7 +59,7 @@ situation — a client retrying after a timeout — where the first batch alread
       id: 'route',
       title: 'Accepts the batch and answers 202 accepted',
       detail:
-        'Register `POST /v1/purges` and answer **202** with `status: "accepted"`, the purge id, the accepted paths and the collapsed duplicates. The draft answers **200** with `status: "queued"`, which tells the caller the purge is done when nothing has reached an edge yet.',
+        'Register `POST /v1/purges` and answer **202** with `status: "accepted"`, the purge id, the accepted paths and the collapsed duplicates. The starter answers **200** with `status: "queued"`, which tells the caller the purge is done when nothing has reached an edge yet.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/purges["']/, /STATUS_ACCEPTED/, /status_code=202/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/purges['"]/, /STATUS_ACCEPTED/, /code\(202\)/]},
@@ -74,7 +74,7 @@ situation — a client retrying after a timeout — where the first batch alread
       id: 'tenant-domain',
       title: 'Authenticates the tenant and proves domain ownership',
       detail:
-        'A missing `X-Tenant-Id` is **401**; a domain the tenant does not own (`owns_domain`) is **403** before any provider call. The draft trusts both, so any caller can purge any customer’s domain.',
+        'A missing `X-Tenant-Id` is **401**; a domain the tenant does not own (`owns_domain`) is **403** before any provider call. The starter trusts both, so any caller can purge any customer’s domain.',
       match: {
         python: {all: [/owns_domain\(/, /status_code=401/, /status_code=403/, /DOMAIN_NOT_OWNED/]},
         typescript: {all: [/domains\.owns\(/, /code\(401\)/, /code\(403\)/, /DOMAIN_NOT_OWNED/]},
@@ -87,7 +87,7 @@ situation — a client retrying after a timeout — where the first batch alread
       id: 'path-cap',
       title: 'Caps the request at 500 paths and dedupes them',
       detail:
-        '`paths` is bounded by `MAX_PATHS` = 500, every entry must start with `/`, and duplicates are collapsed by `dedupe_paths` before the provider sees them. The draft forwards whatever array it was handed, so one body can carry an unbounded purge.',
+        '`paths` is bounded by `MAX_PATHS` = 500, every entry must start with `/`, and duplicates are collapsed by `dedupe_paths` before the provider sees them. The starter forwards whatever array it was handed, so one body can carry an unbounded purge.',
       match: {
         python: {all: [/MAX_PATHS/, /dedupe_paths\(/, /status_code=400/]},
         typescript: {all: [/MAX_PATHS/, /dedupePaths\(/, /code\(400\)/]},
@@ -100,7 +100,7 @@ situation — a client retrying after a timeout — where the first batch alread
       id: 'blast-radius',
       title: 'Gates wildcards behind an elevated scope',
       detail:
-        'A pattern with `*` requires `purge:wildcard`, a whole-domain pattern requires `purge:domain`, and a request without the matching scope is **403** (`has_wildcard`, `required_scope`). The draft accepts `/*` from any token, which is the origin stampede.',
+        'A pattern with `*` requires `purge:wildcard`, a whole-domain pattern requires `purge:domain`, and a request without the matching scope is **403** (`has_wildcard`, `required_scope`). The starter accepts `/*` from any token, which is the origin stampede.',
       match: {
         python: {all: [/WILDCARD_SCOPE/, /DOMAIN_SCOPE/, /has_wildcard\(/, /status_code=403/]},
         typescript: {all: [/WILDCARD_SCOPE/, /DOMAIN_SCOPE/, /requiredScope\(/, /code\(403\)/]},
@@ -113,7 +113,7 @@ situation — a client retrying after a timeout — where the first batch alread
       id: 'idempotent-replay',
       title: 'Replays an Idempotency-Key without submitting twice',
       detail:
-        '`Idempotency-Key` is required, the recorded purge is looked up under `(tenant, key)` **before** the provider submission, and the stored record is returned on a replay. The draft has no lookup, so a retried deploy purge hits the provider twice.',
+        '`Idempotency-Key` is required, the recorded purge is looked up under `(tenant, key)` **before** the provider submission, and the stored record is returned on a replay. The starter has no lookup, so a retried deploy purge hits the provider twice.',
       match: {
         python: {
           all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/],
@@ -186,8 +186,8 @@ providers = PurgeProvider()
 
 @app.post("/v1/purges")
 def create_purge(body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft lets any token purge a whole domain with a wildcard, forwards a path list of
-    # any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Review all
+    # TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
+    # any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
     # three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a
     # replay from the stored purge instead of calling the provider again.
     purge = {
@@ -328,7 +328,7 @@ def create_purge(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/purges: a model-generated draft that purges whatever the caller sends. */
+      starter: `/** POST /v1/purges: flawed code that purges whatever the caller sends. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -369,8 +369,8 @@ const providers = {
 };
 
 app.post('/v1/purges', async (request, reply) => {
-  // TODO: this draft lets any token purge a whole domain with a wildcard, forwards a path list of
-  // any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Review all
+  // TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
+  // any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
   // three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a replay
   // from the stored purge instead of calling the provider again.
   const tenant = request.headers['x-tenant-id'] as string;
@@ -567,8 +567,8 @@ func createPurge(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft lets any token purge a whole domain with a wildcard, forwards a path list of
-	// any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Review all
+	// TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
+	// any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
 	// three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a replay
 	// from the stored purge instead of calling the provider again.
 	purge := Purge{PurgeID: uuid.NewString(), Status: "queued", Domain: body.Domain, Paths: body.Paths}
@@ -809,9 +809,9 @@ object PurgeApi {
       post {
         optionalHeaderValueByName("X-Tenant-Id") { tenant =>
           entity(as[PurgeRequest]) { body =>
-            // TODO: this draft lets any token purge a whole domain with a wildcard, forwards a path
+            // TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path
             // list of any size, and re-runs the whole purge when the same Idempotency-Key is
-            // replayed. Review all three: gate wildcards behind the elevated scope, cap and dedupe
+            // replayed. Fix all three: gate wildcards behind the elevated scope, cap and dedupe
             // the paths, and answer a replay from the stored purge instead of calling the provider.
             val purge = Purge(UUID.randomUUID().toString, "queued", body.domain, body.paths)
             provider.submitPurge(purge.purge_id, body.domain, body.paths)
@@ -970,8 +970,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft lets any token purge a whole domain with a wildcard, forwards a path list of
-    // any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Review all
+    // TODO: this starter lets any token purge a whole domain with a wildcard, forwards a path list of
+    // any size, and re-runs the whole purge when the same Idempotency-Key is replayed. Fix all
     // three: gate wildcards behind the elevated scope, cap and dedupe the paths, and answer a replay
     // from the stored purge instead of calling the provider again.
     const auto domain = body.value("domain", std::string());
@@ -1151,5 +1151,5 @@ int main() {
     'Wildcards are two privileges, not one: `purge:wildcard` covers patterns inside a domain, `purge:domain` covers `/*`. Parse `X-Purge-Scope` as a comma-separated set, compute the scope the request needs from the paths, and reject with 403 when the caller does not hold it — before anything reaches the provider.',
     'The idempotency lookup must come before the submission, and it must return the *stored* purge so the replayed response carries the original `purge_id`. Storing after the provider call is fine as long as the record is written once and the replay path never submits again.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo purges one literal path on the tenant's own domain. Three separate defects are being checked: authorization granularity (which the wildcard check measures — a normal token must not be able to turn one request into a domain-wide origin stampede), input caps and dedupe (cheap rejections that keep one body from carrying a year of URLs, plus collapsing what the caller sent twice), and idempotency keyed by \`(tenant, key)\` so the retry of a deploy purge returns the first purge instead of doubling provider calls. Real control planes add a per-tenant purge budget, a domain allowlist that ops can lock during a launch, and an audit row for every wildcard that was granted — the three things the later steps of this course build.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo purges one literal path on the tenant's own domain. Three separate defects are being checked: authorization granularity (which the wildcard check measures — a normal token must not be able to turn one request into a domain-wide origin stampede), input caps and dedupe (cheap rejections that keep one body from carrying a year of URLs, plus collapsing what the caller sent twice), and idempotency keyed by \`(tenant, key)\` so the retry of a deploy purge returns the first purge instead of doubling provider calls. Real control planes add a per-tenant purge budget, a domain allowlist that ops can lock during a launch, and an audit row for every wildcard that was granted — the three things the later steps of this course build.`,
 };

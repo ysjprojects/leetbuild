@@ -8,7 +8,7 @@ export const promptDetectStep: Step = {
   focus: ['aifw', 'guard'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the detector is healthy
+**Starting point.** The starter is working code: when the detector is healthy
 and the prompt is benign it answers \`allow\`, so the demo passes. It hides four flaws, one of them a
 reversed comparison. Find them, fix them, and prove the fix.
 
@@ -19,13 +19,13 @@ plus **tags** for predefined categories; rules block on the score, on the tags, 
 
 - Call \`PromptGuard.Detect(prompt, request_id)\` with a **150 ms** deadline per call. The firewall
   sits on every request; without a deadline one slow detector stalls the whole application.
-- **Block when \`score < BLOCK_SCORE\`** with \`BLOCK_SCORE = 20\`. Low is dangerous: the draft
+- **Block when \`score < BLOCK_SCORE\`** with \`BLOCK_SCORE = 20\`. Low is dangerous: the starter
   blocks when the score is *high*, which is the benign end of the scale.
 - **Block when any tag is in \`BLOCKED_TAGS\`** (\`offensive\`, \`politics\`), whatever the score.
-  The draft never reads the tags.
+  The starter never reads the tags.
 - On \`DEADLINE_EXCEEDED\` or \`UNAVAILABLE\`, **fail closed**: the decision is \`block\` with reason
   \`detector-unavailable\`, unless the caller passed \`fail_open=True\` — a per-application setting
-  for low-risk deployments, off by default. Any other status is an error the caller sees. The draft
+  for low-risk deployments, off by default. Any other status is an error the caller sees. The starter
   catches everything and answers \`allow\`.
 
 The decision carries \`action\`, \`score\`, \`tags\` and \`reason\`; \`score\` is 0 and \`tags\` empty
@@ -48,7 +48,7 @@ count on, because every prompt is allowed while it lasts.`,
   hints: [
     'Read the scale the source gives before comparing: 1 is the most likely injection, 99 the least. A block rule is `score < BLOCK_SCORE`, and the deadline is an argument of the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`).',
     'Tags are a second, independent rule: intersect the reply’s tags with `BLOCKED_TAGS` and block on any hit regardless of the score. Keep the first matching tag as the reason so the event explains itself.',
-    'Catch the RPC error, read its status code, and branch: `UNAVAILABLE` / `DEADLINE_EXCEEDED` → `block` with reason `detector-unavailable` unless `fail_open`; anything else is re-raised. A bare `except` that returns `allow` is the draft’s worst line.',
+    'Catch the RPC error, read its status code, and branch: `UNAVAILABLE` / `DEADLINE_EXCEEDED` → `block` with reason `detector-unavailable` unless `fail_open`; anything else is re-raised. A bare `except` that returns `allow` is the starter’s worst line.',
   ],
   checks: [
     {
@@ -68,7 +68,7 @@ count on, because every prompt is allowed while it lasts.`,
       id: 'threshold',
       title: 'Blocks when the score is below 20',
       detail:
-        'The decision is `block` when `score < BLOCK_SCORE` with `BLOCK_SCORE = 20` — the source’s scale puts the most likely injection at 1. The draft compares the wrong way round.',
+        'The decision is `block` when `score < BLOCK_SCORE` with `BLOCK_SCORE = 20` — the source’s scale puts the most likely injection at 1. The starter compares the wrong way round.',
       match: {
         python: {all: [/BLOCK_SCORE\s*=\s*20/, /score\s*<\s*BLOCK_SCORE/], none: [/score\s*>=?\s*\d/]},
         typescript: {all: [/BLOCK_SCORE\s*=\s*20/, /score\s*<\s*BLOCK_SCORE/], none: [/score\s*>=?\s*\d/]},
@@ -81,7 +81,7 @@ count on, because every prompt is allowed while it lasts.`,
       id: 'tags',
       title: 'Blocks on a forbidden tag whatever the score',
       detail:
-        'The reply’s tags are intersected with `BLOCKED_TAGS` (`offensive`, `politics`) and any hit blocks. The draft never reads the tags.',
+        'The reply’s tags are intersected with `BLOCKED_TAGS` (`offensive`, `politics`) and any hit blocks. The starter never reads the tags.',
       match: {
         python: {all: [/BLOCKED_TAGS\s*=/, /["']offensive["']/, /["']politics["']/, /in BLOCKED_TAGS/]},
         typescript: {
@@ -96,7 +96,7 @@ count on, because every prompt is allowed while it lasts.`,
       id: 'fail-closed',
       title: 'Fails closed on DEADLINE_EXCEEDED / UNAVAILABLE unless fail_open',
       detail:
-        'An RPC that times out or finds the detector down yields `block` with reason `detector-unavailable`, unless `fail_open` was passed; other statuses propagate. The draft catches every error and returns `allow`.',
+        'An RPC that times out or finds the detector down yields `block` with reason `detector-unavailable`, unless `fail_open` was passed; other statuses propagate. The starter catches every error and returns `allow`.',
       match: {
         python: {
           all: [/StatusCode\.UNAVAILABLE/, /StatusCode\.DEADLINE_EXCEEDED/, /fail_open/, /detector-unavailable/],
@@ -197,7 +197,7 @@ async def decide(prompt: str, request_id: str, fail_open: bool = False) -> Decis
 `,
     },
     typescript: {
-      starter: `/** Detect: a model-generated draft that blocks on a high score and allows on every error. */
+      starter: `/** Detect: flawed code that blocks on a high score and allows on every error. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -526,5 +526,5 @@ Decision decide(const std::string& prompt, const std::string& requestId, bool fa
 `,
     },
   },
-  debrief: `The interviewer is testing whether you read the contract before you wrote the rule. The source defines the scale — 1 is the most likely injection, 99 the least — and a generated draft that "blocks high scores" is the most natural mistake a model makes with it; it passes every demo because benign prompts score high and nobody sends an attack to the demo. The tags are the second dimension the source gives: a topic rule is independent of the injection score. The deadline is the latency contract of a component on every request's critical path, and the failure policy is the security contract: a firewall that fails open during a detector outage is a firewall with a published off switch, so the default is closed and fail-open is an explicit per-application choice. Real firewalls combine the score with bot and attack scores as the source describes, cache decisions for identical prompts, and keep a shadow mode that scores without blocking while thresholds are tuned.`,
+  debrief: `The interviewer is testing whether you read the contract before you wrote the rule. The source defines the scale — 1 is the most likely injection, 99 the least — and a starter that "blocks high scores" is the most natural mistake to make with it; it passes every demo because benign prompts score high and nobody sends an attack to the demo. The tags are the second dimension the source gives: a topic rule is independent of the injection score. The deadline is the latency contract of a component on every request's critical path, and the failure policy is the security contract: a firewall that fails open during a detector outage is a firewall with a published off switch, so the default is closed and fail-open is an explicit per-application choice. Real firewalls combine the score with bot and attack scores as the source describes, cache decisions for identical prompts, and keep a shadow mode that scores without blocking while thresholds are tuned.`,
 };

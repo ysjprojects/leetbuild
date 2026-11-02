@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Feedback collector on the AI-era track: the course is not "store a thumbs-up", it is the review you
- * owe a model-generated feedback path before its numbers are trusted. A validated write against a real
- * request id → an atomic Redis ballot with a 30-day TTL → a gRPC attribution lookup with a deadline and
- * an honest fallback → tenant-keyed events carrying a fingerprint and an outbox → a satisfaction read
- * with an honesty floor and an expiring cache.
+ * Feedback collector: the course is not "store a thumbs-up", it is the debugging you owe a feedback
+ * path before its numbers are trusted. A validated write against a real request id → an atomic Redis
+ * ballot with a 30-day TTL → a gRPC attribution lookup with a deadline and an honest fallback →
+ * tenant-keyed events carrying a fingerprint and an outbox → a satisfaction read with an honesty
+ * floor and an expiring cache.
  */
 export const feedbackCollectorProblem: Problem = {
   id: 'feedback-collector',
@@ -19,7 +19,7 @@ export const feedbackCollectorProblem: Problem = {
   tagline: 'Attach user ratings to exact request ids and turn them into ordered, attributable signal.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Feedback Collector
 
@@ -60,12 +60,12 @@ One service, **feedbackd**, with five pieces:
 5. \`GET /v1/models/{version}/satisfaction\`: a window from the documented set, a 50-sample honesty floor,
    an aggregate over the recent window only, and a score cached with a 60-second TTL.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
+failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['crawler', 'kafka', 'indexer', 'index', 'store'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it publishes an event per crawled page and the
+**Starting point.** The starter is working code: it publishes an event per crawled page and the
 indexer picks it up, so the demo shows pages appearing in search. Three contracts are broken. Find
 them, fix them, and prove the fix.
 
@@ -20,11 +20,11 @@ a page — with body
   Partitioning by host is what keeps a host's history ordered: keyed by worker id, the same host's
   pages arrive on different partitions and a re-crawl interleaves with the first crawl.
 - The payload carries **references, never the page**: \`url\`, \`host\`, \`status\`,
-  \`content_hash\` and \`body_ref\` (where the stored page lives). The draft inlines the fetched
+  \`content_hash\` and \`body_ref\` (where the stored page lives). The starter inlines the fetched
   markup “for convenience”, which copies every page into a retained, replicated topic.
 - **The index write confirms before the event is announced.** Write the entry first, then mark the
   page indexed, then publish; a consumer that reads an event must always find the entry it points
-  at. The draft publishes first and marks the page indexed before the write returns, so a consumer
+  at. The starter publishes first and marks the page indexed before the write returns, so a consumer
   can read an index entry that is not there yet and a failed write still looks indexed.
 
 **Failure mode the checks target.** Worker-keyed events lose per-host order; an inlined body turns
@@ -45,7 +45,7 @@ demo where one worker crawls one host and the index never fails.`,
   },
   hints: [
     'The message key is the partition key. Take the host out of the URL once (`urlsplit(...).hostname`, `new URL(url).hostname`, `url.Parse(...).Hostname()`, `new URI(url).getHost`) and use it for both the event and the key — the key and the payload must not disagree about which host this page belongs to.',
-    'A reference is a pointer the consumer can resolve later: the URL, the content hash that proves which revision it is, and where the bytes live. Anything the consumer can derive by fetching the reference does not belong in the topic, which is why the draft’s inlined markup is both a leak and a retention cost.',
+    'A reference is a pointer the consumer can resolve later: the URL, the content hash that proves which revision it is, and where the bytes live. Anything the consumer can derive by fetching the reference does not belong in the topic, which is why the starter’s inlined markup is both a leak and a retention cost.',
     'Order the write and the announcement: `index.put(...)` first, then mark the page indexed, then `publish(...)`. If the publish fails after the write, the page is indexed but unannounced — recoverable by a sweep. If the publish happens first, the event is a promise the index has not made yet, and the consumer reads nothing.',
   ],
   checks: [
@@ -53,7 +53,7 @@ demo where one worker crawls one host and the index never fails.`,
       id: 'host-key',
       title: 'Publishes crawl.page keyed by host',
       detail:
-        'The event goes to `crawl.page` with the **host** as the message key, so one host’s pages stay ordered on one partition. The draft keys by worker id.',
+        'The event goes to `crawl.page` with the **host** as the message key, so one host’s pages stay ordered on one partition. The starter keys by worker id.',
       match: {
         python: {all: [/crawl\.page/, /key=host/]},
         typescript: {all: [/crawl\.page/, /key:\s*host/]},
@@ -66,7 +66,7 @@ demo where one worker crawls one host and the index never fails.`,
       id: 'no-content',
       title: 'The payload carries no page content',
       detail:
-        'Neither the fetched markup nor a `content` field appears in the event: the topic carries references. The draft inlines the page body, so the topic retains a copy of every crawled byte.',
+        'Neither the fetched markup nor a `content` field appears in the event: the topic carries references. The starter inlines the page body, so the topic retains a copy of every crawled byte.',
       match: {
         python: {none: [/\bcontent\b/, /\bhtml\b/]},
         typescript: {none: [/\bcontent\b/, /\bhtml\b/]},
@@ -79,7 +79,7 @@ demo where one worker crawls one host and the index never fails.`,
       id: 'page-ref',
       title: 'The event carries the content hash and the body reference',
       detail:
-        'The payload has `content_hash` and `body_ref` so the consumer can verify which revision it is and fetch the bytes itself. The draft sends neither a hash nor a reference.',
+        'The payload has `content_hash` and `body_ref` so the consumer can verify which revision it is and fetch the bytes itself. The starter sends neither a hash nor a reference.',
       match: {
         python: {all: [/content_hash/, /body_ref/]},
         typescript: {all: [/content_hash/, /body_ref/]},
@@ -92,7 +92,7 @@ demo where one worker crawls one host and the index never fails.`,
       id: 'index-before-announce',
       title: 'Indexes before announcing',
       detail:
-        'The index write happens before the event is published, so a consumer can never read an entry the index does not have. The draft publishes first and writes afterwards.',
+        'The index write happens before the event is published, so a consumer can never read an entry the index does not have. The starter publishes first and writes afterwards.',
       match: {
         python: {order: [/index\.put\(/, /producer\.produce\(/]},
         typescript: {order: [/index\.put\(/, /publish\(/]},
@@ -105,7 +105,7 @@ demo where one worker crawls one host and the index never fails.`,
       id: 'indexed-confirmed',
       title: 'Marks the page indexed only after the write confirmed',
       detail:
-        '`mark_indexed` runs after `index.put` returns, not before: a write that fails must not leave the page looking indexed. The draft marks it indexed first.',
+        '`mark_indexed` runs after `index.put` returns, not before: a write that fails must not leave the page looking indexed. The starter marks it indexed first.',
       match: {
         python: {order: [/index\.put\(/, /records\.mark_indexed\(/]},
         typescript: {order: [/index\.put\(/, /records\.markIndexed\(/]},
@@ -141,7 +141,7 @@ def page(
     worker_id: str = Header(alias="X-Worker-Id"),
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> dict:
-    # TODO: this draft keys the event by worker so one host's history scatters across partitions,
+    # TODO: this starter keys the event by worker so one host's history scatters across partitions,
     # inlines the fetched markup for convenience, and marks the page indexed before the index
     # write confirms. Key by host, keep the payload to references, and index before you announce.
     event = {"url": body.url, "status": body.status, "content": body.html}
@@ -195,7 +195,7 @@ def page(
 `,
     },
     typescript: {
-      starter: `/** Page events: a model-generated draft that ships the page inside the event. */
+      starter: `/** Page events: flawed code that ships the page inside the event. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -223,7 +223,7 @@ async function publish(workerId: string, event: PageEvent): Promise<void> {
 }
 
 app.post('/v1/crawl/pages', async (request, reply) => {
-  // TODO: this draft keys the event by worker so one host's history scatters across partitions,
+  // TODO: this starter keys the event by worker so one host's history scatters across partitions,
   // inlines the fetched markup for convenience, and marks the page indexed before the index
   // write confirms. Key by host, keep the payload to references, and index before you announce.
   const body = request.body as PageBody;
@@ -320,7 +320,7 @@ func publish(ctx context.Context, workerID string, event PageEvent) error {
 }
 
 func RecordPage(ctx context.Context, body PageRequest, workerID string) error {
-	// TODO: this draft keys the event by worker so one host's history scatters across partitions,
+	// TODO: this starter keys the event by worker so one host's history scatters across partitions,
 	// inlines the fetched markup for convenience, and marks the page indexed before the index
 	// write confirms. Key by host, keep the payload to references, and index before you announce.
 	if err := publish(ctx, workerID, PageEvent{URL: body.URL, Status: body.Status, Content: body.HTML}); err != nil {
@@ -408,7 +408,7 @@ object PageEvents {
     producer.send(new ProducerRecord[String, String](PageTopic, workerId, event.toString))
 
   def recordPage(body: PageRequest, workerId: String): Unit = {
-    // TODO: this draft keys the event by worker so one host's history scatters across partitions,
+    // TODO: this starter keys the event by worker so one host's history scatters across partitions,
     // inlines the fetched markup for convenience, and marks the page indexed before the index
     // write confirms. Key by host, keep the payload to references, and index before you announce.
     publish(workerId, PageEvent(body.url, body.status, body.html))
@@ -467,7 +467,7 @@ void publish(const std::string& workerId, const std::string& payload) {
 }
 
 void recordPage(const std::string& url, int status, const std::string& contentHash, const std::string& markup) {
-  // TODO: this draft keys the event by worker so one host's history scatters across partitions,
+  // TODO: this starter keys the event by worker so one host's history scatters across partitions,
   // inlines the fetched markup for convenience, and marks the page indexed before the index
   // write confirms. Key by host, keep the payload to references, and index before you announce.
   const json event = {{"url", url}, {"status", status}, {"content", markup}};
@@ -516,5 +516,5 @@ void recordPage(const std::string& url, int status, const std::string& content_h
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a publish path for ordering, leakage and honesty. The draft works in the demo because one worker crawls one host and the index never fails: the key looks arbitrary, the payload looks convenient, and the order of two statements looks irrelevant. Each is a production contract: the partition key is the ordering guarantee, the topic is a retention surface that must not hold tenant bytes, and the announcement is only true after the index has confirmed the write. Real crawlers go further: an outbox row when the broker rejects the produce, a schema registry so a future producer cannot smuggle page content into the event, and a compaction policy that keeps the latest hash per URL.`,
+  debrief: `The interviewer is testing whether you can debug a publish path for ordering, leakage and honesty. The starter works in the demo because one worker crawls one host and the index never fails: the key looks arbitrary, the payload looks convenient, and the order of two statements looks irrelevant. Each is a production contract: the partition key is the ordering guarantee, the topic is a retention surface that must not hold tenant bytes, and the announcement is only true after the index has confirmed the write. Real crawlers go further: an outbox row when the broker rejects the produce, a schema registry so a future producer cannot smuggle page content into the event, and a compaction policy that keeps the latest hash per URL.`,
 };

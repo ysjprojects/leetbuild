@@ -8,10 +8,9 @@ export const stateStep: Step = {
   focus: ['engine', 'redis', 'worker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the worker reads the run's
+**Starting point.** The starter is working code: the worker reads the run's
 cursor, runs the step, writes the checkpoint back, and the single-worker demo advances run after
-run. It hides a lost update, a value that grows with the payload and a key that never dies. Review
-it like the engine owner, fix it, and prove the fix with the checks below.
+run. It hides a lost update, a value that grows with the payload and a key that never dies. Debug it like the engine owner, fix it, and prove the fix with the checks below.
 
 Implement the run's checkpoint in Redis.
 
@@ -29,7 +28,7 @@ Implement the run's checkpoint in Redis.
 **Failure mode the checks target.** Two workers — the original and a duplicate the scheduler started
 after a lost heartbeat — both read \`current_step\`, both run the step's effect, and both write the
 checkpoint, so the run advances past a step whose effect never ran, and a retried step's replacement
-re-advances a run that already moved on. The value also grows with every payload the draft serializes
+re-advances a run that already moved on. The value also grows with every payload the starter serializes
 into it, and an abandoned run keeps its key forever.`,
   sequence: {
     participants: ['Worker', 'Run checkpoint (Redis)', 'blob store'],
@@ -57,7 +56,7 @@ into it, and an abandoned run keeps its key forever.`,
       id: 'cas',
       title: 'Advance is a compare-and-swap',
       detail:
-        'Unless the stored `current_step` still matches what the worker advanced from, nothing is written. The draft reads the step on the client and then overwrites the checkpoint, so a duplicate worker that read the same value writes it too.',
+        'Unless the stored `current_step` still matches what the worker advanced from, nothing is written. The starter reads the step on the client and then overwrites the checkpoint, so a duplicate worker that read the same value writes it too.',
       match: {
         python: {all: [/\.eval\(/, /HGET/, /HSET/]},
         typescript: {all: [/\.eval\(/, /HGET/, /HSET/]},
@@ -70,7 +69,7 @@ into it, and an abandoned run keeps its key forever.`,
       id: 'noop',
       title: 'A duplicate advance writes nothing',
       detail:
-        'The script returns `0` instead of overwriting, so the worker that lost the race learns it lost. The draft returns success to both workers, so one of the two effects is missing from the record.',
+        'The script returns `0` instead of overwriting, so the worker that lost the race learns it lost. The starter returns success to both workers, so one of the two effects is missing from the record.',
       match: {
         python: {all: [/if current == ARGV\[1\]/, /return 0/]},
         typescript: {all: [/if current == ARGV\[1\]/, /return 0/]},
@@ -83,7 +82,7 @@ into it, and an abandoned run keeps its key forever.`,
       id: 'ref',
       title: 'The checkpoint holds a reference, not the payload',
       detail:
-        'The step output goes to the blob store and only its reference reaches Redis, so the checkpoint value stays the same size whatever the step produced. The draft serializes the whole output into the hash value.',
+        'The step output goes to the blob store and only its reference reaches Redis, so the checkpoint value stays the same size whatever the step produced. The starter serializes the whole output into the hash value.',
       match: {
         python: {all: [/output_ref/, /blobs\.put\(/], none: [/"output":\s*output\}/]},
         typescript: {all: [/output_ref/, /blobs\.put\(/], none: [/"output":\s*output\}/]},
@@ -96,7 +95,7 @@ into it, and an abandoned run keeps its key forever.`,
       id: 'trail',
       title: 'The checkpoint records the completed steps',
       detail:
-        'The hash carries `completed`, the ordered list of finished step names, written by the same script that moves the run. The draft keeps a bare cursor, so nothing can say which steps actually ran.',
+        'The hash carries `completed`, the ordered list of finished step names, written by the same script that moves the run. The starter keeps a bare cursor, so nothing can say which steps actually ran.',
       match: {
         python: {all: [/completed/, /HSET/]},
         typescript: {all: [/completed/, /HSET/]},
@@ -109,7 +108,7 @@ into it, and an abandoned run keeps its key forever.`,
       id: 'ttl',
       title: 'The checkpoint expires and the advance refreshes it',
       detail:
-        '`CHECKPOINT_TTL_S` is seven days and every advance refreshes it inside the script, so the key dies when the run stops moving. The draft writes the key with no expiry at all.',
+        '`CHECKPOINT_TTL_S` is seven days and every advance refreshes it inside the script, so the key dies when the run stops moving. The starter writes the key with no expiry at all.',
       match: {
         python: {all: [/CHECKPOINT_TTL_S/, /EXPIRE/]},
         typescript: {all: [/CHECKPOINT_TTL_S/, /EXPIRE/]},
@@ -153,7 +152,7 @@ def checkpoint_key(run_id: str) -> str:
 
 
 def advance(run_id: str, to_step: str, output: dict, cursor: int) -> bool:
-    # TODO: this draft reads the cursor on the client and then writes the checkpoint back with a
+    # TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
     # plain write, serializes the whole step output into the value instead of a reference, keeps
     # only a cursor with no completed list, and never expires the key. A duplicate worker therefore
     # advances the run twice and one effect is lost from the record.
@@ -262,7 +261,7 @@ def checkpoint(run_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Run checkpoint: a model-generated draft that overwrites the run state from client memory. */
+      starter: `/** Run checkpoint: flawed code that overwrites the run state from client memory. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -297,7 +296,7 @@ export async function advance(
   output: Record<string, unknown>,
   cursor: number,
 ): Promise<boolean> {
-  // TODO: this draft reads the cursor on the client and then writes the checkpoint back with a
+  // TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
   // plain write, serializes the whole step output into the value instead of a reference, keeps
   // only a cursor with no completed list, and never expires the key. A duplicate worker therefore
   // advances the run twice and one effect is lost from the record.
@@ -459,7 +458,7 @@ func checkpointKey(runID string) string {
 // advance moves the run forward: read the cursor, compare it with the one the worker believes it
 // holds, then write the new value back.
 func advance(ctx context.Context, runID string, toStep string, output map[string]any, cursor int) bool {
-	// TODO: this draft reads the cursor on the client and then writes the checkpoint back with a
+	// TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
 	// plain write, serializes the whole step output into the value instead of a reference, keeps
 	// only a cursor with no completed list, and never expires the key. A duplicate worker therefore
 	// advances the run twice and one effect is lost from the record.
@@ -654,7 +653,7 @@ object Checkpoint {
 
   def key(runId: String): String = s"run:$runId:checkpoint"
 
-  // TODO: this draft reads the cursor on the client and then writes the checkpoint back with a
+  // TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
   // plain write, serializes the whole step output into the value instead of a reference, keeps
   // only a cursor with no completed list, and never expires the key. A duplicate worker therefore
   // advances the run twice and one effect is lost from the record.
@@ -817,7 +816,7 @@ std::string checkpointKey(const std::string& runId) {
 // holds, then write the new value back.
 bool advance(Redis& redis, const std::string& runId, const std::string& toStep, const std::string& output,
              long long cursor) {
-  // TODO: this draft reads the cursor on the client and then writes the checkpoint back with a
+  // TODO: this starter reads the cursor on the client and then writes the checkpoint back with a
   // plain write, serializes the whole step output into the value instead of a reference, keeps only
   // a cursor with no completed list, and never expires the key. A duplicate worker therefore
   // advances the run twice and one effect is lost from the record.

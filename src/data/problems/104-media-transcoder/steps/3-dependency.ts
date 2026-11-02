@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'worker', 'source'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the worker, catches
-the error and tries again until it works. That is exactly what turns one corrupt segment into a job
-that never finishes. Review it, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it calls the worker, catches the error and tries
+again until it works. That is exactly what turns one corrupt segment into a job that never
+finishes. Debug it, fix it, and prove the fix with the checks below.
 
 Implement the worker client that encodes one segment at a time:
 
@@ -19,7 +19,7 @@ Implement the worker client that encodes one segment at a time:
   per attempt (\`timeout\`, \`deadline: Date.now() + …\`, \`context.WithTimeout\`,
   \`withDeadlineAfter\`, \`set_deadline\`). A fixed ceiling is wrong in both directions: it cuts a
   long segment short and gives a tiny segment a worker's whole budget to hang in.
-- Each segment gets at most **two attempts** (\`MAX_ATTEMPTS = 2\`) in a bounded loop. The draft
+- Each segment gets at most **two attempts** (\`MAX_ATTEMPTS = 2\`) in a bounded loop. The starter
   retries every error forever, so one bad segment consumes the job.
 - Failures are **classified**: \`INVALID_ARGUMENT\` is corrupt input at that index and is
   **terminal** — the job fails with the segment index and no further attempt is made.
@@ -68,7 +68,7 @@ one: it starves long segments and lets short ones hang.`,
       id: 'scaled-deadline',
       title: 'Deadline scaled to the segment’s length',
       detail:
-        'Each attempt carries a deadline computed as `DEADLINE_BASE_MS + DEADLINE_PER_SECOND_MS × segment_seconds` (a context with timeout, `set_deadline`, `withDeadlineAfter`, `deadline`). The draft gives every call the same fixed 30-second ceiling.',
+        'Each attempt carries a deadline computed as `DEADLINE_BASE_MS + DEADLINE_PER_SECOND_MS × segment_seconds` (a context with timeout, `set_deadline`, `withDeadlineAfter`, `deadline`). The starter gives every call the same fixed 30-second ceiling.',
       match: {
         python: {all: [/DEADLINE_BASE_MS/, /DEADLINE_PER_SECOND_MS/, /timeout=deadline_ms\(/]},
         typescript: {all: [/DEADLINE_BASE_MS/, /DEADLINE_PER_SECOND_MS/, /Date\.now\(\)\s*\+\s*deadlineMs\(/]},
@@ -81,7 +81,7 @@ one: it starves long segments and lets short ones hang.`,
       id: 'bounded-attempts',
       title: 'At most two attempts per segment',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 2` and the loop cannot run forever. The draft retries every error indefinitely, so a corrupt segment loops until the job is killed.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 2` and the loop cannot run forever. The starter retries every error indefinitely, so a corrupt segment loops until the job is killed.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2/, /range\(MAX_ATTEMPTS\)/], none: [/while True/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2/, /attempt\s*<\s*MAX_ATTEMPTS/], none: [/while\s*\(\s*true\s*\)/]},
@@ -94,7 +94,7 @@ one: it starves long segments and lets short ones hang.`,
       id: 'classify',
       title: 'Corrupt input is terminal, worker loss is retryable',
       detail:
-        '`INVALID_ARGUMENT` (corrupt media) and `UNAVAILABLE`/`DEADLINE_EXCEEDED` (worker loss) are separated in one place — `is_retryable`/`isRetryable` — and only the retryable ones loop. The draft treats every error the same and retries all of them.',
+        '`INVALID_ARGUMENT` (corrupt media) and `UNAVAILABLE`/`DEADLINE_EXCEEDED` (worker loss) are separated in one place — `is_retryable`/`isRetryable` — and only the retryable ones loop. The starter treats every error the same and retries all of them.',
       match: {
         python: {all: [/INVALID_ARGUMENT/, /UNAVAILABLE/, /def is_retryable\(/]},
         typescript: {all: [/INVALID_ARGUMENT/, /UNAVAILABLE/, /function isRetryable\(/]},
@@ -107,7 +107,7 @@ one: it starves long segments and lets short ones hang.`,
       id: 'segment-scope',
       title: 'Retries stay inside the failing segment',
       detail:
-        'The client encodes one segment per call (`EncodeSegment` with a `segment_index`) and never re-encodes the file; there is no whole-file call. The draft re-encodes everything when one worker dies.',
+        'The client encodes one segment per call (`EncodeSegment` with a `segment_index`) and never re-encodes the file; there is no whole-file call. The starter re-encodes everything when one worker dies.',
       match: {
         python: {all: [/EncodeSegment\(/, /segment_index/], none: [/EncodeFile\(|encode_all\(/]},
         typescript: {all: [/EncodeSegment\(/, /segmentIndex/], none: [/EncodeFile\(|encodeFile\(/]},
@@ -120,7 +120,7 @@ one: it starves long segments and lets short ones hang.`,
       id: 'fail-with-index',
       title: 'A failed segment names its index',
       detail:
-        'When the attempts are exhausted (or the input is corrupt) the error carries the segment index — `SegmentFailure(segment_index, reason)` / `SegmentFailure{SegmentIndex: …}` — so the job and the event can say which segment broke. The draft raises a bare exception with no index.',
+        'When the attempts are exhausted (or the input is corrupt) the error carries the segment index — `SegmentFailure(segment_index, reason)` / `SegmentFailure{SegmentIndex: …}` — so the job and the event can say which segment broke. The starter raises a bare exception with no index.',
       match: {
         python: {all: [/SegmentFailure\(segment_index/, /segment_index/]},
         typescript: {all: [/SegmentFailure\(segmentIndex/, /segmentIndex/]},
@@ -143,9 +143,9 @@ logger = logging.getLogger("transcoder")
 
 
 def encode_job(stub, job_id: str, segments, source_uri: str) -> None:
-    # TODO: this draft retries every error forever with a fixed 30 s ceiling, never tells corrupt
+    # TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
     # input apart from worker loss, re-encodes the whole file when a worker dies, and raises
-    # without the segment index. Review all four.
+    # without the segment index. Fix all four.
     for segment_index, _segment_seconds in enumerate(segments):
         request = workers_pb2.EncodeRequest(job_id=job_id, segment_index=segment_index, source_uri=source_uri)
         while True:
@@ -157,7 +157,7 @@ def encode_job(stub, job_id: str, segments, source_uri: str) -> None:
 
 
 def encode_file(stub, job_id: str, source_uri: str) -> None:
-    """One call for the whole source, the way the draft started before segments existed."""
+    """One call for the whole source, the way the starter started before segments existed."""
     stub.EncodeFile(workers_pb2.EncodeFileRequest(job_id=job_id, source_uri=source_uri), timeout=30.0)
 `,
       solution: `import logging
@@ -220,7 +220,7 @@ def encode_job(stub: grpc.Channel, job_id: str, segments, source_uri: str) -> No
 `,
     },
     typescript: {
-      starter: `/** Worker client: a model-generated draft that retries a corrupt segment forever. */
+      starter: `/** Worker client: flawed code that retries a corrupt segment forever. */
 import * as grpc from '@grpc/grpc-js';
 
 import {EncodeFileRequest, EncodeRequest} from './generated/workers_pb';
@@ -231,9 +231,9 @@ export interface WorkerStub {
 }
 
 export async function encodeJob(worker: WorkerStub, jobId: string, segments: number[], sourceUri: string): Promise<void> {
-  // TODO: this draft retries every error forever with a fixed 30 s ceiling, never tells corrupt
+  // TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
   // input apart from worker loss, re-encodes the whole file when a worker dies, and raises
-  // without the segment index. Review all four.
+  // without the segment index. Fix all four.
   for (const [segmentIndex] of segments.entries()) {
     const request = EncodeRequest.create({jobId, segmentIndex, sourceUri});
     while (true) {
@@ -251,7 +251,7 @@ export async function encodeJob(worker: WorkerStub, jobId: string, segments: num
   }
 }
 
-/** One call for the whole source, the way the draft started before segments existed. */
+/** One call for the whole source, the way the starter started before segments existed. */
 export async function encodeFile(worker: WorkerStub, jobId: string, sourceUri: string): Promise<void> {
   const request = EncodeFileRequest.create({jobId, sourceUri});
   await new Promise<void>((resolve, reject) => {
@@ -352,9 +352,9 @@ import (
 )
 
 func encodeJob(ctx context.Context, worker WorkerClient, jobID string, segments []float64, sourceURI string) error {
-	// TODO: this draft retries every error forever with a fixed 30 s ceiling, never tells corrupt
+	// TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
 	// input apart from worker loss, re-encodes the whole file when a worker dies, and returns an
-	// error without the segment index. Review all four.
+	// error without the segment index. Fix all four.
 	for segmentIndex := range segments {
 		request := &EncodeRequest{JobId: jobID, SegmentIndex: int32(segmentIndex), SourceUri: sourceURI}
 		for {
@@ -370,7 +370,7 @@ func encodeJob(ctx context.Context, worker WorkerClient, jobID string, segments 
 	return nil
 }
 
-// encodeFile is one call for the whole source, the way the draft started before segments existed.
+// encodeFile is one call for the whole source, the way the starter started before segments existed.
 func encodeFile(ctx context.Context, worker WorkerClient, jobID, sourceURI string) error {
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -457,9 +457,9 @@ import scala.concurrent.duration._
 
 object WorkerClient {
 
-  // TODO: this draft retries every error forever with a fixed 30 s ceiling, never tells corrupt
+  // TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
   // input apart from worker loss, re-encodes the whole file when a worker dies, and throws
-  // without the segment index. Review all four.
+  // without the segment index. Fix all four.
   def encodeJob(stub: WorkerGrpc.WorkerBlockingStub, jobId: String, segments: Seq[Double], sourceUri: String): Unit = {
     segments.zipWithIndex.foreach { case (_, segmentIndex) =>
       val request = EncodeRequest(jobId = jobId, segmentIndex = segmentIndex, sourceUri = sourceUri)
@@ -475,7 +475,7 @@ object WorkerClient {
     }
   }
 
-  /** One call for the whole source, the way the draft started before segments existed. */
+  /** One call for the whole source, the way the starter started before segments existed. */
   def encodeFile(stub: WorkerGrpc.WorkerBlockingStub, jobId: String, sourceUri: String): Unit =
     stub.withDeadlineAfter(30, SECONDS).encodeFile(EncodeFileRequest(jobId = jobId, sourceUri = sourceUri))
 }
@@ -549,9 +549,9 @@ object WorkerClient {
 
 void encodeJob(transcode::Worker::Stub& worker, const std::string& job_id, const std::vector<double>& segments,
                const std::string& source_uri) {
-  // TODO: this draft retries every error forever with a fixed 30 s ceiling, never tells corrupt
+  // TODO: this starter retries every error forever with a fixed 30 s ceiling, never tells corrupt
   // input apart from worker loss, re-encodes the whole file when a worker dies, and throws
-  // without the segment index. Review all four.
+  // without the segment index. Fix all four.
   for (int segment_index = 0; segment_index < static_cast<int>(segments.size()); ++segment_index) {
     transcode::EncodeRequest request;
     request.set_job_id(job_id);
@@ -568,7 +568,7 @@ void encodeJob(transcode::Worker::Stub& worker, const std::string& job_id, const
   }
 }
 
-/** One call for the whole source, the way the draft started before segments existed. */
+/** One call for the whole source, the way the starter started before segments existed. */
 void encodeFile(transcode::Worker::Stub& worker, const std::string& job_id, const std::string& source_uri) {
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
@@ -651,5 +651,5 @@ void encodeJob(transcode::Worker::Stub& worker, const std::string& job_id, const
     'Scale the deadline per segment: `deadline = DEADLINE_BASE_MS + DEADLINE_PER_SECOND_MS × segment_seconds`. A fixed ceiling cuts long segments off mid-encode and gives small ones far more budget than they need to hang.',
     'Bounded attempts are what keep a corrupt segment from consuming the job: `for attempt in range(MAX_ATTEMPTS)` with a terminal raise after the last one. Retries stay inside the segment loop — a worker that dies is replaced for that index, and the rest of the file keeps its finished work.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated RPC client against the two failure kinds a media pipeline actually sees. The draft is right on the happy path: the call, the retry, the log line. Four defects are being checked: the classification (corrupt input is terminal, worker loss is retryable — retrying corrupt bytes forever is what makes a job loop for hours and burn its budget), bounded attempts (two per segment, not infinity), the deadline scaled to segment length rather than one fixed ceiling, and segment-scoped failure (the error carries the index, and no attempt re-encodes the file). The scope point matters twice over: an encoder is the expensive part of the pipeline, and with the claim tracker from the previous step a whole-file retry cannot even fix the missing segment because the finished ones are skipped. Real clients add jittered backoff between attempts, a per-worker circuit breaker, and a resumable range fetch so attempt two starts from the last good byte offset.`,
+  debrief: `The interviewer is testing whether you can debug an RPC client against the two failure kinds a media pipeline actually sees. The starter is right on the happy path: the call, the retry, the log line. Four defects are being checked: the classification (corrupt input is terminal, worker loss is retryable — retrying corrupt bytes forever is what makes a job loop for hours and burn its budget), bounded attempts (two per segment, not infinity), the deadline scaled to segment length rather than one fixed ceiling, and segment-scoped failure (the error carries the index, and no attempt re-encodes the file). The scope point matters twice over: an encoder is the expensive part of the pipeline, and with the claim tracker from the previous step a whole-file retry cannot even fix the missing segment because the finished ones are skipped. Real clients add jittered backoff between attempts, a per-worker circuit breaker, and a resumable range fetch so attempt two starts from the last good byte offset.`,
 };

@@ -8,9 +8,9 @@ export const neighborReadStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the neighbour endpoint. It
+**Starting point.** The starter is working code for the neighbour endpoint. It
 registers the route, walks the graph and returns edges. It compiles, it answers for the demo graph,
-and it hides three production flaws. Review it like the service owner, fix it, and prove the fix with
+and it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with
 the checks below.
 
 Implement \`GET /v1/entities/{id}/neighbors?depth=…\`:
@@ -27,7 +27,7 @@ Implement \`GET /v1/entities/{id}/neighbors?depth=…\`:
 - Read through the versioned adjacency cache from the earlier step; a cache miss or a stale version
   reloads from the graph store.
 
-**Failure mode the checks target.** The draft accepts any \`depth\` the caller sends, then
+**Failure mode the checks target.** The starter accepts any \`depth\` the caller sends, then
 materialises every path: on a hub entity the recursive walk visits the same node through an
 exponential number of paths and one request becomes a combinatorial explosion that takes the service
 down. It also never checks that the entity belongs to the caller's tenant, so any tenant that knows
@@ -62,7 +62,7 @@ walk over a hub returns an unbounded body.`,
       id: 'depth-cap',
       title: 'Refuses depth above 2 with 400',
       detail:
-        '`MAX_DEPTH = 2` and any `depth > MAX_DEPTH` is **400** before any traversal. The draft accepts an unbounded depth and walks it.',
+        '`MAX_DEPTH = 2` and any `depth > MAX_DEPTH` is **400** before any traversal. The starter accepts an unbounded depth and walks it.',
       match: {
         python: {all: [/MAX_DEPTH\s*=\s*2/, /depth\s*>\s*MAX_DEPTH/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_DEPTH\s*=\s*2/, /depth\s*>\s*MAX_DEPTH/, /code\(\s*400\s*\)/]},
@@ -75,7 +75,7 @@ walk over a hub returns an unbounded body.`,
       id: 'edge-cap',
       title: 'Caps the result at 500 edges with a truncation marker',
       detail:
-        '`MAX_EDGES = 500`; a walk that hits the cap stops and the response carries `truncated: true` so the caller knows the answer is clipped. The draft returns unbounded edges.',
+        '`MAX_EDGES = 500`; a walk that hits the cap stops and the response carries `truncated: true` so the caller knows the answer is clipped. The starter returns unbounded edges.',
       match: {
         python: {all: [/MAX_EDGES\s*=\s*500/, /truncated/]},
         typescript: {all: [/MAX_EDGES\s*=\s*500/, /truncated/]},
@@ -88,7 +88,7 @@ walk over a hub returns an unbounded body.`,
       id: 'tenant-scope',
       title: 'A foreign or unknown entity id is 404',
       detail:
-        'The endpoint resolves the entity’s owning tenant (`entity_tenant`) and answers **404** when it is unknown or belongs to someone else. The draft returns any tenant’s edges whenever the id is known.',
+        'The endpoint resolves the entity’s owning tenant (`entity_tenant`) and answers **404** when it is unknown or belongs to someone else. The starter returns any tenant’s edges whenever the id is known.',
       match: {
         python: {all: [/entity_tenant\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/entityTenant\(/, /code\(\s*404\s*\)/]},
@@ -101,7 +101,7 @@ walk over a hub returns an unbounded body.`,
       id: 'bounded-traversal',
       title: 'Traverses breadth-first with a frontier and a visited set',
       detail:
-        '`neighbors` walks level by level with a `frontier` and a `visited` set, so each node is expanded once. The draft recurses over paths and expands a hub exponentially.',
+        '`neighbors` walks level by level with a `frontier` and a `visited` set, so each node is expanded once. The starter recurses over paths and expands a hub exponentially.',
       match: {
         python: {all: [/def neighbors\(/, /visited/, /frontier/]},
         typescript: {all: [/function neighbors\(/, /visited/, /frontier/]},
@@ -131,8 +131,8 @@ store = GraphStore()
 
 
 def read_neighbors(entity_id: str, depth: int = 5) -> JSONResponse:
-    # TODO: this draft accepts an unbounded depth, materialises every path to a hub entity, and
-    # returns edges from any tenant when the entity id is known. Review all three.
+    # TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
+    # returns edges from any tenant when the entity id is known. Fix all three.
     edges: list[str] = []
 
     def walk(node: str, remaining: int) -> None:
@@ -211,7 +211,7 @@ def read_neighbors(
 `,
     },
     typescript: {
-      starter: `/** Neighbour read: a model-generated draft that walks every path. */
+      starter: `/** Neighbour read: flawed code that walks every path. */
 import Fastify from 'fastify';
 
 import {store} from './graph';
@@ -227,8 +227,8 @@ async function walk(node: string, remaining: number, edges: string[]): Promise<v
 }
 
 app.get('/v1/entities/:entityId/neighbors', async (request, reply) => {
-  // TODO: this draft accepts an unbounded depth, materialises every path to a hub entity, and
-  // returns edges from any tenant when the entity id is known. Review all three.
+  // TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
+  // returns edges from any tenant when the entity id is known. Fix all three.
   const entityId = (request.params as {entityId: string}).entityId;
   const depth = Number((request.query as {depth?: string}).depth ?? '5');
   const edges: string[] = [];
@@ -325,8 +325,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readNeighbors(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft accepts an unbounded depth, materialises every path to a hub entity, and
-	// returns edges from any tenant when the entity id is known. Review all three.
+	// TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
+	// returns edges from any tenant when the entity id is known. Fix all three.
 	entityID := r.PathValue("entityID")
 	edges := make([]string, 0)
 	walk("default", entityID, 5, &edges)
@@ -446,8 +446,8 @@ object NeighborRead {
   val route: Route =
     path("v1" / "entities" / Segment / "neighbors") { entityId =>
       get {
-        // TODO: this draft accepts an unbounded depth, materialises every path to a hub entity, and
-        // returns edges from any tenant when the entity id is known. Review all three.
+        // TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
+        // returns edges from any tenant when the entity id is known. Fix all three.
         val edges = walk("default", entityId, 5, Nil)
         complete(StatusCodes.OK, s"""{"edges":\${edges.size}}""")
       }
@@ -554,8 +554,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/entities/([^/]+)/neighbors)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft accepts an unbounded depth, materialises every path to a hub entity, and
-    // returns edges from any tenant when the entity id is known. Review all three.
+    // TODO: this starter accepts an unbounded depth, materialises every path to a hub entity, and
+    // returns edges from any tenant when the entity id is known. Fix all three.
     const std::string entityId = req.matches[1];
     const int depth = req.has_param("depth") ? std::stoi(req.get_param_value("depth")) : 5;
     std::vector<std::string> edges;

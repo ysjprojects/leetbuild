@@ -8,9 +8,9 @@ export const chatProxyStep: Step = {
   focus: ['client', 'aifw', 'guard', 'app'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, pulls
+**Starting point.** The starter is working code: it registers the route, pulls
 the prompt out of the body, asks the detector for a score and forwards the request to the LLM
-application. It compiles, the demo works, and it hides four production flaws. Review it as the
+application. It compiles, the demo works, and it hides four production flaws. Debug it as the
 owner of the firewall, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/chat\`, the proxy every request to the LLM application passes through. The
@@ -62,7 +62,7 @@ firewall; and the prompt in the log line ships user content into every log sink 
       id: 'api-key',
       title: 'Requires X-Api-Key and carries a request id',
       detail:
-        'A missing or empty `X-Api-Key` is **401**, and every request carries an `X-Request-Id` (the caller’s or a fresh one) back in the response. The draft falls back to `anonymous` and has no request id.',
+        'A missing or empty `X-Api-Key` is **401**, and every request carries an `X-Request-Id` (the caller’s or a fresh one) back in the response. The starter falls back to `anonymous` and has no request id.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /X-Request-Id/], none: [/anonymous/]},
         typescript: {all: [/code\(\s*401\s*\)/, /x-request-id/], none: [/anonymous/]},
@@ -75,7 +75,7 @@ firewall; and the prompt in the log line ships user content into every log sink 
       id: 'prompt-path',
       title: 'Locates the prompt by PROMPT_PATH and caps it at 64 KiB',
       detail:
-        'The prompt is read at the configured `PROMPT_PATH` (**400** when missing or not a string) and rejected with **413** above `MAX_PROMPT_BYTES = 1 << 16` before any detector or model work. The draft hard-codes the field and has no cap.',
+        'The prompt is read at the configured `PROMPT_PATH` (**400** when missing or not a string) and rejected with **413** above `MAX_PROMPT_BYTES = 1 << 16` before any detector or model work. The starter hard-codes the field and has no cap.',
       match: {
         python: {
           all: [/PROMPT_PATH/, /MAX_PROMPT_BYTES\s*=\s*1\s*<<\s*16/, /status_code\s*=\s*413/, /status_code\s*=\s*400/],
@@ -101,7 +101,7 @@ firewall; and the prompt in the log line ships user content into every log sink 
       id: 'block',
       title: 'Blocks on the decision and never logs the prompt',
       detail:
-        'When the decision’s `action` is `block` the proxy answers **403** and does not forward; the log line carries request id, action and score, never the prompt. The draft logs the prompt and forwards every request whatever the score.',
+        'When the decision’s `action` is `block` the proxy answers **403** and does not forward; the log line carries request id, action and score, never the prompt. The starter logs the prompt and forwards every request whatever the score.',
       match: {
         python: {all: [/status_code\s*=\s*403/, /\.action\s*==\s*["']block["']/], none: [/logger\.\w+\([^)]*prompt/]},
         typescript: {all: [/code\(\s*403\s*\)/, /\.action\s*===\s*['"]block['"]/], none: [/log\.\w+\([^)]*prompt/]},
@@ -129,7 +129,7 @@ UPSTREAM = "http://llm-app:8080/v1/chat"
 
 @app.post("/v1/chat")
 async def chat(request: Request, api_key: str | None = Header(default=None, alias="X-Api-Key")) -> JSONResponse:
-    # TODO: this draft lets unauthenticated callers through as "anonymous", hard-codes where the
+    # TODO: this starter lets unauthenticated callers through as "anonymous", hard-codes where the
     # prompt lives and never caps it, computes a decision it does not act on, and logs the prompt.
     body = await request.json()
     prompt = body["input"]["prompt"]
@@ -194,7 +194,7 @@ async def chat(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/chat: a model-generated draft that scores the prompt and forwards it anyway. */
+      starter: `/** POST /v1/chat: flawed code that scores the prompt and forwards it anyway. */
 import Fastify from 'fastify';
 
 import {decide} from './detect';
@@ -209,7 +209,7 @@ interface ChatBody {
 }
 
 app.post('/v1/chat', async (request, reply) => {
-  // TODO: this draft lets unauthenticated callers through as "anonymous", hard-codes where the
+  // TODO: this starter lets unauthenticated callers through as "anonymous", hard-codes where the
   // prompt lives and never caps it, computes a decision it does not act on, and logs the prompt.
   const apiKey = (request.headers['x-api-key'] as string | undefined) ?? 'anonymous';
   const body = request.body as ChatBody;
@@ -297,7 +297,7 @@ type chatBody struct {
 }
 
 func chat(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft lets unauthenticated callers through as "anonymous", hard-codes where the
+	// TODO: this starter lets unauthenticated callers through as "anonymous", hard-codes where the
 	// prompt lives and never caps it, computes a decision it does not act on, and logs the prompt.
 	apiKey := r.Header.Get("X-Api-Key")
 	if apiKey == "" {
@@ -447,7 +447,7 @@ object FirewallApi {
       post {
         optionalHeaderValueByName("X-Api-Key") { keyOpt =>
           entity(as[String]) { raw =>
-            // TODO: this draft lets unauthenticated callers through as "anonymous", hard-codes
+            // TODO: this starter lets unauthenticated callers through as "anonymous", hard-codes
             // where the prompt lives and never caps it, computes a decision it does not act on,
             // and logs the prompt.
             val apiKey = keyOpt.getOrElse("anonymous")
@@ -571,7 +571,7 @@ int main() {
   httplib::Client upstream(kUpstreamHost);
 
   svr.Post("/v1/chat", [&upstream](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft lets unauthenticated callers through as "anonymous", hard-codes where the
+    // TODO: this starter lets unauthenticated callers through as "anonymous", hard-codes where the
     // prompt lives and never caps it, computes a decision it does not act on, and logs the prompt.
     auto apiKey = req.get_header_value("X-Api-Key");
     if (apiKey.empty()) apiKey = "anonymous";
@@ -674,5 +674,5 @@ int main() {
     'Write a small `prompt_at(body, path)` that walks dotted keys and returns the string or nothing. The path is configuration — the same proxy fronts several applications with different body shapes — so a hard-coded `body["input"]["prompt"]` is the wrong layer.',
     'The decision is the whole point: `if decision.action == "block"` → 403 with the request id, and return. The log line is a contract: request id, action, score, tags. The prompt never goes in it.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated proxy at the trust boundary. The draft looks fine because the demo sends one well-formed body from one authenticated client and the detector always says allow. Four separate defects are being checked: authentication (a firewall that lets anonymous traffic through has no per-key limits to apply), locating and capping the input (the prompt lives wherever the application put it, and 64 KiB is a cost bound as much as a safety bound), acting on the decision (the firewall in the source blocks on a rule over the score; a score that is only logged protects nothing), and the log line (the prompt is user content and may never be logged verbatim). Real firewalls add a per-application prompt path from configuration, a hashed prompt fingerprint for dedupe and debugging, and the bot and attack scores the source says the prompt score combines with.`,
+  debrief: `The interviewer is testing whether you can debug a proxy at the trust boundary. The starter looks fine because the demo sends one well-formed body from one authenticated client and the detector always says allow. Four separate defects are being checked: authentication (a firewall that lets anonymous traffic through has no per-key limits to apply), locating and capping the input (the prompt lives wherever the application put it, and 64 KiB is a cost bound as much as a safety bound), acting on the decision (the firewall in the source blocks on a rule over the score; a score that is only logged protects nothing), and the log line (the prompt is user content and may never be logged verbatim). Real firewalls add a per-application prompt path from configuration, a hashed prompt fingerprint for dedupe and debugging, and the bot and attack scores the source says the prompt score combines with.`,
 };

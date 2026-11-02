@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['worker', 'model', 'small'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the large model is healthy
+**Starting point.** The starter is working code: when the large model is healthy
 it returns a real classification and the demo passes. Every failure path invents an answer. Find the
 flaws, fix them, and prove the fix.
 
@@ -27,7 +27,7 @@ Implement \`infer(image_key, task)\`, the worker's model layer:
 - Every result names the **exact model version** that produced it (\`model_version\`), including the
   downgraded one.
 
-**Failure mode the checks target.** The draft maps a timeout to \`{"label": "unknown", "confidence":
+**Failure mode the checks target.** The starter maps a timeout to \`{"label": "unknown", "confidence":
 0.0}\` with a 200, so downstream consumers train on a label nobody predicted; it retries every error,
 including permanent rejections; and it picks a model per attempt with no provenance, so no one can
 tell which model version a stored prediction came from.`,
@@ -52,7 +52,7 @@ tell which model version a stored prediction came from.`,
       id: 'deadline',
       title: 'Every attempt carries a 2-second deadline',
       detail:
-        'The call itself is created with a 2000 ms deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, a context with timeout, `withDeadlineAfter`, `set_deadline`. The draft passes no deadline at all.',
+        'The call itself is created with a 2000 ms deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, a context with timeout, `withDeadlineAfter`, `set_deadline`. The starter passes no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*2/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -65,7 +65,7 @@ tell which model version a stored prediction came from.`,
       id: 'retry-policy',
       title: 'Bounds the attempts and only retries the retryable codes',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS` and gated on `RETRYABLE_CODES` (`UNAVAILABLE`, `DEADLINE_EXCEEDED`); a validation rejection is not retried. The draft retries every error five times.',
+        'Attempts are bounded by `MAX_ATTEMPTS` and gated on `RETRYABLE_CODES` (`UNAVAILABLE`, `DEADLINE_EXCEEDED`); a validation rejection is not retried. The starter retries every error five times.',
       match: {
         python: {all: [/RETRYABLE_CODES/, /range\(MAX_ATTEMPTS\)/], none: [/INVALID_ARGUMENT/]},
         typescript: {all: [/RETRYABLE_CODES/, /attempt\s*<\s*MAX_ATTEMPTS/], none: [/INVALID_ARGUMENT/]},
@@ -78,7 +78,7 @@ tell which model version a stored prediction came from.`,
       id: 'downgrade',
       title: 'Downgrades to the small model and records it',
       detail:
-        'After the large model is exhausted the small model answers, and the response marks the downgrade (`downgraded: true` plus a reason) instead of hiding it. The draft alternates models silently.',
+        'After the large model is exhausted the small model answers, and the response marks the downgrade (`downgraded: true` plus a reason) instead of hiding it. The starter alternates models silently.',
       match: {
         python: {all: [/downgraded/, /SMALL_MODEL_VERSION/, /downgrade_reason/]},
         typescript: {all: [/downgraded/, /SMALL_MODEL_VERSION/, /downgrade_reason/]},
@@ -91,7 +91,7 @@ tell which model version a stored prediction came from.`,
       id: 'no-default-label',
       title: 'Never returns a default label as a prediction',
       detail:
-        'There is no `"unknown"` fallback label: the response only ever carries a label the model produced, together with its confidence. The draft answers timeouts with a fabricated `unknown`.',
+        'There is no `"unknown"` fallback label: the response only ever carries a label the model produced, together with its confidence. The starter answers timeouts with a fabricated `unknown`.',
       match: {
         python: {all: [/confidence/], none: [/["']unknown["']/]},
         typescript: {all: [/confidence/], none: [/["']unknown["']/]},
@@ -104,7 +104,7 @@ tell which model version a stored prediction came from.`,
       id: 'provenance',
       title: 'Names the exact model version on every result',
       detail:
-        'Every prediction carries `model_version` with the concrete version constant that produced it (large or small). The draft records nothing, so a stored prediction cannot be traced back to a version.',
+        'Every prediction carries `model_version` with the concrete version constant that produced it (large or small). The starter records nothing, so a stored prediction cannot be traced back to a version.',
       match: {
         python: {all: [/model_version/, /LARGE_MODEL_VERSION/, /SMALL_MODEL_VERSION/]},
         typescript: {all: [/model_version/, /LARGE_MODEL_VERSION/, /SMALL_MODEL_VERSION/]},
@@ -116,7 +116,7 @@ tell which model version a stored prediction came from.`,
   ],
   code: {
     python: {
-      starter: `"""Model calls: a model-generated draft that answers unknown when the model times out."""
+      starter: `"""Model calls: flawed code that answers unknown when the model times out."""
 import grpc
 
 import vision_pb2
@@ -129,9 +129,9 @@ MODEL_VERSIONS = ["vision-large-3.1.0", "vision-small-1.7.2"]
 
 
 def infer(image_key: str, task: str) -> dict:
-    # TODO: this draft retries every error — a validation rejection included — calls the models with
+    # TODO: this starter retries every error — a validation rejection included — calls the models with
     # no deadline, alternates between them with no recorded provenance, and answers a timeout with
-    # the label "unknown" as if the model had predicted it. Review all four.
+    # the label "unknown" as if the model had predicted it. Fix all four.
     for attempt in range(5):
         model_version = MODEL_VERSIONS[attempt % len(MODEL_VERSIONS)]
         request = vision_pb2.PredictRequest(
@@ -195,7 +195,7 @@ def infer(image_key: str, task: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Model calls: a model-generated draft that answers unknown when the model times out. */
+      starter: `/** Model calls: flawed code that answers unknown when the model times out. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -214,9 +214,9 @@ const predictor = new vision.Predictor('models:9000', grpc.credentials.createIns
 const MODEL_VERSIONS = ['vision-large-3.1.0', 'vision-small-1.7.2'];
 
 export async function infer(imageKey: string, task: string): Promise<Record<string, unknown>> {
-  // TODO: this draft retries every error — a validation rejection included — calls the models with
+  // TODO: this starter retries every error — a validation rejection included — calls the models with
   // no deadline, alternates between them with no recorded provenance, and answers a timeout with
-  // the label "unknown" as if the model had predicted it. Review all four.
+  // the label "unknown" as if the model had predicted it. Fix all four.
   for (let attempt = 0; attempt < 5; attempt++) {
     const modelVersion = MODEL_VERSIONS[attempt % MODEL_VERSIONS.length];
     try {
@@ -326,9 +326,9 @@ import (
 var modelVersions = []string{"vision-large-3.1.0", "vision-small-1.7.2"}
 
 func Infer(ctx context.Context, client pb.PredictorClient, req *pb.PredictRequest) (map[string]any, error) {
-	// TODO: this draft retries every error — a validation rejection included — calls the models with
+	// TODO: this starter retries every error — a validation rejection included — calls the models with
 	// no deadline, alternates between them with no recorded provenance, and answers a timeout with
-	// the label "unknown" as if the model had predicted it. Review all four.
+	// the label "unknown" as if the model had predicted it. Fix all four.
 	for attempt := 0; attempt < 5; attempt++ {
 		req.ModelVersion = modelVersions[attempt%len(modelVersions)]
 		reply, err := client.Predict(ctx, req)
@@ -421,9 +421,9 @@ object ModelClient {
   private val blocking = PredictorGrpc.newBlockingStub(channel)
 
   def infer(request: PredictRequest): Map[String, Any] = {
-    // TODO: this draft retries every error — a validation rejection included — calls the models with
+    // TODO: this starter retries every error — a validation rejection included — calls the models with
     // no deadline, alternates between them with no recorded provenance, and answers a timeout with
-    // the label "unknown" as if the model had predicted it. Review all four.
+    // the label "unknown" as if the model had predicted it. Fix all four.
     var attempt = 0
     while (attempt < 5) {
       val modelVersion = ModelVersions(attempt % ModelVersions.size)
@@ -511,9 +511,9 @@ const std::vector<std::string> kModelVersions{"vision-large-3.1.0", "vision-smal
 
 std::map<std::string, std::string> infer(std::unique_ptr<vision::Predictor::Stub>& predictor,
                                          const vision::PredictRequest& request) {
-  // TODO: this draft retries every error — a validation rejection included — calls the models with
+  // TODO: this starter retries every error — a validation rejection included — calls the models with
   // no deadline, alternates between them with no recorded provenance, and answers a timeout with
-  // the label "unknown" as if the model had predicted it. Review all four.
+  // the label "unknown" as if the model had predicted it. Fix all four.
   for (int attempt = 0; attempt < 5; ++attempt) {
     ClientContext context;
     vision::PredictRequest scoped = request;
@@ -592,8 +592,8 @@ Prediction infer(vision::Predictor::Stub* predictor, const vision::PredictReques
     'Retryability is a property of the status, not of “it threw”: capture the error, compare its code against `RETRYABLE_CODES`, and re-raise anything else immediately. A rejection will be rejected again — retrying it only spends the tenant’s latency budget.',
     'The downgrade is data, not a footnote: return the small model’s label with `downgraded: true` and the reason, and put the concrete `model_version` on every path. Never synthesise a label: a fabricated `unknown` is indistinguishable downstream from a real prediction.',
   ],
-  debrief: `The interviewer is testing honest degradation. The draft is dangerous precisely because it always
-answers: a timeout becomes a 200 with a plausible-looking label, so the metric dashboard stays green
+  debrief: `The interviewer is testing honest degradation. The starter is dangerous precisely because it always
+answers: a timeout becomes a 200 with a convincing-looking label, so the metric dashboard stays green
 while the training set fills with labels no model produced. Three fixes are being checked — a deadline
 per attempt, a retry policy keyed on the status code, and a downgrade that is *recorded* rather than
 hidden — plus provenance, because on a multi-version model a prediction without a version cannot be

@@ -45,13 +45,13 @@ export const eventsStep: Step = {
   },
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. The analytics team noticed that one
+**Starting point.** You are the AI platform engineer on call. The analytics team noticed that one
 tenant's quality counters jump around — a sign that the tenant's events are scattered across
 partitions — and that the retained \`feedback.recorded\` topic now contains raw comment text. The
-model-generated producer below keys by rating value, copies the comment into the payload, and returns
+producer below keys by rating value, copies the comment into the payload, and returns
 success before the broker confirms, with no outbox for the rejected produce.
 
-Review \`events\` and publish a feedback event that is ordered, content-free and lossless.
+Debug \`events\` and publish a feedback event that is ordered, content-free and lossless.
 
 - Produce to \`feedback.recorded\` with the **tenant as the message key**, so every event for one tenant
   shares a partition and the consumer sees them in order. Never key by the rating value.
@@ -158,8 +158,8 @@ outbox = Outbox()
 
 
 async def publish(tenant: str, record: dict) -> None:
-    # TODO: this draft keys by rating value, copies the comment into the retained topic, and acks
-    # before the broker confirms with no outbox. Review all three.
+    # TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
+    # before the broker confirms with no outbox. Fix all three.
     payload = {
         "request_id": record["request_id"],
         "rating": record["rating"],
@@ -229,8 +229,8 @@ export class Outbox {
 export const outbox = new Outbox();
 
 export async function publish(tenant: string, record: {request_id: string; rating: number; comment: string}) {
-  // TODO: this draft keys by rating value, copies the comment into the retained topic, and acks
-  // before the broker confirms with no outbox. Review all three.
+  // TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
+  // before the broker confirms with no outbox. Fix all three.
   const payload = {
     request_id: record.request_id,
     rating: record.rating,
@@ -305,8 +305,8 @@ func (o *Outbox) Put(ctx context.Context, record map[string]any) error {
 var outbox = &Outbox{}
 
 func publish(ctx context.Context, writer *kafka.Writer, tenant string, record map[string]any) {
-	// TODO: this draft keys by rating value, copies the comment into the retained topic, and acks
-	// before the broker confirms with no outbox. Review all three.
+	// TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
+	// before the broker confirms with no outbox. Fix all three.
 	payload, _ := json.Marshal(map[string]any{
 		"request_id": record["request_id"],
 		"rating":     record["rating"],
@@ -389,8 +389,8 @@ object FeedbackEvents {
   val Topic = "feedback.recorded"
 
   def publish(producer: KafkaProducer[String, String], tenant: String, record: Map[String, String]): Unit = {
-    // TODO: this draft keys by rating value, copies the comment into the retained topic, and acks
-    // before the broker confirms with no outbox. Review all three.
+    // TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
+    // before the broker confirms with no outbox. Fix all three.
     val payload = JsObject(
       "request_id" -> JsString(record("request_id")),
       "rating" -> JsString(record("rating")),
@@ -451,8 +451,8 @@ Outbox outbox;
 
 void publish(RdKafka::Producer* producer, const std::string& tenant, const std::string& requestId, int rating,
              const std::string& comment) {
-  // TODO: this draft keys by rating value, copies the comment into the retained topic, and acks
-  // before the broker confirms with no outbox. Review all three.
+  // TODO: this starter keys by rating value, copies the comment into the retained topic, and acks
+  // before the broker confirms with no outbox. Fix all three.
   const std::string payload =
       "{"request_id":"" + requestId + "","rating":" + std::to_string(rating) + ","comment":"" + comment + ""}";
   const std::string key = std::to_string(rating);
@@ -522,7 +522,7 @@ void publish(RdKafka::Producer* producer, const std::string& tenant, const std::
   debrief: `The Kafka message key is the ordering control: key by tenant and every event for that tenant
 shares a partition, so the quality consumer sees a tenant's ratings in the order they happened. Key by
 rating value and the stream scatters, which is exactly the "counters jump around" symptom that started
-this review.
+this investigation.
 
 The comment is tenant content. Once it is in a retained topic it outlives the feedback row, the
 request and the retention policy that governs the database, so the event carries a salted fingerprint

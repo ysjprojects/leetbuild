@@ -8,7 +8,7 @@ export const mergeClientStep: Step = {
   focus: ['sync', 'merger', 'revisions'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the merge service,
+**Starting point.** The starter is working code: it calls the merge service,
 returns a merged body on success and always returns *something* on failure, so the client never
 shows an error. Two of those three properties are wrong. Find them, fix them, and prove the fix.
 
@@ -26,7 +26,7 @@ Implement the three-way merge client that the push path uses for a document both
 - **No failure path may overwrite either side** with a last-write-wins pick on upload time. Silently
   choosing the newer upload is how a day of work disappears while the sync reports success.
 
-**Failure mode the checks target.** The draft has no deadline, so a hung merge service holds every
+**Failure mode the checks target.** The starter has no deadline, so a hung merge service holds every
 push open; it retries every failure forever, including the rejections that are terminal by design;
 and when the call finally fails it resolves the conflict by comparing upload times, discarding the
 losing edit without telling anyone. The user sees a synced document; the other edit is gone.`,
@@ -51,7 +51,7 @@ losing edit without telling anyone. The user sees a synced document; the other e
       id: 'deadline',
       title: 'Every merge attempt carries a 2-second deadline',
       detail:
-        'The call is created with a 2 s deadline — `timeout=MERGE_DEADLINE_S`, `deadline: Date.now() + MERGE_DEADLINE_MS`, a context with timeout, `withDeadlineAfter` or `set_deadline`. The draft has no deadline, so one stuck merge holds the push open.',
+        'The call is created with a 2 s deadline — `timeout=MERGE_DEADLINE_S`, `deadline: Date.now() + MERGE_DEADLINE_MS`, a context with timeout, `withDeadlineAfter` or `set_deadline`. The starter has no deadline, so one stuck merge holds the push open.',
       match: {
         python: {all: [/MERGE_DEADLINE_S\s*=\s*2\.0/, /timeout=MERGE_DEADLINE_S/]},
         typescript: {all: [/MERGE_DEADLINE_MS\s*=\s*2000/, /deadline:\s*Date\.now\(\)\s*\+\s*MERGE_DEADLINE_MS/]},
@@ -64,7 +64,7 @@ losing edit without telling anyone. The user sees a synced document; the other e
       id: 'bounded-retries',
       title: 'At most two attempts, only the two retryable codes',
       detail:
-        'Attempts are bounded by `MAX_MERGE_ATTEMPTS = 2` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The draft retries every failure forever.',
+        'Attempts are bounded by `MAX_MERGE_ATTEMPTS = 2` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The starter retries every failure forever.',
       match: {
         python: {
           all: [
@@ -112,7 +112,7 @@ losing edit without telling anyone. The user sees a synced document; the other e
       id: 'rejection-terminal',
       title: 'A merge rejection is terminal',
       detail:
-        '`FAILED_PRECONDITION` — the service’s "these revisions are not mergeable" — stops the retry loop instead of being retried. The draft treats every failure as retryable and loops forever on a rejection.',
+        '`FAILED_PRECONDITION` — the service’s "these revisions are not mergeable" — stops the retry loop instead of being retried. The starter treats every failure as retryable and loops forever on a rejection.',
       match: {
         python: {all: [/REJECTED\s*=\s*grpc\.StatusCode\.FAILED_PRECONDITION/, /error\.code\(\)\s*==\s*REJECTED/]},
         typescript: {all: [/REJECTED\s*=\s*grpc\.status\.FAILED_PRECONDITION/, /code === REJECTED/]},
@@ -125,7 +125,7 @@ losing edit without telling anyone. The user sees a synced document; the other e
       id: 'conflicted-retains-both',
       title: 'A failed merge keeps both revisions',
       detail:
-        'The failure path records a conflicted document that carries the local **and** the remote revision; nothing is discarded. The draft returns the winner it picked and never records a conflict.',
+        'The failure path records a conflicted document that carries the local **and** the remote revision; nothing is discarded. The starter returns the winner it picked and never records a conflict.',
       match: {
         python: {all: [/def conflicted\(/, /"conflicted"/, /\blocal\b/, /\bremote\b/]},
         typescript: {all: [/function conflicted\(/, /'conflicted'/, /local, remote/]},
@@ -138,7 +138,7 @@ losing edit without telling anyone. The user sees a synced document; the other e
       id: 'no-last-write-wins',
       title: 'No failure path resolves by upload time',
       detail:
-        'Nothing in the client compares upload times to pick a side: a merge failure is a conflict, not a winner. The draft compares `uploaded_at` and silently drops the losing edit.',
+        'Nothing in the client compares upload times to pick a side: a merge failure is a conflict, not a winner. The starter compares `uploaded_at` and silently drops the losing edit.',
       match: {
         python: {all: [/conflicted\(/], none: [/uploaded_at/]},
         typescript: {all: [/conflicted\(/], none: [/uploaded_at/]},
@@ -229,7 +229,7 @@ def three_way_merge(doc_id: str, base: dict, local: dict, remote: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Three-way merge: a model-generated draft that picks a winner when the call fails. */
+      starter: `/** Three-way merge: flawed code that picks a winner when the call fails. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -710,5 +710,5 @@ MergeOutcome threeWayMerge(
     'Retryability is a property of the status, not of "it threw". Capture the error, compare its code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, and stop the loop for `FAILED_PRECONDITION` — that code means the service already decided these revisions cannot be merged.',
     "A conflict is a value, not an exception: build the conflicted record with both revisions in it, persist it, and return it to the caller. If you find yourself comparing two timestamps, you are about to delete a user's work — the timestamp is only useful for showing the user which edit is newer, never for choosing which one survives.",
   ],
-  debrief: `The interview question is "what does a merge failure mean?" A generated client usually answers "somebody wins", because that keeps the happy path linear. But an infrastructure failure is not a merge decision: turning a timeout into last-write-wins converts a retryable dependency problem into permanent data loss, and it does so silently, with the sync reporting success. Three separate contracts are being checked. The deadline: an unbounded merge call holds a push worker and the device's connection for as long as the dependency is slow. The retry policy: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may succeed on a retry; \`FAILED_PRECONDITION\` is a decision, and a rejection loop burns the worker for nothing. The failure path: a conflicted document that carries both revisions is the only honest answer, and it is also what makes the user experience possible — show both, let a person choose or retype. Real systems add merge-service-side operation logs for text, a conflict inbox, and a policy for auto-merging the non-overlapping cases while still surfacing the overlapping ones.`,
+  debrief: `The interview question is "what does a merge failure mean?" The starter answers "somebody wins", because that keeps the happy path linear. But an infrastructure failure is not a merge decision: turning a timeout into last-write-wins converts a retryable dependency problem into permanent data loss, and it does so silently, with the sync reporting success. Three separate contracts are being checked. The deadline: an unbounded merge call holds a push worker and the device's connection for as long as the dependency is slow. The retry policy: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may succeed on a retry; \`FAILED_PRECONDITION\` is a decision, and a rejection loop burns the worker for nothing. The failure path: a conflicted document that carries both revisions is the only honest answer, and it is also what makes the user experience possible — show both, let a person choose or retype. Real systems add merge-service-side operation logs for text, a conflict inbox, and a policy for auto-merging the non-overlapping cases while still surfacing the overlapping ones.`,
 };

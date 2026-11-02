@@ -8,7 +8,7 @@ export const streamingCancelStep: Step = {
   focus: ['client', 'gateway', 'providers'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it streams the happy path correctly — connect,
+The starter is working code: it streams the happy path correctly — connect,
 receive chunks, write SSE frames — but it keeps paying the provider after the browser tab closes.
 Find the missing cancellation path, fix it, and prove the fix.
 
@@ -661,5 +661,5 @@ await app.listen({host: '0.0.0.0', port: 8443});
 `,
     },
   },
-  debrief: `The interview signal is **cancellation as a first-class path**, not an error path. Most candidates demo the happy stream and never ask what happens when the client disconnects; the reviewer wants to see that you know where the disconnect signal lives, how to propagate it to the provider, and why closing the socket is not enough. The trace to draw is client disconnect → handler notices → upstream RPC cancelled → output tokens stop → usage reflects what was actually generated. Real gateways also cap stream duration, send keep-alive comments through idle proxies, and use a provider that supports cancellation end to end.`,
+  debrief: `The interview signal is **cancellation as a first-class path**, not an error path. Most candidates demo the happy stream and never ask what happens when the client disconnects; the interviewer wants to see that you know where the disconnect signal lives, how to propagate it to the provider, and why closing the socket is not enough. The trace to draw is client disconnect → handler notices → upstream RPC cancelled → output tokens stop → usage reflects what was actually generated. Real gateways also cap stream duration, send keep-alive comments through idle proxies, and use a provider that supports cancellation end to end.`,
 };

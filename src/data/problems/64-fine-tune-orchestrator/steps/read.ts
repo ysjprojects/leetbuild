@@ -8,10 +8,10 @@ export const readStep: Step = {
   focus: ['readapi', 'eval', 'checkpoints'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated read handler: it looks up a job and
-returns its status. It compiles, it answers the dashboard, and it reports a job as successful the
-moment the trainer exits zero — even when the eval gate failed. Review it like the model owner, fix
-it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the read handler: it looks up a job and returns
+its status. It compiles, it answers the dashboard, and it reports a job as successful the moment the
+trainer exits zero — even when the eval gate failed. Debug it like the model owner, fix it, and
+prove the fix with the checks below.
 
 Implement \`GET /v1/finetune/jobs/{job_id}\`.
 
@@ -60,7 +60,7 @@ that serves any team's jobs leaks every tenant's runs to anyone who can guess an
       id: 'tenant-scope',
       title: 'Serves only the caller’s team',
       detail:
-        'The handler compares the job’s team with the authenticated team and answers **404** when they differ. The draft serves any team’s jobs.',
+        'The handler compares the job’s team with the authenticated team and answers **404** when they differ. The starter serves any team’s jobs.',
       match: {
         python: {all: [/job\["team"\] != x_team_id/, /status_code\s*=\s*404/]},
         typescript: {all: [/job\.team !== team/, /code\(\s*404\s*\)/]},
@@ -73,7 +73,7 @@ that serves any team's jobs leaks every tenant's runs to anyone who can guess an
       id: 'eval-gate',
       title: 'Reports the eval gate result',
       detail:
-        'The response carries the eval result (`eval.passed`). The draft hides the gate and returns only the exit code.',
+        'The response carries the eval result (`eval.passed`). The starter hides the gate and returns only the exit code.',
       match: {
         python: {all: [/"eval"/, /"passed"/]},
         typescript: {all: [/eval:/, /passed/]},
@@ -86,7 +86,7 @@ that serves any team's jobs leaks every tenant's runs to anyone who can guess an
       id: 'not-promotable',
       title: 'Exit-zero without a passing eval is not promotable',
       detail:
-        '`promotable` requires the run to be finished, the trainer to have exited zero **and** the eval gate to have passed. The draft calls every exit-zero run a success.',
+        '`promotable` requires the run to be finished, the trainer to have exited zero **and** the eval gate to have passed. The starter calls every exit-zero run a success.',
       match: {
         python: {all: [/promotable/, /exit_code/, /passed/]},
         typescript: {all: [/promotable/, /exitCode/, /passed/]},
@@ -99,7 +99,7 @@ that serves any team's jobs leaks every tenant's runs to anyone who can guess an
       id: 'budget-reconcile',
       title: 'Reconciles the spent budget with the reservation',
       detail:
-        'The response reports `reserved`, `spent` and `remaining` so `spent = reserved - remaining` holds against what Redis released. The draft reports neither the reservation nor the remainder.',
+        'The response reports `reserved`, `spent` and `remaining` so `spent = reserved - remaining` holds against what Redis released. The starter reports neither the reservation nor the remainder.',
       match: {
         python: {all: [/reserved/, /spent/, /remaining/]},
         typescript: {all: [/reserved/, /spent/, /remaining/]},
@@ -111,7 +111,7 @@ that serves any team's jobs leaks every tenant's runs to anyone who can guess an
   ],
   code: {
     python: {
-      starter: `"""GET /v1/finetune/jobs/{job_id}: a job view (model-generated draft)."""
+      starter: `"""GET /v1/finetune/jobs/{job_id}: a job view that trusts the exit code."""
 import logging
 
 from fastapi import FastAPI, Header
@@ -179,7 +179,7 @@ async def read_job(job_id: str, x_team_id: str = Header(...)) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/finetune/jobs/:jobId: a job view (model-generated draft). */
+      starter: `/** GET /v1/finetune/jobs/:jobId: a job view that trusts the exit code. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -223,7 +223,7 @@ app.get('/v1/finetune/jobs/:jobId', async (request, reply) => {
 `,
     },
     go: {
-      starter: `// Package read serves GET /v1/finetune/jobs/{id} (model-generated draft).
+      starter: `// Package read serves GET /v1/finetune/jobs/{id}: a job view that trusts the exit code.
 package read
 
 import (
@@ -337,7 +337,7 @@ object Read {
 `,
     },
     cpp: {
-      starter: `// GET /v1/finetune/jobs/{id} (model-generated draft).
+      starter: `// GET /v1/finetune/jobs/{id}: a job view that trusts the exit code.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -405,5 +405,5 @@ void RegisterRead(httplib::Server& svr, JobStore* jobs) {
     'The eval gate belongs in the answer: report its result and compute `promotable` from exit code zero **and** a passing eval — a run that finished but failed its golden set is trained, not promotable.',
     'Reconcile the budget in the response: `reserved`, `spent` and `remaining`, so the numbers agree with what the Redis layer released.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated read path against trust and honesty. The draft reads fine because the dashboard only ever asks for its own jobs and only ever shows finished ones. Four separate defects are being checked: the team scoping (404, not 403, for a foreign job), the eval gate that must be reported rather than hidden, the \`promotable\` computation that must combine the exit code with the eval result, and the budget reconciliation against the reservation. The quiet one is exit-zero-as-success: a trainer can exit zero on a run whose eval failed, and a registry that promotes on exit code alone ships a model nobody validated. Real systems also expose the checkpoint lineage so a run can be reproduced and its restarts explained.`,
+  debrief: `The interviewer is testing whether you can debug a read path against trust and honesty. The starter reads fine because the dashboard only ever asks for its own jobs and only ever shows finished ones. Four separate defects are being checked: the team scoping (404, not 403, for a foreign job), the eval gate that must be reported rather than hidden, the \`promotable\` computation that must combine the exit code with the eval result, and the budget reconciliation against the reservation. The quiet one is exit-zero-as-success: a trainer can exit zero on a run whose eval failed, and a registry that promotes on exit code alone ships a model nobody validated. Real systems also expose the checkpoint lineage so a run can be reproduced and its restarts explained.`,
 };

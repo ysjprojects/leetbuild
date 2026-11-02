@@ -8,9 +8,10 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes a \`session.event\` for every
-session change so audit and analytics can consume it. It compiles, it serves the demo, and it hides three
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it publishes a \`session.event\` for every
+session change so audit and analytics can consume it. It compiles, it serves the demo, and it hides
+three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
+below.
 
 Implement \`emit_session_event\` against the \`session.event\` topic.
 
@@ -41,7 +42,7 @@ the store disagree, which is the bug audit teams spend a week chasing.`,
     ],
   },
   hints: [
-    'What has to be true before a consumer sees the event? The draft announces the session before the store has it.',
+    'What has to be true before a consumer sees the event? The starter announces the session before the store has it.',
     'The topic is retained and replicated. Which field in the payload would you never want a future reader to have?',
     'A produce can fail. Where does the event go so it is not lost, and what makes the retry safe to publish twice?',
   ],
@@ -50,7 +51,7 @@ the store disagree, which is the bug audit teams spend a week chasing.`,
       id: 'user-key',
       title: 'Keys the event by user id',
       detail:
-        'The record key is the `user_id`, so one user’s events share a partition and keep their order. The draft keys by `session_id`, so a user’s history scatters.',
+        'The record key is the `user_id`, so one user’s events share a partition and keep their order. The starter keys by `session_id`, so a user’s history scatters.',
       match: {
         python: {all: [/key\s*=\s*user_id/]},
         typescript: {all: [/key\s*:\s*userId/]},
@@ -63,7 +64,7 @@ the store disagree, which is the bug audit teams spend a week chasing.`,
       id: 'hashed-token',
       title: 'Publishes a token hash and the device class',
       detail:
-        'The payload carries `token_hash` and `device_class`, so the event is useful without carrying the credential. The draft publishes the raw `token`.',
+        'The payload carries `token_hash` and `device_class`, so the event is useful without carrying the credential. The starter publishes the raw `token`.',
       match: {
         python: {all: [/token_hash/, /device_class/]},
         typescript: {all: [/token_hash/, /device_class/]},
@@ -76,7 +77,7 @@ the store disagree, which is the bug audit teams spend a week chasing.`,
       id: 'record-first',
       title: 'Commits the session record before producing the event',
       detail:
-        'The record commit happens before the produce in the source, so a consumer cannot observe a session the store has not committed. The draft produces first.',
+        'The record commit happens before the produce in the source, so a consumer cannot observe a session the store has not committed. The starter produces first.',
       match: {
         python: {order: [/store\.commit\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.commit\(/, /producer\.send\(/]},
@@ -89,7 +90,7 @@ the store disagree, which is the bug audit teams spend a week chasing.`,
       id: 'outbox',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A failed produce lands in the `outbox` so the event can be replayed later. The draft lets the produce failure disappear.',
+        'A failed produce lands in the `outbox` so the event can be replayed later. The starter lets the produce failure disappear.',
       match: {
         python: {all: [/outbox\.add\(/]},
         typescript: {all: [/outbox\.add\(/]},
@@ -102,7 +103,7 @@ the store disagree, which is the bug audit teams spend a week chasing.`,
       id: 'idempotent-producer',
       title: 'Runs an idempotent producer with acks',
       detail:
-        'The producer enables `enable.idempotence` and sets `acks` so a retry cannot duplicate the event. The draft uses default producer settings.',
+        'The producer enables `enable.idempotence` and sets `acks` so a retry cannot duplicate the event. The starter uses default producer settings.',
       match: {
         python: {all: [/enable\.idempotence/, /acks/]},
         typescript: {all: [/idempotent\s*:\s*true/]},
@@ -450,5 +451,5 @@ void emit_session_event(RdKafka::Producer& producer, const std::string& session_
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated event path for ordering, secrecy and durability. Three defects are being checked: keying by session id instead of user id scatters one user's history and breaks per-user ordering; publishing the raw token puts a credential in a retained, replicated topic; and producing before the record commit — or dropping a rejected produce — leaves the topic and the store disagreeing. The habits to name out loud are: choose the partition key by what needs to stay ordered, keep credentials out of any topic or log line, make the store the source of truth before you announce a change, and give a failed produce a durable home. Real systems add an outbox relay with its own retry and dedupe, a schema registry so a future producer cannot smuggle content in, and a consumer that updates counters before committing its offset.`,
+  debrief: `The interviewer is testing whether you can debug an event path for ordering, secrecy and durability. Three defects are being checked: keying by session id instead of user id scatters one user's history and breaks per-user ordering; publishing the raw token puts a credential in a retained, replicated topic; and producing before the record commit — or dropping a rejected produce — leaves the topic and the store disagreeing. The habits to name out loud are: choose the partition key by what needs to stay ordered, keep credentials out of any topic or log line, make the store the source of truth before you announce a change, and give a failed produce a durable home. Real systems add an outbox relay with its own retry and dedupe, a schema registry so a future producer cannot smuggle content in, and a consumer that updates counters before committing its offset.`,
 };

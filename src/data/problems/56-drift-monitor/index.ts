@@ -7,11 +7,11 @@ import {driftEventsStep} from './steps/4-events';
 import {monitorReportStep} from './steps/5-read';
 
 /**
- * Drift monitor on the AI-era track: the course is not "compute a distance between two histograms",
- * it is the review you owe a model-generated drift detector before it is trusted to page a human.
- * Validated, idempotent monitor registration → windowed sketches merged by one atomic script, with a
- * frozen baseline → alert calls that carry their evidence, deduplicated per (monitor, window) →
- * monitor-keyed history with an outbox → a report that calls out insufficient data.
+ * Drift monitor: the course is not "compute a distance between two histograms", it is the
+ * debugging you owe a drift detector before it is trusted to page a human. Validated, idempotent
+ * monitor registration → windowed sketches merged by one atomic script, with a frozen baseline →
+ * alert calls that carry their evidence, deduplicated per (monitor, window) → monitor-keyed history
+ * with an outbox → a report that calls out insufficient data.
  */
 export const driftMonitorProblem: Problem = {
   id: 'drift-monitor',
@@ -19,7 +19,7 @@ export const driftMonitorProblem: Problem = {
   tagline: 'Detect input and outcome drift before users notice, without crying wolf.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Drift Monitor
 
@@ -67,12 +67,12 @@ One service, **driftd**, with five pieces:
 5. \`GET /v1/monitors/{id}/report\`: the distance with its sample counts and baseline window, an
    explicit \`insufficient_data\` state below the sample floor, and a **404** for a foreign monitor.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -7,12 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Distillation pipeline on the AI-era track: the course is not "call a teacher model", it is the
- * review you owe a model-generated pipeline before its output becomes a student's training set.
- * A budgeted, idempotent job → an atomic Redis budget plus counters → teacher calls with a deadline,
- * bounded retries and refusals that are recorded → dataset-keyed sample events behind a dedupe
- * filter with an outbox → an acceptance report that reconciles its own counters and distrusts a
- * rate that looks too good.
+ * Distillation pipeline: the course is not "call a teacher model", it is the debugging you owe a
+ * pipeline before its output becomes a student's training set. A budgeted, idempotent job → an
+ * atomic Redis budget plus counters → teacher calls with a deadline, bounded retries and refusals
+ * that are recorded → dataset-keyed sample events behind a dedupe filter with an outbox → an
+ * acceptance report that reconciles its own counters and distrusts a rate that looks too good.
  */
 export const distillationPipelineProblem: Problem = {
   id: 'distillation-pipeline',
@@ -20,7 +19,7 @@ export const distillationPipelineProblem: Problem = {
   tagline: 'Generate teacher outputs, filter them, and prove a student can learn from the survivors.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Distillation Pipeline
 
@@ -61,12 +60,12 @@ One service, **distilld**, with five pieces:
    rejection reasons, an explicit reconciliation of the three counts, and a flag — not a clean bill
    of health — when the acceptance rate is above 95 percent.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
+failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

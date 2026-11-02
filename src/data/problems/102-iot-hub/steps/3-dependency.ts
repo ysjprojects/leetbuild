@@ -8,13 +8,12 @@ export const dependencyStep: Step = {
   focus: ['hub', 'gateway', 'device'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it delivers to a healthy
-device, the gateway answers, the demo records a door unlocking, and nothing looks wrong. It hides
-three flaws. It retries an offline device every second until a reply looks like success, so a device
-that stays offline for days is poked forever; it carries no deadline and no attempt cap and never
-looks at the command’s validity window; and it reports the command delivered the moment the gateway
-accepts the enqueue. Review it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter is working code: it delivers to a healthy device, the gateway
+answers, the demo records a door unlocking, and nothing looks wrong. It hides three flaws. It
+retries an offline device every second until a reply looks like success, so a device that stays
+offline for days is poked forever; it carries no deadline and no attempt cap and never looks at the
+command’s validity window; and it reports the command delivered the moment the gateway accepts the
+enqueue. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 The hub reaches devices through a **device gateway** over gRPC. An online device gets the command
 pushed to it and answers with an acknowledgment; an offline device’s command waits in the gateway’s
@@ -66,16 +65,16 @@ demo where the device is always online and acknowledges in milliseconds.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the delivery call itself (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)`, `set_deadline`) — a channel option is not a per-call deadline. The draft carries none, so one silent gateway pins the hub’s worker for as long as it stays silent.',
+    'The deadline is an argument on the delivery call itself (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)`, `set_deadline`) — a channel option is not a per-call deadline. The starter carries none, so one silent gateway pins the hub’s worker for as long as it stays silent.',
     'A command is only meaningful inside its window: put `expires_at_ms` on the request and make the retry loop’s condition `now < expires_at`. The gateway queues for an offline device only until that instant and then drops the command (`EXPIRED`), so a loop that ignores the window is spending gateway capacity on a command that can no longer run.',
-    '“Delivered” is the device’s acknowledgment: return `True` on `DELIVERED` and never on the gateway accepting the enqueue — the draft’s `accepted` shortcut records a door as unlocked that never was. Gate the loop on the retryable codes (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) with a `MAX_ATTEMPTS = 3` cap, so every other failure exits instead of spinning once a second.',
+    '“Delivered” is the device’s acknowledgment: return `True` on `DELIVERED` and never on the gateway accepting the enqueue — the starter’s `accepted` shortcut records a door as unlocked that never was. Gate the loop on the retryable codes (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) with a `MAX_ATTEMPTS = 3` cap, so every other failure exits instead of spinning once a second.',
   ],
   checks: [
     {
       id: 'deadline',
       title: 'Every delivery attempt carries a 5 s deadline',
       detail:
-        'The `Deliver` call is created with a **5 s** deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)` or `set_deadline`. Without one a gateway that never answers holds the hub’s delivery worker open indefinitely; the draft calls `Deliver` with no deadline at all.',
+        'The `Deliver` call is created with a **5 s** deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)` or `set_deadline`. Without one a gateway that never answers holds the hub’s delivery worker open indefinitely; the starter calls `Deliver` with no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*5/, /timeout=DEADLINE_S/, /\.Deliver\(/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.Deliver\(/]},
@@ -88,7 +87,7 @@ demo where the device is always online and acknowledges in milliseconds.`,
       id: 'bounded-retry',
       title: 'Attempts are capped and stop at the validity window',
       detail:
-        '`MAX_ATTEMPTS = 3` caps the attempts and the loop condition also stops at the command’s `expires_at`, so a device that stays offline is not retried past the window. The draft’s `while True` has no cap and never looks at the window.',
+        '`MAX_ATTEMPTS = 3` caps the attempts and the loop condition also stops at the command’s `expires_at`, so a device that stays offline is not retried past the window. The starter’s `while True` has no cap and never looks at the window.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*3/, /attempts\s*<\s*MAX_ATTEMPTS/, /time\.time\(\)\s*<\s*command\.expires_at/],
@@ -124,7 +123,7 @@ demo where the device is always online and acknowledges in milliseconds.`,
       id: 'offline-queue-until-expiry',
       title: 'An offline device’s command expires with its window',
       detail:
-        'The command’s validity window travels with the request (`expires_at_ms` / `expiresAtMs` / `ExpiresAtMs`) and the gateway’s `EXPIRED` outcome is handled: a command whose window closed is dropped by the queue and never delivered late or retried. The draft never sends the window, never checks it, and pokes the gateway on a fixed one-second timer instead.',
+        'The command’s validity window travels with the request (`expires_at_ms` / `expiresAtMs` / `ExpiresAtMs`) and the gateway’s `EXPIRED` outcome is handled: a command whose window closed is dropped by the queue and never delivered late or retried. The starter never sends the window, never checks it, and pokes the gateway on a fixed one-second timer instead.',
       match: {
         python: {all: [/expires_at_ms=int\(command\.expires_at/, /DeliverReply\.EXPIRED/], none: [/time\.sleep\(/]},
         typescript: {
@@ -146,7 +145,7 @@ demo where the device is always online and acknowledges in milliseconds.`,
       id: 'ack-required',
       title: 'Delivered means the device acknowledged it',
       detail:
-        '`DELIVERED` — the device’s acknowledgment — is the only reply that counts as delivered. The gateway accepting the enqueue (`accepted` / `Accepted`) is not delivery: returning on it records a door as unlocked that never was. The draft returns success the moment the gateway accepts the enqueue.',
+        '`DELIVERED` — the device’s acknowledgment — is the only reply that counts as delivered. The gateway accepting the enqueue (`accepted` / `Accepted`) is not delivery: returning on it records a door as unlocked that never was. The starter returns success the moment the gateway accepts the enqueue.',
       match: {
         python: {all: [/reply\.status\s*==\s*gateway_pb2\.DeliverReply\.DELIVERED/], none: [/reply\.accepted/]},
         typescript: {all: [/reply\.status\s*===\s*DeliverStatus\.DELIVERED/], none: [/reply\.accepted/]},
@@ -159,7 +158,7 @@ demo where the device is always online and acknowledges in milliseconds.`,
       id: 'no-infinite-retry',
       title: 'No unbounded retry: only the retryable codes are retried',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retryable, gated by a `RETRYABLE` set (a `retryable` predicate in Go and C++), so a permanent failure exits instead of spinning. There is no `while True` / `for (;;)` loop and no one-second sleep hammering the gateway for an offline device; the draft retries every failure forever.',
+        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retryable, gated by a `RETRYABLE` set (a `retryable` predicate in Go and C++), so a permanent failure exits instead of spinning. There is no `while True` / `for (;;)` loop and no one-second sleep hammering the gateway for an offline device; the starter retries every failure forever.',
       match: {
         python: {all: [/RETRYABLE\s*=\s*\{/, /not\s+in\s+RETRYABLE/], none: [/while\s+True/, /time\.sleep\(/]},
         typescript: {
@@ -265,7 +264,7 @@ def deliver(command) -> bool:
 `,
     },
     typescript: {
-      starter: `/** Device gateway client: a model-generated draft that retries an offline device forever. */
+      starter: `/** Device gateway client: flawed code that retries an offline device forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -625,5 +624,5 @@ bool deliver(DeviceGateway::Stub* gateway, const Command& command) {
 `,
     },
   },
-  debrief: `The interviewer is probing one question under many names: when is a command actually delivered, and what happens when it cannot be? The 5-second deadline bounds one attempt, \`MAX_ATTEMPTS\` plus the validity window bound the whole delivery, and the retryable set decides which failures are even worth another attempt. The window is what makes an offline device safe: the gateway queues only until it closes and then drops the command, so a hub that keeps retrying is doing work for a command that can no longer run. The acknowledgment is the correctness answer — the gateway accepting an enqueue means only that the queue took the command, and a door that never unlocked must never be recorded as unlocked. The draft looks fine because a device on a lab bench is always online and acknowledges in milliseconds. Real hubs add per-device backpressure, replay from an outbox when the gateway itself is unreachable, and a reconciliation sweep that expires stale commands the queue never delivered.`,
+  debrief: `The interviewer is probing one question under many names: when is a command actually delivered, and what happens when it cannot be? The 5-second deadline bounds one attempt, \`MAX_ATTEMPTS\` plus the validity window bound the whole delivery, and the retryable set decides which failures are even worth another attempt. The window is what makes an offline device safe: the gateway queues only until it closes and then drops the command, so a hub that keeps retrying is doing work for a command that can no longer run. The acknowledgment is the correctness answer — the gateway accepting an enqueue means only that the queue took the command, and a door that never unlocked must never be recorded as unlocked. The starter looks fine because a device on a lab bench is always online and acknowledges in milliseconds. Real hubs add per-device backpressure, replay from an outbox when the gateway itself is unreachable, and a reconciliation sweep that expires stale commands the queue never delivered.`,
 };

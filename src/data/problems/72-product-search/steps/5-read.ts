@@ -8,26 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'read', 'catalog', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it looks the product up, caches
+**Starting point.** The starter is working code: it looks the product up, caches
 it in a process dictionary, and returns the price. It compiles, it answers the demo, and it hides
-three production flaws. Review it like the service owner, fix it, and prove the fix with the checks
+three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`GET /v1/products/{id}\` with the authenticated \`X-Tenant-Id\` header.
 
 - The document is read through the catalog snapshot for the **caller's tenant** (\`snapshot(tenant, id)\`),
-  and a product that is not in that tenant's catalog is **404**. The draft ignores the tenant and
+  and a product that is not in that tenant's catalog is **404**. The starter ignores the tenant and
   serves any product id from a shared process cache.
 - The response reports the document's **own** price version (\`price_version\` / \`priceVersion\`), not
-  a constant. The draft answers \`price_version: "latest"\` while the price it returns may be old —
+  a constant. The starter answers \`price_version: "latest"\` while the price it returns may be old —
   the version must describe the value beside it.
 - The document carries its **index version** and its index timestamp; the response is refused
   (**409**) when the snapshot is more than **5 minutes** behind (\`MAX_INDEX_LAG_MS = 300000\`,
-  \`snapshot_ms - index_ms > MAX_INDEX_LAG_MS\`). The draft caches until the process restarts and has
+  \`snapshot_ms - index_ms > MAX_INDEX_LAG_MS\`). The starter caches until the process restarts and has
   no bound at all, so a price change may never appear.
 - Log the refusal, not the price history: a stale document is an operations signal.
 
-**Failure mode the checks target.** A read path is where staleness becomes a lie. The draft's cache
+**Failure mode the checks target.** A read path is where staleness becomes a lie. The starter's cache
 has no version and no expiry, so it serves whatever it saw first; its \`price_version\` is a constant,
 so a caller that trusts the version trusts nothing; and it is keyed by product id alone, so a
 cross-tenant read is one id away. The fix ties the response to the document it actually returns:
@@ -62,7 +62,7 @@ loudly instead of serving a price the catalog has moved past.`,
       id: 'version-reported',
       title: "Reports the document's own price version",
       detail:
-        'The response carries the version of the price it returns, never a constant. The draft answers `price_version: "latest"` while serving a cached value, so a caller that trusts the version is misled.',
+        'The response carries the version of the price it returns, never a constant. The starter answers `price_version: "latest"` while serving a cached value, so a caller that trusts the version is misled.',
       match: {
         python: {all: [/price_version/], none: [/latest/i]},
         typescript: {all: [/priceVersion/], none: [/latest/i]},
@@ -75,7 +75,7 @@ loudly instead of serving a price the catalog has moved past.`,
       id: 'staleness-bound',
       title: 'Enforces the five-minute index lag bound',
       detail:
-        'A document whose index timestamp trails the snapshot by more than `MAX_INDEX_LAG_MS = 300000` is refused (409). The draft caches until the process restarts and has no bound, so a price change may never appear.',
+        'A document whose index timestamp trails the snapshot by more than `MAX_INDEX_LAG_MS = 300000` is refused (409). The starter caches until the process restarts and has no bound, so a price change may never appear.',
       match: {
         python: {all: [/MAX_INDEX_LAG_MS\s*=\s*300000/, /stale/]},
         typescript: {all: [/MAX_INDEX_LAG_MS\s*=\s*300000/, /stale/]},
@@ -88,7 +88,7 @@ loudly instead of serving a price the catalog has moved past.`,
       id: 'tenant-scope',
       title: 'Scopes the read to the tenant, 404 for a foreign id',
       detail:
-        "The document is read for the caller's tenant and a product id outside that catalog is **404**. The draft keys a process cache by product id alone, so any tenant can read any product that was cached once.",
+        "The document is read for the caller's tenant and a product id outside that catalog is **404**. The starter keys a process cache by product id alone, so any tenant can read any product that was cached once.",
       match: {
         python: {all: [/tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/tenant/, /code\(\s*404\s*\)/]},
@@ -101,7 +101,7 @@ loudly instead of serving a price the catalog has moved past.`,
       id: 'index-version-check',
       title: 'Compares the document index version against the snapshot',
       detail:
-        "The read carries the document's index version and compares it with the current catalog snapshot before answering. The draft has neither, so there is nothing to compare and nothing to refuse.",
+        "The read carries the document's index version and compares it with the current catalog snapshot before answering. The starter has neither, so there is nothing to compare and nothing to refuse.",
       match: {
         python: {all: [/index_version/, /snapshot/]},
         typescript: {all: [/indexVersion/, /snapshot/]},
@@ -138,8 +138,8 @@ def read_product(
     product_id: str,
     tenant: str = Header(default="", alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft serves the document from a process-lifetime cache, reports the latest price
-    # version while the price is stale, and returns any tenant's product by id. Review all three.
+    # TODO: this starter serves the document from a process-lifetime cache, reports the latest price
+    # version while the price is stale, and returns any tenant's product by id. Fix all three.
     document = CACHE.get(product_id)
     if document is None:
         document = catalog.fetch(tenant, product_id)
@@ -201,7 +201,7 @@ def read_product(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/products/:id: a model-generated draft with a process-lifetime cache. */
+      starter: `/** GET /v1/products/:id: flawed code with a process-lifetime cache. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -219,8 +219,8 @@ const catalog: Catalog = {
 };
 
 app.get('/v1/products/:id', async (request, reply) => {
-  // TODO: this draft serves the document from a process-lifetime cache, reports the latest price
-  // version while the price is stale, and returns any tenant's product by id. Review all three.
+  // TODO: this starter serves the document from a process-lifetime cache, reports the latest price
+  // version while the price is stale, and returns any tenant's product by id. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const {id} = request.params as {id: string};
   let document = CACHE[id];
@@ -287,8 +287,8 @@ func catalogFetch(tenant, id string) map[string]any {
 }
 
 func readProduct(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves the document from a process-lifetime cache, reports the latest price
-	// version while the price is stale, and returns any tenant's product by id. Review all three.
+	// TODO: this starter serves the document from a process-lifetime cache, reports the latest price
+	// version while the price is stale, and returns any tenant's product by id. Fix all three.
 	tenant := r.Header.Get("X-Tenant-Id")
 	id := r.PathValue("id")
 	document, ok := productCache[id]
@@ -395,7 +395,7 @@ object ProductRead {
     path("v1" / "products" / Segment) { productId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this draft serves the document from a process-lifetime cache, reports the latest
+          // TODO: this starter serves the document from a process-lifetime cache, reports the latest
           // price version while the price is stale, and returns any tenant's product by id.
           val document = cache.getOrElseUpdate(productId, catalogFetch(tenant, productId))
           complete(StatusCodes.OK, s"""{"id":"\${document("id")}","price":\${document("price")},"price_version":"latest"}""")
@@ -477,8 +477,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/products/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves the document from a process-lifetime cache, reports the latest price
-    // version while the price is stale, and returns any tenant's product by id. Review all three.
+    // TODO: this starter serves the document from a process-lifetime cache, reports the latest price
+    // version while the price is stale, and returns any tenant's product by id. Fix all three.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const std::string id = req.matches[1];
     auto it = productCache.find(id);

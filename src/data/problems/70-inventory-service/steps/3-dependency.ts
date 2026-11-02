@@ -36,7 +36,7 @@ same confirmation, a retry that mints a fresh id is a second reservation for the
 - Return the outcome (\`CONFIRMED\` / \`REJECTED\` / \`PENDING\`) so the caller can tell a pending retry
   from a terminal rejection.
 
-**Failure mode the checks target.** The draft reads a deadline as a rejection: it releases the hold
+**Failure mode the checks target.** The starter reads a deadline as a rejection: it releases the hold
 when the warehouse is merely slow, so a valid sale is cancelled and the units go to the next buyer,
 and it retries with a fresh \`uuid()\`, so the warehouse books a second reservation for units it
 already holds. Its rejection path releases without looking at the reservation status, so a replayed
@@ -109,7 +109,7 @@ never enters any of those paths.`,
       id: 'timeout-pending',
       title: 'A timeout leaves the reservation pending — never releases the hold',
       detail:
-        '`DEADLINE_EXCEEDED` / `UNAVAILABLE` records the reservation as `pending` and returns **`PENDING`**, with the hold left alone: the confirmation may still arrive. The draft calls `release` from the timeout branch, so a slow warehouse silently loses a valid sale.',
+        '`DEADLINE_EXCEEDED` / `UNAVAILABLE` records the reservation as `pending` and returns **`PENDING`**, with the hold left alone: the confirmation may still arrive. The starter calls `release` from the timeout branch, so a slow warehouse silently loses a valid sale.',
       match: {
         python: {
           all: [/StatusCode\.DEADLINE_EXCEEDED/, /return PENDING/, /['"]pending['"]/],
@@ -142,7 +142,7 @@ never enters any of those paths.`,
       id: 'retry-same-id',
       title: 'Retries once with the same reservation id',
       detail:
-        'At most **`MAX_CONFIRM_ATTEMPTS = 2`** attempts, and every attempt puts the caller’s `reservation_id` into the request — the retry never mints a fresh id (`uuid`, `randomUUID`, `uuid.NewString`, `UUID.randomUUID`), because the warehouse dedupes on that id. The draft retries once with a new id and double-reserves.',
+        'At most **`MAX_CONFIRM_ATTEMPTS = 2`** attempts, and every attempt puts the caller’s `reservation_id` into the request — the retry never mints a fresh id (`uuid`, `randomUUID`, `uuid.NewString`, `UUID.randomUUID`), because the warehouse dedupes on that id. The starter retries once with a new id and double-reserves.',
       match: {
         python: {
           all: [/MAX_CONFIRM_ATTEMPTS\s*=\s*2/, /range\(MAX_CONFIRM_ATTEMPTS\)/, /reservation_id\s*=\s*reservation_id/],
@@ -183,7 +183,7 @@ never enters any of those paths.`,
       id: 'release-once',
       title: 'Releases the hold exactly once, guarded by the reservation status',
       detail:
-        'The rejection path releases only while the reservation is still `reserved` — `if reservation.status == "reserved"` → release the hold → record `released` — so a replayed confirmation is a no-op instead of a second release. The draft releases unconditionally, from both the rejection and the timeout branch.',
+        'The rejection path releases only while the reservation is still `reserved` — `if reservation.status == "reserved"` → release the hold → record `released` — so a replayed confirmation is a no-op instead of a second release. The starter releases unconditionally, from both the rejection and the timeout branch.',
       match: {
         python: {
           all: [/REJECTED/, /release_hold\(redis,/, /['"]reserved['"]/],
@@ -211,7 +211,7 @@ never enters any of those paths.`,
       id: 'status-model',
       title: 'Records and reports the reservation status',
       detail:
-        'All four states are written through the reservation record — `reserved` → `pending` on a timeout, `confirmed` on acceptance, `released` after the hold is given back — and the return reports `PENDING` / `REJECTED` / `CONFIRMED` so the caller can tell a pending retry from a terminal rejection. The draft only ever records `confirmed` or `released` and answers `REJECTED` for a timeout.',
+        'All four states are written through the reservation record — `reserved` → `pending` on a timeout, `confirmed` on acceptance, `released` after the hold is given back — and the return reports `PENDING` / `REJECTED` / `CONFIRMED` so the caller can tell a pending retry from a terminal rejection. The starter only ever records `confirmed` or `released` and answers `REJECTED` for a timeout.',
       match: {
         python: {
           all: [/['"]reserved['"]/, /['"]pending['"]/, /['"]confirmed['"]/, /['"]released['"]/, /return PENDING/],
@@ -245,7 +245,7 @@ never enters any of those paths.`,
   ],
   code: {
     python: {
-      starter: `"""Warehouse confirmation: the model-generated draft releases the hold when the warehouse is slow."""
+      starter: `"""Warehouse confirmation: the starter releases the hold when the warehouse is slow."""
 
 import uuid
 
@@ -339,7 +339,7 @@ def confirm(store, redis, reservation_id: str, sku: str, quantity: int) -> str:
 `,
     },
     typescript: {
-      starter: `/** Warehouse confirmation: the model-generated draft releases the hold when the warehouse is slow. */
+      starter: `/** Warehouse confirmation: the starter releases the hold when the warehouse is slow. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {randomUUID} from 'node:crypto';

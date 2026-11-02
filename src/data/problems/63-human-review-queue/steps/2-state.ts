@@ -8,10 +8,10 @@ export const stateStep: Step = {
   focus: ['queue', 'redis', 'items'],
   task: `## Task
 
-**Review premise.** The starter pops the next item and stamps a deadline. It works on the demo
+**Starting point.** The starter pops the next item and stamps a deadline. It works on the demo
 because no reviewer ever closes the tab mid-item and every server sits in one region. It strands work
 the moment a reviewer crashes and it misjudges breaches the moment two regions' clocks disagree.
-Review it, fix it, and prove the fix with the checks below.
+Debug it, fix it, and prove the fix with the checks below.
 
 Implement the assignment path over **Redis**, plus the sweeper that returns abandoned items:
 
@@ -34,7 +34,7 @@ Implement the assignment path over **Redis**, plus the sweeper that returns aban
 - \`mark_breached(tenant, item_id)\` records the breach so the queue read and the events path can see
   it — a breached item is *visible as breached*, never silently just "first".
 
-**Failure mode the checks target.** The draft pops with no lease at all, so a crashed reviewer leaves
+**Failure mode the checks target.** The starter pops with no lease at all, so a crashed reviewer leaves
 an item assigned to nobody and it never comes back. And it computes the deadline from the server's
 wall clock, so a region whose clock runs fast marks honest items breached and one that runs slow
 hides real breaches.`,
@@ -56,7 +56,7 @@ hides real breaches.`,
       id: 'lease',
       title: 'Assignment takes a lease with a TTL',
       detail:
-        '`assign_item` writes the lease for `LEASE_SECONDS` (NX + PX) and tracks the id as assigned. The draft assigns with no lease.',
+        '`assign_item` writes the lease for `LEASE_SECONDS` (NX + PX) and tracks the id as assigned. The starter assigns with no lease.',
       match: {
         python: {all: [/def assign_item\(/, /LEASE_SECONDS/]},
         typescript: {all: [/function assignItem\(/, /LEASE_SECONDS/]},
@@ -69,7 +69,7 @@ hides real breaches.`,
       id: 'lease-expiry',
       title: 'Expired leases return the item to the queue',
       detail:
-        '`reclaim_expired` finds assigned items whose lease expired and calls `requeue` on them. The draft leaves them assigned forever.',
+        '`reclaim_expired` finds assigned items whose lease expired and calls `requeue` on them. The starter leaves them assigned forever.',
       match: {
         python: {all: [/def reclaim_expired\(/, /requeue\(/]},
         typescript: {all: [/function reclaimExpired\(/, /requeue\(/]},
@@ -82,7 +82,7 @@ hides real breaches.`,
       id: 'monotonic',
       title: 'SLA deadline comes from a monotonic clock',
       detail:
-        'The deadline is computed from a monotonic time source against a per-priority `SLA_SECONDS` table — `time.monotonic`, `performance.now`, `time.Since`, `System.nanoTime` or `steady_clock`. The draft uses the wall clock.',
+        'The deadline is computed from a monotonic time source against a per-priority `SLA_SECONDS` table — `time.monotonic`, `performance.now`, `time.Since`, `System.nanoTime` or `steady_clock`. The starter uses the wall clock.',
       match: {
         python: {all: [/time\.monotonic\(/, /SLA_SECONDS/]},
         typescript: {all: [/performance\.now\(/, /SLA_SECONDS/]},
@@ -95,7 +95,7 @@ hides real breaches.`,
       id: 'breach-marker',
       title: 'A breached item is recorded as breached',
       detail:
-        'An item past its SLA is recorded as **breached** (`mark_breached`), so the queue read and the event path see it. The draft reorders silently.',
+        'An item past its SLA is recorded as **breached** (`mark_breached`), so the queue read and the event path see it. The starter reorders silently.',
       match: {
         python: {all: [/def mark_breached\(/, /breached/]},
         typescript: {all: [/function markBreached\(/, /breached/]},
@@ -108,7 +108,7 @@ hides real breaches.`,
       id: 'priority-order',
       title: 'The next item is chosen in priority order',
       detail:
-        '`next_item` walks `p1`, `p2`, `p3` in order and takes the first non-empty list. The draft pops one list in insertion order.',
+        '`next_item` walks `p1`, `p2`, `p3` in order and takes the first non-empty list. The starter pops one list in insertion order.',
       match: {
         python: {all: [/PRIORITY_ORDER/, /def next_item\(/]},
         typescript: {all: [/PRIORITY_ORDER/, /function nextItem\(/]},
@@ -148,9 +148,9 @@ def take_next(
     tenant: str = Header(alias="X-Tenant-Id"),
     reviewer: str = Header(alias="X-Reviewer-Id"),
 ) -> JSONResponse:
-    # TODO: this draft pops the next item with no lease, so a reviewer who crashes strands the item
+    # TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the item
     # forever, and it stamps a wall-clock deadline that drifts minutes per day between regions.
-    # Review both.
+    # Fix both.
     item = queue.pop(tenant)
     queue.assign(tenant, item["item_id"], reviewer)
     deadline = time.time() + SLA_MINUTES[item["priority"]] * 60
@@ -253,7 +253,7 @@ def take_next(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items/next: a model-generated draft that assigns without a lease. */
+      starter: `/** POST /v1/review/items/next: flawed code that assigns without a lease. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -263,9 +263,9 @@ const SLA_MINUTES: Record<string, number> = {p1: 5, p2: 15, p3: 60};
 const lists = new Map<string, string[]>();
 
 app.post('/v1/review/items/next', async (request, reply) => {
-  // TODO: this draft pops the next item with no lease, so a reviewer who crashes strands the item
+  // TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the item
   // forever, and it stamps a wall-clock deadline that drifts minutes per day between regions.
-  // Review both.
+  // Fix both.
   const tenant = request.headers['x-tenant-id'] as string;
   const reviewer = request.headers['x-reviewer-id'] as string;
   const queue = lists.get(\`review:queue:\${tenant}:p1\`) ?? [];
@@ -376,9 +376,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func takeNext(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	reviewer := r.Header.Get("X-Reviewer-Id")
-	// TODO: this draft pops the next item with no lease, so a reviewer who crashes strands the
+	// TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the
 	// item forever, and it stamps a wall-clock deadline that drifts minutes per day between
-	// regions. Review both.
+	// regions. Fix both.
 	key := "review:queue:" + tenant + ":p1"
 	list := queues[key]
 	if len(list) == 0 {
@@ -524,8 +524,8 @@ object Api {
   def route: Route =
     path("v1" / "review" / "items" / "next") {
       post {
-        // TODO: this draft pops the next item with no lease, so a reviewer who crashes strands the
-        // item forever, and it stamps a wall-clock deadline that drifts between regions. Review both.
+        // TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the
+        // item forever, and it stamps a wall-clock deadline that drifts between regions. Fix both.
         headerValueByName("X-Tenant-Id") { tenant =>
           headerValueByName("X-Reviewer-Id") { reviewer =>
             Queue.pop(tenant) match {
@@ -634,8 +634,8 @@ int main() {
   httplib::Server svr;
   svr.Post("/v1/review/items/next", [](const httplib::Request& req, httplib::Response& res) {
     auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: this draft pops the next item with no lease, so a reviewer who crashes strands the
-    // item forever, and it stamps a wall-clock deadline that drifts between regions. Review both.
+    // TODO: this starter pops the next item with no lease, so a reviewer who crashes strands the
+    // item forever, and it stamps a wall-clock deadline that drifts between regions. Fix both.
     auto& list = queues["review:queue:" + tenant + ":p1"];
     if (list.empty()) {
       res.status = 404;
@@ -742,5 +742,5 @@ int main() {
     'The SLA deadline must not depend on the wall clock. Compute it from a monotonic source and keep the per-priority budget in one table, so a region whose clock drifts cannot mark honest items breached.',
     'The sweeper is the safety net: for each assigned id whose lease key has expired, requeue it — at the front and marked breached when it is past its deadline, at the back when it is not.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated assignment path against reviewer failure. The draft reads fine because the demo never crashes a reviewer and runs in one region. Two defects are being checked. First, assignment without a lease: a lease key with a TTL plus a set of assigned ids is what lets a sweeper notice that the reviewer who took an item is gone and put it back — without it, a crashed tab strands work permanently. Second, a wall-clock deadline: regions drift minutes per day, so a fast clock marks honest items breached and a slow one hides real breaches; the SLA must be computed from a monotonic source, and in production from one clock service all replicas agree on. The subtle third point is visibility: a breached item must come back *marked breached* so the read path and the event path can act on it, not silently first. Real queues add heartbeat extension of the lease, per-tenant lease budgets, and a dead-letter path for items that breach repeatedly.`,
+  debrief: `The interviewer is testing whether you can debug an assignment path against reviewer failure. The starter reads fine because the demo never crashes a reviewer and runs in one region. Two defects are being checked. First, assignment without a lease: a lease key with a TTL plus a set of assigned ids is what lets a sweeper notice that the reviewer who took an item is gone and put it back — without it, a crashed tab strands work permanently. Second, a wall-clock deadline: regions drift minutes per day, so a fast clock marks honest items breached and a slow one hides real breaches; the SLA must be computed from a monotonic source, and in production from one clock service all replicas agree on. The subtle third point is visibility: a breached item must come back *marked breached* so the read path and the event path can act on it, not silently first. Real queues add heartbeat extension of the lease, per-tenant lease budgets, and a dead-letter path for items that breach repeatedly.`,
 };

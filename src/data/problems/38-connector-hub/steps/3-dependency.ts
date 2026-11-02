@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['hub', 'vendor', 'oauth'],
   task: `## Task
 
-The starter is a plausible model-generated draft: while the vendor is healthy every page arrives
+**Starting point.** The starter is working code: while the vendor is healthy every page arrives
 and the sync advances. Every failure path is wrong. Find them, fix them, and prove the fix.
 
 Implement \`fetch_page(connector)\`, the vendor call a sync worker makes for one page:
@@ -18,7 +18,7 @@ Implement \`fetch_page(connector)\`, the vendor call a sync worker makes for one
 - A **429** (\`RESOURCE_EXHAUSTED\`) is retried after **exponential backoff with jitter**:
   \`BACKOFF_BASE_MS = 250\`, doubling per attempt, capped at \`BACKOFF_MAX_MS = 8_000\`, with full
   jitter, and the vendor's own \`retry-after\` trailing metadata honoured when it sends one. At most
-  \`MAX_ATTEMPTS = 5\` attempts. The draft re-sends 429s in a tight loop with no delay, which is how
+  \`MAX_ATTEMPTS = 5\` attempts. The starter re-sends 429s in a tight loop with no delay, which is how
   a polite client becomes the reason the vendor rate-limits you harder.
 - A **401** (\`UNAUTHENTICATED\`) is permanent: it is attempted **once**, then the connector is
   **disabled with a visible reason** (\`store.disable(connector_id, reason)\`) so a human can see why
@@ -31,7 +31,7 @@ Implement \`fetch_page(connector)\`, the vendor call a sync worker makes for one
 - Anything else — \`INVALID_ARGUMENT\`, \`PERMISSION_DENIED\` — is returned to the caller at once
   instead of being retried.
 
-**Failure mode the checks target.** The draft's blanket retry turns a vendor deploy into a hot loop
+**Failure mode the checks target.** The starter's blanket retry turns a vendor deploy into a hot loop
 and a bad token into an infinite one; with no backoff the retries amplify exactly when the vendor is
 asking you to slow down; and with no breaker a single broken vendor costs every worker its
 throughput. Each of these is invisible in a demo where the vendor is healthy.`,
@@ -69,7 +69,7 @@ throughput. Each of these is invisible in a demo where the vendor is healthy.`,
       id: 'backoff-429',
       title: 'Backs off with jitter before retrying a 429',
       detail:
-        "A 429 waits `min(BACKOFF_MAX_MS, BACKOFF_BASE_MS · 2^n)` with jitter — or the vendor's `retry-after` — before the next attempt. The draft retries immediately in a tight loop, so a rate limit becomes a flood.",
+        "A 429 waits `min(BACKOFF_MAX_MS, BACKOFF_BASE_MS · 2^n)` with jitter — or the vendor's `retry-after` — before the next attempt. The starter retries immediately in a tight loop, so a rate limit becomes a flood.",
       match: {
         python: {all: [/BACKOFF_BASE_MS/, /random\.uniform\(/, /time\.sleep\(/]},
         typescript: {all: [/BACKOFF_BASE_MS/, /Math\.random\(/, /setTimeout\(/]},
@@ -82,7 +82,7 @@ throughput. Each of these is invisible in a demo where the vendor is healthy.`,
       id: 'stop-on-401',
       title: 'Never retries a 401, and has no unbounded loop',
       detail:
-        '`UNAUTHENTICATED` is recognized and returned immediately, and the attempts are counted against `MAX_ATTEMPTS` instead of a `while (true)` retry. The draft retries a bad token forever.',
+        '`UNAUTHENTICATED` is recognized and returned immediately, and the attempts are counted against `MAX_ATTEMPTS` instead of a `while (true)` retry. The starter retries a bad token forever.',
       match: {
         python: {all: [/UNAUTHENTICATED/], none: [/while\s+True/]},
         typescript: {all: [/UNAUTHENTICATED/], none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/]},
@@ -95,7 +95,7 @@ throughput. Each of these is invisible in a demo where the vendor is healthy.`,
       id: 'disable-with-reason',
       title: 'Disables the connector with a visible reason',
       detail:
-        'A 401 disables the connector through the store with a human-readable reason, so the health endpoint and the operator both see why the sync stopped. The draft leaves the connector looking enabled while it fails on every run.',
+        'A 401 disables the connector through the store with a human-readable reason, so the health endpoint and the operator both see why the sync stopped. The starter leaves the connector looking enabled while it fails on every run.',
       match: {
         python: {all: [/store\.disable\(/]},
         typescript: {all: [/store\.disable\(/]},
@@ -139,7 +139,7 @@ store = ConnectorStore()
 
 
 def fetch_page(connector: dict) -> bytes:
-    # TODO: this draft retries every status forever with no delay, including the 401 that can never
+    # TODO: this starter retries every status forever with no delay, including the 401 that can never
     # succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
     # disable for 401s, and a breaker after five consecutive 5xx.
     while True:
@@ -256,7 +256,7 @@ def fetch_page(connector: dict) -> bytes:
 `,
     },
     typescript: {
-      starter: `/** fetchPage: a model-generated draft that retries every status in a tight loop. */
+      starter: `/** fetchPage: flawed code that retries every status in a tight loop. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -284,7 +284,7 @@ const {vendor} = grpc.loadPackageDefinition(protoLoader.loadSync('vendor.proto')
 const client = new vendor.Vendor('vendor:9000', grpc.credentials.createInsecure());
 
 export async function fetchPage(connector: Connector): Promise<Buffer> {
-  // TODO: this draft retries every status forever with no delay, including the 401 that can never
+  // TODO: this starter retries every status forever with no delay, including the 401 that can never
   // succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
   // disable for 401s, and a breaker after five consecutive 5xx.
   for (;;) {
@@ -434,7 +434,7 @@ func (s *ConnectorStore) Disable(ctx context.Context, connectorID, reason string
 var store = &ConnectorStore{}
 
 func fetchPage(ctx context.Context, connector Connector) ([]byte, error) {
-	// TODO: this draft retries every status forever with no delay, including the 401 that can never
+	// TODO: this starter retries every status forever with no delay, including the 401 that can never
 	// succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
 	// disable for 401s, and a breaker after five consecutive 5xx.
 	for {
@@ -599,7 +599,7 @@ object VendorClient {
   )
 
   def fetchPage(connector: Connector): Array[Byte] = {
-    // TODO: this draft retries every status forever with no delay, including the 401 that can never
+    // TODO: this starter retries every status forever with no delay, including the 401 that can never
     // succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
     // disable for 401s, and a breaker after five consecutive 5xx.
     while (true) {
@@ -732,7 +732,7 @@ struct ConnectorStore {
 ConnectorStore store;
 
 std::string fetchPage(const Connector& connector) {
-  // TODO: this draft retries every status forever with no delay, including the 401 that can never
+  // TODO: this starter retries every status forever with no delay, including the 401 that can never
   // succeed, and has no breaker. Add exponential backoff with jitter for 429s, one attempt and a
   // disable for 401s, and a breaker after five consecutive 5xx.
   while (true) {
@@ -858,8 +858,8 @@ std::string fetchPage(const Connector& connector) {
   },
   hints: [
     'Separate the statuses before you write the loop: retryable is `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `DEADLINE_EXCEEDED`, permanent is `UNAUTHENTICATED` / `INVALID_ARGUMENT` / `PERMISSION_DENIED`. A permanent code returns on the first attempt — there is no third try that succeeds with a bad token.',
-    'Backoff belongs between attempts, not in front of the first one: `min(BACKOFF_MAX_MS, BACKOFF_BASE_MS · 2^attempt)` with jitter, and if the vendor sent `retry-after` in the trailing metadata, that value overrides your own schedule. Sleeping zero is the draft.',
+    'Backoff belongs between attempts, not in front of the first one: `min(BACKOFF_MAX_MS, BACKOFF_BASE_MS · 2^attempt)` with jitter, and if the vendor sent `retry-after` in the trailing metadata, that value overrides your own schedule. Sleeping zero is the starter.',
     'The breaker counts *consecutive* 5xx replies: `record(failed)` resets the counter on success and opens after `BREAKER_FAILURES`, and `allow()` is checked before the call so an open breaker returns without touching the vendor. A 401 is not a breaker event — it is a connector that must be disabled once.',
   ],
-  debrief: `The interview question is failure policy against a dependency you do not control. The draft passes every serial test with a healthy vendor and fails exactly when the vendor is having its worst day: an unbounded retry with no delay turns your client into the load that keeps the vendor down, retrying a 401 burns rate limit for a result that can never change, and with no breaker every worker independently rediscovers that the vendor is out. The fixes are the four contracts every outbound call needs — a deadline, bounded attempts over a status whitelist, a backoff policy that honours the server's own instructions, and a breaker so the dependency gets room to recover. Real hubs also include the connector's own rate limit as a client-side token bucket, a per-connector concurrency cap so one big connector cannot starve the rest, and an alarm on the breaker opening so a vendorship problem reaches a human.`,
+  debrief: `The interview question is failure policy against a dependency you do not control. The starter passes every serial test with a healthy vendor and fails exactly when the vendor is having its worst day: an unbounded retry with no delay turns your client into the load that keeps the vendor down, retrying a 401 burns rate limit for a result that can never change, and with no breaker every worker independently rediscovers that the vendor is out. The fixes are the four contracts every outbound call needs — a deadline, bounded attempts over a status whitelist, a backoff policy that honours the server's own instructions, and a breaker so the dependency gets room to recover. Real hubs also include the connector's own rate limit as a client-side token bucket, a per-connector concurrency cap so one big connector cannot starve the rest, and an alarm on the breaker opening so a vendorship problem reaches a human.`,
 };

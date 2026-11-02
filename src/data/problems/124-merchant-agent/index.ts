@@ -8,21 +8,21 @@ import {judgeGateStep} from './steps/4-judge-gate';
 import {assistTraceStep} from './steps/5-assist-trace';
 
 /**
- * Shopify's Sidekick, rebuilt as the system around one agent on the AI-era track: an assist
- * endpoint whose shop and permission set come from the server → the agentic loop with a constant
- * system prompt, a compact tool list and just-in-time instructions, bounded by turns and deadlines →
- * a per-shop budget, a shop-scoped tool cache and write tools claimed once → a release gate of
- * per-criterion judges calibrated against human labels over a ground-truth sample → shop-keyed
- * trace events with no merchant data feeding the ground-truth set.
+ * Shopify's Sidekick, rebuilt as the system around one agent: an assist endpoint whose shop and
+ * permission set come from the server → the agentic loop with a constant system prompt, a compact
+ * tool list and just-in-time instructions, bounded by turns and deadlines → a per-shop budget, a
+ * shop-scoped tool cache and write tools claimed once → a release gate of per-criterion judges
+ * calibrated against human labels over a ground-truth sample → shop-keyed trace events with no
+ * merchant data feeding the ground-truth set.
  */
 export const merchantAgentProblem: Problem = {
   id: 'merchant-agent',
   title: 'Merchant Assistant',
   tagline:
-    "Shopify's Sidekick as a reviewable system: just-in-time tool instructions, bounded agentic turns, per-shop budgets, and judges calibrated against humans before a prompt ships.",
+    "Shopify's Sidekick as a production system: just-in-time tool instructions, bounded agentic turns, per-shop budgets, and judges calibrated against humans before a prompt ships.",
   difficulty: 'hard',
   concepts: ['http', 'grpc', 'redis', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 75,
   company: SHOPIFY,
   sources: [
@@ -108,12 +108,12 @@ One service, **sidekick**, with five pieces:
    \`acks=all\` producer with an outbox on failure, and a \`gtx-builder\` consumer that inserts the
    ground-truth candidate before it commits.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

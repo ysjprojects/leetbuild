@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'clock'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: one instance fires the job,
+**Starting point.** The starter is working code: one instance fires the job,
 the window is recorded, and the demo looks correct. It breaks the moment two scheduler instances
-run, and it forgets every fire that dies. Review it like the owner of the scheduler, fix it, and
+run, and it forgets every fire that dies. Debug it like the owner of the scheduler, fix it, and
 prove the fix with the checks below.
 
 Implement the fire path that decides, per window, whether **this** instance may run the job.
@@ -28,7 +28,7 @@ Implement the fire path that decides, per window, whether **this** instance may 
   \`job.trigger(schedule_id, window)\`.
 - **Record an outcome for the window** as soon as the fire resolves: \`record_outcome(schedule_id,
   window, "fired")\` on success and \`record_outcome(schedule_id, window, "error")\` when the fire
-  raises. The draft writes nothing on failure, so a crashed fire leaves the window with no record
+  raises. The starter writes nothing on failure, so a crashed fire leaves the window with no record
   and the next tick tries the same window again — forever.
 
 **Failure mode the checks target.** \`GET\` then \`SET\` is a check-then-act race, and a rolling
@@ -51,7 +51,7 @@ an infinite retry loop that no history read can ever explain.`,
       id: 'atomic-acquire',
       title: 'Acquires the window lease in one atomic command',
       detail:
-        'The lease is taken with a single `SET ... NX EX` (or `SetNX`, `SetParams.nx().ex()`, `UpdateType::NOT_EXIST`): one round trip that only one instance can win. The draft reads a last-run timestamp and then writes it, two steps with a window in between.',
+        'The lease is taken with a single `SET ... NX EX` (or `SetNX`, `SetParams.nx().ex()`, `UpdateType::NOT_EXIST`): one round trip that only one instance can win. The starter reads a last-run timestamp and then writes it, two steps with a window in between.',
       match: {
         python: {all: [/nx=True/, /ex=LEASE_TTL_S/, /lease:\{schedule_id\}:\{window\}/]},
         typescript: {all: [/'NX'/, /LEASE_TTL_S/, /lease:\$\{scheduleId\}:\$\{window\}/]},
@@ -77,7 +77,7 @@ an infinite retry loop that no history read can ever explain.`,
       id: 'lease-ttl',
       title: 'Lease expires shortly after its window',
       detail:
-        '`LEASE_TTL_S = 30` and the lease is asserted to be shorter than the window, so it expires just after the window it guards and never bleeds into the next one. The draft leaves no expiry at all.',
+        '`LEASE_TTL_S = 30` and the lease is asserted to be shorter than the window, so it expires just after the window it guards and never bleeds into the next one. The starter leaves no expiry at all.',
       match: {
         python: {all: [/LEASE_TTL_S\s*=\s*30/, /LEASE_TTL_S\s*[<>=]+\s*WINDOW_S/]},
         typescript: {all: [/LEASE_TTL_S\s*=\s*30/, /LEASE_TTL_S\s*[<>=]+\s*WINDOW_S/]},
@@ -90,7 +90,7 @@ an infinite retry loop that no history read can ever explain.`,
       id: 'crash-outcome',
       title: 'Records an outcome for the window, including failures',
       detail:
-        'The fire path writes `record_outcome(schedule_id, window, ...)`: `fired` on success and `error` when the trigger raises, so a crashed window has a record instead of being retried forever. The draft records nothing at all.',
+        'The fire path writes `record_outcome(schedule_id, window, ...)`: `fired` on success and `error` when the trigger raises, so a crashed window has a record instead of being retried forever. The starter records nothing at all.',
       match: {
         python: {all: [/record_outcome\(/, /"error"/, /except\s+/]},
         typescript: {all: [/recordOutcome\(/, /'error'/, /catch\s*\(/]},
@@ -103,7 +103,7 @@ an infinite retry loop that no history read can ever explain.`,
       id: 'single-winner',
       title: 'Only the lease winner fires the job',
       detail:
-        'The lease is acquired **before** the job is triggered, and the losing instance returns without firing; nothing reads a last-run timestamp to decide. The draft triggers the job and only afterwards writes that it ran.',
+        'The lease is acquired **before** the job is triggered, and the losing instance returns without firing; nothing reads a last-run timestamp to decide. The starter triggers the job and only afterwards writes that it ran.',
       match: {
         python: {order: [/acquire_lease\(/, /\.trigger\(/], none: [/last_run/]},
         typescript: {order: [/acquireLease\(/, /\.trigger\(/], none: [/lastRun/]},
@@ -124,9 +124,9 @@ logger = logging.getLogger("scheduler")
 
 
 def fire_window(job, schedule_id: str, window: int, owner: str) -> str:
-    # TODO: this draft reads the last-run timestamp and then writes it as two separate commands, so
+    # TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
     # a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-    # crashes, so the window is retried forever. Review both.
+    # crashes, so the window is retried forever. Fix both.
     last = r.get(f"last_run:{schedule_id}")
     if last is not None and int(last) >= window:
         return "skipped"
@@ -176,7 +176,7 @@ def fire_window(job, schedule_id: str, window: int, owner: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** A model-generated draft that tracks the last run instead of leasing the window. */
+      starter: `/** Fire lease: flawed code that tracks the last run instead of leasing the window. */
 import {Redis} from 'ioredis';
 
 const redis = new Redis({host: 'redis', port: 6379});
@@ -187,9 +187,9 @@ export async function fireWindow(
   window: number,
   owner: string,
 ): Promise<string> {
-  // TODO: this draft reads the last-run timestamp and then writes it as two separate commands, so
+  // TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
   // a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-  // crashes, so the window is retried forever. Review both.
+  // crashes, so the window is retried forever. Fix both.
   const last = await redis.get(\`lastRun:\${scheduleId}\`);
   if (last !== null && Number(last) >= window) return 'skipped';
   await job.trigger(scheduleId, window);
@@ -257,9 +257,9 @@ var (
 )
 
 func FireWindow(job JobTrigger, scheduleID string, window int64, owner string) (string, error) {
-	// TODO: this draft reads the last-run timestamp and then writes it as two separate commands, so
+	// TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
 	// a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-	// crashes, so the window is retried forever. Review both.
+	// crashes, so the window is retried forever. Fix both.
 	key := fmt.Sprintf("lastRun:%s", scheduleID)
 	last, err := rdb.Get(ctx, key).Int64()
 	if err == nil && last >= window {
@@ -340,9 +340,9 @@ object FireWindows {
   val redis = new Jedis("redis", 6379)
 
   def fireWindow(job: JobTrigger, scheduleId: String, window: Long, owner: String): String = {
-    // TODO: this draft reads the last-run timestamp and then writes it as two separate commands, so
+    // TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so
     // a rolling deploy lets two instances fire the same window, and it records nothing when a fire
-    // crashes, so the window is retried forever. Review both.
+    // crashes, so the window is retried forever. Fix both.
     val key = s"lastRun:$scheduleId"
     val last = Option(redis.get(key)).flatMap(_.toLongOption)
     if (last.exists(_ >= window)) return "skipped"
@@ -402,9 +402,9 @@ Redis redis("tcp://redis:6379");
 
 std::string fireWindow(JobTrigger& job, const std::string& scheduleId, long window,
                        const std::string& owner) {
-  // TODO: this draft reads the last-run timestamp and then writes it as two separate commands, so a
+  // TODO: this starter reads the last-run timestamp and then writes it as two separate commands, so a
   // rolling deploy lets two instances fire the same window, and it records nothing when a fire
-  // crashes, so the window is retried forever. Review both.
+  // crashes, so the window is retried forever. Fix both.
   const auto key = "last_run:" + scheduleId;
   const auto last = redis.get(key);
   if (last.has_value() && std::stol(*last) >= window) return "skipped";
@@ -463,5 +463,5 @@ std::string fireWindow(JobTrigger& job, const std::string& scheduleId, long wind
     'Include the fire window in the key and give the key a TTL. `lease:{schedule_id}:{window}` is what makes the next window independent, and a TTL shorter than the window means a crashed lease clears long before the window comes round again.',
     'The loser must not touch the job, and the winner must always leave a record: return before the trigger when the lease was not won, and write `fired` or `error` for the window after it resolves. A window with no record is a window the fleet will keep retrying.',
   ],
-  debrief: `The interviewer is testing the fire path for mutual exclusion. The draft passes because the demo runs one instance and never crashes. Four defects are checked: check-then-act acquisition that a rolling deploy defeats, a key that lumps every window together, a lease with no expiry that becomes a permanent lock, and a fire path that records only successes so a failing window retries forever. Real schedulers add a fencing token to the lease so a paused process cannot act on a stale grant, keep the outcome record separate from the lease so the history survives the TTL, and derive the window from a single clock source rather than each node's wall clock.`,
+  debrief: `The interviewer is testing the fire path for mutual exclusion. The starter passes because the demo runs one instance and never crashes. Four defects are checked: check-then-act acquisition that a rolling deploy defeats, a key that lumps every window together, a lease with no expiry that becomes a permanent lock, and a fire path that records only successes so a failing window retries forever. Real schedulers add a fencing token to the lease so a paused process cannot act on a stale grant, keep the outcome record separate from the lease so the history survives the TTL, and derive the window from a single clock source rather than each node's wall clock.`,
 };

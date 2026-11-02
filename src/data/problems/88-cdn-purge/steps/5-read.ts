@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'purge', 'tenant'],
   task: `## Task
 
-**Review premise.** The starter reads the purge record and returns it as done. It compiles, and it
+**Starting point.** The starter reads the purge record and returns it as done. It compiles, and it
 is exactly the endpoint that told on-call a domain was clean for six hours while some edges were
-still serving the broken pricing page. Review it like the owner of the status contract, fix it, and
+still serving the broken pricing page. Debug it like the owner of the status contract, fix it, and
 prove the fix with the checks below.
 
 Implement \`GET /v1/purges/{purge_id}\`:
@@ -36,7 +36,7 @@ Implement \`GET /v1/purges/{purge_id}\`:
 
 :::widget status-codes {}
 
-**Failure mode the checks target.** The draft answers \`done\` the moment the provider accepted the
+**Failure mode the checks target.** The starter answers \`done\` the moment the provider accepted the
 batch, so the status endpoint reports success while propagation is still in flight — the six hours
 of stale pricing came from trusting that word. It filters \`outcomes\` down to the accepted paths, so
 the failures an operator needs are hidden. And it looks up the purge by id alone, so any tenant can
@@ -56,7 +56,7 @@ read (and, in the intake endpoint, infer) another tenant's purge.`,
       id: 'route-read',
       title: 'Reads one purge through the store and states the status vocabulary',
       detail:
-        'Register `GET /v1/purges/{purge_id}`, extract the id, and read the record (`store.get`) with the three purges statuses in scope. The draft reports `done`, a word this service has no evidence for.',
+        'Register `GET /v1/purges/{purge_id}`, extract the id, and read the record (`store.get`) with the three purges statuses in scope. The starter reports `done`, a word this service has no evidence for.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/purges\/\{purge_id\}["']/, /store\.get\(/, /PURGE_STATUSES/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/purges\/:purgeId['"]/, /store\.get\(/, /PURGE_STATUSES/]},
@@ -78,7 +78,7 @@ read (and, in the intake endpoint, infer) another tenant's purge.`,
       id: 'status-model',
       title: 'Derives accepted, propagated or partially_failed — never done',
       detail:
-        '`derive_status` maps the per-path outcomes to `accepted`, `propagated` or `partially_failed`, and the word `done` appears nowhere. The draft returns `done` as soon as the provider accepted the batch, which is why a propagation failure stayed invisible for six hours.',
+        '`derive_status` maps the per-path outcomes to `accepted`, `propagated` or `partially_failed`, and the word `done` appears nowhere. The starter returns `done` as soon as the provider accepted the batch, which is why a propagation failure stayed invisible for six hours.',
       match: {
         python: {
           all: [/STATUS_ACCEPTED/, /STATUS_PROPAGATED/, /STATUS_PARTIALLY_FAILED/, /derive_status\(/],
@@ -106,7 +106,7 @@ read (and, in the intake endpoint, infer) another tenant's purge.`,
       id: 'tenant-scope',
       title: 'A foreign purge is 404, not forbidden',
       detail:
-        'The record is scoped to the calling tenant and a mismatch answers **404**, so the endpoint never confirms that another tenant’s purge id exists. The draft looks the purge up by id alone and returns it to anyone.',
+        'The record is scoped to the calling tenant and a mismatch answers **404**, so the endpoint never confirms that another tenant’s purge id exists. The starter looks the purge up by id alone and returns it to anyone.',
       match: {
         python: {all: [/status_code=404/, /purge\["tenant"\] != tenant/]},
         typescript: {all: [/code\(404\)/, /purge\.tenant !== tenant/]},
@@ -119,7 +119,7 @@ read (and, in the intake endpoint, infer) another tenant's purge.`,
       id: 'propagated-at',
       title: 'propagated_at is stamped only by a real confirmation',
       detail:
-        '`mark_propagated` records the paths the provider confirmed and sets `propagated_at` only once every path has propagated, so the read reports a null timestamp until then. The draft has no confirmation path at all and treats provider acceptance as propagation.',
+        '`mark_propagated` records the paths the provider confirmed and sets `propagated_at` only once every path has propagated, so the read reports a null timestamp until then. The starter has no confirmation path at all and treats provider acceptance as propagation.',
       match: {
         python: {all: [/mark_propagated\(/, /propagated_at/, /OUTCOME_PROPAGATED/]},
         typescript: {all: [/markPropagated\(/, /propagated_at/, /OUTCOME_PROPAGATED/]},
@@ -132,7 +132,7 @@ read (and, in the intake endpoint, infer) another tenant's purge.`,
       id: 'failed-visible',
       title: 'Failed paths stay in the response',
       detail:
-        'The response carries the whole `outcomes` map, so a purge with one refused pattern reads `partially_failed` with that path in the body. The draft filters the map down to the accepted paths and hides exactly what an operator needs.',
+        'The response carries the whole `outcomes` map, so a purge with one refused pattern reads `partially_failed` with that path in the body. The starter filters the map down to the accepted paths and hides exactly what an operator needs.',
       match: {
         python: {all: [/OUTCOME_FAILED/, /STATUS_PARTIALLY_FAILED/, /"outcomes": purge\["outcomes"\]/]},
         typescript: {all: [/OUTCOME_FAILED/, /STATUS_PARTIALLY_FAILED/, /outcomes: purge\.outcomes/]},
@@ -160,8 +160,8 @@ store = PurgeStore()
 
 @app.get("/v1/purges/{purge_id}")
 def get_purge(purge_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft reports done as soon as the provider accepted the batch, hides the paths
-    # that failed, and lets any tenant read any purge. Review all three: a status derived from the
+    # TODO: this starter reports done as soon as the provider accepted the batch, hides the paths
+    # that failed, and lets any tenant read any purge. Fix all three: a status derived from the
     # per-path outcomes with propagated_at only after confirmation, the full outcome map in the
     # response, and a 404 for a purge that belongs to another tenant.
     purge = store.get(purge_id)
@@ -233,7 +233,7 @@ def get_purge(purge_id: str, tenant: str | None = Header(default=None, alias="X-
 `,
     },
     typescript: {
-      starter: `/** GET /v1/purges/:purgeId: a model-generated draft that calls provider acceptance done. */
+      starter: `/** GET /v1/purges/:purgeId: flawed code that calls provider acceptance done. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -253,13 +253,13 @@ const store = {
 };
 
 app.get('/v1/purges/:purgeId', async (request, reply) => {
-  // TODO: this draft reports done as soon as the provider accepted the batch, hides the paths that
-  // failed, and lets any tenant read any purge. Review all three: a status derived from the
+  // TODO: this starter reports done as soon as the provider accepted the batch, hides the paths that
+  // failed, and lets any tenant read any purge. Fix all three: a status derived from the
   // per-path outcomes with propagated_at only after confirmation, the full outcome map in the
   // response, and a 404 for a purge that belongs to another tenant.
   // Fastify types route params as a generic record; this route declares :purgeId.
   const params = request.params as {purgeId: string};
-  // The draft assumes the purge exists, so it skips the missing-record path entirely.
+  // The starter assumes the purge exists, so it skips the missing-record path entirely.
   const purge = (await store.get(params.purgeId)) as Purge;
   const outcomes: Record<string, string> = {};
   for (const [path, outcome] of Object.entries(purge.outcomes)) if (outcome === 'accepted') outcomes[path] = outcome;
@@ -363,8 +363,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func getPurge(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reports done as soon as the provider accepted the batch, hides the paths
-	// that failed, and lets any tenant read any purge. Review all three: a status derived from the
+	// TODO: this starter reports done as soon as the provider accepted the batch, hides the paths
+	// that failed, and lets any tenant read any purge. Fix all three: a status derived from the
 	// per-path outcomes with propagated_at only after confirmation, the full outcome map in the
 	// response, and a 404 for a purge that belongs to another tenant.
 	purge, _ := store.Get(r.Context(), r.URL.Query().Get("id"))
@@ -530,8 +530,8 @@ object PurgeReadApi {
     path("v1" / "purges" / Segment) { purgeId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this draft reports done as soon as the provider accepted the batch, hides the
-          // paths that failed, and lets any tenant read any purge. Review all three: a status
+          // TODO: this starter reports done as soon as the provider accepted the batch, hides the
+          // paths that failed, and lets any tenant read any purge. Fix all three: a status
           // derived from the per-path outcomes with propagated_at only after confirmation, the
           // full outcome map in the response, and a 404 for a purge that belongs to another tenant.
           store.get(purgeId) match {
@@ -665,8 +665,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/purges/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reports done as soon as the provider accepted the batch, hides the paths
-    // that failed, and lets any tenant read any purge. Review all three: a status derived from the
+    // TODO: this starter reports done as soon as the provider accepted the batch, hides the paths
+    // that failed, and lets any tenant read any purge. Fix all three: a status derived from the
     // per-path outcomes with propagated_at only after confirmation, the full outcome map in the
     // response, and a 404 for a purge that belongs to another tenant.
     const auto purge = store.get(req.matches[1]);
@@ -774,5 +774,5 @@ int main() {
     'Stamp `propagated_at` where the confirmation arrives (`mark_propagated`), not where the purge is accepted: the provider’s 200 means it took the request, the confirmation means every edge has dropped the object. Until then the field is null, and the status stays accepted.',
     'Scope the read by tenant and answer 404 for anything that is not the caller’s own purge — the same status a nonexistent id gets, so the endpoint never leaks that another tenant’s purge id is real. Return the outcomes map whole: the failed paths are the payload an operator is reading this endpoint for.',
   ],
-  debrief: `The interviewer is testing whether the status endpoint can be trusted at 3 a.m. The draft reads fine because the provider is healthy in the demo and every path is accepted, so \`done\` and \`propagated\` coincide. Three contracts are being checked. First, the vocabulary: \`accepted\`, \`propagated\`, \`partially_failed\` map to what the system actually knows, and a word like \`done\` claims something the service cannot verify while edges are catching up — the six-hour stale-pricing incident is exactly that word being believed. Second, the failure surface: hiding the paths that failed turns a partial purge into a silent one, and the operator cannot fix what the response does not show. Third, tenancy: a purge id is a capability, so a foreign read is 404 rather than 403, and the response never confirms that somebody else's purge exists. Real platforms add a \`Retry-After\`-style hint for a pending purge, per-POP propagation detail from the event stream, and an alert when a purge stays \`accepted\` for longer than the propagation SLO.`,
+  debrief: `The interviewer is testing whether the status endpoint can be trusted at 3 a.m. The starter reads fine because the provider is healthy in the demo and every path is accepted, so \`done\` and \`propagated\` coincide. Three contracts are being checked. First, the vocabulary: \`accepted\`, \`propagated\`, \`partially_failed\` map to what the system actually knows, and a word like \`done\` claims something the service cannot verify while edges are catching up — the six-hour stale-pricing incident is exactly that word being believed. Second, the failure surface: hiding the paths that failed turns a partial purge into a silent one, and the operator cannot fix what the response does not show. Third, tenancy: a purge id is a capability, so a foreign read is 404 rather than 403, and the response never confirms that somebody else's purge exists. Real platforms add a \`Retry-After\`-style hint for a pending purge, per-POP propagation detail from the event stream, and an alert when a purge stays \`accepted\` for longer than the propagation SLO.`,
 };

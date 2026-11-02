@@ -8,17 +8,17 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'store', 'dlq'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the status endpoint: it
+**Starting point.** The starter is working code for the status endpoint: it
 registers the route, reads the \`jobs\` row and answers with the type, state, attempt count and
 \`next_retry_at\` it found there. It compiles, it answers correctly for a job that is alive in a
-healthy demo, and it hides four production flaws. Review it like the engineer who gets paged about
+healthy demo, and it hides four production flaws. Debug it like the engineer who gets paged about
 this queue, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/jobs/{id}\`:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when absent) and the job is
   resolved **scoped to it**: another tenant's job id — and an id that does not exist — both answer
-  **404**, never **403**, because a 403 confirms the job exists. The draft looks the job up by id
+  **404**, never **403**, because a 403 confirms the job exists. The starter looks the job up by id
   alone, so any authenticated caller reads any tenant's job, its payload and its error history.
 - \`state\` is **reconciled against the queue's own sets** before it is reported. \`jobs:inflight\`
   is a sorted set whose member is the job id and whose score is that claim's visibility deadline in
@@ -33,7 +33,7 @@ Implement \`GET /v1/jobs/{id}\`:
   time is already in the past the read answers with a recomputed backoff
   (\`BACKOFF_BASE_MS\` = 1000 doubling with the attempt count, capped at \`BACKOFF_CAP_MS\` = 30000)
   plus \`retry_overdue: true\` — so support can tell "a retry is owed" from "a retry is scheduled".
-  A job that has spent \`MAX_ATTEMPTS\` gets \`next_retry_at: null\`. The draft echoes the stored
+  A job that has spent \`MAX_ATTEMPTS\` gets \`next_retry_at: null\`. The starter echoes the stored
   value and never compares it to now.
 - \`dead_letter_reason\` is surfaced from \`job_dead_letter\` for a job that was buried; a job that
   is still alive answers \`null\`.
@@ -105,7 +105,7 @@ endpoint safe to page on.`,
       id: 'stalled-inflight',
       title: 'A stranded in-flight claim reads as stalled with its claim age',
       detail:
-        'The state is reconciled against `jobs:inflight` before it is reported: an entry whose score (the claim deadline in ms) is already past is `stalled` with `claim_age_ms`, never the row’s `queued`. The draft returns the stored state verbatim, so a job stranded in a crashed worker’s claim looks queued forever.',
+        'The state is reconciled against `jobs:inflight` before it is reported: an entry whose score (the claim deadline in ms) is already past is `stalled` with `claim_age_ms`, never the row’s `queued`. The starter returns the stored state verbatim, so a job stranded in a crashed worker’s claim looks queued forever.',
       match: {
         python: {
           all: [/jobs:inflight/, /['"]stalled['"]/, /claim_age_ms/, /now_ms\(\)/],
@@ -133,7 +133,7 @@ endpoint safe to page on.`,
       id: 'retry-overdue',
       title: 'next_retry_at is checked against the clock, or flagged retry_overdue',
       detail:
-        'The stored retry time is compared with `now`: a time still ahead of the clock is reported as it is, a time in the past is replaced by a recomputed backoff (`BACKOFF_BASE_MS` doubling per attempt, capped at `BACKOFF_CAP_MS`) and flagged `retry_overdue: true`. The draft copies `next_retry_at` out of the row without ever looking at the clock, so the dashboard can show a retry that already passed.',
+        'The stored retry time is compared with `now`: a time still ahead of the clock is reported as it is, a time in the past is replaced by a recomputed backoff (`BACKOFF_BASE_MS` doubling per attempt, capped at `BACKOFF_CAP_MS`) and flagged `retry_overdue: true`. The starter copies `next_retry_at` out of the row without ever looking at the clock, so the dashboard can show a retry that already passed.',
       match: {
         python: {
           all: [/BACKOFF_BASE_MS/, /BACKOFF_CAP_MS/, /next_retry_at/, /retry_overdue/, /backoff_ms\(/],
@@ -161,7 +161,7 @@ endpoint safe to page on.`,
       id: 'tenant-scoped-404',
       title: 'A foreign job id is 404, never 403 with existence',
       detail:
-        'The tenant comes from `X-Tenant-Id` and the job is resolved scoped to it; a job belonging to another tenant answers **404** — the same answer the caller gets for an id that never existed — and never **403**, which would confirm that the job exists. The draft looks the job up by id alone, so a job id is treated as a capability.',
+        'The tenant comes from `X-Tenant-Id` and the job is resolved scoped to it; a job belonging to another tenant answers **404** — the same answer the caller gets for an id that never existed — and never **403**, which would confirm that the job exists. The starter looks the job up by id alone, so a job id is treated as a capability.',
       match: {
         python: {
           all: [/X-Tenant-Id/, /row\["tenant"\]/, /\b404\b/],
@@ -194,7 +194,7 @@ endpoint safe to page on.`,
       id: 'job-history',
       title: 'Attempt history and dead-letter reason come from the job’s own tables',
       detail:
-        '`attempt_history` is read from `job_attempts` as an ordered list (`ORDER BY attempt_no`) and `dead_letter_reason` is surfaced from `job_dead_letter`. The draft answers with the row’s attempt counter and says nothing about why a buried job died, so the history the endpoint exists to show is missing.',
+        '`attempt_history` is read from `job_attempts` as an ordered list (`ORDER BY attempt_no`) and `dead_letter_reason` is surfaced from `job_dead_letter`. The starter answers with the row’s attempt counter and says nothing about why a buried job died, so the history the endpoint exists to show is missing.',
       match: {
         python: {
           all: [/job_attempts/, /ORDER BY attempt_no/, /attempt_history/, /job_dead_letter/, /dead_letter_reason/],
@@ -216,7 +216,7 @@ endpoint safe to page on.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/jobs/{job_id}: a model-generated draft that echoes the stored jobs row."""
+      starter: `"""GET /v1/jobs/{job_id}: flawed code that echoes the stored jobs row."""
 import logging
 
 from fastapi import FastAPI, Header
@@ -236,10 +236,10 @@ def job_row(job_id: str) -> dict | None:
 
 @app.get("/v1/jobs/{job_id}")
 def read_job(job_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft reports the stored state verbatim — queued for a job stranded in a crashed
+    # TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
     # worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
     # the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-    # reads any job. Review all of it before the status endpoint ships.
+    # reads any job. Fix all of it before the status endpoint ships.
     row = job_row(job_id)
     if row is None:
         return JSONResponse({"error": "unknown job"}, status_code=404)
@@ -361,7 +361,7 @@ def read_job(job_id: str, tenant: str | None = Header(default=None, alias="X-Ten
 `,
     },
     typescript: {
-      starter: `/** GET /v1/jobs/:jobId: a model-generated draft that echoes the stored jobs row. */
+      starter: `/** GET /v1/jobs/:jobId: flawed code that echoes the stored jobs row. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -382,10 +382,10 @@ async function jobRow(jobId: string): Promise<JobRow | undefined> {
 }
 
 app.get('/v1/jobs/:jobId', async (request, reply) => {
-  // TODO: this draft reports the stored state verbatim — queued for a job stranded in a crashed
+  // TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
   // worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
   // the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-  // reads any job. Review all of it before the status endpoint ships.
+  // reads any job. Fix all of it before the status endpoint ships.
   const tenant = request.headers['x-tenant-id'];
   const {jobId} = request.params as {jobId: string};
   const row = await jobRow(jobId);
@@ -550,10 +550,10 @@ func readJobRow(r *http.Request, jobID string) (jobRow, error) {
 }
 
 func readJob(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reports the stored state verbatim — queued for a job stranded in a crashed
+	// TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
 	// worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
 	// the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-	// reads any job. Review all of it before the status endpoint ships.
+	// reads any job. Fix all of it before the status endpoint ships.
 	tenant := r.Header.Get("X-Tenant-Id")
 	jobID := r.PathValue("jobID")
 	row, err := readJobRow(r, jobID)
@@ -839,10 +839,10 @@ object JobRead {
   val route: Route =
     path("v1" / "jobs" / Segment) { jobId =>
       get {
-        // TODO: this draft reports the stored state verbatim — queued for a job stranded in a
+        // TODO: this starter reports the stored state verbatim — queued for a job stranded in a
         // crashed worker's claim — copies next_retry_at from the row without comparing it to the
         // clock, returns the attempt counter instead of the history, and looks the job up by id
-        // alone, so any tenant reads any job. Review all of it before the status endpoint ships.
+        // alone, so any tenant reads any job. Fix all of it before the status endpoint ships.
         jobRow(jobId) match {
           case Some(row) =>
             val response = JsObject(
@@ -1026,10 +1026,10 @@ int main() {
   svr.Get(R"(/v1/jobs/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
     const std::string tenant = req.get_header_value("X-Tenant-Id");
     const std::string job_id = req.matches[1];
-    // TODO: this draft reports the stored state verbatim — queued for a job stranded in a crashed
+    // TODO: this starter reports the stored state verbatim — queued for a job stranded in a crashed
     // worker's claim — copies next_retry_at from the row without comparing it to the clock, returns
     // the attempt counter instead of the history, and looks the job up by id alone, so any tenant
-    // reads any job. Review all of it before the status endpoint ships.
+    // reads any job. Fix all of it before the status endpoint ships.
     pqxx::work tx(db_pool());
     const auto jobs = tx.exec_params(
         "SELECT type, state, attempts, next_retry_at_ms FROM jobs WHERE id = $1", job_id);
@@ -1175,12 +1175,12 @@ int main() {
     },
   },
   hints: [
-    'Scope before you read: `X-Tenant-Id` first, then resolve the job against the row’s own tenant — a foreign id and an unknown id must produce the same **404** with the same body, because a 403 confirms the job exists before the caller is allowed to know that. The draft resolves by id alone, so a job id becomes a capability.',
+    'Scope before you read: `X-Tenant-Id` first, then resolve the job against the row’s own tenant — a foreign id and an unknown id must produce the same **404** with the same body, because a 403 confirms the job exists before the caller is allowed to know that. The starter resolves by id alone, so a job id becomes a capability.',
     '`jobs:inflight` is the queue’s own truth, not a cache of the row: `ZSCORE jobs:inflight <job id>` is that claim’s deadline in ms. If the deadline is behind the clock the job is `stalled` and `claim_age_ms` is `now − deadline` — the crash the row cannot see, because the worker died before it wrote anything.',
     'Never echo `next_retry_at`: compare the stored time with the clock, and when it is already past answer with a recomputed backoff (`BACKOFF_BASE_MS` doubling per attempt, capped at `BACKOFF_CAP_MS`) plus `retry_overdue: true`, so the dashboard says "a retry is owed" instead of showing a retry that already passed. Read `attempt_history` from `job_attempts` with `ORDER BY attempt_no`, and take `dead_letter_reason` from `job_dead_letter` — the row’s counter and a silent `null` are what make a buried job unexplainable.',
   ],
   debrief: `The interviewer is testing the read half of a queue, where the question is never "does it return
-a state" but "is it the state the queue is actually in, and may this caller see it". The draft is
+a state" but "is it the state the queue is actually in, and may this caller see it". The starter is
 convincing because the demo job is alive, owned by the caller, and sitting in a healthy retry
 window — every flaw needs a crashed worker, a retry that already came due, or a caller who guessed
 an id. The checks are the route; a job stranded in \`jobs:inflight\` past its deadline reported

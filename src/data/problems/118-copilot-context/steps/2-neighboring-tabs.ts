@@ -8,11 +8,11 @@ export const neighboringTabsStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it remembers the editor's
+**Starting point.** The starter is working code: it remembers the editor's
 open tabs in Redis and picks snippets for the prompt, so the demo shows context from other files.
 It hides four production flaws: a key that leaks code across developers, entries that never
 expire, a matching bar so high that almost nothing is ever included, and one Redis round trip per
-tab on every keystroke. Review it, fix it, and prove the fix.
+tab on every keystroke. Debug it, fix it, and prove the fix.
 
 Implement the neighboring-tabs cache behind \`remember_tabs(session, tabs)\` and
 \`pick_snippets(session, paths, prefix)\`:
@@ -52,7 +52,7 @@ round trip per open file to a latency budget the model already consumes.`,
     ],
   },
   hints: [
-    'Put the session in the key and the TTL on the write: `tabs:{session}:{path}` with `EX 600`. Both are one argument each; the draft is missing both.',
+    'Put the session in the key and the TTL on the write: `tabs:{session}:{path}` with `EX 600`. Both are one argument each; the starter is missing both.',
     'Tokenise, do not substring-match: `[A-Za-z_][A-Za-z0-9_]*` over the last 60 lines of the prefix gives a set; the same over each 500-character window of a tab gives another; Jaccard is intersection over union. Keep the threshold at 0.05 and keep the best window even below it.',
     'One `MGET` with every key returns every tab in one round trip, in key order, with `nil` for the ones that expired. Score, sort by score descending, keep four.',
   ],
@@ -61,7 +61,7 @@ round trip per open file to a latency budget the model already consumes.`,
       id: 'session-key',
       title: 'Keys tabs by session and path',
       detail:
-        'The key is `tabs:{session}:{path}` — the authenticated session, then the file path. The draft keys by path alone, so one developer’s open file becomes everyone’s context.',
+        'The key is `tabs:{session}:{path}` — the authenticated session, then the file path. The starter keys by path alone, so one developer’s open file becomes everyone’s context.',
       match: {
         python: {all: [/tabs:\{session\}:\{path\}/]},
         typescript: {all: [/tabs:\$\{session\}:\$\{path\}/]},
@@ -74,7 +74,7 @@ round trip per open file to a latency budget the model already consumes.`,
       id: 'ttl',
       title: 'Tab entries expire after 600 s',
       detail:
-        'Every tab is written with `TAB_TTL_S = 600` as its expiry (`EX`, `setex`, a `time.Duration`, `std::chrono::seconds`). The draft’s `SET` has no TTL, so closed tabs live in Redis forever.',
+        'Every tab is written with `TAB_TTL_S = 600` as its expiry (`EX`, `setex`, a `time.Duration`, `std::chrono::seconds`). The starter’s `SET` has no TTL, so closed tabs live in Redis forever.',
       match: {
         python: {all: [/TAB_TTL_S\s*=\s*600/, /ex\s*=\s*TAB_TTL_S/]},
         typescript: {all: [/TAB_TTL_S\s*=\s*600/, /['"]EX['"],\s*TAB_TTL_S/]},
@@ -87,7 +87,7 @@ round trip per open file to a latency budget the model already consumes.`,
       id: 'similarity',
       title: 'Scores snippets by Jaccard with a very low bar',
       detail:
-        'Snippets are ranked by `jaccard` set similarity between the identifiers of the last `CURSOR_WINDOW_LINES` lines and each tab window, included at `MIN_SNIPPET_SCORE = 0.05` with the best window kept even below it. The draft only includes a tab when the cursor line appears in it verbatim.',
+        'Snippets are ranked by `jaccard` set similarity between the identifiers of the last `CURSOR_WINDOW_LINES` lines and each tab window, included at `MIN_SNIPPET_SCORE = 0.05` with the best window kept even below it. The starter only includes a tab when the cursor line appears in it verbatim.',
       match: {
         python: {all: [/def jaccard\(/, /MIN_SNIPPET_SCORE\s*=\s*0\.05/, /CURSOR_WINDOW_LINES\s*=\s*60/]},
         typescript: {all: [/function jaccard\(/, /MIN_SNIPPET_SCORE\s*=\s*0\.05/, /CURSOR_WINDOW_LINES\s*=\s*60/]},
@@ -100,7 +100,7 @@ round trip per open file to a latency budget the model already consumes.`,
       id: 'batched-read',
       title: 'Reads every tab in one MGET',
       detail:
-        'All of a session’s tabs are fetched with one `MGET` (one round trip) instead of one `GET` per path. The draft issues a `GET` per open tab on every keystroke.',
+        'All of a session’s tabs are fetched with one `MGET` (one round trip) instead of one `GET` per path. The starter issues a `GET` per open tab on every keystroke.',
       match: {
         python: {all: [/\.mget\(/], none: [/\.get\(/]},
         typescript: {all: [/\.mget\(/], none: [/\.get\(/]},
@@ -122,7 +122,7 @@ SNIPPET_CHARS = 500
 
 def remember_tabs(session: str, tabs: list[tuple[str, str]]) -> None:
     # TODO: the key has no session and the entry no TTL, matching is an exact substring test, and
-    # the read below is one GET per tab. Review all four.
+    # the read below is one GET per tab. Fix all four.
     for path, text in tabs:
         r.set(f"tabs:{path}", text)
 
@@ -199,7 +199,7 @@ def pick_snippets(session: str, paths: list[str], prefix: str) -> list[str]:
 `,
     },
     typescript: {
-      starter: `/** Neighboring tabs: a model-generated draft that keys by path and matches by substring. */
+      starter: `/** Neighboring tabs: flawed code that keys by path and matches by substring. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -209,7 +209,7 @@ const SNIPPET_CHARS = 500;
 
 export async function rememberTabs(session: string, tabs: Array<{path: string; text: string}>): Promise<void> {
   // TODO: the key has no session and the entry no TTL, matching is an exact substring test, and
-  // the read below is one GET per tab. Review all four.
+  // the read below is one GET per tab. Fix all four.
   for (const tab of tabs) await r.set(\`tabs:\${tab.path}\`, tab.text);
 }
 
@@ -304,7 +304,7 @@ const (
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 // TODO: the key has no session and the entry no TTL, matching is an exact substring test, and
-// the read below is one GET per tab. Review all four.
+// the read below is one GET per tab. Fix all four.
 func rememberTabs(ctx context.Context, session string, tabs map[string]string) error {
 	for path, text := range tabs {
 		if err := rdb.Set(ctx, fmt.Sprintf("tabs:%s", path), text, 0).Err(); err != nil {
@@ -473,7 +473,7 @@ object TabSnippets {
   val jedis = new Jedis("redis", 6379)
 
   // TODO: the key has no session and the entry no TTL, matching is an exact substring test, and
-  // the read below is one GET per tab. Review all four.
+  // the read below is one GET per tab. Fix all four.
   def rememberTabs(session: String, tabs: Seq[(String, String)]): Unit =
     tabs.foreach { case (path, text) => jedis.set(s"tabs:$path", text) }
 
@@ -555,7 +555,7 @@ constexpr std::size_t kSnippetChars = 500;
 sw::redis::Redis redis("tcp://redis:6379");
 
 // TODO: the key has no session and the entry no TTL, matching is an exact substring test, and
-// the read below is one GET per tab. Review all four.
+// the read below is one GET per tab. Fix all four.
 void rememberTabs(const std::string& session, const std::vector<std::pair<std::string, std::string>>& tabs) {
   for (const auto& [path, text] : tabs) redis.set("tabs:" + path, text);
 }
@@ -683,5 +683,5 @@ std::vector<std::string> pickSnippets(
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can see a cache as part of the product's security and latency story, not just its hit rate. The draft hides a cross-tenant leak in the key — one developer's open file becomes another's context — and a missing TTL that turns an editor's tab list into permanent storage of source code. The matching flaw is the one GitHub's post names explicitly: their A/B tests found that a very low inclusion bar, and including the best match even when it is weak, gave the best completions; the draft's exact-line test is the opposite policy and silently includes nothing most of the time. The MGET is the latency half: neighboring tabs run on every keystroke, and the post credits caching with making them free; one round trip per tab is not free. Real implementations tokenise per language, cache the scored windows keyed by a hash of the tab, and evict a tab the moment the editor reports it closed.`,
+  debrief: `The interviewer is testing whether you can see a cache as part of the product's security and latency story, not just its hit rate. The starter hides a cross-tenant leak in the key — one developer's open file becomes another's context — and a missing TTL that turns an editor's tab list into permanent storage of source code. The matching flaw is the one GitHub's post names explicitly: their A/B tests found that a very low inclusion bar, and including the best match even when it is weak, gave the best completions; the starter's exact-line test is the opposite policy and silently includes nothing most of the time. The MGET is the latency half: neighboring tabs run on every keystroke, and the post credits caching with making them free; one round trip per tab is not free. Real implementations tokenise per language, cache the scored windows keyed by a hash of the tab, and evict a tab the moment the editor reports it closed.`,
 };

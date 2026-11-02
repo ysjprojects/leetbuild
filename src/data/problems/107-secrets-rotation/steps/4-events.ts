@@ -8,12 +8,11 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'worker', 'audit'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the lifecycle publisher: it
-writes an event for every rotation and returns it. It compiles, the demo shows events flowing, and
-it hides three production flaws — the key is the consumer instead of the secret, the payload carries
-the material "so workers can pick it up directly from the topic", and the event is published before
-the pointer moves. Review it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter is working code for the lifecycle publisher: it writes an event for
+every rotation and returns it. It compiles, the demo shows events flowing, and it hides three
+production flaws — the key is the consumer instead of the secret, the payload carries the material
+"so workers can pick it up directly from the topic", and the event is published before the pointer
+moves. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement the lifecycle publisher on topic **\`secret.event\`**:
 
@@ -72,7 +71,7 @@ has not happened yet, so the newest version is announced while the old one is st
       id: 'per-secret-order',
       title: 'Events are keyed by the secret name',
       detail:
-        'The record key is the secret name, so a secret’s create → activate → retire → revoke sequence stays on one partition in order. The draft keys by consumer, scattering one secret’s history across the topic.',
+        'The record key is the secret name, so a secret’s create → activate → retire → revoke sequence stays on one partition in order. The starter keys by consumer, scattering one secret’s history across the topic.',
       match: {
         python: {all: [/\bkey=name\b/]},
         typescript: {all: [/key:\s*name\b/]},
@@ -85,7 +84,7 @@ has not happened yet, so the newest version is announced while the old one is st
       id: 'event-fields',
       title: 'The payload carries the secret, the version and the fingerprint',
       detail:
-        'Every event names its secret, its `version_id`, the `fingerprint` of that version and a timestamp — enough for a consumer to correlate the event with what it holds. The draft sends a consumer id and the version id, so a consumer cannot tell which material the event refers to.',
+        'Every event names its secret, its `version_id`, the `fingerprint` of that version and a timestamp — enough for a consumer to correlate the event with what it holds. The starter sends a consumer id and the version id, so a consumer cannot tell which material the event refers to.',
       match: {
         python: {all: [/version_id/, /fingerprint/, /\bsecret\b/]},
         typescript: {all: [/version_id/, /fingerprint/, /\bsecret\b/]},
@@ -98,7 +97,7 @@ has not happened yet, so the newest version is announced while the old one is st
       id: 'no-material',
       title: 'No event, in any field, carries material',
       detail:
-        'The word `material` appears nowhere in the publisher: the topic is retained and replicated, and a payload cannot be un-published. The draft ships the material so workers can skip the vault fetch.',
+        'The word `material` appears nowhere in the publisher: the topic is retained and replicated, and a payload cannot be un-published. The starter ships the material so workers can skip the vault fetch.',
       match: {
         python: {all: [/\bdef publish_event\(/], none: [/\bmaterial\b/]},
         typescript: {all: [/async function publishEvent\(/], none: [/\bmaterial\b/]},
@@ -111,7 +110,7 @@ has not happened yet, so the newest version is announced while the old one is st
       id: 'publish-after-swap',
       title: 'The event is published after the pointer swap',
       detail:
-        'In `rotate` the call to `activate` comes before the publish, so no event describes a version the fleet cannot use yet. The draft publishes first and swaps second, announcing an activation that has not happened.',
+        'In `rotate` the call to `activate` comes before the publish, so no event describes a version the fleet cannot use yet. The starter publishes first and swaps second, announcing an activation that has not happened.',
       match: {
         python: {order: [/\bactivate\(name, new_version_id\)/, /publish_event\(/]},
         typescript: {order: [/activate\(name, newVersionId\)/, /publishEvent\(/]},
@@ -133,8 +132,8 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_event(consumer_id: str, event_type: str, version_id: str, material: str) -> dict:
-    # TODO: this draft keys by consumer, ships the material into the topic so workers can pick it
-    # up directly, and publishes before the pointer swap. Review all three.
+    # TODO: this starter keys by consumer, ships the material into the topic so workers can pick it
+    # up directly, and publishes before the pointer swap. Fix all three.
     event = {
         "type": event_type,
         "consumer": consumer_id,
@@ -212,7 +211,7 @@ def revoke(name: str, version_id: str, fingerprint: str) -> None:
 `,
     },
     typescript: {
-      starter: `/** secret.event: a model-generated draft that keys by consumer and ships the material. */
+      starter: `/** secret.event: flawed code that keys by consumer and ships the material. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'secret.event';
@@ -227,8 +226,8 @@ export async function publishEvent(
   versionId: string,
   material: string,
 ): Promise<Record<string, unknown>> {
-  // TODO: this draft keys by consumer, ships the material into the topic so workers can pick it up
-  // directly, and publishes before the pointer swap. Review all three.
+  // TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
+  // directly, and publishes before the pointer swap. Fix all three.
   const event = {type: eventType, consumer: consumerId, version_id: versionId, material};
   await producer.send({topic: TOPIC, messages: [{key: consumerId, value: JSON.stringify(event)}]});
   return event;
@@ -323,8 +322,8 @@ type SecretEvent struct {
 }
 
 func publishEvent(ctx context.Context, consumerID, eventType, versionID, material string) (SecretEvent, error) {
-	// TODO: this draft keys by consumer, ships the material into the topic so workers can pick it up
-	// directly, and publishes before the pointer swap. Review all three.
+	// TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
+	// directly, and publishes before the pointer swap. Fix all three.
 	event := SecretEvent{Type: eventType, Consumer: consumerID, VersionID: versionID, Material: material}
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -445,8 +444,8 @@ object RotationEvents {
     props
   })
 
-  // TODO: this draft keys by consumer, ships the material into the topic so workers can pick it up
-  // directly, and publishes before the pointer swap. Review all three.
+  // TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
+  // directly, and publishes before the pointer swap. Fix all three.
   def publishEvent(consumerId: String, eventType: String, versionId: String, material: String): Map[String, String] = {
     val event = Map(
       "type" -> eventType,
@@ -536,8 +535,8 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: this draft keys by consumer, ships the material into the topic so workers can pick it up
-// directly, and publishes before the pointer swap. Review all three.
+// TODO: this starter keys by consumer, ships the material into the topic so workers can pick it up
+// directly, and publishes before the pointer swap. Fix all three.
 json publishEvent(const std::string& consumerId, const std::string& eventType, const std::string& versionId,
                   const std::string& material) {
   const json event = {{"type", eventType}, {"consumer", consumerId}, {"version_id", versionId}, {"material", material}};

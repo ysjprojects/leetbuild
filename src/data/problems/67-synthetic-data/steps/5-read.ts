@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'synth', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a report comes back, the row
+**Starting point.** The starter is working code: a report comes back, the row
 count looks healthy and the demo ships. It authorizes nothing, it hides the records nobody scored,
 and it cannot say where a single admitted record came from. Find the flaws, fix them, and prove the
 fix.
@@ -17,7 +17,7 @@ Implement \`GET /v1/synthetic/jobs/{job_id}\`, the report a reviewer reads befor
 
 - The job is looked up for the **authenticated tenant**: \`assert_tenant_owns(tenant, job_id)\`. A job
   belonging to another tenant, or one that does not exist, answers **404** — a foreign job id must be
-  indistinguishable from a missing one. The draft serves any job id it is handed.
+  indistinguishable from a missing one. The starter serves any job id it is handed.
 - The body reports the four outcomes: **\`generated\`**, **\`admitted\`**, **\`parked\`** and
   **\`rejected\`**. The parked count is the one that matters — records a timed-out judge never scored
   are neither admitted nor rejected, and a report that only shows a total hides them.
@@ -26,7 +26,7 @@ Implement \`GET /v1/synthetic/jobs/{job_id}\`, the report a reviewer reads befor
 - The body carries the **\`judge_version\`** that scored the corpus, so a set scored by a judge nobody
   can name cannot ship.
 - Every admitted record **resolves to a seed digest**: read the digest stored on the admitted record
-  (\`records.admitted(job_id)\`) and return it per record. The draft recomputes a digest from whatever
+  (\`records.admitted(job_id)\`) and return it per record. The starter recomputes a digest from whatever
   the seed looks like *now*, so a record generated before a seed version bump points at the wrong
   seed — the linkage is lost exactly for the records generated across retries.
 
@@ -73,7 +73,7 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
       id: 'counts',
       title: 'Reports generated, admitted, parked and rejected counts',
       detail:
-        'The report separates the four outcomes — `generated`, `admitted`, `parked`, `rejected` — on `GET /v1/synthetic/jobs/{id}`. The draft reports a total plus admitted, so the unscored records it parked nowhere are invisible.',
+        'The report separates the four outcomes — `generated`, `admitted`, `parked`, `rejected` — on `GET /v1/synthetic/jobs/{id}`. The starter reports a total plus admitted, so the unscored records it parked nowhere are invisible.',
       match: {
         python: {
           all: [/@app\.get\(/, /\/v1\/synthetic\/jobs\//, /"generated"/, /"admitted"/, /"parked"/, /"rejected"/],
@@ -101,7 +101,7 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
       id: 'coverage',
       title: 'Returns per-entity coverage, not a total',
       detail:
-        'Coverage is read from the job’s coverage hash (`HGETALL synth:cov:{job_id}`) and returned per entity. The draft returns a single generated count, which is the number that hid the collapse.',
+        'Coverage is read from the job’s coverage hash (`HGETALL synth:cov:{job_id}`) and returned per entity. The starter returns a single generated count, which is the number that hid the collapse.',
       match: {
         python: {all: [/coverage/, /hgetall\(/]},
         typescript: {all: [/coverage/, /hgetall\(/]},
@@ -114,7 +114,7 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
       id: 'judge-version',
       title: 'Names the judge version that scored the corpus',
       detail:
-        'The report carries `judge_version`, so a corpus scored by an unnamed judge cannot ship. The draft reports no judge identity at all.',
+        'The report carries `judge_version`, so a corpus scored by an unnamed judge cannot ship. The starter reports no judge identity at all.',
       match: {
         python: {all: [/judge_version/]},
         typescript: {all: [/judge_version|judgeVersion/]},
@@ -127,7 +127,7 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
       id: 'provenance',
       title: 'Resolves every admitted record to its stored seed digest',
       detail:
-        'Each admitted record is read with its stored `seed_digest` (`records.admitted(...)`), so a record generated before a seed version bump still points at the seed it came from. The draft recomputes the digest from the current seed.',
+        'Each admitted record is read with its stored `seed_digest` (`records.admitted(...)`), so a record generated before a seed version bump still points at the seed it came from. The starter recomputes the digest from the current seed.',
       match: {
         python: {all: [/seed_digest/, /records\.admitted\(/], none: [/recompute_digest/]},
         typescript: {all: [/seed_digest/, /records\.admitted\(/], none: [/recomputeDigest/]},
@@ -140,7 +140,7 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
       id: 'tenant-scope',
       title: 'Scopes the report to the authenticated tenant',
       detail:
-        'The job is authorized against the request tenant before its counters are read, and a foreign job answers **404**. The draft serves any job id in the path.',
+        'The job is authorized against the request tenant before its counters are read, and a foreign job answers **404**. The starter serves any job id in the path.',
       match: {
         python: {all: [/assert_tenant_owns/, /404/]},
         typescript: {all: [/assertTenantOwns/, /404/]},
@@ -152,7 +152,7 @@ the report that let the collapsed, timeout-ridden corpus through in the first pl
   ],
   code: {
     python: {
-      starter: `"""GET /v1/synthetic/jobs/{job_id}: a model-generated draft that reports a total."""
+      starter: `"""GET /v1/synthetic/jobs/{job_id}: flawed code that reports a total."""
 import hashlib
 
 from fastapi import FastAPI, Header
@@ -180,7 +180,7 @@ records = ReportStore()
 
 
 def recompute_digest(seed_row: str) -> str:
-    # TODO: this draft reports a total and an admitted count, so the records nobody scored are
+    # TODO: this starter reports a total and an admitted count, so the records nobody scored are
     # invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row
     # as it looks today, so a record generated before a seed version bump points at the wrong seed.
     return hashlib.sha256(seed_row.encode("utf-8")).hexdigest()
@@ -266,7 +266,7 @@ def read_job(job_id: str, tenant: str | None = Header(default=None, alias="X-Ten
 `,
     },
     typescript: {
-      starter: `/** GET /v1/synthetic/jobs/:jobId: a model-generated draft that reports a total. */
+      starter: `/** GET /v1/synthetic/jobs/:jobId: flawed code that reports a total. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -275,7 +275,7 @@ import {records} from './store';
 
 export const app = Fastify();
 
-// TODO: this draft reports a total and an admitted count, so the records nobody scored are
+// TODO: this starter reports a total and an admitted count, so the records nobody scored are
 // invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row as
 // it looks today, so a record generated before a seed version bump points at the wrong seed.
 function recomputeDigest(seedRow: string): string {
@@ -370,7 +370,7 @@ void app.listen({port: 8080, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// GET /v1/synthetic/jobs/{job_id}: a model-generated draft that reports a total.
+      starter: `// GET /v1/synthetic/jobs/{job_id}: flawed code that reports a total.
 package main
 
 import (
@@ -397,7 +397,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 // recomputeDigest re-hashes the seed row as it looks today.
 //
-// TODO: this draft reports a total only, so the records nobody scored are invisible; it serves any
+// TODO: this starter reports a total only, so the records nobody scored are invisible; it serves any
 // tenant's job; and provenance is recomputed from the current seed row instead of the digest
 // stored when the record was admitted, so a record made before a seed version bump drifts.
 func recomputeDigest(seedRow string) string {
@@ -561,7 +561,7 @@ object SynthReport {
 
   val records = ReportStore
 
-  // TODO: this draft reports a total and an admitted count, so the records nobody scored are
+  // TODO: this starter reports a total and an admitted count, so the records nobody scored are
   // invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row as
   // it looks today, so a record generated before a seed version bump points at the wrong seed.
   def recomputeDigest(seedRow: String): String =
@@ -647,7 +647,7 @@ object SynthReport {
 `,
     },
     cpp: {
-      starter: `// GET /v1/synthetic/jobs/{job_id}: a model-generated draft that reports a total.
+      starter: `// GET /v1/synthetic/jobs/{job_id}: flawed code that reports a total.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -665,7 +665,7 @@ struct ReportStore {
 ReportStore records;
 std::string sha256Hex(const std::string& input);
 
-// TODO: this draft reports a total and an admitted count, so the records nobody scored are
+// TODO: this starter reports a total and an admitted count, so the records nobody scored are
 // invisible; it serves any tenant's job; and it resolves provenance by re-hashing the seed row as
 // it looks today, so a record generated before a seed version bump points at the wrong seed.
 std::string recomputeDigest(const std::string& seedRow) {

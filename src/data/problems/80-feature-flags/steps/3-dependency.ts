@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['flagsvc', 'engine'],
   task: `## Task
 
-An emergency disable must reach **every** evaluator fast; a normal rule change may lag. The starter is
-the model-generated draft: it pushes the kill switch over gRPC in a retry loop. It compiles and works
-on the demo, and it hides three flaws.
+**Starting point.** An emergency disable must reach **every** evaluator fast; a normal rule change
+may lag. The starter is working code: it pushes the kill switch over gRPC in a retry loop. It
+compiles and works on the demo, and it hides three flaws.
 
 Propagate a kill switch from the flag service to each evaluator over gRPC, and reconcile it against the
 snapshot an evaluator already holds.
@@ -25,7 +25,7 @@ snapshot an evaluator already holds.
 - A kill memo is versioned. When a snapshot arrives, apply it **only if its version is newer than the
   kill memo's version** — a stale snapshot must never overwrite a newer kill memo.
 
-**The subtle flaw.** The draft retries the push with no dedupe and no deadline, so under storm
+**The subtle flaw.** The starter retries the push with no dedupe and no deadline, so under storm
 conditions the same kill is replayed; it has no staleness bound; and its \`apply_kill\` writes the
 memo unconditionally, so an old snapshot that arrives late can resurrect a flag a newer kill already
 disabled.`,
@@ -62,7 +62,7 @@ disabled.`,
       id: 'bounded',
       title: 'Bounds the push with a 1s deadline and normal changes with 5s staleness',
       detail:
-        'The kill push carries a 1-second deadline and normal changes are allowed to be up to 5 seconds stale. The draft pushes with no deadline and has no staleness bound.',
+        'The kill push carries a 1-second deadline and normal changes are allowed to be up to 5 seconds stale. The starter pushes with no deadline and has no staleness bound.',
       match: {
         python: {all: [/KILL_DEADLINE_S/, /STALENESS_BOUND_S/]},
         typescript: {all: [/KILL_DEADLINE_MS/, /STALENESS_BOUND_MS/]},
@@ -75,7 +75,7 @@ disabled.`,
       id: 'immediate',
       title: 'A kill switch carries the effective-immediately marker',
       detail:
-        'The kill request is marked `effective_immediately`, so an evaluator applies it without waiting for the next snapshot. The draft sends a plain push.',
+        'The kill request is marked `effective_immediately`, so an evaluator applies it without waiting for the next snapshot. The starter sends a plain push.',
       match: {
         python: {all: [/effective_immediately/]},
         typescript: {all: [/effectiveImmediately/]},
@@ -88,7 +88,7 @@ disabled.`,
       id: 'dedupe',
       title: 'Dedupes pushes by version',
       detail:
-        'A push whose version is not newer than the last version this evaluator applied is dropped. The draft retries the same push with no dedupe.',
+        'A push whose version is not newer than the last version this evaluator applied is dropped. The starter retries the same push with no dedupe.',
       match: {
         python: {all: [/def push_kill\(/, /last_version/]},
         typescript: {all: [/function pushKill\(/, /lastVersion/]},
@@ -101,7 +101,7 @@ disabled.`,
       id: 'memo',
       title: 'A stale snapshot cannot overwrite a newer kill memo',
       detail:
-        'The kill memo is versioned and a snapshot is applied only when it is newer than the memo. The draft writes the memo unconditionally, so a late old snapshot resurrects a killed flag.',
+        'The kill memo is versioned and a snapshot is applied only when it is newer than the memo. The starter writes the memo unconditionally, so a late old snapshot resurrects a killed flag.',
       match: {
         python: {all: [/def apply_kill\(/, /memo_version/]},
         typescript: {all: [/function applyKill\(/, /memoVersion/]},
@@ -119,7 +119,7 @@ KILL_MEMO = "flags:kill"
 
 
 def push_kill(channel, flag_key: str, version: int) -> bool:
-    # TODO: this draft retries kill-switch pushes with no dedupe under storm conditions, has no
+    # TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
     # staleness bound, and lets an old snapshot overwrite a newer kill memo.
     stub = channel.unary_unary("/flags.FlagService/PushKill")
     for _ in range(5):
@@ -182,7 +182,7 @@ interface FlagStub extends grpc.Client {
 }
 
 async function pushKill(stub: FlagStub, push: KillPush): Promise<boolean> {
-  // TODO: this draft retries kill-switch pushes with no dedupe under storm conditions, has no
+  // TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
   // staleness bound, and lets an old snapshot overwrite a newer kill memo.
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
@@ -260,7 +260,7 @@ type KillRequest struct {
 type KillReply struct{}
 
 func PushKill(ctx context.Context, conn *grpc.ClientConn, req KillRequest) error {
-	// TODO: this draft retries kill-switch pushes with no dedupe under storm conditions, has no
+	// TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
 	// staleness bound, and lets an old snapshot overwrite a newer kill memo.
 	for attempt := 0; attempt < 5; attempt++ {
 		if err := conn.Invoke(ctx, "/flags.FlagService/PushKill", &req, &KillReply{}); err == nil {
@@ -326,7 +326,7 @@ object KillMemo {
 }
 
 def pushKill(channel: ManagedChannel, flagKey: String, version: Long): Boolean = {
-  // TODO: this draft retries kill-switch pushes with no dedupe under storm conditions, has no
+  // TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
   // staleness bound, and lets an old snapshot overwrite a newer kill memo.
   var attempt = 0
   while (attempt < 5) {
@@ -371,7 +371,7 @@ def applyKill(redis: RedisCommands, flagKey: String, version: Long): Boolean = {
 static const std::string kill_memo = "flags:kill";
 
 bool push_kill(grpc::ChannelInterface* channel, const std::string& flag_key, long version) {
-  // TODO: this draft retries kill-switch pushes with no dedupe under storm conditions, has no
+  // TODO: this starter retries kill-switch pushes with no dedupe under storm conditions, has no
   // staleness bound, and lets an old snapshot overwrite a newer kill memo.
   for (int attempt = 0; attempt < 5; attempt += 1) {
     grpc::ClientContext ctx;

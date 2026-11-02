@@ -12,9 +12,9 @@ export const endpointStep: Step = {
   focus: ['exchange', 'bidding', 'features', 'creatives'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, decodes
+**Starting point.** The starter is working code: it registers the route, decodes
 the body, calls the feature service, the scorer and the creative cache and returns a bid. It
-compiles, it answers the demo request, and it hides three production flaws. Review it like the
+compiles, it answers the demo request, and it hides three production flaws. Debug it like the
 service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/bids\` with body
@@ -25,7 +25,7 @@ Implement \`POST /v1/bids\` with body
 - \`timeout_ms\` is the auction's **total** budget: an integer from **1** to **200**, defaulting to
   **100**; anything else is **400**.
 - \`floor_cents\` is an integer from **0** to **1 000 000**; a negative or absurd floor is **400**.
-  The draft accepts both, so \`max(floor_cents, score + 1)\` turns a negative floor into a
+  The starter accepts both, so \`max(floor_cents, score + 1)\` turns a negative floor into a
   nonsense bid that wins the auction and loses money.
 - The budget is started **once**, at the top of the handler, as a \`Deadline\`/clock object; every
   downstream call is handed \`remaining_ms()\` (\`budget_ms=\` / \`budgetMs:\` / \`BudgetMs:\`) instead of
@@ -37,7 +37,7 @@ Implement \`POST /v1/bids\` with body
   "degraded": true}\`. A late bid is worse than no bid — the auction has already closed.
 - A bid that did finish returns \`{"auction_id", "bid_cents", "creative_id", "degraded"}\`.
 
-**Failure mode the checks target.** The draft never reads \`timeout_ms\`, so the budget exists only in
+**Failure mode the checks target.** The starter never reads \`timeout_ms\`, so the budget exists only in
 the caller's head: features, scoring and the creative cache run back to back at their own latency and
 the response lands after the exchange's 100 ms close. It validates nothing either, so one negative
 \`floor_cents\` produces a bid the bidder cannot afford. The checks below require the validation
@@ -73,7 +73,7 @@ budget.`,
       id: 'validate',
       title: 'Rejects a negative floor and a nonsense budget with 400',
       detail:
-        '`floor_cents` must be an integer in 0..1 000 000 and `timeout_ms` in 1..200, both **400** on violation. The draft validates neither, so a negative floor becomes a winning bid and a 5 s `timeout_ms` becomes a budget the exchange never offered.',
+        '`floor_cents` must be an integer in 0..1 000 000 and `timeout_ms` in 1..200, both **400** on violation. The starter validates neither, so a negative floor becomes a winning bid and a 5 s `timeout_ms` becomes a budget the exchange never offered.',
       match: {
         python: {all: [/MAX_FLOOR_CENTS/, /MAX_BUDGET_MS/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_FLOOR_CENTS/, /MAX_BUDGET_MS/, /code\(\s*400\s*\)/]},
@@ -86,7 +86,7 @@ budget.`,
       id: 'deadline',
       title: 'Starts one deadline and hands its remaining time to every stage',
       detail:
-        'The budget is started once at the top of the handler and each downstream call receives `remaining_ms()` of that same deadline — never a fresh full timeout. The draft passes no budget at all, so every stage waits its own full latency.',
+        'The budget is started once at the top of the handler and each downstream call receives `remaining_ms()` of that same deadline — never a fresh full timeout. The starter passes no budget at all, so every stage waits its own full latency.',
       match: {
         python: {all: [/class Deadline/, /def remaining_ms\(/, /Deadline\.start\(/]},
         typescript: {all: [/class Deadline/, /remainingMs\(\)/, /Deadline\.start\(/]},
@@ -99,7 +99,7 @@ budget.`,
       id: 'budget-shared',
       title: 'No stage starts without checking what is left',
       detail:
-        'The remaining budget is compared against the minimum a bid needs before the next stage runs, and each stage is called with the remaining budget. The draft calls features, the scorer and the creative cache in sequence with no guard.',
+        'The remaining budget is compared against the minimum a bid needs before the next stage runs, and each stage is called with the remaining budget. The starter calls features, the scorer and the creative cache in sequence with no guard.',
       match: {
         python: {all: [/remaining_ms\(\)\s*<\s*MIN_BID_MS/, /budget_ms\s*=\s*deadline\.remaining_ms\(\)/]},
         typescript: {all: [/remainingMs\(\)\s*<\s*MIN_BID_MS/, /budgetMs:\s*deadline\.remainingMs\(\)/]},
@@ -112,7 +112,7 @@ budget.`,
       id: 'no-late-bid',
       title: 'Abandons with a marked no-bid instead of a late bid',
       detail:
-        'A request that cannot finish inside the budget answers 200 with `bid: null` and `reason: "deadline_exceeded"`, so the exchange gets an honest no-bid. The draft always answers with a bid, even one that arrives after the close.',
+        'A request that cannot finish inside the budget answers 200 with `bid: null` and `reason: "deadline_exceeded"`, so the exchange gets an honest no-bid. The starter always answers with a bid, even one that arrives after the close.',
       match: {
         python: {all: [/no_bid\(/, /deadline_exceeded/, /"bid": None/]},
         typescript: {all: [/noBid\(/, /deadline_exceeded/, /bid: null/]},
@@ -166,10 +166,10 @@ creatives = Creatives()
 
 @app.post("/v1/bids")
 def bid(body: BidRequest, bidder: str = Header(alias="X-Bidder-Id")) -> JSONResponse:
-    # TODO: this draft never reads timeout_ms, so no stage shares the auction's budget: features,
+    # TODO: this starter never reads timeout_ms, so no stage shares the auction's budget: features,
     # the scorer and the creative cache run back to back at their own latency and the bid lands
     # after the exchange closed. It also validates nothing, so a negative floor_cents produces a
-    # nonsense bid. Review all three.
+    # nonsense bid. Fix all three.
     feats = features.fetch(body.user_hash, budget_ms=body.timeout_ms)
     score = scorer.score(feats, budget_ms=body.timeout_ms)
     creative = creatives.pick(body.auction_id, budget_ms=body.timeout_ms)
@@ -290,7 +290,7 @@ def bid(body: BidRequest, bidder: str | None = Header(default=None, alias="X-Bid
 `,
     },
     typescript: {
-      starter: `/** POST /v1/bids: a model-generated draft that never reads the auction budget. */
+      starter: `/** POST /v1/bids: flawed code that never reads the auction budget. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -325,10 +325,10 @@ const deps = {
 };
 
 app.post('/v1/bids', async (request, reply) => {
-  // TODO: this draft never reads timeout_ms, so no stage shares the auction's budget: features,
+  // TODO: this starter never reads timeout_ms, so no stage shares the auction's budget: features,
   // the scorer and the creative cache run back to back at their own latency and the bid lands
   // after the exchange closed. It also validates nothing, so a negative floor_cents produces a
-  // nonsense bid. Review all three.
+  // nonsense bid. Fix all three.
   const body = request.body as BidBody;
   const features = await deps.features.fetch(body.user_hash, {budgetMs: body.timeout_ms ?? 100});
   const score = await deps.scorer.score(features, {budgetMs: body.timeout_ms ?? 100});
@@ -486,10 +486,10 @@ func bid(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft never reads TimeoutMs, so no stage shares the auction's budget: features,
+	// TODO: this starter never reads TimeoutMs, so no stage shares the auction's budget: features,
 	// the scorer and the creative cache run back to back at their own latency and the bid lands
 	// after the exchange closed. It also validates nothing, so a negative FloorCents produces a
-	// nonsense bid. Review all three.
+	// nonsense bid. Fix all three.
 	feats, _ := features.Fetch(r.Context(), body.UserHash, body.TimeoutMs)
 	score, _ := scorer.Score(r.Context(), feats, body.TimeoutMs)
 	creative, _ := creatives.Pick(r.Context(), body.AuctionID, body.TimeoutMs)
@@ -691,10 +691,10 @@ object BiddingApi extends Features with Scorer with Creatives {
       post {
         headerValueByName("X-Bidder-Id") { bidder =>
           entity(as[BidRequest]) { body =>
-            // TODO: this draft never reads body.timeout_ms, so no stage shares the auction's
+            // TODO: this starter never reads body.timeout_ms, so no stage shares the auction's
             // budget: features, the scorer and the creative cache run back to back at their own
             // latency and the bid lands after the exchange closed. It also validates nothing, so a
-            // negative floor_cents produces a nonsense bid. Review all three.
+            // negative floor_cents produces a nonsense bid. Fix all three.
             val feats = fetch(body.user_hash, body.timeout_ms)
             val score = this.score(feats, body.timeout_ms)
             val creative = pick(body.auction_id, body.timeout_ms)
@@ -836,10 +836,10 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft never reads timeout_ms, so no stage shares the auction's budget: features,
+    // TODO: this starter never reads timeout_ms, so no stage shares the auction's budget: features,
     // the scorer and the creative cache run back to back at their own latency and the bid lands
     // after the exchange closed. It also validates nothing, so a negative floor_cents produces a
-    // nonsense bid. Review all three.
+    // nonsense bid. Fix all three.
     const auto userHash = body.value("user_hash", std::string());
     const auto auctionId = body.value("auction_id", std::string());
     const int timeoutMs = body.value("timeout_ms", 100);
@@ -981,9 +981,9 @@ int main() {
     'Validate before spending: tenant, `auction_id`, `timeout_ms` in 1..200, `floor_cents` in 0..1 000 000, each an early 400. A negative floor is not a cheap bid — `max(floor, score + 1)` makes it a *winning* bid the bidder never agreed to.',
     'The guard is what makes the deadline real: before each stage compare `remaining_ms() < MIN_BID_MS` and return the no-bid — 200 with `bid: null`, `reason: "deadline_exceeded"`, `degraded: true`. The exchange would rather hear "no bid" than receive a bid after the auction closed.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary and
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary and
 whether you understand that an auction's budget is one number shared by every stage, not a timeout
-per call. The draft reads fine because the demo has a fast feature service and never sends a timeout.
+per call. The starter reads fine because the demo has a fast feature service and never sends a timeout.
 
 Three defects are being checked. Validation: a negative floor and a five-second budget both travel
 through an endpoint that trusts the caller, and the first one produces a bid the bidder cannot pay.

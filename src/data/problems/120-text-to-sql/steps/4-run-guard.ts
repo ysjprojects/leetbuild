@@ -8,10 +8,10 @@ export const runGuardStep: Step = {
   focus: ['analyst', 'api', 'warehouse'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it looks the query up and
+**Starting point.** The starter is working code: it looks the query up and
 hands its SQL to the warehouse. With well-behaved model output the demo passes. It hides four
 production flaws: anything the model wrote is executed, against any table, without a partition
-filter, with no row cap and no timeout. Review it like the owner of the warehouse, fix it, and prove
+filter, with no row cap and no timeout. Debug it like the owner of the warehouse, fix it, and prove
 the fix.
 
 Implement \`POST /v1/queries/{id}/run\`. The record for \`{id}\` holds \`sql\`, \`user\`,
@@ -40,7 +40,7 @@ returns nothing.
 **Failure mode the checks target.** Executing model output verbatim means the model, not the
 service, decides what the warehouse runs: one hallucinated table name is a failed query, one
 missing partition filter is a full-table scan, one missing \`LIMIT\` streams a billion rows into a
-browser tab, and one slow join holds a warehouse slot until someone notices. The draft gets all of
+browser tab, and one slow join holds a warehouse slot until someone notices. The starter gets all of
 these wrong by doing nothing at all.`,
   sequence: {
     participants: ['Analyst', 'querygen', 'query store', 'Warehouse'],
@@ -76,7 +76,7 @@ these wrong by doing nothing at all.`,
       id: 'single-select',
       title: 'Runs only a single SELECT',
       detail:
-        '`is_single_select` accepts one statement starting with `SELECT` or `WITH` and nothing else; a failure is **422**. The draft executes whatever the model wrote.',
+        '`is_single_select` accepts one statement starting with `SELECT` or `WITH` and nothing else; a failure is **422**. The starter executes whatever the model wrote.',
       match: {
         python: {all: [/def is_single_select\(/, /status_code\s*=\s*422/]},
         typescript: {all: [/function isSingleSelect\(/, /code\(\s*422\s*\)/]},
@@ -89,7 +89,7 @@ these wrong by doing nothing at all.`,
       id: 'tables-acked',
       title: 'Rejects tables outside the ACKed list',
       detail:
-        '`referenced_tables` collects every `FROM`/`JOIN` target and any name not in `tables_acked` is **422**. The draft lets a hallucinated table reach the warehouse.',
+        '`referenced_tables` collects every `FROM`/`JOIN` target and any name not in `tables_acked` is **422**. The starter lets a hallucinated table reach the warehouse.',
       match: {
         python: {all: [/def referenced_tables\(/, /tables_acked/, /status_code\s*=\s*422/]},
         typescript: {all: [/function referencedTables\(/, /tables_acked/, /code\(\s*422\s*\)/]},
@@ -115,7 +115,7 @@ these wrong by doing nothing at all.`,
       id: 'limit-timeout',
       title: 'Injects LIMIT 1000 and a 60 s statement timeout',
       detail:
-        '`with_limit` appends `LIMIT 1000` (`MAX_ROWS`) or lowers a larger one, and the warehouse call carries `STATEMENT_TIMEOUT_S = 60`. The draft runs the query unbounded in rows and time.',
+        '`with_limit` appends `LIMIT 1000` (`MAX_ROWS`) or lowers a larger one, and the warehouse call carries `STATEMENT_TIMEOUT_S = 60`. The starter runs the query unbounded in rows and time.',
       match: {
         python: {
           all: [
@@ -252,7 +252,7 @@ def run_query(query_id: str, user: str | None = Header(default=None, alias="X-Us
 `,
     },
     typescript: {
-      starter: `/** POST /v1/queries/:id/run: a model-generated draft that executes the generated SQL as-is. */
+      starter: `/** POST /v1/queries/:id/run: flawed code that executes the generated SQL as-is. */
 import Fastify from 'fastify';
 
 import {store} from './store';

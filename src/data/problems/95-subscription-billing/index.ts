@@ -7,13 +7,13 @@ import {invoiceEventsStep} from './steps/4-events';
 import {invoiceLedgerStep} from './steps/5-read';
 
 /**
- * Subscription billing on the AI-era track: the course is not "charge a customer every month", it
- * is the review you owe a model-generated billing path before it moves real money. A validated plan
- * change prorated over the actual days of the period → one atomic Redis run marker per
- * (subscription, period) claimed before the charge and confirmed after → a processor call with a
- * deadline, an invoice-scoped idempotency key and reconciliation instead of blind retries → invoice
- * events keyed by subscription published after confirmation, failures included, with an outbox →
- * a ledger read that ties out against the processor and never shows another tenant's invoices.
+ * Subscription billing: the course is not "charge a customer every month", it is the debugging you
+ * owe a billing path before it moves real money. A validated plan change prorated over the actual
+ * days of the period → one atomic Redis run marker per (subscription, period) claimed before the
+ * charge and confirmed after → a processor call with a deadline, an invoice-scoped idempotency key
+ * and reconciliation instead of blind retries → invoice events keyed by subscription published
+ * after confirmation, failures included, with an outbox → a ledger read that ties out against the
+ * processor and never shows another tenant's invoices.
  */
 export const subscriptionBillingProblem: Problem = {
   id: 'subscription-billing',
@@ -21,7 +21,6 @@ export const subscriptionBillingProblem: Problem = {
   tagline: 'Plans and invoices that prorate correctly, charge once and reconcile.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Subscription Billing
 
@@ -75,12 +74,12 @@ One service, **billingd**, with five pieces:
    reconciliation state, computed from stored invoices and tied out against the processor's records
    for the same period, with a foreign subscription answered as **404**.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real billing
-path: read the draft against the failure modes, name the subtle one, fix it, and prove the fix with
-checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real billing path: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

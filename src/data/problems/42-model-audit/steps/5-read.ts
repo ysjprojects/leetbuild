@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'auditd', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the endpoint answers quickly, it
+**Starting point.** The starter is working code: the endpoint answers quickly, it
 is right for every record the demo asks about, and it hides three flaws — one that makes verification
-meaningless, one that makes it partial, and one that leaks across tenants. Review it, fix it, and
+meaningless, one that makes it partial, and one that leaks across tenants. Debug it, fix it, and
 prove the fix.
 
 Implement \`GET /v1/audit/decisions/{record_id}/verify\`:
@@ -18,15 +18,15 @@ Implement \`GET /v1/audit/decisions/{record_id}/verify\`:
 - The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the record lookup is scoped by it:
   \`WHERE record_id = $1 AND tenant_id = $2\`. A missing **or foreign** record is **404**, never a
   \`403\` and never a \`200\` — a 403 confirms the record exists, which the caller is not entitled to
-  know. The draft resolves the record by id alone and takes the chain’s tenant from a query string,
+  know. The starter resolves the record by id alone and takes the chain’s tenant from a query string,
   so any caller can verify against any tenant’s chain.
 - **Actually verify.** Walk the chain from the record’s position to the head, recomputing
   \`sha1(prev | record_digest | position)\` at every step and comparing it with the stored digest, and
-  stop at the first position that disagrees or is missing. The draft returns \`valid\` whenever the
+  stop at the first position that disagrees or is missing. The starter returns \`valid\` whenever the
   record exists and only checks that the head value is non-empty — which is not verification.
 - **Report what was covered.** The response is
   \`{"record_id", "valid", "chain_length", "first_divergence"}\`: the number of positions actually
-  walked and the exact position of the first divergence, or \`null\`. The draft reports neither, so a
+  walked and the exact position of the first divergence, or \`null\`. The starter reports neither, so a
   partial walk is indistinguishable from a whole chain.
 - Verification covers from the record’s position **up to the head it names** and stops there: the
   head read at the start of the request is the head the answer refers to.
@@ -82,7 +82,7 @@ theirs; and an answer without a covered length cannot be audited later.`,
       id: 'recompute',
       title: 'Verification recomputes the chain',
       detail:
-        'Each position is rehashed as `sha1(prev | record_digest | position)` and compared with the stored digest. The draft returns `valid` from existence, so an edited record still verifies.',
+        'Each position is rehashed as `sha1(prev | record_digest | position)` and compared with the stored digest. The starter returns `valid` from existence, so an edited record still verifies.',
       match: {
         python: {all: [/sha1hex/, /prev/]},
         typescript: {all: [/sha1hex/, /prev/]},
@@ -95,7 +95,7 @@ theirs; and an answer without a covered length cannot be audited later.`,
       id: 'first-divergence',
       title: 'Reports the first divergence at its exact position',
       detail:
-        'The walk stops at the first position whose recomputed digest disagrees or whose entry is missing, and reports that position. The draft reports only a boolean.',
+        'The walk stops at the first position whose recomputed digest disagrees or whose entry is missing, and reports that position. The starter reports only a boolean.',
       match: {
         python: {all: [/first_divergence/]},
         typescript: {all: [/firstDivergence/]},
@@ -121,7 +121,7 @@ theirs; and an answer without a covered length cannot be audited later.`,
       id: 'tenant-scope',
       title: 'The lookup is tenant-scoped and foreign records are 404',
       detail:
-        '`WHERE record_id = $1 AND tenant_id = $2` and one **404** for both a missing and a foreign record — never **403**. The draft resolves by id alone and verifies against whatever tenant the request names.',
+        '`WHERE record_id = $1 AND tenant_id = $2` and one **404** for both a missing and a foreign record — never **403**. The starter resolves by id alone and verifies against whatever tenant the request names.',
       match: {
         python: {all: [/\b404\b/, /tenant_id = %s/], none: [/\b403\b/]},
         typescript: {all: [/code\(404\)/, /tenant_id = \$2/], none: [/code\(403\)/]},
@@ -141,7 +141,7 @@ app = FastAPI()
 
 @app.get("/v1/audit/decisions/{record_id}/verify")
 def verify(record_id: str, tenant: str = "", cur=None) -> JSONResponse:
-    # TODO: the draft returns valid whenever the record exists, checks only that the head value is
+    # TODO: the starter returns valid whenever the record exists, checks only that the head value is
     # non-empty and resolves the chain from the tenant the request names. Recompute the hashes,
     # scope the lookup to the caller's tenant, and 404 a missing or foreign record.
     cur.execute("SELECT position FROM audit_entries WHERE record_id = %s", (record_id,))
@@ -225,13 +225,13 @@ def verify(
 `,
     },
     typescript: {
-      starter: `/** A model-generated verifier that reports "valid" as long as the record exists. */
+      starter: `/** A verifier that reports "valid" as long as the record exists. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
 
 app.get('/v1/audit/decisions/:record_id/verify', async (request, reply) => {
-  // TODO: the draft returns valid whenever the record exists, checks only that the head value is
+  // TODO: the starter returns valid whenever the record exists, checks only that the head value is
   // non-empty and resolves the chain from the tenant the request names. Recompute the hashes, scope
   // the lookup to the caller's tenant, and 404 a missing or foreign record.
   const {record_id} = request.params as {record_id: string};
@@ -317,7 +317,7 @@ import (
 )
 
 func verifyRecord(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft returns valid whenever the record exists, checks only that the head value is
+	// TODO: the starter returns valid whenever the record exists, checks only that the head value is
 	// non-empty and resolves the chain from the tenant the request names. Recompute the hashes,
 	// scope the lookup to the caller's tenant, and 404 a missing or foreign record.
 	recordID := r.PathValue("record_id")
@@ -453,7 +453,7 @@ object VerifyApi {
   val route: Route =
     path("v1" / "audit" / "decisions" / Segment / "verify") { recordId =>
       get {
-        // TODO: the draft returns valid whenever the record exists, checks only that the head value
+        // TODO: the starter returns valid whenever the record exists, checks only that the head value
         // is non-empty and resolves the chain from the tenant the request names. Recompute the
         // hashes, scope the lookup to the caller's tenant, and 404 a missing or foreign record.
         parameter("tenant") { tenant =>
@@ -582,7 +582,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/audit/decisions/([\\w-]+)/verify)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft returns valid whenever the record exists, checks only that the head value is
+    // TODO: the starter returns valid whenever the record exists, checks only that the head value is
     // non-empty and resolves the chain from the tenant the request names. Recompute the hashes,
     // scope the lookup to the caller's tenant, and 404 a missing or foreign record.
     const std::string record_id = req.matches[1];
@@ -687,5 +687,5 @@ int main() {
     'Verification is a recomputation, not a lookup. Walk from the record’s position to the head, recompute `sha1(prev | record_digest | position)` at each step, and stop at the first mismatch or missing entry. If your `valid` is derived from `exists`, an edited record passes and the endpoint is decoration.',
     'Report the coverage. `chain_length` is how many positions you actually walked and `first_divergence` is where the walk stopped, so a partial verification can never be mistaken for a whole chain — and an answer recorded today can be re-checked against the head it named.',
   ],
-  debrief: `The interviewer is testing the endpoint whose whole job is to be able to say "no". The draft fails in three independent ways, and each one is a different lesson. Trusting existence makes the verifier vacuous: the tamper an auditor performs is exactly the one the draft ignores. Resolving the chain from a request parameter is an IDOR with an audit flavour — you can verify against a chain you do not own, and the answer leaks whether it is intact. And a bare boolean hides the uncomfortable case: a walk that stopped at position 12 of 4 000 is "valid" up to 12, which is a very different statement from "the chain is intact". Reporting the covered length and the divergence position makes the endpoint falsifiable, which is the only property that matters for evidence. Real systems also sign the head at intervals and return the checkpoint, so verification can be bounded and delegated.`,
+  debrief: `The interviewer is testing the endpoint whose whole job is to be able to say "no". The starter fails in three independent ways, and each one is a different lesson. Trusting existence makes the verifier vacuous: the tamper an auditor performs is exactly the one the starter ignores. Resolving the chain from a request parameter is an IDOR with an audit flavour — you can verify against a chain you do not own, and the answer leaks whether it is intact. And a bare boolean hides the uncomfortable case: a walk that stopped at position 12 of 4 000 is "valid" up to 12, which is a very different statement from "the chain is intact". Reporting the covered length and the divergence position makes the endpoint falsifiable, which is the only property that matters for evidence. Real systems also sign the head at intervals and return the checkpoint, so verification can be bounded and delegated.`,
 };

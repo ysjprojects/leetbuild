@@ -8,9 +8,9 @@ export const citationEndpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, takes
+**Starting point.** The starter is working code: it registers the route, takes
 the body and stores a citation. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/citations\` with body
 \`{"document_id": "doc-7", "version": 3, "start": 412, "end": 447, "quote": "…"}\`.
@@ -73,7 +73,7 @@ Every one of those is silent until a reviewer clicks the citation.`,
       id: 'validate',
       title: 'Rejects a malformed span and a missing tenant',
       detail:
-        'A missing `X-Tenant-Id` is **401**; `version < 1`, `start < 0`, `end <= start`, an empty `document_id` or an oversized `quote` is **400**. The draft forwards whatever the caller sent.',
+        'A missing `X-Tenant-Id` is **401**; `version < 1`, `start < 0`, `end <= start`, an empty `document_id` or an oversized `quote` is **400**. The starter forwards whatever the caller sent.',
       match: {
         python: {
           all: [
@@ -104,7 +104,7 @@ Every one of those is silent until a reviewer clicks the citation.`,
       id: 'span-match',
       title: 'The quote must equal the bytes at those offsets',
       detail:
-        'The quote is compared against the slice of the version text and a mismatch answers **422** with the stored text and the supplied quote. The draft stores the quote without ever reading the document bytes.',
+        'The quote is compared against the slice of the version text and a mismatch answers **422** with the stored text and the supplied quote. The starter stores the quote without ever reading the document bytes.',
       match: {
         python: {all: [/status_code\s*=\s*422/, /actual\s*!=\s*body\.quote/, /"stored"/, /"supplied"/]},
         typescript: {all: [/code\(\s*422\s*\)/, /actual\s*!==?\s*body\.quote/, /stored:/, /supplied:/]},
@@ -117,7 +117,7 @@ Every one of those is silent until a reviewer clicks the citation.`,
       id: 'version-scope',
       title: 'Resolves against the named immutable version',
       detail:
-        'The span resolves against `(document_id, version)` — the version the caller named — and the stored record keeps that version, so a later edit cannot re-point it. The draft resolves the document’s latest text and keeps no version.',
+        'The span resolves against `(document_id, version)` — the version the caller named — and the stored record keeps that version, so a later edit cannot re-point it. The starter resolves the document’s latest text and keeps no version.',
       match: {
         python: {all: [/resolve_span\(/, /documents\.get_version\(/, /"version":\s*body\.version/]},
         typescript: {all: [/resolveSpan\(/, /documents\.getVersion\(/, /version:\s*body\.version/]},
@@ -130,7 +130,7 @@ Every one of those is silent until a reviewer clicks the citation.`,
       id: 'idempotent',
       title: 'Keys a replayed record by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the record is stored under `(tenant, key)`; a replay returns the stored citation instead of recording a second one. The draft ignores the header and keys by document id alone.',
+        '`Idempotency-Key` is required and the record is stored under `(tenant, key)`; a replay returns the stored citation instead of recording a second one. The starter ignores the header and keys by document id alone.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/], order: [/store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/], order: [/store\.get\(/, /store\.put\(/]},
@@ -170,7 +170,7 @@ store = CitationStore()
 def record(
     body: CitationRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
 ) -> JSONResponse:
-    # TODO: the draft stores whatever offsets the caller sends, accepts the quote without checking
+    # TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
     # it, and keys by document id alone, so citations to old versions silently point at the newest
     # text. Validate the span, resolve it against (document_id, version), and key the record by
     # (tenant, Idempotency-Key).
@@ -267,7 +267,7 @@ def record(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/citations: a model-generated draft that trusts the caller's offsets. */
+      starter: `/** POST /v1/citations: flawed code that trusts the caller's offsets. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -285,7 +285,7 @@ interface CitationBody {
 }
 
 app.post('/v1/citations', async (request, reply) => {
-  // TODO: the draft stores whatever offsets the caller sends, accepts the quote without checking
+  // TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
   // it, and keys by document id alone, so citations to old versions silently point at the newest
   // text. Validate the span, resolve it against (document_id, version), and key the record by
   // (tenant, Idempotency-Key).
@@ -419,7 +419,7 @@ func record(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: the draft stores whatever offsets the caller sends, accepts the quote without checking
+	// TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
 	// it, and keys by document id alone, so citations to old versions silently point at the newest
 	// text. Validate the span, resolve it against (document_id, version), and key the record by
 	// (tenant, Idempotency-Key).
@@ -597,7 +597,7 @@ object CitationApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[CitationRequest]) { body =>
-            // TODO: the draft stores whatever offsets the caller sends, accepts the quote without
+            // TODO: the starter stores whatever offsets the caller sends, accepts the quote without
             // checking it, and keys by document id alone, so citations to old versions silently
             // point at the newest text. Validate the span, resolve it against (document_id,
             // version), and key the record by (tenant, Idempotency-Key).
@@ -737,7 +737,7 @@ int main() {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: the draft stores whatever offsets the caller sends, accepts the quote without checking
+    // TODO: the starter stores whatever offsets the caller sends, accepts the quote without checking
     // it, and keys by document id alone, so citations to old versions silently point at the newest
     // text. Validate the span, resolve it against (document_id, version), and key the record by
     // (tenant, Idempotency-Key).
@@ -869,5 +869,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler whose bug is in the data model, not the syntax. The draft reads fine because the demo cites a document that was never edited. Three defects are being checked. First, an unverified span: offsets and a quote only mean something together, so the handler must slice the version text and compare — a 422 with both texts is what lets a caller re-anchor. Second, the resolution key: \`(document_id, version)\` is the identity of the text an offset points into; resolving the document's latest version and storing no version at all means every later edit rewrites history. Third, idempotency: the record is keyed by \`(tenant, Idempotency-Key)\` so a client retry returns the same citation instead of a second one with a fresh id. Real stores add byte-offset normalization for encodings, a quote fingerprint for cheap re-anchoring, and a compaction job that re-verifies citations when a document's text is rewritten.`,
+  debrief: `The interviewer is testing whether you can debug a handler whose bug is in the data model, not the syntax. The starter reads fine because the demo cites a document that was never edited. Three defects are being checked. First, an unverified span: offsets and a quote only mean something together, so the handler must slice the version text and compare — a 422 with both texts is what lets a caller re-anchor. Second, the resolution key: \`(document_id, version)\` is the identity of the text an offset points into; resolving the document's latest version and storing no version at all means every later edit rewrites history. Third, idempotency: the record is keyed by \`(tenant, Idempotency-Key)\` so a client retry returns the same citation instead of a second one with a fresh id. Real stores add byte-offset normalization for encodings, a quote fingerprint for cheap re-anchoring, and a compaction job that re-verifies citations when a document's text is rewritten.`,
 };

@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Fleet tracking on the AI-era track: the course is the review you owe a model-generated position
- * pipeline before it drives a dispatch map. Skew-bounded, replay-safe batch ingestion → one atomic
- * Redis compare-and-set per vehicle so out-of-order packets cannot roll state backward → a gRPC
- * geofence check with a deadline whose failures retry under the position sequence → vehicle-keyed
- * position events with no driver identity, published after the Redis write → a fleet snapshot read
- * from one instant with a freshness bound.
+ * Fleet tracking: the course is the debugging you owe a position pipeline before it drives a
+ * dispatch map. Skew-bounded, replay-safe batch ingestion → one atomic Redis compare-and-set per
+ * vehicle so out-of-order packets cannot roll state backward → a gRPC geofence check with a
+ * deadline whose failures retry under the position sequence → vehicle-keyed position events with
+ * no driver identity, published after the Redis write → a fleet snapshot read from one instant with
+ * a freshness bound.
  */
 export const fleetTrackingProblem: Problem = {
   id: 'fleet-tracking',
@@ -20,7 +20,6 @@ export const fleetTrackingProblem: Problem = {
   tagline: 'Vehicle positions that stay current under out-of-order arrivals and replays.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Fleet Tracking
 
@@ -64,12 +63,12 @@ One service, **fleetd**, with five pieces:
 5. \`GET /v1/fleets/{id}/positions\`: a snapshot from one instant, capped at 5 000 vehicles,
    paginated, every position within the freshness bound or flagged stale, and scoped to the tenant.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

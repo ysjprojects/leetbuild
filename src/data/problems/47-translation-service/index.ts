@@ -7,13 +7,13 @@ import {localeEventsStep} from './steps/4-events';
 import {glossaryReadStep} from './steps/5-read';
 
 /**
- * Translation service on the AI-era track: the course is not "call a translation API", it is the
- * review you owe a model-generated localization layer before it ships a language nobody can read.
- * A validated language pair bound to a glue tenant's glossary version → tenant-scoped, versioned
- * Redis caches for glossaries and translation memory → an MT call with a deadline whose fallback is
- * *marked*, never a silent identity → locale-keyed quality events with no text in the payload and
- * counters before the offset commit → a glossary read that returns one tenant's terms with the
- * version a caller can pin.
+ * Translation service: the course is not "call a translation API", it is the debugging you owe a
+ * localization layer before it ships a language nobody can read. A validated language pair bound
+ * to a tenant's glossary version → tenant-scoped, versioned Redis caches for glossaries and
+ * translation memory → an MT call with a deadline whose fallback is *marked*, never a silent
+ * identity → locale-keyed quality events with no text in the payload and counters before the
+ * offset commit → a glossary read that returns one tenant's terms with the version a caller can
+ * pin.
  */
 export const translationServiceProblem: Problem = {
   id: 'translation-service',
@@ -21,7 +21,7 @@ export const translationServiceProblem: Problem = {
   tagline: 'Translate on demand with glossaries that bind, honest fallbacks and locale-keyed metrics.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Translation Service
 
@@ -67,12 +67,12 @@ One service, **translationd**, with five pieces:
    **403** when the lookup resolves to another tenant's glossary, and a response no cache may hold
    past the next update.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

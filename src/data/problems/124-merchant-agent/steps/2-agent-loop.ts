@@ -8,10 +8,10 @@ export const agentLoopStep: Step = {
   focus: ['api', 'model', 'tools'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the loop behind every
+**Starting point.** The starter is working code for the loop behind every
 assist turn: the model reads the conversation, picks a tool or answers, the tool runs, the result
 goes back to the model. It works on the demo. It hides four production flaws — one of them is the
-exact failure Shopify's Sidekick team describes as *death by a thousand instructions*. Review it, fix
+exact failure Shopify's Sidekick team describes as *death by a thousand instructions*. Debug it, fix
 it, and prove the fix.
 
 Implement \`run_agent(shop, scopes, message, page)\` over two gRPC services: \`Model.Complete\`
@@ -55,7 +55,7 @@ account into a product editor.`,
     ],
   },
   hints: [
-    'Split the three things the draft stuffs into one prompt: a constant `SYSTEM_PROMPT` (sent as-is), a `ToolSpec(name, description)` list the model sees every turn, and each tool’s `instructions`, which only exist to be handed back when that tool fires.',
+    'Split the three things the starter stuffs into one prompt: a constant `SYSTEM_PROMPT` (sent as-is), a `ToolSpec(name, description)` list the model sees every turn, and each tool’s `instructions`, which only exist to be handed back when that tool fires.',
     'Keep a `jit_instructions` variable: set it from the invoked tool after a successful `Invoke`, pass it in the next `Complete` request’s `instructions` field, then reset it to empty. The conversation messages carry the tool result; the instructions ride alongside, for one turn.',
     'Bound the loop three ways: `for _ in range(MAX_TURNS)` instead of `while True`, `timeout=` on every stub call, and an elapsed-time check against `LOOP_BUDGET_S` at the top of each turn. Before invoking, look the tool up and compare its `required_scope` with the merchant’s scopes; on a miss, append a `PERMISSION_DENIED` tool message instead of calling anything.',
   ],
@@ -77,7 +77,7 @@ account into a product editor.`,
       id: 'jit-instructions',
       title: 'Injects a tool’s instructions only when that tool fires',
       detail:
-        'A `jit_instructions` value is set from the invoked tool and passed as the next `Complete` request’s `instructions`; no code path joins every tool’s instructions into the prompt or the tool list. The draft dumps all of them into the system prompt and the tool descriptions.',
+        'A `jit_instructions` value is set from the invoked tool and passed as the next `Complete` request’s `instructions`; no code path joins every tool’s instructions into the prompt or the tool list. The starter dumps all of them into the system prompt and the tool descriptions.',
       match: {
         python: {all: [/jit_instructions/, /instructions\s*=\s*jit_instructions/], none: [/\.instructions for /]},
         typescript: {all: [/jitInstructions/, /instructions:\s*jitInstructions/], none: [/=>\s*\w+\.instructions\b/]},
@@ -93,7 +93,7 @@ account into a product editor.`,
       id: 'bounded-turns',
       title: 'At most six model turns, no unbounded loop',
       detail:
-        'Turns are bounded by `MAX_TURNS = 6` in a counted loop; there is no `while True` / `for {}`. The draft loops until the model stops calling tools, which a confused model never does.',
+        'Turns are bounded by `MAX_TURNS = 6` in a counted loop; there is no `while True` / `for {}`. The starter loops until the model stops calling tools, which a confused model never does.',
       match: {
         python: {all: [/MAX_TURNS\s*=\s*6/, /range\(MAX_TURNS\)/], none: [/while\s+True/]},
         typescript: {
@@ -130,7 +130,7 @@ account into a product editor.`,
       id: 'scope-gate',
       title: 'Refuses tools outside the merchant’s scopes',
       detail:
-        'Before `Invoke`, the tool is looked up and its `required_scope` checked against the scopes attached in step 1; a miss appends a `PERMISSION_DENIED` tool result and never invokes. The draft invokes whatever name the model produces.',
+        'Before `Invoke`, the tool is looked up and its `required_scope` checked against the scopes attached in step 1; a miss appends a `PERMISSION_DENIED` tool result and never invokes. The starter invokes whatever name the model produces.',
       match: {
         python: {all: [/\.required_scope not in scopes/, /PERMISSION_DENIED/]},
         typescript: {all: [/scopes\.includes\(\s*\w+\.requiredScope\s*\)/, /PERMISSION_DENIED/]},
@@ -201,9 +201,9 @@ class Outcome:
 
 
 def run_agent(shop: str, scopes: list[str], message: str, page: str) -> Outcome:
-    # TODO: this draft dumps every tool's instructions into the system prompt and the tool list,
+    # TODO: this starter dumps every tool's instructions into the system prompt and the tool list,
     # loops until the model stops calling tools, sets no deadline, and invokes any tool the model
-    # names. Review all four.
+    # names. Fix all four.
     system = SYSTEM_PROMPT + "\\n\\n" + "\\n\\n".join(t.instructions for t in TOOLS.values())
     specs = [
         sidekick_pb2.ToolSpec(name=t.name, description=t.description + "\\n" + t.instructions)
@@ -325,7 +325,7 @@ def run_agent(shop: str, scopes: list[str], message: str, page: str) -> Outcome:
 `,
     },
     typescript: {
-      starter: `/** The agentic loop: a model-generated draft that puts every tool's instructions in the system prompt. */
+      starter: `/** The agentic loop: flawed code that puts every tool's instructions in the system prompt. */
 import {model, tools, type Message} from './clients';
 
 const SYSTEM_PROMPT =
@@ -375,9 +375,9 @@ export async function runAgent(input: {
   message: string;
   page: string;
 }): Promise<Outcome> {
-  // TODO: this draft dumps every tool's instructions into the system prompt and the tool list,
+  // TODO: this starter dumps every tool's instructions into the system prompt and the tool list,
   // loops until the model stops calling tools, sets no deadline, and invokes any tool the model
-  // names. Review all four.
+  // names. Fix all four.
   const system = SYSTEM_PROMPT + '\\n\\n' + Object.values(TOOLS).map(t => t.instructions).join('\\n\\n');
   const specs = Object.values(TOOLS).map(t => ({name: t.name, description: t.description + '\\n' + t.instructions}));
   const messages: Message[] = [{role: 'user', content: \`[page: \${input.page}] \${input.message}\`}];
@@ -535,9 +535,9 @@ type Outcome struct {
 	ToolsUsed []string
 }
 
-// TODO: this draft dumps every tool's instructions into the system prompt and the tool list, loops
+// TODO: this starter dumps every tool's instructions into the system prompt and the tool list, loops
 // until the model stops calling tools, sets no deadline, and invokes any tool the model names.
-// Review all four.
+// Fix all four.
 func Run(ctx context.Context, shop string, scopes []string, message, page string) (Outcome, error) {
 	var parts []string
 	var specs []*pb.ToolSpec
@@ -729,9 +729,9 @@ object Agent {
   val model = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
   val tools = ToolsGrpc.blockingStub(ManagedChannelBuilder.forAddress("tools", 9000).usePlaintext().build())
 
-  // TODO: this draft dumps every tool's instructions into the system prompt and the tool list, loops
+  // TODO: this starter dumps every tool's instructions into the system prompt and the tool list, loops
   // until the model stops calling tools, sets no deadline, and invokes any tool the model names.
-  // Review all four.
+  // Fix all four.
   def run(shop: String, scopes: List[String], message: String, page: String): Outcome = {
     val systemPrompt = SystemPrompt + "\\n\\n" + Tools.values.map(_.instructions).mkString("\\n\\n")
     val specs = Tools.values.map(t => ToolSpec(name = t.name, description = t.description + "\\n" + t.instructions)).toSeq
@@ -884,9 +884,9 @@ std::unique_ptr<sidekick::Model::Stub> model =
 std::unique_ptr<sidekick::Tools::Stub> tools =
     sidekick::Tools::NewStub(grpc::CreateChannel("tools:9000", grpc::InsecureChannelCredentials()));
 
-// TODO: this draft dumps every tool's instructions into the system prompt and the tool list, loops
+// TODO: this starter dumps every tool's instructions into the system prompt and the tool list, loops
 // until the model stops calling tools, sets no deadline, and invokes any tool the model names.
-// Review all four.
+// Fix all four.
 AgentOutcome runAgent(
     const std::string& shop,
     const std::vector<std::string>& scopes,
@@ -1053,5 +1053,5 @@ AgentOutcome runAgent(
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand what an agent's context window is for. Sidekick's team hit it at scale: past twenty tools the boundaries blur, past fifty there are several ways to do everything, and a system prompt that tries to cover every case becomes a pile of conflicting special cases that slows the model and cannot be maintained. The fix is structural, not a better prompt: the system prompt holds fundamental behaviour and never changes (so the provider's prompt cache keeps hitting), the tool list is compact, and each tool's guidance is delivered just in time — alongside that tool's result, for the next turn only. The other three flaws are the ones every generated loop has: no turn bound, no deadline, and no check that the tool the model picked is one this merchant's staff account may use. Real loops add per-tool argument schemas validated before invocation, instruction variants by beta flag, model version and page context (the source's modularity point), and a token budget per turn alongside the time budget.`,
+  debrief: `The interviewer is testing whether you understand what an agent's context window is for. Sidekick's team hit it at scale: past twenty tools the boundaries blur, past fifty there are several ways to do everything, and a system prompt that tries to cover every case becomes a pile of conflicting special cases that slows the model and cannot be maintained. The fix is structural, not a better prompt: the system prompt holds fundamental behaviour and never changes (so the provider's prompt cache keeps hitting), the tool list is compact, and each tool's guidance is delivered just in time — alongside that tool's result, for the next turn only. The other three flaws are the ones every first loop has: no turn bound, no deadline, and no check that the tool the model picked is one this merchant's staff account may use. Real loops add per-tool argument schemas validated before invocation, instruction variants by beta flag, model version and page context (the source's modularity point), and a token budget per turn alongside the time budget.`,
 };

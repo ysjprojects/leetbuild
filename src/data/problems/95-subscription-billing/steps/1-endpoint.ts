@@ -8,9 +8,9 @@ export const changePlanStep: Step = {
   focus: ['client', 'billing', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and returns an invoice schedule. It compiles, it serves the demo, and it hides three
-production flaws. Review it like the billing owner, fix it, and prove the fix with the checks below.
+production flaws. Debug it like the billing owner, fix it, and prove the fix with the checks below.
 
 Implement the plan change on \`POST /v1/subscriptions\` with body
 \`{"subscription_id": "…", "plan": "…", "effective_date": "now", "proration_policy": "actual_days"}\`.
@@ -82,7 +82,7 @@ endpoint that denies nothing looks permissive rather than unsafe).`,
       id: 'tenant',
       title: 'Authenticates the tenant',
       detail:
-        'A missing `X-Tenant-Id` is **401** and a subscription that belongs to another tenant is **404**. The draft denies nothing: it reads the subscription straight from the body, so any caller can preview — or force — any tenant’s schedule.',
+        'A missing `X-Tenant-Id` is **401** and a subscription that belongs to another tenant is **404**. The starter denies nothing: it reads the subscription straight from the body, so any caller can preview — or force — any tenant’s schedule.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/, /status_code\s*=\s*404/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/, /code\(\s*404\s*\)/]},
@@ -95,7 +95,7 @@ endpoint that denies nothing looks permissive rather than unsafe).`,
       id: 'effective-date',
       title: 'Rejects an unsupported effective date or proration policy',
       detail:
-        '`effective_date` must be `now` or the next period boundary, and `proration_policy` must be one the platform implements — both **400** otherwise. The draft accepts any string and prorates it anyway, so an uncomputable change reaches an invoice.',
+        '`effective_date` must be `now` or the next period boundary, and `proration_policy` must be one the platform implements — both **400** otherwise. The starter accepts any string and prorates it anyway, so an uncomputable change reaches an invoice.',
       match: {
         python: {all: [/EFFECTIVE_NOW/, /next_period_start/, /PRORATION_POLICIES/, /status_code\s*=\s*400/]},
         typescript: {all: [/EFFECTIVE_NOW/, /nextPeriodStart/, /PRORATION_POLICIES/, /code\(\s*400\s*\)/]},
@@ -108,7 +108,7 @@ endpoint that denies nothing looks permissive rather than unsafe).`,
       id: 'actual-days',
       title: 'Prorates over the actual days of the period',
       detail:
-        'The divisor is the period’s real length, computed from its two bounds (`period_days = (period_end - period_start).days`), never a constant thirty-day month. The draft divides by `MONTH_DAYS = 30`, so a 31-day period is under-billed and February is over-billed.',
+        'The divisor is the period’s real length, computed from its two bounds (`period_days = (period_end - period_start).days`), never a constant thirty-day month. The starter divides by `MONTH_DAYS = 30`, so a 31-day period is under-billed and February is over-billed.',
       match: {
         python: {
           all: [/period_days\s*=\s*\(\s*period_end\s*-\s*period_start\s*\)\.days/],
@@ -130,7 +130,7 @@ endpoint that denies nothing looks permissive rather than unsafe).`,
       id: 'exclusive-day',
       title: 'Charges the switch day exactly once',
       detail:
-        'The old plan covers `[period_start, change_at)` and the new plan `[change_at, period_end)`, with `old_days + new_days == period_days` held as an invariant. The draft bills the old plan for the whole period *and* the new plan from the change day on, charging that day twice.',
+        'The old plan covers `[period_start, change_at)` and the new plan `[change_at, period_end)`, with `old_days + new_days == period_days` held as an invariant. The starter bills the old plan for the whole period *and* the new plan from the change day on, charging that day twice.',
       match: {
         python: {all: [/old_days\s*\+\s*new_days\s*!=\s*period_days/, /\bchange_at\b/]},
         typescript: {all: [/oldDays\s*\+\s*newDays\s*!==\s*periodDays/, /\bchangeAt\b/]},
@@ -179,7 +179,7 @@ def change_day(value: str) -> int:
 
 @app.post("/v1/subscriptions")
 def change_plan(body: PlanChange) -> dict:
-    # TODO: a model-generated draft. It prorates over a thirty-day month, charges the old plan for
+    # TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
     # the whole period and the new plan from the change day on, so the switch day is billed twice,
     # and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
     subscription = store.load(body.subscription_id)
@@ -305,7 +305,7 @@ def change_plan(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/subscriptions: a model-generated draft of the plan-change handler. */
+      starter: `/** POST /v1/subscriptions: flawed code of the plan-change handler. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -342,7 +342,7 @@ function changeDay(value: string): number {
 }
 
 app.post('/v1/subscriptions', async (request, reply) => {
-  // TODO: a model-generated draft. It prorates over a thirty-day month, charges the old plan for
+  // TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
   // the whole period and the new plan from the change day on, so the switch day is billed twice,
   // and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
   const body = request.body as PlanChange;
@@ -539,7 +539,7 @@ func changeDay(value string) int {
 }
 
 func changePlan(rw http.ResponseWriter, r *http.Request) {
-	// TODO: a model-generated draft. It prorates over a thirty-day month, charges the old plan for
+	// TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
 	// the whole period and the new plan from the change day on, so the switch day is billed twice,
 	// and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
 	var body PlanChange
@@ -760,7 +760,7 @@ object SubscriptionApi {
     path("v1" / "subscriptions") {
       post {
         entity(as[PlanChange]) { body =>
-          // TODO: a model-generated draft. It prorates over a thirty-day month, charges the old plan
+          // TODO: flawed code. It prorates over a thirty-day month, charges the old plan
           // for the whole period and the new plan from the change day on, so the switch day is billed
           // twice, and it denies nothing: no tenant check, no plan check, no effective-date or
           // policy check.
@@ -907,7 +907,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/subscriptions", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: a model-generated draft. It prorates over a thirty-day month, charges the old plan for
+    // TODO: flawed code. It prorates over a thirty-day month, charges the old plan for
     // the whole period and the new plan from the change day on, so the switch day is billed twice,
     // and it denies nothing: no tenant check, no plan check, no effective-date or policy check.
     const json body = json::parse(req.body, nullptr, false);
@@ -1080,5 +1080,5 @@ int main() {
     'The period length is data, not a constant: `period_days = (period_end - period_start).days` and a line costs `round(price_cents * days / period_days)`. A thirty-day month over-bills a February slice and under-bills a 31-day one, and nothing about the demo looks wrong until a real month is billed.',
     'Model the change as a half-open split of the period: the old plan covers `[period_start, change_at)` and the new plan `[change_at, period_end)`. Then `old_days + new_days == period_days` holds by construction, and the switch day belongs to exactly one line. Assert it, so a future edit cannot silently reintroduce the double charge.',
   ],
-  debrief: `The interviewer is testing whether you can review generated billing arithmetic. Four defects are being checked: authentication and tenancy at the boundary (a schedule is another tenant's data), validation of the effective date and the proration policy (a change the platform cannot compute must be refused, not approximated), the divisor (the actual days of the period, never 30), and the exclusive split of the period (the switch day is charged once, by one plan). The second one is what candidates miss: an endpoint that denies nothing looks friendlier than it is, because every unvalidated input ends up multiplied by a price. Real billing systems add a rounding policy per currency, credit notes instead of negative lines, an idempotency key on the change request itself, an audit record of the plan version used for each line, and a scheduled job that recomputes and compares rather than trusting the handler's arithmetic.`,
+  debrief: `The interviewer is testing whether you can debug billing arithmetic. Four defects are being checked: authentication and tenancy at the boundary (a schedule is another tenant's data), validation of the effective date and the proration policy (a change the platform cannot compute must be refused, not approximated), the divisor (the actual days of the period, never 30), and the exclusive split of the period (the switch day is charged once, by one plan). The second one is what candidates miss: an endpoint that denies nothing looks friendlier than it is, because every unvalidated input ends up multiplied by a price. Real billing systems add a rounding policy per currency, credit notes instead of negative lines, an idempotency key on the change request itself, an audit record of the plan version used for each line, and a scheduled job that recomputes and compares rather than trusting the handler's arithmetic.`,
 };

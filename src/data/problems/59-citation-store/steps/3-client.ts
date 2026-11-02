@@ -8,7 +8,7 @@ export const citationClientStep: Step = {
   focus: ['api', 'docstore'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a healthy document store answers and every
+**Starting point.** The starter is working code: a healthy document store answers and every
 citation comes back verified, so the demo report is green. Every failure path is wrong. Find them,
 fix them, and prove the fix.
 
@@ -28,7 +28,7 @@ Implement the verifier that resolves citations against the document store:
 - A citation that cannot be resolved is **never dropped** and never counted as verified: the batch
   returns every citation it was given.
 
-**Failure mode the checks target.** The draft fetches with no deadline and retries a \`NOT_FOUND\`
+**Failure mode the checks target.** The starter fetches with no deadline and retries a \`NOT_FOUND\`
 forever, returns whatever text it eventually gets, treats a fetch failure as “still valid” so the
 report looks green, and silently drops the citations it cannot resolve. Each of those is invisible
 while the document store is healthy and the corpus is unchanged.`,
@@ -54,7 +54,7 @@ while the document store is healthy and the corpus is unchanged.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with `MAX_ATTEMPTS` and a loop; the draft’s `while true` has no exit for a permanent error.',
+    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with `MAX_ATTEMPTS` and a loop; the starter’s `while true` has no exit for a permanent error.',
     'Retryability is a property of the status, not of “it threw”: compare the code against the retryable set, and treat `NOT_FOUND` as terminal — a missing version is data, not an outage. A timeout is the opposite case: it must produce `broken` with a reason, never `verified`.',
     'Re-anchoring is a search, not a comparison: `text.find(quote)` (or `indexOf`/`strings.Index`/`indexOf`) gives the offset the quote moved to. Record it and stay verified; only a missing quote is `span_moved`. Whatever the outcome, the citation stays in the result — dropping it is how regressions disappear from the report.',
   ],
@@ -78,7 +78,7 @@ while the document store is healthy and the corpus is unchanged.`,
       id: 'timeout-broken',
       title: 'A fetch failure yields broken status with a reason',
       detail:
-        'A deadline-exceeded fetch marks the citation `broken` with a `reason`; the draft marks every fetch failure `verified` so the report stays green.',
+        'A deadline-exceeded fetch marks the citation `broken` with a `reason`; the starter marks every fetch failure `verified` so the report stays green.',
       match: {
         python: {all: [/STATUS_BROKEN/, /grpc\.StatusCode\.DEADLINE_EXCEEDED/, /"reason"/]},
         typescript: {all: [/STATUS_BROKEN/, /DEADLINE_EXCEEDED/, /reason/]},
@@ -91,7 +91,7 @@ while the document store is healthy and the corpus is unchanged.`,
       id: 'not-found-terminal',
       title: 'A missing version is terminal, attempts are bounded',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS` and only the retryable set is retried; `NOT_FOUND` is returned immediately because a version that does not exist cannot be retried into existence. The draft retries it forever.',
+        'Attempts are bounded by `MAX_ATTEMPTS` and only the retryable set is retried; `NOT_FOUND` is returned immediately because a version that does not exist cannot be retried into existence. The starter retries it forever.',
       match: {
         python: {all: [/grpc\.StatusCode\.NOT_FOUND/, /MAX_ATTEMPTS/, /RETRYABLE/]},
         typescript: {all: [/grpc\.status\.NOT_FOUND/, /MAX_ATTEMPTS/, /RETRYABLE/]},
@@ -104,7 +104,7 @@ while the document store is healthy and the corpus is unchanged.`,
       id: 'broken-kept',
       title: 'A citation is marked broken, never dropped',
       detail:
-        'A citation that cannot be resolved comes back `broken` with a `reason` and stays in the batch result. The draft drops it (`continue`) so the report only ever shows the citations that worked.',
+        'A citation that cannot be resolved comes back `broken` with a `reason` and stays in the batch result. The starter drops it (`continue`) so the report only ever shows the citations that worked.',
       match: {
         python: {all: [/STATUS_BROKEN/, /"reason"/], none: [/\bcontinue\b/]},
         typescript: {all: [/STATUS_BROKEN/, /reason/], none: [/\bcontinue\b/]},
@@ -117,7 +117,7 @@ while the document store is healthy and the corpus is unchanged.`,
       id: 'reanchor',
       title: 'Verified only when the span can be re-anchored',
       detail:
-        'The fetched text is searched for the quote and the citation is `verified` only when the quote is found (at its new offset). The draft never re-anchors: it guesses the status from whether the fetch returned at all.',
+        'The fetched text is searched for the quote and the citation is `verified` only when the quote is found (at its new offset). The starter never re-anchors: it guesses the status from whether the fetch returned at all.',
       match: {
         python: {all: [/def reanchor\(/, /STATUS_VERIFIED/], order: [/def reanchor\(/, /STATUS_VERIFIED/]},
         typescript: {
@@ -246,7 +246,7 @@ def verify_all(citations: list[dict]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** Citation verification: a model-generated draft that retries a missing version forever. */
+      starter: `/** Citation verification: flawed code that retries a missing version forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

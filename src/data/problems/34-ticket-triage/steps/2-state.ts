@@ -8,7 +8,7 @@ export const triageStateStep: Step = {
   focus: ['triage', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a ticket that fits gets through, so the demo
+**Starting point.** The starter is working code: a ticket that fits gets through, so the demo
 passes. The state layer hides a race and a leak. Find them, fix them, and prove the fix.
 
 Implement the Redis layer every triage call goes through:
@@ -27,7 +27,7 @@ Implement the Redis layer every triage call goes through:
   write. Without it the counter only ever grows and the queue jams forever.
 - When the queue is at capacity answer **429** with \`Retry-After\` (seconds, the key's TTL) and
   \`X-Queue-Remaining\` (slots left in this window), and **do not call the classifier**.
-- **Claim before classifying**: the admission comes first, the classifier second. The draft
+- **Claim before classifying**: the admission comes first, the classifier second. The starter
   classifies first and claims afterwards, so the duplicate has already cost a model call.
 
 **Failure mode the checks target.** \`EXISTS\`-then-\`SET\` is a check-then-act race: both duplicate
@@ -71,7 +71,7 @@ claiming after classification means a duplicate is only noticed when it is alrea
       id: 'dedupe-nx',
       title: 'Claims the dedupe key with SET NX, never EXISTS',
       detail:
-        'The dedupe key is `triage:dedupe:{tenant}:{ticket_hash}` and is claimed with `SET … NX`, so exactly one of two concurrent identical tickets wins. The draft checks it with `EXISTS` and writes it later, which is a race by construction.',
+        'The dedupe key is `triage:dedupe:{tenant}:{ticket_hash}` and is claimed with `SET … NX`, so exactly one of two concurrent identical tickets wins. The starter checks it with `EXISTS` and writes it later, which is a race by construction.',
       match: {
         python: {all: [/triage:dedupe:\{tenant\}:\{ticket_hash\}/, /SET/, /NX/], none: [/\bEXISTS\b/]},
         typescript: {all: [/triage:dedupe:\$\{tenant\}:\$\{ticketHash\}/, /SET/, /NX/], none: [/\bEXISTS\b/]},
@@ -110,7 +110,7 @@ claiming after classification means a duplicate is only noticed when it is alrea
       id: 'claim-before-classify',
       title: 'Claims before it classifies',
       detail:
-        'The claim and the admission run before the classifier call, so a rejected or duplicate ticket never reaches the model. The draft classifies first and claims afterwards.',
+        'The claim and the admission run before the classifier call, so a rejected or duplicate ticket never reaches the model. The starter classifies first and claims afterwards.',
       match: {
         python: {order: [/admit\(/, /classify\(/]},
         typescript: {order: [/admit\(/, /classify\(/]},
@@ -145,7 +145,7 @@ class TriageRequest(BaseModel):
 
 @app.post("/v1/tickets/triage")
 def triage(body: TriageRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft checks the dedupe key with EXISTS and writes it after classification, so two
+    # TODO: this starter checks the dedupe key with EXISTS and writes it after classification, so two
     # concurrent identical tickets both classify; the admission counter is incremented from the
     # client with no expiry, so the window never resets; and the 429 carries no headers.
     ticket_hash = hashlib.sha256(body.text.encode("utf-8")).hexdigest()[:32]
@@ -234,7 +234,7 @@ def triage(body: TriageRequest, tenant: str = Header(alias="X-Tenant-Id")) -> di
 `,
     },
     typescript: {
-      starter: `/** Triage state: a model-generated draft that races on the dedupe key. */
+      starter: `/** Triage state: flawed code that races on the dedupe key. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -250,7 +250,7 @@ const QUEUE_CAP = 240;
 const DEDUPE_TTL_S = 24 * 3600;
 
 app.post('/v1/tickets/triage', async (request, reply) => {
-  // TODO: this draft checks the dedupe key with EXISTS and writes it after classification, so two
+  // TODO: this starter checks the dedupe key with EXISTS and writes it after classification, so two
   // concurrent identical tickets both classify; the admission counter is incremented from the
   // client with no expiry, so the window never resets; and the 429 carries no headers.
   const tenant = request.headers['x-tenant-id'] as string;
@@ -372,7 +372,7 @@ func triage(rw http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	sum := sha256.Sum256([]byte(body.Text))
 	ticketHash := hex.EncodeToString(sum[:])[:32]
-	// TODO: this draft checks the dedupe key with Exists and writes it after classification, so two
+	// TODO: this starter checks the dedupe key with Exists and writes it after classification, so two
 	// concurrent identical tickets both classify; the admission counter is incremented from the
 	// client with no expiry, so the window never resets; and the 429 carries no headers.
 	decision, err := client.Classify(r.Context(), body.Text)
@@ -541,7 +541,7 @@ object TriageState {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[TriageRequest]) { body =>
-            // TODO: this draft checks the dedupe key with exists and writes it after classification,
+            // TODO: this starter checks the dedupe key with exists and writes it after classification,
             // so two concurrent identical tickets both classify; the admission counter is
             // incremented from the client with no expiry; the 429 carries no headers.
             val hash = ticketHash(body.text)
@@ -697,7 +697,7 @@ int main() {
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
     const auto text = body.value("text", std::string());
-    // TODO: this draft checks the dedupe key with exists and writes it after classification, so two
+    // TODO: this starter checks the dedupe key with exists and writes it after classification, so two
     // concurrent identical tickets both classify; the admission counter is incremented from the
     // client with no expiry, so the window never resets; the 429 carries no headers.
     const std::string ticketHash = hashTicket(text);
@@ -815,9 +815,9 @@ int main() {
     },
   },
   hints: [
-    'One script does all of it: `SET dedupe 1 NX EX` decides the winner, `HINCRBY admit n 1` reserves the slot, `EXPIRE` opens the window on the first write. Splitting those commands across round trips is exactly the race the draft loses.',
+    'One script does all of it: `SET dedupe 1 NX EX` decides the winner, `HINCRBY admit n 1` reserves the slot, `EXPIRE` opens the window on the first write. Splitting those commands across round trips is exactly the race the starter loses.',
     'The two keys are independent: the dedupe key is per ticket and lives for a day, the admission key is per queue and lives for the minute bucket. Racing them in one `EVAL` keeps them consistent — a ticket is never claimed without a slot, and a slot is never taken for a ticket that was already claimed.',
     'The 429 is a contract with the caller: `Retry-After` is the remaining `TTL` of the admission key and `X-Queue-Remaining` is the capacity left in this minute. Both come from the script’s reply; a hardcoded 60 hides how long the queue is really jammed.',
   ],
-  debrief: `The interviewer is testing whether you can see a check-then-act race in code that looks careful. The draft does check the dedupe key — with \`EXISTS\`, and it writes the key after it has already classified. Two duplicate webhooks in flight therefore both miss the key and both pay for a model call. The admission counter has the second flaw: it is incremented from the client and never given an expiry, so the counter is a monotone lock — a queue with one busy minute is at capacity forever. The fix is one Lua script that claims, admits and expires atomically, plus a 429 that tells the caller when to come back. Real systems add a per-tenant admission budget alongside the per-queue one, and a sweep that reconciles Redis counters against the routing records when they drift.`,
+  debrief: `The interviewer is testing whether you can see a check-then-act race in code that looks careful. The starter does check the dedupe key — with \`EXISTS\`, and it writes the key after it has already classified. Two duplicate webhooks in flight therefore both miss the key and both pay for a model call. The admission counter has the second flaw: it is incremented from the client and never given an expiry, so the counter is a monotone lock — a queue with one busy minute is at capacity forever. The fix is one Lua script that claims, admits and expires atomically, plus a 429 that tells the caller when to come back. Real systems add a per-tenant admission budget alongside the per-queue one, and a sweep that reconciles Redis counters against the routing records when they drift.`,
 };

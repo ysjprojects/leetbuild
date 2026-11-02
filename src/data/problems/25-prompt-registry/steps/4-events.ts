@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['registry', 'kafka', 'consumer'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a promotion publishes an event, a consumer counts
+The starter is working code: a promotion publishes an event, a consumer counts
 it, and the dashboard moves. It partitions by the wrong field, copies the wrong payload and returns
 before the broker has the record. Find the flaws, fix them, and prove the fix.
 
@@ -17,7 +17,7 @@ lifecycle events are **registered**, **promoted**, **pinned** and **rolled_back*
 
 - Publish one event to the **\`prompt.lifecycle\`** topic keyed by the **prompt name**. The key is
   the partition key: keyed by name, one prompt’s history arrives in order, which is the only way a
-  consumer can replay "promoted 4, rolled back to 3" correctly. The draft keys by the operator.
+  consumer can replay "promoted 4, rolled back to 3" correctly. The starter keys by the operator.
 - The payload carries **hashes and ids**: the version’s \`content_hash\`, version, the event type
   and the \`actor\`. It must **never** carry the template text, and no log line may either — the
   topic is retained for days and replicated, so content written there outlives the retention policy
@@ -28,7 +28,7 @@ lifecycle events are **registered**, **promoted**, **pinned** and **rolled_back*
 - When the broker rejects the produce, write an **outbox row** instead of dropping the event; a relay
   republishes it when the broker recovers.
 - The handler **waits for the broker’s acknowledgement** (a flush, an awaited send, or
-  \`Async: false\`) before it answers 202. The draft acknowledges first and produces afterwards, so a
+  \`Async: false\`) before it answers 202. The starter acknowledges first and produces afterwards, so a
   crash or a broker outage silently loses the event that the audit trail depends on.
 
 **Failure mode the checks target.** Three contracts, one event: ordering (the key), confidentiality
@@ -51,7 +51,7 @@ exists to provide.`,
       id: 'name-key',
       title: 'Keyed by the prompt name for per-prompt order',
       detail:
-        'The message key is the prompt `name`, so every event of one prompt lands in one partition in order. The draft keys by the operator, which scatters one prompt’s history across partitions.',
+        'The message key is the prompt `name`, so every event of one prompt lands in one partition in order. The starter keys by the operator, which scatters one prompt’s history across partitions.',
       match: {
         python: {all: [/key=name/, /prompt\.lifecycle/]},
         typescript: {all: [/key:\s*name\b/, /prompt\.lifecycle/]},
@@ -64,7 +64,7 @@ exists to provide.`,
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence with `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or `RequiredAcks: kafka.RequireAll` with a hash balancer. The draft sends with no configuration at all.',
+        'The producer is configured for idempotence with `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or `RequiredAcks: kafka.RequireAll` with a hash balancer. The starter sends with no configuration at all.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -77,7 +77,7 @@ exists to provide.`,
       id: 'no-text',
       title: 'Publishes hashes and actor ids, never the text',
       detail:
-        'The event and the logs carry the `content_hash`, the version, the event type and the actor — never the template text. The draft logs the text and copies it into a retained, replicated topic.',
+        'The event and the logs carry the `content_hash`, the version, the event type and the actor — never the template text. The starter logs the text and copies it into a retained, replicated topic.',
       match: {
         python: {all: [/content_hash/], none: [/\btemplate\b/i]},
         typescript: {all: [/content_hash/], none: [/\btemplate\b/i]},
@@ -90,7 +90,7 @@ exists to provide.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -103,7 +103,7 @@ exists to provide.`,
       id: 'await-ack',
       title: 'Waits for the broker before answering',
       detail:
-        'The handler waits for the acknowledgement — `producer.flush(...)` after the produce, an awaited `send`, `Async: false`, `.send(record).get()`, `flush(...)` — so a rejected record is not answered with 202. The draft returns before the broker has confirmed.',
+        'The handler waits for the acknowledgement — `producer.flush(...)` after the produce, an awaited `send`, `Async: false`, `.send(record).get()`, `flush(...)` — so a rejected record is not answered with 202. The starter returns before the broker has confirmed.',
       match: {
         python: {all: [/producer\.flush\(/], order: [/producer\.produce\(/, /producer\.flush\(/]},
         typescript: {all: [/await producer\.send\(/]},
@@ -142,7 +142,7 @@ class LifecycleRequest(BaseModel):
 
 @app.post("/v1/prompts/{name}/events")
 def publish_event(name: str, body: LifecycleRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft keys the topic by the operator, copies the full text into the payload and the
+    # TODO: this starter keys the topic by the operator, copies the full text into the payload and the
     # log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
     # actor ids only, use the idempotent producer with acks=all, and write an outbox row when the
     # broker rejects the produce.
@@ -242,7 +242,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** prompt.lifecycle: a model-generated draft that keys by the operator and acks too early. */
+      starter: `/** prompt.lifecycle: flawed code that keys by the operator and acks too early. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -260,7 +260,7 @@ interface LifecycleBody {
 }
 
 app.post('/v1/prompts/:name/events', async (request, reply) => {
-  // TODO: this draft keys the topic by the operator, copies the full text into the payload and the
+  // TODO: this starter keys the topic by the operator, copies the full text into the payload and the
   // log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
   // actor ids only, use the idempotent producer with acks=all, and write an outbox row when the
   // broker rejects the produce.
@@ -362,7 +362,7 @@ func publishEvent(rw http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	var body LifecycleRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this draft keys the topic by the operator, copies the full text into the payload and the
+	// TODO: this starter keys the topic by the operator, copies the full text into the payload and the
 	// log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
 	// actor ids only, use required acks all, and write an outbox row when the broker rejects the
 	// produce.
@@ -467,7 +467,7 @@ object LifecycleApi {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: this draft keys the topic by the operator, copies the full text into the payload and the
+  // TODO: this starter keys the topic by the operator, copies the full text into the payload and the
   // log line, and answers before the broker confirms. Key by the prompt name, publish hashes and
   // actor ids only, use the idempotent producer with acks=all, and write an outbox row when the
   // broker rejects the produce.
@@ -557,7 +557,7 @@ const std::string kLifecycleTopic = "prompt.lifecycle";
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this draft keys the topic by the operator, copies the full text into the payload and the log
+// TODO: this starter keys the topic by the operator, copies the full text into the payload and the log
 // line, and answers before the broker confirms. Key by the prompt name, publish hashes and actor ids
 // only, use the idempotent producer with acks=all, and write an outbox row when the broker rejects
 // the produce.

@@ -8,22 +8,22 @@ export const eventsStep: Step = {
   focus: ['kafka', 'consumer', 'store'],
   task: `## Task
 
-A flag's history — created, updated, killed, rollout stage — is an event stream downstream consumers
-project. The starter is the model-generated draft: it publishes an event to \`flag.event\` before the
-snapshot commits. It works on the demo and hides three flaws.
+**Starting point.** A flag's history — created, updated, killed, rollout stage — is an event stream
+downstream consumers project. The starter is working code: it publishes an event to \`flag.event\`
+before the snapshot commits. It works on the demo and hides three flaws.
 
 Publish \`flag.event\` for every flag change, after the change is durable.
 
 - The event is **keyed by the flag key**, so a flag's history stays ordered in one partition. The
-  draft keys by environment, so a flag's events scatter across partitions.
+  starter keys by environment, so a flag's events scatter across partitions.
 - The payload carries the **version**, a **rule digest** and the **actor**; it must not carry **user
-  ids** or raw user values from a test evaluation. The draft ships \`user_ids\` from a dry run.
+  ids** or raw user values from a test evaluation. The starter ships \`user_ids\` from a dry run.
 - The event is published **after the snapshot commits** — a consumer must never see an event that
   describes a snapshot the store does not have.
 - When the broker rejects the produce, the event goes to an **outbox** row so it can be republished
   without duplicating a committed change.
 
-**The subtle flaw.** The draft produces before \`store.commit\`, so a consumer can observe an update
+**The subtle flaw.** The starter produces before \`store.commit\`, so a consumer can observe an update
 the store never committed; it keys by environment, so per-flag order is lost; and its payload leaks
 the user ids from the dry-run evaluation.`,
   sequence: {
@@ -54,7 +54,7 @@ the user ids from the dry-run evaluation.`,
       id: 'key',
       title: 'Keys the event by the flag key',
       detail:
-        'The produced message key is the flag key, so a flag history stays ordered. The draft keys by environment, so a flag scatters across partitions.',
+        'The produced message key is the flag key, so a flag history stays ordered. The starter keys by environment, so a flag scatters across partitions.',
       match: {
         python: {all: [/key\s*=\s*flag_key/]},
         typescript: {all: [/key:\s*flagKey/]},
@@ -67,7 +67,7 @@ the user ids from the dry-run evaluation.`,
       id: 'payload',
       title: 'Carries version, rule digest and actor',
       detail:
-        'The payload names the version, a rule digest and the actor, so a consumer can detect a rule change without parsing an expression. The draft ships the raw rule expression instead.',
+        'The payload names the version, a rule digest and the actor, so a consumer can detect a rule change without parsing an expression. The starter ships the raw rule expression instead.',
       match: {
         python: {all: [/rule_digest/, /"actor"/, /"version"/]},
         typescript: {all: [/ruleDigest/, /actor/, /version/]},
@@ -80,7 +80,7 @@ the user ids from the dry-run evaluation.`,
       id: 'privacy',
       title: 'Leaks no user ids into the event payload',
       detail:
-        'The payload must not carry user ids or raw user values from a test evaluation. The draft publishes `user_ids` from the dry run.',
+        'The payload must not carry user ids or raw user values from a test evaluation. The starter publishes `user_ids` from the dry run.',
       match: {
         python: {none: [/user_id|userId/]},
         typescript: {none: [/user_id|userId/]},
@@ -93,7 +93,7 @@ the user ids from the dry-run evaluation.`,
       id: 'commit',
       title: 'Publishes after the snapshot commits, with an outbox on rejection',
       detail:
-        'The event is produced only after the snapshot commit, and a rejected produce is recorded in an outbox. The draft produces first and has no outbox.',
+        'The event is produced only after the snapshot commit, and a rejected produce is recorded in an outbox. The starter produces first and has no outbox.',
       match: {
         python: {all: [/outbox/], order: [/store\.commit\(/, /producer\.produce\(/]},
         typescript: {all: [/outbox/], order: [/store\.commit\(/, /producer\.send\(/]},
@@ -111,7 +111,7 @@ TOPIC = "flag.event"
 
 
 def publish(producer, store, flag_key: str, environment: str, rules: list, user_ids: list) -> None:
-    # TODO: this draft produces before the snapshot commits, keys the event by environment, and
+    # TODO: this starter produces before the snapshot commits, keys the event by environment, and
     # publishes the rule expression together with the user ids from a test evaluation.
     event = {
         "environment": environment,
@@ -169,7 +169,7 @@ async function publish(
   rules: unknown,
   userIds: string[],
 ): Promise<void> {
-  // TODO: this draft produces before the snapshot commits, keys the event by environment, and
+  // TODO: this starter produces before the snapshot commits, keys the event by environment, and
   // publishes the rule expression together with the user ids from a test evaluation.
   const event: FlagEvent = {environment, rules, userIds};
   await producer.send({topic: TOPIC, messages: [{key: environment, value: JSON.stringify(event)}]});
@@ -234,7 +234,7 @@ type Event struct {
 }
 
 func Publish(ctx context.Context, writer *kafka.Writer, store SnapshotStore, flagKey string, environment string, rules string, userIds []string) error {
-	// TODO: this draft produces before the snapshot commits, keys the event by environment, and
+	// TODO: this starter produces before the snapshot commits, keys the event by environment, and
 	// publishes the rule expression together with the user ids from a test evaluation.
 	event := Event{Environment: environment, Rules: rules, UserIds: userIds}
 	payload, _ := json.Marshal(event)
@@ -293,7 +293,7 @@ object Topic {
 }
 
 def publish(producer: KafkaProducer[String, String], flagKey: String, environment: String, rules: String, userIds: List[String]): Unit = {
-  // TODO: this draft produces before the snapshot commits, keys the event by environment, and
+  // TODO: this starter produces before the snapshot commits, keys the event by environment, and
   // publishes the rule expression together with the user ids from a test evaluation.
   val key = environment
   val payload = s"""{"environment":"$environment","rules":$rules,"userIds":\${userIds.mkString("[", ",", "]")}}"""
@@ -333,7 +333,7 @@ using json = nlohmann::json;
 
 static const std::string topic = "flag.event";
 
-// TODO: this draft produces before the snapshot commits, keys the event by environment, and
+// TODO: this starter produces before the snapshot commits, keys the event by environment, and
 // publishes the rule expression together with the user ids from a test evaluation.
 void publish(KafkaProducer& producer, SnapshotStore& store, const std::string& flag_key, const std::string& environment, const std::string& rules, const json& user_ids) {
   json event = {

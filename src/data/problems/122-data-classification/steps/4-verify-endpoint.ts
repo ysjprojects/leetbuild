@@ -8,9 +8,9 @@ export const verifyEndpointStep: Step = {
   focus: ['owner', 'metasense', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route,
+**Starting point.** The starter is working code: it registers the route,
 reads the caller and the body, stores the tags and returns the tier. It compiles, it serves the demo,
-and it hides four production flaws. Review it like the data governance office, fix it, and prove
+and it hides four production flaws. Debug it like the data governance office, fix it, and prove
 the fix.
 
 Implement \`POST /v1/entities/{entity_id}/verify\` with body
@@ -75,7 +75,7 @@ asked about later — which, in a regulated review, is the same as none.`,
       id: 'owner-only',
       title: 'Authenticates the caller and allows only the owner',
       detail:
-        'A missing `X-User-Id` is **401**; the owner comes from `store.owner_of(entity_id)` and any other caller gets **403**. The draft lets any caller verify any entity.',
+        'A missing `X-User-Id` is **401**; the owner comes from `store.owner_of(entity_id)` and any other caller gets **403**. The starter lets any caller verify any entity.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /status_code\s*=\s*403/, /store\.owner_of\(/]},
         typescript: {all: [/code\(\s*401\s*\)/, /code\(\s*403\s*\)/, /store\.ownerOf\(/]},
@@ -88,7 +88,7 @@ asked about later — which, in a regulated review, is the same as none.`,
       id: 'tier-server-side',
       title: 'Derives the tier from tags and privacy rules, never from the body',
       detail:
-        'A `derive_tier(tags)` function over `PRIVACY_RULES` computes the tier; the handler never reads a `tier` from the request. The draft stores whatever tier the caller sent.',
+        'A `derive_tier(tags)` function over `PRIVACY_RULES` computes the tier; the handler never reads a `tier` from the request. The starter stores whatever tier the caller sent.',
       match: {
         python: {all: [/PRIVACY_RULES/, /derive_tier\(/], none: [/body\.tier/]},
         typescript: {all: [/PRIVACY_RULES/, /deriveTier\(/], none: [/body\.tier/]},
@@ -101,7 +101,7 @@ asked about later — which, in a regulated review, is the same as none.`,
       id: 'tag-whitelist',
       title: 'Rejects tags outside the taxonomy with 400',
       detail:
-        'On `edit`, every tag is checked against `TAXONOMY` and an unknown tag (or an unknown `action`) is **400**. The draft stores any string as a tag.',
+        'On `edit`, every tag is checked against `TAXONOMY` and an unknown tag (or an unknown `action`) is **400**. The starter stores any string as a tag.',
       match: {
         python: {all: [/TAXONOMY/, /status_code\s*=\s*400/]},
         typescript: {all: [/TAXONOMY/, /code\(\s*400\s*\)/]},
@@ -114,7 +114,7 @@ asked about later — which, in a regulated review, is the same as none.`,
       id: 'audit',
       title: 'Audits who verified and returns verified_by',
       detail:
-        'The handler calls `store.audit(entity_id, user, action)` and the response carries `verified_by`. The draft stores the tags and forgets who confirmed them.',
+        'The handler calls `store.audit(entity_id, user, action)` and the response carries `verified_by`. The starter stores the tags and forgets who confirmed them.',
       match: {
         python: {all: [/store\.audit\(/, /verified_by/]},
         typescript: {all: [/store\.audit\(/, /verified_by/]},
@@ -154,8 +154,8 @@ store = VerificationStore()
 
 @app.post("/v1/entities/{entity_id}/verify")
 def verify(entity_id: str, body: VerifyRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
-    # TODO: this draft lets any caller verify any entity, takes the tier from the body, accepts
-    # any tag string, and records nothing about who verified. Review all four.
+    # TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
+    # any tag string, and records nothing about who verified. Fix all four.
     tags = body.tags if body.action == "edit" else store.pending_tags(entity_id)
     version = store.record_verification(entity_id, tags, body.tier)
     return JSONResponse({"entity": entity_id, "tier": body.tier, "tags": tags, "version": version}, status_code=200)
@@ -244,7 +244,7 @@ def verify(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/entities/:entityId/verify: a model-generated draft that trusts the caller's tier. */
+      starter: `/** POST /v1/entities/:entityId/verify: flawed code that trusts the caller's tier. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -258,8 +258,8 @@ interface VerifyBody {
 }
 
 app.post('/v1/entities/:entityId/verify', async (request, reply) => {
-  // TODO: this draft lets any caller verify any entity, takes the tier from the body, accepts
-  // any tag string, and records nothing about who verified. Review all four.
+  // TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
+  // any tag string, and records nothing about who verified. Fix all four.
   const {entityId} = request.params as {entityId: string};
   const body = request.body as VerifyBody;
   const tags = body.action === 'edit' ? (body.tags ?? {}) : await store.pendingTags(entityId);
@@ -371,8 +371,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func verify(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft lets any caller verify any entity, takes the tier from the body, accepts
-	// any tag string, and records nothing about who verified. Review all four.
+	// TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
+	// any tag string, and records nothing about who verified. Fix all four.
 	entityID := r.PathValue("entity_id")
 	var body VerifyRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -571,8 +571,8 @@ object VerifyApi {
       post {
         headerValueByName("X-User-Id") { user =>
           entity(as[VerifyRequest]) { body =>
-            // TODO: this draft lets any caller verify any entity, takes the tier from the body,
-            // accepts any tag string, and records nothing about who verified. Review all four.
+            // TODO: this starter lets any caller verify any entity, takes the tier from the body,
+            // accepts any tag string, and records nothing about who verified. Fix all four.
             val tags = if (body.action.contains("edit")) body.tags.getOrElse(Map.empty) else store.pendingTags(entityId)
             val tier = body.tier.getOrElse(4)
             val version = store.recordVerification(entityId, tags, tier)
@@ -680,8 +680,8 @@ int main() {
   httplib::SSLServer svr("cert.pem", "key.pem");
 
   svr.Post(R"(/v1/entities/([^/]+)/verify)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft lets any caller verify any entity, takes the tier from the body, accepts
-    // any tag string, and records nothing about who verified. Review all four.
+    // TODO: this starter lets any caller verify any entity, takes the tier from the body, accepts
+    // any tag string, and records nothing about who verified. Fix all four.
     const std::string entityId = req.matches[1];
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();

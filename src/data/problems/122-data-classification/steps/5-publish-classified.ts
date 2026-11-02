@@ -8,9 +8,9 @@ export const publishClassifiedStep: Step = {
   focus: ['metasense', 'classified', 'catalog', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a verification produces an
+**Starting point.** The starter is working code: a verification produces an
 event and the metadata store consumer applies it, so the demo shows the tier changing in the
-catalogue. It hides five production flaws. Review it like the team whose access-control policies
+catalogue. It hides five production flaws. Debug it like the team whose access-control policies
 read this topic, fix it, and prove the fix.
 
 After a verification is recorded, \`publish_classified(entity, tier, tags, verified_by, version)\`
@@ -56,7 +56,7 @@ commit-before-write trades correctness for exactly-once *looking* code.`,
       id: 'entity-key',
       title: 'Keyed by entity, carries verified_by and version',
       detail:
-        'The message key is the entity (partition by entity) and the payload carries `verified_by` and `version`. The draft keys by the event id and drops the verifier.',
+        'The message key is the entity (partition by entity) and the payload carries `verified_by` and `version`. The starter keys by the event id and drops the verifier.',
       match: {
         python: {all: [/key=entity/, /verified_by/, /"version"/]},
         typescript: {all: [/key:\s*entity\b/, /verified_by/, /version/]},
@@ -82,7 +82,7 @@ commit-before-write trades correctness for exactly-once *looking* code.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) in the error branch instead of dropping the event. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) in the error branch instead of dropping the event. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -95,7 +95,7 @@ commit-before-write trades correctness for exactly-once *looking* code.`,
       id: 'version-guard',
       title: 'Skips events that are not newer than the stored version',
       detail:
-        'The consumer reads `store.current_version(entity)` and ignores an event whose `version` is not greater, so a replayed or reordered event cannot undo a later verification. The draft applies every event it sees.',
+        'The consumer reads `store.current_version(entity)` and ignores an event whose `version` is not greater, so a replayed or reordered event cannot undo a later verification. The starter applies every event it sees.',
       match: {
         python: {all: [/store\.current_version\(/, /<=\s*current/]},
         typescript: {all: [/store\.currentVersion\(/, /<=\s*current/]},
@@ -108,7 +108,7 @@ commit-before-write trades correctness for exactly-once *looking* code.`,
       id: 'upsert-before-commit',
       title: 'Upserts the catalogue before committing the offset',
       detail:
-        'The consumer runs `store.upsert(...)` before committing the offset; committing first makes a crash lose the tier change. The draft commits first.',
+        'The consumer runs `store.upsert(...)` before committing the offset; committing first makes a crash lose the tier change. The starter commits first.',
       match: {
         python: {order: [/store\.upsert\(/, /consumer\.commit\(/]},
         typescript: {order: [/store\.upsert\(/, /await commit\(\)/]},
@@ -139,8 +139,8 @@ store = CatalogueStore()
 
 
 def publish_classified(entity: str, tier: int, tags: dict[str, str], verified_by: str, version: int) -> None:
-    # TODO: this draft keys by the event id, uses an unconfigured producer, drops the event when
-    # the broker fails, and its consumer commits before the write and applies replays. Review all five.
+    # TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when
+    # the broker fails, and its consumer commits before the write and applies replays. Fix all five.
     event_id = f"{entity}:{version}"
     event = {"id": event_id, "entity": entity, "tier": tier, "tags": tags, "version": version}
     producer.produce(TOPIC, key=event_id, value=json.dumps(event))
@@ -225,7 +225,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** entity.classified: a model-generated draft that keys by event id and commits too early. */
+      starter: `/** entity.classified: flawed code that keys by event id and commits too early. */
 import {Kafka} from 'kafkajs';
 
 import {store} from './store';
@@ -250,8 +250,8 @@ export async function publishClassified(
   verifiedBy: string,
   version: number,
 ): Promise<void> {
-  // TODO: this draft keys by the event id, uses an unconfigured producer, drops the event when
-  // the broker fails, and its consumer commits before the write and applies replays. Review all five.
+  // TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when
+  // the broker fails, and its consumer commits before the write and applies replays. Fix all five.
   const id = \`\${entity}:\${version}\`;
   const event: Classified = {id, entity, tier, tags, version};
   await producer.send({topic: TOPIC, messages: [{key: id, value: JSON.stringify(event)}]});
@@ -359,8 +359,8 @@ func (s *CatalogueStore) Upsert(ctx context.Context, entity string, tier int, ta
 
 var store = &CatalogueStore{}
 
-// TODO: this draft keys by the event id, uses an unconfigured producer, drops the event when the
-// broker fails, and its consumer commits before the write and applies replays. Review all five.
+// TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when the
+// broker fails, and its consumer commits before the write and applies replays. Fix all five.
 func publishClassified(ctx context.Context, entity string, tier int, tags map[string]string, verifiedBy string, version int) {
 	id := fmt.Sprintf("%s:%d", entity, version)
 	event := Classified{ID: id, Entity: entity, Tier: tier, Tags: tags, Version: version}
@@ -497,8 +497,8 @@ object PublishClassified {
   val producer = new KafkaProducer[String, String](new Properties())
   val store = CatalogueStore.open()
 
-  // TODO: this draft keys by the event id, uses an unconfigured producer, drops the event when the
-  // broker fails, and its consumer commits before the write and applies replays. Review all five.
+  // TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when the
+  // broker fails, and its consumer commits before the write and applies replays. Fix all five.
   def publishClassified(entity: String, tier: Int, tags: Map[String, String], verifiedBy: String, version: Int): Unit = {
     val id = s"$entity:$version"
     val payload = JsObject(
@@ -614,8 +614,8 @@ struct CatalogueStore {
 CatalogueStore store;
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this draft keys by the event id, uses an unconfigured producer, drops the event when the
-// broker fails, and its consumer commits before the write and applies replays. Review all five.
+// TODO: this starter keys by the event id, uses an unconfigured producer, drops the event when the
+// broker fails, and its consumer commits before the write and applies replays. Fix all five.
 void publishClassified(const std::string& entity, int tier, const std::map<std::string, std::string>& tags,
                        const std::string& verifiedBy, int version) {
   const std::string id = entity + ":" + std::to_string(version);
@@ -721,5 +721,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking what a generated Kafka snippet almost always gets wrong, plus the one thing a governance topic adds. The message key is an ordering contract: partition by entity and an entity's versions arrive in order; key by event id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must apply its write before the offset commit or a crash loses it. A broker is not a database: the durable path on a failed produce is an outbox row, the same pattern the source's downstream platforms rely on to consume predictions reliably. The governance-specific piece is the version guard: this topic decides who can read a table, so a replayed Tier 4 event must never overwrite the Tier 1 the owner set a minute later. Real platforms add schema registry validation for the event, a dead-letter topic for permanently unprocessable records, and a reconciliation job that compares the catalogue against the latest version per entity.`,
+  debrief: `The interviewer is checking what a Kafka snippet almost always gets wrong, plus the one thing a governance topic adds. The message key is an ordering contract: partition by entity and an entity's versions arrive in order; key by event id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must apply its write before the offset commit or a crash loses it. A broker is not a database: the durable path on a failed produce is an outbox row, the same pattern the source's downstream platforms rely on to consume predictions reliably. The governance-specific piece is the version guard: this topic decides who can read a table, so a replayed Tier 4 event must never overwrite the Tier 1 the owner set a minute later. Real platforms add schema registry validation for the event, a dead-letter topic for permanently unprocessable records, and a reconciliation job that compares the catalogue against the latest version per entity.`,
 };

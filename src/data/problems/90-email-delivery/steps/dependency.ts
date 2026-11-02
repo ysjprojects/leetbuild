@@ -8,23 +8,23 @@ export const dependencyStep: Step = {
   focus: ['api', 'relay', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the relay and returns
+**Starting point.** The starter is working code: it calls the relay and returns
 on the happy path, so the demo passes. It hides three flaws in the failure paths — the paths the demo
 never exercises. Find them, fix them, and prove the fix.
 
 Implement the gRPC relay client used by every send:
 
-- Every relay call carries a **10-second deadline** (\`DEADLINE_S = 10\`); the draft waits 30 seconds,
+- Every relay call carries a **10-second deadline** (\`DEADLINE_S = 10\`); the starter waits 30 seconds,
   so a slow relay holds the worker for three times as long as it should.
 - A **hard bounce is terminal**: the reply's \`bounce_kind == HARD\` is recorded and the call returns
-  after one attempt. The draft treats a hard bounce like any error and retries it forever.
+  after one attempt. The starter treats a hard bounce like any error and retries it forever.
 - Retries **reuse the same message id**: the id is the parameter the caller supplied, so a retry is
-  the same message. The draft generates a fresh \`uuid4()\` on every attempt.
+  the same message. The starter generates a fresh \`uuid4()\` on every attempt.
 - A **timeout is reconciled by message id before any resend**: on \`DEADLINE_EXCEEDED\` the client asks
   the relay what happened to \`message_id\` and returns the reconciled outcome instead of sending
-  again. The draft resends immediately with a new id, so the mail goes out twice.
+  again. The starter resends immediately with a new id, so the mail goes out twice.
 - A **suppressed response is terminal**, not retryable: only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  in \`RETRYABLE_CODES\`. The draft retries a suppressed reply.
+  in \`RETRYABLE_CODES\`. The starter retries a suppressed reply.
 
 **Failure mode the checks target.** Retrying a hard bounce keeps hammering a dead address for a week;
 a new message id on a timeout resend delivers duplicates; treating a suppressed reply as retryable
@@ -49,7 +49,7 @@ re-sends to an address the platform promised to leave alone.`,
       id: 'deadline',
       title: 'Every relay call carries a 10-second deadline',
       detail:
-        'The call is made with a 10-second deadline taken from a named constant (`DEADLINE_S = 10`). The draft waits 30 seconds before giving up.',
+        'The call is made with a 10-second deadline taken from a named constant (`DEADLINE_S = 10`). The starter waits 30 seconds before giving up.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*10/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline/]},
@@ -62,7 +62,7 @@ re-sends to an address the platform promised to leave alone.`,
       id: 'hard-bounce-terminal',
       title: 'A hard bounce stops after one attempt and is recorded',
       detail:
-        'A `HARD` bounce records the bounce and returns; there is no unbounded retry loop. The draft retries a hard bounce forever.',
+        'A `HARD` bounce records the bounce and returns; there is no unbounded retry loop. The starter retries a hard bounce forever.',
       match: {
         python: {all: [/HARD_BOUNCE/, /record_bounce\(/], none: [/while True/]},
         typescript: {all: [/HARD_BOUNCE/, /recordBounce\(/], none: [/while\s*\(\s*true\s*\)/]},
@@ -75,7 +75,7 @@ re-sends to an address the platform promised to leave alone.`,
       id: 'same-message-id',
       title: 'Retries reuse the message id',
       detail:
-        'The request is built from the `message_id` the caller supplied, so a retry is the same message. The draft generates a fresh id on every attempt.',
+        'The request is built from the `message_id` the caller supplied, so a retry is the same message. The starter generates a fresh id on every attempt.',
       match: {
         python: {all: [/message_id=message_id/], none: [/uuid4\(/]},
         typescript: {all: [/message_id:\s*messageId/], none: [/randomUUID\(/]},
@@ -88,7 +88,7 @@ re-sends to an address the platform promised to leave alone.`,
       id: 'reconcile-before-resend',
       title: 'Reconciles a timeout by message id before resending',
       detail:
-        'On `DEADLINE_EXCEEDED` the client reconciles the outcome for `message_id` before it sends again. The draft resends with a new id, so the mail is delivered twice.',
+        'On `DEADLINE_EXCEEDED` the client reconciles the outcome for `message_id` before it sends again. The starter resends with a new id, so the mail is delivered twice.',
       match: {
         python: {all: [/reconcile\(/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/reconcile\(/, /DEADLINE_EXCEEDED/]},
@@ -101,7 +101,7 @@ re-sends to an address the platform promised to leave alone.`,
       id: 'suppressed-terminal',
       title: 'A suppressed response is terminal, not retryable',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are in `RETRYABLE_CODES`; a suppressed reply returns immediately. The draft adds suppressed to the retryable set.',
+        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are in `RETRYABLE_CODES`; a suppressed reply returns immediately. The starter adds suppressed to the retryable set.',
       match: {
         python: {all: [/RETRYABLE_CODES/, /suppressed/], none: [/RETRYABLE_CODES[^\n]*[Ss]uppressed/]},
         typescript: {all: [/RETRYABLE_CODES/, /suppressed/], none: [/RETRYABLE_CODES[^\n]*[Ss]uppressed/]},
@@ -125,7 +125,7 @@ MAX_ATTEMPTS = 3
 
 
 def send(recipient: str, message_id: str) -> dict:
-    # TODO: this draft retries hard bounces forever, resends after a timeout with a new message id
+    # TODO: this starter retries hard bounces forever, resends after a timeout with a new message id
     # so the mail is delivered twice, and treats a suppressed response as retryable.
     while True:
         request = relay_pb2.SendRequest(recipient=recipient, message_id=str(uuid.uuid4()))
@@ -198,7 +198,7 @@ export async function send(
   recipient: string,
   messageId: string,
 ): Promise<{state: string; message_id: string}> {
-  // TODO: this draft retries hard bounces forever, resends after a timeout with a new message id
+  // TODO: this starter retries hard bounces forever, resends after a timeout with a new message id
   // so the mail is delivered twice, and treats a suppressed response as retryable.
   while (true) {
     const request = {recipient, message_id: randomUUID()};
@@ -284,7 +284,7 @@ import (
 const maxAttempts = 3
 
 func Send(ctx context.Context, relay pb.RelayClient, recipient, messageID string) (string, error) {
-	// TODO: this draft retries hard bounces forever, resends after a timeout with a new message id
+	// TODO: this starter retries hard bounces forever, resends after a timeout with a new message id
 	// so the mail is delivered twice, and treats a suppressed response as retryable.
 	for {
 		reply, err := relay.Send(ctx, &pb.SendRequest{
@@ -370,7 +370,7 @@ object Client {
   val MaxAttempts = 3
 
   def send(relay: RelayStub, recipient: String, messageId: String): String = {
-    // TODO: this draft retries hard bounces forever, resends after a timeout with a new message id
+    // TODO: this starter retries hard bounces forever, resends after a timeout with a new message id
     // so the mail is delivered twice, and treats a suppressed response as retryable.
     while (true) {
       val request = SendRequest(recipient = recipient, messageId = java.util.UUID.randomUUID().toString)
@@ -443,7 +443,7 @@ namespace client {
 constexpr int kMaxAttempts = 3;
 
 std::string send(relay::Relay::Stub& stub, const std::string& recipient, const std::string& message_id) {
-  // TODO: this draft retries hard bounces forever, resends after a timeout with a new message id
+  // TODO: this starter retries hard bounces forever, resends after a timeout with a new message id
   // so the mail is delivered twice, and treats a suppressed response as retryable.
   while (true) {
     relay::SendRequest request;
@@ -522,9 +522,9 @@ std::string send(relay::Relay::Stub& stub, const std::string& recipient, const s
     },
   },
   hints: [
-    'A hard bounce is a terminal signal, not an error: `bounce_kind == HARD` records the bounce and returns. Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` belong in `RETRYABLE_CODES`, and a bounded `for` loop replaces the draft’s `while True`.',
+    'A hard bounce is a terminal signal, not an error: `bounce_kind == HARD` records the bounce and returns. Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` belong in `RETRYABLE_CODES`, and a bounded `for` loop replaces the starter’s `while True`.',
     'A retry is the same message: build the request from the `message_id` the caller passed in. A fresh `uuid4()` per attempt turns one message into several deliveries.',
     'A timeout leaves the outcome unknown, so reconcile it: ask the relay for `message_id` before sending again. Re-sending first is how a duplicate is delivered.',
   ],
-  debrief: `The interviewer is testing whether you can review the failure paths of a gRPC client. The draft reads fine because the demo relay accepts everything. Three defects are being checked: an unbounded retry that ignores a terminal hard bounce; a fresh message id on retry, so a timeout resend delivers a duplicate; and a suppressed reply in the retryable set. The fix is a bounded loop with a deadline, one message id for the whole attempt sequence, reconciliation on timeout, and a small retryable set. Real relays add per-category retry budgets, jittered backoff, and idempotency keys the relay itself deduplicates on.`,
+  debrief: `The interviewer is testing whether you can debug the failure paths of a gRPC client. The starter reads fine because the demo relay accepts everything. Three defects are being checked: an unbounded retry that ignores a terminal hard bounce; a fresh message id on retry, so a timeout resend delivers a duplicate; and a suppressed reply in the retryable set. The fix is a bounded loop with a deadline, one message id for the whole attempt sequence, reconciliation on timeout, and a small retryable set. Real relays add per-category retry budgets, jittered backoff, and idempotency keys the relay itself deduplicates on.`,
 };

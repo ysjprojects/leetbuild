@@ -8,7 +8,7 @@ export const securityEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every decision becomes an
+**Starting point.** The starter is working code: every decision becomes an
 event and the consumer counts something, so the dashboard shows numbers. Five production contracts
 are broken. Find them, fix them, prove the fix.
 
@@ -66,7 +66,7 @@ exactly-once.`,
       id: 'user-key',
       title: 'Keyed by user; carries the document hash',
       detail:
-        'The message key is the user (partition by user) and the event carries `document_hash`. The draft keys by the event id, so one user’s events scatter across partitions and lose order.',
+        'The message key is the user (partition by user) and the event carries `document_hash`. The starter keys by the event id, so one user’s events scatter across partitions and lose order.',
       match: {
         python: {all: [/key=user/, /document_hash/]},
         typescript: {all: [/key:\s*user\b/, /document_hash/]},
@@ -92,7 +92,7 @@ exactly-once.`,
       id: 'no-text',
       title: 'No question, answer or document text in the event or logs',
       detail:
-        'Neither the event payload nor any log line carries the question, the answer or the document text. The draft copies the question and the answer into every event — a retained, replicated copy of exactly what the guard refused to log.',
+        'Neither the event payload nor any log line carries the question, the answer or the document text. The starter copies the question and the answer into every event — a retained, replicated copy of exactly what the guard refused to log.',
       match: {
         python: {none: [/\bquestion\b/i, /\banswer\b/i]},
         typescript: {none: [/\bquestion\b/i, /\banswer\b/i]},
@@ -105,7 +105,7 @@ exactly-once.`,
       id: 'hour-bucket',
       title: 'Counts signatures per hour',
       detail:
-        'The consumer buckets refusals by `HOUR_S = 3600` into `signatures:{hour}` and increments the signature’s field. The draft counts into one global key, so nobody can tell when an attack started or stopped.',
+        'The consumer buckets refusals by `HOUR_S = 3600` into `signatures:{hour}` and increments the signature’s field. The starter counts into one global key, so nobody can tell when an attack started or stopped.',
       match: {
         python: {all: [/HOUR_S\s*=\s*3600/, /signatures:\{hour\}/]},
         typescript: {all: [/HOUR_S\s*=\s*3600/, /signatures:\$\{hour\}/]},
@@ -118,7 +118,7 @@ exactly-once.`,
       id: 'write-before-commit',
       title: 'Writes the count before committing the offset',
       detail:
-        'The consumer runs `HINCRBY` before committing the offset; committing first makes a crash lose the count forever. The draft commits first.',
+        'The consumer runs `HINCRBY` before committing the offset; committing first makes a crash lose the count forever. The starter commits first.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -235,7 +235,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** prompt.security: a model-generated draft that keys by event id and commits too early. */
+      starter: `/** prompt.security: flawed code that keys by event id and commits too early. */
 import {randomUUID} from 'node:crypto';
 
 import {Kafka} from 'kafkajs';
@@ -750,5 +750,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking the three things a generated Kafka snippet almost always gets wrong, plus the one this course is about. The key is an ordering contract: partition by user and a user's incidents arrive in order; key by event id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer applies its write before the commit, or a crash between the two loses the count. The hour bucket is what turns counts into a timeline — the source's point about attacks evolving after each patch is only visible if you can see when a signature appeared. And the text rule is the course's own: the guard refused to log the question and the answer for a reason, and an event topic that retains and replicates them undoes it. Real pipelines add a schema registry, a dead-letter topic for unparseable events, and an alert when one signature's hourly count crosses a threshold.`,
+  debrief: `The interviewer is checking the three things a Kafka snippet almost always gets wrong, plus the one this course is about. The key is an ordering contract: partition by user and a user's incidents arrive in order; key by event id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer applies its write before the commit, or a crash between the two loses the count. The hour bucket is what turns counts into a timeline — the source's point about attacks evolving after each patch is only visible if you can see when a signature appeared. And the text rule is the course's own: the guard refused to log the question and the answer for a reason, and an event topic that retains and replicates them undoes it. Real pipelines add a schema registry, a dead-letter topic for unparseable events, and an alert when one signature's hourly count crosses a threshold.`,
 };

@@ -8,10 +8,10 @@ export const merchantBudgetStep: Step = {
   focus: ['api', 'redis', 'tools'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the spending layer the loop
+**Starting point.** The starter is working code for the spending layer the loop
 calls: it charges a per-shop budget, caches tool results, and invokes tools. A single shop with budget
 left sails through, so the demo passes. It hides a race, a leak, a cross-merchant cache and a
-double write. Review it, fix it, and prove the fix.
+double write. Debug it, fix it, and prove the fix.
 
 Implement the spending layer every assist turn goes through:
 
@@ -21,10 +21,10 @@ Implement the spending layer every assist turn goes through:
 - One **atomic Lua \`EVAL\`** reads both counters, rejects when either reservation does not fit, and
   increments both when it does, setting \`EXPIRE\` on first write. A read followed by a separate
   increment lets two concurrent turns both pass the same check.
-- **Reserve before the model call.** The draft charges after the answer, so an over-budget turn has
+- **Reserve before the model call.** The starter charges after the answer, so an over-budget turn has
   already been paid for.
 - **Tool-result cache**: read-tool results are cached under \`tool:{shop}:{name}:{digest}\` (digest
-  = SHA-256 of the args JSON) for **\`CACHE_TTL_S = 120\`** seconds. The draft keys by
+  = SHA-256 of the args JSON) for **\`CACHE_TTL_S = 120\`** seconds. The starter keys by
   \`(name, digest)\` only — the same "customers from Toronto" query served from another shop's
   cache is a cross-merchant data leak.
 - **Write tools run once per turn**: \`fill_product_form\` is claimed with \`SET NX EX\` on
@@ -75,7 +75,7 @@ merchant's customer list to another; and a retried write tool edits the merchant
       id: 'shop-window-key',
       title: 'Keys the budget by shop and 60-second window',
       detail:
-        'The key is `budget:{shop}:{window}` from the authenticated shop and the minute bucket (`WINDOW_S = 60`). The draft’s `budget:{shop}` never resets, so a shop that had one busy minute is locked out for good.',
+        'The key is `budget:{shop}:{window}` from the authenticated shop and the minute bucket (`WINDOW_S = 60`). The starter’s `budget:{shop}` never resets, so a shop that had one busy minute is locked out for good.',
       match: {
         python: {all: [/budget:\{shop\}:\{window\}/, /WINDOW_S\s*=\s*60/]},
         typescript: {all: [/budget:\$\{shop\}:\$\{window\}/, /WINDOW_S\s*=\s*60/]},
@@ -88,7 +88,7 @@ merchant's customer list to another; and a retried write tool edits the merchant
       id: 'shop-scoped-cache',
       title: 'Caches tool results per shop with a 120 s TTL',
       detail:
-        'The tool cache key is `tool:{shop}:{name}:{digest}` and every entry is written with `EX CACHE_TTL_S` (120). The draft keys by tool and args only and never expires — a cross-merchant leak that persists.',
+        'The tool cache key is `tool:{shop}:{name}:{digest}` and every entry is written with `EX CACHE_TTL_S` (120). The starter keys by tool and args only and never expires — a cross-merchant leak that persists.',
       match: {
         python: {all: [/tool:\{shop\}:\{name\}:\{digest\}/, /CACHE_TTL_S\s*=\s*120/, /ex\s*=\s*CACHE_TTL_S/]},
         typescript: {all: [/tool:\$\{shop\}:\$\{name\}:\$\{digest\}/, /CACHE_TTL_S\s*=\s*120/, /'EX',\s*CACHE_TTL_S/]},
@@ -101,7 +101,7 @@ merchant's customer list to another; and a retried write tool edits the merchant
       id: 'write-once',
       title: 'Claims write tools with SET NX per shop and turn',
       detail:
-        'A write tool is claimed with `SET write:{shop}:{turn_id}:{name} … NX EX` before it runs; a failed claim returns the stored result. The draft invokes `fill_product_form` on every attempt.',
+        'A write tool is claimed with `SET write:{shop}:{turn_id}:{name} … NX EX` before it runs; a failed claim returns the stored result. The starter invokes `fill_product_form` on every attempt.',
       match: {
         python: {all: [/write:\{shop\}:\{turn_id\}:\{name\}/, /nx\s*=\s*True/]},
         typescript: {all: [/write:\$\{shop\}:\$\{turnId\}:\$\{name\}/, /'NX'/]},
@@ -114,7 +114,7 @@ merchant's customer list to another; and a retried write tool edits the merchant
       id: 'reserve-first',
       title: 'Reserves before the model call',
       detail:
-        'The reservation runs before `Complete`; a refused turn never reaches the model. The draft calls the model first and charges afterwards, so an over-budget turn is still paid for.',
+        'The reservation runs before `Complete`; a refused turn never reaches the model. The starter calls the model first and charges afterwards, so an over-budget turn is still paid for.',
       match: {
         python: {order: [/reserve\(/, /model\.Complete\(/]},
         typescript: {order: [/reserve\(/, /model\.Complete\(/]},
@@ -292,7 +292,7 @@ def assist_turn(shop: str, turn_id: str, message: str, page: str, max_tokens: in
 `,
     },
     typescript: {
-      starter: `/** Spending layer: a model-generated draft that charges after the call and caches across shops. */
+      starter: `/** Spending layer: flawed code that charges after the call and caches across shops. */
 import {createHash} from 'node:crypto';
 
 import {Redis} from 'ioredis';
@@ -1107,5 +1107,5 @@ json assistTurn(const std::string& shop, const std::string& turnId, const std::s
 `,
     },
   },
-  debrief: `The interview question behind this step is tenancy under concurrency. A read-then-increment budget passes every serial test and fails when the assistant is busy, which is when the budget matters; one Lua script makes read, check and increment a single step and sets the window's expiry at creation, so a shop's counters die with their minute instead of accumulating forever. Reserving before the model call is the second half of the contract: a refused turn must never be paid for. The cache is where generated code quietly crosses merchants — a key built from the tool and its arguments is the same key for every shop that asks the same question, and the fastest path through the cache becomes the leak. The write claim is the agent-specific flaw: an assistant that fills product forms is a system that edits merchant data, and a retried turn, a retried tool call or a replayed request must not edit it twice. Real systems add per-tool TTLs (an analytics answer can live longer than a customer segment), invalidation when the merchant edits the underlying record, and a refund of reserved tokens when the model reports lower usage than estimated.`,
+  debrief: `The interview question behind this step is tenancy under concurrency. A read-then-increment budget passes every serial test and fails when the assistant is busy, which is when the budget matters; one Lua script makes read, check and increment a single step and sets the window's expiry at creation, so a shop's counters die with their minute instead of accumulating forever. Reserving before the model call is the second half of the contract: a refused turn must never be paid for. The cache is where the code quietly crosses merchants — a key built from the tool and its arguments is the same key for every shop that asks the same question, and the fastest path through the cache becomes the leak. The write claim is the agent-specific flaw: an assistant that fills product forms is a system that edits merchant data, and a retried turn, a retried tool call or a replayed request must not edit it twice. Real systems add per-tool TTLs (an analytics answer can live longer than a customer segment), invalidation when the merchant edits the underlying record, and a refund of reserved tokens when the model reports lower usage than estimated.`,
 };

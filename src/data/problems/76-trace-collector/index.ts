@@ -7,12 +7,12 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Trace collector on the AI-era track: the course is not "accept a span", it is the review you owe
- * a model-generated trace pipeline before an on-call engineer trusts it during an incident.
- * Validated span ingest at the edge → partial traces assembled atomically in Redis with dedupe and
- * a TTL → a deadline-bounded storage write that keeps the trace when storage is slow → completed
- * traces published per service without span payloads and counters before the offset commit → a
- * read path that shows the gaps, not a tidied-up tree.
+ * Trace collector: the course is not "accept a span", it is the debugging you owe a trace pipeline
+ * before an on-call engineer trusts it during an incident. Validated span ingest at the edge →
+ * partial traces assembled atomically in Redis with dedupe and a TTL → a deadline-bounded storage
+ * write that keeps the trace when storage is slow → completed traces published per service without
+ * span payloads and counters before the offset commit → a read path that shows the gaps, not a
+ * tidied-up tree.
  */
 export const traceCollectorProblem: Problem = {
   id: 'trace-collector',
@@ -20,7 +20,6 @@ export const traceCollectorProblem: Problem = {
   tagline: 'Assemble distributed traces from spans that arrive late, out of order and twice.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Trace Collector
 
@@ -64,12 +63,12 @@ One service, **traced**, with five pieces:
    partial marker plus the gaps when a child never arrived, and access scoped to the tenant that
    owns the trace.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real
-observability feature: read the draft against the failure modes, name the subtle one, fix it, and
-prove the fix with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real observability feature:
+debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -5,8 +5,8 @@ import type {Company} from '@/lib/types';
  * companies' own — trademarks of their owners, shown only to say whose writing a course is based
  * on — as traced by Simple Icons (CC0 path data) from each brand page, and drawn in the colours
  * those pages give: redditinc.com/brand, brand.netflix.com/en/assets/logos, discord.com/branding,
- * stripe.com/newsroom/information, dropbox.com/branding, doordash.com/about — and, for the AI-era
- * courses, github.com/logos, cloudflare.com/press-kit, brand.uber.com, news.airbnb.com/media-assets,
+ * stripe.com/newsroom/information, dropbox.com/branding, doordash.com/about — and, for the AI
+ * systems courses, github.com/logos, cloudflare.com/press-kit, brand.uber.com, news.airbnb.com/media-assets,
  * anthropic.com, grab.com, zillowgroup.com/press, shopify.com/brand-assets. Marks that are black on
  * the brand page sit white on a tile of that black, as Stripe's S sits on its purple.
  */

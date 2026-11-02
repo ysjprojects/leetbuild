@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it counts an applicant’s
+**Starting point.** The starter is working code: it counts an applicant’s
 attempts, opens their case and answers the caller. It compiles, it serves the demo, and it hides the
-two flaws that make KYC state unsafe under a burst. Review it like the service owner, fix it, and
+two flaws that make KYC state unsafe under a burst. Debug it like the service owner, fix it, and
 prove the fix with the checks below.
 
 Implement the Redis state layer behind \`POST /v1/verifications\` and the status read that follows it:
@@ -32,7 +32,7 @@ Implement the Redis state layer behind \`POST /v1/verifications\` and the status
 - \`GET /v1/applicants/{id}/status\` reads the same case key, scoped by the caller’s tenant, and
   answers \`404\` when that applicant has no case.
 
-**Failure mode the checks target.** The draft reads the attempt count and writes it back in two round
+**Failure mode the checks target.** The starter reads the attempt count and writes it back in two round
 trips, so a burst slips past the cap; it keys the active case \`kyc:case:active\`, so two applicants
 collide on one case; and its refusal carries no \`Retry-After\`, so a refused client retries
 immediately.`,
@@ -61,7 +61,7 @@ immediately.`,
       id: 'atomic-attempts',
       title: 'Increments attempts with one atomic script',
       detail:
-        'The attempt bucket moves server-side in one script: the counter is read, compared against the cap, `INCR`ed and given its `EXPIRE` in the same `EVAL` — redis-py `register_script`, ioredis `defineCommand`, go-redis `NewScript`, Jedis `eval`, redis-plus-plus `eval`. The draft does a client-side `GET` followed by `incr`, so a burst reads the same count and every submission passes the cap.',
+        'The attempt bucket moves server-side in one script: the counter is read, compared against the cap, `INCR`ed and given its `EXPIRE` in the same `EVAL` — redis-py `register_script`, ioredis `defineCommand`, go-redis `NewScript`, Jedis `eval`, redis-plus-plus `eval`. The starter does a client-side `GET` followed by `incr`, so a burst reads the same count and every submission passes the cap.',
       match: {
         python: {all: [/\bregister_script\b/, /\bINCR\b/, /\bEXPIRE\b/]},
         typescript: {all: [/\bdefineCommand\b/, /\bINCR\b/, /\bEXPIRE\b/]},
@@ -74,7 +74,7 @@ immediately.`,
       id: 'single-case',
       title: 'Opens one active case per applicant, atomically',
       detail:
-        'The active case is created create-if-absent inside the script that also gives it its lifetime: `SET ... NX`, guarded by an `EXISTS` check or by the `SET` result, so two concurrent submissions of one applicant converge on a single case. The draft checks `exists` and then `set`s from the client, so both submissions open a case.',
+        'The active case is created create-if-absent inside the script that also gives it its lifetime: `SET ... NX`, guarded by an `EXISTS` check or by the `SET` result, so two concurrent submissions of one applicant converge on a single case. The starter checks `exists` and then `set`s from the client, so both submissions open a case.',
       match: {
         python: {all: [/\bSET\b/, /\bNX\b/]},
         typescript: {all: [/\bSET\b/, /\bNX\b/]},
@@ -87,7 +87,7 @@ immediately.`,
       id: 'case-key-scope',
       title: 'Scopes the active case key by tenant and applicant',
       detail:
-        'The case key is `kyc:case:{tenant}:{applicant}` — tenant and applicant, so two applicants never collide on one case and a tenant cannot read another tenant’s applicant. The draft keys it `kyc:case:active`: one case for the whole service.',
+        'The case key is `kyc:case:{tenant}:{applicant}` — tenant and applicant, so two applicants never collide on one case and a tenant cannot read another tenant’s applicant. The starter keys it `kyc:case:active`: one case for the whole service.',
       match: {
         python: {all: [/kyc:case:/, /applicant/], none: [/kyc:case:active/]},
         typescript: {all: [/kyc:case:/, /applicant/], none: [/kyc:case:active/]},
@@ -100,7 +100,7 @@ immediately.`,
       id: 'cap-refusal',
       title: 'Refuses the fifth attempt with 429',
       detail:
-        'Attempts past the cap of 4 are refused with `429 Too Many Requests`, spelled as the literal status the client gets: `status_code=429`, `reply.code(429)`, `http.StatusTooManyRequests`, `StatusCodes.TooManyRequests`, `429`. The draft answers through its own spelling of the status, so the refusal it sends is not the 429 a full bucket owes.',
+        'Attempts past the cap of 4 are refused with `429 Too Many Requests`, spelled as the literal status the client gets: `status_code=429`, `reply.code(429)`, `http.StatusTooManyRequests`, `StatusCodes.TooManyRequests`, `429`. The starter answers through its own spelling of the status, so the refusal it sends is not the 429 a full bucket owes.',
       match: {
         python: {all: [/status_code\s*=\s*429/]},
         typescript: {all: [/code\(\s*429\s*\)/]},
@@ -113,7 +113,7 @@ immediately.`,
       id: 'retry-after',
       title: 'Reports the remaining window in Retry-After',
       detail:
-        'A refused attempt answers with `Retry-After` holding the seconds left in the bucket — the `TTL` the script returned — so a client waits the window out instead of retrying immediately. The draft refuses without either.',
+        'A refused attempt answers with `Retry-After` holding the seconds left in the bucket — the `TTL` the script returned — so a client waits the window out instead of retrying immediately. The starter refuses without either.',
       match: {
         python: {all: [/Retry-After/, /TTL|EXPIRE/]},
         typescript: {all: [/Retry-After/, /TTL|EXPIRE/]},
@@ -125,7 +125,7 @@ immediately.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/verifications: a model-generated draft of the KYC attempt and case state."""
+      starter: `"""POST /v1/verifications: flawed code of the KYC attempt and case state."""
 import json
 
 import redis
@@ -305,7 +305,7 @@ def case_status(applicant_id: str, tenant: str = Header(alias="X-Tenant-Id")) ->
 `,
     },
     typescript: {
-      starter: `/** POST /v1/verifications: a model-generated draft of the KYC attempt and case state. */
+      starter: `/** POST /v1/verifications: flawed code of the KYC attempt and case state. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -484,7 +484,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// POST /v1/verifications: a model-generated draft of the KYC attempt and case state.
+      starter: `// POST /v1/verifications: flawed code of the KYC attempt and case state.
 package main
 
 import (
@@ -778,7 +778,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `// POST /v1/verifications: a model-generated draft of the KYC attempt and case state.
+      starter: `// POST /v1/verifications: flawed code of the KYC attempt and case state.
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
@@ -1011,7 +1011,7 @@ object KycStateApi {
 `,
     },
     cpp: {
-      starter: `// POST /v1/verifications: a model-generated draft of the KYC attempt and case state.
+      starter: `// POST /v1/verifications: flawed code of the KYC attempt and case state.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
@@ -1238,5 +1238,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is state that moves in one step and is scoped to the entity it belongs to. A read-then-write attempt counter passes every serial test and fails exactly under a burst, which is when an attempt cap has to hold: two submissions both read three attempts used and both write four. One script per decision makes read, compare, increment and expiry a single step, and the same script returns the bucket’s \`TTL\`, which is what a refusal owes its client in \`Retry-After\`. The case key carries the tenant and the applicant because a case belongs to exactly that pair: the draft’s shared \`kyc:case:active\` key answers the second applicant with the first one’s case and lets one tenant read another tenant’s applicant. \`SET ... NX\` inside the script makes opening a case create-if-absent, so a duplicate submission finds the case that already exists instead of racing a second review into being. Real services keep the case record in the key with a lifetime that matches the review window, keep the attempt bucket short-lived, and write both to an audit trail, because every counter they move is evidence a regulator may ask for.`,
+  debrief: `The interview question behind this step is state that moves in one step and is scoped to the entity it belongs to. A read-then-write attempt counter passes every serial test and fails exactly under a burst, which is when an attempt cap has to hold: two submissions both read three attempts used and both write four. One script per decision makes read, compare, increment and expiry a single step, and the same script returns the bucket’s \`TTL\`, which is what a refusal owes its client in \`Retry-After\`. The case key carries the tenant and the applicant because a case belongs to exactly that pair: the starter’s shared \`kyc:case:active\` key answers the second applicant with the first one’s case and lets one tenant read another tenant’s applicant. \`SET ... NX\` inside the script makes opening a case create-if-absent, so a duplicate submission finds the case that already exists instead of racing a second review into being. Real services keep the case record in the key with a lifetime that matches the review window, keep the attempt bucket short-lived, and write both to an audit trail, because every counter they move is evidence a regulator may ask for.`,
 };

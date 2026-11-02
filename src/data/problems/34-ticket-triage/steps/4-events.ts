@@ -8,7 +8,7 @@ export const triageEventsStep: Step = {
   focus: ['triage', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a ticket is routed and an event goes out, so the
+**Starting point.** The starter is working code: a ticket is routed and an event goes out, so the
 demo passes. It hides three flaws, one of them a data-protection problem. Find them, fix them, and
 prove the fix.
 
@@ -16,17 +16,17 @@ Implement the event path that carries every routing decision to the downstream q
 
 - **Topic and key.** The decision is published to \`triage.decided\` **keyed by tenant**, so every
   ticket of one tenant lands on the same partition and the tenant's ticket stream stays ordered.
-  Keying by the queue (the draft) interleaves a tenant's tickets with everyone else's; the ordering
+  Keying by the queue (the starter) interleaves a tenant's tickets with everyone else's; the ordering
   guarantee downstream routing depends on is gone.
 - **Payload.** The event carries **ids and scores**: \`ticket_id\`, \`tenant\`, \`queue\`,
   \`priority\`, \`confidence\`, \`fallback_reason\`. The ticket text is **never** in the payload — the
-  draft publishes the raw text "so the routing consumer can re-verify", which turns a retained,
+  starter publishes the raw text "so the routing consumer can re-verify", which turns a retained,
   replicated topic into a copy of the customer's inbox.
 - **Outbox on rejection.** When the broker rejects the produce (or the delivery report says the
   message never landed), the event is written to an **outbox row** so it can be republished instead
   of being lost.
 - **Record before commit.** The consumer writes the routing record **before** it commits its offset.
-  The draft commits first, so a crash between the two loses the routing record for an event the
+  The starter commits first, so a crash between the two loses the routing record for an event the
   broker considers delivered.
 - The consumer commits its own offsets (\`enable.auto.commit=false\`) inside the group \`routing\`.
 
@@ -59,7 +59,7 @@ is a silent data loss window on every rebalance.`,
       id: 'tenant-key',
       title: 'Publishes triage.decided keyed by tenant',
       detail:
-        'The message key is the tenant on `triage.decided`, so one tenant’s tickets share a partition and stay ordered. The draft keys by the queue, which interleaves tenants.',
+        'The message key is the tenant on `triage.decided`, so one tenant’s tickets share a partition and stay ordered. The starter keys by the queue, which interleaves tenants.',
       match: {
         python: {all: [/triage\.decided/, /key=tenant/]},
         typescript: {all: [/triage\.decided/, /key:\s*tenant/]},
@@ -72,7 +72,7 @@ is a silent data loss window on every rebalance.`,
       id: 'ids-not-text',
       title: 'Carries ids and scores, never the ticket text',
       detail:
-        'The event has `ticket_id`, `queue`, `priority` and `confidence`; the ticket text is never published. The draft puts the raw text in the payload, so a retained topic becomes a copy of the customer inbox.',
+        'The event has `ticket_id`, `queue`, `priority` and `confidence`; the ticket text is never published. The starter puts the raw text in the payload, so a retained topic becomes a copy of the customer inbox.',
       match: {
         python: {all: [/ticket_id/, /confidence/, /queue/], none: [/"text"/]},
         typescript: {all: [/ticket_id/, /confidence/, /queue/], none: [/text:/]},
@@ -85,7 +85,7 @@ is a silent data loss window on every rebalance.`,
       id: 'outbox-on-reject',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce — a thrown error, a non-zero result or a failed delivery report — writes an outbox row instead of dropping the event. The draft assumes the produce always lands.',
+        'A rejected produce — a thrown error, a non-zero result or a failed delivery report — writes an outbox row instead of dropping the event. The starter assumes the produce always lands.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+\w+/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -98,7 +98,7 @@ is a silent data loss window on every rebalance.`,
       id: 'record-before-commit',
       title: 'Records the routing before committing the offset',
       detail:
-        'The consumer stores the routing record and only then commits its offset, so a crash between the two replays the event instead of losing it. The draft commits first.',
+        'The consumer stores the routing record and only then commits its offset, so a crash between the two replays the event instead of losing it. The starter commits first.',
       match: {
         python: {order: [/store\.record_routing\(/, /\.commit\(/]},
         typescript: {order: [/store\.recordRouting\(/, /commitOffsets\(/]},
@@ -111,7 +111,7 @@ is a silent data loss window on every rebalance.`,
       id: 'manual-commit',
       title: 'Commits its own offsets and produces with acks=all',
       detail:
-        'The consumer runs in the `routing` group with `enable.auto.commit=false` and commits offsets itself; auto-commit would advance the offset before the routing record is written. The producer waits for all in-sync replicas, and Go’s reader commits through `CommitMessages`. The draft configures neither.',
+        'The consumer runs in the `routing` group with `enable.auto.commit=false` and commits offsets itself; auto-commit would advance the offset before the routing record is written. The producer waits for all in-sync replicas, and Go’s reader commits through `CommitMessages`. The starter configures neither.',
       match: {
         python: {all: [/enable\.auto\.commit/, /False/, /acks": "all"/]},
         typescript: {all: [/autoCommit:\s*false/, /acks:\s*-1/]},
@@ -136,7 +136,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish(ticket: dict, decision: dict) -> None:
-    # TODO: this draft keys by the queue, publishes the ticket text so the routing consumer can
+    # TODO: this starter keys by the queue, publishes the ticket text so the routing consumer can
     # re-verify, and lets the consumer commit its offset before the routing record is stored.
     event = {
         "ticket_id": ticket["ticket_id"],
@@ -214,7 +214,7 @@ def consume(store) -> None:
 `,
     },
     typescript: {
-      starter: `/** triage.decided: a model-generated draft that keys by queue and ships the ticket text. */
+      starter: `/** triage.decided: flawed code that keys by queue and ships the ticket text. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'triage-api', brokers: ['kafka:9092']});
@@ -228,7 +228,7 @@ interface RoutingEvent {
 }
 
 export async function publish(ticket: {ticket_id: string; tenant: string; text: string}, queue: string): Promise<void> {
-  // TODO: this draft keys by the queue, publishes the ticket text so the routing consumer can
+  // TODO: this starter keys by the queue, publishes the ticket text so the routing consumer can
   // re-verify, and lets the consumer commit its offset before the routing record is stored.
   const event: RoutingEvent = {ticket_id: ticket.ticket_id, queue, text: ticket.text};
   await producer.send({
@@ -353,7 +353,7 @@ type RoutingEvent struct {
 }
 
 func publish(ctx context.Context, ticket Ticket, queue string) {
-	// TODO: this draft keys by the queue, publishes the ticket text so the routing consumer can
+	// TODO: this starter keys by the queue, publishes the ticket text so the routing consumer can
 	// re-verify, and lets the consumer commit its offset before the routing record is stored.
 	event := RoutingEvent{TicketID: ticket.TicketID, Queue: queue, Text: ticket.Text}
 	payload, _ := json.Marshal(event)
@@ -497,7 +497,7 @@ object TriageEvents {
   val producer = new KafkaProducer[String, String](producerProps)
 
   def publish(ticket: Ticket, queue: String): Unit = {
-    // TODO: this draft keys by the queue, publishes the ticket text so the routing consumer can
+    // TODO: this starter keys by the queue, publishes the ticket text so the routing consumer can
     // re-verify, and lets the consumer commit its offset before the routing record is stored.
     val event = RoutingEvent(ticket.ticket_id, queue, ticket.text).toJson.compactPrint
     producer.send(new ProducerRecord[String, String](TriageTopic, queue, event))
@@ -616,7 +616,7 @@ static rd_kafka_t* make_producer(char* errstr, std::size_t errlen) {
 }
 
 static void publish(rd_kafka_t* producer, const json& ticket, const std::string& queue) {
-  // TODO: this draft keys by the queue, publishes the ticket text so the routing consumer can
+  // TODO: this starter keys by the queue, publishes the ticket text so the routing consumer can
   // re-verify, and lets the consumer commit its offset before the routing record is stored.
   const json event = {
       {"ticket_id", ticket["ticket_id"]},
@@ -730,5 +730,5 @@ static void consume(rd_kafka_t* consumer) {
     'Publish the decision, not the input. `ticket_id`, `queue`, `priority`, `confidence` and `fallback_reason` are everything downstream routing needs; the text lives in the routing record where retention and access control already apply. A topic is replicated, retained and readable by every consumer group.',
     'A produce can fail: the local queue can be full (`BufferError`), `producev` returns an error, or the delivery report arrives with a failure. All three mean the same thing — write the outbox row, then let the republisher retry. And in the consumer, `store.record_routing(event)` must come *before* `commit`, or a crash between the two silently drops the event.',
   ],
-  debrief: `The interviewer is testing whether you can review an event path for ordering, privacy and delivery. The draft is a straight-line \`publish\` that looks fine in a demo where nothing fails and nobody reads the topic. Three defects: the message key is the queue, so one tenant's tickets are spread across partitions and the ordering the routing consumer relies on is gone; the payload carries the raw ticket text, which turns a retained topic into a secondary copy of the customer inbox with a different access surface; and the consumer commits its offset before it writes the routing record, so a rebalance or crash in that window loses the routing for an event the broker will never redeliver. Real platforms add a schema registry so a future producer cannot smuggle a text field back in, an outbox republisher with dedupe on \`ticket_id\`, and a lag alert on the routing group.`,
+  debrief: `The interviewer is testing whether you can debug an event path for ordering, privacy and delivery. The starter is a straight-line \`publish\` that looks fine in a demo where nothing fails and nobody reads the topic. Three defects: the message key is the queue, so one tenant's tickets are spread across partitions and the ordering the routing consumer relies on is gone; the payload carries the raw ticket text, which turns a retained topic into a secondary copy of the customer inbox with a different access surface; and the consumer commits its offset before it writes the routing record, so a rebalance or crash in that window loses the routing for an event the broker will never redeliver. Real platforms add a schema registry so a future producer cannot smuggle a text field back in, an outbox republisher with dedupe on \`ticket_id\`, and a lag alert on the routing group.`,
 };

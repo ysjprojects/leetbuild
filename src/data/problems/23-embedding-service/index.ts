@@ -8,7 +8,7 @@ import {readStep} from './steps/5-read';
 
 /**
  * Embedding service — bounded batches, a version-aware vector cache, and an event that fires only
- * after every chunk is durable. Every step ships a plausible model-generated draft that compiles
+ * after every chunk is durable. Every step ships working code with a flaw that compiles
  * and demos well but fails under upgrade, concurrency or partial failure.
  */
 export const embeddingServiceProblem: Problem = {
@@ -17,7 +17,7 @@ export const embeddingServiceProblem: Problem = {
   tagline: 'Batch embeddings with a version-aware cache and a document-ready event.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `Build the embedding service behind retrieval. \`POST /v1/embeddings\` turns up to 256
 inputs into vectors for the authenticated tenant; \`GET /v1/embeddings/{content_hash}\` serves a

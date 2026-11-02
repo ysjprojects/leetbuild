@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and returns a job. It compiles, it serves the demo, and it hides three production flaws.
-Review it like the pipeline owner, fix it, and prove the fix with the checks below.
+Debug it like the pipeline owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/distill/jobs\` with body \`{"teacher": "teach-70b-v3", "dataset_id": "…",
 "sample_cap": 1000}\`.
@@ -61,7 +61,7 @@ gateway retry after a timeout — starts another job over the same dataset.`,
       id: 'approved-teacher',
       title: 'Refuses a teacher outside the approved catalog',
       detail:
-        'The teacher is checked against a server-side catalog and anything else is **400**. The draft takes whatever string the caller sends as the model to spend the budget on.',
+        'The teacher is checked against a server-side catalog and anything else is **400**. The starter takes whatever string the caller sends as the model to spend the budget on.',
       match: {
         python: {all: [/APPROVED_TEACHERS/, /status_code\s*=\s*400/]},
         typescript: {all: [/APPROVED_TEACHERS/, /code\(\s*400\s*\)/]},
@@ -74,7 +74,7 @@ gateway retry after a timeout — starts another job over the same dataset.`,
       id: 'sample-cap',
       title: 'Bounds sample_cap to 100..10000',
       detail:
-        '`sample_cap` is an integer in **100..10000** and anything else is **400** before any sampling: the cap is the job’s token budget. The draft accepts any cap, including a negative one.',
+        '`sample_cap` is an integer in **100..10000** and anything else is **400** before any sampling: the cap is the job’s token budget. The starter accepts any cap, including a negative one.',
       match: {
         python: {all: [/MIN_SAMPLE_CAP/, /MAX_SAMPLE_CAP/, /status_code\s*=\s*400/]},
         typescript: {all: [/MIN_SAMPLE_CAP/, /MAX_SAMPLE_CAP/, /code\(\s*400\s*\)/]},
@@ -87,7 +87,7 @@ gateway retry after a timeout — starts another job over the same dataset.`,
       id: 'idempotency-key',
       title: 'Keys job starts by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the job is stored under `(tenant, key)`, so a replay resumes the same job instead of starting a second one. The draft ignores the header and starts a fresh job on every call.',
+        '`Idempotency-Key` is required and the job is stored under `(tenant, key)`, so a replay resumes the same job instead of starting a second one. The starter ignores the header and starts a fresh job on every call.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -100,7 +100,7 @@ gateway retry after a timeout — starts another job over the same dataset.`,
       id: 'validate-before-create',
       title: 'Rejects before it creates or queues the job',
       detail:
-        'The catalog and the cap are checked before the job row is written, so a rejected request cannot leave a job behind or enqueue sampling. The draft creates the job first and would have to unwind it.',
+        'The catalog and the cap are checked before the job row is written, so a rejected request cannot leave a job behind or enqueue sampling. The starter creates the job first and would have to unwind it.',
       match: {
         python: {order: [/MAX_SAMPLE_CAP/, /store\.put\(/]},
         typescript: {order: [/MAX_SAMPLE_CAP/, /store\.put\(/]},
@@ -132,8 +132,8 @@ class JobRequest(BaseModel):
 
 @app.post("/v1/distill/jobs")
 def start_job(body: JobRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft trusts any teacher string the caller sends, accepts an unbounded sample_cap,
-    # and has nothing keyed by the request, so every client retry starts another job. Review all three.
+    # TODO: this starter trusts any teacher string the caller sends, accepts an unbounded sample_cap,
+    # and has nothing keyed by the request, so every client retry starts another job. Fix all three.
     job_id = f"job-{len(JOBS) + 1}"
     job = {
         "job_id": job_id,
@@ -229,7 +229,7 @@ def start_job(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/distill/jobs: a model-generated draft that trusts whatever the caller sends. */
+      starter: `/** POST /v1/distill/jobs: flawed code that trusts whatever the caller sends. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -243,8 +243,8 @@ interface JobBody {
 }
 
 app.post('/v1/distill/jobs', async (request, reply) => {
-  // TODO: this draft trusts any teacher string the caller sends, accepts an unbounded sample_cap,
-  // and has nothing keyed by the request, so every client retry starts another job. Review all three.
+  // TODO: this starter trusts any teacher string the caller sends, accepts an unbounded sample_cap,
+  // and has nothing keyed by the request, so every client retry starts another job. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as JobBody;
   const job = {
@@ -366,8 +366,8 @@ func startJob(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts any teacher string the caller sends, accepts an unbounded sample_cap,
-	// and has nothing keyed by the request, so every client retry starts another job. Review all three.
+	// TODO: this starter trusts any teacher string the caller sends, accepts an unbounded sample_cap,
+	// and has nothing keyed by the request, so every client retry starts another job. Fix all three.
 	job := map[string]any{
 		"job_id":     "job-" + tenant,
 		"status":     "queued",
@@ -535,9 +535,9 @@ object DistillApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[JobRequest]) { body =>
-            // TODO: this draft trusts any teacher string the caller sends, accepts an unbounded
+            // TODO: this starter trusts any teacher string the caller sends, accepts an unbounded
             // sample_cap, and has nothing keyed by the request, so every client retry starts
-            // another job. Review all three.
+            // another job. Fix all three.
             counter += 1
             val job = Job(s"job-$counter", "queued", body.teacher, body.dataset_id, body.sample_cap, 0, 0, 0)
             system.log.info(s"job queued tenant=$tenant teacher=\${body.teacher} cap=\${body.sample_cap}")
@@ -651,8 +651,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft trusts any teacher string the caller sends, accepts an unbounded sample_cap,
-    // and has nothing keyed by the request, so every client retry starts another job. Review all three.
+    // TODO: this starter trusts any teacher string the caller sends, accepts an unbounded sample_cap,
+    // and has nothing keyed by the request, so every client retry starts another job. Fix all three.
     jobCounter += 1;
     const json job = {
         {"job_id", "job-" + std::to_string(jobCounter)},
@@ -765,5 +765,5 @@ int main() {
     'The catalog belongs to the pipeline, not to the caller: a set of approved teacher versions resolved server-side. Whatever string arrives, the job stores a version the platform approved — that is what keeps "point the pipeline at a random model" from being an API parameter.',
     'Idempotency for a job start is `(tenant, Idempotency-Key) → job_id`. Look the key up before you build anything, return the stored job on a hit, and write the job under the same key — that is what makes a client retry resume instead of double-sampling a dataset.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary, where a distillation job is money. The draft reads fine because the demo sends one request from one tenant with a well-formed body and never retries. Three defects are being checked: the teacher catalog (the caller may name a dataset and a size, never a model), the sample cap (an uncapped job is an unbounded bill, and the rejection has to come before anything is created), and idempotency keyed by tenant (a retried start must resume the job, not start a twin over the same dataset). Real pipelines add per-tenant concurrency caps, a dataset allow-list, and a quota system that reserves budget before the call rather than when the bill arrives.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, where a distillation job is money. The starter reads fine because the demo sends one request from one tenant with a well-formed body and never retries. Three defects are being checked: the teacher catalog (the caller may name a dataset and a size, never a model), the sample cap (an uncapped job is an unbounded bill, and the rejection has to come before anything is created), and idempotency keyed by tenant (a retried start must resume the job, not start a twin over the same dataset). Real pipelines add per-tenant concurrency caps, a dataset allow-list, and a quota system that reserves budget before the call rather than when the bill arrives.`,
 };

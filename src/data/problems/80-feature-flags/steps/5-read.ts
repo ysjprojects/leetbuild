@@ -8,22 +8,22 @@ export const readStep: Step = {
   focus: ['read', 'engine', 'audit'],
   task: `## Task
 
-When a user asks "why did I get this?", the service has to answer with the decision it actually served.
-The starter is the model-generated draft: it recomputes the decision for whatever user the caller
-names. It runs on the demo and hides two flaws.
+**Starting point.** When a user asks "why did I get this?", the service has to answer with the
+decision it actually served. The starter is working code: it recomputes the decision for whatever
+user the caller names. It runs on the demo and hides two flaws.
 
 Implement \`GET /v1/flags/{key}/evaluations\`, the explain view for one user.
 
 - The caller's user comes from the authenticated **\`X-User-Id\` header**; the endpoint must expose only
   the **caller's own** user, never another user's evaluation history (**403** for a mismatched query).
 - The explanation must **agree with the served evaluation bit-for-bit**: same bucket, same value. The
-  draft recomputes with a **fresh salt**, so the explanation flips while the served value does not.
+  starter recomputes with a **fresh salt**, so the explanation flips while the served value does not.
 - The response names the **exact snapshot version** that produced the decision —
   \`{"flag_key", "user_id", "matched_rule", "bucket", "value", "version"}\`.
 - The response is computed from the snapshot only; it must not mutate the flag or record a new
   evaluation as a side effect.
 
-**The subtle flaw.** The draft salts the bucket with a value generated per request, so a user who was
+**The subtle flaw.** The starter salts the bucket with a value generated per request, so a user who was
 served \`true\` is explained as \`false\`; and it reads the user from a query parameter, so anyone can read
 another user's evaluation history for the same flag.`,
   sequence: {
@@ -54,7 +54,7 @@ another user's evaluation history for the same flag.`,
       id: 'salt',
       title: 'Explains with the flag salt the served evaluation used',
       detail:
-        "The bucket is recomputed with the flag's stored salt, so the explanation matches the served value. The draft salts per request, so the two disagree.",
+        "The bucket is recomputed with the flag's stored salt, so the explanation matches the served value. The starter salts per request, so the two disagree.",
       match: {
         python: {all: [/flag\["salt"\]/]},
         typescript: {all: [/flag\.salt/]},
@@ -67,7 +67,7 @@ another user's evaluation history for the same flag.`,
       id: 'agree',
       title: 'Returns the served value, bit-for-bit',
       detail:
-        'The explanation returns the same value the evaluation served. The draft recomputes a value from a fresh salt and can return the opposite.',
+        'The explanation returns the same value the evaluation served. The starter recomputes a value from a fresh salt and can return the opposite.',
       match: {
         python: {all: [/served_value/]},
         typescript: {all: [/servedValue/]},
@@ -80,7 +80,7 @@ another user's evaluation history for the same flag.`,
       id: 'scope',
       title: "Exposes only the caller's user",
       detail:
-        "The user comes from the `X-User-Id` header; a caller cannot read another user's history. The draft takes the user from a query parameter.",
+        "The user comes from the `X-User-Id` header; a caller cannot read another user's history. The starter takes the user from a query parameter.",
       match: {
         python: {all: [/X-User-Id/], none: [/query_params\[["']user_id["']\]/]},
         typescript: {all: [/x-user-id/i], none: [/req\.query/]},
@@ -93,7 +93,7 @@ another user's evaluation history for the same flag.`,
       id: 'version',
       title: 'Names the exact snapshot version',
       detail:
-        'The explanation returns the snapshot version that produced the decision. The draft omits it, so a reader cannot tell which version explained the value.',
+        'The explanation returns the snapshot version that produced the decision. The starter omits it, so a reader cannot tell which version explained the value.',
       match: {
         python: {all: [/snapshot\["version"\]/]},
         typescript: {all: [/snapshot\.version/]},
@@ -113,7 +113,7 @@ app = FastAPI()
 
 @app.get("/v1/flags/{key}/evaluations")
 def evaluations(key: str, user_id: str) -> JSONResponse:
-    # TODO: this draft recomputes the decision with a fresh salt, so the explanation disagrees with
+    # TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
     # the served evaluation, and it returns other users' evaluation history from the same flag.
     snapshot = load_snapshot(redis_client)
     flag = snapshot["flags"][key]
@@ -167,7 +167,7 @@ interface Snapshot {
 }
 
 app.get('/v1/flags/:key/evaluations', async (req, reply) => {
-  // TODO: this draft recomputes the decision with a fresh salt, so the explanation disagrees with
+  // TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
   // the served evaluation, and it returns other users' evaluation history from the same flag.
   const key = (req.params as {key: string}).key;
   const user = (req.query as {user_id: string}).user_id;
@@ -216,7 +216,7 @@ import (
 )
 
 func evaluations(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft recomputes the decision with a fresh salt, so the explanation disagrees with
+	// TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
 	// the served evaluation, and it returns other users' evaluation history from the same flag.
 	key := r.PathValue("key")
 	user := r.URL.Query().Get("user_id")
@@ -288,7 +288,7 @@ import spray.json._
 def evaluations: Route = path("v1" / "flags" / Segment / "evaluations") { key =>
   get {
     parameter("user_id") { user =>
-      // TODO: this draft recomputes the decision with a fresh salt, so the explanation disagrees
+      // TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees
       // with the served evaluation, and it returns other users' history from the same flag.
       val snapshot = loadSnapshot()
       val flag = snapshot.flags(key)
@@ -336,7 +336,7 @@ def evaluations: Route = path("v1" / "flags" / Segment / "evaluations") { key =>
 
 using json = nlohmann::json;
 
-// TODO: this draft recomputes the decision with a fresh salt, so the explanation disagrees with
+// TODO: this starter recomputes the decision with a fresh salt, so the explanation disagrees with
 // the served evaluation, and it returns other users' evaluation history from the same flag.
 json explain(const json& snapshot, const std::string& flag_key, const std::string& user_id) {
   json flag = snapshot["flags"][flag_key];
@@ -398,5 +398,5 @@ int main() {
     "Take the user from the authenticated **`X-User-Id` header**. A `user_id` query parameter lets a caller read another user's evaluation history.",
     'Return the **snapshot version** that produced the decision. Without it, a reader cannot tell whether the explanation describes the current rule set.',
   ],
-  debrief: `The interviewer is testing whether an explanation endpoint is a *read* of the decision or a second, independent decision. It must be the same decision: same salt, same bucket, same value, and it must name the version that produced it. The draft fails on all three — a per-request salt makes the explanation flip, a query parameter exposes another user's history, and the version is missing. Real systems read the explanation from the evaluation that was served, or recompute from the exact snapshot version, and they scope every read to the authenticated caller.`,
+  debrief: `The interviewer is testing whether an explanation endpoint is a *read* of the decision or a second, independent decision. It must be the same decision: same salt, same bucket, same value, and it must name the version that produced it. The starter fails on all three — a per-request salt makes the explanation flip, a query parameter exposes another user's history, and the version is missing. Real systems read the explanation from the evaluation that was served, or recompute from the exact snapshot version, and they scope every read to the authenticated caller.`,
 };

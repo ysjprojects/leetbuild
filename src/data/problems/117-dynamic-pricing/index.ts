@@ -7,8 +7,8 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Dynamic pricing on the AI-era track: the course is not "serve a model's price suggestion", it is
- * the review you owe a generated pricing service before it moves money. A guarded publish endpoint
+ * Dynamic pricing: the course is not "serve a model's price suggestion", it is
+ * the debugging you owe a pricing service before it moves money. A guarded publish endpoint
  * at the trust boundary → one atomic Redis headroom reservation per sku window → a demand-model
  * call with a 700 ms deadline that falls back to the last approved price → sku-keyed price.changed
  * events with an outbox, published only after the store commits → a storefront read that shows
@@ -20,7 +20,7 @@ export const dynamicPricingProblem: Problem = {
   tagline: 'Prices that move within guardrails, never publish stale model output and explain themselves.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Dynamic Pricing
 
@@ -65,12 +65,12 @@ One service, **priced**, with five pieces:
 5. \`GET /v1/prices/{sku}\`: the price the storefront charges, with its source, timestamp and
    guardrail state, and experiment candidates visible only to operators holding a preview scope.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real pricing feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

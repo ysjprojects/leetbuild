@@ -8,10 +8,10 @@ export const processorClientStep: Step = {
   focus: ['billing', 'processor', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the processor client: it
+**Starting point.** The starter is working code for the processor client: it
 charges the invoice, loops three times over anything that throws, and returns a charge reference
 when the processor is healthy. The happy path bills correctly, so the demo passes and every defect
-sits in a branch a healthy processor never takes. Review it like the billing owner and fix it.
+sits in a branch a healthy processor never takes. Debug it like the billing owner and fix it.
 
 Implement the charge of one invoice against the payment processor's gRPC service — \`Charge\` and
 \`GetInvoice\` on the same stub:
@@ -92,7 +92,7 @@ way.`,
       id: 'deadline',
       title: 'Sends the charge under a 5-second deadline',
       detail:
-        'Every processor call sets a **5-second** deadline (the stack’s equivalent of `timeout=PROCESSOR_DEADLINE_S`). The draft calls the processor with no deadline at all, so a hung processor pins the billing run forever.',
+        'Every processor call sets a **5-second** deadline (the stack’s equivalent of `timeout=PROCESSOR_DEADLINE_S`). The starter calls the processor with no deadline at all, so a hung processor pins the billing run forever.',
       match: {
         python: {all: [/PROCESSOR_DEADLINE_S/, /timeout=PROCESSOR_DEADLINE_S/]},
         typescript: {all: [/PROCESSOR_DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+\s*PROCESSOR_DEADLINE_MS/]},
@@ -105,7 +105,7 @@ way.`,
       id: 'invoice-key',
       title: 'Keys the charge by the invoice id',
       detail:
-        'The idempotency key is the invoice id, so the processor can recognise a repeated charge. The draft mints a fresh `uuid` per attempt, so a retry looks like a brand-new charge and the customer is billed twice.',
+        'The idempotency key is the invoice id, so the processor can recognise a repeated charge. The starter mints a fresh `uuid` per attempt, so a retry looks like a brand-new charge and the customer is billed twice.',
       match: {
         python: {all: [/idempotency_key=invoice\.id/, /invoice_id/]},
         typescript: {all: [/idempotencyKey:\s*invoice\.id/, /invoice_id/]},
@@ -118,7 +118,7 @@ way.`,
       id: 'reconcile-before-retry',
       title: 'Reconciles the processor invoice before any retry',
       detail:
-        'A `DEADLINE_EXCEEDED` is followed by `GetInvoice` for the same invoice id, and the charge is only retried when the processor reports no charge. The draft retries the charge immediately, so a charge that actually landed is charged again.',
+        'A `DEADLINE_EXCEEDED` is followed by `GetInvoice` for the same invoice id, and the charge is only retried when the processor reports no charge. The starter retries the charge immediately, so a charge that actually landed is charged again.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/], order: [/processor\.Charge\(/, /processor\.GetInvoice\(/]},
         typescript: {all: [/DEADLINE_EXCEEDED/], order: [/processor\.Charge\(/, /processor\.GetInvoice\(/]},
@@ -131,7 +131,7 @@ way.`,
       id: 'decline-terminal',
       title: 'A hard decline is terminal and records a reason',
       detail:
-        'A hard decline stops after one attempt and marks the invoice **failed** with the decline code as its `reason`. The draft treats it as retryable and fires three charges at the customer’s issuer.',
+        'A hard decline stops after one attempt and marks the invoice **failed** with the decline code as its `reason`. The starter treats it as retryable and fires three charges at the customer’s issuer.',
       match: {
         python: {all: [/TERMINAL_DECLINES/, /"failed"/, /reason/, /decline_code/]},
         typescript: {all: [/TERMINAL_DECLINES/, /'failed'/, /reason/, /decline_code/]},
@@ -206,7 +206,7 @@ def charge(body: dict) -> dict:
 
 
 def charge_invoice(invoice: Invoice) -> dict:
-    # TODO: a model-generated draft. It retries DECLINE_RETRIES times over every error, mints a
+    # TODO: flawed code. It retries DECLINE_RETRIES times over every error, mints a
     # fresh uuid as the idempotency key inside the loop, sets no deadline, never reconciles a
     # timeout with GetInvoice, retries a hard decline at the customer's issuer and returns
     # {"status": "pending"} with no reason once the attempts run out.
@@ -338,7 +338,7 @@ def confirm(invoice: Invoice, reference: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Billing run: charge an invoice on the payment processor (model-generated draft). */
+      starter: `/** Billing run: charge an invoice on the payment processor (flawed). */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
@@ -398,7 +398,7 @@ function unary<R>(
 }
 
 export async function chargeInvoice(invoice: Invoice): Promise<Record<string, string>> {
-  // TODO: a model-generated draft. It retries declineRetries times over every error, mints a fresh
+  // TODO: flawed code. It retries declineRetries times over every error, mints a fresh
   // randomUUID inside the loop as the key, sets no deadline, never reconciles a timeout with
   // GetInvoice, retries a hard decline at the customer's issuer and reports 'pending' with no
   // reason once the attempts run out.
@@ -591,7 +591,7 @@ func (s *InvoiceStore) Save(invoice *Invoice) { s.rows[invoice.ID] = invoice }
 
 var store = &InvoiceStore{rows: map[string]*Invoice{}}
 
-// TODO: a model-generated draft. It retries declineRetries times over every error, mints a fresh
+// TODO: flawed code. It retries declineRetries times over every error, mints a fresh
 // uuid as the idempotency key inside the loop, sets no deadline, never reconciles a timeout with
 // GetInvoice, retries a hard decline at the customer's issuer and leaves the row pending with no
 // reason.
@@ -631,7 +631,7 @@ import (
 )
 
 const (
-	// processorDeadline bounds one attempt; the draft sets none at all.
+	// processorDeadline bounds one attempt; the starter sets none at all.
 	processorDeadline = 5 * time.Second
 	maxAttempts       = 3
 )
@@ -751,7 +751,7 @@ object ProcessorClient {
     def save(invoice: Invoice): Unit = rows(invoice.id) = invoice
   }
 
-  // TODO: a model-generated draft. It retries DeclineRetries times over every error, mints a fresh
+  // TODO: flawed code. It retries DeclineRetries times over every error, mints a fresh
   // UUID inside the loop as the idempotency key, sets no deadline, never reconciles a timeout with
   // getInvoice, retries a hard decline at the customer's issuer and reports "pending" with no
   // reason once the attempts run out.
@@ -888,7 +888,7 @@ class InvoiceStore {
 
 InvoiceStore store;
 
-// Stand-in for the uuid library: the draft mints a fresh key for every attempt.
+// Stand-in for the uuid library: the starter mints a fresh key for every attempt.
 std::string new_uuid() {
   static std::mt19937_64 rng{std::random_device{}()};
   return std::to_string(std::uniform_int_distribution<unsigned long long>{}(rng));
@@ -901,7 +901,7 @@ ChargeOutcome outcome_for(const Invoice& invoice, const std::string& status) {
   return outcome;
 }
 
-// TODO: a model-generated draft. It retries kDeclineRetries times over every error, mints a fresh
+// TODO: flawed code. It retries kDeclineRetries times over every error, mints a fresh
 // uuid inside the loop as the idempotency key, sets no deadline, never reconciles a timeout with
 // GetInvoice, retries a hard decline at the customer's issuer and reports "pending" with no reason.
 ChargeOutcome ChargeInvoice(Processor::Stub* stub, const Invoice& invoice) {
@@ -1020,7 +1020,7 @@ std::string Reconcile(Processor::Stub* stub, const std::string& invoice_id) {
     },
   },
   hints: [
-    'The deadline and the key are the two things a generated client always forgets. The deadline is an argument on the call itself (`timeout=`, `deadline: Date.now() + …`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) and the key has to be derived from the invoice (`invoice.id`), never minted — a generated key is a new charge to the processor on every attempt.',
+    'The deadline and the key are the two things this client forgot. The deadline is an argument on the call itself (`timeout=`, `deadline: Date.now() + …`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) and the key has to be derived from the invoice (`invoice.id`), never minted — a freshly minted key is a new charge to the processor on every attempt.',
     'A timeout is an unknown outcome, not a failure: the processor may have charged and lost the reply. Read its state with `GetInvoice` for the same invoice id first, adopt the reference it reports when the charge already landed, and only then decide whether another attempt is allowed — with the same key, so the processor can collapse it.',
     'A decline is a business answer, not a transient error. `HARD_DECLINE`, `CARD_DECLINED` and `INSUFFICIENT_FUNDS` stop after the first attempt and mark the invoice `failed` with the code as its `reason`; only the deadline and an unavailable processor are worth another attempt, and `MAX_ATTEMPTS` bounds even those.',
   ],

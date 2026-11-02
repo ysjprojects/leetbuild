@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['api', 'db', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it publishes a \`kyc.decided\` event for every new
+**Starting point.** The starter is working code: it publishes a \`kyc.decided\` event for every new
 decision and the status consumer turns those events into counters, so the demo looks finished. Four
 production contracts around the event are broken, and each one is only visible when you read the
-draft against the failure mode it was supposed to prevent.
+starter against the failure mode it was supposed to prevent.
 
 \`kyc.decided\` is the only record most downstream systems ever read about a decision, so the event
 is an interface contract:
@@ -60,7 +60,7 @@ is an interface contract:
       id: 'key-applicant',
       title: 'Keys each event by the applicant reference',
       detail:
-        'The message key is the applicant reference, so every event for one applicant lands on one partition and their history stays ordered. The draft keys by the reviewer, which interleaves one applicant’s events with every other case that reviewer touched.',
+        'The message key is the applicant reference, so every event for one applicant lands on one partition and their history stays ordered. The starter keys by the reviewer, which interleaves one applicant’s events with every other case that reviewer touched.',
       match: {
         python: {all: [/applicant/], none: [/reviewer/]},
         typescript: {all: [/applicant/], none: [/reviewer/]},
@@ -73,7 +73,7 @@ is an interface contract:
       id: 'digests-only',
       title: 'Carries document digests, never images or extracted fields',
       detail:
-        'The payload carries one `digest` per document — enough for downstream systems to act and audit without another lookup. The draft embeds the extracted document fields, including the document number and an image reference, so identity data ends up in a retained, replicated topic.',
+        'The payload carries one `digest` per document — enough for downstream systems to act and audit without another lookup. The starter embeds the extracted document fields, including the document number and an image reference, so identity data ends up in a retained, replicated topic.',
       match: {
         python: {all: [/digest/], none: [/extracted/, /image/, /document_number/, /documentNumber/]},
         typescript: {all: [/digest/], none: [/extracted/, /image/, /document_number/, /documentNumber/]},
@@ -86,7 +86,7 @@ is an interface contract:
       id: 'publish-after-commit',
       title: 'Publishes only after the decision record commits',
       detail:
-        'The decision record commits before the event is produced: `store.put(...)` / the transaction commit returns first, then `producer.produce(...)` / `send`. The draft produces first, so a crash in between publishes a decision that the audit trail never recorded.',
+        'The decision record commits before the event is produced: `store.put(...)` / the transaction commit returns first, then `producer.produce(...)` / `send`. The starter produces first, so a crash in between publishes a decision that the audit trail never recorded.',
       match: {
         python: {order: [/store\.put\(|\.commit\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.put\(|\.commit\(/, /producer\.send\(/]},
@@ -99,7 +99,7 @@ is an interface contract:
       id: 'acks-all',
       title: 'Configures the producer for durable delivery',
       detail:
-        'The producer waits for a durable acknowledgement — `acks=all`, `acks: -1`, or `RequireAll` — so a produce that reports success is replicated, not merely buffered. The draft runs on the client default and never asks the broker to confirm the write.',
+        'The producer waits for a durable acknowledgement — `acks=all`, `acks: -1`, or `RequireAll` — so a produce that reports success is replicated, not merely buffered. The starter runs on the client default and never asks the broker to confirm the write.',
       match: {
         python: {all: [/"acks"/, /"all"/]},
         typescript: {all: [/acks:\s*-1/]},
@@ -112,7 +112,7 @@ is an interface contract:
       id: 'reason-codes',
       title: 'Carries the decision outcome and reason codes',
       detail:
-        'The payload carries the decision outcome and its reason codes (`reasons`), so downstream systems can act without querying the case store. The draft publishes the extracted document fields instead — the reasons never leave the store and every consumer has to invent them.',
+        'The payload carries the decision outcome and its reason codes (`reasons`), so downstream systems can act without querying the case store. The starter publishes the extracted document fields instead — the reasons never leave the store and every consumer has to invent them.',
       match: {
         python: {all: [/reasons/], none: [/extracted/]},
         typescript: {all: [/reasons/], none: [/extracted/]},
@@ -256,7 +256,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** kycd decision events: a model-generated draft that keys by reviewer and embeds extracted fields. */
+      starter: `/** kycd decision events: flawed code that keys by reviewer and embeds extracted fields. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';

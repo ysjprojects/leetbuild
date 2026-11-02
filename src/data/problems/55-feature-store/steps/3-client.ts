@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['worker', 'offline', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it fans out over the partitions,
+**Starting point.** The starter is working code: it fans out over the partitions,
 calls the warehouse and collects rows. It works on an idle cluster and it produces a training set full
 of fake zeros exactly when the warehouse is busy. Find the flaws, fix them, and prove the fix with the
 checks below.
@@ -17,14 +17,14 @@ Implement the backfill job that materializes one feature version from the offlin
 
 - The offline store is called once **per partition** over gRPC:
   \`Scan(feature, version, partition, cutoff_ms)\`.
-- Every call carries a **60-second deadline**. The draft has no deadline at all, so one slow partition
+- Every call carries a **60-second deadline**. The starter has no deadline at all, so one slow partition
   pins a worker until the warehouse decides to answer.
-- At most **4 partitions** are in flight. The draft launches every partition at once; a backfill that
+- At most **4 partitions** are in flight. The starter launches every partition at once; a backfill that
   opens 200 concurrent scans is a self-inflicted outage for the warehouse and for everyone else using it.
-- A partition that ends in \`DEADLINE_EXCEEDED\` is reported **missing**, never zero-filled. The draft
+- A partition that ends in \`DEADLINE_EXCEEDED\` is reported **missing**, never zero-filled. The starter
   turns every timeout into rows of \`0.0\`, which is how an infrastructure failure becomes
   plausible-looking training data — a zero the model happily learns from.
-- \`PERMISSION_DENIED\` **stops the backfill once**. The draft retries the rejection partition by
+- \`PERMISSION_DENIED\` **stops the backfill once**. The starter retries the rejection partition by
   partition, so a bad credential becomes a hot loop against a store that has already said no.
 - The scan request carries the **training cutoff** so the offline read is the same point-in-time
   question the online store answers, and the summary distinguishes \`written\` from \`missing\`.
@@ -62,7 +62,7 @@ the concurrency gate, the deadline, and the two error policies.`,
       id: 'bounded-concurrency',
       title: 'Keeps at most 4 partitions in flight',
       detail:
-        'A concurrency limit of 4 gates the scan calls, so a 200-partition backfill does not become 200 concurrent requests. The draft launches every partition at once.',
+        'A concurrency limit of 4 gates the scan calls, so a 200-partition backfill does not become 200 concurrent requests. The starter launches every partition at once.',
       match: {
         python: {all: [/MAX_CONCURRENCY/, /Semaphore\(MAX_CONCURRENCY\)/]},
         typescript: {all: [/MAX_CONCURRENCY/, /slice\(i,\s*i \+ MAX_CONCURRENCY\)/]},
@@ -75,7 +75,7 @@ the concurrency gate, the deadline, and the two error policies.`,
       id: 'deadline-60s',
       title: 'Gives every partition call a 60-second deadline',
       detail:
-        'Each scan carries a 60-second deadline, so one slow partition cannot pin a worker indefinitely. The draft calls with no deadline.',
+        'Each scan carries a 60-second deadline, so one slow partition cannot pin a worker indefinitely. The starter calls with no deadline.',
       match: {
         python: {all: [/PARTITION_DEADLINE_S/, /timeout=PARTITION_DEADLINE_S/]},
         typescript: {all: [/PARTITION_DEADLINE_S/, /Date\.now\(\) \+ PARTITION_DEADLINE_S \* 1000/]},
@@ -88,7 +88,7 @@ the concurrency gate, the deadline, and the two error policies.`,
       id: 'timeout-missing',
       title: 'Reports a timed-out partition as missing',
       detail:
-        'A `DEADLINE_EXCEEDED` partition lands in `missing`; it is never replaced with invented values. The draft zero-fills the partition, so the training set silently gains fake rows.',
+        'A `DEADLINE_EXCEEDED` partition lands in `missing`; it is never replaced with invented values. The starter zero-fills the partition, so the training set silently gains fake rows.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/, /missing/], none: [/zero[-_ ]?fill/i]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /missing/], none: [/zero[-_ ]?fill/i]},
@@ -101,7 +101,7 @@ the concurrency gate, the deadline, and the two error policies.`,
       id: 'permission-aborts',
       title: 'Stops the whole backfill on PERMISSION_DENIED',
       detail:
-        'A permission rejection ends the job with a single abort instead of being retried per partition. The draft catches the error and tries every remaining partition anyway.',
+        'A permission rejection ends the job with a single abort instead of being retried per partition. The starter catches the error and tries every remaining partition anyway.',
       match: {
         python: {all: [/PERMISSION_DENIED/, /BackfillAborted/]},
         typescript: {all: [/PERMISSION_DENIED/, /BackfillAborted/]},
@@ -114,7 +114,7 @@ the concurrency gate, the deadline, and the two error policies.`,
       id: 'cutoff-scan',
       title: 'Scans the offline store as of the training cutoff',
       detail:
-        'The scan request carries `cutoff_ms`, so the backfill asks the offline store the same point-in-time question the online store answers. The draft scans whatever is latest.',
+        'The scan request carries `cutoff_ms`, so the backfill asks the offline store the same point-in-time question the online store answers. The starter scans whatever is latest.',
       match: {
         python: {all: [/ScanRequest\(/, /cutoff_ms=cutoff_ms/]},
         typescript: {all: [/ScanRequest/, /cutoff_ms/]},
@@ -212,7 +212,7 @@ async def backfill(name: str, version: int, cutoff_ms: int, partitions: list[int
 `,
     },
     typescript: {
-      starter: `/** Backfill a feature version: a model-generated draft that trusts the warehouse to be fast. */
+      starter: `/** Backfill a feature version: flawed code that trusts the warehouse to be fast. */
 import * as grpc from '@grpc/grpc-js';
 
 import {warehouse} from './warehouse';
@@ -625,5 +625,5 @@ int run_backfill(
     'A timeout is information, not a value. `DEADLINE_EXCEEDED` belongs in a `missing` list that the caller can retry later; turning it into `0.0` rows is how an infrastructure failure becomes plausible-looking training data that nobody can explain.',
     'A permission rejection is a property of the credential, not of the partition: the first `PERMISSION_DENIED` ends the job with one abort. Retrying it per partition hammers a store that has already answered, and the answer will not change until the job does.',
   ],
-  debrief: `The interview question behind this step is honest failure propagation from a dependency. A warehouse is shared, rate-limited and occasionally slow, so a backfill has three obligations the draft ignores. Bounded concurrency protects the dependency and the job's own memory; a per-call deadline turns "slow" into a decision the job can make instead of a hang; and the two error policies are deliberately different — a timeout is transient, so the partition is reported missing and can be retried by whoever owns the schedule, while a permission rejection is terminal, so the job stops once instead of burning the warehouse with retries that cannot succeed. The subtle part is what \`missing\` prevents: a zero-fill looks like data, it passes every schema check, and it quietly teaches a model that the feature is zero in exactly the situations where the pipeline was broken.`,
+  debrief: `The interview question behind this step is honest failure propagation from a dependency. A warehouse is shared, rate-limited and occasionally slow, so a backfill has three obligations the starter ignores. Bounded concurrency protects the dependency and the job's own memory; a per-call deadline turns "slow" into a decision the job can make instead of a hang; and the two error policies are deliberately different — a timeout is transient, so the partition is reported missing and can be retried by whoever owns the schedule, while a permission rejection is terminal, so the job stops once instead of burning the warehouse with retries that cannot succeed. The subtle part is what \`missing\` prevents: a zero-fill looks like data, it passes every schema check, and it quietly teaches a model that the feature is zero in exactly the situations where the pipeline was broken.`,
 };

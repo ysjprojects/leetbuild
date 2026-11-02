@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Permission service on the AI-era track: the course is not "store some roles in a table", it is the
- * review you owe a model-generated authorization layer before it guards anything. A grant that cannot
- * exceed its assigner → a version-bumped cache a revocation cannot survive → a policy-engine call that
- * denies when it cannot verify → subject-keyed events with an outbox that can rebuild the cache → a
- * read that explains every permission instead of returning a blob.
+ * Permission service: the course is not "store some roles in a table", it is the debugging you owe
+ * an authorization layer before it guards anything. A grant that cannot exceed its assigner → a
+ * version-bumped cache a revocation cannot survive → a policy-engine call that denies when it
+ * cannot verify → subject-keyed events with an outbox that can rebuild the cache → a read that
+ * explains every permission instead of returning a blob.
  */
 export const permissionServiceProblem: Problem = {
   id: 'permission-service',
@@ -19,7 +19,6 @@ export const permissionServiceProblem: Problem = {
   tagline: 'Grants that cannot escalate, revoke immediately and explain themselves.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Permission Service
 
@@ -67,12 +66,12 @@ One service, **permz**, with five pieces:
    grants that produce it), from the version-stamped cache, matched **bit-for-bit** by the live check
    endpoint — and a foreign subject's permissions are **403** without the audit permission.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real authorization feature:
+debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

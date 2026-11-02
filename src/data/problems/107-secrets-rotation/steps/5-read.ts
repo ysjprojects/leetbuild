@@ -8,11 +8,11 @@ export const readStep: Step = {
   focus: ['ops', 'api', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the versions read: it
-resolves the name, lists the versions and answers 200. It compiles, it serves the console, and it
-hides three production flaws — an \`include_material\` flag that returns plaintext to admin callers,
-consumer acceptance that only the secret owner may see, and no scope check at all. Review it like
-the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the versions read: it resolves the name, lists
+the versions and answers 200. It compiles, it serves the console, and it hides three production
+flaws — an \`include_material\` flag that returns plaintext to admin callers, consumer acceptance
+that only the secret owner may see, and no scope check at all. Debug it like the service owner, fix
+it, and prove the fix with the checks below.
 
 Implement \`GET /v1/secrets/{name}/versions\`.
 
@@ -66,7 +66,7 @@ authenticated principal enumerate every secret's versions, fingerprints and wind
       id: 'scope-required',
       title: 'The secrets scope is required to read a lifecycle',
       detail:
-        'The caller is authenticated (**401** without `X-Operator-Id`) and the token must grant the `secrets` scope (**403** otherwise). The draft checks no scope, so any authenticated principal can enumerate versions, fingerprints and windows.',
+        'The caller is authenticated (**401** without `X-Operator-Id`) and the token must grant the `secrets` scope (**403** otherwise). The starter checks no scope, so any authenticated principal can enumerate versions, fingerprints and windows.',
       match: {
         python: {all: [/SECRETS_SCOPE/, /X-Scopes/, /status_code\s*=\s*403/, /status_code\s*=\s*401/]},
         typescript: {all: [/SECRETS_SCOPE/, /x-scopes/, /code\(\s*403\s*\)/, /code\(\s*401\s*\)/]},
@@ -79,7 +79,7 @@ authenticated principal enumerate every secret's versions, fingerprints and wind
       id: 'no-material-flag',
       title: 'No parameter can surface material',
       detail:
-        'Query parameters are validated against an allowlist (`limit`, `state`, `cursor`) and anything else is **400**, and every entry is built by the `version_view` projection. The draft accepts `include_material` and returns the material to admin callers, turning the vault into a read path.',
+        'Query parameters are validated against an allowlist (`limit`, `state`, `cursor`) and anything else is **400**, and every entry is built by the `version_view` projection. The starter accepts `include_material` and returns the material to admin callers, turning the vault into a read path.',
       match: {
         python: {all: [/ALLOWED_QUERY/, /def version_view\(/, /status_code\s*=\s*400/], none: [/include_material/]},
         typescript: {
@@ -95,7 +95,7 @@ authenticated principal enumerate every secret's versions, fingerprints and wind
       id: 'activation-window',
       title: 'Every entry carries its activation window',
       detail:
-        'A version entry reports `activated_at`, `retired_at` and `rotation_seconds` beside `version_id` and `fingerprint`, so an operator can see which versions were live when and which are overdue. The draft returns an unprojected record with neither window nor policy.',
+        'A version entry reports `activated_at`, `retired_at` and `rotation_seconds` beside `version_id` and `fingerprint`, so an operator can see which versions were live when and which are overdue. The starter returns an unprojected record with neither window nor policy.',
       match: {
         python: {all: [/def version_view\(/, /activated_at/, /retired_at/, /rotation_seconds/]},
         typescript: {all: [/function versionView\(/, /activated_at/, /retired_at/, /rotation_seconds/]},
@@ -108,7 +108,7 @@ authenticated principal enumerate every secret's versions, fingerprints and wind
       id: 'consumer-acceptance',
       title: 'Consumer acceptance is operator-visible',
       detail:
-        'The projection carries `acceptance` counts and the per-consumer `consumers` list for every caller holding the scope — not only for the secret owner. The draft shows lagging consumers to the owner alone, hiding exactly what retirement needs.',
+        'The projection carries `acceptance` counts and the per-consumer `consumers` list for every caller holding the scope — not only for the secret owner. The starter shows lagging consumers to the owner alone, hiding exactly what retirement needs.',
       match: {
         python: {all: [/acceptance/, /consumers/], none: [/operator == owner/]},
         typescript: {all: [/acceptance/, /consumers/], none: [/operator === owner/]},
@@ -152,8 +152,8 @@ def list_versions(
     request: Request,
     operator: str = Header(default="", alias="X-Operator-Id"),
 ) -> JSONResponse:
-    # TODO: this draft accepts an include_material flag, returns the material to admin callers, and
-    # shows lagging consumers to the secret owner only. Review all three.
+    # TODO: this starter accepts an include_material flag, returns the material to admin callers, and
+    # shows lagging consumers to the secret owner only. Fix all three.
     owner = store.owner_of(name)
     entries = []
     for version in store.list_versions(name):
@@ -240,7 +240,7 @@ def list_versions(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/secrets/:name/versions: a model-generated draft with a material flag. */
+      starter: `/** GET /v1/secrets/:name/versions: flawed code with a material flag. */
 import Fastify from 'fastify';
 
 import {store} from './secret_store';
@@ -251,8 +251,8 @@ app.get('/v1/secrets/:name/versions', async (request, reply) => {
   const operator = request.headers['x-operator-id'];
   const {name} = request.params as {name: string};
   const query = request.query as Record<string, string | undefined>;
-  // TODO: this draft accepts an include_material flag, returns the material to admin callers, and
-  // shows lagging consumers to the secret owner only. Review all three.
+  // TODO: this starter accepts an include_material flag, returns the material to admin callers, and
+  // shows lagging consumers to the secret owner only. Fix all three.
   const owner = await store.ownerOf(name);
   const versions = await store.listVersions(name);
   const entries: Record<string, unknown>[] = [];
@@ -356,8 +356,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func listVersions(rw http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	operator := r.Header.Get("X-Operator-Id")
-	// TODO: this draft accepts an include_material flag, returns the material to admin callers, and
-	// shows lagging consumers to the secret owner only. Review all three.
+	// TODO: this starter accepts an include_material flag, returns the material to admin callers, and
+	// shows lagging consumers to the secret owner only. Fix all three.
 	owner := store.OwnerOf(r.Context(), name)
 	versions, err := store.ListVersions(r.Context(), name)
 	if err != nil {
@@ -523,8 +523,8 @@ object SecretReadApi {
       get {
         optionalHeaderValueByName("X-Operator-Id") { operatorOpt =>
           parameterMap { params =>
-            // TODO: this draft accepts an include_material flag, returns the material to admin
-            // callers, and shows lagging consumers to the secret owner only. Review all three.
+            // TODO: this starter accepts an include_material flag, returns the material to admin
+            // callers, and shows lagging consumers to the secret owner only. Fix all three.
             val operator = operatorOpt.getOrElse("")
             val owner = store.ownerOf(name)
             val entries = store.listVersions(name).map { version =>
@@ -673,8 +673,8 @@ int main() {
   svr.Get(R"(/v1/secrets/([a-z0-9_-]+)/versions)", [](const httplib::Request& req, httplib::Response& res) {
     const auto name = req.matches[1].str();
     const auto operatorId = req.get_header_value("X-Operator-Id");
-    // TODO: this draft accepts an include_material flag, returns the material to admin callers, and
-    // shows lagging consumers to the secret owner only. Review all three.
+    // TODO: this starter accepts an include_material flag, returns the material to admin callers, and
+    // shows lagging consumers to the secret owner only. Fix all three.
     const auto owner = store.ownerOf(name);
     json entries = json::array();
     for (const auto& version : store.listVersions(name)) {

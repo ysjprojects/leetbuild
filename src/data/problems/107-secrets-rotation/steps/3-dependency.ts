@@ -8,12 +8,12 @@ export const dependencyStep: Step = {
   focus: ['worker', 'consumer', 'redis', 'api'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the verification step: it
-walks the registered consumers, asks each one whether it can read the new version, and returns a
-map. It compiles, the demo retires cleanly, and it hides three production flaws — a verification
-with no per-call deadline, a consumer that is counted as verified because the budget ran out, and a
-retry that re-polls the whole fleet whenever one consumer is down. Review it like the service owner,
-fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the verification step: it walks the registered
+consumers, asks each one whether it can read the new version, and returns a map. It compiles, the
+demo retires cleanly, and it hides three production flaws — a verification with no per-call
+deadline, a consumer that is counted as verified because the budget ran out, and a retry that
+re-polls the whole fleet whenever one consumer is down. Debug it like the service owner, fix it,
+and prove the fix with the checks below.
 
 Implement the gRPC verification that gates retirement. Every registered consumer runs one unary
 call, \`CanReadVersion\`, with request \`{"secret": name, "version_id": version_id}\` and reply
@@ -39,9 +39,9 @@ call, \`CanReadVersion\`, with request \`{"secret": name, "version_id": version_
 
 **Failure mode the checks target.** Retirement is the one irreversible step in a rotation: once the
 old version is gone, a consumer holding it cannot decrypt, and the failure surfaces in a checkout
-path eleven minutes later. The draft's three flaws all push in that direction. No per-call deadline
+path eleven minutes later. The starter's three flaws all push in that direction. No per-call deadline
 means one wedged consumer pins the rotation worker. Counting a spent budget as acceptance means the
-draft retires exactly the consumers it failed to hear from. And retrying the whole fleet for every
+starter retires exactly the consumers it failed to hear from. And retrying the whole fleet for every
 consumer turns a single down service into a verification storm, delaying the rotation that was
 supposed to be safe.`,
   sequence: {
@@ -78,7 +78,7 @@ supposed to be safe.`,
       id: 'verify-deadline',
       title: 'Each verification call carries a 2-second deadline',
       detail:
-        'The deadline is set on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) from the 2-second constant. The draft has no per-call deadline at all, so one wedged consumer pins the rotation worker.',
+        'The deadline is set on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) from the 2-second constant. The starter has no per-call deadline at all, so one wedged consumer pins the rotation worker.',
       match: {
         python: {all: [/VERIFY_DEADLINE_S/, /timeout\s*=\s*VERIFY_DEADLINE_S/]},
         typescript: {all: [/VERIFY_DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+\s*VERIFY_DEADLINE_MS/]},
@@ -91,7 +91,7 @@ supposed to be safe.`,
       id: 'verified-acceptance',
       title: 'Retirement requires verified acceptance from every consumer',
       detail:
-        '`all_verified` gates `retire`: a registry with no consumers is not acceptance, and anything unverified returns `retired: false` with the blocking consumers named. The draft retires whatever it heard from and counts a spent budget as agreement.',
+        '`all_verified` gates `retire`: a registry with no consumers is not acceptance, and anything unverified returns `retired: false` with the blocking consumers named. The starter retires whatever it heard from and counts a spent budget as agreement.',
       match: {
         python: {all: [/\bdef all_verified\(/, /\bdef retire\(/, /blocked_by/]},
         typescript: {all: [/function allVerified\(/, /async function retire\(/, /blockedBy/]},
@@ -104,7 +104,7 @@ supposed to be safe.`,
       id: 'blocked-alert',
       title: 'An unverified consumer blocks retirement and raises an alert',
       detail:
-        'The blocking path calls `alert_unverified` with the pending consumers before it returns, so a rotation that cannot safely finish pages someone instead of proceeding. The draft alerts nobody and retires anyway.',
+        'The blocking path calls `alert_unverified` with the pending consumers before it returns, so a rotation that cannot safely finish pages someone instead of proceeding. The starter alerts nobody and retires anyway.',
       match: {
         python: {all: [/\bdef alert_unverified\(/, /\bpending\b/]},
         typescript: {all: [/function alertUnverified\(/, /\bpending\b/]},
@@ -117,7 +117,7 @@ supposed to be safe.`,
       id: 'no-fleet-repoll',
       title: 'One consumer failure does not re-poll the fleet',
       detail:
-        'Each consumer gets one call from `verify_consumer`; a failure is reported, never retried by looping over the registry again. The draft has a `while` loop around a per-consumer call, so one down service re-polls every consumer behind it.',
+        'Each consumer gets one call from `verify_consumer`; a failure is reported, never retried by looping over the registry again. The starter has a `while` loop around a per-consumer call, so one down service re-polls every consumer behind it.',
       match: {
         python: {all: [/\bdef verify_consumer\(/], none: [/\bwhile True\b/]},
         typescript: {all: [/async function verifyConsumer\(/], none: [/\bwhile \(true\)/]},
@@ -156,9 +156,9 @@ def verify_consumers(
     version_id: str,
     stubs: dict[str, "consumers_pb2_grpc.ConsumerVerifierStub"],
 ) -> dict[str, bool]:
-    # TODO: this draft gives the verification a 2-second budget instead of a per-call deadline,
+    # TODO: this starter gives the verification a 2-second budget instead of a per-call deadline,
     # counts a consumer as verified once its budget is spent, and re-polls every consumer when one
-    # is down. Review all three, then gate retirement on verified acceptance from every consumer.
+    # is down. Fix all three, then gate retirement on verified acceptance from every consumer.
     reports: dict[str, bool] = {}
     for consumer_id, stub in stubs.items():
         started = time.monotonic()
@@ -264,7 +264,7 @@ def retire(name: str, old_version_id: str, new_version_id: str, stubs) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Consumer verification: a model-generated draft that retires on a spent budget. */
+      starter: `/** Consumer verification: flawed code that retires on a spent budget. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -290,9 +290,9 @@ export async function verifyConsumers(
   versionId: string,
   clients: Record<string, VerifierClient>,
 ): Promise<Record<string, boolean>> {
-  // TODO: this draft gives the verification a 2-second budget instead of a per-call deadline,
+  // TODO: this starter gives the verification a 2-second budget instead of a per-call deadline,
   // counts a consumer as verified once its budget is spent, and re-polls every consumer when one
-  // is down. Review all three, then gate retirement on verified acceptance from every consumer.
+  // is down. Fix all three, then gate retirement on verified acceptance from every consumer.
   const reports: Record<string, boolean> = {};
   for (const [consumerId, client] of Object.entries(clients)) {
     const started = Date.now();
@@ -461,9 +461,9 @@ func verifyConsumers(
 	clients map[string]pb.ConsumerVerifierClient,
 	name, versionID string,
 ) map[string]bool {
-	// TODO: this draft gives the verification a 2-second budget instead of a per-call deadline,
+	// TODO: this starter gives the verification a 2-second budget instead of a per-call deadline,
 	// counts a consumer as verified once its budget is spent, and re-polls every consumer when one
-	// is down. Review all three, then gate retirement on verified acceptance from every consumer.
+	// is down. Fix all three, then gate retirement on verified acceptance from every consumer.
 	reports := map[string]bool{}
 	for consumerID, client := range clients {
 		started := time.Now()
@@ -608,9 +608,9 @@ object RotationVerify {
   def client(target: String): ConsumerVerifierGrpc.ConsumerVerifierBlockingStub =
     ConsumerVerifierGrpc.blockingStub(ManagedChannelBuilder.forAddress(target, 9000).usePlaintext().build())
 
-  // TODO: this draft gives the verification a 2-second budget instead of a per-call deadline,
+  // TODO: this starter gives the verification a 2-second budget instead of a per-call deadline,
   // counts a consumer as verified once its budget is spent, and re-polls every consumer when one
-  // is down. Review all three, then gate retirement on verified acceptance from every consumer.
+  // is down. Fix all three, then gate retirement on verified acceptance from every consumer.
   def verifyConsumers(
       stubs: Map[String, ConsumerVerifierGrpc.ConsumerVerifierBlockingStub],
       name: String,
@@ -731,9 +731,9 @@ RotationStore store;
 
 constexpr long long kVerifyBudgetMs = 2000;
 
-// TODO: this draft gives the verification a 2-second budget instead of a per-call deadline, counts
+// TODO: this starter gives the verification a 2-second budget instead of a per-call deadline, counts
 // a consumer as verified once its budget is spent, and re-polls every consumer when one is down.
-// Review all three, then gate retirement on verified acceptance from every consumer.
+// Fix all three, then gate retirement on verified acceptance from every consumer.
 std::map<std::string, bool> verifyConsumers(
     const std::map<std::string, ConsumerVerifier::Stub*>& stubs,
     const std::string& name,
@@ -881,5 +881,5 @@ RetirementDecision retire(
     'Map the reply to a report you can reason about: `verified = reply.version_id == version_id`, and every error path — `UNAVAILABLE`, `DEADLINE_EXCEEDED`, anything else — produces `verified: false` with the status in `detail`. Never turn an absent answer into an affirmative one.',
     'Retirement is a gate, not a summary: compute `all_verified(reports)` (an empty registry is not acceptance), filter the unverified into `pending`, alert with them, and return `retired: false` naming who blocked. One call per consumer is the other half — the fleet is polled once, never once per failure.',
   ],
-  debrief: `The interviewer is probing the dependency that makes a rotation safe: before you delete the old version, every consumer must prove it can read the new one. Three flaws are being checked, and all three are the same mistake in different clothes — treating the absence of an answer as an answer. No per-call deadline means a wedged consumer holds the rotation open forever; a wall-clock budget that "expires" into acceptance means the draft retires exactly the consumers it never heard from; and re-polling the whole fleet on one failure turns a down service into a storm that delays the very rotation it was meant to protect. The gate itself is the third property: \`all_verified\` over every registered consumer, an alert when the gate fails, and a returned decision that names the blockers. Real rotators add capability checks instead of liveness checks (a consumer that says "I can read it" must actually have fetched and decrypted it), a per-consumer verification lease so a slow deploy does not block forever, and a two-phase retirement that marks the version retiring for a full deploy cycle first.`,
+  debrief: `The interviewer is probing the dependency that makes a rotation safe: before you delete the old version, every consumer must prove it can read the new one. Three flaws are being checked, and all three are the same mistake in different clothes — treating the absence of an answer as an answer. No per-call deadline means a wedged consumer holds the rotation open forever; a wall-clock budget that "expires" into acceptance means the starter retires exactly the consumers it never heard from; and re-polling the whole fleet on one failure turns a down service into a storm that delays the very rotation it was meant to protect. The gate itself is the third property: \`all_verified\` over every registered consumer, an alert when the gate fails, and a returned decision that names the blockers. Real rotators add capability checks instead of liveness checks (a consumer that says "I can read it" must actually have fetched and decrypted it), a per-consumer verification lease so a slow deploy does not block forever, and a two-phase retirement that marks the version retiring for a full deploy cycle first.`,
 };

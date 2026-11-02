@@ -8,9 +8,9 @@ export const experimentClientStep: Step = {
   focus: ['api', 'stats'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the ramp route,
+**Starting point.** The starter is working code: it registers the ramp route,
 validates the target, and asks the stats service before the percentage moves. It works on a demo
-whose metrics are green, and it removes the gate exactly when the gate matters. Review it like the
+whose metrics are green, and it removes the gate exactly when the gate matters. Debug it like the
 service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/experiments/{id}/ramp\` with body \`{"to_percent": 60}\`:
@@ -21,7 +21,7 @@ Implement \`POST /v1/experiments/{id}/ramp\` with body \`{"to_percent": 60}\`:
 - Before the new percentage is applied, ask the stats service over gRPC:
   \`CheckGuardrails(experiment_id, metric_bounds)\` with a **2 000 ms deadline**
   (\`timeout=2.0\` / \`{deadline: Date.now() + 2000}\` / \`context.WithTimeout(..., 2*time.Second)\` /
-  a Scala deadline of 2 seconds / \`ClientContext.set_deadline(..., milliseconds(2000))\`). The draft
+  a Scala deadline of 2 seconds / \`ClientContext.set_deadline(..., milliseconds(2000))\`). The starter
   gives the call five seconds, so a stuck stats service holds the ramp request open.
 - A breached bound **pauses** the ramp: persist the experiment \`paused\`, do **not** apply the new
   percentage, and answer **409** with the offending metric —
@@ -97,7 +97,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'deadline',
       title: 'Guardrail RPC carries a 2 s deadline',
       detail:
-        'Every `CheckGuardrails` attempt is created with an explicit 2 000 ms deadline — `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)` with `2 * time.Second`, `withDeadlineAfter(GuardrailDeadlineS, SECONDS)` or `ctx.set_deadline(..., milliseconds(kGuardrailDeadlineMs))`. The draft gives the call five seconds, so a stuck stats service holds the ramp request past the budget the platform promised.',
+        'Every `CheckGuardrails` attempt is created with an explicit 2 000 ms deadline — `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)` with `2 * time.Second`, `withDeadlineAfter(GuardrailDeadlineS, SECONDS)` or `ctx.set_deadline(..., milliseconds(kGuardrailDeadlineMs))`. The starter gives the call five seconds, so a stuck stats service holds the ramp request past the budget the platform promised.',
       match: {
         python: {all: [/GUARDRAIL_DEADLINE_S\s*=\s*2\.0/, /timeout\s*=\s*GUARDRAIL_DEADLINE_S/]},
         typescript: {
@@ -112,7 +112,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'pause-on-breach',
       title: 'A breached bound pauses the ramp and names the metric',
       detail:
-        'A `PAUSED` verdict persists the experiment as `paused` and answers **409** with the offending `metric`, its `limit` and the `observed` value; the percentage is never applied. The order matcher holds the guardrail call before the ramp write, so a breach cannot slip through to `applyPercent`. The draft retries the verdict and ramps a metric that is still breached.',
+        'A `PAUSED` verdict persists the experiment as `paused` and answers **409** with the offending `metric`, its `limit` and the `observed` value; the percentage is never applied. The order matcher holds the guardrail call before the ramp write, so a breach cannot slip through to `applyPercent`. The starter retries the verdict and ramps a metric that is still breached.',
       match: {
         python: {
           all: [/\bpaused\b/, /\bmetric\b/, /CheckGuardrails\(/],
@@ -140,7 +140,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'no-override',
       title: 'A caller-supplied override is rejected',
       detail:
-        'A body field such as `skip_guardrails`, `override` or `force` is a **400** — rejected, never honoured — and the guardrail input (the bounds and the verdict) never comes from the request. The draft reads `skip_guardrails` from the body and skips the check, which turns the gate into a suggestion.',
+        'A body field such as `skip_guardrails`, `override` or `force` is a **400** — rejected, never honoured — and the guardrail input (the bounds and the verdict) never comes from the request. The starter reads `skip_guardrails` from the body and skips the check, which turns the gate into a suggestion.',
       match: {
         python: {
           all: [/skip_guardrails/, /OVERRIDE_FIELDS/, /status_code\s*=\s*400/],
@@ -172,7 +172,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'no-retry-paused',
       title: 'A PAUSED verdict is terminal',
       detail:
-        'The verdict is read once: a `PAUSED` answer ends the request, and only `UNAVAILABLE` / `DEADLINE_EXCEEDED` are retried — at most `MAX_GUARDRAIL_ATTEMPTS = 2` attempts, never an unbounded `while`/`for` around the check. The draft loops until the check passes, holding the request open and ramping on a metric that is still breached.',
+        'The verdict is read once: a `PAUSED` answer ends the request, and only `UNAVAILABLE` / `DEADLINE_EXCEEDED` are retried — at most `MAX_GUARDRAIL_ATTEMPTS = 2` attempts, never an unbounded `while`/`for` around the check. The starter loops until the check passes, holding the request open and ramping on a metric that is still breached.',
       match: {
         python: {
           all: [/VERDICT_PAUSED/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_GUARDRAIL_ATTEMPTS/],
@@ -200,7 +200,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
       id: 'fresh-check',
       title: 'A paused experiment needs a fresh pass',
       detail:
-        'The stored `paused` status is consulted for this request but never substitutes for the check: the ramp re-runs the guardrail call, stays `paused` and answers **409** while the breach is present, and only a fresh passing check lifts the pause and applies the percentage. The order matcher keeps the status ahead of the percentage. The draft never reads the stored status at all.',
+        'The stored `paused` status is consulted for this request but never substitutes for the check: the ramp re-runs the guardrail call, stays `paused` and answers **409** while the breach is present, and only a fresh passing check lifts the pause and applies the percentage. The order matcher keeps the status ahead of the percentage. The starter never reads the stored status at all.',
       match: {
         python: {
           all: [/experiment\[["']status["']\]\s*==\s*["']paused["']/, /status_code\s*=\s*409/],
@@ -227,7 +227,7 @@ the body is data, not policy: \`skip_guardrails\` is a 400, not a shortcut.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/experiments/{id}/ramp: a model-generated draft that retries the verdict until it passes."""
+      starter: `"""POST /v1/experiments/{id}/ramp: flawed code that retries the verdict until it passes."""
 import logging
 
 import grpc
@@ -265,7 +265,7 @@ store = ExperimentStore()
 
 @app.post("/v1/experiments/{experiment_id}/ramp")
 def ramp(experiment_id: str, body: dict, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: the draft ramps on a cron, retries the stats service until the verdict stops saying
+    # TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
     # PAUSED, gives the call a five-second deadline, and honours body["skip_guardrails"]. Make a
     # breach pause the experiment with the metric named, retry only transient failures, and take
     # no guardrail input from the request body.
@@ -394,7 +394,7 @@ def ramp(experiment_id: str, body: dict, tenant: str | None = Header(default=Non
 `,
     },
     typescript: {
-      starter: `/** POST /v1/experiments/:id/ramp: a model-generated draft that trusts the body and retries the verdict. */
+      starter: `/** POST /v1/experiments/:id/ramp: flawed code that trusts the body and retries the verdict. */
 import Fastify from 'fastify';
 
 import {stats} from './stats';
@@ -439,7 +439,7 @@ function callCheckGuardrails(experimentId: string): Promise<{verdict: string}> {
 }
 
 app.post('/v1/experiments/:id/ramp', async (request, reply) => {
-  // TODO: the draft ramps on a cron, retries the stats service until the verdict stops saying
+  // TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
   // PAUSED, gives the call a five-second budget, and honours body.skip_guardrails. Make a breach
   // pause the experiment with the metric named, retry only transient failures, and read no
   // guardrail input from the request body.
@@ -613,7 +613,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func ramp(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft ramps on a cron, retries the stats service until the verdict stops saying
+	// TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
 	// PAUSED, gives the call a five-second deadline, and honours body.SkipGuardrails. Make a breach
 	// pause the experiment with the metric named, retry only transient failures, and take no
 	// guardrail input from the request body.
@@ -869,7 +869,7 @@ object RampRoutes {
       post {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
           entity(as[String]) { payload =>
-            // TODO: the draft ramps on a cron, retries the stats service until the verdict stops
+            // TODO: the starter ramps on a cron, retries the stats service until the verdict stops
             // saying PAUSED, gives the call a five-second deadline, and honours the body's
             // skip_guardrails field. Make a breach pause the experiment with the metric named,
             // retry only transient failures, and read no guardrail input from the request body.
@@ -1098,7 +1098,7 @@ int main() {
       res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
       return;
     }
-    // TODO: the draft ramps on a cron, retries the stats service until the verdict stops saying
+    // TODO: the starter ramps on a cron, retries the stats service until the verdict stops saying
     // PAUSED, gives the call a five-second deadline, and honours body["skip_guardrails"]. Make a
     // breach pause the experiment with the metric named, retry only transient failures, and take
     // no guardrail input from the request body.
@@ -1274,11 +1274,11 @@ int main() {
     },
   },
   hints: [
-    'The deadline belongs on the call, not around it: `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)`, `withDeadlineAfter(...)`, `ctx.set_deadline(...)`. Every retry pays that deadline again, and the loop in the draft has no exit at all.',
+    'The deadline belongs on the call, not around it: `timeout=GUARDRAIL_DEADLINE_S`, `{deadline: Date.now() + GUARDRAIL_DEADLINE_MS}`, `context.WithTimeout(ctx, guardrailDeadline)`, `withDeadlineAfter(...)`, `ctx.set_deadline(...)`. Every retry pays that deadline again, and the loop in the starter has no exit at all.',
     'Sort the outcomes by who decides. `PAUSED` is the stats service answering — terminal: persist `paused`, name the `metric` in a 409 and return before `applyPercent`. Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` mean "ask again", at most `MAX_GUARDRAIL_ATTEMPTS` (2) times, and a check that never succeeds leaves the percentage where it was.',
     'The stored status is not the check. A ramp on a `paused` experiment must run the guardrail call for *this* request: a fresh pass lifts the pause, a breach keeps it `paused` and answers 409 again. And the body never decides any of it — `skip_guardrails` is a 400, not a shortcut; the bounds live in service config.',
   ],
-  debrief: `The interviewer is testing whether you can review the gate in front of traffic. A ramp step is
+  debrief: `The interviewer is testing whether you can debug the gate in front of traffic. A ramp step is
 not a schedule, it is a decision, and the decision belongs to the stats service: \`PAUSED\` is an
 answer, so retrying it until it clears is not resilience — it is deleting the gate while the metric
 is still breached, and every attempt pays the deadline again. Retry only what means "ask again"

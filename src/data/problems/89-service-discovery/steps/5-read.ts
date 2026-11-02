@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['router', 'discovery', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it enumerates the service's
+**Starting point.** The starter is working code: it enumerates the service's
 keys and returns them, and the demo — one service, three healthy instances, no failures — is
 indistinguishable from correct. It returns instances whose key has already lapsed and only expires
 from the keyspace a moment later, it never says how old the heartbeat it is trusting is, and it
@@ -27,7 +27,7 @@ uses.
   - its heartbeat is fresh — \`now - last_heartbeat <= 3 * heartbeat_interval\` seconds;
   - its probe verdict is \`SERVING\` (\`sd:probe:{service}:{instance_id}\`).
 - Each returned instance carries \`instance_id\`, \`address\`, \`port\`, \`metadata_version\` and
-  **\`last_heartbeat\`**. The draft omits the heartbeat, so a caller cannot tell a two-second-old
+  **\`last_heartbeat\`**. The starter omits the heartbeat, so a caller cannot tell a two-second-old
   answer from a fifty-second-old one, and the caller that knows it is stale has nowhere to write
   that knowledge back.
 - Explain every exclusion: \`excluded\` holds \`{"instance_id", "reason", …}\` with reason
@@ -84,7 +84,7 @@ carries a \`last_heartbeat\`, and enumeration without the internal scope is 403.
       id: 'fresh',
       title: 'Lapsed keys never appear as routable',
       detail:
-        'Every candidate’s key is checked with `TTL` before it is returned, and a lapsed key is reported as `expired` instead. The draft returns whatever `GET` still answers, which includes the window between expiry and deletion.',
+        'Every candidate’s key is checked with `TTL` before it is returned, and a lapsed key is reported as `expired` instead. The starter returns whatever `GET` still answers, which includes the window between expiry and deletion.',
       match: {
         python: {all: [/\.ttl\(/, /expired/, /excluded/]},
         typescript: {all: [/\.ttl\(/, /expired/, /excluded/]},
@@ -97,7 +97,7 @@ carries a \`last_heartbeat\`, and enumeration without the internal scope is 403.
       id: 'heartbeat-age',
       title: 'The heartbeat and metadata version are in the answer',
       detail:
-        'Every returned instance carries `last_heartbeat` and `metadata_version`, and freshness is computed from the age against `3 * heartbeat_interval`. The draft omits the heartbeat, so callers cannot tell how old the answer is.',
+        'Every returned instance carries `last_heartbeat` and `metadata_version`, and freshness is computed from the age against `3 * heartbeat_interval`. The starter omits the heartbeat, so callers cannot tell how old the answer is.',
       match: {
         python: {all: [/last_heartbeat/, /metadata_version/, /heartbeat/]},
         typescript: {all: [/last_heartbeat/, /metadata_version/, /heartbeat/]},
@@ -110,7 +110,7 @@ carries a \`last_heartbeat\`, and enumeration without the internal scope is 403.
       id: 'scope',
       title: 'Enumeration requires the internal scope',
       detail:
-        'The `X-Scope` header is checked against the internal scope constant and anything else answers **403**. The draft serves the full membership map to any caller that can reach the port.',
+        'The `X-Scope` header is checked against the internal scope constant and anything else answers **403**. The starter serves the full membership map to any caller that can reach the port.',
       match: {
         python: {all: [/INTERNAL_SCOPE/, /403/]},
         typescript: {all: [/INTERNAL_SCOPE/, /403/]},
@@ -123,7 +123,7 @@ carries a \`last_heartbeat\`, and enumeration without the internal scope is 403.
       id: 'exclusions',
       title: 'Exclusions come back with reasons',
       detail:
-        'Instances that are not routable are returned in `excluded` with a `reason` — `expired`, `stale` or `unhealthy` — rather than being dropped silently. The draft returns only what it found.',
+        'Instances that are not routable are returned in `excluded` with a `reason` — `expired`, `stale` or `unhealthy` — rather than being dropped silently. The starter returns only what it found.',
       match: {
         python: {all: [/excluded/, /reason/, /stale/]},
         typescript: {all: [/excluded/, /reason/, /stale/]},
@@ -136,7 +136,7 @@ carries a \`last_heartbeat\`, and enumeration without the internal scope is 403.
       id: 'healthy-only',
       title: 'Unhealthy instances are excluded, not served',
       detail:
-        'The shared probe verdict (`sd:probe:{service}:{instance_id}`) gates the answer: anything that is not `SERVING` is reported as `unhealthy`. The draft never reads a probe verdict.',
+        'The shared probe verdict (`sd:probe:{service}:{instance_id}`) gates the answer: anything that is not `SERVING` is reported as `unhealthy`. The starter never reads a probe verdict.',
       match: {
         python: {all: [/sd:probe:/, /unhealthy/]},
         typescript: {all: [/sd:probe:/, /unhealthy/]},
@@ -162,9 +162,9 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/services/{service}/instances")
 def instances(service: str, scope: str = Header(default="", alias="X-Scope")) -> JSONResponse:
-    # TODO: this draft returns every registered instance including the ones whose keys have not
+    # TODO: this starter returns every registered instance including the ones whose keys have not
     # vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-    # any service. Review all four.
+    # any service. Fix all four.
     found = []
     for key in r.scan_iter(f"sd:{service}:*"):
         raw = r.get(key)
@@ -241,7 +241,7 @@ def instances(service: str, scope: str | None = Header(default=None, alias="X-Sc
 `,
     },
     typescript: {
-      starter: `/** GET /v1/services/:service/instances: a model-generated draft that lists the keyspace. */
+      starter: `/** GET /v1/services/:service/instances: flawed code that lists the keyspace. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -249,9 +249,9 @@ export const app = Fastify();
 export const redis = new Redis({host: 'redis', port: 6379});
 
 app.get('/v1/services/:service/instances', async (request, reply) => {
-  // TODO: this draft returns every registered instance including the ones whose keys have not
+  // TODO: this starter returns every registered instance including the ones whose keys have not
   // vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-  // any service. Review all four.
+  // any service. Fix all four.
   const {service} = request.params as {service: string};
   const found: unknown[] = [];
   for await (const key of redis.scanStream({match: \`sd:\${service}:*\`})) {
@@ -366,9 +366,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func instances(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft returns every registered instance including the ones whose keys have not
+	// TODO: this starter returns every registered instance including the ones whose keys have not
 	// vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-	// any service. Review all four.
+	// any service. Fix all four.
 	service := r.PathValue("service")
 	keys, _ := rdb.Keys(r.Context(), "sd:"+service+":*").Result()
 	found := make([]InstanceRecord, 0, len(keys))
@@ -554,9 +554,9 @@ object Read {
   val route: Route =
     path("v1" / "services" / Segment / "instances") { service =>
       get {
-        // TODO: this draft returns every registered instance including the ones whose keys have not
+        // TODO: this starter returns every registered instance including the ones whose keys have not
         // vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller
-        // enumerate any service. Review all four.
+        // enumerate any service. Fix all four.
         val keys = jedis.keys("sd:" + service + ":*").asScala
         val found = keys.flatMap(recordAt).toList
         system.log.info(s"instances service=$service count=\${found.size}")
@@ -684,9 +684,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/services/([^/]+)/instances)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft returns every registered instance including the ones whose keys have not
+    // TODO: this starter returns every registered instance including the ones whose keys have not
     // vanished yet, omits the last heartbeat, reads no probe verdict and lets any caller enumerate
-    // any service. Review all four.
+    // any service. Fix all four.
     const auto service = req.matches[1].str();
     json found = json::array();
     long long cursor = 0;

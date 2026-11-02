@@ -8,19 +8,19 @@ export const eventsStep: Step = {
   focus: ['api', 'store', 'kafka', 'sync'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the event write lands in the
+**Starting point.** The starter is working code: the event write lands in the
 store, a change record lands in the topic, and the sync consumer moves, so the demo looks right. It
-compiles, it serves the demo, and it hides five production flaws. Review it like the service owner,
+compiles, it serves the demo, and it hides five production flaws. Debug it like the service owner,
 fix it, and prove the fix with the checks below.
 
 Implement the change stream behind the event write:
 
 - Every accepted change publishes **one** \`calendar.event\` record **keyed by the calendar id**.
   Kafka orders within a partition, not within a topic, so the key decides what can be reordered:
-  partition by calendar and the changes of one calendar arrive in revision order. The draft keys by
+  partition by calendar and the changes of one calendar arrive in revision order. The starter keys by
   the first attendee, so a calendar’s revisions scatter across partitions and a consumer can apply
   revision 7 before revision 4.
-- The topic comes from a **named constant** holding \`calendar.event\`; the draft inlines the
+- The topic comes from a **named constant** holding \`calendar.event\`; the starter inlines the
   string at the produce call and again at the subscription.
 - The payload carries \`{event_id, revision, kind}\` and nothing else: never the event body or its
   title and description, never an attendee address. The topic is retained and replicated, so
@@ -29,7 +29,7 @@ Implement the change stream behind the event write:
   the change in the stream: every consumer applies a revision the store never accepted.
 - The producer is **idempotent with \`acks=all\`** (the stack’s equivalent: \`enable.idempotence\`
   plus required acks \`all\`). When the broker rejects the produce, the same payload is written to
-  an \`outbox\` row that a relay republishes. The draft is fire-and-forget, so a rejected produce
+  an \`outbox\` row that a relay republishes. The starter is fire-and-forget, so a rejected produce
   is a silently lost change.
 - The \`calendar-sync\` **consumer applies each change to the store and only then commits the
   offset**. Commit first and a crash between the two loses the apply forever, because the offset
@@ -63,7 +63,7 @@ consumer applies a stale revision last.`,
       id: 'calendar-key',
       title: 'Keyed by the calendar id, topic from a constant',
       detail:
-        'The produce call uses the calendar id as the message key, so the changes of one calendar share a partition and stay in revision order, and the topic comes from a named `calendar.event` constant. The draft keys by the first attendee and inlines the topic string.',
+        'The produce call uses the calendar id as the message key, so the changes of one calendar share a partition and stay in revision order, and the topic comes from a named `calendar.event` constant. The starter keys by the first attendee and inlines the topic string.',
       match: {
         python: {all: [/key=\w*calendar_id/, /CALENDAR_EVENT_TOPIC\s*=\s*["']calendar\.event["']/]},
         typescript: {all: [/key:\s*calendarId/, /CALENDAR_EVENT_TOPIC\s*=\s*['"]calendar\.event['"]/]},
@@ -83,7 +83,7 @@ consumer applies a stale revision last.`,
       id: 'ids-only-payload',
       title: 'Payload is event id, revision and kind only',
       detail:
-        'The record carries `event_id`, `revision` and `kind` and nothing else: no event body, no title or description, no attendee address. The draft serializes the whole event, so retained content outlives the event and every RSVP.',
+        'The record carries `event_id`, `revision` and `kind` and nothing else: no event body, no title or description, no attendee address. The starter serializes the whole event, so retained content outlives the event and every RSVP.',
       match: {
         python: {
           all: [/event_id/, /revision/, /kind/],
@@ -111,7 +111,7 @@ consumer applies a stale revision last.`,
       id: 'commit-then-publish',
       title: 'Store commit happens before the produce',
       detail:
-        'The order is the store commit and only then the produce, so the stream never carries a revision the store rolled back. The draft publishes first and commits after, which turns one failed transaction into a change every consumer already applied.',
+        'The order is the store commit and only then the produce, so the stream never carries a revision the store rolled back. The starter publishes first and commits after, which turns one failed transaction into a change every consumer already applied.',
       match: {
         python: {order: [/\.commit\(/, /produce\(/]},
         typescript: {order: [/\.commit\(/, /producer\.send\(/]},
@@ -124,7 +124,7 @@ consumer applies a stale revision last.`,
       id: 'idempotent-outbox',
       title: 'Idempotent producer, acks=all, outbox on failure',
       detail:
-        'The producer is configured for idempotence with `acks=all`, and a rejected produce writes the same payload to an `outbox` row a relay republishes. The draft is fire-and-forget: the default acknowledgement level, no retry, and a lost change when the broker rejects the produce.',
+        'The producer is configured for idempotence with `acks=all`, and a rejected produce writes the same payload to an `outbox` row a relay republishes. The starter is fire-and-forget: the default acknowledgement level, no retry, and a lost change when the broker rejects the produce.',
       match: {
         python: {
           all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/, /insert_outbox\(/],
@@ -145,7 +145,7 @@ consumer applies a stale revision last.`,
       id: 'consumer-order',
       title: 'Sync consumer applies before committing offsets',
       detail:
-        'The consumer reads `calendar.event` in a named group and applies each change to the store before committing the offset; committing first makes a crash between the two lose the apply forever. The draft commits the offset first, then applies.',
+        'The consumer reads `calendar.event` in a named group and applies each change to the store before committing the offset; committing first makes a crash between the two lose the apply forever. The starter commits the offset first, then applies.',
       match: {
         python: {all: [/group\.id/, /CALENDAR_EVENT_TOPIC/], order: [/store\.apply_change\(/, /consumer\.commit\(/]},
         typescript: {
@@ -305,7 +305,7 @@ def consume() -> None:
     },
     typescript: {
       starter: `/**
- * calendar.event: a model-generated draft that keys by attendee and publishes before the commit,
+ * calendar.event: flawed code that keys by attendee and publishes before the commit,
  * so one calendar's revisions scatter across partitions and a rollback still reaches the stream.
  */
 import Fastify from 'fastify';
@@ -870,5 +870,5 @@ void consume(const std::string& group) {
     'Ids only, never content: build the record from `{event_id, revision, kind}`. The topic is retained and replicated, so an event body or an attendee address written there outlives the event, the RSVP and every delete path the service has.',
     'Commit, then publish: `store.commit(change)` before `producer.produce(...)`; make the producer idempotent with `acks=all` and write an `outbox` row when the broker rejects the produce; in the consumer, `applyChange` before `commitSync` so a crash replays the record instead of losing the apply.',
   ],
-  debrief: `The interviewer is checking the four contracts a generated Kafka snippet gets wrong, plus the topic constant that keeps producer and consumer in sync. First, the message key is an ordering contract: partition by calendar and one calendar’s changes arrive in revision order; key by attendee and a four-hundred-person event fans its revisions across partitions, so the sync consumer applies a stale revision last. Second, the payload is a retention contract: the topic keeps and replicates whatever you write into it, so the record carries ids, the revision and the change kind — never the body or the addresses, which have their own delete semantics in the store. Third, publish-after-commit is what makes the stream honest: produce first and a rollback leaves a change consumers apply even though the store never accepted it, which is why real systems write an outbox row inside the transaction and let a relay publish it. Fourth, exactly-once *looking* code is not exactly-once: idempotence plus acks=all on the producer, one key per partition, and apply-before-commit on the consumer, or a crash in either place loses work silently. Real platforms add schema-registry validation, per-calendar partition budgets, and dead-letter topics for changes that can never be applied.`,
+  debrief: `The interviewer is checking the four contracts a Kafka snippet gets wrong, plus the topic constant that keeps producer and consumer in sync. First, the message key is an ordering contract: partition by calendar and one calendar’s changes arrive in revision order; key by attendee and a four-hundred-person event fans its revisions across partitions, so the sync consumer applies a stale revision last. Second, the payload is a retention contract: the topic keeps and replicates whatever you write into it, so the record carries ids, the revision and the change kind — never the body or the addresses, which have their own delete semantics in the store. Third, publish-after-commit is what makes the stream honest: produce first and a rollback leaves a change consumers apply even though the store never accepted it, which is why real systems write an outbox row inside the transaction and let a relay publish it. Fourth, exactly-once *looking* code is not exactly-once: idempotence plus acks=all on the producer, one key per partition, and apply-before-commit on the consumer, or a crash in either place loses work silently. Real platforms add schema-registry validation, per-calendar partition budgets, and dead-letter topics for changes that can never be applied.`,
 };

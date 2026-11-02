@@ -8,29 +8,28 @@ export const windowedSketchStep: Step = {
   focus: ['monitor', 'redis', 'baseline'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: batches arrive, buckets go up,
-and the demo shows a distribution. It hides two multi-window bugs — one that loses counts under
-concurrency, one that destroys the reference — and one about time. Review it, fix it, and prove the
-fix.
+**Starting point.** The starter is working code: batches arrive, buckets go up, and the demo shows a
+distribution. It hides two multi-window bugs — one that loses counts under concurrency, one that
+destroys the reference — and one about time. Debug it, fix it, and prove the fix.
 
 Input distributions are tracked as **windowed sketches** in Redis, one per (tenant, monitor, window),
 with the baseline kept apart.
 
 - The **live** sketch key is \`sketch:live:{tenant}:{monitor_id}:{window}\`, where \`window\` is the
   window start (\`floor(now / window_s) * window_s\`). A key without the tenant, the monitor or the
-  window mixes unrelated monitors or never resets. The draft uses one \`sketch:{tenant}:{monitor}:{…}\`
+  window mixes unrelated monitors or never resets. The starter uses one \`sketch:{tenant}:{monitor}:{…}\`
   namespace for everything.
 - A batch is a list of \`(bucket, count)\` pairs and must be merged by **one atomic Lua \`EVAL\`**: the
   counters are incremented server-side with \`HINCRBY\`, never read and written back from the client.
-  The draft does \`HGET\` → add → \`HSET\` per bucket, so two concurrent batches lose counts.
+  The starter does \`HGET\` → add → \`HSET\` per bucket, so two concurrent batches lose counts.
 - The **baseline** sketch lives under its own prefix, \`sketch:baseline:{tenant}:{baseline_ref}\`, and a
-  live merge must never touch it. The draft writes the baseline into the same mutable namespace as
+  live merge must never touch it. The starter writes the baseline into the same mutable namespace as
   live traffic, so last week's reference slowly becomes this week's data and drift stops firing.
 - The baseline is **frozen once**: \`freeze_baseline\` uses a write-once set, so a second freeze is a
   no-op rather than a silent overwrite of the reference.
 - **Window expiry follows the window boundary exactly**: \`EXPIRE\` is set to
   \`window_end - now\` (\`window_end = window_start + window_s\`), so the key dies when its window's last
-  second does. The draft expires it an hour after the first write, which is not a window at all.
+  second does. The starter expires it an hour after the first write, which is not a window at all.
 
 **Failure mode the checks target.** A read-modify-write from the client is a lost-update race; a shared
 key between the live signal and its own baseline makes the comparison self-referential; a fixed TTL is
@@ -60,7 +59,7 @@ not a window. Each one leaves the monitor running, quiet and wrong.`,
       id: 'atomic-merge',
       title: 'Merges a whole batch with one atomic script',
       detail:
-        'Every bucket of a batch is merged inside one `EVAL`/`NewScript` call with `HINCRBY`. The draft reads with `HGET`, adds in the client and writes with `HSET`, so two concurrent batches both read the same value and one increment is lost.',
+        'Every bucket of a batch is merged inside one `EVAL`/`NewScript` call with `HINCRBY`. The starter reads with `HGET`, adds in the client and writes with `HSET`, so two concurrent batches both read the same value and one increment is lost.',
       match: {
         python: {all: [/MERGE_LUA/, /\.eval\(/, /HINCRBY/]},
         typescript: {all: [/MERGE_LUA/, /\.eval\(/, /HINCRBY/]},
@@ -86,7 +85,7 @@ not a window. Each one leaves the monitor running, quiet and wrong.`,
       id: 'baseline-separate',
       title: 'Keeps the baseline out of the live key space',
       detail:
-        'Baseline sketches use their own `sketch:baseline:` prefix, and a merge refuses a key in that space instead of writing into it. The draft puts live and baseline traffic in one mutable key, so the reference drifts with the signal it is supposed to judge.',
+        'Baseline sketches use their own `sketch:baseline:` prefix, and a merge refuses a key in that space instead of writing into it. The starter puts live and baseline traffic in one mutable key, so the reference drifts with the signal it is supposed to judge.',
       match: {
         python: {all: [/sketch:baseline:/, /BASELINE_PREFIX/, /raise ValueError/]},
         typescript: {all: [/sketch:baseline:/, /BASELINE_PREFIX/, /throw new Error/]},
@@ -99,7 +98,7 @@ not a window. Each one leaves the monitor running, quiet and wrong.`,
       id: 'baseline-frozen',
       title: 'Freezes the baseline once',
       detail:
-        'The baseline is written with a write-once set (`nx=True`, `NX`, `SetNX`, `SetParams…nx()`, `UpdateType::NOT_EXIST`), so a later freeze cannot overwrite the reference. The draft deletes and rewrites the key, so a re-run silently rebases the monitor on the new traffic.',
+        'The baseline is written with a write-once set (`nx=True`, `NX`, `SetNX`, `SetParams…nx()`, `UpdateType::NOT_EXIST`), so a later freeze cannot overwrite the reference. The starter deletes and rewrites the key, so a re-run silently rebases the monitor on the new traffic.',
       match: {
         python: {all: [/freeze_baseline\(/, /nx=True/]},
         typescript: {all: [/freezeBaseline\(/, /['"]NX['"]/]},
@@ -112,7 +111,7 @@ not a window. Each one leaves the monitor running, quiet and wrong.`,
       id: 'window-boundary',
       title: 'Expires the sketch exactly at the window boundary',
       detail:
-        'The TTL is `window_end - now`, set by `EXPIRE` inside the merge script, so the key dies when its window ends. The draft expires the key 3600 s after the first write, which drifts out of step with the window it claims to represent.',
+        'The TTL is `window_end - now`, set by `EXPIRE` inside the merge script, so the key dies when its window ends. The starter expires the key 3600 s after the first write, which drifts out of step with the window it claims to represent.',
       match: {
         python: {all: [/window_end\(/, /EXPIRE/]},
         typescript: {all: [/windowEnd\(/, /EXPIRE/]},
@@ -138,9 +137,9 @@ def window(now: int, window_s: int) -> int:
 
 
 def merge_batch(tenant: str, monitor_id: str, window_start: int, batch: dict[int, int]) -> int:
-    # TODO: this draft reads each bucket, adds in the client and writes it back, so two concurrent
+    # TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
     # batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-    # the key an hour after the first write instead of at the window boundary. Review all three.
+    # the key an hour after the first write instead of at the window boundary. Fix all three.
     key = f"{SKETCH_ROOT}:{tenant}:{monitor_id}:{window_start}"
     total = 0
     for bucket_id, count in batch.items():
@@ -218,7 +217,7 @@ def freeze_baseline(tenant: str, baseline_ref: str, batch: dict[int, int]) -> bo
 `,
     },
     typescript: {
-      starter: `/** Windowed sketches in Redis: a model-generated draft. */
+      starter: `/** Windowed sketches in Redis: flawed code. */
 import Redis from 'ioredis';
 
 export const r = new Redis({host: 'redis', port: 6379});
@@ -239,9 +238,9 @@ export async function mergeBatch(
   windowStart: number,
   batch: Batch,
 ): Promise<number> {
-  // TODO: this draft reads each bucket, adds in the client and writes it back, so two concurrent
+  // TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
   // batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-  // the key an hour after the first write instead of at the window boundary. Review all three.
+  // the key an hour after the first write instead of at the window boundary. Fix all three.
   const key = SKETCH_ROOT + ':' + tenant + ':' + monitorId + ':' + windowStart;
   let total = 0;
   for (const [bucket, count] of Object.entries(batch)) {
@@ -355,9 +354,9 @@ func sketchKey(parts ...string) string {
 }
 
 func mergeBatch(ctx context.Context, tenant, monitorID string, windowStart int64, batch Batch) (int64, error) {
-	// TODO: this draft reads each bucket, adds in the client and writes it back, so two concurrent
+	// TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
 	// batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-	// the key an hour after the first write instead of at the window boundary. Review all three.
+	// the key an hour after the first write instead of at the window boundary. Fix all three.
 	key := sketchKey(tenant, monitorID, fmt.Sprintf("%d", windowStart))
 	var total int64
 	for bucket, count := range batch {
@@ -471,9 +470,9 @@ object SketchStore {
   def sketchKey(parts: String*): String = (SketchRoot +: parts).mkString(":")
 
   def mergeBatch(tenant: String, monitorId: String, windowStart: Long, batch: Map[Int, Long]): Long = {
-    // TODO: this draft reads each bucket, adds in the client and writes it back, so two concurrent
+    // TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
     // batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-    // the key an hour after the first write instead of at the window boundary. Review all three.
+    // the key an hour after the first write instead of at the window boundary. Fix all three.
     val key = sketchKey(tenant, monitorId, windowStart.toString)
     var total = 0L
     batch.foreach { case (bucket, count) =>
@@ -574,9 +573,9 @@ long mergeBatch(const std::string& tenant,
                 const std::string& monitorId,
                 long windowStart,
                 const std::unordered_map<std::string, long>& batch) {
-  // TODO: this draft reads each bucket, adds in the client and writes it back, so two concurrent
+  // TODO: this starter reads each bucket, adds in the client and writes it back, so two concurrent
   // batches lose counts; it writes live and baseline traffic into one mutable key; and it expires
-  // the key an hour after the first write instead of at the window boundary. Review all three.
+  // the key an hour after the first write instead of at the window boundary. Fix all three.
   const auto key = sketchKey({tenant, monitorId, std::to_string(windowStart)});
   long total = 0;
   for (const auto& [bucket, count] : batch) {

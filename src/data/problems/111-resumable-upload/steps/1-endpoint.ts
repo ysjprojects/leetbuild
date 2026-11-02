@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the initiation
+**Starting point.** The starter is working code: it registers the initiation
 route, parses the body and hands back an upload id. It compiles, it serves the demo, and it hides
-four production flaws. Review it like the service owner, fix it, and prove the fix with the checks
+four production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`POST /v1/uploads\`, the initiation call a client makes before it sends any bytes. The body
@@ -70,7 +70,7 @@ the bytes uploaded to the first session are orphaned.`,
       id: 'part-bounds',
       title: 'Bounds the part size and the resulting part count',
       detail:
-        '`part_bytes` sits in `MIN_PART_SIZE..MAX_PART_SIZE` (1 MiB..64 MiB) and `part_count = ceil(total_bytes / part_bytes)` stays under `MAX_PART_COUNT` (10 000). The draft trusts the caller’s part size, so a 1-byte part creates a million-row manifest.',
+        '`part_bytes` sits in `MIN_PART_SIZE..MAX_PART_SIZE` (1 MiB..64 MiB) and `part_count = ceil(total_bytes / part_bytes)` stays under `MAX_PART_COUNT` (10 000). The starter trusts the caller’s part size, so a 1-byte part creates a million-row manifest.',
       match: {
         python: {all: [/MIN_PART_SIZE/, /MAX_PART_SIZE/, /MAX_PART_COUNT/, /part_count\s*=/]},
         typescript: {all: [/MIN_PART_SIZE/, /MAX_PART_SIZE/, /MAX_PART_COUNT/, /partCount\s*=/]},
@@ -83,7 +83,7 @@ the bytes uploaded to the first session are orphaned.`,
       id: 'quota',
       title: 'Rejects a total size over the tenant quota',
       detail:
-        'A `total_bytes` above the 5 GiB tenant quota is **413**. The draft checks no quota, so one tenant can initiate unlimited storage.',
+        'A `total_bytes` above the 5 GiB tenant quota is **413**. The starter checks no quota, so one tenant can initiate unlimited storage.',
       match: {
         python: {all: [/MAX_UPLOAD_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_UPLOAD_BYTES/, /code\(\s*413\s*\)/]},
@@ -96,7 +96,7 @@ the bytes uploaded to the first session are orphaned.`,
       id: 'content-type',
       title: 'Validates the declared type and sniffs at completion',
       detail:
-        '`content_type` is checked against `ALLOWED_CONTENT_TYPES`, and `sniff_content_type` reads the leading bytes at completion so the recorded type is the sniffed one. The draft trusts the declared type and never sniffs.',
+        '`content_type` is checked against `ALLOWED_CONTENT_TYPES`, and `sniff_content_type` reads the leading bytes at completion so the recorded type is the sniffed one. The starter trusts the declared type and never sniffs.',
       match: {
         python: {all: [/ALLOWED_CONTENT_TYPES/, /def sniff_content_type\(/]},
         typescript: {all: [/ALLOWED_CONTENT_TYPES/, /function sniffContentType\(/]},
@@ -109,7 +109,7 @@ the bytes uploaded to the first session are orphaned.`,
       id: 'idempotency',
       title: 'Keys initiation by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the upload is stored under `(tenant, key)`; a replay returns the original upload id instead of starting a second session. The draft ignores the header entirely.',
+        '`Idempotency-Key` is required and the upload is stored under `(tenant, key)`; a replay returns the original upload id instead of starting a second session. The starter ignores the header entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -153,8 +153,8 @@ store = UploadStore()
 
 @app.post("/v1/uploads")
 def init_upload(body: InitUploadRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft trusts the caller's part size and content type, never checks the tenant
-    # quota, and creates a new upload session on every retry. Review all four.
+    # TODO: this starter trusts the caller's part size and content type, never checks the tenant
+    # quota, and creates a new upload session on every retry. Fix all four.
     upload_id = uuid.uuid4().hex
     logger.info("upload init tenant=%s total=%d", tenant, body.total_bytes)
     return JSONResponse(
@@ -272,7 +272,7 @@ def complete_upload(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/uploads: a model-generated draft that trusts the caller's declaration. */
+      starter: `/** POST /v1/uploads: flawed code that trusts the caller's declaration. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -286,8 +286,8 @@ interface InitUploadBody {
 }
 
 app.post('/v1/uploads', async (request, reply) => {
-  // TODO: this draft trusts the caller's part size and content type, never checks the tenant
-  // quota, and creates a new upload session on every retry. Review all four.
+  // TODO: this starter trusts the caller's part size and content type, never checks the tenant
+  // quota, and creates a new upload session on every retry. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as InitUploadBody;
   request.log.info({tenant, total: body.total_bytes}, 'upload init');
@@ -428,8 +428,8 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func initUpload(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft trusts the caller's part size and content type, never checks the tenant
-	// quota, and creates a new upload session on every retry. Review all four.
+	// TODO: this starter trusts the caller's part size and content type, never checks the tenant
+	// quota, and creates a new upload session on every retry. Fix all four.
 	tenant := r.Header.Get("X-Tenant-Id")
 	var body initUploadBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -600,8 +600,8 @@ object UploadApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[InitUploadRequest]) { body =>
-            // TODO: this draft trusts the caller's part size and content type, never checks the
-            // tenant quota, and creates a new upload session on every retry. Review all four.
+            // TODO: this starter trusts the caller's part size and content type, never checks the
+            // tenant quota, and creates a new upload session on every retry. Fix all four.
             val parts = (body.total_bytes + body.part_bytes - 1) / body.part_bytes
             system.log.info(s"upload init tenant=$tenant total=\${body.total_bytes}")
             complete(
@@ -752,8 +752,8 @@ int main() {
       res.set_content(json{{"error", "invalid json"}}.dump(), "application/json");
       return;
     }
-    // TODO: this draft trusts the caller's part size and content type, never checks the tenant
-    // quota, and creates a new upload session on every retry. Review all four.
+    // TODO: this starter trusts the caller's part size and content type, never checks the tenant
+    // quota, and creates a new upload session on every retry. Fix all four.
     const auto totalBytes = body.value("total_bytes", 0LL);
     const auto partBytes = body.value("part_bytes", 0LL);
     std::cerr << "upload init tenant=" << tenant << " total=" << totalBytes << "\\n";
@@ -881,5 +881,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends well-formed requests from one tenant and never retries. Four defects are being checked: the tenant is never optional; the part size and the resulting part count are bounded so the manifest cannot blow up; the total is checked against the tenant quota; and the initiation is idempotent, so a client retry returns the original upload id instead of orphaning the first session's bytes. The quiet one is the declared type: a client can send \`image/png\` and then upload a PDF, so the server sniffs the leading bytes at completion and records what it saw. Real upload services add per-tenant storage accounting, a signed initiation token, and a declared-part-count cross-check against the object store's multipart metadata.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one tenant and never retries. Four defects are being checked: the tenant is never optional; the part size and the resulting part count are bounded so the manifest cannot blow up; the total is checked against the tenant quota; and the initiation is idempotent, so a client retry returns the original upload id instead of orphaning the first session's bytes. The quiet one is the declared type: a client can send \`image/png\` and then upload a PDF, so the server sniffs the leading bytes at completion and records what it saw. Real upload services add per-tenant storage accounting, a signed initiation token, and a declared-part-count cross-check against the object store's multipart metadata.`,
 };

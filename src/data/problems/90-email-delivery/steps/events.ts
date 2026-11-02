@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces one event per send
+**Starting point.** The starter is working code: it produces one event per send
 and the demo consumer reads it, so the happy path looks fine. It hides three flaws that only show up
 once a recipient's events matter. Find them, fix them, and prove the fix.
 
@@ -16,16 +16,16 @@ Implement the \`email.event\` producer used by the send and complaint paths:
 
 - Every event goes to the topic \`email.event\` **keyed by the recipient hash**
   (\`sha256(recipient)\`), so all of one recipient's events land in one partition and their lifecycle
-  stays ordered. The draft keys by campaign, so a recipient's events are spread across partitions and
+  stays ordered. The starter keys by campaign, so a recipient's events are spread across partitions and
   a \`bounced\` can overtake an \`accepted\`.
-- The \`accepted\` event is published **after the relay confirms** the send. The draft publishes
+- The \`accepted\` event is published **after the relay confirms** the send. The starter publishes
   \`accepted\` as soon as the request is queued, so a message the relay later rejects is reported as
   accepted.
 - The payload carries the **message id and the bounce category**, never a full address: the recipient
-  appears only as its hash (the record key). The draft puts the raw address in the payload, which then
+  appears only as its hash (the record key). The starter puts the raw address in the payload, which then
   reaches every consumer and every third-party sink.
 - The lifecycle is complete: **queued**, **accepted**, **bounced** and **complained** are all produced
-  for the topic to be a real audit trail. The draft only produces \`accepted\`.
+  for the topic to be a real audit trail. The starter only produces \`accepted\`.
 
 **Failure mode the checks target.** Keying by campaign breaks per-recipient ordering; publishing
 \`accepted\` before the relay confirms reports a message as accepted that may never leave; and a raw
@@ -46,7 +46,7 @@ address in the payload leaks the recipient to every downstream reader.`,
       id: 'recipient-key',
       title: 'Keys every event by the recipient hash',
       detail:
-        'The record key is `sha256(recipient)`, so a recipient’s events share a partition. The draft keys by campaign.',
+        'The record key is `sha256(recipient)`, so a recipient’s events share a partition. The starter keys by campaign.',
       match: {
         python: {all: [/def recipient_hash\(/, /key=recipient_key/], none: [/campaign/i]},
         typescript: {all: [/recipientHash\(/, /key:\s*recipientKey/], none: [/campaign/i]},
@@ -59,7 +59,7 @@ address in the payload leaks the recipient to every downstream reader.`,
       id: 'publish-after-accept',
       title: 'Publishes accepted only after the relay confirms',
       detail:
-        'The `accepted` event is produced after the relay returns acceptance. The draft produces it while the message is still queued.',
+        'The `accepted` event is produced after the relay returns acceptance. The starter produces it while the message is still queued.',
       match: {
         python: {order: [/relay\.send\(/, /publish\(/]},
         typescript: {order: [/relay\.send\(/, /publish\(/]},
@@ -72,7 +72,7 @@ address in the payload leaks the recipient to every downstream reader.`,
       id: 'hashed-payload',
       title: 'Payload carries the recipient hash, never the raw address',
       detail:
-        'The payload carries the recipient as a hash and the message id; the raw address never reaches the topic. The draft writes the address into the payload.',
+        'The payload carries the recipient as a hash and the message id; the raw address never reaches the topic. The starter writes the address into the payload.',
       match: {
         python: {all: [/recipient_hash\(/, /message_id/], none: [/recipient_email/]},
         typescript: {all: [/recipientHash\(/, /message_id/], none: [/recipient_email/]},
@@ -84,7 +84,8 @@ address in the payload leaks the recipient to every downstream reader.`,
     {
       id: 'lifecycle-events',
       title: 'Produces the whole lifecycle: queued, accepted, bounced, complained',
-      detail: 'All four event types are produced so the topic is a real lifecycle. The draft only produces `accepted`.',
+      detail:
+        'All four event types are produced so the topic is a real lifecycle. The starter only produces `accepted`.',
       match: {
         python: {all: [/["']queued["']/, /["']accepted["']/, /["']bounced["']/, /["']complained["']/]},
         typescript: {all: [/["']queued["']/, /["']accepted["']/, /["']bounced["']/, /["']complained["']/]},
@@ -97,7 +98,7 @@ address in the payload leaks the recipient to every downstream reader.`,
       id: 'payload-fields',
       title: 'Payload carries the message id and the bounce category',
       detail:
-        'The payload includes `message_id` and `category`, so a consumer can correlate and classify without the address. The draft omits the category.',
+        'The payload includes `message_id` and `category`, so a consumer can correlate and classify without the address. The starter omits the category.',
       match: {
         python: {all: [/message_id/, /category/]},
         typescript: {all: [/message_id|messageId/, /category/]},
@@ -115,7 +116,7 @@ TOPIC = "email.event"
 
 
 def publish(event_type: str, campaign_key: str, message_id: str, recipient: str) -> None:
-    # TODO: this draft keys by campaign, publishes accepted before the relay confirms, and puts the
+    # TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
     # raw recipient address in the payload that reaches third parties.
     producer.send(
         TOPIC,
@@ -175,7 +176,7 @@ export async function publish(
   messageId: string,
   recipient: string,
 ): Promise<void> {
-  // TODO: this draft keys by campaign, publishes accepted before the relay confirms, and puts the
+  // TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
   // raw recipient address in the payload that reaches third parties.
   await producer.send({
     topic: TOPIC,
@@ -251,7 +252,7 @@ type Producer interface {
 }
 
 func Publish(ctx context.Context, producer Producer, eventType, campaignKey, messageID, recipient string) error {
-	// TODO: this draft keys by campaign, publishes accepted before the relay confirms, and puts the
+	// TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
 	// raw recipient address in the payload that reaches third parties.
 	payload, _ := json.Marshal(map[string]string{
 		"event_type":      eventType,
@@ -331,7 +332,7 @@ object Events {
   val Topic = "email.event"
 
   def publish(eventType: String, campaignKey: String, messageId: String, recipient: String): Unit = {
-    // TODO: this draft keys by campaign, publishes accepted before the relay confirms, and puts the
+    // TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
     // raw recipient address in the payload that reaches third parties.
     val payload = Map(
       "event_type" -> eventType,
@@ -402,7 +403,7 @@ const std::string kTopic = "email.event";
 
 void publish(Producer& producer, const std::string& event_type, const std::string& campaign_key,
              const std::string& message_id, const std::string& recipient) {
-  // TODO: this draft keys by campaign, publishes accepted before the relay confirms, and puts the
+  // TODO: this starter keys by campaign, publishes accepted before the relay confirms, and puts the
   // raw recipient address in the payload that reaches third parties.
   const json payload = json{{"event_type", event_type}, {"recipient_email", recipient}, {"message_id", message_id}};
   producer.send(kTopic, campaign_key, payload.dump());
@@ -458,5 +459,5 @@ void handleComplaint(Producer& producer, const std::string& recipient, const std
     'The `accepted` event belongs after the relay returns. Publishing it while the message is only queued reports a delivery the relay may never make.',
     'The payload is read by every consumer: keep the recipient as its hash and carry `message_id` and `category`. A raw address in the value leaks the recipient to each downstream sink.',
   ],
-  debrief: `The interviewer is testing whether you can review an event producer for ordering and privacy. The draft reads fine because the demo consumer just counts events. Three defects are being checked: a campaign key that breaks per-recipient ordering, an \`accepted\` event published before the relay confirms, and a raw address in the payload. The fix keys by the recipient hash, publishes \`accepted\` only after acceptance, and keeps the value to ids and categories. Real pipelines add an idempotent producer with \`acks=all\`, a schema registry, and a consumer that commits its offset after processing.`,
+  debrief: `The interviewer is testing whether you can debug an event producer for ordering and privacy. The starter reads fine because the demo consumer just counts events. Three defects are being checked: a campaign key that breaks per-recipient ordering, an \`accepted\` event published before the relay confirms, and a raw address in the payload. The fix keys by the recipient hash, publishes \`accepted\` only after acceptance, and keeps the value to ids and categories. Real pipelines add an idempotent producer with \`acks=all\`, a schema registry, and a consumer that commits its offset after processing.`,
 };

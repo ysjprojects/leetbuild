@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'hub', 'gateway'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body and answers with a command id. It compiles, it serves the demo, and it hides three
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body and
+answers with a command id. It compiles, it serves the demo, and it hides three production flaws.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/devices/{id}/commands\`, the only way a command enters the fleet.
 
@@ -23,7 +23,7 @@ Implement \`POST /v1/devices/{id}/commands\`, the only way a command enters the 
 - The **validity window** bounds the command's life: store \`expires_at = now + validity_s\` (accept
   \`validity_s\` in **1..3600**, \`400\` otherwise) and discard a command whose window has closed
   **unexecuted** — replaying it after the window reports \`state: "expired"\` (\`410\`), not a second
-  execution. The draft keeps no window, so a command accepted for a device that is offline for days
+  execution. The starter keeps no window, so a command accepted for a device that is offline for days
   fires long after the operator changed their mind.
 - The command rate is **per device**, not per caller: at most **10** commands per device per
   **60-second** window, counted in a window key, with \`429\` when the device's budget is spent —
@@ -32,7 +32,7 @@ Implement \`POST /v1/devices/{id}/commands\`, the only way a command enters the 
   in \`state: "pending_ack"\` (\`queued\` when no acknowledgment is expected), so "accepted" is never
   confused with "executed".
 
-**Failure mode the checks target.** The draft mints a fresh \`command_id\` per request and ignores the
+**Failure mode the checks target.** The starter mints a fresh \`command_id\` per request and ignores the
 caller's idempotency id, so a retried delivery executes the side effect twice; it stores no validity
 window, so a command for an offline device fires days late; and it applies no per-device limit, so one
 misbehaving integration can enqueue unbounded work onto a single device. Each defect is invisible in a
@@ -86,7 +86,7 @@ demo that sends one well-formed request and never retries.`,
       id: 'identity',
       title: 'Keys the command by its per-device idempotency id',
       detail:
-        'The command is looked up and stored under `(device_id, idempotency_id)` before execution, so a replay returns the recorded command instead of executing it again. The draft mints a fresh id per request and ignores the caller’s idempotency id.',
+        'The command is looked up and stored under `(device_id, idempotency_id)` before execution, so a replay returns the recorded command instead of executing it again. The starter mints a fresh id per request and ignores the caller’s idempotency id.',
       match: {
         python: {all: [/idempotency_id/, /command_store\.get\(/, /command_store\.put\(/]},
         typescript: {all: [/idempotency_id/, /commandStore\.get\(/, /commandStore\.put\(/]},
@@ -99,7 +99,7 @@ demo that sends one well-formed request and never retries.`,
       id: 'window',
       title: 'Discards commands past their validity window',
       detail:
-        'The command carries `expires_at = now + validity_s`; a command whose window has closed is discarded unexecuted and a replay after the window reports `expired`. The draft stores no window at all, so a command fires days late.',
+        'The command carries `expires_at = now + validity_s`; a command whose window has closed is discarded unexecuted and a replay after the window reports `expired`. The starter stores no window at all, so a command fires days late.',
       match: {
         python: {all: [/expires_at/, /expired/, /time\.time\(\)/]},
         typescript: {all: [/expires_at/, /expired|Expired/, /Date\.now\(\)/]},
@@ -112,7 +112,7 @@ demo that sends one well-formed request and never retries.`,
       id: 'rate-limit',
       title: 'Enforces a per-device command rate',
       detail:
-        'Commands are counted per device in a 60-second window and the device gets `429` when its budget is spent — before any gateway work. The draft applies no per-device limit, so one caller can flood a device.',
+        'Commands are counted per device in a 60-second window and the device gets `429` when its budget is spent — before any gateway work. The starter applies no per-device limit, so one caller can flood a device.',
       match: {
         python: {all: [/COMMAND_RATE_LIMIT/, /status_code\s*=\s*429/]},
         typescript: {all: [/COMMAND_RATE_LIMIT/, /code\(\s*429\s*\)/]},
@@ -125,7 +125,7 @@ demo that sends one well-formed request and never retries.`,
       id: 'ack',
       title: 'Tracks the expected acknowledgment',
       detail:
-        'The command records `ack_required` and is returned as `pending_ack` (`queued` when no acknowledgment is expected), so "accepted" is never confused with "executed". The draft returns `executed` immediately.',
+        'The command records `ack_required` and is returned as `pending_ack` (`queued` when no acknowledgment is expected), so "accepted" is never confused with "executed". The starter returns `executed` immediately.',
       match: {
         python: {all: [/ack_required/, /pending_ack/]},
         typescript: {all: [/ack_required/, /pending_ack/]},
@@ -168,9 +168,9 @@ def submit_command(
     body: CommandRequest,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft ignores the command's idempotency id so a replay executes twice, keeps no
+    # TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
     # validity window so an old command fires days late, and applies no per-device rate limit so one
-    # caller can flood the device. Review all three.
+    # caller can flood the device. Fix all three.
     command_id = str(uuid.uuid4())
     command_store.record(device_id, {"command_id": command_id, "action": body.action})
     return JSONResponse({"command_id": command_id, "state": "executed"}, status_code=200)
@@ -255,7 +255,7 @@ def submit_command(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/devices/{id}/commands: a model-generated draft that trusts the caller. */
+      starter: `/** POST /v1/devices/{id}/commands: flawed code that trusts the caller. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -280,9 +280,9 @@ const commandStore: CommandStore = {
 };
 
 app.post('/v1/devices/:id/commands', async (request, reply) => {
-  // TODO: this draft ignores the command's idempotency id so a replay executes twice, keeps no
+  // TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
   // validity window so an old command fires days late, and applies no per-device rate limit so one
-  // caller can flood the device. Review all three.
+  // caller can flood the device. Fix all three.
   const deviceId = request.params['id'] as string;
   const body = request.body as CommandBody;
   const commandId = randomUUID();
@@ -422,9 +422,9 @@ func submitCommand(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft ignores the command's idempotency id so a replay executes twice, keeps no
+	// TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
 	// validity window so an old command fires days late, and applies no per-device rate limit so one
-	// caller can flood the device. Review all three.
+	// caller can flood the device. Fix all three.
 	commandID := uuid.NewString()
 	_ = commandStore.Record(deviceID, map[string]any{"command_id": commandID, "action": body.Action})
 	writeJSON(rw, http.StatusOK, map[string]any{"command_id": commandID, "state": "executed"})
@@ -584,9 +584,9 @@ object Api {
     path("v1" / "devices" / Segment / "commands") {
       post {
         entity(as[CommandRequest]) { body =>
-          // TODO: this draft ignores the command's idempotency id so a replay executes twice, keeps no
+          // TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
           // validity window so an old command fires days late, and applies no per-device rate limit so
-          // one caller can flood the device. Review all three.
+          // one caller can flood the device. Fix all three.
           complete(StatusCodes.OK, Command(java.util.UUID.randomUUID().toString, body.action, "executed"))
         }
       }
@@ -699,9 +699,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft ignores the command's idempotency id so a replay executes twice, keeps no
+    // TODO: this starter ignores the command's idempotency id so a replay executes twice, keeps no
     // validity window so an old command fires days late, and applies no per-device rate limit so one
-    // caller can flood the device. Review all three.
+    // caller can flood the device. Fix all three.
     const auto deviceId = req.matches[1].str();
     const auto commandId = uuidString();
     commandStore.record(deviceId, json{{"command_id", commandId}, {"action", body.value("action", "")}});
@@ -806,8 +806,8 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a
-fleet. The draft reads fine because the demo sends one command from one operator and never retries.
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a fleet.
+The starter reads fine because the demo sends one command from one operator and never retries.
 Three separate defects are being checked: command identity (the idempotency id makes a replay a no-op
 instead of a second unlock), the validity window (a command has a lifetime, and the hub must be able
 to drop one that outlived its usefulness without executing it), and per-device rate limiting (the

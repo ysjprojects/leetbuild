@@ -8,10 +8,9 @@ export const readStep: Step = {
   focus: ['dash', 'api', 'ledger'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the completeness
+**Starting point.** The starter is working code: it registers the completeness
 route, reads a count and returns it next to an expectation. It compiles, the page renders, and it
-hides three production flaws — the same ones that let the incident review conclude "100 %". Review it
-like the service owner, fix it, and prove the fix with the checks below.
+hides three production flaws — the same ones that let the incident review conclude "100 %". Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/services/{service}/completeness\`:
 
@@ -28,7 +27,7 @@ Implement \`GET /v1/services/{service}/completeness\`:
   caller's to read, and "not found" tells a prober less than "forbidden" would.
 - Return the service id, the hours, the gap count and the threshold; never the log text.
 
-**Failure mode the checks target.** The draft returns one number and compares it with a global
+**Failure mode the checks target.** The starter returns one number and compares it with a global
 constant, so a service that indexed ten records during an outage hour and a million during a normal
 hour both "look fine"; it computes the expectation globally, so one tenant's backfill inflates every
 other tenant's baseline until genuine drops stop flagging; and it answers for any service id, which
@@ -66,7 +65,7 @@ turns the completeness page into an existence oracle for other tenants' pipeline
       id: 'hourly',
       title: 'Reports indexed counts per hour bucket',
       detail:
-        'The report buckets by `HOUR_MS` over a 24-hour window, so it shows *when* the pipeline stopped, not only that the total is low. The draft returns one number for the whole window.',
+        'The report buckets by `HOUR_MS` over a 24-hour window, so it shows *when* the pipeline stopped, not only that the total is low. The starter returns one number for the whole window.',
       match: {
         python: {all: [/HOUR_MS/, /hour_bucket\(/]},
         typescript: {all: [/HOUR_MS/, /hourBucket\(/]},
@@ -79,7 +78,7 @@ turns the completeness page into an existence oracle for other tenants' pipeline
       id: 'expectation-per-tenant',
       title: "Computes the expectation from the tenant's own history",
       detail:
-        'The expected count is read for `(tenant, service)` over the same window, never a global constant or a cross-tenant average. The draft compares every tenant with one global expectation, which hides real drops and invents fake ones.',
+        'The expected count is read for `(tenant, service)` over the same window, never a global constant or a cross-tenant average. The starter compares every tenant with one global expectation, which hides real drops and invents fake ones.',
       match: {
         python: {all: [/hourly_expectation\(tenant,\s*service/]},
         typescript: {all: [/hourlyExpectation\(tenant,\s*service/]},
@@ -92,7 +91,7 @@ turns the completeness page into an existence oracle for other tenants' pipeline
       id: 'foreign-404',
       title: "Answers 404 for a service outside the tenant's registry",
       detail:
-        "A `service` that is not in the caller's registry is **404**. The draft answers for any id, so the completeness page doubles as an existence oracle for other tenants' pipelines.",
+        "A `service` that is not in the caller's registry is **404**. The starter answers for any id, so the completeness page doubles as an existence oracle for other tenants' pipelines.",
       match: {
         python: {all: [/status_code\s*=\s*404/, /[Rr]egistry/]},
         typescript: {all: [/code\(\s*404\s*\)/, /[Rr]egistry/]},
@@ -105,7 +104,7 @@ turns the completeness page into an existence oracle for other tenants' pipeline
       id: 'gap-threshold',
       title: 'Flags hours below the expectation by more than the threshold',
       detail:
-        'Each hour is marked `gap` when the indexed count falls more than `GAP_THRESHOLD` below its expectation, and the response totals the flagged hours. The draft has no per-hour comparison at all, which is why an outage looked complete.',
+        'Each hour is marked `gap` when the indexed count falls more than `GAP_THRESHOLD` below its expectation, and the response totals the flagged hours. The starter has no per-hour comparison at all, which is why an outage looked complete.',
       match: {
         python: {all: [/GAP_THRESHOLD/, /"gap"/]},
         typescript: {all: [/GAP_THRESHOLD/, /\bgap\b/]},
@@ -137,8 +136,8 @@ ledger = IndexLedger()
 
 @app.get("/v1/services/{service}/completeness")
 def completeness(service: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft reports one total, compares it with a global expectation, and answers for any
-    # service id instead of 404 for one outside the caller's registry. Review all three.
+    # TODO: this starter reports one total, compares it with a global expectation, and answers for any
+    # service id instead of 404 for one outside the caller's registry. Fix all three.
     total = ledger.total_count(tenant, service)
     return JSONResponse({"service": service, "indexed": total, "expected": EXPECTED_PER_HOUR})
 `,
@@ -209,7 +208,7 @@ def completeness(service: str, tenant: str | None = Header(default=None, alias="
 `,
     },
     typescript: {
-      starter: `/** GET /v1/services/:service/completeness: a model-generated draft with one total. */
+      starter: `/** GET /v1/services/:service/completeness: flawed code with one total. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -223,8 +222,8 @@ export interface IndexLedger {
 export const ledger: IndexLedger = {totalCount: async () => 0};
 
 app.get('/v1/services/:service/completeness', async (request, reply) => {
-  // TODO: this draft reports one total, compares it with a global expectation, and answers for any
-  // service id instead of 404 for one outside the caller's registry. Review all three.
+  // TODO: this starter reports one total, compares it with a global expectation, and answers for any
+  // service id instead of 404 for one outside the caller's registry. Fix all three.
   const {service} = request.params as {service: string};
   const tenant = request.headers['x-tenant-id'] as string;
   const total = await ledger.totalCount(tenant, service);
@@ -306,8 +305,8 @@ func (l *IndexLedger) TotalCount(ctx context.Context, tenant, service string) (i
 var ledger = &IndexLedger{}
 
 func completeness(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reports one total, compares it with a global expectation, and answers for any
-	// service id instead of 404 for one outside the caller's registry. Review all three.
+	// TODO: this starter reports one total, compares it with a global expectation, and answers for any
+	// service id instead of 404 for one outside the caller's registry. Fix all three.
 	tenant := r.Header.Get("X-Tenant-Id")
 	service := r.PathValue("service")
 	total, _ := ledger.TotalCount(r.Context(), tenant, service)
@@ -440,8 +439,8 @@ object Read {
   val route: Route =
     path("v1" / "services" / Segment / "completeness") { service =>
       get {
-        // TODO: this draft reports one total, compares it with a global expectation, and answers
-        // for any service id instead of 404 for one outside the caller's registry. Review all
+        // TODO: this starter reports one total, compares it with a global expectation, and answers
+        // for any service id instead of 404 for one outside the caller's registry. Fix all
         // three.
         val total = ledger.totalCount(service)
         complete(StatusCodes.OK, s"""{"service":"$service","indexed":$total,"expected":$ExpectedPerHour}""")
@@ -541,8 +540,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/services/([^/]+)/completeness)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reports one total, compares it with a global expectation, and answers for
-    // any service id instead of 404 for one outside the caller's registry. Review all three.
+    // TODO: this starter reports one total, compares it with a global expectation, and answers for
+    // any service id instead of 404 for one outside the caller's registry. Fix all three.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto service = req.matches[1].str();
     const auto total = ledger.totalCount(tenant, service);

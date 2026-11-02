@@ -8,9 +8,9 @@ export const entityUpsertStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers
+**Starting point.** The starter is working code: it registers
 \`POST /v1/entities\`, parses the body and returns the entity. It compiles, it serves the demo, and it
-hides four production flaws. Review it like the graph owner, fix it, and prove the fix with the
+hides four production flaws. Debug it like the graph owner, fix it, and prove the fix with the
 checks below.
 
 Implement \`POST /v1/entities\` with body
@@ -32,7 +32,7 @@ Implement \`POST /v1/entities\` with body
   request; the request never overwrites the stored labels wholesale.
 - Log ids, types and the policy — never the raw labels.
 
-**Failure mode the checks target.** The draft lets the request body carry \`authority: true\` or
+**Failure mode the checks target.** The starter lets the request body carry \`authority: true\` or
 \`merge_policy: "force"\` and acts on it, so any caller can force a merge; it folds two entities
 together whenever their aliases intersect even when their types differ, so a \`person\` and an
 \`company\` sharing a domain-shaped alias silently become one node; it copies \`labels\` from the
@@ -68,7 +68,7 @@ second tenant reuses an alias.`,
       id: 'merge-policy',
       title: 'Resolves the merge policy server-side and refuses authority flags',
       detail:
-        'The tenant’s policy is a server constant (`SERVER_MERGE_POLICY`) and any caller-supplied authority flag is rejected rather than honoured. The draft reads `merge_policy`/`authority` straight from the body.',
+        'The tenant’s policy is a server constant (`SERVER_MERGE_POLICY`) and any caller-supplied authority flag is rejected rather than honoured. The starter reads `merge_policy`/`authority` straight from the body.',
       match: {
         python: {all: [/SERVER_MERGE_POLICY/, /AUTHORITY_FIELDS/]},
         typescript: {all: [/SERVER_MERGE_POLICY/, /AUTHORITY_FIELDS/]},
@@ -81,7 +81,7 @@ second tenant reuses an alias.`,
       id: 'cross-type-409',
       title: 'Cross-type alias collision is 409 with both candidates',
       detail:
-        'When one alias is already claimed by an entity of a different type, the request is **409** and the body names both candidates (`candidates`); nothing is written. The draft merges them.',
+        'When one alias is already claimed by an entity of a different type, the request is **409** and the body names both candidates (`candidates`); nothing is written. The starter merges them.',
       match: {
         python: {all: [/status_code\s*=\s*409/, /AliasCollision/, /candidates/]},
         typescript: {all: [/code\(\s*409\s*\)/, /AliasCollision/, /candidates/]},
@@ -94,7 +94,7 @@ second tenant reuses an alias.`,
       id: 'idempotency',
       title: 'Keys the upsert by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the entity is stored under `(tenant, key)`; a replay returns the stored entity and writes no edge. The draft ignores the header so a retried batch double-writes edges.',
+        '`Idempotency-Key` is required and the entity is stored under `(tenant, key)`; a replay returns the stored entity and writes no edge. The starter ignores the header so a retried batch double-writes edges.',
       match: {
         python: {all: [/Idempotency-Key/, /idem_key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /idemKey/, /store\.get\(/, /store\.put\(/]},
@@ -107,7 +107,7 @@ second tenant reuses an alias.`,
       id: 'label-merge',
       title: 'Merges labels under the policy, never overwrites them',
       detail:
-        'Stored and incoming labels are folded by `merge_labels` under `SERVER_MERGE_POLICY`; the request cannot replace the stored labels. The draft assigns `body.labels` directly.',
+        'Stored and incoming labels are folded by `merge_labels` under `SERVER_MERGE_POLICY`; the request cannot replace the stored labels. The starter assigns `body.labels` directly.',
       match: {
         python: {all: [/def merge_labels\(/, /SERVER_MERGE_POLICY/]},
         typescript: {all: [/function mergeLabels\(/, /SERVER_MERGE_POLICY/]},
@@ -154,9 +154,9 @@ store = GraphStore()
 
 @app.post("/v1/entities")
 def upsert_entity(body: EntityUpsert) -> JSONResponse:
-    # TODO: this draft honours the caller's authority flags, merges any two entities whose aliases
+    # TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
     # intersect even across types, overwrites labels with whatever arrives, and never checks
-    # Idempotency-Key. Review all four.
+    # Idempotency-Key. Fix all four.
     hits = [hit for alias in [body.canonical_name, *body.aliases] for hit in store.find_by_alias(body.type, alias)]
     if hits and (body.authority or body.merge_policy == "force"):
         for other in hits:
@@ -289,7 +289,7 @@ async def upsert_entity(request: Request) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/entities: a model-generated draft that trusts the request body. */
+      starter: `/** POST /v1/entities: flawed code that trusts the request body. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -306,9 +306,9 @@ interface EntityBody {
 }
 
 app.post('/v1/entities', async (request, reply) => {
-  // TODO: this draft honours the caller's authority flags, merges any two entities whose aliases
+  // TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
   // intersect even across types, overwrites labels with whatever arrives, and never checks
-  // Idempotency-Key. Review all four.
+  // Idempotency-Key. Fix all four.
   const body = request.body as EntityBody;
   const aliases = [body.canonical_name, ...(body.aliases ?? [])];
   const hits = await Promise.all(aliases.map(alias => store.findByAlias(body.type, alias)));
@@ -453,9 +453,9 @@ func upsertEntity(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft honours the caller's authority flags, merges any two entities whose aliases
+	// TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
 	// intersect even across types, overwrites labels with whatever arrives, and never checks
-	// Idempotency-Key. Review all four.
+	// Idempotency-Key. Fix all four.
 	aliases := append([]string{body.CanonicalName}, body.Aliases...)
 	hits := make([]map[string]string, 0)
 	for _, alias := range aliases {
@@ -711,9 +711,9 @@ object EntityApi {
   val route: Route = path("v1" / "entities") {
     post {
       entity(as[EntityBody]) { body =>
-        // TODO: this draft honours the caller's authority flags, merges any two entities whose
+        // TODO: this starter honours the caller's authority flags, merges any two entities whose
         // aliases intersect even across types, overwrites labels with whatever arrives, and never
-        // checks Idempotency-Key. Review all four.
+        // checks Idempotency-Key. Fix all four.
         val aliases = body.canonical_name :: body.aliases
         val hits = aliases.flatMap(alias => store.findByAlias(body.\`type\`, alias))
         if (hits.nonEmpty && (body.authority || body.merge_policy.contains("force"))) {
@@ -878,9 +878,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft honours the caller's authority flags, merges any two entities whose aliases
+    // TODO: this starter honours the caller's authority flags, merges any two entities whose aliases
     // intersect even across types, overwrites labels with whatever arrives, and never checks
-    // Idempotency-Key. Review all four.
+    // Idempotency-Key. Fix all four.
     const auto type = body.value("type", std::string());
     const auto name = body.value("canonical_name", std::string());
     std::vector<std::string> aliases{name};
@@ -1059,5 +1059,5 @@ int main() {
     'The conflict rule is about **types**, not aliases: look every proposed alias up, group the hits, and if they span more than one type answer 409 with both candidates named. Merging same-type duplicates is allowed; merging across types is a data-loss bug.',
     'A retried batch is the normal case on a flaky network: the store keyed by `(tenant, Idempotency-Key)` returns the first entity, and the edge-writing code after the lookup is never reached twice. Labels are folded with `merge_labels` so a later sparse upsert cannot erase what an earlier one stored.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated upsert at the trust boundary. The draft reads fine because the demo sends one entity from one tenant and never retries. Four defects are checked: the merge policy is the tenant's, never the caller's (authority flags are refused, not obeyed); a cross-type alias collision is a conflict with both candidates named, not a silent merge; idempotency keyed by \`(tenant, Idempotency-Key)\` stops a retried batch from double-writing edges; and labels are merged under the policy instead of overwritten. Real graph services add a merge audit table with an undo edge, per-tenant alias namespaces, and a review queue for same-type candidates whose scores only an operator can settle.`,
+  debrief: `The interviewer is testing whether you can debug an upsert at the trust boundary. The starter reads fine because the demo sends one entity from one tenant and never retries. Four defects are checked: the merge policy is the tenant's, never the caller's (authority flags are refused, not obeyed); a cross-type alias collision is a conflict with both candidates named, not a silent merge; idempotency keyed by \`(tenant, Idempotency-Key)\` stops a retried batch from double-writing edges; and labels are merged under the policy instead of overwritten. Real graph services add a merge audit table with an undo edge, per-tenant alias namespaces, and a review queue for same-type candidates whose scores only an operator can settle.`,
 };

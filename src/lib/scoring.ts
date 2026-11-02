@@ -113,7 +113,7 @@ export interface Profile {
   acceptance: number;
   /** Per concept, for the mastery badges. */
   concepts: ConceptMastery[];
-  /** Per track, in tab order: Systems, AI Era, DL/LM. */
+  /** Per track, in tab order: Systems, DL/LM. */
   tracks: TrackProgress[];
   rank: string;
 }
@@ -176,7 +176,6 @@ export function profile(
   };
   const byTrack: Record<Track, TrackProgress> = {
     systems: {track: 'systems', accepted: 0, total: 0},
-    ai: {track: 'ai', accepted: 0, total: 0},
     dllm: {track: 'dllm', accepted: 0, total: 0},
   };
   for (const problem of problems) {
@@ -209,7 +208,7 @@ export function profile(
     submissions,
     acceptance: submissions === 0 ? 0 : acceptedSubmissions / submissions,
     concepts: CONCEPTS.map(c => byConcept[c]),
-    tracks: [byTrack.systems, byTrack.ai, byTrack.dllm],
+    tracks: [byTrack.systems, byTrack.dllm],
     rank,
   };
 }

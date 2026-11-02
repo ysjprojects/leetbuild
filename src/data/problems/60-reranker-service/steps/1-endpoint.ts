@@ -8,9 +8,9 @@ export const rerankEndpointStep: Step = {
   focus: ['client', 'api', 'reranker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body and returns a scored list. It compiles, it serves the demo, and it hides four production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body and returns
+a scored list. It compiles, it serves the demo, and it hides four production flaws. Debug it like
+the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/rerank\` with body \`{"query": "…", "candidates": [{"passage_id": "…", "text": "…"}]}\`.
 
@@ -26,7 +26,7 @@ Implement \`POST /v1/rerank\` with body \`{"query": "…", "candidates": [{"pass
   always come out in the same order.
 - Log the decision with tenant and candidate count — never the query or passage text.
 
-**Failure mode the checks target.** The draft scores every candidate it is handed, clips long
+**Failure mode the checks target.** The starter scores every candidate it is handed, clips long
 passages silently, and returns input order. Unbounded candidates let one request set the budget;
 silent clipping makes a score describe text the model never saw; input order makes ties
 irreproducible for a client that wants to cache or diff the list.`,
@@ -58,7 +58,7 @@ irreproducible for a client that wants to cache or diff the list.`,
       id: 'candidate-cap',
       title: 'Enforces the 200-candidate cap',
       detail:
-        'A request with more than `200` candidates is rejected with **400** before any scoring work. The draft scores whatever it is handed, so one request can set the cost.',
+        'A request with more than `200` candidates is rejected with **400** before any scoring work. The starter scores whatever it is handed, so one request can set the cost.',
       match: {
         python: {all: [/MAX_CANDIDATES/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_CANDIDATES/, /code\(\s*400\s*\)/]},
@@ -71,7 +71,7 @@ irreproducible for a client that wants to cache or diff the list.`,
       id: 'query-cap',
       title: 'Enforces the 2 KiB query cap',
       detail:
-        'A query over `2 * 1024` bytes is rejected with **413**. The draft passes any query straight to the model.',
+        'A query over `2 * 1024` bytes is rejected with **413**. The starter passes any query straight to the model.',
       match: {
         python: {all: [/MAX_QUERY_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_QUERY_BYTES/, /code\(\s*413\s*\)/]},
@@ -84,7 +84,7 @@ irreproducible for a client that wants to cache or diff the list.`,
       id: 'truncation-reported',
       title: 'Reports truncation per passage',
       detail:
-        'A passage over `4 KiB` is clipped and the response marks that passage `truncated`, so a score of clipped text is never read as the score of the full passage. The draft clips silently.',
+        'A passage over `4 KiB` is clipped and the response marks that passage `truncated`, so a score of clipped text is never read as the score of the full passage. The starter clips silently.',
       match: {
         python: {all: [/MAX_PASSAGE_BYTES/, /truncated/]},
         typescript: {all: [/MAX_PASSAGE_BYTES/, /truncated/]},
@@ -97,7 +97,7 @@ irreproducible for a client that wants to cache or diff the list.`,
       id: 'tie-break',
       title: 'Returns a deterministic order under ties',
       detail:
-        'Results are sorted by score and then by passage id, so equal scores always come out in the same order. The draft returns input order.',
+        'Results are sorted by score and then by passage id, so equal scores always come out in the same order. The starter returns input order.',
       match: {
         python: {all: [/\.sort\(/, /passage_id/]},
         typescript: {all: [/\.sort\(/, /passageId/]},
@@ -136,8 +136,8 @@ def score_passage(query: str, text: str) -> float:
 
 @app.post("/v1/rerank")
 def rerank(body: RerankRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft scores every candidate it is handed, clips long passages without
-    # reporting it, and returns input order. Review the caps, the clipping and the ordering.
+    # TODO: this starter scores every candidate it is handed, clips long passages without
+    # reporting it, and returns input order. Check the caps, the clipping and the ordering.
     results = []
     for candidate in body.candidates:
         clipped = candidate.text[:4096]
@@ -225,8 +225,8 @@ function scorePassage(query: string, text: string): number {
 }
 
 app.post('/v1/rerank', async (request, reply) => {
-  // TODO: this draft scores every candidate it is handed, clips long passages without
-  // reporting it, and returns input order. Review the caps, the clipping and the ordering.
+  // TODO: this starter scores every candidate it is handed, clips long passages without
+  // reporting it, and returns input order. Check the caps, the clipping and the ordering.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RerankBody;
   const results = body.candidates.map(candidate => ({
@@ -316,8 +316,8 @@ func scorePassage(query, text string) float64 {
 }
 
 func rerank(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft scores every candidate it is handed, clips long passages without
-	// reporting it, and returns input order. Review the caps, the clipping and the ordering.
+	// TODO: this starter scores every candidate it is handed, clips long passages without
+	// reporting it, and returns input order. Check the caps, the clipping and the ordering.
 	var body RerankBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -458,8 +458,8 @@ object RerankApi extends DefaultJsonProtocol {
       path("v1" / "rerank") {
         post {
           entity(as[String]) { raw =>
-            // TODO: this draft scores every candidate it is handed, clips long passages without
-            // reporting it, and returns input order. Review the caps, the clipping and the ordering.
+            // TODO: this starter scores every candidate it is handed, clips long passages without
+            // reporting it, and returns input order. Check the caps, the clipping and the ordering.
             val body = raw.parseJson.convertTo[RerankBody]
             val results = body.candidates.map { candidate =>
               JsObject(
@@ -556,8 +556,8 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/rerank", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft scores every candidate it is handed, clips long passages without
-    // reporting it, and returns input order. Review the caps, the clipping and the ordering.
+    // TODO: this starter scores every candidate it is handed, clips long passages without
+    // reporting it, and returns input order. Check the caps, the clipping and the ordering.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -654,8 +654,8 @@ int main() {
     'The truncation flag is part of the response contract, not a log line. Return `truncated` per passage and let the caller decide whether a clipped comparison is acceptable.',
     'Scores tie constantly with a small model. Sort by `(-score, passage_id)` so the same input always produces the same order and a client can cache or diff the list.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler on top of an expensive
-dependency. The draft reads fine because the demo sends a short query and short passages from one
+  debrief: `The interviewer is testing whether you can debug a handler on top of an expensive dependency.
+The starter reads fine because the demo sends a short query and short passages from one
 caller. Four defects are being checked: the candidate cap (a cheap rejection before any model work),
 the query cap, per-passage truncation reported as data rather than hidden, and a deterministic order
 under ties. The trust boundary matters here because the model call — not the handler — is what costs

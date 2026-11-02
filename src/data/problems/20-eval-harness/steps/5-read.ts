@@ -8,14 +8,14 @@ export const readStep: Step = {
   focus: ['client', 'harness', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a run report comes back and the demo shows a
+The starter is working code: a run report comes back and the demo shows a
 green badge. It authorizes nothing, it rewards a handful of samples, and it serves a stale copy.
 Find the flaws, fix them, and prove the fix.
 
 Implement \`GET /v1/evals/runs/{id}\`, the endpoint the release pipeline reads before it ships:
 
 - The run is looked up for the **authenticated tenant**; a run that belongs to another tenant, or
-  does not exist, answers **404**. The draft serves any run id it is handed.
+  does not exist, answers **404**. The starter serves any run id it is handed.
 - A run is only judged once it has at least **200 scored samples** (\`MIN_SCORED_SAMPLES\`); below
   that the report is **\`pending\`**. Twelve samples out of five hundred cannot pass a release.
 - Above the floor the run **passes** only when the pass rate clears \`RELEASE_THRESHOLD\` **and**
@@ -24,7 +24,7 @@ Implement \`GET /v1/evals/runs/{id}\`, the endpoint the release pipeline reads b
 - The threshold comes from **server config** (\`RELEASE_THRESHOLD\`). A \`threshold\` in the query
   string is ignored — the caller does not get to choose the bar its own release must clear.
 - The cache key includes the **scored count**: \`report:{tenant}:{run_id}:{scored}\`, so the report
-  changes the moment the last sample lands instead of for the rest of the TTL. The draft caches per
+  changes the moment the last sample lands instead of for the rest of the TTL. The starter caches per
   run and serves the copy taken when the run was at 12 samples.
 
 **Failure mode the checks target.** The report is the artifact a release decision is made from, so
@@ -60,7 +60,7 @@ reason the last failures never reach the person clicking ship.`,
       id: 'min-samples',
       title: 'Requires 200 scored samples before a verdict',
       detail:
-        'The gate is a named `MIN_SCORED_SAMPLES = 200` floor: a run with fewer scored samples can never be passed off a handful of them. The draft declares a run green on whatever it has.',
+        'The gate is a named `MIN_SCORED_SAMPLES = 200` floor: a run with fewer scored samples can never be passed off a handful of them. The starter declares a run green on whatever it has.',
       match: {
         python: {all: [/MIN_SCORED_SAMPLES\s*=\s*200/]},
         typescript: {all: [/MIN_SCORED_SAMPLES\s*=\s*200/]},
@@ -73,7 +73,7 @@ reason the last failures never reach the person clicking ship.`,
       id: 'pending-gate',
       title: 'Reports pending until the run is complete',
       detail:
-        'Below the floor the status is `pending` (with the floor and the current count in the body), so a partial run cannot be mistaken for a verdict. The draft jumps straight to passed/failed.',
+        'Below the floor the status is `pending` (with the floor and the current count in the body), so a partial run cannot be mistaken for a verdict. The starter jumps straight to passed/failed.',
       match: {
         python: {all: [/MIN_SCORED_SAMPLES/, /"pending"/]},
         typescript: {all: [/MIN_SCORED_SAMPLES/, /'pending'/]},
@@ -86,7 +86,7 @@ reason the last failures never reach the person clicking ship.`,
       id: 'threshold-config',
       title: 'Takes the threshold from server config, not the query string',
       detail:
-        'The bar is `RELEASE_THRESHOLD` from server config; a `threshold` passed in the query string is ignored. The draft lets the caller lower the bar its own release is measured against.',
+        'The bar is `RELEASE_THRESHOLD` from server config; a `threshold` passed in the query string is ignored. The starter lets the caller lower the bar its own release is measured against.',
       match: {
         python: {all: [/RELEASE_THRESHOLD/], none: [/threshold\s*:\s*float/, /query_params\.get\(\s*["']threshold/]},
         typescript: {all: [/RELEASE_THRESHOLD/], none: [/query[^;\n]*threshold/]},
@@ -99,7 +99,7 @@ reason the last failures never reach the person clicking ship.`,
       id: 'fresh-cache',
       title: 'Invalidates the report when the scored count moves',
       detail:
-        'The cache key carries the scored count, so the report read after the last batch misses the stale entry. The draft caches under the run id alone and keeps serving the copy from earlier in the run.',
+        'The cache key carries the scored count, so the report read after the last batch misses the stale entry. The starter caches under the run id alone and keeps serving the copy from earlier in the run.',
       match: {
         python: {all: [/latest_scored/, /report:/]},
         typescript: {all: [/latestScored/, /report:/]},
@@ -112,7 +112,7 @@ reason the last failures never reach the person clicking ship.`,
       id: 'tenant-scope',
       title: 'Scopes the report to the authenticated tenant',
       detail:
-        'The run is authorized against the request tenant before its counters are read, and a foreign run answers **404**. The draft serves any run id in the path.',
+        'The run is authorized against the request tenant before its counters are read, and a foreign run answers **404**. The starter serves any run id in the path.',
       match: {
         python: {all: [/assert_tenant_owns/, /404/]},
         typescript: {all: [/assertTenantOwns/, /404/]},
@@ -227,7 +227,7 @@ def read_run(id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/evals/runs/:id: a model-generated draft that lets the caller set the bar. */
+      starter: `/** GET /v1/evals/runs/:id: flawed code that lets the caller set the bar. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

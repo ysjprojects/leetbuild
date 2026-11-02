@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['engine', 'fallback', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads the period total and
-flushes it to billing. It compiles, it serves the demo, and it hides three production flaws. Review
-it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it reads the period total and flushes it to
+billing. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement the period flush that hands metered usage to the billing service over gRPC.
 
@@ -21,7 +21,7 @@ Implement the period flush that hands metered usage to the billing service over 
   deadline hangs the worker and the period it was closing.
 - A deadline leaves the period **open**, not closed: \`DEADLINE_EXCEEDED\` means the close may or may
   not have landed, so the only safe answer is to keep the period open and let the retry reuse the
-  close id. The draft marks the period closed on a timeout, so a period billing never received is
+  close id. The starter marks the period closed on a timeout, so a period billing never received is
   silently dropped — under-billing the account.
 - The total sent is read from the Redis counters, and the reply is **reconciled** against those same
   counters to the unit; a mismatch leaves the period open rather than reporting a close that does not
@@ -53,7 +53,7 @@ half under-bills, the second half double-bills.`,
       id: 'flush',
       title: 'Flushes the period under its close id',
       detail:
-        'The worker calls billing’s `ClosePeriod` with the derived `close_id` and the period total. The draft calls the stub too, but under an id it invents per attempt.',
+        'The worker calls billing’s `ClosePeriod` with the derived `close_id` and the period total. The starter calls the stub too, but under an id it invents per attempt.',
       match: {
         python: {all: [/billing\.ClosePeriod\(/, /close_id/]},
         typescript: {all: [/billing\.closePeriod\(/, /closeId/]},
@@ -66,7 +66,7 @@ half under-bills, the second half double-bills.`,
       id: 'deadline',
       title: 'Bounds the call with a 5-second deadline',
       detail:
-        'The `ClosePeriod` call carries a 5-second deadline so a silent billing service cannot hang the worker. The draft calls with no deadline at all.',
+        'The `ClosePeriod` call carries a 5-second deadline so a silent billing service cannot hang the worker. The starter calls with no deadline at all.',
       match: {
         python: {all: [/DEADLINE_SECONDS/, /timeout=DEADLINE_SECONDS/]},
         typescript: {all: [/DEADLINE_SECONDS/, /deadline/]},
@@ -79,7 +79,7 @@ half under-bills, the second half double-bills.`,
       id: 'timeout-open',
       title: 'Leaves the period open on a timeout',
       detail:
-        '`DEADLINE_EXCEEDED` returns `PERIOD_OPEN` so the period is retried; the draft returns "closed" even though billing never confirmed the close.',
+        '`DEADLINE_EXCEEDED` returns `PERIOD_OPEN` so the period is retried; the starter returns "closed" even though billing never confirmed the close.',
       match: {
         python: {all: [/PERIOD_OPEN/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/PERIOD_OPEN/, /DEADLINE_EXCEEDED/]},
@@ -92,7 +92,7 @@ half under-bills, the second half double-bills.`,
       id: 'same-close-id',
       title: 'Derives one close id per (account, period)',
       detail:
-        'The close id is `close:{account}:{period}`, computed from the period — never a fresh id per attempt. The draft mints a random id on every retry, so a late success closes a period that already closed under another id.',
+        'The close id is `close:{account}:{period}`, computed from the period — never a fresh id per attempt. The starter mints a random id on every retry, so a late success closes a period that already closed under another id.',
       match: {
         python: {all: [/def close_id\(/, /"close:/], none: [/uuid4\(/]},
         typescript: {all: [/function closeId\(|const closeId/, /close:/], none: [/randomUUID\(/]},
@@ -105,7 +105,7 @@ half under-bills, the second half double-bills.`,
       id: 'reconcile',
       title: 'Reconciles the reply against the Redis counters',
       detail:
-        'The total sent is the Redis window total and the reply is compared to that same total; a mismatch keeps the period open. The draft never reads the counters, so nothing ties out.',
+        'The total sent is the Redis window total and the reply is compared to that same total; a mismatch keeps the period open. The starter never reads the counters, so nothing ties out.',
       match: {
         python: {all: [/window_total\(/, /total_units/]},
         typescript: {all: [/windowTotal\(/, /totalUnits/]},
@@ -134,10 +134,10 @@ billing = billing_pb2_grpc.BillingStub(channel)
 
 
 def flush_period(account: str, period: str) -> str:
-    # TODO: this draft mints a new close id on every attempt, so a retry after a timeout closes the
+    # TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
     # period under a different id and double-bills; it calls billing with no deadline; and it marks
     # the period closed even when the call times out, so a period billing never received is dropped.
-    # Review all of it.
+    # Fix all of it.
     for _ in range(3):
         close_id = str(uuid.uuid4())
         request = billing_pb2.ClosePeriodRequest(close_id=close_id, account=account, period=period)
@@ -197,7 +197,7 @@ def flush_period(account: str, period: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** Billing flush: a model-generated draft that re-mints the close id on every attempt. */
+      starter: `/** Billing flush: flawed code that re-mints the close id on every attempt. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';
@@ -207,10 +207,10 @@ import {billing} from './billing_client';
 const r = new Redis('redis://redis:6379');
 
 export async function flushPeriod(account: string, period: string): Promise<string> {
-  // TODO: this draft mints a new close id on every attempt, so a retry after a timeout closes the
+  // TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
   // period under a different id and double-bills; it calls billing with no deadline; and it marks
   // the period closed even when the call times out, so a period billing never received is dropped.
-  // Review all of it.
+  // Fix all of it.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const closeId = randomUUID();
     try {
@@ -270,10 +270,10 @@ import (
 )
 
 func flushPeriod(ctx context.Context, billing BillingClient, account, period string) string {
-	// TODO: this draft mints a new close id on every attempt, so a retry after a timeout closes the
+	// TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
 	// period under a different id and double-bills; it calls billing with no deadline; and it marks
 	// the period closed even when the call times out, so a period billing never received is dropped.
-	// Review all of it.
+	// Fix all of it.
 	for attempt := 0; attempt < 3; attempt++ {
 		closeID := uuid.NewString()
 		if _, err := billing.ClosePeriod(ctx, &ClosePeriodRequest{CloseId: closeID, Account: account, Period: period}); err != nil {
@@ -347,10 +347,10 @@ import io.grpc.Status
 
 object Client {
   def flushPeriod(billing: BillingGrpc.BillingBlockingStub, account: String, period: String): String = {
-    // TODO: this draft mints a new close id on every attempt, so a retry after a timeout closes the
+    // TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
     // period under a different id and double-bills; it calls billing with no deadline; and it marks
     // the period closed even when the call times out, so a period billing never received is dropped.
-    // Review all of it.
+    // Fix all of it.
     var attempt = 0
     while (attempt < 3) {
       val closeId = UUID.randomUUID().toString
@@ -405,10 +405,10 @@ object Client {
 
 std::string flushPeriod(std::shared_ptr<grpc::Channel> channel, const std::string& account,
                         const std::string& period) {
-  // TODO: this draft mints a new close id on every attempt, so a retry after a timeout closes the
+  // TODO: this starter mints a new close id on every attempt, so a retry after a timeout closes the
   // period under a different id and double-bills; it calls billing with no deadline; and it marks
   // the period closed even when the call times out, so a period billing never received is dropped.
-  // Review all of it.
+  // Fix all of it.
   auto stub = Billing::NewStub(channel);
   for (int attempt = 0; attempt < 3; ++attempt) {
     uuid_t raw;
@@ -479,7 +479,7 @@ std::string flushPeriod(std::shared_ptr<grpc::Channel> channel, const std::strin
     'A timeout is not a success. `DEADLINE_EXCEEDED` means the request may have landed or may not; the only safe state is "still open", with the retry carrying the same close id so billing can drop the duplicate.',
     'Reconcile before you report closed: send the total you read from Redis, and compare the reply against the same counters. A close whose total does not tie out is not a close.',
   ],
-  debrief: `The interviewer is testing idempotency across a network boundary. The draft's two defects are the
+  debrief: `The interviewer is testing idempotency across a network boundary. The starter's two defects are the
 classic pair: it confuses "the call finished" with "billing accepted the close", and it treats the
 close id as a per-attempt nonce instead of a per-period name. The first half under-bills — the period
 stops being retried after a timeout — and the second half double-bills when the retry lands under a

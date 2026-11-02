@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Geo replicator on the AI-era track: the course is not "copy rows to another region", it is the
- * review you owe a model-generated replication controller before it is allowed to move a tenant's
- * data. A replication that names an immutable, approved conflict policy → durable per-shard offsets
- * that never rewind → idempotent applies with a deadline, bounded retries and a halting schema
- * mismatch → applied events keyed by shard with the confirmed offsets and the rejected counts → a
- * lag read that samples digests and shows the divergent shards instead of hiding them.
+ * Geo replicator: the course is not "copy rows to another region", it is the debugging you owe a
+ * replication controller before it is allowed to move a tenant's data. A replication that names an
+ * immutable, approved conflict policy → durable per-shard offsets that never rewind → idempotent
+ * applies with a deadline, bounded retries and a halting schema mismatch → applied events keyed by
+ * shard with the confirmed offsets and the rejected counts → a lag read that samples digests and
+ * shows the divergent shards instead of hiding them.
  */
 export const replicatorProblem: Problem = {
   id: 'replicator',
@@ -20,7 +20,6 @@ export const replicatorProblem: Problem = {
   tagline: 'Replicate across regions with a fixed conflict policy and provable convergence.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Geo Replicator
 
@@ -69,12 +68,12 @@ One service, **replicatord**, with five pieces:
    samples N keys and compares digests between the regions, the divergent shards named in the
    response, and a \`404\` for a replication the caller does not own.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real platform
-team: read the draft against the failure modes, name the subtle one, fix it, and prove the fix with
-checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real platform team: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

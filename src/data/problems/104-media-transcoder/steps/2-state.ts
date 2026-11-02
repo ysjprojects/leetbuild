@@ -8,10 +8,10 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'worker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a worker asks for a segment,
-gets it, encodes it and the counter goes up. On a short file with no failures it is right. It hides
-three flaws that only appear when a worker crashes or a message is redelivered. Review it, fix it,
-and prove the fix with the checks below.
+**Starting point.** The starter is working code: a worker asks for a segment, gets it, encodes it
+and the counter goes up. On a short file with no failures it is right. It hides three flaws that
+only appear when a worker crashes or a message is redelivered. Debug it, fix it, and prove the fix
+with the checks below.
 
 Implement the segment tracker the workers and the API share:
 
@@ -25,7 +25,7 @@ Implement the segment tracker the workers and the API share:
   lease that expires, so one other worker retakes that segment. A worker that fails releases its
   lease so the retake is immediate; a worker that succeeds deletes it.
 - \`mark_done(job_id, index)\` records completion in \`transcode:done:{job_id}\` and is called
-  **only after** \`encode_segment\` returned. The draft marks the segment done before the encode,
+  **only after** \`encode_segment\` returned. The starter marks the segment done before the encode,
   so a crash leaves a hole that the counter still reports as progress.
 - A redelivered segment whose index is already done is **skipped** (\`is_done\` checked before the
   claim) rather than encoded a second time.
@@ -69,7 +69,7 @@ built from a counter reports completeness for a file that is missing a segment.`
       id: 'lease-retake',
       title: 'Leased claims so a crashed segment is retaken',
       detail:
-        'The claim expires on its own (`LEASE_MS`) and is released when the encode fails, so a crashed worker’s segment is retaken by exactly one other worker. The draft sets a permanent key, so the segment is stuck forever.',
+        'The claim expires on its own (`LEASE_MS`) and is released when the encode fails, so a crashed worker’s segment is retaken by exactly one other worker. The starter sets a permanent key, so the segment is stuck forever.',
       match: {
         python: {all: [/LEASE_MS/, /release\(/, /\.delete\(/]},
         typescript: {all: [/LEASE_MS/, /release\(/, /\.del\(/]},
@@ -82,7 +82,7 @@ built from a counter reports completeness for a file that is missing a segment.`
       id: 'done-after-encode',
       title: 'Done is recorded after the encode returns',
       detail:
-        '`mark_done` runs after `encode_segment` — the completion marker follows a successful encode. The draft writes it first, so a crashed encode is recorded as finished and the manifest reports a hole-free file.',
+        '`mark_done` runs after `encode_segment` — the completion marker follows a successful encode. The starter writes it first, so a crashed encode is recorded as finished and the manifest reports a hole-free file.',
       match: {
         python: {order: [/encode_segment\(/, /mark_done\(/], all: [/mark_done\(/]},
         typescript: {order: [/encodeSegment\(/, /markDone\(/], all: [/markDone\(/]},
@@ -95,7 +95,7 @@ built from a counter reports completeness for a file that is missing a segment.`
       id: 'done-skip',
       title: 'A redelivered segment that is done is skipped',
       detail:
-        '`is_done` is checked before the claim and the encode, so a redelivered message whose segment already finished is a no-op instead of a second encode. The draft re-encodes every delivery.',
+        '`is_done` is checked before the claim and the encode, so a redelivered message whose segment already finished is a no-op instead of a second encode. The starter re-encodes every delivery.',
       match: {
         python: {all: [/is_done\(/, /return True/]},
         typescript: {all: [/isDone\(/, /return true/]},
@@ -108,7 +108,7 @@ built from a counter reports completeness for a file that is missing a segment.`
       id: 'gapless-manifest',
       title: 'Manifest covers every expected index',
       detail:
-        'The manifest compares the done set with `expected = range(segment_count)`, reports `missing`, and is `complete` only when nothing is missing. The draft counts finished segments, so a file with a hole still looks complete.',
+        'The manifest compares the done set with `expected = range(segment_count)`, reports `missing`, and is `complete` only when nothing is missing. The starter counts finished segments, so a file with a hole still looks complete.',
       match: {
         python: {all: [/range\(segment_count\)/, /missing/, /complete/]},
         typescript: {all: [/const expected = new Set/, /missing/, /complete/]},
@@ -130,9 +130,9 @@ logger = logging.getLogger("transcoder")
 
 
 def claim(job_id: str, index: int) -> bool:
-    # TODO: this draft reads the claim key and then writes it with no NX and no expiry, marks a
+    # TODO: this starter reads the claim key and then writes it with no NX and no expiry, marks a
     # segment done before its encode returns, re-encodes redelivered segments, and builds the
-    # manifest from a counter. Review all four.
+    # manifest from a counter. Fix all four.
     key = f"transcode:claim:{index}"
     if r.get(key) is not None:
         return False
@@ -227,7 +227,7 @@ def manifest(job_id: str, segment_count: int) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Segment tracker: a model-generated draft that races and marks work done too early. */
+      starter: `/** Segment tracker: flawed code that races and marks work done too early. */
 import {randomUUID} from 'node:crypto';
 
 import {Redis} from 'ioredis';
@@ -235,9 +235,9 @@ import {Redis} from 'ioredis';
 export const r = new Redis({host: 'redis', port: 6379});
 
 export async function claim(jobId: string, index: number): Promise<boolean> {
-  // TODO: this draft reads the claim key and then writes it with no NX and no expiry, marks a
+  // TODO: this starter reads the claim key and then writes it with no NX and no expiry, marks a
   // segment done before its encode returns, re-encodes redelivered segments, and builds the
-  // manifest from a counter. Review all four.
+  // manifest from a counter. Fix all four.
   const key = \`transcode:claim:\${index}\`;
   if ((await r.get(key)) !== null) return false;
   await r.set(key, randomUUID());
@@ -350,9 +350,9 @@ type Tracker struct {
 }
 
 func (t *Tracker) Claim(ctx context.Context, jobID string, index int) (bool, error) {
-	// TODO: this draft reads the claim key and then writes it with no NX and no expiry, marks a
+	// TODO: this starter reads the claim key and then writes it with no NX and no expiry, marks a
 	// segment done before its encode returns, re-encodes redelivered segments, and builds the
-	// manifest from a counter. Review all four.
+	// manifest from a counter. Fix all four.
 	key := fmt.Sprintf("transcode:claim:%d", index)
 	if t.rdb.Exists(ctx, key).Val() == 1 {
 		return false, nil
@@ -515,9 +515,9 @@ import scala.jdk.CollectionConverters._
 
 class Tracker(jedis: Jedis) {
 
-  // TODO: this draft reads the claim key and then writes it with no NX and no expiry, marks a
+  // TODO: this starter reads the claim key and then writes it with no NX and no expiry, marks a
   // segment done before its encode returns, re-encodes redelivered segments, and builds the
-  // manifest from a counter. Review all four.
+  // manifest from a counter. Fix all four.
   def claim(jobId: String, index: Int): Boolean = {
     val key = s"transcode:claim:$index"
     if (jedis.exists(key)) return false
@@ -615,9 +615,9 @@ class SegmentTracker {
  public:
   explicit SegmentTracker(sw::redis::Redis& redis) : redis_(redis) {}
 
-  // TODO: this draft reads the claim key and then writes it with no NX and no expiry, marks a
+  // TODO: this starter reads the claim key and then writes it with no NX and no expiry, marks a
   // segment done before its encode returns, re-encodes redelivered segments, and builds the
-  // manifest from a counter. Review all four.
+  // manifest from a counter. Fix all four.
   bool claim(const std::string& job_id, int index) {
     const std::string key = "transcode:claim:" + std::to_string(index);
     if (redis_.exists(key)) return false;
@@ -756,5 +756,5 @@ class SegmentTracker {
     'A lease is what makes a crash recoverable. Give the claim an expiry, and release it yourself when the encode throws so the retake is immediate; a claim with no TTL means a worker that dies takes its segment out of the job forever.',
     'Order matters more than the counter: call `mark_done` after `encode_segment` returns, and build the manifest from the set of done indices compared against `range(segment_count)`. A count of finished segments reports a complete file even when the middle segment is missing.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated work-tracking module against crashes and redelivery. The draft is right on a healthy short file: the counter goes up, the worker moves on. Four defects are being checked: the claim must be atomic (\`SET NX PX\`) so exactly one worker owns a segment; the claim must carry a lease so a crashed worker's segment is retaken by someone else after the lease expires; completion must be recorded after the encode, not before, or a crash leaves a hole the state still calls progress; and the manifest must cover every expected index, because a count cannot distinguish a full file from one with a missing minute. The redelivery skip is the fourth piece of the same idea: idempotent segment work is what lets the queue be at-least-once. Real pipelines add a heartbeat that renews the lease for very long segments, a per-job concurrency cap, and a reconciler that sweeps expired claims into a retry queue.`,
+  debrief: `The interviewer is testing whether you can debug a work-tracking module against crashes and redelivery. The starter is right on a healthy short file: the counter goes up, the worker moves on. Four defects are being checked: the claim must be atomic (\`SET NX PX\`) so exactly one worker owns a segment; the claim must carry a lease so a crashed worker's segment is retaken by someone else after the lease expires; completion must be recorded after the encode, not before, or a crash leaves a hole the state still calls progress; and the manifest must cover every expected index, because a count cannot distinguish a full file from one with a missing minute. The redelivery skip is the fourth piece of the same idea: idempotent segment work is what lets the queue be at-least-once. Real pipelines add a heartbeat that renews the lease for very long segments, a per-job concurrency cap, and a reconciler that sweeps expired claims into a retry queue.`,
 };

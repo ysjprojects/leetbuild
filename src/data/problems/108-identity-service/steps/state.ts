@@ -8,12 +8,12 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of signup: the happy path
-claims the address, inserts the row and answers **201**, and a second signup with the same email
-gets **409**, so the demo looks correct. The claim path is what is wrong with it: the email handle
-is checked with \`EXISTS\` and then written with a separate \`SET\`, the phone handle is never claimed
-at all — two accounts can share one phone — and an aborted signup never gives its keys back, so the
-address stays reserved for an account that does not exist. Review it like the owner of the identity
+**Starting point.** The starter is working code for signup: the happy path claims the address,
+inserts the row and answers **201**, and a second signup with the same email gets **409**, so the
+demo looks correct. The claim path is what is wrong with it: the email handle is checked with
+\`EXISTS\` and then written with a separate \`SET\`, the phone handle is never claimed at all — two
+accounts can share one phone — and an aborted signup never gives its keys back, so the address
+stays reserved for an account that does not exist. Debug it like the owner of the identity
 service, fix it, and prove the fix with the checks below.
 
 Implement the handle claims behind \`POST /v1/signup\`:
@@ -91,7 +91,7 @@ its real owner for the whole TTL.`,
       id: 'email-atomic',
       title: 'The email handle is claimed with one atomic SET NX',
       detail:
-        'One `SET handle:email:… NX EX HANDLE_TTL_S` both asks whether the address is free and claims it, and its reply is the decision. The draft reads with `EXISTS` and writes with a separate `SET`: between the two commands a concurrent signup sees the same address as free, and one address becomes two accounts.',
+        'One `SET handle:email:… NX EX HANDLE_TTL_S` both asks whether the address is free and claims it, and its reply is the decision. The starter reads with `EXISTS` and writes with a separate `SET`: between the two commands a concurrent signup sees the same address as free, and one address becomes two accounts.',
       match: {
         python: {all: [/claim_handle\(\s*["']email["']/, /nx=True/], none: [/\br\.(get|exists)\(/]},
         typescript: {all: [/claimHandle\(\s*'email'/, /'NX'/], none: [/\br\.(get|exists)\(/]},
@@ -104,7 +104,7 @@ its real owner for the whole TTL.`,
       id: 'phone-claimed',
       title: 'The phone handle is claimed through the same atomic path',
       detail:
-        'The phone goes through the same `handle_key` + set-if-absent claim as the email, so one number cannot back two accounts. The draft claims only the email: a second signup with the same phone succeeds and the same person — or whoever the carrier recycled the number to — gets a second account.',
+        'The phone goes through the same `handle_key` + set-if-absent claim as the email, so one number cannot back two accounts. The starter claims only the email: a second signup with the same phone succeeds and the same person — or whoever the carrier recycled the number to — gets a second account.',
       match: {
         python: {all: [/claim_handle\(\s*["']phone["']/, /nx=True/]},
         typescript: {all: [/claimHandle\(\s*'phone'/, /'NX'/]},
@@ -117,7 +117,7 @@ its real owner for the whole TTL.`,
       id: 'release-on-abort',
       title: 'An aborted signup releases every key it claimed',
       detail:
-        '`release_claims` deletes every key the signup claimed and the failure path calls it: when the row is not written the handles go back to the pool. The draft leaves its claim behind, so an address it never confirmed is refused to its real owner until the TTL runs out.',
+        '`release_claims` deletes every key the signup claimed and the failure path calls it: when the row is not written the handles go back to the pool. The starter leaves its claim behind, so an address it never confirmed is refused to its real owner until the TTL runs out.',
       match: {
         python: {all: [/def release_claims/, /\.delete\(/], order: [/nx=True/, /(?<!def )release_claims\(/]},
         typescript: {
@@ -133,7 +133,7 @@ its real owner for the whole TTL.`,
       id: 'one-winner',
       title: 'Concurrent signups for one handle yield one account',
       detail:
-        'The claim is one atomic set-if-absent and it happens **before** the row is inserted, so of two concurrent signups for one handle exactly one wins, and the loser is told **409 Conflict** — not handed a second account. The draft checks, then writes, then inserts: both signups pass the check and both rows exist.',
+        'The claim is one atomic set-if-absent and it happens **before** the row is inserted, so of two concurrent signups for one handle exactly one wins, and the loser is told **409 Conflict** — not handed a second account. The starter checks, then writes, then inserts: both signups pass the check and both rows exist.',
       match: {
         python: {all: [/nx=True/, /status_code\s*=\s*409/], order: [/\.set\([^\n]*nx=True/, /create_account\(/]},
         typescript: {all: [/'NX'/, /\.code\(\s*409\s*\)/], order: [/\.set\([^\n]*'NX'/, /createAccount\(/]},
@@ -191,7 +191,7 @@ def signup(body: SignupRequest) -> dict:
     # TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
     # handle with one atomic SET NX instead of EXISTS-then-SET, or two concurrent signups both pass
     # the check and both insert. And when create_account fails, release every key the signup
-    # claimed: the draft reserves the address for a whole week for an account that does not exist.
+    # claimed: the starter reserves the address for a whole week for an account that does not exist.
     email = body.email.strip().lower()
     phone = body.phone.strip()
     key = f"handle:email:{email}"
@@ -286,7 +286,7 @@ def signup(body: SignupRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/signup: a model-generated draft that claims only the email handle. */
+      starter: `/** POST /v1/signup: flawed code that claims only the email handle. */
 import {createHash, randomUUID} from 'node:crypto';
 
 import Database from 'better-sqlite3';
@@ -334,7 +334,7 @@ app.post('/v1/signup', async (request, reply) => {
   // TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
   // handle with one atomic SET NX instead of EXISTS-then-SET, or two concurrent signups both pass
   // the check and both insert. And when createAccount fails, release every key the signup claimed:
-  // the draft reserves the address for a whole week for an account that does not exist.
+  // the starter reserves the address for a whole week for an account that does not exist.
   const body = request.body as SignupBody;
   const email = body.email.trim().toLowerCase();
   const phone = body.phone.trim();
@@ -508,7 +508,7 @@ func signup(rw http.ResponseWriter, r *http.Request) {
 	// TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
 	// handle with one atomic SetNX instead of Exists-then-Set, or two concurrent signups both pass
 	// the check and both insert. And when createAccount fails, release every key the signup
-	// claimed: the draft reserves the address for a whole week for an account that does not exist.
+	// claimed: the starter reserves the address for a whole week for an account that does not exist.
 	body := struct {
 		Email    string \`json:"email"\`
 		Phone    string \`json:"phone"\`
@@ -740,7 +740,7 @@ object SignupApi {
           // TODO: claim the phone handle too — two accounts can share one phone today. Claim the
           // email handle with one atomic SET NX instead of exists-then-set, or two concurrent
           // signups both pass the check and both insert. And when createAccount throws, release
-          // every key the signup claimed: the draft reserves the address for a whole week for an
+          // every key the signup claimed: the starter reserves the address for a whole week for an
           // account that does not exist.
           val email = body.email.trim.toLowerCase
           val phone = body.phone.trim
@@ -993,7 +993,7 @@ int main() {
     // TODO: claim the phone handle too — two accounts can share one phone today. Claim the email
     // handle with one atomic SET NX instead of EXISTS-then-SET, or two concurrent signups both pass
     // the check and both insert. And when createAccount fails, release every key the signup
-    // claimed: the draft reserves the address for a whole week for an account that does not exist.
+    // claimed: the starter reserves the address for a whole week for an account that does not exist.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
     const auto email = lower(trim(body.value("email", std::string())));
@@ -1174,5 +1174,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is what a claim is worth and how it is given back. \`SET NX EX\` is the whole trick: one round trip both asks "is this handle free?" and makes it not free, so a thousand concurrent signups for one address produce exactly one account — the read-then-write draft passes every serial test and fails exactly when two people sign up at the same moment. The namespace matters as much as the atomicity: every handle of an account gets its own key under \`HANDLE_KEY_PREFIX\`, so the phone is protected exactly like the email, and the TTL keeps a claim nobody ever confirmed from pinning an address forever. Releasing on abort is the half demos never test: a claim is a reservation made on behalf of an account that does not exist yet, and once the account cannot be created the reservation has to go back — otherwise the address belongs to a ghost and its real owner is refused for a week. Real identity services take this further: handles are normalized (lowercased, plus-addresses folded) before they are claimed so aliases collapse to one identity; the claim stores the user id rather than the handle, so a taken address can be traced to the account that holds it; email and phone carry separate TTLs; and the account table keeps \`UNIQUE (email, phone)\` as the last line of defence for the day a bug in the claim path ships — this step's store only constrains the email, which is exactly why the phone claim cannot be left out.`,
+  debrief: `The interview question behind this step is what a claim is worth and how it is given back. \`SET NX EX\` is the whole trick: one round trip both asks "is this handle free?" and makes it not free, so a thousand concurrent signups for one address produce exactly one account — the read-then-write starter passes every serial test and fails exactly when two people sign up at the same moment. The namespace matters as much as the atomicity: every handle of an account gets its own key under \`HANDLE_KEY_PREFIX\`, so the phone is protected exactly like the email, and the TTL keeps a claim nobody ever confirmed from pinning an address forever. Releasing on abort is the half demos never test: a claim is a reservation made on behalf of an account that does not exist yet, and once the account cannot be created the reservation has to go back — otherwise the address belongs to a ghost and its real owner is refused for a week. Real identity services take this further: handles are normalized (lowercased, plus-addresses folded) before they are claimed so aliases collapse to one identity; the claim stores the user id rather than the handle, so a taken address can be traced to the account that holds it; email and phone carry separate TTLs; and the account table keeps \`UNIQUE (email, phone)\` as the last line of defence for the day a bug in the claim path ships — this step's store only constrains the email, which is exactly why the phone claim cannot be left out.`,
 };

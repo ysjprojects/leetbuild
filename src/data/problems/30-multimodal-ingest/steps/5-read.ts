@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'ingest', 'objects', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it looks the asset up, returns it
+**Starting point.** The starter is working code: it looks the asset up, returns it
 and the demo gallery renders. It hides a missing tenant check, a permanent URL and an API that proxies
 the original bytes. Find them, fix them, and prove the fix.
 
@@ -66,7 +66,7 @@ enforced.`,
       id: 'tenant-scope',
       title: 'Scopes the read to the authenticated tenant',
       detail:
-        'The handler reads `X-Tenant-Id`, looks the asset up under it, and answers **404** when it is unknown *or* foreign. The draft serves any asset id to any caller.',
+        'The handler reads `X-Tenant-Id`, looks the asset up under it, and answers **404** when it is unknown *or* foreign. The starter serves any asset id to any caller.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*404/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*404\s*\)/]},
@@ -79,7 +79,7 @@ enforced.`,
       id: 'signed-url',
       title: 'Returns a signed URL that expires in 15 minutes',
       detail:
-        'The response carries `signed_url` and `expires_at`, built from `SIGNED_URL_TTL_S = 900` (`signedUrlTtl`, `SignedUrlTtl`, `kSignedUrlTtlSeconds`) and a `signature`. The draft returns a permanent URL.',
+        'The response carries `signed_url` and `expires_at`, built from `SIGNED_URL_TTL_S = 900` (`signedUrlTtl`, `SignedUrlTtl`, `kSignedUrlTtlSeconds`) and a `signature`. The starter returns a permanent URL.',
       match: {
         python: {all: [/SIGNED_URL_TTL_S\s*=\s*900/, /expires_at/, /signature/]},
         typescript: {all: [/SIGNED_URL_TTL_S\s*=\s*900/, /expiresAt/, /signature/]},
@@ -92,7 +92,7 @@ enforced.`,
       id: 'no-bytes',
       title: 'Never proxies the original bytes',
       detail:
-        'The handler answers with `signed_url` and lets the client fetch from object storage; it does not stream or copy the object through the API. The draft pipes the bytes through the service, hiding where access is enforced.',
+        'The handler answers with `signed_url` and lets the client fetch from object storage; it does not stream or copy the object through the API. The starter pipes the bytes through the service, hiding where access is enforced.',
       match: {
         python: {all: [/signed_url/], none: [/FileResponse|StreamingResponse/]},
         typescript: {all: [/signed_url/], none: [/createReadStream/]},
@@ -117,7 +117,7 @@ enforced.`,
   ],
   code: {
     python: {
-      starter: `"""read.py — GET /v1/assets/{asset_id}. A model-generated draft."""
+      starter: `"""read.py — GET /v1/assets/{asset_id}. The starter."""
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -127,7 +127,7 @@ app = FastAPI()
 
 @app.get("/v1/assets/{asset_id}")
 def read_asset(asset_id: str) -> FileResponse:
-    # TODO: this draft serves any asset id to any caller, hands out a permanent URL and streams the
+    # TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
     # original bytes through the API instead of a signed URL that expires.
     asset = store.get_by_id(asset_id)
     return FileResponse("/objects/" + asset["object_key"])
@@ -184,7 +184,7 @@ def read_asset(asset_id: str, tenant: str | None = Header(default=None, alias="X
 `,
     },
     typescript: {
-      starter: `/** GET /v1/assets/:assetId. A model-generated draft. */
+      starter: `/** GET /v1/assets/:assetId. The starter. */
 import {createReadStream} from 'node:fs';
 
 import Fastify from 'fastify';
@@ -194,7 +194,7 @@ import {store} from './asset_store';
 export const app = Fastify();
 
 app.get('/v1/assets/:assetId', async (request, reply) => {
-  // TODO: this draft serves any asset id to any caller, hands out a permanent URL and streams the
+  // TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
   // original bytes through the API instead of a signed URL that expires.
   const {assetId} = request.params as {assetId: string};
   const asset = await store.getById(assetId);
@@ -253,7 +253,7 @@ import (
 )
 
 func readAsset(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves any asset id to any caller, hands out a permanent URL and streams the
+	// TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
 	// original bytes through the API instead of a signed URL that expires.
 	asset, err := store.GetByID(r.Context(), r.PathValue("assetID"))
 	if err != nil || asset == nil {
@@ -364,7 +364,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "assets" / Segment) { assetId =>
       get {
-        // TODO: this draft serves any asset id to any caller, hands out a permanent URL and streams
+        // TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams
         // the original bytes through the API instead of a signed URL that expires.
         getFromFile(s"/objects/$assetId.png")
       }
@@ -439,7 +439,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/assets/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves any asset id to any caller, hands out a permanent URL and streams the
+    // TODO: this starter serves any asset id to any caller, hands out a permanent URL and streams the
     // original bytes through the API instead of a signed URL that expires.
     const std::string assetId = req.matches[1];
     res.status = 200;
@@ -511,7 +511,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you know where access is enforced. The draft enforces it nowhere: any
+  debrief: `The interviewer is testing whether you know where access is enforced. The starter enforces it nowhere: any
 authenticated caller with an id reads any tenant's asset, and because the response is a permanent URL,
 the leak outlives the request. Both bugs are the same bug — the read path treats possession of an id as
 authorization — and the fix is to scope the lookup by tenant and to mint a credential that is bound to

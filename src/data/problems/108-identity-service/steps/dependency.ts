@@ -8,11 +8,11 @@ export const dependencyStep: Step = {
   focus: ['api', 'provider', 'retry', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the identity service’s
-verification client: it calls the provider’s \`SendVerification\` and moves the signup along. Against
-a healthy provider — one signup, one delivered email — everything looks perfect, and the demo
-passes. It hides three production flaws. Review it like the identity service owner, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter is working code for the identity service’s verification client: it
+calls the provider’s \`SendVerification\` and moves the signup along. Against a healthy provider —
+one signup, one delivered email — everything looks perfect, and the demo passes. It hides three
+production flaws. Debug it like the identity service owner, fix it, and prove the fix with the
+checks below.
 
 Implement \`send_verification(email, attempt)\` — the gRPC call that mails the verification link —
 and the paths around it:
@@ -30,7 +30,7 @@ and the paths around it:
 - Retries are **bounded** by \`MAX_ATTEMPTS = 5\` and spaced by an exponential
   \`backoff_seconds(...)\` (\`BACKOFF_BASE_S = 60\`), never a fixed one-minute loop.
 
-**Failure mode the checks target.** The draft marks the account \`verified\` the moment
+**Failure mode the checks target.** The starter marks the account \`verified\` the moment
 \`SendVerification\` returns or times out, “to keep signups smooth”, so a provider outage silently
 mints verified identities for addresses nobody proved they own — sign up with a victim’s address
 during the outage and log straight in. It also re-queues every failure and drains that queue on a
@@ -66,16 +66,16 @@ carries a deadline, one stuck provider holds a worker (and the signup behind it)
     ],
   },
   hints: [
-    'A deadline is an argument on the call itself — `timeout=`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — not a wrapper around it. The draft calls `SendVerification` bare, so one stuck provider holds the signup request open until the client walks away.',
+    'A deadline is an argument on the call itself — `timeout=`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline` — not a wrapper around it. The starter calls `SendVerification` bare, so one stuck provider holds the signup request open until the client walks away.',
     'A timeout is a retryable failure, not a confirmation: classify `DEADLINE_EXCEEDED` as retryable, `queue_retry(email, attempt + 1)` and write the account back to `unverified`. `verified` has exactly one author — the `ConfirmVerification` reply carrying `confirmed` — and the send result must never touch it.',
-    'A hard bounce arrives as an `INVALID_ARGUMENT` whose detail says `hard_bounce`: `suppress` the address (and gate signup on `is_suppressed`) and drop it from the retry schedule, because it is terminal. Space the remaining retries by the schedule constant (`BACKOFF_BASE_S = 60`, doubling) and stop at `MAX_ATTEMPTS = 5` — the draft’s fixed `60 s` loop never ends.',
+    'A hard bounce arrives as an `INVALID_ARGUMENT` whose detail says `hard_bounce`: `suppress` the address (and gate signup on `is_suppressed`) and drop it from the retry schedule, because it is terminal. Space the remaining retries by the schedule constant (`BACKOFF_BASE_S = 60`, doubling) and stop at `MAX_ATTEMPTS = 5` — the starter’s fixed `60 s` loop never ends.',
   ],
   checks: [
     {
       id: 'deadline',
       title: 'The provider call carries a 3 s deadline',
       detail:
-        '`SendVerification` is invoked with a **3 s** deadline: `DEADLINE_S = 3` and `timeout=DEADLINE_S` (Python), `DEADLINE_MS = 3_000` and `deadline: Date.now() + DEADLINE_MS` (TypeScript), `context.WithTimeout(ctx, deadlineS*time.Second)` (Go), `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)` (Scala), `ctx.set_deadline(… std::chrono::seconds(kDeadlineS))` (C++). The draft calls the provider with no deadline at all.',
+        '`SendVerification` is invoked with a **3 s** deadline: `DEADLINE_S = 3` and `timeout=DEADLINE_S` (Python), `DEADLINE_MS = 3_000` and `deadline: Date.now() + DEADLINE_MS` (TypeScript), `context.WithTimeout(ctx, deadlineS*time.Second)` (Go), `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)` (Scala), `ctx.set_deadline(… std::chrono::seconds(kDeadlineS))` (C++). The starter calls the provider with no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*3/, /timeout=DEADLINE_S/, /\.SendVerification\(/]},
         typescript: {
@@ -98,7 +98,7 @@ carries a deadline, one stuck provider holds a worker (and the signup behind it)
       id: 'timeout-queues',
       title: 'A timeout queues a retry and leaves the account unverified',
       detail:
-        '`DEADLINE_EXCEEDED` sits in the retryable set: the timeout path calls `queue_retry(email, attempt + 1)` / `queueRetry(...)` and explicitly writes the account back to `unverified`. The draft marks the account `verified` on the timeout, turning a provider outage into a way to claim an address that was never proven owned.',
+        '`DEADLINE_EXCEEDED` sits in the retryable set: the timeout path calls `queue_retry(email, attempt + 1)` / `queueRetry(...)` and explicitly writes the account back to `unverified`. The starter marks the account `verified` on the timeout, turning a provider outage into a way to claim an address that was never proven owned.',
       match: {
         python: {all: [/StatusCode\.DEADLINE_EXCEEDED/, /queue_retry\(/, /set_status\([^;\n]*"unverified"\)/]},
         typescript: {
@@ -113,7 +113,7 @@ carries a deadline, one stuck provider holds a worker (and the signup behind it)
       id: 'hard-bounce',
       title: 'A hard bounce is terminal and suppresses the address',
       detail:
-        'A hard bounce — a `hard_bounce` detail on an `INVALID_ARGUMENT` status — is terminal: `suppress(...)` adds the address to the suppression set, drops it from the retry schedule, and `is_suppressed(...)` / `isSuppressed(...)` refuses it at signup. The draft queues a bounced address like any other failure and re-sends it forever.',
+        'A hard bounce — a `hard_bounce` detail on an `INVALID_ARGUMENT` status — is terminal: `suppress(...)` adds the address to the suppression set, drops it from the retry schedule, and `is_suppressed(...)` / `isSuppressed(...)` refuses it at signup. The starter queues a bounced address like any other failure and re-sends it forever.',
       match: {
         python: {all: [/HARD_BOUNCE/, /def suppress\(/, /is_suppressed\(/]},
         typescript: {all: [/HARD_BOUNCE/, /suppress\(/, /isSuppressed\(/]},
@@ -126,7 +126,7 @@ carries a deadline, one stuck provider holds a worker (and the signup behind it)
       id: 'confirm-only',
       title: 'Verified is granted only from the provider confirmation',
       detail:
-        'The account becomes `verified` only inside the confirmation path, after `ConfirmVerification` answers `confirmed`; the send result — accepted, timed out or errored — never flips it. The draft sets `verified` straight from the send, so an outage manufactures verified identities.',
+        'The account becomes `verified` only inside the confirmation path, after `ConfirmVerification` answers `confirmed`; the send result — accepted, timed out or errored — never flips it. The starter sets `verified` straight from the send, so an outage manufactures verified identities.',
       match: {
         python: {all: [/\.ConfirmVerification\(/, /\.confirmed/, /set_status\([^;\n]*"verified"\)/]},
         typescript: {all: [/\.ConfirmVerification\(/, /\.confirmed/, /setStatus\([^;\n]*['"]verified['"]\)/]},
@@ -139,7 +139,7 @@ carries a deadline, one stuck provider holds a worker (and the signup behind it)
       id: 'bounded-backoff',
       title: 'Retries back off and stop instead of looping every minute',
       detail:
-        'The schedule is bounded by `MAX_ATTEMPTS = 5` and spaced by `backoff_seconds` / `backoffSeconds` / `backoffMs` built from `BACKOFF_BASE_S = 60` (doubling per attempt), instead of the draft’s fixed `60 s` / `1 min` loop that never stops.',
+        'The schedule is bounded by `MAX_ATTEMPTS = 5` and spaced by `backoff_seconds` / `backoffSeconds` / `backoffMs` built from `BACKOFF_BASE_S = 60` (doubling per attempt), instead of the starter’s fixed `60 s` / `1 min` loop that never stops.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*5/, /BACKOFF_BASE_S\s*=\s*60/, /def backoff_seconds\(/],
@@ -166,7 +166,7 @@ carries a deadline, one stuck provider holds a worker (and the signup behind it)
   ],
   code: {
     python: {
-      starter: `"""Verification client: a model-generated draft that keeps signups smooth."""
+      starter: `"""Verification client: flawed code that keeps signups smooth."""
 import time
 
 import grpc
@@ -291,7 +291,7 @@ def retry_worker() -> None:
 `,
     },
     typescript: {
-      starter: `/** Verification client: a model-generated draft that keeps signups smooth. */
+      starter: `/** Verification client: flawed code that keeps signups smooth. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -876,5 +876,5 @@ void retry_worker() {
 `,
     },
   },
-  debrief: `One question sits under all five checks: what does the system believe when the provider is unavailable? The draft answers “that the address is verified”, because a send that timed out looked, to a hurried author, like a send that succeeded — and the account row is what every later login trusts. The fix separates three things the draft merged: the *send* (best effort, bounded, retried with backoff), the *address’s standing* (unverified until the provider confirms, suppressed after a hard bounce) and the *proof* (only the \`ConfirmVerification\` reply may write \`verified\`). A timeout therefore queues work and changes nothing about the user’s status; a bounce stops the retries and bars the address from signup, because the provider has told you it will never be deliverable; and the confirmation path is the single writer of \`verified\`, which is what makes “verified email” mean something at login time. The draft is indistinguishable from the fix while the provider is healthy, which is exactly why the failure paths are the interview. Real services add a jittered backoff, a signed single-use confirmation token with its own expiry, a bounce/complaint webhook from the provider that feeds the same suppression list, and a dashboard for addresses stuck unverified longer than a day.`,
+  debrief: `One question sits under all five checks: what does the system believe when the provider is unavailable? The starter answers “that the address is verified”, because a send that timed out looked, to a hurried author, like a send that succeeded — and the account row is what every later login trusts. The fix separates three things the starter merged: the *send* (best effort, bounded, retried with backoff), the *address’s standing* (unverified until the provider confirms, suppressed after a hard bounce) and the *proof* (only the \`ConfirmVerification\` reply may write \`verified\`). A timeout therefore queues work and changes nothing about the user’s status; a bounce stops the retries and bars the address from signup, because the provider has told you it will never be deliverable; and the confirmation path is the single writer of \`verified\`, which is what makes “verified email” mean something at login time. The starter is indistinguishable from the fix while the provider is healthy, which is exactly why the failure paths are the interview. Real services add a jittered backoff, a signed single-use confirmation token with its own expiry, a bounce/complaint webhook from the provider that feeds the same suppression list, and a dashboard for addresses stuck unverified longer than a day.`,
 };

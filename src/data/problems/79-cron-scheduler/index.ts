@@ -7,11 +7,11 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Cron scheduler on the AI-era track: the course is not "call a function on a timer", it is the
- * review you owe a model-generated scheduler before it owns a shared job fleet. A bounded time spec
- * whose timezone resolves → one Redis lease per fire window so exactly one instance fires it → a
- * gRPC trigger with a deadline behind a misfire policy that will not storm the target → schedule
- * events keyed by schedule id with an outbox → a history read that shows pauses as misfires.
+ * Cron scheduler: the course is not "call a function on a timer", it is the debugging you owe a
+ * scheduler before it owns a shared job fleet. A bounded time spec whose timezone resolves → one
+ * Redis lease per fire window so exactly one instance fires it → a gRPC trigger with a deadline
+ * behind a misfire policy that will not storm the target → schedule events keyed by schedule id with
+ * an outbox → a history read that shows pauses as misfires.
  */
 export const cronSchedulerProblem: Problem = {
   id: 'cron-scheduler',
@@ -19,7 +19,6 @@ export const cronSchedulerProblem: Problem = {
   tagline: 'One instance of a scheduled job runs, not one per node, and misfires are explicit.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Cron Scheduler
 
@@ -60,12 +59,12 @@ One service, **cronsched**, with five pieces:
 5. \`GET /v1/schedules/{id}/history\`: fires, skips and misfires for the last 30 days, built from the
    windows the cron should have fired, with a stall flag derived from that same expectation math.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real scheduler feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

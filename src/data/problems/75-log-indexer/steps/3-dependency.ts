@@ -8,10 +8,10 @@ export const dependencyStep: Step = {
   focus: ['writer', 'shard'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds a \`BulkWrite\`
+**Starting point.** The starter is working code: it builds a \`BulkWrite\`
 request, calls the shard, and loops until it succeeds. It compiles, it writes documents on the happy
 path, and it hides three production flaws — one of them duplicates documents whenever a shard
-blinks. Review it like the service owner, fix it, and prove the fix with the checks below.
+blinks. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`bulk_write\` for one committed batch of records:
 
@@ -24,12 +24,12 @@ Implement \`bulk_write\` for one committed batch of records:
   for the batch**: raise/return a \`MappingConflict\` that carries the offending **field** the shard
   named, so the caller can fix the mapping instead of replaying a batch that will never be accepted.
 - The batch id is minted **once per batch, before the retry loop**, and every attempt sends that same
-  id. The shard dedupes on it, so a replayed attempt is a no-op. The draft mints a new id inside the
+  id. The shard dedupes on it, so a replayed attempt is a no-op. The starter mints a new id inside the
   loop, so a retry writes a second copy of every document.
 - The request also carries the **attempt number**, so the shard and the logs can tell a first try
   from a replay.
 
-**Failure mode the checks target.** The draft's three flaws compound: it retries a mapping conflict
+**Failure mode the checks target.** The starter's three flaws compound: it retries a mapping conflict
 forever, so one bad field pins a worker in a hot loop against a shard that will never accept the
 batch; it treats a single \`DEADLINE_EXCEEDED\` as fatal, so a shard that is merely slow loses the
 batch; and it mints the batch id per attempt, so the retry it does perform duplicates the records the
@@ -68,7 +68,7 @@ first attempt may have written.`,
       id: 'retryable-set',
       title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED, with a bound',
       detail:
-        'The retryable set is exactly `UNAVAILABLE` and `DEADLINE_EXCEEDED`, the attempts are capped at `MAX_ATTEMPTS`, and a backoff separates them. The draft gives up on the first timeout and retries everything else forever.',
+        'The retryable set is exactly `UNAVAILABLE` and `DEADLINE_EXCEEDED`, the attempts are capped at `MAX_ATTEMPTS`, and a backoff separates them. The starter gives up on the first timeout and retries everything else forever.',
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS/, /BACKOFF_S/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS/, /BACKOFF_MS/]},
@@ -81,7 +81,7 @@ first attempt may have written.`,
       id: 'terminal-conflict',
       title: 'Surfaces a mapping conflict as terminal, with the field',
       detail:
-        '`INVALID_ARGUMENT` / `FAILED_PRECONDITION` raise a `MappingConflict` carrying the offending `field` from the shard — never a retry. The draft retries the conflict forever, so one bad mapping pins the worker.',
+        '`INVALID_ARGUMENT` / `FAILED_PRECONDITION` raise a `MappingConflict` carrying the offending `field` from the shard — never a retry. The starter retries the conflict forever, so one bad mapping pins the worker.',
       match: {
         python: {all: [/(?:INVALID_ARGUMENT|FAILED_PRECONDITION)/, /MappingConflict/, /field/]},
         typescript: {all: [/(?:INVALID_ARGUMENT|FAILED_PRECONDITION)/, /MappingConflict/, /field/]},
@@ -94,7 +94,7 @@ first attempt may have written.`,
       id: 'stable-batch-id',
       title: 'Mints the batch id once, before the retry loop',
       detail:
-        'The batch id is created before the loop and reused by every attempt, so a replay carries the same id. The draft mints a new id inside the loop, which turns a retry into a second copy of the batch.',
+        'The batch id is created before the loop and reused by every attempt, so a replay carries the same id. The starter mints a new id inside the loop, which turns a retry into a second copy of the batch.',
       match: {
         python: {all: [/batch_id/], order: [/batch_id\s*=\s*str\(uuid\.uuid4\(\)\)/, /\bwhile\b/]},
         typescript: {all: [/batchId/], order: [/const batchId = randomUUID\(\)/, /\bfor\b/]},
@@ -107,7 +107,7 @@ first attempt may have written.`,
       id: 'request-dedupe',
       title: 'Sends the batch id and the attempt in the request',
       detail:
-        "The request carries `batch_id` and the `attempt` number, which is the shard's dedupe key — a replayed batch is recognised instead of duplicated. The draft sends a fresh id each time, so the shard cannot tell a replay from a new batch.",
+        "The request carries `batch_id` and the `attempt` number, which is the shard's dedupe key — a replayed batch is recognised instead of duplicated. The starter sends a fresh id each time, so the shard cannot tell a replay from a new batch.",
       match: {
         python: {all: [/BulkWriteRequest\(/, /batch_id=batch_id/, /attempt=attempt/]},
         typescript: {all: [/BulkWrite/, /batch_id:\s*batchId/, /attempt/]},
@@ -128,8 +128,8 @@ import index_pb2
 
 
 def bulk_write(stub, index: str, records: list[bytes]) -> str:
-    # TODO: this draft retries a mapping conflict forever, abandons the batch on the first shard
-    # timeout, and mints a new batch id per attempt so a retry duplicates every document. Review
+    # TODO: this starter retries a mapping conflict forever, abandons the batch on the first shard
+    # timeout, and mints a new batch id per attempt so a retry duplicates every document. Fix
     # all three.
     attempt = 0
     while True:
@@ -212,7 +212,7 @@ def bulk_write(stub, index: str, records: list[bytes]) -> str:
 `,
     },
     typescript: {
-      starter: `/** Index shard client: a model-generated draft that re-mints the batch id per attempt. */
+      starter: `/** Index shard client: flawed code that re-mints the batch id per attempt. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';
@@ -233,8 +233,8 @@ export async function bulkWrite(
   index: string,
   records: Uint8Array[],
 ): Promise<string> {
-  // TODO: this draft retries a mapping conflict forever, abandons the batch on the first shard
-  // timeout, and mints a new batch id per attempt so a retry duplicates every document. Review
+  // TODO: this starter retries a mapping conflict forever, abandons the batch on the first shard
+  // timeout, and mints a new batch id per attempt so a retry duplicates every document. Fix
   // all three.
   for (;;) {
     const batchId = randomUUID();
@@ -329,8 +329,8 @@ import (
 
 // BulkWrite ships one batch of records to an index shard.
 func BulkWrite(ctx context.Context, client pb.ShardClient, index string, records [][]byte) (string, error) {
-	// TODO: this draft retries a mapping conflict forever, abandons the batch on the first shard
-	// timeout, and mints a new batch id per attempt so a retry duplicates every document. Review
+	// TODO: this starter retries a mapping conflict forever, abandons the batch on the first shard
+	// timeout, and mints a new batch id per attempt so a retry duplicates every document. Fix
 	// all three.
 	for {
 		batchID := uuid.NewString()
@@ -429,8 +429,8 @@ import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 object Client {
   val stub = ShardGrpc.blockingStub(ManagedChannelBuilder.forAddress("shard", 9000).usePlaintext().build())
 
-  // TODO: this draft retries a mapping conflict forever, abandons the batch on the first shard
-  // timeout, and mints a new batch id per attempt so a retry duplicates every document. Review
+  // TODO: this starter retries a mapping conflict forever, abandons the batch on the first shard
+  // timeout, and mints a new batch id per attempt so a retry duplicates every document. Fix
   // all three.
   def bulkWrite(index: String, records: Seq[Array[Byte]]): String = {
     var result: String = null
@@ -521,8 +521,8 @@ std::string bulkWrite(
     const std::shared_ptr<Shard::Stub>& stub,
     const std::string& index,
     const std::vector<std::string>& records) {
-  // TODO: this draft retries a mapping conflict forever, abandons the batch on the first shard
-  // timeout, and mints a new batch id per attempt so a retry duplicates every document. Review
+  // TODO: this starter retries a mapping conflict forever, abandons the batch on the first shard
+  // timeout, and mints a new batch id per attempt so a retry duplicates every document. Fix
   // all three.
   int attempt = 1;
   while (true) {
@@ -608,5 +608,5 @@ std::string bulkWrite(
     "The batch id is the dedupe key, so it has to exist before the loop. Mint it once, put it in every attempt's request next to the attempt number, and the shard can turn a replay into a no-op instead of a second copy of every document.",
     'A `FAILED_PRECONDITION` from the shard usually names the field it choked on. Carry that field into your `MappingConflict` so the caller sees `user_id` instead of "batch failed", and make the error type distinct enough that the caller will never retry it.',
   ],
-  debrief: `The interviewer is testing the failure contract of a networked write, which a generated snippet almost always gets wrong in the same way. The deadline bounds one attempt; the attempt count bounds the whole call; the retryable set decides which failures even deserve another try; and the batch id is the idempotency key that makes retrying safe, which is why it must be minted outside the loop — a retry with a fresh id is a second write, whatever the code comments say. Terminal errors are the other half: a mapping conflict is evidence that the data will be rejected forever, so retrying it is a hot loop against a shard that already answered. Real clients add jittered exponential backoff, a per-shard concurrency limit, a breaker so a dead shard stops receiving traffic, and a dead-letter batch that a human can re-map and replay with the original id.`,
+  debrief: `The interviewer is testing the failure contract of a networked write, which a first version almost always gets wrong in the same way. The deadline bounds one attempt; the attempt count bounds the whole call; the retryable set decides which failures even deserve another try; and the batch id is the idempotency key that makes retrying safe, which is why it must be minted outside the loop — a retry with a fresh id is a second write, whatever the code comments say. Terminal errors are the other half: a mapping conflict is evidence that the data will be rejected forever, so retrying it is a hot loop against a shard that already answered. Real clients add jittered exponential backoff, a per-shard concurrency limit, a breaker so a dead shard stops receiving traffic, and a dead-letter batch that a human can re-map and replay with the original id.`,
 };

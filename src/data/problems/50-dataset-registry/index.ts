@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Dataset registry on the AI-era track: the course is not "store a version in a database", it is the
- * review you owe a model-generated registry before training runs depend on its version names.
- * Immutable, licensed, measured version records → one atomic latest-version pointer with pins that
- * never move → a deadline-bounded validator call that gates promotion → dataset-keyed events with no
- * content and an outbox after the commit → a tenant-scoped read that returns provenance and an
- * expiring signed URL.
+ * Dataset registry: the course is not "store a version in a database", it is the debugging you
+ * owe a registry before training runs depend on its version names. Immutable, licensed, measured
+ * version records → one atomic latest-version pointer with pins that never move → a
+ * deadline-bounded validator call that gates promotion → dataset-keyed events with no content and
+ * an outbox after the commit → a tenant-scoped read that returns provenance and an expiring signed
+ * URL.
  */
 export const datasetRegistryProblem: Problem = {
   id: 'dataset-registry',
@@ -20,7 +20,7 @@ export const datasetRegistryProblem: Problem = {
   tagline: 'Immutable dataset versions with provenance, licenses and pinned consumers.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Dataset Registry
 
@@ -65,12 +65,12 @@ One service, **registryd**, with five pieces:
 5. \`GET /v1/datasets/{id}/versions/{v}\`: tenant-scoped provenance — a foreign version is \`404\` —
    a signed URL that expires, and a validator report that is present even when it failed.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

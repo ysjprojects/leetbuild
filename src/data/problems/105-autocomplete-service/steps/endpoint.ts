@@ -8,10 +8,10 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
-\`prefix\` from the query string, asks the index for matches and returns them. It compiles, it serves
-the demo — a three-letter prefix from one tenant — and it hides three production flaws. Review it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, reads \`prefix\` from the
+query string, asks the index for matches and returns them. It compiles, it serves the demo — a
+three-letter prefix from one tenant — and it hides three production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/autocomplete?prefix=…\` for the typeahead box.
 
@@ -61,7 +61,7 @@ English and duplicates the moment the catalog is not.`,
       id: 'prefix-bounds',
       title: 'Bounds the normalized prefix at 64 characters',
       detail:
-        'The normalized prefix must be 1..64 characters; an empty or oversized prefix is **400**. The draft matches on the raw prefix with no bound, so `prefix=` returns the whole index.',
+        'The normalized prefix must be 1..64 characters; an empty or oversized prefix is **400**. The starter matches on the raw prefix with no bound, so `prefix=` returns the whole index.',
       match: {
         python: {all: [/MIN_PREFIX_CHARS/, /MAX_PREFIX_CHARS/, /status_code\s*=\s*400/]},
         typescript: {all: [/MIN_PREFIX_CHARS/, /MAX_PREFIX_CHARS/, /code\(\s*400\s*\)/]},
@@ -74,7 +74,7 @@ English and duplicates the moment the catalog is not.`,
       id: 'control-chars',
       title: 'Rejects control characters in the prefix',
       detail:
-        'A prefix containing a control character is **400** before any index work. The draft forwards the raw prefix to the index and the cache key.',
+        'A prefix containing a control character is **400** before any index work. The starter forwards the raw prefix to the index and the cache key.',
       match: {
         python: {all: [/CONTROL_CHARS/, /status_code\s*=\s*400/]},
         typescript: {all: [/CONTROL_CHARS/, /code\(\s*400\s*\)/]},
@@ -87,7 +87,7 @@ English and duplicates the moment the catalog is not.`,
       id: 'suggestion-cap',
       title: 'Returns at most 10 suggestions',
       detail:
-        'The endpoint owns the contract: it folds, dedupes by the normalized term, and returns at most 10. The draft returns every match in the index — thousands for a short prefix.',
+        'The endpoint owns the contract: it folds, dedupes by the normalized term, and returns at most 10. The starter returns every match in the index — thousands for a short prefix.',
       match: {
         python: {all: [/MAX_SUGGESTIONS/, /\[:MAX_SUGGESTIONS\]/]},
         typescript: {all: [/MAX_SUGGESTIONS/, /slice\(\s*0\s*,\s*MAX_SUGGESTIONS\s*\)/]},
@@ -100,7 +100,7 @@ English and duplicates the moment the catalog is not.`,
       id: 'normalize',
       title: 'Folds case and accents so duplicates collapse',
       detail:
-        'Normalization folds case *and* accents, and suggestions are deduplicated by the normalized term. The draft calls `lower()` only, so `Café` and `cafe` both appear.',
+        'Normalization folds case *and* accents, and suggestions are deduplicated by the normalized term. The starter calls `lower()` only, so `Café` and `cafe` both appear.',
       match: {
         python: {all: [/def fold\(/, /unicodedata/, /seen\s*=\s*set\(/]},
         typescript: {all: [/function fold\(/, /\.normalize\(/, /new Set\b/]},
@@ -128,9 +128,9 @@ index = SuggestionIndex()
 
 @app.get("/v1/autocomplete")
 def autocomplete(prefix: str = "", x_tenant_id: str = Header(default="")):
-    # TODO: this draft matches on the raw prefix with no bounds, returns every match in the
+    # TODO: this starter matches on the raw prefix with no bounds, returns every match in the
     # index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-    # and "cafe" both appear as separate suggestions. Review all three.
+    # and "cafe" both appear as separate suggestions. Fix all three.
     return {"prefix": prefix.lower(), "suggestions": index.matching(x_tenant_id, prefix.lower())}
 `,
       solution: `import unicodedata
@@ -202,9 +202,9 @@ const index: SuggestionIndex = {
 };
 
 app.get('/v1/autocomplete', async (request, reply) => {
-  // TODO: this draft matches on the raw prefix with no bounds, returns every match in the
+  // TODO: this starter matches on the raw prefix with no bounds, returns every match in the
   // index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-  // and "cafe" both appear as separate suggestions. Review all three.
+  // and "cafe" both appear as separate suggestions. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const prefix = String((request.query as Record<string, unknown>).prefix ?? '');
   return {prefix: prefix.toLowerCase(), suggestions: await index.matching(tenant, prefix.toLowerCase())};
@@ -276,9 +276,9 @@ type SuggestionIndex interface {
 func autocomplete(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	prefix := r.URL.Query().Get("prefix")
-	// TODO: this draft matches on the raw prefix with no bounds, returns every match in the
+	// TODO: this starter matches on the raw prefix with no bounds, returns every match in the
 	// index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-	// and "cafe" both appear as separate suggestions. Review all three.
+	// and "cafe" both appear as separate suggestions. Fix all three.
 	terms, _ := index.Matching(tenant, strings.ToLower(prefix))
 	rw.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(rw).Encode(map[string]any{"prefix": strings.ToLower(prefix), "suggestions": terms})
@@ -413,9 +413,9 @@ object Api {
       get {
         parameter("prefix".?) { prefixOpt =>
           headerValueByName("X-Tenant-Id") { tenant =>
-            // TODO: this draft matches on the raw prefix with no bounds, returns every match in
+            // TODO: this starter matches on the raw prefix with no bounds, returns every match in
             // the index (thousands for a short prefix), and lowercases without Unicode folding,
-            // so "Café" and "cafe" both appear as separate suggestions. Review all three.
+            // so "Café" and "cafe" both appear as separate suggestions. Fix all three.
             val prefix = prefixOpt.getOrElse("").toLowerCase
             complete(StatusCodes.OK, s"""{"prefix":"$prefix","suggestions":[]}""")
           }
@@ -518,9 +518,9 @@ int main() {
   svr.Get("/v1/autocomplete", [](const httplib::Request& req, httplib::Response& res) {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto prefix = req.get_param_value("prefix");
-    // TODO: this draft matches on the raw prefix with no bounds, returns every match in the
+    // TODO: this starter matches on the raw prefix with no bounds, returns every match in the
     // index (thousands for a short prefix), and lowercases without Unicode folding, so "Café"
-    // and "cafe" both appear as separate suggestions. Review all three.
+    // and "cafe" both appear as separate suggestions. Fix all three.
     const auto terms = matching(tenant, prefix);
     res.status = 200;
     res.set_content(json{{"prefix", prefix}, {"suggestions", terms}}.dump(), "application/json");
@@ -655,5 +655,5 @@ int main() {
     'Reject control characters explicitly, before the index: a newline or a NUL in a prefix corrupts cache keys and log lines. The cost order is normalize, reject control characters, bound the length, then look up.',
     'The index returns everything that matches; the endpoint owns the ten-suggestion contract. Fold each term, keep the first spelling you see per normalized key, and slice the ranked list to ten after dedupe — never truncate the raw list first.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated typeahead handler at the trust boundary. The draft reads fine because the demo sends a short ASCII prefix from one tenant. Three defects are being checked. Unbounded matching turns the endpoint into a bulk export: an empty prefix returns the whole index, and a 64-character cap makes a scrape expensive instead of free. Control characters are the second: they never belong in a cache key or a log line, so they are rejected before the lookup. The subtle one is Unicode folding: \`lower()\` is not normalization, so \`Café\` and \`cafe\` survive as two suggestions and the "duplicate" bug only appears once the catalog is not English. Real endpoints keep the ranking server-side, return a stable list per normalized prefix so the client can cache it, and hash the prefix in analytics rather than sending it raw.`,
+  debrief: `The interviewer is testing whether you can debug a typeahead handler at the trust boundary. The starter reads fine because the demo sends a short ASCII prefix from one tenant. Three defects are being checked. Unbounded matching turns the endpoint into a bulk export: an empty prefix returns the whole index, and a 64-character cap makes a scrape expensive instead of free. Control characters are the second: they never belong in a cache key or a log line, so they are rejected before the lookup. The subtle one is Unicode folding: \`lower()\` is not normalization, so \`Café\` and \`cafe\` survive as two suggestions and the "duplicate" bug only appears once the catalog is not English. Real endpoints keep the ranking server-side, return a stable list per normalized prefix so the client can cache it, and hash the prefix in analytics rather than sending it raw.`,
 };

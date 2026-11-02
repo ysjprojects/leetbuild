@@ -8,10 +8,10 @@ export const stateStep: Step = {
   focus: ['hub', 'shadow', 'device'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: an operator's desired document
-is stored, a device's report is stored, and the demo shows the shadow changing. What happens to the
-operator's change when a device reconnects with its old configuration — and to the version numbers
-the fleet reads back — is the flaw. Review it like the service owner, fix it, and prove the fix.
+**Starting point.** The starter is working code: an operator's desired document is stored, a
+device's report is stored, and the demo shows the shadow changing. What happens to the operator's
+change when a device reconnects with its old configuration — and to the version numbers the fleet
+reads back — is the flaw. Debug it like the service owner, fix it, and prove the fix.
 
 Implement the Redis shadow state behind the hub. One hash per device at \`shadow:{device_id}\`:
 
@@ -33,7 +33,7 @@ Implement the Redis shadow state behind the hub. One hash per device at \`shadow
   Reconciliation converges **on the desired document**: the device is asked to adopt what the
   operator wants, never the other way around.
 
-**Failure mode the checks target.** The draft keeps one \`state\` document and one fused \`version\`
+**Failure mode the checks target.** The starter keeps one \`state\` document and one fused \`version\`
 counter for both sides, and it advances that counter by two on every write, so the versions the
 fleet sees skip every other number and neither document owns its version. Because there is only one
 document, a device that reconnects with its old configuration overwrites the operator's intended
@@ -56,14 +56,14 @@ and there is nothing left to reconcile back to.`,
   hints: [
     'Two documents, two counters. The desired write is `HINCRBY` on `desired_version` inside its own script; the report script records the device’s own `reported_version`. A fused counter cannot tell an operator write from a device report, makes the numbers skip, and leaves neither document with a version of its own.',
     'Merging by version is a comparison that has to live inside Redis: read the stored version with `HGET`, then `if incoming <= stored then return {0, stored} end`. Do the read, the comparison and the `HSET` in one script — two reports that arrive together otherwise both see the old version and the later one wins.',
-    'The reconciler is read-only and one-directional: both documents, both counters, `behind = reported_version < desired_version`, and `apply` is always the desired document with `divergence` listing the fields the device has not adopted. Copying reported into desired is the draft’s bug, not convergence.',
+    'The reconciler is read-only and one-directional: both documents, both counters, `behind = reported_version < desired_version`, and `apply` is always the desired document with `divergence` listing the fields the device has not adopted. Copying reported into desired is the starter’s bug, not convergence.',
   ],
   checks: [
     {
       id: 'desired-version',
       title: 'The desired document owns its version counter',
       detail:
-        'A desired write bumps `desired_version` by one inside its own `DESIRED_LUA`/`desiredScript` script (`HINCRBY` on that field), so the operator’s document has a version of its own. The draft shares one fused `version` counter for both sides and advances it by two per write, so the numbers skip and neither side can be compared against the other.',
+        'A desired write bumps `desired_version` by one inside its own `DESIRED_LUA`/`desiredScript` script (`HINCRBY` on that field), so the operator’s document has a version of its own. The starter shares one fused `version` counter for both sides and advances it by two per write, so the numbers skip and neither side can be compared against the other.',
       match: {
         python: {all: [/DESIRED_LUA/, /'desired_version'/, /HINCRBY/]},
         typescript: {all: [/DESIRED_LUA/, /'desired_version'/, /HINCRBY/]},
@@ -76,7 +76,7 @@ and there is nothing left to reconcile back to.`,
       id: 'reported-version',
       title: 'The reported document owns its version counter',
       detail:
-        'A report advances `reported_version` through its own report script (`REPORT_LUA`) and writes the `reported` field: the device’s reports move the reported counter, an operator write never does, and the desired counter is never touched by a report. The draft advances one shared counter for both documents.',
+        'A report advances `reported_version` through its own report script (`REPORT_LUA`) and writes the `reported` field: the device’s reports move the reported counter, an operator write never does, and the desired counter is never touched by a report. The starter advances one shared counter for both documents.',
       match: {
         python: {all: [/REPORT_LUA/, /'reported_version'/, /HSET/]},
         typescript: {all: [/REPORT_LUA/, /'reported_version'/, /HSET/]},
@@ -89,7 +89,7 @@ and there is nothing left to reconcile back to.`,
       id: 'stale-report-guard',
       title: 'A report that is not newer changes nothing',
       detail:
-        'The report script reads the stored `reported_version` (`HGET`) and keeps only a strictly newer one: `if incoming <= stored then return {0, stored} end`. The draft writes whatever arrives, so a device that reconnects with its old configuration overwrites the current document and the operator’s newer intent is lost.',
+        'The report script reads the stored `reported_version` (`HGET`) and keeps only a strictly newer one: `if incoming <= stored then return {0, stored} end`. The starter writes whatever arrives, so a device that reconnects with its old configuration overwrites the current document and the operator’s newer intent is lost.',
       match: {
         python: {all: [/'reported_version'/, /incoming\s*<=\s*stored/, /return \{0/]},
         typescript: {all: [/'reported_version'/, /incoming\s*<=\s*stored/, /return \{0/]},
@@ -102,7 +102,7 @@ and there is nothing left to reconcile back to.`,
       id: 'merge-by-version',
       title: 'Two documents merged by version, never overwritten wholesale',
       detail:
-        'The desired and reported documents live in their own hash fields (`desired`, `reported`) under the one `shadow:{device_id}` key: a report writes `reported`, an operator write writes `desired`, and the pair is merged by version. The draft keeps a single `state` field whose newest writer wins, so a device report replaces the operator’s document wholesale.',
+        'The desired and reported documents live in their own hash fields (`desired`, `reported`) under the one `shadow:{device_id}` key: a report writes `reported`, an operator write writes `desired`, and the pair is merged by version. The starter keeps a single `state` field whose newest writer wins, so a device report replaces the operator’s document wholesale.',
       match: {
         python: {all: [/'desired'/, /'reported'/, /HSET/]},
         typescript: {all: [/'desired'/, /'reported'/, /HSET/]},
@@ -115,7 +115,7 @@ and there is nothing left to reconcile back to.`,
       id: 'converge',
       title: 'Reconciliation converges on the desired document',
       detail:
-        '`reconcile` reads both documents and both counters, lists the fields where reported is behind desired (`divergence`), and hands the **desired** document back as what the device must apply — `behind = reported_version < desired_version`. The draft has no reconciler at all: with one document, the last writer wins and the operator’s intent is what gets lost.',
+        '`reconcile` reads both documents and both counters, lists the fields where reported is behind desired (`divergence`), and hands the **desired** document back as what the device must apply — `behind = reported_version < desired_version`. The starter has no reconciler at all: with one document, the last writer wins and the operator’s intent is what gets lost.',
       match: {
         python: {all: [/def reconcile\(/, /reported_version\s*<\s*desired_version/, /divergence/]},
         typescript: {all: [/function reconcile\(/, /reportedVersion\s*<\s*desiredVersion/, /divergence/]},
@@ -151,7 +151,7 @@ class ReportedBody(BaseModel):
 
 
 def write_state(device_id: str, state: dict[str, str]) -> int:
-    # TODO: the draft keeps one document ("state") and one fused counter for both sides, advancing
+    # TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
     # it by two per write so the versions it hands out skip every other number. A device that
     # reports its old configuration overwrites the operator's intended document wholesale. Give
     # desired and reported their own fields and their own version counters, ignore a report that is
@@ -252,7 +252,7 @@ def post_reconcile(device_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** IoT hub shadow state: a model-generated draft with one document and one fused counter. */
+      starter: `/** IoT hub shadow state: flawed code with one document and one fused counter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -271,7 +271,7 @@ interface ReportedBody {
 }
 
 async function writeState(deviceId: string, state: Record<string, string>): Promise<number> {
-  // TODO: the draft keeps one document ('state') and one fused counter for both sides, advancing it
+  // TODO: the starter keeps one document ('state') and one fused counter for both sides, advancing it
   // by two per write so the versions it hands out skip every other number, and a device that
   // reports its old configuration overwrites the operator's intended document wholesale. Give
   // desired and reported their own fields and their own version counters, ignore a report that is
@@ -407,7 +407,7 @@ func shadowKey(deviceID string) string {
 }
 
 func writeState(ctx context.Context, deviceID string, state map[string]string) int64 {
-	// TODO: the draft keeps one document ("state") and one fused counter for both sides, advancing
+	// TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
 	// it by two per write so the versions it hands out skip every other number. A device that
 	// reports its old configuration overwrites the operator's intended document wholesale. Give
 	// desired and reported their own fields and their own version counters, ignore a report that
@@ -617,7 +617,7 @@ object ShadowStateApi {
   def shadowKey(deviceId: String): String = "shadow:" + deviceId
 
   def writeState(deviceId: String, state: Map[String, String]): Long = {
-    // TODO: the draft keeps one document ("state") and one fused counter for both sides, advancing
+    // TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
     // it by two per write so the versions it hands out skip every other number, and a device that
     // reports its old configuration overwrites the operator's intended document wholesale. Give
     // desired and reported their own fields and their own version counters, ignore a report that
@@ -766,7 +766,7 @@ std::string shadowKey(const std::string& deviceId) {
 }
 
 long long writeState(sw::redis::Redis& redis, const std::string& deviceId, const json& state) {
-  // TODO: the draft keeps one document ("state") and one fused counter for both sides, advancing
+  // TODO: the starter keeps one document ("state") and one fused counter for both sides, advancing
   // it by two per write so the versions it hands out skip every other number. A device that
   // reports its old configuration overwrites the operator's intended document wholesale. Give
   // desired and reported their own fields and their own version counters, ignore a report that is
@@ -921,5 +921,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interview question behind this step is state that is allowed to disagree with itself. A shadow exists because desired and reported are two different documents, and every property the fleet depends on follows from keeping them apart: two documents with two counters, a merge that refuses to move backward, and a read that reports the disagreement instead of hiding it. The draft looks right because the demo writes the same value twice; its real behaviour is that the device is the authority, so an operator's change is undone the moment the device reconnects with its old configuration, and the fused counter makes the versions the fleet reads meaningless — they skip numbers and neither side can be compared against the other. The stale guard has to be a comparison inside Redis, not in your process: a \`HGET\` followed by an \`HSET\` lets two reports that arrive together both observe the old version and the later one wins. Convergence is the last piece and the easiest to get backwards: reconciliation asks the device to adopt the desired document, never the reverse, and copying reported into desired is how intent is lost, not how a shadow converges. Real device managers add per-document TTLs, delta updates over MQTT, per-field conflict policies, and a delivery loop that re-sends the desired document until the device acknowledges it.`,
+  debrief: `The interview question behind this step is state that is allowed to disagree with itself. A shadow exists because desired and reported are two different documents, and every property the fleet depends on follows from keeping them apart: two documents with two counters, a merge that refuses to move backward, and a read that reports the disagreement instead of hiding it. The starter looks right because the demo writes the same value twice; its real behaviour is that the device is the authority, so an operator's change is undone the moment the device reconnects with its old configuration, and the fused counter makes the versions the fleet reads meaningless — they skip numbers and neither side can be compared against the other. The stale guard has to be a comparison inside Redis, not in your process: a \`HGET\` followed by an \`HSET\` lets two reports that arrive together both observe the old version and the later one wins. Convergence is the last piece and the easiest to get backwards: reconciliation asks the device to adopt the desired document, never the reverse, and copying reported into desired is how intent is lost, not how a shadow converges. Real device managers add per-document TTLs, delta updates over MQTT, per-field conflict policies, and a delivery loop that re-sends the desired document until the device acknowledges it.`,
 };

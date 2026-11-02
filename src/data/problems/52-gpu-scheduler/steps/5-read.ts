@@ -8,21 +8,20 @@ export const readStep: Step = {
   focus: ['operator', 'scheduler', 'redis', 'registry'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the console shows a capacity
+**Starting point.** The starter is working code: the console shows a capacity
 line, the numbers look plausible, and the demo never reboots a node. It computes \`free\` from a
-snapshot of \`allocated\` taken up to five minutes ago, and it serves any node to any caller. Review
-it like the service owner, fix it, and prove the fix with the checks below.
+snapshot of \`allocated\` taken up to five minutes ago, and it serves any node to any caller. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/nodes/{id}\`, the read the operator console and the on-call runbook both quote:
 
 - The view is an **operator surface**, not a tenant surface: it requires \`X-Operator-Id\` and
   \`X-Operator-Token\`, and the credential's scope claim (\`X-Scope\`) must be \`operator\`. Anything
   else is **403**, including a request with no credential at all — and the refusal names nothing
-  about the node. The draft serves any node to any caller, so a tenant token is enough to enumerate
+  about the node. The starter serves any node to any caller, so a tenant token is enough to enumerate
   the fleet it is bidding against.
 - \`capacity\`, \`allocated\` and \`free\` are computed through the **same atomic path the scheduler
   writes**: one \`NODE_CAPACITY_LUA\` script owns the \`node:{id}\` hash, and allocation, release,
-  resync and read all run it (the read passes \`op=read\`). The draft computes
+  resync and read all run it (the read passes \`op=read\`). The starter computes
   \`free = capacity - allocated\` from an in-process cache refreshed every five minutes, so the read
   and the placement that was refused a second ago disagree by exactly the placements that happened
   since the last refresh.
@@ -33,7 +32,7 @@ Implement \`GET /v1/nodes/{id}\`, the read the operator console and the on-call 
 - A node that **rebooted** re-registers: \`POST /v1/nodes/{id}/register\` takes the node's capacity
   and recomputes \`allocated\` from the placement ledger (\`ledger.active_gpus_for(node_id)\`, every
   open allocation summed) instead of trusting whatever the agent reports, then writes both counters
-  through the same script. The draft never reconciles, so after a reboot its counters keep whatever
+  through the same script. The starter never reconciles, so after a reboot its counters keep whatever
   they held before, forever.
 - Log the read with the operator id, the node id and the three counts — never the operator token.
 
@@ -99,7 +98,7 @@ honest must also be scoped.`,
     ],
   },
   hints: [
-    'Compute `free` where the scheduler computes it: one `NODE_CAPACITY_LUA` script owns `node:{id}`, and allocation, release, resync and read all run it. The draft’s five-minute `allocated` snapshot is a second owner of the same number — the read and the reservation then disagree by exactly the placements that happened since the last refresh.',
+    'Compute `free` where the scheduler computes it: one `NODE_CAPACITY_LUA` script owns `node:{id}`, and allocation, release, resync and read all run it. The starter’s five-minute `allocated` snapshot is a second owner of the same number — the read and the reservation then disagree by exactly the placements that happened since the last refresh.',
     'Clamp, and answer the admission question: `free_gpus(capacity, allocated)` is `max(capacity - allocated, 0)` and `can_place(...)` is the test the scheduler runs before it reserves, so `placeable` can never be true on a node where a placement would be refused. A negative free count is the signature of two writers and no single owner of the counters.',
     'Two things the happy path never shows: the view is an operator surface (`X-Operator-Id` and `X-Operator-Token` with `X-Scope: operator`, **403** otherwise), and a rebooted node re-registers — recompute `allocated` from the ledger (`active_gpus_for`) instead of trusting the agent, then write both counters through the same script. Log the operator id and the counts, never the token.',
   ],
@@ -108,7 +107,7 @@ honest must also be scoped.`,
       id: 'node-route',
       title: 'Serves GET /v1/nodes/{id} with capacity, allocated and free',
       detail:
-        'The node read is registered on `GET /v1/nodes/{id}` (the language’s path-parameter route) and its response carries `capacity`, `allocated` and `free` for that node. The draft already answers this route, so this check passes on it — the four below are where it fails.',
+        'The node read is registered on `GET /v1/nodes/{id}` (the language’s path-parameter route) and its response carries `capacity`, `allocated` and `free` for that node. The starter already answers this route, so this check passes on it — the four below are where it fails.',
       match: {
         python: {
           all: [/@app\.get\(\s*["']\/v1\/nodes\/\{/, /["']capacity["']/, /["']allocated["']/, /["']free["']/],
@@ -153,7 +152,7 @@ honest must also be scoped.`,
       id: 'free-clamp',
       title: 'Free never exceeds what a placement would grant',
       detail:
-        '`free_gpus(capacity, allocated)` clamps to `max(capacity - allocated, 0)` and `can_place(capacity, allocated, want_gpus)` is the same admission test the scheduler runs, so `free` and `placeable` can never promise a GPU a placement would refuse. The draft subtracts the cached number and will happily return a negative free count.',
+        '`free_gpus(capacity, allocated)` clamps to `max(capacity - allocated, 0)` and `can_place(capacity, allocated, want_gpus)` is the same admission test the scheduler runs, so `free` and `placeable` can never promise a GPU a placement would refuse. The starter subtracts the cached number and will happily return a negative free count.',
       match: {
         python: {
           all: [
@@ -186,7 +185,7 @@ honest must also be scoped.`,
       id: 'reconcile',
       title: 'Recomputes allocated from the ledger when a node re-registers',
       detail:
-        'A node that rebooted re-registers, and `reconcileNode`/`reconcile_node` recomputes `allocated` by summing the open allocations in the ledger (`active_gpus_for`/`activeGpusFor`) before writing both counters through the same script. The draft never reconciles, so a rebooted node keeps pre-reboot counters forever.',
+        'A node that rebooted re-registers, and `reconcileNode`/`reconcile_node` recomputes `allocated` by summing the open allocations in the ledger (`active_gpus_for`/`activeGpusFor`) before writing both counters through the same script. The starter never reconciles, so a rebooted node keeps pre-reboot counters forever.',
       match: {
         python: {
           all: [
@@ -223,7 +222,7 @@ honest must also be scoped.`,
       id: 'operator-scope',
       title: 'Scopes the node view to operators',
       detail:
-        'The read requires an operator credential — `X-Operator-Id` plus `X-Operator-Token` with the scope claim `operator` — and answers **403** for anyone else. The draft serves any node to any caller, so a tenant token is enough to enumerate the fleet.',
+        'The read requires an operator credential — `X-Operator-Id` plus `X-Operator-Token` with the scope claim `operator` — and answers **403** for anyone else. The starter serves any node to any caller, so a tenant token is enough to enumerate the fleet.',
       match: {
         python: {
           all: [
@@ -277,7 +276,7 @@ def cached_allocated(node_id: str) -> int:
 
 @app.get("/v1/nodes/{node_id}")
 def read_node(node_id: str) -> JSONResponse:
-    # TODO: this draft computes free from a five-minute snapshot of the allocated count and serves
+    # TODO: this starter computes free from a five-minute snapshot of the allocated count and serves
     # any node to any caller. Recompute free through the same atomic path the scheduler writes,
     # clamp it so the read can never promise a GPU a placement would refuse, resync a node that
     # rebooted, and scope the view to operators.
@@ -426,7 +425,7 @@ def register_node(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/nodes/{id}: a model-generated draft that reports a five-minute-old free count. */
+      starter: `/** GET /v1/nodes/{id}: flawed code that reports a five-minute-old free count. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -446,7 +445,7 @@ function cachedAllocated(nodeId: string): number {
 }
 
 app.get('/v1/nodes/:nodeId', async (request, reply) => {
-  // TODO: this draft computes free from a five-minute snapshot of the allocated count and serves
+  // TODO: this starter computes free from a five-minute snapshot of the allocated count and serves
   // any node to any caller. Recompute free through the same atomic path the scheduler writes,
   // clamp it so the read can never promise a GPU a placement would refuse, resync a node that
   // rebooted, and scope the view to operators.
@@ -631,7 +630,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readNode(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft computes free from a five-minute snapshot of the allocated count and serves
+	// TODO: this starter computes free from a five-minute snapshot of the allocated count and serves
 	// any node to any caller. Recompute free through the same atomic path the scheduler writes,
 	// clamp it so the read can never promise a GPU a placement would refuse, resync a node that
 	// rebooted, and scope the view to operators.
@@ -851,7 +850,7 @@ object NodeRead {
   val route: Route =
     path("v1" / "nodes" / Segment) { nodeId =>
       get {
-        // TODO: this draft computes free from a five-minute snapshot of the allocated count and
+        // TODO: this starter computes free from a five-minute snapshot of the allocated count and
         // serves any node to any caller. Recompute free through the same atomic path the scheduler
         // writes, clamp it, resync a node that rebooted, and scope the view to operators.
         val capacity =
@@ -1050,7 +1049,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/nodes/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft computes free from a five-minute snapshot of the allocated count and serves
+    // TODO: this starter computes free from a five-minute snapshot of the allocated count and serves
     // any node to any caller. Recompute free through the same atomic path the scheduler writes,
     // clamp it so the read can never promise a GPU a placement would refuse, resync a node that
     // rebooted, and scope the view to operators.

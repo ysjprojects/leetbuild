@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'suggester', 'fallback'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the suggester over
-gRPC and returns its terms. It compiles, it works when the suggester is healthy, and it hides three
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it calls the suggester over gRPC and returns its
+terms. It compiles, it works when the suggester is healthy, and it hides three production flaws.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement the suggester call behind \`GET /v1/autocomplete\`.
 
@@ -47,7 +47,7 @@ when the curated list itself is wrong there is no value to roll back.`,
       id: 'deadline',
       title: 'Calls the suggester with a 150 ms deadline',
       detail:
-        'The suggester call carries `DEADLINE_MS = 150`. The draft calls with a two-second timeout and retries inside the request.',
+        'The suggester call carries `DEADLINE_MS = 150`. The starter calls with a two-second timeout and retries inside the request.',
       match: {
         python: {all: [/DEADLINE_MS/, /timeout\s*=\s*DEADLINE_MS/]},
         typescript: {all: [/DEADLINE_MS/, /deadline/]},
@@ -60,7 +60,7 @@ when the curated list itself is wrong there is no value to roll back.`,
       id: 'fallback-list',
       title: 'A timeout serves the fallback list, not an empty response',
       detail:
-        'On error the response carries the curated fallback list. The draft returns `[]`, so a slow suggester makes the UI look broken.',
+        'On error the response carries the curated fallback list. The starter returns `[]`, so a slow suggester makes the UI look broken.',
       match: {
         python: {all: [/FALLBACK_SUGGESTIONS/, /except\s+grpc\.RpcError/]},
         typescript: {all: [/FALLBACK_SUGGESTIONS/, /if\s*\(\s*error/]},
@@ -73,7 +73,7 @@ when the curated list itself is wrong there is no value to roll back.`,
       id: 'fallback-marker',
       title: 'Marks the fallback response',
       detail:
-        'The degraded response is marked `"source": "fallback"` so the client and metrics can tell it apart from a real suggester answer. The draft has no marker at all.',
+        'The degraded response is marked `"source": "fallback"` so the client and metrics can tell it apart from a real suggester answer. The starter has no marker at all.',
       match: {
         python: {all: [/"fallback"/]},
         typescript: {all: [/'fallback'/]},
@@ -86,7 +86,7 @@ when the curated list itself is wrong there is no value to roll back.`,
       id: 'drop-retries',
       title: 'Drops retries instead of running them inline',
       detail:
-        'The suggester is attempted once under the deadline; a failed attempt is counted as dropped rather than retried in the request. The draft retries three times inline.',
+        'The suggester is attempted once under the deadline; a failed attempt is counted as dropped rather than retried in the request. The starter retries three times inline.',
       match: {
         python: {all: [/RETRIES_DROPPED/], none: [/for\s+attempt\s+in\s+range\(/]},
         typescript: {all: [/RETRIES_DROPPED/], none: [/attempt\s*<\s*\d+/]},
@@ -99,7 +99,7 @@ when the curated list itself is wrong there is no value to roll back.`,
       id: 'fallback-version',
       title: 'Versions the fallback list so it can be rolled back',
       detail:
-        'The fallback list carries `FALLBACK_LIST_VERSION`, returned with the marker, so a bad list is rolled back by changing one value. The draft has no version.',
+        'The fallback list carries `FALLBACK_LIST_VERSION`, returned with the marker, so a bad list is rolled back by changing one value. The starter has no version.',
       match: {
         python: {all: [/FALLBACK_LIST_VERSION/]},
         typescript: {all: [/FALLBACK_LIST_VERSION/]},
@@ -115,7 +115,7 @@ when the curated list itself is wrong there is no value to roll back.`,
 
 
 def suggest(stub, tenant: str, prefix: str):
-    # TODO: this draft returns nothing when the suggester times out, retries three times inside
+    # TODO: this starter returns nothing when the suggester times out, retries three times inside
     # the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
     request = SuggestRequest(tenant=tenant, prefix=prefix)
     for attempt in range(3):
@@ -152,7 +152,7 @@ def suggest(stub, tenant: str, prefix: str):
       starter: `import * as grpc from '@grpc/grpc-js';
 
 export function suggest(client: SuggesterClient, tenant: string, prefix: string): Promise<string[]> {
-  // TODO: this draft returns nothing when the suggester times out, retries three times inside
+  // TODO: this starter returns nothing when the suggester times out, retries three times inside
   // the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
   const request = {tenant, prefix};
   return new Promise(resolve => {
@@ -214,7 +214,7 @@ import (
 )
 
 func Suggest(ctx context.Context, client SuggesterClient, tenant, prefix string) (Result, error) {
-	// TODO: this draft returns nothing when the suggester times out, retries three times inside
+	// TODO: this starter returns nothing when the suggester times out, retries three times inside
 	// the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
 	for attempt := 0; attempt < 3; attempt++ {
 		response, err := client.Suggest(ctx, &SuggestRequest{Tenant: tenant, Prefix: prefix})
@@ -263,7 +263,7 @@ func Suggest(ctx context.Context, client SuggesterClient, tenant, prefix string)
 
 object Client {
   def suggest(stub: SuggesterGrpc.SuggesterStub, tenant: String, prefix: String)(implicit ec: ExecutionContext): Future[Result] = {
-    // TODO: this draft returns nothing when the suggester times out, retries three times inside
+    // TODO: this starter returns nothing when the suggester times out, retries three times inside
     // the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
     val request = SuggestRequest(tenant = tenant, prefix = prefix)
     def run(remaining: Int): Future[Result] = {
@@ -308,7 +308,7 @@ object Client {
 #include <grpcpp/grpcpp.h>
 
 Result Suggest(Suggester::Stub& stub, const std::string& tenant, const std::string& prefix) {
-  // TODO: this draft returns nothing when the suggester times out, retries three times inside
+  // TODO: this starter returns nothing when the suggester times out, retries three times inside
   // the user's request so a slow suggester is multiplied, and serves no versioned fallback list.
   SuggestRequest request;
   request.set_tenant(tenant);
@@ -363,5 +363,5 @@ Result Suggest(Suggester::Stub& stub, const std::string& tenant, const std::stri
     'The fallback is not "empty with a flag"; it is a real, curated list of terms, marked so the client and the dashboard can tell a degraded answer from a real one. Return the list and the marker together.',
     'Version the fallback list and return the version in the response. When the curated list itself is wrong, a rollback is then one value change instead of a deploy.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated dependency client at the availability boundary. The draft reads fine because the suggester is healthy in the demo. Three defects are being checked. Returning nothing on timeout turns a slow suggester into a broken search box, so users type the whole term and the product loses its reason to exist. Retrying inline is worse than useless during an outage: the suggester is already slow, and every request multiplies the load on it. The unversioned fallback list is the subtle one — the list itself becomes a thing that can regress, and without a version there is nothing to roll back. Real clients also add a breaker so a down suggester is not called at all, a cached copy of the fallback list in memory so a config-service outage cannot empty it, and a metric on the fallback rate so degradation is visible.`,
+  debrief: `The interviewer is testing whether you can debug a dependency client at the availability boundary. The starter reads fine because the suggester is healthy in the demo. Three defects are being checked. Returning nothing on timeout turns a slow suggester into a broken search box, so users type the whole term and the product loses its reason to exist. Retrying inline is worse than useless during an outage: the suggester is already slow, and every request multiplies the load on it. The unversioned fallback list is the subtle one — the list itself becomes a thing that can regress, and without a version there is nothing to roll back. Real clients also add a breaker so a down suggester is not called at all, a cached copy of the fallback list in memory so a config-service outage cannot empty it, and a metric on the fallback rate so degradation is visible.`,
 };

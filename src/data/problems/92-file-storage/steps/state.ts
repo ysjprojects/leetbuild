@@ -8,10 +8,10 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the Redis layer behind the
+**Starting point.** The starter is working code for the Redis layer behind the
 upload handshake: it writes the session hash, increments the tenant's usage, and acks a chunk with a
 \`HSET\`. It compiles, it serves the demo, and it hides two production flaws — the ack and the
-accounting are separate calls, and the session key never expires. Review it, fix it, and prove the fix
+accounting are separate calls, and the session key never expires. Debug it, fix it, and prove the fix
 with the checks below.
 
 Implement the upload state on Redis:
@@ -61,7 +61,7 @@ silently shrinks. And an ack that just \`HSET\`s counts a retried chunk twice.`,
       id: 'session-ttl',
       title: 'Sessions expire instead of pinning quota',
       detail:
-        'The session key and its reservation carry a TTL of `86400` seconds. The draft writes the session with no expiry at all, so an abandoned upload keeps its declared size reserved forever.',
+        'The session key and its reservation carry a TTL of `86400` seconds. The starter writes the session with no expiry at all, so an abandoned upload keeps its declared size reserved forever.',
       match: {
         python: {all: [/EXPIRE/, /SESSION_TTL_S/]},
         typescript: {all: [/EXPIRE/, /SESSION_TTL_S/]},
@@ -74,7 +74,7 @@ silently shrinks. And an ack that just \`HSET\`s counts a retried chunk twice.`,
       id: 'atomic-ack',
       title: 'Chunk ack and byte accounting are one script',
       detail:
-        'The chunk field and the session accounting move inside a single registered script (`ACK_LUA`), so a crash cannot ack a chunk without charging for it. The draft acks with `HSET` and increments in a second call.',
+        'The chunk field and the session accounting move inside a single registered script (`ACK_LUA`), so a crash cannot ack a chunk without charging for it. The starter acks with `HSET` and increments in a second call.',
       match: {
         python: {all: [/ACK_LUA/, /register_script/, /redis\.call\(/]},
         typescript: {all: [/ACK_LUA/, /defineCommand/, /redis\.call\(/]},
@@ -87,7 +87,7 @@ silently shrinks. And an ack that just \`HSET\`s counts a retried chunk twice.`,
       id: 'idempotent-ack',
       title: 'A re-acked chunk does not double-count',
       detail:
-        'The chunk field is written with `HSETNX` and the accounting only runs when the field is new, so a retried ack cannot add the same bytes twice. The draft uses a plain `HSET` and charges every time.',
+        'The chunk field is written with `HSETNX` and the accounting only runs when the field is new, so a retried ack cannot add the same bytes twice. The starter uses a plain `HSET` and charges every time.',
       match: {
         python: {all: [/HSETNX/, /chunk:/]},
         typescript: {all: [/HSETNX/, /chunk:/]},
@@ -100,7 +100,7 @@ silently shrinks. And an ack that just \`HSET\`s counts a retried chunk twice.`,
       id: 'release-quota',
       title: 'An abandoned session returns its reservation',
       detail:
-        'The sweep finds reservations whose session key is gone, `ZREM`s the member and `DECRBY`s the tenant usage. The draft never releases anything, so expired sessions keep spending quota.',
+        'The sweep finds reservations whose session key is gone, `ZREM`s the member and `DECRBY`s the tenant usage. The starter never releases anything, so expired sessions keep spending quota.',
       match: {
         python: {all: [/ZREM/, /DECRBY/]},
         typescript: {all: [/ZREM/, /DECRBY/]},
@@ -113,7 +113,7 @@ silently shrinks. And an ack that just \`HSET\`s counts a retried chunk twice.`,
       id: 'reserve-atomic',
       title: 'Reserving and charging the quota happen together',
       detail:
-        '`CREATE_LUA` increments the usage and records the reservation in one `EVAL`, so the reservation set and the usage counter can never disagree. The draft increments the usage from the client with no reservation record.',
+        '`CREATE_LUA` increments the usage and records the reservation in one `EVAL`, so the reservation set and the usage counter can never disagree. The starter increments the usage from the client with no reservation record.',
       match: {
         python: {all: [/CREATE_LUA/, /ZADD/, /quota:used/]},
         typescript: {all: [/CREATE_LUA/, /ZADD/, /quota:used/]},
@@ -131,7 +131,7 @@ r = redis.Redis.from_url("redis://localhost:6379")
 
 
 def create_session(upload_id, tenant, declared_size):
-    # TODO: this draft writes the session with no expiry and keeps no reservation record, so an
+    # TODO: this starter writes the session with no expiry and keeps no reservation record, so an
     # abandoned upload pins its declared size forever.
     r.hset("session:" + upload_id, mapping={"tenant": tenant, "declared_size": declared_size})
     r.incrby("quota:used:" + tenant, declared_size)
@@ -220,7 +220,7 @@ class UploadState:
 const client = new Redis();
 
 export async function createSession(uploadId: string, tenant: string, declaredSize: number): Promise<number> {
-  // TODO: this draft writes the session with no expiry and keeps no reservation record, so an
+  // TODO: this starter writes the session with no expiry and keeps no reservation record, so an
   // abandoned upload pins its declared size forever.
   await client.hset('session:' + uploadId, 'tenant', tenant, 'declared_size', String(declaredSize));
   return client.incrby('quota:used:' + tenant, declaredSize);
@@ -328,7 +328,7 @@ import (
 )
 
 func createSession(ctx context.Context, rdb *redis.Client, uploadID, tenant string, declaredSize int64) error {
-	// TODO: this draft writes the session with no expiry and keeps no reservation record, so an
+	// TODO: this starter writes the session with no expiry and keeps no reservation record, so an
 	// abandoned upload pins its declared size forever.
 	if err := rdb.HSet(ctx, "session:"+uploadID, "tenant", tenant, "declared_size", declaredSize).Err(); err != nil {
 		return err
@@ -436,7 +436,7 @@ func sweep(ctx context.Context, rdb *redis.Client, tenant string) (int64, error)
 
 object UploadState {
   def createSession(jedis: Jedis, uploadId: String, tenant: String, declaredSize: Long): Long = {
-    // TODO: this draft writes the session with no expiry and keeps no reservation record, so an
+    // TODO: this starter writes the session with no expiry and keeps no reservation record, so an
     // abandoned upload pins its declared size forever.
     jedis.hset("session:" + uploadId, "tenant", tenant)
     jedis.hset("session:" + uploadId, "declared_size", String.valueOf(declaredSize))
@@ -534,7 +534,7 @@ struct UploadState {
   sw::redis::Redis redis;
 
   long createSession(const std::string& uploadId, const std::string& tenant, long declaredSize) {
-    // TODO: this draft writes the session with no expiry and keeps no reservation record, so an
+    // TODO: this starter writes the session with no expiry and keeps no reservation record, so an
     // abandoned upload pins its declared size forever.
     redis.hset("session:" + uploadId, "tenant", tenant);
     redis.hset("session:" + uploadId, "declared_size", std::to_string(declaredSize));
@@ -621,5 +621,5 @@ struct UploadState {
     'The TTL belongs on both keys the reserve script writes: the session hash so an abandoned upload stops existing, and the reservation set so the sweeper still has the member to release. A reservation with no session is a leak; a session with no reservation is unaccounted storage.',
     '`HSETNX` is what makes a retried ack safe. A client that never saw your response will resend the same chunk; the second ack must return the same stored total instead of adding the bytes again.',
   ],
-  debrief: `The interviewer is testing whether you understand that a reservation is a promise about bytes that do not exist yet. The draft's two calls look equivalent to one script until the process dies between them, and its missing TTL looks harmless until an abandoned upload keeps its declared size reserved for a week. The two fixes are one idea: keep the accounting and the thing it accounts for in the same atomic unit, and give every promise an expiry with a path that releases it. Real systems add a sweeper on a schedule instead of inline, a lease so two sweepers cannot double-release, and a reconciliation job against the object store for the bytes that leaked anyway.`,
+  debrief: `The interviewer is testing whether you understand that a reservation is a promise about bytes that do not exist yet. The starter's two calls look equivalent to one script until the process dies between them, and its missing TTL looks harmless until an abandoned upload keeps its declared size reserved for a week. The two fixes are one idea: keep the accounting and the thing it accounts for in the same atomic unit, and give every promise an expiry with a path that releases it. Real systems add a sweeper on a schedule instead of inline, a lease so two sweepers cannot double-release, and a reconciliation job against the object store for the bytes that leaked anyway.`,
 };

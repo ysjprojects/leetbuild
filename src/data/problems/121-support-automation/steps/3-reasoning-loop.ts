@@ -8,11 +8,11 @@ export const reasoningLoopStep: Step = {
   focus: ['workflow', 'llm', 'tools', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the Chain of Thought
+**Starting point.** The starter is working code for the Chain of Thought
 workflow: it assembles context, asks the LLM Adapter for reasoning, runs the tool the model asked
 for, feeds the outcome back and loops until the model returns a result. With a well-behaved model
 the demo answers "where is my next reservation?" in two iterations. It hides five production
-flaws. Review it like the workflow engine's owner, fix it, and prove the fix.
+flaws. Debug it like the workflow engine's owner, fix it, and prove the fix.
 
 Implement \`run_turn(turn)\` — prepare context, ask for reasoning, execute the tool, process the
 outcome, repeat until a result:
@@ -84,7 +84,7 @@ after a timeout refunds twice.`,
       id: 'bounded-loop',
       title: 'At most six reasoning iterations, then escalate',
       detail:
-        'The loop is bounded by `MAX_ITERATIONS = 6` and falls out with an escalated turn; there is no `while True`. The draft loops until the model stops asking for tools, which a model is never required to do.',
+        'The loop is bounded by `MAX_ITERATIONS = 6` and falls out with an escalated turn; there is no `while True`. The starter loops until the model stops asking for tools, which a model is never required to do.',
       match: {
         python: {all: [/MAX_ITERATIONS\s*=\s*6/, /range\(MAX_ITERATIONS\)/], none: [/while\s+True/]},
         typescript: {
@@ -100,7 +100,7 @@ after a timeout refunds twice.`,
       id: 'tool-registry',
       title: 'Resolves tools through the registry, never by name alone',
       detail:
-        '`TOOL_REGISTRY` maps tool names to side-effect classes and the model’s name is looked up before any `Invoke`; an unknown name becomes an error outcome for the model. The draft invokes whatever string the model emitted.',
+        '`TOOL_REGISTRY` maps tool names to side-effect classes and the model’s name is looked up before any `Invoke`; an unknown name becomes an error outcome for the model. The starter invokes whatever string the model emitted.',
       match: {
         python: {all: [/TOOL_REGISTRY\s*=/, /not in TOOL_REGISTRY/]},
         typescript: {all: [/TOOL_REGISTRY(:[^=]*)?\s*=/, /TOOL_REGISTRY\[/]},
@@ -130,7 +130,7 @@ after a timeout refunds twice.`,
       id: 'write-idempotency',
       title: 'Keys WRITE tools by turn and iteration',
       detail:
-        'A tool whose registry entry is `WRITE` is invoked with `idempotency_key = "{turn_id}:{iteration}"`; `READ` tools carry none. The draft sends no key, so a retried `issue_refund` refunds twice.',
+        'A tool whose registry entry is `WRITE` is invoked with `idempotency_key = "{turn_id}:{iteration}"`; `READ` tools carry none. The starter sends no key, so a retried `issue_refund` refunds twice.',
       match: {
         python: {all: [/SideEffect\.WRITE/, /idempotency_key\s*=/]},
         typescript: {all: [/['"]write['"]/, /idempotency_key:/]},
@@ -234,7 +234,7 @@ def run_turn(turn: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Chain of Thought workflow: a model-generated draft that loops until the model stops asking. */
+      starter: `/** Chain of Thought workflow: flawed code that loops until the model stops asking. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

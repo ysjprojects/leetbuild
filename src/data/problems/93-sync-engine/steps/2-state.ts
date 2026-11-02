@@ -8,7 +8,7 @@ export const cursorStateStep: Step = {
   focus: ['sync', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it keeps a cursor per device in
+**Starting point.** The starter is working code: it keeps a cursor per device in
 Redis and advances the watermark after a batch, so a happy-path client resumes exactly where it
 stopped. Two contracts are broken and they only break on a crash or a quiet week. Find them, fix
 them, and prove the fix.
@@ -50,7 +50,7 @@ newer value, so a device reading the watermark sees a revision that already went
       id: 'cursor-after-apply',
       title: 'Advances the cursor after the batch is applied',
       detail:
-        'The batch is applied first and the cursor is committed second; a crash between them replays the batch instead of losing it. The draft commits the cursor before `apply_batch` runs.',
+        'The batch is applied first and the cursor is committed second; a crash between them replays the batch instead of losing it. The starter commits the cursor before `apply_batch` runs.',
       match: {
         python: {order: [/apply_batch\(device, changes\)/, /commit_cursor\(device, revision\)/]},
         typescript: {order: [/applyBatch\(device, changes\)/, /commitCursor\(device, revision\)/]},
@@ -63,7 +63,7 @@ newer value, so a device reading the watermark sees a revision that already went
       id: 'cursor-monotonic',
       title: 'Advances the cursor with one compare-and-set script',
       detail:
-        'The cursor advance is a Lua script (`CURSOR_LUA`) that keeps the higher revision, so a replayed or out-of-order batch cannot move a device backwards. The draft writes the value it was given with a plain `SET`.',
+        'The cursor advance is a Lua script (`CURSOR_LUA`) that keeps the higher revision, so a replayed or out-of-order batch cannot move a device backwards. The starter writes the value it was given with a plain `SET`.',
       match: {
         python: {all: [/CURSOR_LUA/, /\.eval\(/, /SET/]},
         typescript: {all: [/CURSOR_LUA/, /\.eval\(/, /SET/]},
@@ -76,7 +76,7 @@ newer value, so a device reading the watermark sees a revision that already went
       id: 'cursor-no-ttl',
       title: 'Cursors never expire',
       detail:
-        'The cursor key is written without an expiry — a device idle for a week must come back to the cursor it left. The draft stores the cursor with a one-week TTL, so an idle device resyncs from zero.',
+        'The cursor key is written without an expiry — a device idle for a week must come back to the cursor it left. The starter stores the cursor with a one-week TTL, so an idle device resyncs from zero.',
       match: {
         python: {all: [/cursor_key\(device\)/], none: [/cursor[^\n]*\bex\s*=/]},
         typescript: {all: [/cursorKey\(device\)/], none: [/cursorKey\(device\)[^\n]*'EX'/]},
@@ -89,7 +89,7 @@ newer value, so a device reading the watermark sees a revision that already went
       id: 'watermark-monotonic',
       title: 'The server watermark only moves forward',
       detail:
-        'The watermark advance is one atomic script (`WATERMARK_LUA`) that ignores a lower revision, so two concurrent advances cannot move it backwards. The draft overwrites the key with whatever the last write carried.',
+        'The watermark advance is one atomic script (`WATERMARK_LUA`) that ignores a lower revision, so two concurrent advances cannot move it backwards. The starter overwrites the key with whatever the last write carried.',
       match: {
         python: {all: [/WATERMARK_LUA/, /\.eval\(/, /SET/]},
         typescript: {all: [/WATERMARK_LUA/, /\.eval\(/, /SET/]},
@@ -132,7 +132,7 @@ def apply_batch(device: str, changes: list[dict]) -> dict:
 
 def commit_cursor(device: str, revision: int) -> int:
     """Advance the device's cursor to the revision of the batch it just sent."""
-    # TODO: this draft advances the cursor before the batch is applied and keeps it in a key that
+    # TODO: this starter advances the cursor before the batch is applied and keeps it in a key that
     # expires after a week, so a crash loses the batch and an idle device resyncs from zero.
     r.set(cursor_key(device), revision, ex=CURSOR_TTL_S)
     return revision
@@ -211,7 +211,7 @@ def push(device: str, changes: list[dict], revision: int) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Cursors and the server watermark: a draft that writes the receipt first. */
+      starter: `/** Cursors and the server watermark: a version that writes the receipt first. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -230,7 +230,7 @@ export async function applyBatch(
 }
 
 export async function commitCursor(device: string, revision: number): Promise<number> {
-  // TODO: this draft advances the cursor before the batch is applied and keeps it in a key with a
+  // TODO: this starter advances the cursor before the batch is applied and keeps it in a key with a
   // one-week expiry, so a crash loses the batch and an idle device resyncs from zero.
   await r.set(cursorKey(device), String(revision), 'EX', CURSOR_TTL_S);
   return revision;
@@ -330,7 +330,7 @@ func applyBatch(ctx context.Context, device string, changes []Change) (map[strin
 }
 
 func commitCursor(ctx context.Context, device string, revision int64) (int64, error) {
-	// TODO: this draft advances the cursor before the batch is applied and keeps it in a key with
+	// TODO: this starter advances the cursor before the batch is applied and keeps it in a key with
 	// a one-week expiry, so a crash loses the batch and an idle device resyncs from zero.
 	return revision, rdb.Set(ctx, cursorKey(device), revision, cursorTTL).Err()
 }
@@ -440,7 +440,7 @@ object CursorStore {
   def applyBatch(device: String, changes: List[Change]): BatchOutcome = ???
 
   def commitCursor(device: String, revision: Long): Long = {
-    // TODO: this draft advances the cursor before the batch is applied and keeps it in a key with
+    // TODO: this starter advances the cursor before the batch is applied and keeps it in a key with
     // a one-week expiry, so a crash loses the batch and an idle device resyncs from zero.
     jedis.setex(cursorKey(device), CursorTtlSeconds, revision.toString)
     revision
@@ -525,7 +525,7 @@ std::string cursorKey(const std::string& device) {
 json applyBatch(const std::string& device, const json& changes);
 
 long long commitCursor(sw::redis::Redis& redis, const std::string& device, long long revision) {
-  // TODO: this draft advances the cursor before the batch is applied and keeps it in a key with a
+  // TODO: this starter advances the cursor before the batch is applied and keeps it in a key with a
   // one-week expiry, so a crash loses the batch and an idle device resyncs from zero.
   redis.setex(cursorKey(device), kCursorTtlSeconds, std::to_string(revision));
   return revision;
@@ -609,5 +609,5 @@ json push(sw::redis::Redis& redis, const std::string& device, const json& change
     'A cursor key must have no `EXPIRE`, no `ex=`, no `setex`. The question to ask is "what does an idle week cost?" — with a TTL the answer is a full snapshot for every device that comes back, and the device also has no way to tell that it started from zero.',
     'Both advances are compare-and-set: `GET` the current value and `SET` only when the new revision is higher, in one Lua script. Two devices pushing concurrently then both succeed and the watermark still ends on the newest revision instead of on whichever writer landed last.',
   ],
-  debrief: `The interview question behind this step is "what is the cursor, exactly?". A cursor is not a counter of what a device sent — it is the receipt for work the server has durably done. Writing it first gets the semantics backwards, and the failure is the worst kind: a crash between the two writes leaves a device whose own batch is skipped forever, with no error and no retry, because the server believes the device already has it. The TTL is the second trap; a generated draft adds an expiry to every key out of habit, but a cursor's whole purpose is to survive an idle week, so an expiring cursor converts "nothing to sync" into a full snapshot for every returning device. The watermark is the third: it is read by every device to decide whether it is caught up, so it must be monotonic — under concurrency, only an atomic compare-and-set gives that. Real systems store the cursor with the revision's batch id and a per-document high-water mark, and they add a compaction path for devices whose cursor is older than the retention window.`,
+  debrief: `The interview question behind this step is "what is the cursor, exactly?". A cursor is not a counter of what a device sent — it is the receipt for work the server has durably done. Writing it first gets the semantics backwards, and the failure is the worst kind: a crash between the two writes leaves a device whose own batch is skipped forever, with no error and no retry, because the server believes the device already has it. The TTL is the second trap; the starter adds an expiry to every key out of habit, but a cursor's whole purpose is to survive an idle week, so an expiring cursor converts "nothing to sync" into a full snapshot for every returning device. The watermark is the third: it is read by every device to decide whether it is caught up, so it must be monotonic — under concurrency, only an atomic compare-and-set gives that. Real systems store the cursor with the revision's batch id and a per-document high-water mark, and they add a compaction path for devices whose cursor is older than the retention window.`,
 };

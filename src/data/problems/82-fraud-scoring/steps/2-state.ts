@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['scorer', 'redis', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a transaction is scored, a
+**Starting point.** The starter is working code: a transaction is scored, a
 counter goes up, and the alerting view shows numbers, so the demo looks alive. Four contracts are
-broken and none of them is visible on a happy path. Review it, fix it, and prove the fix with the
+broken and none of them is visible on a happy path. Debug it, fix it, and prove the fix with the
 checks below.
 
 Implement the velocity store the scorer writes to at score time.
@@ -33,7 +33,7 @@ Implement the velocity store the scorer writes to at score time.
   (\`velocity_snapshot\`) and the alerting decision (\`should_alert\`) read it, so an alert can never
   fire on a different rule than the one the scorer enforces.
 
-**Failure mode the checks target.** The draft scores first and counts afterwards, so a model timeout
+**Failure mode the checks target.** The starter scores first and counts afterwards, so a model timeout
 is a free attempt; its keys carry only a day bucket and no TTL, so today's suspicious device is still
 suspicious next month; it counts attempts where the rule is about distinct accounts, so a ring of
 twenty accounts from one device reads as twenty attempts from one device; and its thresholds live as
@@ -66,7 +66,7 @@ disagree by construction.`,
       id: 'atomic-script',
       title: 'One atomic Lua EVAL counts the attempt',
       detail:
-        'The counter update is a single script call — `redis.eval(VELOCITY_LUA, 2, …)` and its equivalents — not a client-side read followed by a write. The draft issues `GET`/`INCR` from the client, so two concurrent attempts overwrite each other.',
+        'The counter update is a single script call — `redis.eval(VELOCITY_LUA, 2, …)` and its equivalents — not a client-side read followed by a write. The starter issues `GET`/`INCR` from the client, so two concurrent attempts overwrite each other.',
       match: {
         python: {all: [/VELOCITY_LUA/, /redis\.eval\(/]},
         typescript: {all: [/VELOCITY_LUA/, /redis\.eval\(/]},
@@ -79,7 +79,7 @@ disagree by construction.`,
       id: 'window-expiry',
       title: 'Window keys expire on their own boundary',
       detail:
-        'The script sets an expiry on first write — `EXPIRE`/`PEXPIRE` with the `ATTEMPT_WINDOW_S`/`DEVICE_WINDOW_S` constant — so an hourly and a daily window reset on schedule. The draft never sets a TTL, so a flagged device stays flagged forever.',
+        'The script sets an expiry on first write — `EXPIRE`/`PEXPIRE` with the `ATTEMPT_WINDOW_S`/`DEVICE_WINDOW_S` constant — so an hourly and a daily window reset on schedule. The starter never sets a TTL, so a flagged device stays flagged forever.',
       match: {
         python: {all: [/ATTEMPT_WINDOW_S/, /EXPIRE/]},
         typescript: {all: [/ATTEMPT_WINDOW_S/, /EXPIRE/]},
@@ -92,7 +92,7 @@ disagree by construction.`,
       id: 'count-before-model',
       title: 'The attempt is counted before the model is called',
       detail:
-        'The script call happens before the model call, so a timeout, a retry or a terminal model error still counts the attempt. The draft calls the model first and counts afterwards, which makes every failed attempt invisible to velocity — the exact case fraud rings generate by the thousand.',
+        'The script call happens before the model call, so a timeout, a retry or a terminal model error still counts the attempt. The starter calls the model first and counts afterwards, which makes every failed attempt invisible to velocity — the exact case fraud rings generate by the thousand.',
       match: {
         python: {order: [/redis\.eval\(/, /model\.score\(/]},
         typescript: {order: [/redis\.eval\(/, /model\.score\(/]},
@@ -105,7 +105,7 @@ disagree by construction.`,
       id: 'distinct-accounts',
       title: 'Distinct accounts per device, not raw attempts',
       detail:
-        'The device window counts distinct account references with `PFADD`/`PFCOUNT` (or a set with `SADD`/`SCARD`) under the `vel:device:{device_id}:{day}` key. The draft increments the same key as the card counter, so twenty accounts from one device look like one account retrying.',
+        'The device window counts distinct account references with `PFADD`/`PFCOUNT` (or a set with `SADD`/`SCARD`) under the `vel:device:{device_id}:{day}` key. The starter increments the same key as the card counter, so twenty accounts from one device look like one account retrying.',
       match: {
         python: {all: [/vel:device/, /PFADD/, /PFCOUNT/]},
         typescript: {all: [/vel:device/, /PFADD/, /PFCOUNT/]},
@@ -118,7 +118,7 @@ disagree by construction.`,
       id: 'shared-rules',
       title: 'Reads and alerting share one rule set',
       detail:
-        'Thresholds live in `VELOCITY_RULES`, and both `velocity_snapshot` (the read path) and `should_alert` (the alerting decision) consult it. The draft hardcodes the thresholds in the alerting call and reports raw counters from the read path, so the two drift apart with the first rule change.',
+        'Thresholds live in `VELOCITY_RULES`, and both `velocity_snapshot` (the read path) and `should_alert` (the alerting decision) consult it. The starter hardcodes the thresholds in the alerting call and reports raw counters from the read path, so the two drift apart with the first rule change.',
       match: {
         python: {all: [/VELOCITY_RULES/, /def velocity_snapshot\(/, /def should_alert\(/]},
         typescript: {all: [/VELOCITY_RULES/, /function velocitySnapshot\(/, /shouldAlert\(snapshot/]},
@@ -172,9 +172,9 @@ def should_alert(snapshot: dict) -> bool:
 
 
 def score_with_velocity(model, features: dict, card_ref: str, device_id: str, account_ref: str) -> tuple[dict, dict]:
-    # TODO: the draft counts after the model call, never expires the window keys, counts attempts
+    # TODO: the starter counts after the model call, never expires the window keys, counts attempts
     # where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-    # reports raw counters. Review all four.
+    # reports raw counters. Fix all four.
     scored = model.score(features)
     record_attempt(card_ref, device_id, account_ref)
     logger.info("velocity card=%s device=%s", card_ref, device_id)
@@ -248,13 +248,13 @@ def score_with_velocity(model, features: dict, card_ref: str, device_id: str, ac
     attempts, accounts_seen = record_attempt(card_ref, device_id, account_ref)
     logger.info("velocity card=%s attempts=%d accounts=%d", card_ref, attempts, accounts_seen)
     # The attempt is already counted: if the model times out from here, the window still saw it,
-    # which is exactly the case the draft loses.
+    # which is exactly the case the starter loses.
     scored = model.score(features)
     return scored, velocity_snapshot(card_ref, device_id)
 `,
     },
     typescript: {
-      starter: `/** Velocity counters for the scorer — a model-generated draft. */
+      starter: `/** Velocity counters for the scorer — flawed code. */
 import Redis from 'ioredis';
 
 export const redis = new Redis({host: 'redis', port: 6379});
@@ -299,9 +299,9 @@ export async function scoreWithVelocity(
   deviceId: string,
   accountRef: string,
 ): Promise<{scored: Record<string, unknown>; snapshot: VelocitySnapshot}> {
-  // TODO: the draft counts after the model call, never expires the window keys, counts attempts
+  // TODO: the starter counts after the model call, never expires the window keys, counts attempts
   // where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-  // reports raw counters. Review all four.
+  // reports raw counters. Fix all four.
   const scored = await model.score(features);
   await recordAttempt(cardRef, deviceId, accountRef);
   return {scored, snapshot: await velocitySnapshot(cardRef, deviceId)};
@@ -463,9 +463,9 @@ func scoreWithVelocity(
 	features FeatureVector,
 	cardRef, deviceID, accountRef string,
 ) (ScoreVerdict, VelocitySnapshot, error) {
-	// TODO: the draft counts after the model call, never expires the window keys, counts attempts
+	// TODO: the starter counts after the model call, never expires the window keys, counts attempts
 	// where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-	// reports raw counters. Review all four.
+	// reports raw counters. Fix all four.
 	verdict, err := model.Score(ctx, features)
 	if err != nil {
 		return ScoreVerdict{}, VelocitySnapshot{}, err
@@ -632,9 +632,9 @@ object Velocity {
   def shouldAlert(snapshot: VelocitySnapshot): Boolean =
     snapshot.cardAttempts > 40 || snapshot.deviceAccounts > 5
 
-  // TODO: the draft counts after the model call, never expires the window keys, counts attempts
+  // TODO: the starter counts after the model call, never expires the window keys, counts attempts
   // where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-  // reports raw counters. Review all four.
+  // reports raw counters. Fix all four.
   def scoreWithVelocity(model: ModelClient, features: Map[String, Any], cardRef: String, deviceId: String, accountRef: String): (Map[String, Any], VelocitySnapshot) = {
     val scored = model.score(features)
     recordAttempt(cardRef, deviceId, accountRef)
@@ -727,7 +727,7 @@ object Velocity {
 `,
     },
     cpp: {
-      starter: `// Velocity counters for the scorer — a model-generated draft.
+      starter: `// Velocity counters for the scorer — flawed code.
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -785,9 +785,9 @@ static bool shouldAlert(const VelocitySnapshot& snapshot) {
   return snapshot.card_attempts > 40 || snapshot.device_accounts > 5;
 }
 
-// TODO: the draft counts after the model call, never expires the window keys, counts attempts
+// TODO: the starter counts after the model call, never expires the window keys, counts attempts
 // where the rule is distinct accounts, and hardcodes the alert thresholds while the read path
-// reports raw counters. Review all four.
+// reports raw counters. Fix all four.
 static std::pair<json, VelocitySnapshot> scoreWithVelocity(sw::redis::Redis& redis, const json& features,
                                                           const std::string& card_ref, const std::string& device_id) {
   const json scored = model.score(features);

@@ -8,22 +8,22 @@ import {runGuardStep} from './steps/4-run-guard';
 import {feedbackEvalStep} from './steps/5-feedback-eval';
 
 /**
- * Uber's QueryGPT on the AI-era track: not "ask a model for SQL", but the service around the
- * agents that makes the SQL safe to run. A validated, idempotent query endpoint that resolves a
- * workspace and proposes tables for the user's ACK → a Redis layer that caches decisions by
- * workspace and normalised question, reserves a per-user budget atomically and expires pending
- * ACKs → the agent chain under per-call deadlines with column pruning before generation and
- * defensively parsed output → a run endpoint that never executes generated SQL as-is → a
- * feedback topic carrying the evaluation signals, aggregated per workspace before the commit.
+ * Uber's QueryGPT: not "ask a model for SQL", but the service around the agents that makes the
+ * SQL safe to run. A validated, idempotent query endpoint that resolves a workspace and proposes
+ * tables for the user's ACK → a Redis layer that caches decisions by workspace and normalised
+ * question, reserves a per-user budget atomically and expires pending ACKs → the agent chain under
+ * per-call deadlines with column pruning before generation and defensively parsed output → a run
+ * endpoint that never executes generated SQL as-is → a feedback topic carrying the evaluation
+ * signals, aggregated per workspace before the commit.
  */
 export const textToSqlProblem: Problem = {
   id: 'text-to-sql',
   title: 'Text-to-SQL',
   tagline:
-    "Uber's QueryGPT: intent and table agents behind a guarded endpoint, pruned schemas under deadlines, generated SQL that never runs as-is — reviewed like production.",
+    "Uber's QueryGPT: intent and table agents behind a guarded endpoint, pruned schemas under deadlines, generated SQL that never runs as-is.",
   difficulty: 'medium',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 60,
   company: UBER,
   sources: [
@@ -42,7 +42,7 @@ An operations manager types "number of trips completed by Teslas in Seattle yest
 and expects a query that runs against the right tables in a warehouse with hundreds of thousands of
 datasets. A model can write that query in seconds. Whether it names a table that exists, filters on
 the partition column, and runs without scanning a year of data is decided by the service around
-the model — and that service is what you review here.
+the model — and that service is what you debug here.
 
 ## The real system
 
@@ -103,12 +103,12 @@ One service, **querygen**, with five pieces:
    idempotent producer, and an \`eval\` consumer that computes table overlap and success rates
    into \`eval:{workspace}\` before it commits.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

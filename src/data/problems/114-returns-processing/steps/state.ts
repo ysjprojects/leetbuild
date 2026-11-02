@@ -12,10 +12,10 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it checks the remaining
+**Starting point.** The starter is working code: it checks the remaining
 quantity, decrements it, writes the return's record — and every one of those steps looks right in
 isolation. It compiles, it serves the demo, and when two returns arrive for the same line in the
-same millisecond it hands the last unit to both of them. Review \`state\` like the service owner,
+same millisecond it hands the last unit to both of them. Debug \`state\` like the service owner,
 fix it, and prove the fix with the checks below.
 
 Implement the Redis-backed state the returns API reads and writes:
@@ -39,7 +39,7 @@ Implement the Redis-backed state the returns API reads and writes:
   in one round trip followed by a \`DECRBY\`/\`INCRBY\`/\`HSET\` write in the next. That pair is
   exactly where the second concurrent return lives.
 
-**Failure mode the checks target.** The draft's register is a read then a write, so two concurrent
+**Failure mode the checks target.** The starter's register is a read then a write, so two concurrent
 returns both pass the last unit and the line is over-returned; its record is written from the client
 after the counter already moved, so an interrupted registration leaves a decrement nothing can
 cancel; and its cancel gives the record's quantity back without ever looking at the record's state,
@@ -78,7 +78,7 @@ so replaying a cancel inflates the line past its ordered quantity.`,
       id: 'atomic-decrement',
       title: 'Rejects and decrements inside one atomic script',
       detail:
-        'The remaining quantity is read, compared and decremented inside one Lua script run through `EVAL`, and a quantity above what remains returns `quantity_exceeds_remaining` before the counter is touched. The draft reads with a client-side `GET` and decrements with a separate `DECRBY`, so two concurrent returns both pass the last unit.',
+        'The remaining quantity is read, compared and decremented inside one Lua script run through `EVAL`, and a quantity above what remains returns `quantity_exceeds_remaining` before the counter is touched. The starter reads with a client-side `GET` and decrements with a separate `DECRBY`, so two concurrent returns both pass the last unit.',
       match: {
         python: {
           all: [/RETURNS_LUA/, /\.eval\(/, /redis\.call\('GET'/, /redis\.call\('DECRBY'/, /quantity_exceeds_remaining/],
@@ -112,7 +112,7 @@ so replaying a cancel inflates the line past its ordered quantity.`,
       id: 'record-in-script',
       title: 'The return record is written by the same script',
       detail:
-        'The return’s own record — `line_id`, `quantity`, the reason and its evidence, state `registered` — is written by the same script that decrements the counter, so a decrement can never exist without a return. The draft writes the record from the client after the counter already moved.',
+        'The return’s own record — `line_id`, `quantity`, the reason and its evidence, state `registered` — is written by the same script that decrements the counter, so a decrement can never exist without a return. The starter writes the record from the client after the counter already moved.',
       match: {
         python: {
           all: [/RETURNS_LUA/, /redis\.call\('DECRBY'/, /redis\.call\('HSET'/, /'registered'/],
@@ -193,7 +193,7 @@ so replaying a cancel inflates the line past its ordered quantity.`,
       id: 'cancel-idempotent',
       title: 'A second cancel restores nothing',
       detail:
-        'The script reads the record’s `state`, flips it to `canceled` when it restores, and returns `already_canceled` with 0 restored the next time — so replaying a cancel cannot inflate the line. The draft restores the record’s quantity without ever looking at its state.',
+        'The script reads the record’s `state`, flips it to `canceled` when it restores, and returns `already_canceled` with 0 restored the next time — so replaying a cancel cannot inflate the line. The starter restores the record’s quantity without ever looking at its state.',
       match: {
         python: {
           all: [
@@ -246,7 +246,7 @@ so replaying a cancel inflates the line past its ordered quantity.`,
       id: 'no-client-round-trip',
       title: 'No read-then-write path left in the application code',
       detail:
-        'The module talks to Redis only through the scripts: no client-side `GET`/`HGET` read followed by a separate `DECRBY`/`INCRBY`/`HSET` write remains. The draft does exactly that pair in both directions, which is where the concurrent over-return and the double restore live.',
+        'The module talks to Redis only through the scripts: no client-side `GET`/`HGET` read followed by a separate `DECRBY`/`INCRBY`/`HSET` write remains. The starter does exactly that pair in both directions, which is where the concurrent over-return and the double restore live.',
       match: {
         python: {none: [/r\.get\(/, /r\.hget\(/, /r\.decrby\(/, /r\.incrby\(/, /r\.hset\(/]},
         typescript: {none: [/r\.get\(/, /r\.hget\(/, /r\.decrby\(/, /r\.incrby\(/, /r\.hset\(/]},
@@ -279,7 +279,7 @@ def return_key(return_id: str) -> str:
 
 
 def register_return(order_line_id: str, quantity: int, reason_code: str, photo_ref: str | None) -> tuple[str | None, int]:
-    # TODO: this draft reads the remaining quantity and decrements it in two round trips, so two
+    # TODO: this starter reads the remaining quantity and decrements it in two round trips, so two
     # concurrent returns both pass the last unit; the record is written after the counter already
     # moved; and cancel gives the record's quantity back without checking the return's state.
     remaining = int(r.get(returnable_key(order_line_id)) or 0)
@@ -410,7 +410,7 @@ export async function registerReturn(
   reasonCode: string,
   photoRef?: string,
 ): Promise<Registration> {
-  // TODO: this draft reads the remaining quantity and decrements it in two round trips, so two
+  // TODO: this starter reads the remaining quantity and decrements it in two round trips, so two
   // concurrent returns both pass the last unit; the record is written after the counter already
   // moved; and cancel gives the record's quantity back without checking the return's state.
   const remaining = Number((await r.get(returnableKey(orderLineId))) ?? 0);
@@ -545,7 +545,7 @@ func returnKey(returnID string) string {
 
 // RegisterReturn registers the return against the line's returnable quantity.
 func RegisterReturn(ctx context.Context, orderLineID string, quantity int, reasonCode, photoRef string) (string, int) {
-	// TODO: this draft reads the remaining quantity and decrements it in two round trips, so two
+	// TODO: this starter reads the remaining quantity and decrements it in two round trips, so two
 	// concurrent returns both pass the last unit; the record is written after the counter already
 	// moved; and cancel gives the record's quantity back without checking the return's state.
 	counter := returnableKey(orderLineID)
@@ -683,7 +683,7 @@ object ReturnsState {
   def returnKey(returnId: String): String = s"return:$returnId"
 
   def registerReturn(orderLineId: String, quantity: Int, reasonCode: String, photoRef: Option[String]): (Option[String], Int) = {
-    // TODO: this draft reads the remaining quantity and decrements it in two round trips, so two
+    // TODO: this starter reads the remaining quantity and decrements it in two round trips, so two
     // concurrent returns both pass the last unit; the record is written after the counter already
     // moved; and cancel gives the record's quantity back without checking the return's state.
     val remaining = Option(jedis.get(returnableKey(orderLineId))).map(_.toInt).getOrElse(0)
@@ -828,7 +828,7 @@ std::string newReturnId() {
 // Register the return against the line's returnable quantity.
 std::pair<std::string, int> registerReturn(redisContext* ctx, const std::string& orderLineId, int quantity,
                                            const std::string& reasonCode, const std::string& photoRef) {
-  // TODO: this draft reads the remaining quantity and decrements it in two round trips, so two
+  // TODO: this starter reads the remaining quantity and decrements it in two round trips, so two
   // concurrent returns both pass the last unit; the record is written after the counter already
   // moved; and cancel gives the record's quantity back without checking the return's state.
   const std::string counter = returnableKey(orderLineId);
@@ -956,5 +956,5 @@ int cancelReturn(redisContext* ctx, const std::string& orderLineId, const std::s
     "The return’s record and the counter move must be the same script: `HSET` the record (`line_id`, `quantity`, `state = 'registered'`) right after the `DECRBY` inside it, so a decrement can never exist without the return that points at it — and a record can never exist without the decrement it paid for.",
     'Cancel restores one known amount: read `quantity` from the return’s own record inside the script, mark the record `canceled` and `INCRBY` that quantity back. If the state is already `canceled`, return `already_canceled` with 0 restored — never restore an amount the caller sends.',
   ],
-  debrief: `The interview question behind this step is atomicity with a compensation: a counter a request may have to undo. The draft passes every serial review — read, check, decrement, write — and fails exactly when two returns arrive together, because the gap between the read and the decrement is where the second one lands. One script closes the gap, and it has to carry the return's record too: a decrement without a record is a unit nobody can ever cancel, and a record without the decrement is a return that never counted. The cancel path is the same move in reverse, with two rules the draft misses: restore the quantity the record says was taken — never an amount from the request — and mark the return canceled, so replaying the cancel (a retry, an operator, a duplicate consumer message) restores nothing. Real returns systems keep the counter and the return rows honest with a reconciliation job that compares them, and treat cancel as an idempotent state transition with its own audit trail.`,
+  debrief: `The interview question behind this step is atomicity with a compensation: a counter a request may have to undo. The starter passes every serial read-through — read, check, decrement, write — and fails exactly when two returns arrive together, because the gap between the read and the decrement is where the second one lands. One script closes the gap, and it has to carry the return's record too: a decrement without a record is a unit nobody can ever cancel, and a record without the decrement is a return that never counted. The cancel path is the same move in reverse, with two rules the starter misses: restore the quantity the record says was taken — never an amount from the request — and mark the return canceled, so replaying the cancel (a retry, an operator, a duplicate consumer message) restores nothing. Real returns systems keep the counter and the return rows honest with a reconciliation job that compares them, and treat cancel as an idempotent state transition with its own audit trail.`,
 };

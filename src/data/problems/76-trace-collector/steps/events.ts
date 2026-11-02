@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['collector', 'kafka', 'rollup', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the trace finished, so the draft
+**Starting point.** The starter is working code: the trace finished, so the starter
 publishes one event per span with everything the span had, and the consumer updates the rollup. It
 passes a demo where one trace is published and read back by hand. It keys the topic by trace id,
 pushes span tags (user identifiers live there) into a retained topic, and commits the offset before
@@ -20,19 +20,19 @@ Implement the completion path in two halves — \`publish_completed(trace)\` and
   in the finished trace, **keyed by the service id**, with \`span_count\`, \`p50_ms\` and \`p95_ms\`
   computed from that service's spans and the \`trace_id\`. The key is an ordering contract: with
   \`key = service\`, every event for one service lands in the same partition in order, which is what
-  makes a latency stream for that service meaningful. The draft keys by trace id, so the same
+  makes a latency stream for that service meaningful. The starter keys by trace id, so the same
   service's events are spread across partitions and the rollup sees an arbitrary order.
 - The payload carries **counts and percentiles only**: no span tags, no attributes, no user
   identifiers, no raw payloads. The topic is retained and replicated, so anything written there
   outlives the request, the tenant and the retention policy the span itself was subject to. The
-  draft publishes \`tags\` and \`user_id\` verbatim.
+  starter publishes \`tags\` and \`user_id\` verbatim.
 - The producer is configured for idempotent delivery with \`acks=all\` (Go: \`RequiredAcks:
   RequireAll\` with a hash balancer; C++/Scala/Python: \`enable.idempotence\` + \`acks=all\`; KafkaJS:
   \`idempotent: true\` and \`acks: -1\`), so a broker retry cannot duplicate an event that the rollup
   will then count twice.
 - The consumer updates the Redis rollup counters (\`rollup:{service}\`: \`traces\`, \`spans\`) **before**
   it commits the offset, and runs with auto-commit off. Counters first means a crash between the two
-  costs at most one update; the draft commits first, so a crash after the commit loses the update
+  costs at most one update; the starter commits first, so a crash after the commit loses the update
   permanently — the offset says the event was processed and no counter ever saw it.
 
 **Failure mode the checks target.** Three failures that all look like "the rollup is a bit off":
@@ -78,7 +78,7 @@ one that never recovers, because the event is gone and the offset has moved past
       id: 'key-by-service',
       title: 'Keys every event by the service id',
       detail:
-        'The message key is the service id, so all events of one service stay ordered in one partition. The draft keys by trace id, which spreads one service’s stream across partitions.',
+        'The message key is the service id, so all events of one service stay ordered in one partition. The starter keys by trace id, which spreads one service’s stream across partitions.',
       match: {
         python: {all: [/producer\.produce\(/, /key=service/]},
         typescript: {all: [/topic: TRACE_COMPLETED_TOPIC/, /key: service/]},
@@ -104,7 +104,7 @@ one that never recovers, because the event is gone and the offset has moved past
       id: 'idempotent-acks',
       title: 'Producer is idempotent with acks=all',
       detail:
-        'The producer is configured for idempotent delivery and full acknowledgement, so a broker retry cannot publish the same event twice. The draft uses the default fire-and-forget producer.',
+        'The producer is configured for idempotent delivery and full acknowledgement, so a broker retry cannot publish the same event twice. The starter uses the default fire-and-forget producer.',
       match: {
         python: {all: [/"enable\.idempotence": True/, /"acks": "all"/]},
         typescript: {all: [/idempotent: true/, /acks: -1/]},
@@ -117,7 +117,7 @@ one that never recovers, because the event is gone and the offset has moved past
       id: 'counters-before-commit',
       title: 'Rollup counters are updated before the offset commit',
       detail:
-        'The consumer increments `rollup:{service}` before committing the offset, with auto-commit off: a crash between the two loses at most one update instead of skipping an event forever. The draft commits first.',
+        'The consumer increments `rollup:{service}` before committing the offset, with auto-commit off: a crash between the two loses at most one update instead of skipping an event forever. The starter commits first.',
       match: {
         python: {order: [/hincrby/, /commit\(/]},
         typescript: {order: [/hincrby/, /commitOffsets\(/]},
@@ -236,7 +236,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** trace.completed: a model-generated draft that keys by trace id and commits too early. */
+      starter: `/** trace.completed: flawed code that keys by trace id and commits too early. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 

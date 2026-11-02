@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store', 'review'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the cluster read. It
-compiles, it returns a cluster, and it hides three production flaws. Review it like the service
-owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the cluster read. It compiles, it returns a
+cluster, and it hides three production flaws. Debug it like the service owner, fix it, and prove
+the fix with the checks below.
 
 Implement \`GET /v1/clusters/{id}\`.
 
@@ -23,7 +23,7 @@ Implement \`GET /v1/clusters/{id}\`.
   two clusters. Three records where A–B is strong and B–C is weak must not put A and C in one cluster
   without review.
 
-**Failure mode the checks target.** The draft unions transitively on any pair, so one weak link
+**Failure mode the checks target.** The starter unions transitively on any pair, so one weak link
 collapses unrelated records into one cluster. It hides the evidence and the history, so the operator
 cannot see why the cluster exists. And it does not check the tenant, so a guessed cluster id returns
 another tenant's records.`,
@@ -55,7 +55,7 @@ another tenant's records.`,
       id: 'tenant-scope',
       title: 'Scopes the read to the tenant',
       detail:
-        "The cluster is looked up inside the caller's tenant scope and a foreign cluster is **404**. The draft returns any cluster by id, so a guessed id leaks another tenant's records.",
+        "The cluster is looked up inside the caller's tenant scope and a foreign cluster is **404**. The starter returns any cluster by id, so a guessed id leaks another tenant's records.",
       match: {
         python: {all: [/tenant_scope\(/], none: [/global_?similarity/i]},
         typescript: {all: [/tenantScope\(/], none: [/global_?similarity/i]},
@@ -68,7 +68,7 @@ another tenant's records.`,
       id: 'evidence',
       title: 'Returns the merge evidence per pair',
       detail:
-        'The response carries an `evidence` entry for every link in the cluster. The draft returns members only and hides why they were merged.',
+        'The response carries an `evidence` entry for every link in the cluster. The starter returns members only and hides why they were merged.',
       match: {
         python: {all: [/evidence/]},
         typescript: {all: [/evidence/]},
@@ -81,7 +81,7 @@ another tenant's records.`,
       id: 'weak-pair',
       title: 'Refuses to bridge clusters on a weak pair',
       detail:
-        'A pair below the confidence floor is not unioned silently; the cluster is held for review instead. The draft unions transitively on any pair.',
+        'A pair below the confidence floor is not unioned silently; the cluster is held for review instead. The starter unions transitively on any pair.',
       match: {
         python: {
           all: [/(?:<|<=)\s*MIN_MERGE_CONFIDENCE/],
@@ -106,7 +106,7 @@ another tenant's records.`,
       id: 'history',
       title: 'Returns the merge history',
       detail:
-        'The response carries the `history` of merges that built the cluster. The draft hides it, so an operator cannot see how the cluster formed.',
+        'The response carries the `history` of merges that built the cluster. The starter hides it, so an operator cannot see how the cluster formed.',
       match: {
         python: {all: [/history/]},
         typescript: {all: [/history/]},
@@ -148,8 +148,8 @@ def union_find(clusters: list[dict]) -> list[list[str]]:
 
 @app.get("/v1/clusters/{cluster_id}")
 def read_cluster(cluster_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft unions transitively on any weak pair, hides the evidence and the merge
-    # history, and returns a cluster without checking the tenant. Review all three.
+    # TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
+    # history, and returns a cluster without checking the tenant. Fix all three.
     cluster = cluster_store.load(cluster_id)
     if cluster is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -238,8 +238,8 @@ function unionFind(clusters: Cluster[]): string[][] {
 }
 
 app.get('/v1/clusters/:clusterId', async (request, reply) => {
-  // TODO: this draft unions transitively on any weak pair, hides the evidence and the merge
-  // history, and returns a cluster without checking the tenant. Review all three.
+  // TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
+  // history, and returns a cluster without checking the tenant. Fix all three.
   const {clusterId} = request.params as {clusterId: string};
   const cluster = clusterStore.load(clusterId);
   if (cluster === null) return reply.code(404).send({error: 'not found'});
@@ -332,8 +332,8 @@ func unionFind(clusters []Cluster) [][]string {
 }
 
 func readCluster(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft unions transitively on any weak pair, hides the evidence and the merge
-	// history, and returns a cluster without checking the tenant. Review all three.
+	// TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
+	// history, and returns a cluster without checking the tenant. Fix all three.
 	clusterID := strings.TrimPrefix(r.URL.Path, "/v1/clusters/")
 	cluster, err := clusterStore.Load(clusterID)
 	if err != nil {
@@ -424,8 +424,8 @@ object ClusterApi {
   val route: Route =
     path("v1" / "clusters" / Segment) { clusterId =>
       get {
-        // TODO: this draft unions transitively on any weak pair, hides the evidence and the merge
-        // history, and returns a cluster without checking the tenant. Review all three.
+        // TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
+        // history, and returns a cluster without checking the tenant. Fix all three.
         clusterStore.load(clusterId) match {
           case Some(cluster) =>
             complete(StatusCodes.OK, cluster)
@@ -511,8 +511,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(^/v1/clusters/([^/]+)$)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft unions transitively on any weak pair, hides the evidence and the merge
-    // history, and returns a cluster without checking the tenant. Review all three.
+    // TODO: this starter unions transitively on any weak pair, hides the evidence and the merge
+    // history, and returns a cluster without checking the tenant. Fix all three.
     const std::string clusterId = req.matches[1];
     const json cluster = cluster_store.load(clusterId);
     if (cluster.is_null()) {

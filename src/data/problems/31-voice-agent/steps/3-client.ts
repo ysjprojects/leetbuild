@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['gateway', 'asr', 'tts'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it opens the TTS stream and plays the audio, so the demo speaks. It hides an unbounded retry and a replay bug. Find them, fix them, and prove the fix.
+**Starting point.** The starter is working code: it opens the TTS stream and plays the audio, so the demo speaks. It hides an unbounded retry and a replay bug. Find them, fix them, and prove the fix.
 
 Implement the speech client the gateway uses for one turn.
 
@@ -40,7 +40,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'deadline',
       title: 'Every speech call runs under a 10-second idle deadline',
       detail:
-        'The ASR and TTS calls carry a 10-second idle deadline on their context (`timeout=` / `deadline` / `context.WithTimeout`). The draft has no deadline, so a silent stream hangs a session forever.',
+        'The ASR and TTS calls carry a 10-second idle deadline on their context (`timeout=` / `deadline` / `context.WithTimeout`). The starter has no deadline, so a silent stream hangs a session forever.',
       match: {
         python: {all: [/IDLE_DEADLINE_S/, /timeout=/]},
         typescript: {all: [/IDLE_DEADLINE_S/, /deadline/]},
@@ -53,7 +53,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'cancel',
       title: 'Cancelling a stream stops the work and the billing',
       detail:
-        'A cancelled stream is really cancelled (`cancel()` / `Cancel()` / `TryCancel()`) and the `CANCELLED` status is handled as a normal stop. The draft drops the handle and lets the provider keep synthesising audio nobody will hear.',
+        'A cancelled stream is really cancelled (`cancel()` / `Cancel()` / `TryCancel()`) and the `CANCELLED` status is handled as a normal stop. The starter drops the handle and lets the provider keep synthesising audio nobody will hear.',
       match: {
         python: {all: [/cancel\(\)/, /CancelledError/]},
         typescript: {all: [/cancel\(\)/, /CANCELLED/]},
@@ -66,7 +66,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'resume',
       title: 'A retried TTS resumes at the delivered token offset',
       detail:
-        'The retry request carries `resume_offset` (`resumeOffset` / `ResumeOffset`) set to the tokens already delivered, so the server continues instead of replaying. The draft re-sends the request from offset zero and the caller hears the first sentence twice.',
+        'The retry request carries `resume_offset` (`resumeOffset` / `ResumeOffset`) set to the tokens already delivered, so the server continues instead of replaying. The starter re-sends the request from offset zero and the caller hears the first sentence twice.',
       match: {
         python: {all: [/resume_offset/, /delivered_tokens/]},
         typescript: {all: [/resumeOffset/, /deliveredTokens/]},
@@ -79,7 +79,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'single-stream',
       title: 'A new stream cancels the previous one first',
       detail:
-        'In the source, the cancellation of the live stream comes before the new `Synthesize` call, so one session never has two synthesizers. The draft starts the new stream and leaves the old one running.',
+        'In the source, the cancellation of the live stream comes before the new `Synthesize` call, so one session never has two synthesizers. The starter starts the new stream and leaves the old one running.',
       match: {
         python: {order: [/\.cancel\(\)/, /\.Synthesize\(/]},
         typescript: {order: [/\.cancel\(\)/, /\.synthesize\(/]},
@@ -92,7 +92,7 @@ Implement the speech client the gateway uses for one turn.
       id: 'bounded-retry',
       title: 'Retries are bounded and status-filtered',
       detail:
-        'Retries stop after `MAX_ATTEMPTS` (`maxAttempts` / `MaxAttempts` / `kMaxAttempts`) and only `UNAVAILABLE`/`Unavailable` is retried; `INVALID_ARGUMENT` fails immediately. The draft catches every error and loops forever.',
+        'Retries stop after `MAX_ATTEMPTS` (`maxAttempts` / `MaxAttempts` / `kMaxAttempts`) and only `UNAVAILABLE`/`Unavailable` is retried; `INVALID_ARGUMENT` fails immediately. The starter catches every error and loops forever.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS/, /UNAVAILABLE/]},
@@ -206,7 +206,7 @@ class SpeechClient:
 `,
     },
     typescript: {
-      starter: `/** Speech client: a model-generated draft that replays and retries forever. */
+      starter: `/** Speech client: flawed code that replays and retries forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -327,7 +327,7 @@ export class SpeechClient {
 `,
     },
     go: {
-      starter: `// Speech client: a model-generated draft that replays and retries forever.
+      starter: `// Speech client: flawed code that replays and retries forever.
 package main
 
 import (
@@ -453,7 +453,7 @@ func (c *SpeechClient) Synthesize(ctx context.Context, text string, audio chan<-
 `,
     },
     scala: {
-      starter: `// Speech client: a model-generated draft that replays and retries forever.
+      starter: `// Speech client: flawed code that replays and retries forever.
 import io.grpc.ManagedChannelBuilder
 
 object SpeechClient {
@@ -536,7 +536,7 @@ object SpeechClient {
 `,
     },
     cpp: {
-      starter: `// Speech client: a model-generated draft that replays and retries forever.
+      starter: `// Speech client: flawed code that replays and retries forever.
 #include <grpcpp/grpcpp.h>
 
 #include "speech.grpc.pb.h"

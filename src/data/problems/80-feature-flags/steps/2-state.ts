@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['redis', 'engine'],
   task: `## Task
 
-Every service evaluates flags on every request, so the rule set lives in Redis as a **cache of the flag
-store**. The starter is the model-generated draft: it caches each flag under its own key and computes a
-bucket from the user id and a salt. It serves the demo and hides two flaws.
+**Starting point.** Every service evaluates flags on every request, so the rule set lives in Redis
+as a **cache of the flag store**. The starter is working code: it caches each flag under its own key
+and computes a bucket from the user id and a salt. It serves the demo and hides two flaws.
 
 Cache the **whole rule set as one versioned snapshot object** under \`flags:snapshot\`, and evaluate a
 flag for a user from that snapshot.
@@ -28,7 +28,7 @@ flag for a user from that snapshot.
   value when \`bucket < rollout\` and its \`default\` otherwise, and \`version\` is the snapshot version
   that produced the decision.
 
-**The subtle flaw.** The draft writes \`flag:{key}:rules\` per flag, so ten flag changes apply
+**The subtle flaw.** The starter writes \`flag:{key}:rules\` per flag, so ten flag changes apply
 gradually and a reader can read flag A from the new version and flag B from the old one — a torn rule
 set. Its bucket hash omits the flag key, so every flag applies the identical split.`,
   sequence: {
@@ -47,7 +47,7 @@ set. Its bucket hash omits the flag key, so every flag applies the identical spl
       id: 'snapshot',
       title: 'Reads one versioned snapshot object, not per-flag entries',
       detail:
-        'The rule set is cached as one object under `flags:snapshot`. The draft caches each flag under `flag:{key}:rules`, so a reader can combine two versions.',
+        'The rule set is cached as one object under `flags:snapshot`. The starter caches each flag under `flag:{key}:rules`, so a reader can combine two versions.',
       match: {
         python: {all: [/flags:snapshot/]},
         typescript: {all: [/flags:snapshot/]},
@@ -60,7 +60,7 @@ set. Its bucket hash omits the flag key, so every flag applies the identical spl
       id: 'atomic',
       title: 'Swaps the snapshot atomically in one write',
       detail:
-        'The update publishes the whole object to `flags:snapshot` in a single atomic write. The draft updates each flag separately, so a rule change applies gradually.',
+        'The update publishes the whole object to `flags:snapshot` in a single atomic write. The starter updates each flag separately, so a rule change applies gradually.',
       match: {
         python: {all: [/def swap_snapshot\(/, /\.set\(\s*SNAPSHOT_KEY/]},
         typescript: {all: [/swapSnapshot\s*\(/, /\.set\(\s*SNAPSHOT_KEY/]},
@@ -73,7 +73,7 @@ set. Its bucket hash omits the flag key, so every flag applies the identical spl
       id: 'bucket-key',
       title: 'Buckets with the flag key in the hash',
       detail:
-        'Bucketing hashes the flag key together with the user id and the salt, so each flag splits users independently. The draft hashes only the user id and salt, so every flag buckets a user identically.',
+        'Bucketing hashes the flag key together with the user id and the salt, so each flag splits users independently. The starter hashes only the user id and salt, so every flag buckets a user identically.',
       match: {
         python: {all: [/def bucket\(\s*flag_key/]},
         typescript: {all: [/bucket\s*=\s*\(\s*flagKey|function bucket\(\s*flagKey/]},
@@ -123,7 +123,7 @@ def bucket(user_id: str, salt: str) -> int:
 
 
 def cache_flag(redis: redis_client.Redis, flag: dict) -> None:
-    # TODO: this draft updates one cache entry per flag, so a rule change across ten flags applies
+    # TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
     # gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
     # every flag buckets a user identically.
     redis.set(f"flag:{flag['key']}:rules", json.dumps(flag))
@@ -182,7 +182,7 @@ interface CachedFlag {
 }
 
 async function cacheFlag(redis: Redis, flag: CachedFlag): Promise<void> {
-  // TODO: this draft updates one cache entry per flag, so a rule change across ten flags applies
+  // TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
   // gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
   // every flag buckets a user identically.
   await redis.set(\`flag:\${flag.key}:rules\`, JSON.stringify(flag));
@@ -242,7 +242,7 @@ func Bucket(userID, salt string) int {
 }
 
 func CacheFlag(ctx context.Context, rdb *redis.Client, flag map[string]interface{}) error {
-	// TODO: this draft updates one cache entry per flag, so a rule change across ten flags applies
+	// TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
 	// gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
 	// every flag buckets a user identically.
 	payload, _ := json.Marshal(flag)
@@ -321,7 +321,7 @@ def bucket(userId: String, salt: String): Int = {
 }
 
 def cacheFlag(redis: RedisClient, flag: Map[String, Any]): Unit = {
-  // TODO: this draft updates one cache entry per flag, so a rule change across ten flags applies
+  // TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
   // gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
   // every flag buckets a user identically.
   redis.set(s"flag:\${flag("key")}:rules", flag.toString)
@@ -395,7 +395,7 @@ int bucket(const std::string& user_id, const std::string& salt) {
   return static_cast<int>(fnv1a(user_id + ":" + salt) % 100);
 }
 
-// TODO: this draft updates one cache entry per flag, so a rule change across ten flags applies
+// TODO: this starter updates one cache entry per flag, so a rule change across ten flags applies
 // gradually and a reader can see a torn rule set; its bucket hash also omits the flag key, so
 // every flag buckets a user identically.
 void cache_flag(httplib::Client& redis, const json& flag) {

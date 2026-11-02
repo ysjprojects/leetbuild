@@ -8,9 +8,9 @@ export const invoiceLedgerStep: Step = {
   focus: ['client', 'billing', 'db', 'processor'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the ledger route,
+**Starting point.** The starter is working code: it registers the ledger route,
 reads the periods and returns an amount per period. It compiles, it serves the demo, and it hides four
-production flaws. Review it like the billing owner, fix it, and prove the fix with the checks below.
+production flaws. Debug it like the billing owner, fix it, and prove the fix with the checks below.
 
 Implement the ledger read on \`GET /v1/subscriptions/{id}/invoices\`.
 
@@ -106,7 +106,7 @@ reconciled. Each of those is silent in a demo and loud in production.`,
       id: 'tenant',
       title: 'Answers a foreign subscription with 404',
       detail:
-        'A missing `X-Tenant-Id` is **401** and a subscription owned by another tenant is **404**. The draft serves any subscription id it is handed, which turns the endpoint into a cross-tenant read.',
+        'A missing `X-Tenant-Id` is **401** and a subscription owned by another tenant is **404**. The starter serves any subscription id it is handed, which turns the endpoint into a cross-tenant read.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/, /status_code\s*=\s*404/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/, /code\(\s*404\s*\)/]},
@@ -119,7 +119,7 @@ reconciled. Each of those is silent in a demo and loud in production.`,
       id: 'stored-invoices',
       title: 'Amounts come from the stored invoices',
       detail:
-        'Each period’s `amount_cents` is the stored invoice’s amount (`invoice.amount_cents`), not a number recomputed from plan prices. The draft re-derives the figure with plan math, so the ledger can disagree with what was actually charged.',
+        'Each period’s `amount_cents` is the stored invoice’s amount (`invoice.amount_cents`), not a number recomputed from plan prices. The starter re-derives the figure with plan math, so the ledger can disagree with what was actually charged.',
       match: {
         python: {all: [/invoice\.amount_cents/], none: [/PLANS\[[^\]]*\]\s*\*/]},
         typescript: {all: [/invoice\.amount_cents/], none: [/PLANS\[[^\]]*\]\s*\*/]},
@@ -132,7 +132,7 @@ reconciled. Each of those is silent in a demo and loud in production.`,
       id: 'credits',
       title: 'Credits appear as their own lines',
       detail:
-        'Every credit is returned as its own line with its `credit_id`, amount and reason, instead of being netted into the period total. The draft subtracts credits from the amount, so the customer cannot see why the total is what it is.',
+        'Every credit is returned as its own line with its `credit_id`, amount and reason, instead of being netted into the period total. The starter subtracts credits from the amount, so the customer cannot see why the total is what it is.',
       match: {
         python: {all: [/credits/, /credit_id/, /credit\.amount_cents/]},
         typescript: {all: [/credits/, /credit_id/]},
@@ -145,7 +145,7 @@ reconciled. Each of those is silent in a demo and loud in production.`,
       id: 'reconciled',
       title: 'Reconciles each period against the processor',
       detail:
-        'The response reports `reconciled` by comparing the stored amount with the processor’s own total for the period (`processor_total_cents`, read with `GetInvoice`). The draft never contacts the processor, so a missing or duplicated charge is invisible to the customer and to support.',
+        'The response reports `reconciled` by comparing the stored amount with the processor’s own total for the period (`processor_total_cents`, read with `GetInvoice`). The starter never contacts the processor, so a missing or duplicated charge is invisible to the customer and to support.',
       match: {
         python: {all: [/reconciled/, /processor_total_cents/, /GetInvoice/]},
         typescript: {all: [/reconciled/, /processor_total_cents/, /GetInvoice/]},
@@ -185,7 +185,7 @@ subscriptions = SubscriptionStore()
 
 @app.get("/v1/subscriptions/{subscription_id}/invoices")
 def read_ledger(subscription_id: str) -> JSONResponse:
-    # TODO: a model-generated draft. It re-derives each period's amount_cents from the plan price
+    # TODO: flawed code. It re-derives each period's amount_cents from the plan price
     # (PLANS[plan] * days / MONTH_DAYS) instead of reading the stored invoice row, subtracts the
     # period's credit from the amount so the customer never sees a credit line or its credit_id,
     # takes the subscription id straight from the path with no tenant check (any tenant can read any
@@ -318,7 +318,7 @@ def read_ledger(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/subscriptions/:subscriptionId/invoices: a model-generated draft of the ledger read. */
+      starter: `/** GET /v1/subscriptions/:subscriptionId/invoices: flawed code of the ledger read. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -352,7 +352,7 @@ function daysBetween(start: string, end: string): number {
 
 app.get('/v1/subscriptions/:subscriptionId/invoices', async (request, reply) => {
   const {subscriptionId} = request.params as {subscriptionId: string};
-  // TODO: a model-generated draft. It re-derives each period's amount_cents from the plan price
+  // TODO: flawed code. It re-derives each period's amount_cents from the plan price
   // (PLANS[plan] * days / MONTH_DAYS) instead of reading the stored invoice row, subtracts the
   // period's credit from the amount so the customer never sees a credit line or its credit_id,
   // takes the subscription id straight from the path with no tenant check (any tenant can read any
@@ -520,7 +520,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func readLedger(rw http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	subscriptionID := r.PathValue("subscriptionID")
-	// TODO: a model-generated draft. It re-derives each period's amount_cents from the plan price
+	// TODO: flawed code. It re-derives each period's amount_cents from the plan price
 	// (plans[plan] * days / monthDays) instead of reading the stored invoice row, subtracts the
 	// period's credit from the amount so the customer never sees a credit line or its credit_id,
 	// takes the subscription id straight from the path with no tenant check (any tenant can read any
@@ -703,7 +703,7 @@ object Read {
   val route: Route =
     path("v1" / "subscriptions" / Segment / "invoices") { subscriptionId =>
       get {
-        // TODO: a model-generated draft. It re-derives each period's amount_cents from the plan price
+        // TODO: flawed code. It re-derives each period's amount_cents from the plan price
         // (Plans(plan) * days / MonthDays) instead of reading the stored invoice row, subtracts the
         // period's credit from the amount so the customer never sees a credit line or its credit_id,
         // takes the subscription id straight from the path with no tenant check (any tenant can read
@@ -844,7 +844,7 @@ int main() {
 
   svr.Get("/v1/subscriptions/:id/invoices", [](const httplib::Request& req, httplib::Response& res) {
     const auto subscription_id = req.path_params.at("id");
-    // TODO: a model-generated draft. It re-derives each period's amount_cents from the plan price
+    // TODO: flawed code. It re-derives each period's amount_cents from the plan price
     // (kPlans.at(plan) * days / kMonthDays) instead of reading the stored invoice row, subtracts the
     // period's credit from the amount so the customer never sees a credit line or its credit_id,
     // takes the subscription id straight from the path with no tenant check (any tenant can read any

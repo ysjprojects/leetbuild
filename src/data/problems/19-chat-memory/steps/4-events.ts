@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a turn lands in the topic and the demo shows the
+The starter is working code: a turn lands in the topic and the demo shows the
 event. Its ordering, its payload and its durability are all wrong. Find the flaws, fix them, and
 prove the fix.
 
@@ -16,14 +16,14 @@ Implement the session-event path behind the append endpoint:
 
 - Every accepted turn publishes a \`session.turn\` event **keyed by tenant**. Kafka orders within a
   partition, not within a topic, so the key decides which events can be reordered relative to one
-  another. The draft keys by turn id, scattering one session across partitions — a consumer then
+  another. The starter keys by turn id, scattering one session across partitions — a consumer then
   sees turn 3 before turn 2.
 - The payload carries **ids and token counts**, never the message text:
   \`{turn_id, session_id, role, tokens}\`. The topic is retained and replicated, so a turn's text in
   it would outlive every buffer TTL and outlive the delete semantics of the conversation.
 - The producer uses **\`acks=all\`**, so an acknowledged produce is replicated rather than buffered
   on a single broker.
-- The handler returns only **after the broker confirms**. The draft fires the produce and answers
+- The handler returns only **after the broker confirms**. The starter fires the produce and answers
   immediately, so a produce that fails after the response is a lost event nobody can replay.
 - When the produce is rejected, the event is written to an **outbox** row instead, so a broker
   outage delays events rather than dropping them.
@@ -55,7 +55,7 @@ level and the failure path.`,
       id: 'tenant-key',
       title: 'Keys the event by tenant',
       detail:
-        'The record key is the authenticated tenant, so every turn of one tenant shares a partition and keeps its order. The draft keys by turn id and scatters the session.',
+        'The record key is the authenticated tenant, so every turn of one tenant shares a partition and keeps its order. The starter keys by turn id and scatters the session.',
       match: {
         python: {all: [/key=tenant/]},
         typescript: {all: [/key:\s*tenant/]},
@@ -68,7 +68,7 @@ level and the failure path.`,
       id: 'no-content',
       title: 'Publishes ids and token counts, not message text',
       detail:
-        'The event payload carries `turn_id`, `session_id`, `role` and `tokens`; the turn text never enters the retained topic. The draft copies the content field into the event.',
+        'The event payload carries `turn_id`, `session_id`, `role` and `tokens`; the turn text never enters the retained topic. The starter copies the content field into the event.',
       match: {
         python: {all: [/tokens/], none: [/"content"/]},
         typescript: {all: [/tokens/], none: [/\bcontent:\s*turn\.content/]},
@@ -81,7 +81,7 @@ level and the failure path.`,
       id: 'acks-all',
       title: 'Produce with acks=all',
       detail:
-        'The producer acknowledges only after all in-sync replicas have the record. The draft leaves the acknowledgement level at its default.',
+        'The producer acknowledges only after all in-sync replicas have the record. The starter leaves the acknowledgement level at its default.',
       match: {
         python: {all: [/ACKS_ALL/]},
         typescript: {all: [/ACKS_ALL/]},
@@ -94,7 +94,7 @@ level and the failure path.`,
       id: 'broker-confirmed',
       title: 'Waits for the broker before answering',
       detail:
-        'The handler waits on the delivery report before returning. The draft produces and answers immediately, so a produce that fails after the response is an event nobody can replay.',
+        'The handler waits on the delivery report before returning. The starter produces and answers immediately, so a produce that fails after the response is an event nobody can replay.',
       match: {
         python: {all: [/producer\.send\(/, /\.get\(/]},
         typescript: {all: [/await producer\.send\(/]},
@@ -107,7 +107,7 @@ level and the failure path.`,
       id: 'outbox',
       title: 'Writes an outbox row when the produce fails',
       detail:
-        'A rejected produce stores the same payload in an outbox so it can be replayed. The draft drops the event when the broker rejects it.',
+        'A rejected produce stores the same payload in an outbox so it can be replayed. The starter drops the event when the broker rejects it.',
       match: {
         python: {all: [/outbox/i, /rpush\(/]},
         typescript: {all: [/outbox/i, /INSERT/i]},
@@ -199,7 +199,7 @@ def append_turn(id: str, turn: Turn, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/turns: a model-generated draft that answers before the broker confirms. */
+      starter: `/** POST /v1/sessions/:id/turns: flawed code that answers before the broker confirms. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

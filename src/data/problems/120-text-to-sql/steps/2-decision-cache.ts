@@ -8,7 +8,7 @@ export const decisionCacheStep: Step = {
   focus: ['api', 'redis', 'agents'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a repeated question comes
+**Starting point.** The starter is working code: a repeated question comes
 back from the cache, a user under budget gets through, and the pending ACK is stored, so the demo
 passes. It hides four production flaws: a cache key that collides and never expires, a budget that
 races and never resets, a budget charged after the agents ran, and a pending ACK that lives forever.
@@ -59,7 +59,7 @@ never expire grow Redis by one entry per abandoned question.`,
       id: 'normalised-key',
       title: 'Keys the decision by workspace and normalised question hash',
       detail:
-        'The cache key is `decision:{workspace}:{qhash}` with `qhash` the SHA-256 of the lower-cased, whitespace-collapsed question. The draft keys by the raw question and no workspace, so it collides across workspaces and misses on every capitalisation.',
+        'The cache key is `decision:{workspace}:{qhash}` with `qhash` the SHA-256 of the lower-cased, whitespace-collapsed question. The starter keys by the raw question and no workspace, so it collides across workspaces and misses on every capitalisation.',
       match: {
         python: {all: [/decision:\{workspace\}:\{qhash\}/, /sha256/, /\.lower\(\)/]},
         typescript: {all: [/decision:\$\{workspace\}:\$\{qhash\}/, /sha256/, /toLowerCase\(\)/]},
@@ -98,7 +98,7 @@ never expire grow Redis by one entry per abandoned question.`,
       id: 'budget-first',
       title: 'Answers 429 with Retry-After, and reserves before the agents',
       detail:
-        'Over `QUERY_BUDGET = 50` the handler answers **429** with `Retry-After` from the script’s TTL, and the reservation runs before the intent agent is called. The draft charges after the agents ran, so a rejected request has already paid for two model calls.',
+        'Over `QUERY_BUDGET = 50` the handler answers **429** with `Retry-After` from the script’s TTL, and the reservation runs before the intent agent is called. The starter charges after the agents ran, so a rejected request has already paid for two model calls.',
       match: {
         python: {
           all: [/QUERY_BUDGET\s*=\s*50/, /status_code\s*=\s*429/, /Retry-After/],
@@ -126,7 +126,7 @@ never expire grow Redis by one entry per abandoned question.`,
       id: 'pending-expiry',
       title: 'Pending ACK state expires after ten minutes',
       detail:
-        'The proposed tables are stored under `pending:{query_id}` with `PENDING_TTL_S = 600`. The draft writes the key without an expiry, so every abandoned question stays in Redis forever.',
+        'The proposed tables are stored under `pending:{query_id}` with `PENDING_TTL_S = 600`. The starter writes the key without an expiry, so every abandoned question stays in Redis forever.',
       match: {
         python: {all: [/PENDING_TTL_S\s*=\s*600/, /pending:\{query_id\}/, /ex\s*=\s*PENDING_TTL_S/]},
         typescript: {all: [/PENDING_TTL_S\s*=\s*600/, /pending:\$\{queryId\}/, /'EX',\s*PENDING_TTL_S/]},
@@ -284,7 +284,7 @@ def create_query(body: QueryRequest, user: str = Header(alias="X-User-Id")) -> d
 `,
     },
     typescript: {
-      starter: `/** POST /v1/queries: a model-generated draft that caches by raw question and charges after the agents. */
+      starter: `/** POST /v1/queries: flawed code that caches by raw question and charges after the agents. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';

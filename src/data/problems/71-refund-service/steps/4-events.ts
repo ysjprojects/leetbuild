@@ -8,7 +8,7 @@ export const refundEventsStep: Step = {
   focus: ['api', 'bus', 'outbox', 'reconciler'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an event on the
+**Starting point.** The starter is working code: it produces an event on the
 happy path and the reconciler's counters move, so the demo looks finished. Three production
 contracts are broken. Find them, fix them, and prove the fix.
 
@@ -16,10 +16,10 @@ Implement the publisher for the refund lifecycle on the \`refund.event\` topic:
 
 - Publish exactly one \`refund.event\` per refund with the **payment id as the message key**:
   partitioning by payment keeps one payment's refund lifecycle ordered, so a partial refund can
-  never be replayed after the refund that completed the payment. The draft keys by customer, so one
+  never be replayed after the refund that completed the payment. The starter keys by customer, so one
   payment's events interleave with every other payment that customer owns.
 - Publish **only after the PSP confirmed** the refund: announce nothing you do not have yet. The
-  draft publishes a success event before the provider call, and the topic then carries a success
+  starter publishes a success event before the provider call, and the topic then carries a success
   that never happened.
 - The payload carries ids and money — \`refund_id\`, \`payment_id\`, \`amount_minor\`,
   \`reason_code\`, \`psp_ref\`, \`status\` — and nothing else about the customer. Never card data,
@@ -28,7 +28,7 @@ Implement the publisher for the refund lifecycle on the \`refund.event\` topic:
   with hashed keys), so a produce retry cannot duplicate a refund event and reconcile a refund
   twice.
 - When the broker rejects the produce, insert an **outbox row** instead of dropping the event; a
-  relay republishes it when the broker recovers. The draft discards the produce error.
+  relay republishes it when the broker recovers. The starter discards the produce error.
 - The consumer — the reconciliation worker — only rebuilds the ledger once the event is safely
   handled, so a crash replays an event rather than losing it.
 
@@ -73,7 +73,7 @@ and nowhere else.`,
       id: 'payment-key',
       title: 'Publishes refund.event keyed by payment',
       detail:
-        'One `refund.event` per refund, keyed by the payment id so a payment’s lifecycle stays on one partition and in order. The draft keys by customer, interleaving every payment that customer owns.',
+        'One `refund.event` per refund, keyed by the payment id so a payment’s lifecycle stays on one partition and in order. The starter keys by customer, interleaving every payment that customer owns.',
       match: {
         python: {all: [/refund\.event/, /key=body\.payment_id/]},
         typescript: {all: [/refund\.event/, /key:\s*body\.payment_id/]},
@@ -86,7 +86,7 @@ and nowhere else.`,
       id: 'after-confirmation',
       title: 'Publishes only after the PSP confirmed',
       detail:
-        'The provider call comes first and the event is produced only once the refund is confirmed; the draft produces a success event before it knows the outcome.',
+        'The provider call comes first and the event is produced only once the refund is confirmed; the starter produces a success event before it knows the outcome.',
       match: {
         python: {order: [/refund_via_psp\(/, /produce\(/]},
         typescript: {order: [/refundViaPsp\(/, /producer\.send\(/]},
@@ -99,7 +99,7 @@ and nowhere else.`,
       id: 'event-fields',
       title: 'Carries the amount, reason code and PSP reference',
       detail:
-        'The payload carries `amount_minor`, `reason_code` and `psp_ref` alongside the ids, so the reconciler can rebuild the ledger and finance can trace the refund at the provider. The draft’s event carries neither the amount nor the provider reference.',
+        'The payload carries `amount_minor`, `reason_code` and `psp_ref` alongside the ids, so the reconciler can rebuild the ledger and finance can trace the refund at the provider. The starter’s event carries neither the amount nor the provider reference.',
       match: {
         python: {all: [/amount_minor/, /reason_code/, /psp_ref/]},
         typescript: {all: [/amount_minor/, /reason_code/, /psp_ref/]},
@@ -125,7 +125,7 @@ and nowhere else.`,
       id: 'outbox-fallback',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce inserts an outbox row (`insert_outbox`/`insertOutbox`) inside the error branch instead of dropping it. The draft never looks at the produce result.',
+        'A rejected produce inserts an outbox row (`insert_outbox`/`insertOutbox`) inside the error branch instead of dropping it. The starter never looks at the produce result.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*[({]/]},
@@ -168,9 +168,9 @@ class RefundRequest(BaseModel):
 
 @app.post("/v1/refunds/{refund_id}/publish")
 def publish(refund_id: str, body: RefundRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft keys by customer instead of the payment, publishes the success before the PSP
+    # TODO: this starter keys by customer instead of the payment, publishes the success before the PSP
     # has confirmed anything, writes the customer's note into a retained topic, and drops the
-    # produce error instead of falling back to the outbox. Review all four.
+    # produce error instead of falling back to the outbox. Fix all four.
     event = {"id": refund_id, "customer_id": body.customer_id, "note": body.note, "status": "refund.succeeded"}
     logger.info("refund event customer=%s note=%r", body.customer_id, body.note)
     producer.produce("refund.event", key=body.customer_id, value=json.dumps(event))
@@ -240,7 +240,7 @@ def psp_ref_for(refund_id: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** refund.event: a model-generated draft that announces success before the PSP confirms. */
+      starter: `/** refund.event: flawed code that announces success before the PSP confirms. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -264,9 +264,9 @@ interface PublishBody {
 
 app.post('/v1/refunds/:refundId/publish', async (request, reply) => {
   const body = request.body as PublishBody;
-  // TODO: this draft keys by customer instead of the payment, publishes the success before the PSP
+  // TODO: this starter keys by customer instead of the payment, publishes the success before the PSP
   // has confirmed anything, writes the customer's note into a retained topic, and drops the produce
-  // error instead of falling back to the outbox. Review all four.
+  // error instead of falling back to the outbox. Fix all four.
   const event = {id: body.refund_id, customer_id: body.customer_id, note: body.note ?? '', status: 'refund.succeeded'};
   request.log.info({customer_id: body.customer_id}, 'refund event');
   await producer.send({
@@ -359,9 +359,9 @@ type PublishBody struct {
 	Note       string \`json:"note"\`
 }
 
-// TODO: this draft keys by customer instead of the payment, publishes the success before the PSP has
+// TODO: this starter keys by customer instead of the payment, publishes the success before the PSP has
 // confirmed anything, writes the customer's note into a retained topic, and drops the produce error
-// instead of falling back to the outbox. Review all four.
+// instead of falling back to the outbox. Fix all four.
 func publish(ctx context.Context, body PublishBody) error {
 	event := map[string]any{
 		"id":          body.RefundID,
@@ -450,9 +450,9 @@ object Events {
     def insertOutbox(paymentId: String, payload: String): Unit = ()
   }
 
-  // TODO: this draft keys by customer instead of the payment, publishes the success before the PSP
+  // TODO: this starter keys by customer instead of the payment, publishes the success before the PSP
   // has confirmed anything, writes the customer's note into a retained topic, and drops the produce
-  // error instead of falling back to the outbox. Review all four.
+  // error instead of falling back to the outbox. Fix all four.
   def publish(refundId: String, customerId: String, paymentId: String, note: String): Unit = {
     val event =
       Map("id" -> refundId, "customer_id" -> customerId, "note" -> note, "status" -> "refund.succeeded").toJson.compactPrint
@@ -522,9 +522,9 @@ struct OutboxStore {
 
 OutboxStore store;
 
-// TODO: this draft keys by customer instead of the payment, publishes the success before the PSP has
+// TODO: this starter keys by customer instead of the payment, publishes the success before the PSP has
 // confirmed anything, writes the customer's note into a retained topic, and drops the produce error
-// instead of falling back to the outbox. Review all four.
+// instead of falling back to the outbox. Fix all four.
 void publish(
     const std::string& refundId,
     const std::string& customerId,
@@ -618,5 +618,5 @@ void publish(
     'Publish after the provider answers: call the PSP client first and only produce once the outcome is `CONFIRMED`. A success event published before the confirmation is a message the reconciler cannot take back.',
     'Idempotence is producer configuration — `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with hashed routing. Wrap the produce and, when the broker rejects it, `insert_outbox(payment_id, event)`: the outbox is the durability half of the same contract.',
   ],
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by payment and one payment’s refund lifecycle arrives in order — which is what lets the reconciler rebuild a balance — while keying by customer interleaves every payment that customer owns. Second, publish-after-confirm: the stream is a record of what happened, so an event produced before the provider answers is a lie that the ledger will later disagree with. Third, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for its own retries, and the broker is not a database, so a rejected produce goes to the outbox for a relay to republish. Real platforms add a schema registry so a future producer cannot smuggle customer text into a retained topic, plus a dead-letter path and a lag alarm on the reconciliation group.`,
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by payment and one payment’s refund lifecycle arrives in order — which is what lets the reconciler rebuild a balance — while keying by customer interleaves every payment that customer owns. Second, publish-after-confirm: the stream is a record of what happened, so an event produced before the provider answers is a lie that the ledger will later disagree with. Third, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for its own retries, and the broker is not a database, so a rejected produce goes to the outbox for a relay to republish. Real platforms add a schema registry so a future producer cannot smuggle customer text into a retained topic, plus a dead-letter path and a lag alarm on the reconciliation group.`,
 };

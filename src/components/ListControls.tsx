@@ -25,7 +25,7 @@ import {
 import {type Difficulty, DIFFICULTIES} from '@/lib/types';
 
 /**
- * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · AI Era ·
+ * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems ·
  * DL/LM, each with its icon; the active one is inverted), then a search pill, a sort menu and a
  * filter menu behind two round buttons (a dot marks one that is in effect), and at the right how
  * many courses of the track are solved — or, while filtering, how many rows match and the way out.
@@ -86,18 +86,6 @@ const SystemsIcon: FC = memo(() => (
 ));
 SystemsIcon.displayName = 'SystemsIcon';
 
-/** AI Era: sparkles. */
-const AiEraIcon: FC = memo(() => (
-  <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={15}>
-    <path
-      d="M6.5 2.5c.4 2.6 1.4 3.6 4 4-2.6.4-3.6 1.4-4 4-.4-2.6-1.4-3.6-4-4 2.6-.4 3.6-1.4 4-4Z"
-      strokeLinejoin="round"
-    />
-    <path d="M12 9.5c.2 1.3.7 1.8 2 2-1.3.2-1.8.7-2 2-.2-1.3-.7-1.8-2-2 1.3-.2 1.8-.7 2-2Z" strokeLinejoin="round" />
-  </svg>
-));
-AiEraIcon.displayName = 'AiEraIcon';
-
 /** DL/LM: a chip with pins. */
 const DeepLearningIcon: FC = memo(() => (
   <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={15}>
@@ -113,7 +101,6 @@ const TRACK_ICON: Record<TrackFilter, {icon: FC; tint: string}> = {
   all: {icon: AllTopicsIcon, tint: 'text-ink-100'},
   systems: {icon: SystemsIcon, tint: TRACK_TINT.systems.text},
   dllm: {icon: DeepLearningIcon, tint: TRACK_TINT.dllm.text},
-  ai: {icon: AiEraIcon, tint: TRACK_TINT.ai.text},
 };
 
 const TrackTab: FC<{
@@ -333,9 +320,16 @@ export const ListControls: FC<{
   const [sortPicked, setSortPicked] = useState(0);
   const onSortPicked = useCallback(() => setSortPicked(n => n + 1), []);
   const toggleCompany = useCallback(() => update({company: !query.company}), [update, query.company]);
-  const clearFilters = useCallback(() => update({difficulty: 'all', status: 'all', company: false}), [update]);
+  const toggleAiSystems = useCallback(
+    () => update({tag: query.tag === 'ai-systems' ? 'all' : 'ai-systems'}),
+    [update, query.tag],
+  );
+  const clearFilters = useCallback(
+    () => update({difficulty: 'all', status: 'all', company: false, tag: 'all'}),
+    [update],
+  );
   const filtering = useMemo(() => !isDefaultQuery(query), [query]);
-  const filtersSet = query.difficulty !== 'all' || query.status !== 'all' || query.company;
+  const filtersSet = query.difficulty !== 'all' || query.status !== 'all' || query.company || query.tag !== 'all';
   const sortSet = query.sort !== DEFAULT_LIST_QUERY.sort || query.desc;
   return (
     <div className="space-y-3">
@@ -393,6 +387,10 @@ export const ListControls: FC<{
           <FilterRow label="Source">
             <FilterChip label="All" on={!query.company} onClick={toggleCompany} />
             <FilterChip label="Company-tagged" on={query.company} onClick={toggleCompany} />
+          </FilterRow>
+          <FilterRow label="Topic">
+            <FilterChip label="All" on={query.tag === 'all'} onClick={toggleAiSystems} />
+            <FilterChip label="AI systems" on={query.tag === 'ai-systems'} onClick={toggleAiSystems} />
           </FilterRow>
           {filtersSet ? (
             <div className="border-ink-700 mt-1 border-t px-1 pt-2">

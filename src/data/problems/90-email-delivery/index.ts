@@ -7,8 +7,8 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Email delivery on the AI-era track: the course is not "call an SMTP server from an endpoint", it
- * is the review you owe a model-generated sender before it mails a customer who unsubscribed.
+ * Email delivery: the course is not "call an SMTP server from an endpoint", it
+ * is the debugging you owe a sender before it mails a customer who unsubscribed.
  * Validated, idempotent sends that check suppression first → one durable, atomic Redis admission →
  * a deadline-bounded gRPC relay call with bounce-aware retries and reconciliation → recipient-keyed
  * lifecycle events with hashed payloads → an honest, tenant-scoped status read.
@@ -19,7 +19,6 @@ export const emailDeliveryProblem: Problem = {
   tagline: 'Send once, bounce cleanly and honor suppression before the relay sees anything.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Email Delivery
 
@@ -60,12 +59,12 @@ One service, **mailerd**, with five pieces:
 5. \`GET /v1/messages/{id}\`: the honest read — relay state, bounce category, suppression and the
    attempt timeline — scoped to the caller's tenant, with a foreign id answered as **404**.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

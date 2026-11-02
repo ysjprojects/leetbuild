@@ -8,10 +8,10 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store', 'redis', 'artifact'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the session it was asked for
+**Starting point.** The starter is working code: the session it was asked for
 comes back and the replay renders in the demo, so the read endpoint looks finished. It serves the
 trace to any caller, hands out every typed value the agent typed into the page, and returns a
-screenshot URL that never expires. Review it like the owner of the Session API, fix it, and prove the
+screenshot URL that never expires. Debug it like the owner of the Session API, fix it, and prove the
 fix with the checks below.
 
 Implement \`GET /v1/browser/sessions/{id}\`, the read half of the Session API and the endpoint a
@@ -20,14 +20,14 @@ client polls to replay a session.
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - The session's **owning tenant** is compared with the caller's: a session that belongs to another
   tenant answers **404**, exactly like a session id that does not exist — never **403**, never the
-  body. The draft serves whichever session id it is given.
+  body. The starter serves whichever session id it is given.
 - The response is the **step trace** in \`step_index\` order, bounded to the last \`TRACE_LIMIT\`
   steps, plus the **budget outcome** (\`budget_remaining\`, \`budget_exhausted\`) read from the same
-  Redis session state the state step maintains (\`HGET\`/\`HGETALL\` on \`session:{id}\`). The draft
+  Redis session state the state step maintains (\`HGET\`/\`HGETALL\` on \`session:{id}\`). The starter
   returns the whole \`input_log\` and asks Redis for nothing.
 - Typed values appear **only as redacted field names**: each step carries \`redacted_fields\`, produced
   by the shared \`redact(...)\` helper, and the response never contains a typed input value or the
-  captured page content. The draft ships \`typed_values\` and \`html\`.
+  captured page content. The starter ships \`typed_values\` and \`html\`.
 - The final screenshot reference is **signed** with an expiry of at most **15 minutes**
   (\`SCREENSHOT_TTL_S = 900\`), re-signed on every request — never a permanent public bucket URL.
 
@@ -79,7 +79,7 @@ error reports and never stops working.`,
       id: 'tenant-scope',
       title: 'Answers 404 for a session the caller does not own',
       detail:
-        'The owning tenant of `session:{id}` is compared with the caller’s `X-Tenant-Id`, and a foreign or unknown session is the same **404** — never the body. The draft serves whichever session id it is given, so one tenant can replay another tenant’s session.',
+        'The owning tenant of `session:{id}` is compared with the caller’s `X-Tenant-Id`, and a foreign or unknown session is the same **404** — never the body. The starter serves whichever session id it is given, so one tenant can replay another tenant’s session.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /owner\s*!=\s*tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /owner\s*!==\s*tenant/]},
@@ -92,7 +92,7 @@ error reports and never stops working.`,
       id: 'no-typed-values',
       title: 'Replays field names, never typed values or page content',
       detail:
-        'The replay carries `redacted_fields` from the shared `redact(...)` helper and the response contains no typed input value and no page content — `typed_values`, `input_value`, `values` and `html` never appear. The draft ships the typed values and the captured page "for debugging".',
+        'The replay carries `redacted_fields` from the shared `redact(...)` helper and the response contains no typed input value and no page content — `typed_values`, `input_value`, `values` and `html` never appear. The starter ships the typed values and the captured page "for debugging".',
       match: {
         python: {all: [/redacted_fields/, /redact\(/], none: [/typed_values/, /input_value/, /["']values["']/, /html/]},
         typescript: {
@@ -108,7 +108,7 @@ error reports and never stops working.`,
       id: 'screenshot-expiry',
       title: 'Signs the screenshot reference with a 15-minute expiry',
       detail:
-        'The screenshot reference is signed per request with an expiry of at most 900 seconds — `SCREENSHOT_TTL_S = 900` (`screenshotTtlS`, `ScreenshotTtlS`, `kScreenshotTtlS`) passed to the signer, which returns `expires_at`. The draft hands out a permanent public bucket URL.',
+        'The screenshot reference is signed per request with an expiry of at most 900 seconds — `SCREENSHOT_TTL_S = 900` (`screenshotTtlS`, `ScreenshotTtlS`, `kScreenshotTtlS`) passed to the signer, which returns `expires_at`. The starter hands out a permanent public bucket URL.',
       match: {
         python: {all: [/SCREENSHOT_TTL_S\s*=\s*900/, /\.sign\(/, /expires_at/]},
         typescript: {all: [/SCREENSHOT_TTL_S\s*=\s*900/, /\.sign\(/, /expires_at/]},
@@ -121,7 +121,7 @@ error reports and never stops working.`,
       id: 'trace-budget',
       title: 'Returns the bounded step trace with the budget from Redis',
       detail:
-        'The body carries the trace — `step_index` order, bounded by a page-size constant (`TRACE_LIMIT` / `traceLimit` / `TraceLimit` / `kTraceLimit`) — plus the budget outcome (`budget_remaining`, `budget_exhausted`) read from the same `session:{id}` hash the worker writes with `HGETALL`. The draft returns the whole input log and reads no state.',
+        'The body carries the trace — `step_index` order, bounded by a page-size constant (`TRACE_LIMIT` / `traceLimit` / `TraceLimit` / `kTraceLimit`) — plus the budget outcome (`budget_remaining`, `budget_exhausted`) read from the same `session:{id}` hash the worker writes with `HGETALL`. The starter returns the whole input log and reads no state.',
       match: {
         python: {
           all: [/step_index/, /TRACE_LIMIT/, /session:\{session_id\}/, /\.hgetall\(|\.hget\(/, /budget_remaining/],
@@ -175,8 +175,8 @@ trace = TraceStore()
 
 @app.get("/v1/browser/sessions/{session_id}")
 def read_session(session_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft serves whichever session id it is given, replays the whole input log with the
-    # typed values and the captured page content, and returns a permanent screenshot URL. Review all
+    # TODO: this starter serves whichever session id it is given, replays the whole input log with the
+    # typed values and the captured page content, and returns a permanent screenshot URL. Fix all
     # three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
     # with an expiry.
     session = sessions.load(session_id)
@@ -275,7 +275,7 @@ def read_session(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/browser/sessions/:sessionId: a model-generated draft that replays everything. */
+      starter: `/** GET /v1/browser/sessions/:sessionId: flawed code that replays everything. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -307,8 +307,8 @@ const sessions = new SessionStore();
 const trace = new TraceStore();
 
 app.get('/v1/browser/sessions/:sessionId', async (request, reply) => {
-  // TODO: this draft serves whichever session id it is given, replays the whole input log with the
-  // typed values and the captured page content, and returns a permanent screenshot URL. Review all
+  // TODO: this starter serves whichever session id it is given, replays the whole input log with the
+  // typed values and the captured page content, and returns a permanent screenshot URL. Fix all
   // three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
   // with an expiry.
   const {sessionId} = request.params as {sessionId: string};
@@ -458,8 +458,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readSession(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves whichever session id it is given, replays the whole input log with the
-	// typed values and the captured page content, and returns a permanent screenshot URL. Review all
+	// TODO: this starter serves whichever session id it is given, replays the whole input log with the
+	// typed values and the captured page content, and returns a permanent screenshot URL. Fix all
 	// three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
 	// with an expiry.
 	sessionID := r.PathValue("session_id")
@@ -653,9 +653,9 @@ object Read {
   val route: Route =
     path("v1" / "browser" / "sessions" / Segment) { sessionId =>
       get {
-        // TODO: this draft serves whichever session id it is given, replays the whole input log with
+        // TODO: this starter serves whichever session id it is given, replays the whole input log with
         // the typed values and the captured page content, and returns a permanent screenshot URL.
-        // Review all three: scope the read to the caller's tenant, replay field names only, and sign
+        // Fix all three: scope the read to the caller's tenant, replay field names only, and sign
         // the screenshot with an expiry.
         val session = SessionStore.load(sessionId)
         val steps = TraceStore.all(sessionId)
@@ -796,8 +796,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/browser/sessions/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves whichever session id it is given, replays the whole input log with the
-    // typed values and the captured page content, and returns a permanent screenshot URL. Review all
+    // TODO: this starter serves whichever session id it is given, replays the whole input log with the
+    // typed values and the captured page content, and returns a permanent screenshot URL. Fix all
     // three: scope the read to the caller's tenant, replay field names only, and sign the screenshot
     // with an expiry.
     const auto sessionId = req.matches[1].str();
@@ -941,5 +941,5 @@ int main() {
     'The replay is the dangerous payload: return `redacted_fields` per step — the names the shared `redact(...)` helper kept — and nothing else from the input. Shipping `typed_values` or the captured `html` "for debugging" is exactly what the redaction boundary exists to stop, and a status endpoint must not become a second copy of the customer\'s data.',
     'Read the budget outcome from the same hash the worker writes (`HGETALL session:{id}` → `budget_remaining`, `budget_exhausted`) so the read cannot disagree with enforcement, bound the trace with a server constant (`TRACE_LIMIT`), and mint the screenshot reference with a signer that stamps `expires_at = now + SCREENSHOT_TTL_S` (900 s) on every request. A public bucket URL is a permanent credential.',
   ],
-  debrief: `The interviewer is testing whether you can review a read path with the same suspicion as a write path. The draft looks fine because the demo asks for a session it owns, replays two steps, and shows a screenshot. Three defects are being checked. Scope comes first — the read path is where tenant isolation is usually lost, because the write path authenticated and the read path only looked up an id, so the tenant in \`X-Tenant-Id\` has to own the session and a foreign session must be indistinguishable from a missing one: same \`404\`, same body, no timing hint. Redaction is second, and it is the one that outlives the incident: a replay that returns the typed values and the captured page turns a convenience endpoint into a copy of the data the pipeline redacts, and it is the same leak whether it ships in the body or in the logs. Expiry is third — a screenshot URL with no signature and no expiry is a read credential for the life of the object, and it spreads through links, logs and error reports where nothing can revoke it. The shape check is the fourth contract: the trace ordered by \`step_index\` and bounded by a server constant, with the budget outcome read from the same Redis state enforcement writes, so the number a client sees is the number that stops the next step. Real platforms add ETag or sequence-based long polling so a poller gets a cheap 304, a separate export endpoint for a full trace, and an audit record of who read whose session.`,
+  debrief: `The interviewer is testing whether you can debug a read path with the same suspicion as a write path. The starter looks fine because the demo asks for a session it owns, replays two steps, and shows a screenshot. Three defects are being checked. Scope comes first — the read path is where tenant isolation is usually lost, because the write path authenticated and the read path only looked up an id, so the tenant in \`X-Tenant-Id\` has to own the session and a foreign session must be indistinguishable from a missing one: same \`404\`, same body, no timing hint. Redaction is second, and it is the one that outlives the incident: a replay that returns the typed values and the captured page turns a convenience endpoint into a copy of the data the pipeline redacts, and it is the same leak whether it ships in the body or in the logs. Expiry is third — a screenshot URL with no signature and no expiry is a read credential for the life of the object, and it spreads through links, logs and error reports where nothing can revoke it. The shape check is the fourth contract: the trace ordered by \`step_index\` and bounded by a server constant, with the budget outcome read from the same Redis state enforcement writes, so the number a client sees is the number that stops the next step. Real platforms add ETag or sequence-based long polling so a poller gets a cheap 304, a separate export endpoint for a full trace, and an audit record of who read whose session.`,
 };

@@ -7,12 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * GPU scheduler on the AI-era track: the course is not "accept a job and pick a machine", it is the
- * review you owe a model-generated placement path before it hands a GPU to two workloads at once.
- * Validated placement requests with fresh capacity → one atomic Redis reservation per node →
- * a gRPC start gated on a health report with a deadline and a rollback → node-keyed placement
- * events that replay against the counters → a node read that cannot double-count and is scoped to
- * operators.
+ * GPU scheduler: the course is not "accept a job and pick a machine", it is the debugging you owe
+ * a placement path before it hands a GPU to two workloads at once. Validated placement requests
+ * with fresh capacity → one atomic Redis reservation per node → a gRPC start gated on a health
+ * report with a deadline and a rollback → node-keyed placement events that replay against the
+ * counters → a node read that cannot double-count and is scoped to operators.
  */
 export const gpuSchedulerProblem: Problem = {
   id: 'gpu-scheduler',
@@ -20,7 +19,7 @@ export const gpuSchedulerProblem: Problem = {
   tagline: 'Place GPU workloads on the right nodes and prove the placement is honest.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# GPU Scheduler
 
@@ -66,12 +65,12 @@ One service, **gpusched**, with five pieces:
 5. \`GET /v1/nodes/{id}\`: capacity, allocated and free counts computed through the same atomic path,
    a node that rebooted reconciling to its real counters, and a node view scoped to operators.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it places the demo
-job, and it sounds confident. Your job in every step is the job you will have on a real AI platform
-team: read the draft against the failure modes, name the subtle one, fix it, and prove the fix with
-checks that fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw: it compiles, it places the demo job, and
+it looks right. Your job in every step is the job you will have on a real platform team: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

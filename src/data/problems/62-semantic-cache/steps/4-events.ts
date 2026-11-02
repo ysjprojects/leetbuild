@@ -38,12 +38,12 @@ export const eventsStep: Step = {
   },
   task: `## Task
 
-**Review premise.** You are the AI platform engineer who owns the result stream. The stats dashboard
+**Starting point.** You are the AI platform engineer who owns the result stream. The stats dashboard
 for one tenant flickers between a 91% hit rate and a 4% hit rate inside the same minute, and a
 compliance review has just found customer questions and cached answers sitting in the retained
-\`semantic-cache.result\` topic. The model-generated draft below keys every event by *similarity
-band*, copies the question and the cached answer into the payload "so dashboards can show examples",
-configures neither acks nor idempotence, and drops a rejected produce on the floor.
+\`semantic-cache.result\` topic. The starter below keys every event by *similarity band*, copies
+the question and the cached answer into the payload "so dashboards can show examples", configures
+neither acks nor idempotence, and drops a rejected produce on the floor.
 
 Fix \`events\` so the result stream is ordered per tenant, free of tenant content, and lossless.
 
@@ -76,10 +76,10 @@ Fix \`events\` so the result stream is ordered per tenant, free of tenant conten
 **Failure mode the checks target.** The key is the subtle one: a similarity band looks like a good
 partition key for a quality dashboard and is the worst possible one for per-tenant counters, because
 one tenant's miss wave is split across partitions and no consumer can put it back in order. Copying
-the question and the cached answer into the payload is the loud leak — a draft does it "so dashboards
-can show examples", and a retained, replicated topic is the hardest place to delete from later. The
-fire-and-forget produce is the quiet loss: with no ack, no outbox and no failure counter, a broker
-rejection during a miss wave removes the wave from the statistics and nothing can tell.`,
+the question and the cached answer into the payload is the loud leak — the starter does it "so
+dashboards can show examples", and a retained, replicated topic is the hardest place to delete from
+later. The fire-and-forget produce is the quiet loss: with no ack, no outbox and no failure counter,
+a broker rejection during a miss wave removes the wave from the statistics and nothing can tell.`,
   hints: [
     'The message key is the partition key, so it is the ordering control: `key=tenant` (Python), `key: tenant` (Node), `Key: []byte(tenant)` (Go). Keyed by a similarity band, one tenant’s hits and misses land on different partitions and the consumer counts them out of order.',
     'The event carries the digest, never the content: `outcome`, `entry_digest`, `similarity`, `policy_version` and `model_version` are the whole payload. Drop the text fields and the log line rather than hashing them — the topic is retained and replicated, and the digest is enough to correlate a hit with its row.',
@@ -103,7 +103,7 @@ rejection during a miss wave removes the wave from the statistics and nothing ca
       id: 'no-text',
       title: 'Payload carries the digest, never the query or the answer',
       detail:
-        'The event is `{outcome, entry_digest, similarity, policy_version, model_version}` and nothing else: the query text, the cached answer text and the word `prompt` appear nowhere in the payload, the log lines or the parameters. The draft ships both texts "so dashboards can show examples", and a retained, replicated topic is the last place tenant content may live.',
+        'The event is `{outcome, entry_digest, similarity, policy_version, model_version}` and nothing else: the query text, the cached answer text and the word `prompt` appear nowhere in the payload, the log lines or the parameters. The starter ships both texts "so dashboards can show examples", and a retained, replicated topic is the last place tenant content may live.',
       match: {
         python: {all: [/entry_digest/], none: [/answer/i, /query/i, /prompt/i]},
         typescript: {all: [/entry_digest/], none: [/answer/i, /query/i, /prompt/i]},
@@ -116,7 +116,7 @@ rejection during a miss wave removes the wave from the statistics and nothing ca
       id: 'outbox',
       title: 'A rejected produce leaves an outbox row',
       detail:
-        'The rejection branch writes the event into `cache_result_outbox` (`insert_outbox` / `insertOutbox` / `InsertOutbox`) instead of dropping it, so a relay can republish the row once the broker recovers. The draft never looks at the produce result at all.',
+        'The rejection branch writes the event into `cache_result_outbox` (`insert_outbox` / `insertOutbox` / `InsertOutbox`) instead of dropping it, so a relay can republish the row once the broker recovers. The starter never looks at the produce result at all.',
       match: {
         python: {all: [/cache_result_outbox/, /insert_outbox\(/, /except\s+KafkaError/]},
         typescript: {all: [/cache_result_outbox/, /insertOutbox\(/, /catch\s*\{/]},
@@ -129,7 +129,7 @@ rejection during a miss wave removes the wave from the statistics and nothing ca
       id: 'delivery',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence with `acks=all` — `enable.idempotence` plus `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, `RequiredAcks: kafka.RequireAll` with a hash balancer — so a retry of a produce cannot duplicate a record. The draft configures none of it.',
+        'The producer is configured for idempotence with `acks=all` — `enable.idempotence` plus `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, `RequiredAcks: kafka.RequireAll` with a hash balancer — so a retry of a produce cannot duplicate a record. The starter configures none of it.',
       match: {
         python: {all: [/acks\s*=\s*["']all["']/, /enable_idempotence=True/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -142,7 +142,7 @@ rejection during a miss wave removes the wave from the statistics and nothing ca
       id: 'produce-failure',
       title: 'A rejected produce is surfaced, not swallowed',
       detail:
-        'The rejection path counts `cache_result_produce_failures` and then re-raises (`raise ProduceRejected`, `throw new ProduceRejected`, `return fmt.Errorf(…, produceRejected)`) after the outbox row is written: a rejected produce must neither vanish nor look like a published event. The draft logs a warning and reports success.',
+        'The rejection path counts `cache_result_produce_failures` and then re-raises (`raise ProduceRejected`, `throw new ProduceRejected`, `return fmt.Errorf(…, produceRejected)`) after the outbox row is written: a rejected produce must neither vanish nor look like a published event. The starter logs a warning and reports success.',
       match: {
         python: {all: [/cache_result_produce_failures/, /ProduceRejected/, /raise ProduceRejected/]},
         typescript: {all: [/cache_result_produce_failures/, /ProduceRejected/, /throw new ProduceRejected/]},
@@ -174,8 +174,8 @@ def similarity_band(similarity: float) -> str:
 def publish_result(
     producer, outcome, tenant, entry_digest, similarity, policy_version, query, answer
 ) -> None:
-    # TODO: this draft keys by similarity band, ships the question and the cached answer into the
-    # retained topic, configures no acks or idempotence, and swallows a rejected produce. Review all
+    # TODO: this starter keys by similarity band, ships the question and the cached answer into the
+    # retained topic, configures no acks or idempotence, and swallows a rejected produce. Fix all
     # four.
     payload = {
         "outcome": outcome,
@@ -283,7 +283,7 @@ def consume_results(consumer: KafkaConsumer, redis_client) -> None:
 `,
     },
     typescript: {
-      starter: `/** semantic-cache.result: the draft keys by similarity band and ships the text for the dashboards. */
+      starter: `/** semantic-cache.result: the starter keys by similarity band and ships the text for the dashboards. */
 import type {Redis} from 'ioredis';
 import {Kafka, type Consumer, type Producer} from 'kafkajs';
 
@@ -315,8 +315,8 @@ export async function publishResult(
   query: string,
   answer: string,
 ): Promise<void> {
-  // TODO: this draft keys by similarity band, ships the question and the cached answer into the
-  // retained topic, configures no acks or idempotence, and swallows a rejected produce. Review all
+  // TODO: this starter keys by similarity band, ships the question and the cached answer into the
+  // retained topic, configures no acks or idempotence, and swallows a rejected produce. Fix all
   // four.
   const event: ResultEvent = {outcome, tenant, entry_digest, similarity, policy_version, query, answer};
   console.log({tenant, query, answer});
@@ -459,8 +459,8 @@ func similarityBand(similarity float64) string {
 
 func publishResult(ctx context.Context, writer *kafka.Writer, outcome, tenant, entryDigest string, similarity float64,
 	policyVersion, question, reply string) {
-	// TODO: this draft keys by similarity band, ships the question and the cached answer into the
-	// retained topic, configures no acks or idempotence, and swallows a rejected produce. Review all
+	// TODO: this starter keys by similarity band, ships the question and the cached answer into the
+	// retained topic, configures no acks or idempotence, and swallows a rejected produce. Fix all
 	// four.
 	event := ResultEvent{
 		Outcome:       outcome,
@@ -622,8 +622,8 @@ object CacheEvents {
 
   def publishResult(producer: KafkaProducer[String, String], outcome: String, tenant: String, entryDigest: String,
                     similarity: Double, policyVersion: String, query: String, answer: String): Unit = {
-    // TODO: this draft keys by similarity band, ships the question and the cached answer into the
-    // retained topic, configures no acks or idempotence, and swallows a rejected produce. Review all
+    // TODO: this starter keys by similarity band, ships the question and the cached answer into the
+    // retained topic, configures no acks or idempotence, and swallows a rejected produce. Fix all
     // four.
     val payload = JsObject(
       "outcome" -> JsString(outcome),
@@ -743,8 +743,8 @@ std::string similarityBand(double similarity) {
   return "similarity-" + std::to_string(static_cast<long>(std::llround(similarity * 10)));
 }
 
-// TODO: this draft keys by similarity band, ships the question and the cached answer into the
-// retained topic, configures no acks or idempotence, and swallows a rejected produce. Review all
+// TODO: this starter keys by similarity band, ships the question and the cached answer into the
+// retained topic, configures no acks or idempotence, and swallows a rejected produce. Fix all
 // four.
 void publishResult(RdKafka::Producer* producer, const std::string& outcome, const std::string& tenant,
                    const std::string& entryDigest, double similarity, const std::string& policyVersion,

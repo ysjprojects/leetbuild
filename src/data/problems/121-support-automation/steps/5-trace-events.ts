@@ -8,10 +8,10 @@ export const traceEventsStep: Step = {
   focus: ['workflow', 'kafka', 'consumer', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of LLM observability: the
-workflow calls \`emit\` after every model call, tool call and guardrail gate, an event lands on
-Kafka, and a consumer turns events into counters, so the demo dashboard shows numbers moving. Five
-production contracts are broken. Find them, fix them, and prove the fix.
+**Starting point.** The starter is working code for LLM observability: the workflow calls
+\`emit\` after every model call, tool call and guardrail gate, an event lands on Kafka, and a
+consumer turns events into counters, so the demo dashboard shows numbers moving. Five production
+contracts are broken. Find them, fix them, and prove the fix.
 
 Implement \`emit(span)\` and \`consume()\` for the \`assistant.trace\` topic:
 
@@ -60,7 +60,7 @@ have explained the expensive turn; and commit-before-process trades correctness 
       id: 'conversation-key',
       title: 'Keyed by conversation, carries the turn id',
       detail:
-        'The message key is the conversation (partition by conversation) and the event carries the turn id. The draft keys by the turn id, so one conversation’s spans scatter across partitions and lose order.',
+        'The message key is the conversation (partition by conversation) and the event carries the turn id. The starter keys by the turn id, so one conversation’s spans scatter across partitions and lose order.',
       match: {
         python: {all: [/key=span\.conversation/, /turn_id/]},
         typescript: {all: [/key:\s*span\.conversation/, /turn_id/]},
@@ -86,7 +86,7 @@ have explained the expensive turn; and commit-before-process trades correctness 
       id: 'no-text',
       title: 'No prompt, answer or message text in the event or logs',
       detail:
-        'Neither the event payload nor any log line carries the prompt, the answer or message text. The draft logs both and copies them into the event — a leak that is retained and replicated with the topic.',
+        'Neither the event payload nor any log line carries the prompt, the answer or message text. The starter logs both and copies them into the event — a leak that is retained and replicated with the topic.',
       match: {
         python: {none: [/\b(prompt|answer|text)\b/i]},
         typescript: {none: [/\b(prompt|answer|text)\b/i]},
@@ -99,7 +99,7 @@ have explained the expensive turn; and commit-before-process trades correctness 
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the span. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the span. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*(\(|\{)/]},
@@ -112,7 +112,7 @@ have explained the expensive turn; and commit-before-process trades correctness 
       id: 'metrics-before-commit',
       title: 'Updates the metrics before committing the offset',
       detail:
-        'The consumer runs `HINCRBY` on `metrics:{tenant}:{kind}:{name}` before committing the offset; committing first makes a crash lose the span forever. The draft commits first.',
+        'The consumer runs `HINCRBY` on `metrics:{tenant}:{kind}:{name}` before committing the offset; committing first makes a crash lose the span forever. The starter commits first.',
       match: {
         python: {all: [/metrics:\{/], order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {all: [/metrics:\$\{/], order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -241,7 +241,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** assistant.trace: a model-generated draft that keys by turn id and commits too early. */
+      starter: `/** assistant.trace: flawed code that keys by turn id and commits too early. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 
@@ -789,5 +789,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong, in the setting the post calls LLM-oriented observability: detailed insight into each LLM interaction, its latency and its token usage. First, the message key is an ordering contract: partition by conversation and a turn's spans — reason, tool, reason, guardrail — arrive in the order they happened; key by turn id and the timeline a debugger reads is shuffled. Second, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all so a retry cannot double-count tokens, and the consumer must apply its counters before the offset commit, or a crash between them loses the span permanently. Third, a broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes. The text leak is the quiet one: a trace topic is retained and replicated precisely because it is useful later, which is precisely why guest messages must never be in it — ids, counts and verdicts tell the whole story. Real platforms add a schema registry for the span, per-tenant cost rollups from the token counters, a sampled full-fidelity trace in a store with its own retention and access control, and an alert on the blocked-rate per guardrail.`,
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong, in the setting the post calls LLM-oriented observability: detailed insight into each LLM interaction, its latency and its token usage. First, the message key is an ordering contract: partition by conversation and a turn's spans — reason, tool, reason, guardrail — arrive in the order they happened; key by turn id and the timeline a debugger reads is shuffled. Second, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all so a retry cannot double-count tokens, and the consumer must apply its counters before the offset commit, or a crash between them loses the span permanently. Third, a broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes. The text leak is the quiet one: a trace topic is retained and replicated precisely because it is useful later, which is precisely why guest messages must never be in it — ids, counts and verdicts tell the whole story. Real platforms add a schema registry for the span, per-tenant cost rollups from the token counters, a sampled full-fidelity trace in a store with its own retention and access control, and an alert on the blocked-rate per guardrail.`,
 };

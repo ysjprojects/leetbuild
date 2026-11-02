@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'worker', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the recorder answers **202**, a
+**Starting point.** The starter is working code: the recorder answers **202**, a
 record lands on \`ticket.event\` and the demo shows the timeline filling up. Four production contracts
 are broken. It keys the record by the **agent id** instead of the **ticket id**, so one ticket's
 events scatter across partitions and the order they arrive in is gone; it copies the **note body**
@@ -69,7 +69,7 @@ crash can roll back; and a default producer duplicates entries when a produce is
       id: 'ticket-key',
       title: 'Produced to ticket.event keyed by the ticket id',
       detail:
-        'The record goes to `ticket.event` with the **ticket id** as its key, so one ticket’s timeline stays ordered in one partition. The draft keys by the agent id, so one ticket’s events scatter across partitions and their order is gone.',
+        'The record goes to `ticket.event` with the **ticket id** as its key, so one ticket’s timeline stays ordered in one partition. The starter keys by the agent id, so one ticket’s events scatter across partitions and their order is gone.',
       match: {
         python: {all: [/ticket\.event/, /produce\([^)]*key\s*=\s*ticket_id/]},
         typescript: {all: [/ticket\.event/, /key:\s*ticketId\b/]},
@@ -82,7 +82,7 @@ crash can roll back; and a default producer duplicates entries when a produce is
       id: 'no-body',
       title: 'The payload carries no note body and no requester identity',
       detail:
-        'The payload is ids, the actor role and the transition only: no `note_body` and no `requester_email` reaches a topic that is retained and replicated for days. The draft ships the note text and the requester’s address “so the timeline widget fetches nothing”.',
+        'The payload is ids, the actor role and the transition only: no `note_body` and no `requester_email` reaches a topic that is retained and replicated for days. The starter ships the note text and the requester’s address “so the timeline widget fetches nothing”.',
       match: {
         python: {none: [/[Nn]ote_?[Bb]ody/, /[Rr]equester_?[Ee]mail/, /["']body["']/]},
         typescript: {none: [/[Nn]ote_?[Bb]ody/, /[Rr]equester_?[Ee]mail/, /["']body["']/]},
@@ -95,7 +95,7 @@ crash can roll back; and a default producer duplicates entries when a produce is
       id: 'publish-after-commit',
       title: 'The ticket store commits before the produce',
       detail:
-        'The committed ticket change comes first (`store.commit_ticket` / `commitTicket` / `CommitTicket`), and only then the record is produced. The draft produces, flushes and *then* commits, so a rolled-back write has already been announced to every consumer.',
+        'The committed ticket change comes first (`store.commit_ticket` / `commitTicket` / `CommitTicket`), and only then the record is produced. The starter produces, flushes and *then* commits, so a rolled-back write has already been announced to every consumer.',
       match: {
         python: {order: [/store\.commit_ticket\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.commitTicket\(/, /producer\.send\(/]},
@@ -108,7 +108,7 @@ crash can roll back; and a default producer duplicates entries when a produce is
       id: 'durable-producer',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` (`enable.idempotence` plus `acks`, KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a hashed balancer), so a retry of a produce cannot duplicate a timeline entry. The draft runs a default producer and takes whatever the broker does.',
+        'The producer is configured for idempotence and `acks=all` (`enable.idempotence` plus `acks`, KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a hashed balancer), so a retry of a produce cannot duplicate a timeline entry. The starter runs a default producer and takes whatever the broker does.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -121,7 +121,7 @@ crash can roll back; and a default producer duplicates entries when a produce is
       id: 'actor-role',
       title: 'The payload carries the actor role and the transition',
       detail:
-        'The event body names the **actor id**, the **actor role**, and the state transition as `from` / `to`, so a consumer can render the timeline without asking the ticket store. The draft sends ids only and never says who acted in what role.',
+        'The event body names the **actor id**, the **actor role**, and the state transition as `from` / `to`, so a consumer can render the timeline without asking the ticket store. The starter sends ids only and never says who acted in what role.',
       match: {
         python: {all: [/\bactor_role\b/, /["']from["']/, /["']to["']/]},
         typescript: {all: [/\bactor_role\b/, /\bfrom\b\s*:/, /\bto\b\s*:/]},
@@ -292,7 +292,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** ticket.event: a model-generated draft that keys by the agent and acks before the commit. */
+      starter: `/** ticket.event: flawed code that keys by the agent and acks before the commit. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -435,7 +435,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// ticket.event: a model-generated draft that keys by the agent and acks before the commit.
+// ticket.event: flawed code that keys by the agent and acks before the commit.
 var ticketWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "ticket.event"}
 
 // TicketStore is the ticket table; CommitTicket writes the row and commits the transaction.
@@ -628,7 +628,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-// ticket.event: a model-generated draft that keys by the agent and acks before the commit.
+// ticket.event: flawed code that keys by the agent and acks before the commit.
 object Events {
   private val producer = new KafkaProducer[String, String](new Properties())
 
@@ -765,7 +765,7 @@ object Events {
 
 using json = nlohmann::json;
 
-// ticket.event: a model-generated draft that keys by the agent and acks before the commit.
+// ticket.event: flawed code that keys by the agent and acks before the commit.
 struct Ticket {
   std::string id;
 };

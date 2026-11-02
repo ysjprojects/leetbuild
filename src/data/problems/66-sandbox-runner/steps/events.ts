@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['runner', 'kafka', 'audit'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it publishes an event per stage and the audit
+The starter is working code: it publishes an event per stage and the audit
 consumer shows a stream, so the demo looks complete. Three contracts are broken — the key, the
 payload, and the failure path. Find them, fix them, and prove the fix.
 
@@ -16,7 +16,7 @@ Publish the runner’s lifecycle events to \`sandbox.job\`, one per stage (\`sta
 \`finished\`):
 
 - The message **key is the job id**, so every event of one job lands in one partition and a
-  consumer sees a job’s lifecycle **in order**. The draft keys by the isolation profile, which mixes
+  consumer sees a job’s lifecycle **in order**. The starter keys by the isolation profile, which mixes
   unrelated jobs into the same partition and scatters one job’s events across all of them.
 - The payload is **provenance, not content**: \`id\`, \`seq\` (the stage index), \`stage\`,
   \`tenant\`, \`profile\`, \`exit_code\`, \`usage\` (\`cpu_ms\`, \`mem_mb\`), \`code_digest\` and
@@ -53,7 +53,7 @@ of the tenant’s data; and a dropped produce leaves a job that finished with no
       id: 'job-key',
       title: 'Keyed by job id so a job stays ordered',
       detail:
-        'The message key is the job id and the topic is `sandbox.job`. The draft keys by the isolation profile, so one job’s events scatter across partitions and unrelated jobs share one.',
+        'The message key is the job id and the topic is `sandbox.job`. The starter keys by the isolation profile, so one job’s events scatter across partitions and unrelated jobs share one.',
       match: {
         python: {all: [/sandbox\.job/, /key=job_id/]},
         typescript: {all: [/sandbox\.job/, /key:\s*jobId/]},
@@ -66,7 +66,7 @@ of the tenant’s data; and a dropped produce leaves a job that finished with no
       id: 'digests-only',
       title: 'Publishes digests, never the code or the output',
       detail:
-        'The event carries `code_digest` and `output_digest` and no body: no `output_tail`, no `code_body`. The draft embeds the output tail for debugging, which ships tenant data into a retained, replicated topic.',
+        'The event carries `code_digest` and `output_digest` and no body: no `output_tail`, no `code_body`. The starter embeds the output tail for debugging, which ships tenant data into a retained, replicated topic.',
       match: {
         python: {all: [/code_digest/, /output_digest/], none: [/output_tail/, /code_body/]},
         typescript: {all: [/code_digest/, /output_digest/], none: [/output_tail/, /code_body/]},
@@ -79,7 +79,7 @@ of the tenant’s data; and a dropped produce leaves a job that finished with no
       id: 'audit-fields',
       title: 'Carries profile, exit status and resource usage',
       detail:
-        'Each event is self-sufficient for an audit: `profile`, `exit_code` and `usage` with `cpu_ms` and `mem_mb`. The draft carries only the id, the tenant and the profile, so the consumer cannot answer what the job did or what it cost.',
+        'Each event is self-sufficient for an audit: `profile`, `exit_code` and `usage` with `cpu_ms` and `mem_mb`. The starter carries only the id, the tenant and the profile, so the consumer cannot answer what the job did or what it cost.',
       match: {
         python: {all: [/profile/, /exit_code/, /usage/, /cpu_ms/]},
         typescript: {all: [/profile/, /exit_code/, /usage/, /cpu_ms/]},
@@ -92,7 +92,7 @@ of the tenant’s data; and a dropped produce leaves a job that finished with no
       id: 'outbox',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce inserts the event into the outbox instead of dropping it — the relay republishes it, so a finished job cannot become invisible. The draft ignores the broker result entirely.',
+        'A rejected produce inserts the event into the outbox instead of dropping it — the relay republishes it, so a finished job cannot become invisible. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -211,7 +211,7 @@ def publish(job_id: str, tenant: str, stage: str, run: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** sandbox.job: a model-generated draft that keys by profile and ships the output tail. */
+      starter: `/** sandbox.job: flawed code that keys by profile and ships the output tail. */
 import {Kafka} from 'kafkajs';
 
 import {logger} from './log';

@@ -103,9 +103,9 @@ const MOCK_PRIMARY =
 
 const ACTION_BUTTON = 'rounded-lg border px-3 py-2 text-[12px] font-semibold transition';
 
-/** Each AI-pair action has its own colour, so the review loop is readable at a glance. */
+/** Each AI-pair action has its own colour, so the loop is readable at a glance. */
 const AI_ACTIONS = {
-  draft: `${ACTION_BUTTON} border-danger-400/30 bg-danger-400/10 text-danger-200 hover:bg-danger-400/20`,
+  reset: `${ACTION_BUTTON} border-danger-400/30 bg-danger-400/10 text-danger-200 hover:bg-danger-400/20`,
   review: `${ACTION_BUTTON} border-success-400/30 bg-success-400/10 text-success-300 hover:bg-success-400/20`,
   missing: `${ACTION_BUTTON} border-warning-400/30 bg-warning-400/10 text-warning-300 hover:bg-warning-400/20`,
   test: `${ACTION_BUTTON} border-ink-600 bg-ink-850 text-ink-200 hover:bg-ink-800`,
@@ -130,7 +130,7 @@ const DIFFICULTY_ACCENT: Record<Difficulty, {rail: string; number: string; hover
   },
 };
 
-/** The six signals the scenarios are tagged with, in the order the AI-era track lists them. */
+/** The six signals the scenarios are tagged with, in the order the picker lists them. */
 const SIGNALS = ['Specify', 'Delegate', 'Verify', 'Evaluate', 'Secure', 'Operate'] as const;
 
 const signalChip = (on: boolean): string =>
@@ -223,8 +223,8 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
           <span className="text-ink-400">· {scenario.role}</span>
         </div>
         <p className="text-ink-300 text-[12px] leading-5">
-          The interviewer's brief, the requirements and the AI draft open when the clock starts. Only the signals it
-          probes are known in advance:
+          The interviewer's brief, the requirements and the patch open when the clock starts. Only the signals it probes
+          are known in advance:
         </p>
         <div className="flex flex-wrap gap-1.5">
           {scenario.signals.map(signal => (
@@ -237,7 +237,7 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
             <Select label="language" onChange={onChange} options={LANGUAGE_OPTIONS} value={chosen} />
           </span>
           <span className="text-ink-400">
-            <span className="font-code text-ink-100">{scenario.minutes}:00</span> from the moment you start · the draft
+            <span className="font-code text-ink-100">{scenario.minutes}:00</span> from the moment you start · the patch
             loads in the editor · nothing is recorded
           </span>
         </div>
@@ -330,9 +330,9 @@ const ScenarioPicker: FC<{scenarios: readonly ResolvedMockScenario[]; onStart: (
 ScenarioPicker.displayName = 'ScenarioPicker';
 
 /**
- * The AI-assisted mock interview. It is deliberately offline: the "AI pair" is a deterministic
- * set of actions over the scenario's own draft, checks and notes, so the exercise works with no
- * key, network, login or server. The point is to practise the review loop — generate, inspect,
+ * The mock interview with an offline AI pair. It is deliberately offline: the "AI pair" is a
+ * deterministic set of actions over the scenario's own patch, checks and notes, so the exercise
+ * works with no key, network, login or server. The point is to practise the loop — read, debug,
  * test, decide — under a clock, not to pretend a model is on the other end.
  */
 const MockInterview: FC = memo(() => {
@@ -384,7 +384,7 @@ const MockInterview: FC = memo(() => {
     return () => window.clearTimeout(timer);
   }, [phase, secondsLeft]);
 
-  /** Open a scenario on its own page with the clock not yet running: the draft loads, the brief shows, nothing counts. */
+  /** Open a scenario on its own page with the clock not yet running: the patch loads, the brief shows, nothing counts. */
   const prepare = useCallback((next: ResolvedMockScenario, chosen: Language) => {
     const starters = startersFor(next);
     setScenarioId(next.id);
@@ -428,7 +428,7 @@ const MockInterview: FC = memo(() => {
         return;
       }
       setPhase('running');
-      say('I drafted a first version. It passes the happy path. Review it before you trust it.');
+      say('Here is the patch as it shipped. It passes the happy path. Debug it before you trust it.');
     });
   }, [phase, scenario, openDialog, backToSetup, say]);
   const sealed = phase === 'ready';
@@ -472,13 +472,16 @@ const MockInterview: FC = memo(() => {
     setPhase('report');
   }, [code, language, scenario]);
 
-  const onDraft = useCallback(() => {
+  const onReset = useCallback(() => {
     if (scenario === null) return;
     setCodeByLanguage(current =>
       current === null ? current : {...current, [language]: codeFor(scenario.step, language).starter},
     );
     setEditorReset(value => value + 1);
-    say('Regenerated the draft. It still passes the happy path — that is the problem. What does it miss?', 'ai');
+    say(
+      'Reset to the patch as it came in. It still passes the happy path; that is the problem. What does it miss?',
+      'ai',
+    );
   }, [language, say, scenario]);
 
   const onReview = useCallback(() => {
@@ -518,7 +521,7 @@ const MockInterview: FC = memo(() => {
     if (scenario === null) return;
     const prompt = [
       'You are my AI pair in a timed coding interview. Review the code against the task.',
-      'List the failure modes first, then propose the smallest correct patch. Do not assume the draft is correct.',
+      'List the failure modes first, then propose the smallest correct fix. Do not assume the code is correct.',
       '',
       '## Task',
       scenario.step.task,
@@ -590,11 +593,11 @@ const MockInterview: FC = memo(() => {
                 </span>
               </div>
               <h1 className="text-ink-50 mt-8 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl">
-                Fix the AI draft. <span className="text-danger-300">Beat the clock.</span>
+                Fix the code. <span className="text-danger-300">Beat the clock.</span>
               </h1>
               <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
-                {resolvedMockScenarios.length} scenarios for the AI-era interview loop: review a model-generated patch,
-                use an AI pair, fix the flaw, and prove it before time runs out.
+                {resolvedMockScenarios.length} scenarios: debug a flawed patch against an interviewer's brief, with an
+                offline AI pair, fix the flaw, and prove it before time runs out.
               </p>
               <div className="mt-5 flex flex-wrap gap-2">
                 {[
@@ -660,12 +663,12 @@ const MockInterview: FC = memo(() => {
             </div>
             <CheckResults title="What the checks found" verdict={shownVerdict} />
             <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
-              <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">What the AI got wrong</p>
+              <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">What the patch got wrong</p>
               <p className="text-ink-200 mt-2 text-[13px] leading-6">{scenario.aiNote}</p>
               {!shownVerdict.accepted ? (
                 <p className="text-ink-400 mt-3 text-[12px] leading-6">
                   You used {formatClock(used)} of the {scenario.minutes}:00 budget. Retry and name the failure mode
-                  before you run the review.
+                  before you run the checks.
                 </p>
               ) : null}
             </div>
@@ -817,13 +820,13 @@ const MockInterview: FC = memo(() => {
           <div className="border-ink-700 flex shrink-0 items-center gap-2 border-b px-2 py-1.5">
             <span className="font-code text-ink-200 text-[12px]">{fileName(step.file, language)}</span>
             <span className="border-warning-400/40 bg-warning-400/10 text-warning-300 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold">
-              AI draft
+              Patch
             </span>
             <span className="text-ink-400 ml-auto text-[11px]">edit, then submit</span>
           </div>
           {sealed ? (
             <div className="min-h-0 flex-1 p-4">
-              <Sealed lines={12} note="The AI draft loads when the clock starts." />
+              <Sealed lines={12} note="The patch loads when the clock starts." />
             </div>
           ) : (
             <StepEditor
@@ -856,8 +859,8 @@ const MockInterview: FC = memo(() => {
             <span className="font-code text-ink-400 text-[11px]">{hints} hints used</span>
           </div>
           <div className="grid shrink-0 grid-cols-2 gap-2 p-3 pb-2">
-            <button className={AI_ACTIONS.draft} onClick={onDraft} type="button">
-              Draft
+            <button className={AI_ACTIONS.reset} onClick={onReset} type="button">
+              Reset
             </button>
             <button className={AI_ACTIONS.review} onClick={onReview} type="button">
               Review

@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['redis', 'worker', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a worker pops a shard from the
+**Starting point.** The starter is working code: a worker pops a shard from the
 work set and starts work, so the happy path moves shards through the batch. It hides a lost shard, a
-race and a lie in the counters. Review it, fix it, and prove the fix with the checks below.
+race and a lie in the counters. Debug it, fix it, and prove the fix with the checks below.
 
 Implement the shard queue the worker pool runs on, over Redis. Work set
 \`batch:{batch_id}:shards\`, lease \`batch:{batch_id}:shard:{shard_id}:lease\`, lease index
@@ -18,9 +18,9 @@ Implement the shard queue the worker pool runs on, over Redis. Work set
 
 - **Claim atomically.** Pop a shard, then take its lease with \`SET … NX EX 30\` (or the stack's
   equivalent). If the lease is refused the shard was already taken: put it back and claim nothing.
-  The draft pops with \`SPOP\` and processes with no lease, so a worker crash loses the shard.
+  The starter pops with \`SPOP\` and processes with no lease, so a worker crash loses the shard.
 - **Heartbeat only your own lease.** Renewing must compare the stored owner — a Lua script that
-  returns \`0\` unless \`GET lease == worker_id\` and then \`EXPIRE\`s it. The draft's heartbeat is a
+  returns \`0\` unless \`GET lease == worker_id\` and then \`EXPIRE\`s it. The starter's heartbeat is a
   plain \`SET\`, so two workers can believe they own the same shard.
 - **Reclaim a crash.** The lease index is a sorted set keyed by deadline; a reaper returns every
   shard whose lease expired back to the work set and clears its lease, so another worker retries it.
@@ -51,7 +51,7 @@ makes the progress counter disagree with the work set.`,
       id: 'atomic-claim',
       title: 'Claims a shard with an atomic NX lease',
       detail:
-        'The claim takes the lease with `SET … NX EX` (or a Lua equivalent) and requeues the shard when the lease is refused. The draft pops with `SPOP` and never takes a lease.',
+        'The claim takes the lease with `SET … NX EX` (or a Lua equivalent) and requeues the shard when the lease is refused. The starter pops with `SPOP` and never takes a lease.',
       match: {
         python: {all: [/\.set\(/, /nx=True/]},
         typescript: {all: [/\.set\(/, /NX/]},
@@ -64,7 +64,7 @@ makes the progress counter disagree with the work set.`,
       id: 'lease-ttl',
       title: 'The lease carries a TTL',
       detail:
-        'The lease is written with a TTL so a dead worker’s claim expires; the draft writes a lease with no expiry (or none at all).',
+        'The lease is written with a TTL so a dead worker’s claim expires; the starter writes a lease with no expiry (or none at all).',
       match: {
         python: {all: [/LEASE_S/, /\.set\(/]},
         typescript: {all: [/LEASE_S/, /\.set\(/]},
@@ -77,7 +77,7 @@ makes the progress counter disagree with the work set.`,
       id: 'heartbeat-owner',
       title: 'Heartbeat renews only the owner’s lease',
       detail:
-        'Renewal runs a script that compares the stored owner before it `EXPIRE`s the lease. The draft’s plain `SET` lets a second worker believe it owns the shard.',
+        'Renewal runs a script that compares the stored owner before it `EXPIRE`s the lease. The starter’s plain `SET` lets a second worker believe it owns the shard.',
       match: {
         python: {all: [/HEARTBEAT_LUA/, /EXPIRE/]},
         typescript: {all: [/HEARTBEAT_LUA/, /EXPIRE/]},
@@ -90,7 +90,7 @@ makes the progress counter disagree with the work set.`,
       id: 'reclaim-expired',
       title: 'A reaper returns expired leases to the work set',
       detail:
-        'The lease index is scanned for expired deadlines and each reclaimed shard is pushed back into the work set and cleared from the index. The draft has no reaper, so a crashed shard is lost.',
+        'The lease index is scanned for expired deadlines and each reclaimed shard is pushed back into the work set and cleared from the index. The starter has no reaper, so a crashed shard is lost.',
       match: {
         python: {all: [/zrangebyscore\(/, /zrem\(|sadd\(/]},
         typescript: {all: [/zrangebyscore\(/, /zrem\(|sadd\(/]},
@@ -103,7 +103,7 @@ makes the progress counter disagree with the work set.`,
       id: 'counters-after-work',
       title: 'Counters update after the shard completes',
       detail:
-        'The `HINCRBY` on the counters runs after the shard is processed, not on claim. The draft counts a shard as done the moment it pops it.',
+        'The `HINCRBY` on the counters runs after the shard is processed, not on claim. The starter counts a shard as done the moment it pops it.',
       match: {
         python: {order: [/run_shard\(|process_shard\(/, /hincrby\(/]},
         typescript: {order: [/runShard\(|processShard\(/, /hincrby\(/]},
@@ -121,7 +121,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def claim(batch_id: str, worker_id: str) -> str | None:
-    # TODO: this draft pops the shard with no lease and counts it before the work is done; its
+    # TODO: this starter pops the shard with no lease and counts it before the work is done; its
     # heartbeat overwrites the lease so two workers can believe they own the shard.
     shard_id = r.spop(f"batch:{batch_id}:shards")
     if shard_id is None:
@@ -192,13 +192,13 @@ def run_shard(batch_id: str, shard_id: str) -> None:
 `,
     },
     typescript: {
-      starter: `/** Shard claims: a model-generated draft that pops without a lease. */
+      starter: `/** Shard claims: flawed code that pops without a lease. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
 
 export async function claim(batchID: string, workerID: string): Promise<string | null> {
-  // TODO: this draft pops the shard with no lease and counts it before the work is done; its
+  // TODO: this starter pops the shard with no lease and counts it before the work is done; its
   // heartbeat overwrites the lease so two workers can believe they own the shard.
   const shardID = await r.spop('batch:' + batchID + ':shards');
   if (shardID === null) return null;
@@ -274,7 +274,7 @@ import (
 )
 
 func Claim(ctx context.Context, rdb *redis.Client, batchID, workerID string) (string, error) {
-	// TODO: this draft pops the shard with no lease and counts it before the work is done; its
+	// TODO: this starter pops the shard with no lease and counts it before the work is done; its
 	// heartbeat overwrites the lease so two workers can believe they own the shard.
 	shardID, err := rdb.SPop(ctx, "batch:"+batchID+":shards").Result()
 	if err != nil {
@@ -373,7 +373,7 @@ func RunShard(ctx context.Context, rdb *redis.Client, batchID, shardID string) {
 
 object ShardQueue {
   def claim(jedis: Jedis, batchId: String, workerId: String): Option[String] = {
-    // TODO: this draft pops the shard with no lease and counts it before the work is done; its
+    // TODO: this starter pops the shard with no lease and counts it before the work is done; its
     // heartbeat overwrites the lease so two workers can believe they own the shard.
     Option(jedis.spop(s"batch:$batchId:shards")).map { shardId =>
       jedis.hincrBy(s"batch:$batchId:counts", "done", 1)
@@ -449,7 +449,7 @@ object ShardQueue {
 using namespace sw::redis;
 
 std::string claim(Redis& redis, const std::string& batchId, const std::string& workerId) {
-  // TODO: this draft pops the shard with no lease and counts it before the work is done; its
+  // TODO: this starter pops the shard with no lease and counts it before the work is done; its
   // heartbeat overwrites the lease so two workers can believe they own the shard.
   auto shardId = redis.spop("batch:" + batchId + ":shards");
   if (!shardId) return "";
@@ -524,7 +524,7 @@ void run_shard(Redis& redis, const std::string& batchId, const std::string& shar
 `,
     },
   },
-  debrief: `The interviewer is testing one property: can this queue lose a shard? The draft can, three ways.
+  debrief: `The interviewer is testing one property: can this queue lose a shard? The starter can, three ways.
 It pops without a lease, so a crash between pop and completion removes the shard from the work set
 forever; its heartbeat is a plain write, so a second worker can claim ownership of a shard already
 being processed; and it counts a shard as done before the work happens, so the counter says finished

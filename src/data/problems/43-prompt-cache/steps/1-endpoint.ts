@@ -8,10 +8,10 @@ export const cacheEndpointStep: Step = {
   focus: ['client', 'cache', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it hashes the prefix, looks the
+**Starting point.** The starter is working code: it hashes the prefix, looks the
 hash up, and returns a completion the moment it finds one. The demo never shows the bug because the
 demo has one tenant and one prompt version. Three things are missing from the key — the tenant, the
-prompt version and the raw text's exclusion — and each of them is a leak on its own. Review the draft
+prompt version and the raw text's exclusion — and each of them is a leak on its own. Debug the starter
 as the owner of the cache, fix it, and prove the fix.
 
 Implement \`POST /v1/completions/cached\` with body
@@ -25,7 +25,7 @@ Implement \`POST /v1/completions/cached\` with body
   logs, traces and client crash reports.
 - The cache key is \`pc:{tenant}:{version}:{digest}\` where \`digest\` is a **SHA-256** hex digest of
   the prefix. Build it with one helper, \`cache_key(tenant, version, prefix)\`, so every caller of the
-  cache has to pass all three. The draft builds \`cache:{sha256(prefix)}\` — a prefix hash alone — so
+  cache has to pass all three. The starter builds \`cache:{sha256(prefix)}\` — a prefix hash alone — so
   two tenants that both send \`"You are a helpful assistant…"\` share one entry, and a prompt-template
   change keeps serving completions produced by the old template.
 - A hit is returned **only when all three match**. Re-read the stored record's \`tenant\` and
@@ -38,7 +38,7 @@ Implement \`POST /v1/completions/cached\` with body
 - The response is \`{"status", "completion"}\` with \`status\` one of \`"hit"\` or \`"miss"\`. Log the
   **key**, never the prefix.
 
-**Failure mode the checks target.** The draft's key is a function of the prompt only, so the cache
+**Failure mode the checks target.** The starter's key is a function of the prompt only, so the cache
 boundary is the prompt's popularity instead of the tenant's identity: the first tenant to warm a
 popular prefix serves everybody, and old-template output never expires. A cache key is a security
 boundary, and it must be built from every dimension the answer depends on.`,
@@ -68,7 +68,7 @@ boundary, and it must be built from every dimension the answer depends on.`,
       id: 'tenant-auth',
       title: 'Tenant comes from the authenticated header, missing tenant is 401',
       detail:
-        'The tenant is read from the `x-tenant-id` request header and an absent tenant is `401 {"error": "tenant_required"}`. The draft reads `tenant` out of the JSON body, so the caller chooses its own identity and a request without the field crashes or defaults.',
+        'The tenant is read from the `x-tenant-id` request header and an absent tenant is `401 {"error": "tenant_required"}`. The starter reads `tenant` out of the JSON body, so the caller chooses its own identity and a request without the field crashes or defaults.',
       match: {
         python: {all: [/x-tenant-id/, /\b401\b/], none: [/payload\[["']tenant["']\]/]},
         typescript: {all: [/x-tenant-id/, /\.code\(\s*401\s*\)|\b401\b/], none: [/body\.tenant\b/]},
@@ -81,7 +81,7 @@ boundary, and it must be built from every dimension the answer depends on.`,
       id: 'version-in-key',
       title: 'Key is pc:{tenant}:{version}:{digest} built by one helper',
       detail:
-        'The key carries the tenant **and** the prompt version, and it is built by a single helper that takes all three parts. The draft keys by `cache:{sha256(prefix)}`, so the version never reaches the key and a template change keeps serving the old completion.',
+        'The key carries the tenant **and** the prompt version, and it is built by a single helper that takes all three parts. The starter keys by `cache:{sha256(prefix)}`, so the version never reaches the key and a template change keeps serving the old completion.',
       match: {
         python: {
           all: [/def cache_key\(tenant: str, version: int, prefix: str\)/, /pc:\{tenant\}:\{version\}:\{digest\}/],
@@ -108,7 +108,7 @@ boundary, and it must be built from every dimension the answer depends on.`,
       id: 'digest-only',
       title: 'Only a digest of the prefix enters the key or a log line',
       detail:
-        'The prefix is hashed with SHA-256 and the raw text is never part of the key, a log line or a response field. The draft logs `prefix=%s` on every lookup, writing customer prompt text into log retention.',
+        'The prefix is hashed with SHA-256 and the raw text is never part of the key, a log line or a response field. The starter logs `prefix=%s` on every lookup, writing customer prompt text into log retention.',
       match: {
         python: {all: [/hashlib\.sha256/], none: [/log\.\w+\([^)]*\bprefix\b/, /["']prefix["']\s*:/]},
         typescript: {
@@ -127,7 +127,7 @@ boundary, and it must be built from every dimension the answer depends on.`,
       id: 'three-way-match',
       title: 'A hit requires the stored tenant and version to match',
       detail:
-        'Before answering `"hit"`, the stored record’s `tenant` and `version` are compared with the caller’s. The draft trusts whatever the prefix hash found, so a record written for one tenant — or by an older template — is served as a hit.',
+        'Before answering `"hit"`, the stored record’s `tenant` and `version` are compared with the caller’s. The starter trusts whatever the prefix hash found, so a record written for one tenant — or by an older template — is served as a hit.',
       match: {
         python: {all: [/\["tenant"\] == tenant/, /\["version"\] == version/]},
         typescript: {all: [/\.tenant === tenant/, /\.version === body\.prompt_version/]},
@@ -140,7 +140,7 @@ boundary, and it must be built from every dimension the answer depends on.`,
       id: 'prefix-cap',
       title: 'Prefix over 8 KiB is a 413 that does not echo the prefix',
       detail:
-        'The prefix cap is `8 * 1024` bytes and the over-cap answer is `413` with a body that carries an error code, not a slice of the rejected text. The draft returns `sample: prefix[:64]`, putting prompt text into every error log and client report.',
+        'The prefix cap is `8 * 1024` bytes and the over-cap answer is `413` with a body that carries an error code, not a slice of the rejected text. The starter returns `sample: prefix[:64]`, putting prompt text into every error log and client report.',
       match: {
         python: {all: [/8 \* 1024/, /\b413\b/], none: [/prefix\[:\s*64\]/]},
         typescript: {all: [/8 \* 1024/, /\.code\(\s*413\s*\)|\b413\b/], none: [/prefix\.slice\(0,\s*64\)/]},
@@ -167,7 +167,7 @@ store = Redis.from_url("redis://cache:6379/0")
 
 @app.post("/v1/completions/cached")
 async def completions_cached(request: Request) -> JSONResponse:
-    # TODO: the draft keys by the prefix digest alone, so the same prefix serves every tenant and a
+    # TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
     # prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
     # slice of it in the 413 body.
     payload = await request.json()
@@ -235,7 +235,7 @@ async def completions_cached(request: Request) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/completions/cached: a model-generated draft whose key is the prompt digest alone. */
+      starter: `/** POST /v1/completions/cached: flawed code whose key is the prompt digest alone. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -251,7 +251,7 @@ interface CompletionBody {
 }
 
 app.post('/v1/completions/cached', async (request, reply) => {
-  // TODO: the draft keys by the prefix digest alone, so the same prefix serves every tenant and a
+  // TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
   // prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
   // slice of it in the 413 body.
   const body = request.body as CompletionBody;
@@ -340,7 +340,7 @@ type completionBody struct {
 	PromptVersion int    \`json:"prompt_version"\`
 }
 
-// TODO: the draft keys by the prefix digest alone, so the same prefix serves every tenant and a
+// TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
 // prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
 // slice of it in the 413 body.
 func completionsCached(w http.ResponseWriter, r *http.Request) {
@@ -436,7 +436,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 
 object PromptCacheApi {
-  // TODO: the draft keys by the prefix digest alone, so the same prefix serves every tenant and a
+  // TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
   // prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
   // slice of it in the 413 body.
   val routes: Route = post {
@@ -521,7 +521,7 @@ using json = nlohmann::json;
 
 std::string sha256_hex(const std::string& value);
 
-// TODO: the draft keys by the prefix digest alone, so the same prefix serves every tenant and a
+// TODO: the starter keys by the prefix digest alone, so the same prefix serves every tenant and a
 // prompt-version bump keeps serving the old completion. It also logs the raw prefix and echoes a
 // slice of it in the 413 body.
 void register_cached_completions(httplib::Server& server) {
@@ -593,5 +593,5 @@ void register_cached_completions(httplib::Server& server) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand that a cache key is an isolation boundary, not an optimisation detail. The draft’s key hashes the prompt and nothing else, so the entry that a hit selects is "whoever asked this prefix first" — which is a cross-tenant leak the moment a shared system prompt makes prefixes identical, and a stale-template bug the moment a prompt version bumps without a purge. Naming the three dimensions (tenant, version, prefix digest) and building the key in exactly one helper is what makes the boundary auditable: nobody can add a fourth call site that forgets a dimension when there is only one call site. The digest instead of the text keeps the boundary out of \`MONITOR\` output and slow logs, the header instead of the body keeps the tenant out of the caller’s reach, and the record re-check is the cheap belt to the key’s braces.`,
+  debrief: `The interviewer is testing whether you understand that a cache key is an isolation boundary, not an optimisation detail. The starter’s key hashes the prompt and nothing else, so the entry that a hit selects is "whoever asked this prefix first" — which is a cross-tenant leak the moment a shared system prompt makes prefixes identical, and a stale-template bug the moment a prompt version bumps without a purge. Naming the three dimensions (tenant, version, prefix digest) and building the key in exactly one helper is what makes the boundary auditable: nobody can add a fourth call site that forgets a dimension when there is only one call site. The digest instead of the text keeps the boundary out of \`MONITOR\` output and slow logs, the header instead of the body keeps the tenant out of the caller’s reach, and the record re-check is the cheap belt to the key’s braces.`,
 };

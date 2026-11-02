@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'queue', 'items'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body and returns an item. It compiles, it serves the demo, and it hides three production flaws.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body and returns
+an item. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/review/items\` with body
 \`{"source_type": "…", "source_id": "…", "payload_ref": "…"}\`.
@@ -27,7 +27,7 @@ Implement \`POST /v1/review/items\` with body
   the existing item (**200**, \`deduped: true\`) instead of creating a duplicate; a new source is
   **201** with \`deduped: false\`.
 
-**Failure mode the checks target.** Three defects are being tested. The draft trusts a caller-provided
+**Failure mode the checks target.** Three defects are being tested. The starter trusts a caller-provided
 \`priority\`, so a noisy integration can mark every style complaint \`p1\` and starve the guardrail
 queue. It accepts duplicate escalations for one source, so five workers noticing the same blocked
 completion create five review tasks. And it inlines the full payload into the queue record, so model
@@ -61,7 +61,7 @@ payload store that owns its own retention.`,
       id: 'priority',
       title: 'Derives priority server-side from the platform rules',
       detail:
-        'Priority comes from a server-side table keyed by `source_type` (`guardrail_block` → p1, `user_report` → p2, `model_output` → p3), never from the request. The draft reads `priority` from the caller.',
+        'Priority comes from a server-side table keyed by `source_type` (`guardrail_block` → p1, `user_report` → p2, `model_output` → p3), never from the request. The starter reads `priority` from the caller.',
       match: {
         python: {all: [/SOURCE_PRIORITY/, /def derive_priority\(/]},
         typescript: {all: [/SOURCE_PRIORITY/, /function derivePriority\(/]},
@@ -74,7 +74,7 @@ payload store that owns its own retention.`,
       id: 'dedupe',
       title: 'Dedupes by (source_type, source_id)',
       detail:
-        'A duplicate source returns the existing item instead of a second one: the handler builds a stable `dedupe_key`, looks it up before inserting, and stores under it. The draft inserts unconditionally.',
+        'A duplicate source returns the existing item instead of a second one: the handler builds a stable `dedupe_key`, looks it up before inserting, and stores under it. The starter inserts unconditionally.',
       match: {
         python: {all: [/def dedupe_key\(/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/function dedupeKey\(/, /store\.get\(/, /store\.put\(/]},
@@ -87,7 +87,7 @@ payload store that owns its own retention.`,
       id: 'payload-ref',
       title: 'Stores a payload reference, not the payload',
       detail:
-        'The queue row carries `payload_ref`; the payload text never appears in the request model or the stored item. The draft inlines the full payload into the record.',
+        'The queue row carries `payload_ref`; the payload text never appears in the request model or the stored item. The starter inlines the full payload into the record.',
       match: {
         python: {all: [/payload_ref/], none: [/payload_text/]},
         typescript: {all: [/payload_ref/], none: [/payload_text/]},
@@ -99,7 +99,7 @@ payload store that owns its own retention.`,
     {
       id: 'auth',
       title: 'Requires the tenant',
-      detail: 'A missing `X-Tenant-Id` is **401** before anything is enqueued. The draft trusts the header.',
+      detail: 'A missing `X-Tenant-Id` is **401** before anything is enqueued. The starter trusts the header.',
       match: {
         python: {all: [/status_code\s*=\s*401/]},
         typescript: {all: [/code\(\s*401\s*\)/]},
@@ -143,8 +143,8 @@ store = ItemStore()
 
 @app.post("/v1/review/items")
 def enqueue(body: ReviewItem, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft trusts the caller's priority, accepts duplicate escalations for one source
-    # and inlines the full payload into the queue record. Review all three.
+    # TODO: this starter trusts the caller's priority, accepts duplicate escalations for one source
+    # and inlines the full payload into the queue record. Fix all three.
     item = {
         "item_id": body.source_id,
         "tenant": tenant,
@@ -232,7 +232,7 @@ def enqueue(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items: a model-generated draft that trusts the caller's priority. */
+      starter: `/** POST /v1/review/items: flawed code that trusts the caller's priority. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -247,8 +247,8 @@ interface ReviewBody {
 const enqueued: unknown[] = [];
 
 app.post('/v1/review/items', async (request, reply) => {
-  // TODO: this draft trusts the caller's priority, accepts duplicate escalations for one source
-  // and inlines the full payload into the queue record. Review all three.
+  // TODO: this starter trusts the caller's priority, accepts duplicate escalations for one source
+  // and inlines the full payload into the queue record. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as ReviewBody;
   const item = {
@@ -381,8 +381,8 @@ func enqueue(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts the caller's priority, accepts duplicate escalations for one source
-	// and inlines the full payload into the queue record. Review all three.
+	// TODO: this starter trusts the caller's priority, accepts duplicate escalations for one source
+	// and inlines the full payload into the queue record. Fix all three.
 	item := map[string]any{
 		"item_id":      body.SourceID,
 		"tenant":       tenant,
@@ -534,8 +534,8 @@ object Api {
   def route: Route =
     path("v1" / "review" / "items") {
       post {
-        // TODO: this draft trusts the caller's priority, accepts duplicate escalations for one
-        // source and inlines the full payload into the queue record. Review all three.
+        // TODO: this starter trusts the caller's priority, accepts duplicate escalations for one
+        // source and inlines the full payload into the queue record. Fix all three.
         headerValueByName("X-Tenant-Id") { _ =>
           entity(as[ReviewBody]) { body =>
             items.put(body.sourceId, body)
@@ -628,8 +628,8 @@ int main() {
   httplib::Server svr;
   svr.Post("/v1/review/items", [](const httplib::Request& req, httplib::Response& res) {
     auto body = json::parse(req.body);
-    // TODO: this draft trusts the caller's priority, accepts duplicate escalations for one
-    // source and inlines the full payload into the queue record. Review all three.
+    // TODO: this starter trusts the caller's priority, accepts duplicate escalations for one
+    // source and inlines the full payload into the queue record. Fix all three.
     json item = {
         {"item_id", body["source_id"]},
         {"tenant", req.get_header_value("X-Tenant-Id")},
@@ -745,5 +745,5 @@ int main() {
     'Dedupe needs a stable key. Build one from `(source_type, source_id)`, look it up before you insert, and return the existing item instead of creating a second one.',
     'The queue row should carry `payload_ref` — a pointer into the retention-managed payload store — not the payload text itself. Reject requests that carry content.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends well-formed requests from one integration and never retries. Three separate defects are being checked: server-side priority derivation (the caller names a source, the platform names the priority — otherwise a noisy integration can starve the guardrail queue), dedupe by source so five workers noticing the same blocked completion create one task, and a payload reference instead of content so model output and user text never land in the queue's retained records. The subtle one candidates miss is the priority: it looks like a harmless convenience field, but it is the queue's fairness control. Real queues add per-tenant source allow-lists, a hashed payload fingerprint for dedupe across source types, and a signed reference so only the queue can fetch the payload.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one integration and never retries. Three separate defects are being checked: server-side priority derivation (the caller names a source, the platform names the priority — otherwise a noisy integration can starve the guardrail queue), dedupe by source so five workers noticing the same blocked completion create one task, and a payload reference instead of content so model output and user text never land in the queue's retained records. The subtle one candidates miss is the priority: it looks like a harmless convenience field, but it is the queue's fairness control. Real queues add per-tenant source allow-lists, a hashed payload fingerprint for dedupe across source types, and a signed reference so only the queue can fetch the payload.`,
 };

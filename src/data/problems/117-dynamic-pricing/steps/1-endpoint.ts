@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['api', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and publishes a price. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/prices\` with body \`{"sku": "SKU-1", "price_cents": 1299, "reason": "weekend promo"}\`.
 
@@ -31,7 +31,7 @@ Implement \`POST /v1/prices\` with body \`{"sku": "SKU-1", "price_cents": 1299, 
 - The response returns the published row: \`price_cents\`, \`previous_price_cents\`, \`moved_bp\`,
   \`headroom_bp\`, \`source\` and \`updated_at\`, so the caller can log what actually shipped.
 
-**Failure mode the checks target.** The draft takes a \`multiplier\` from the request body and applies
+**Failure mode the checks target.** The starter takes a \`multiplier\` from the request body and applies
 it to whatever price it finds, so a client bug that sends \`4.0\` ships a 400 percent spike, and a
 multiplier of \`0\` drives the price to zero — the floor is the only thing between a typo and a free
 product. It also upserts the sku it was given, so a mistyped sku silently becomes a real price row
@@ -76,7 +76,7 @@ bound it has to stay under, and its next retry repeats the same oversized change
       id: 'known-sku',
       title: 'Rejects an unknown sku with 404 and writes nothing',
       detail:
-        'The sku is looked up before anything is written; an unknown sku is **404** and no row is created. The draft upserts whatever sku it was handed, so a typo becomes a phantom price row.',
+        'The sku is looked up before anything is written; an unknown sku is **404** and no row is created. The starter upserts whatever sku it was handed, so a typo becomes a phantom price row.',
       match: {
         python: {all: [/store\.get_sku\(/, /status_code\s*=\s*404/], none: [/store\.upsert/]},
         typescript: {all: [/store\.getSku\(/, /code\(\s*404\s*\)/], none: [/store\.upsert/]},
@@ -89,7 +89,7 @@ bound it has to stay under, and its next retry repeats the same oversized change
       id: 'bounds',
       title: 'Applies the absolute floor and ceiling',
       detail:
-        'A target outside `FLOOR_CENTS`..`CEILING_CENTS` is **422** with the floor and the ceiling named in the body. The draft has neither bound, so a multiplier of zero publishes a free product.',
+        'A target outside `FLOOR_CENTS`..`CEILING_CENTS` is **422** with the floor and the ceiling named in the body. The starter has neither bound, so a multiplier of zero publishes a free product.',
       match: {
         python: {all: [/FLOOR_CENTS/, /CEILING_CENTS/, /status_code\s*=\s*422/]},
         typescript: {all: [/FLOOR_CENTS/, /CEILING_CENTS/, /code\(\s*422\s*\)/]},
@@ -102,7 +102,7 @@ bound it has to stay under, and its next retry repeats the same oversized change
       id: 'window-limit',
       title: 'Rejects a move past the window limit with the computed bound',
       detail:
-        'A move larger than `MAX_MOVE_BP` (20 %) of the current price is **409**, and the response carries `bound_cents` derived from the current price and the remaining headroom. The draft applies whatever it was handed and reports no bound.',
+        'A move larger than `MAX_MOVE_BP` (20 %) of the current price is **409**, and the response carries `bound_cents` derived from the current price and the remaining headroom. The starter applies whatever it was handed and reports no bound.',
       match: {
         python: {all: [/MAX_MOVE_BP/, /status_code\s*=\s*409/, /bound_cents/]},
         typescript: {all: [/MAX_MOVE_BP/, /code\(\s*409\s*\)/, /bound_cents/]},
@@ -115,7 +115,7 @@ bound it has to stay under, and its next retry repeats the same oversized change
       id: 'target-price',
       title: 'Takes a target price, never a caller-supplied multiplier',
       detail:
-        'The body carries `price_cents` and the handler publishes that target; there is no multiplier path at all. The draft multiplies the current price by a caller-supplied factor, which is how a 400 percent spike shipped.',
+        'The body carries `price_cents` and the handler publishes that target; there is no multiplier path at all. The starter multiplies the current price by a caller-supplied factor, which is how a 400 percent spike shipped.',
       match: {
         python: {all: [/body\.price_cents/], none: [/\bmultiplier\b/]},
         typescript: {all: [/body\.price_cents/], none: [/\bmultiplier\b/]},
@@ -158,9 +158,9 @@ store = PriceStore()
 
 @app.post("/v1/prices")
 def propose(body: PriceRequest) -> JSONResponse:
-    # TODO: this draft applies whatever multiplier the caller sends (a 400 percent spike shipped),
+    # TODO: this starter applies whatever multiplier the caller sends (a 400 percent spike shipped),
     # has no floor or ceiling so a price can be driven to zero, and upserts an unknown sku into a
-    # phantom price row. Review all three.
+    # phantom price row. Fix all three.
     current = store.current_price(body.sku)
     price_cents = int(current * body.multiplier)
     row = store.upsert(body.sku, price_cents, body.reason)
@@ -265,7 +265,7 @@ def propose(body: PriceRequest, caller: str | None = Header(default=None, alias=
 `,
     },
     typescript: {
-      starter: `/** POST /v1/prices: a model-generated draft that applies whatever multiplier the caller sends. */
+      starter: `/** POST /v1/prices: flawed code that applies whatever multiplier the caller sends. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -279,9 +279,9 @@ interface PriceBody {
 }
 
 app.post('/v1/prices', async (request, reply) => {
-  // TODO: this draft applies whatever multiplier the caller sends (a 400 percent spike shipped),
+  // TODO: this starter applies whatever multiplier the caller sends (a 400 percent spike shipped),
   // has no floor or ceiling so a price can be driven to zero, and upserts an unknown sku into a
-  // phantom price row. Review all three.
+  // phantom price row. Fix all three.
   const body = request.body as PriceBody;
   const current = await store.currentPrice(body.sku);
   const row = await store.upsert(body.sku, Math.round(current * body.multiplier), body.reason);
@@ -404,9 +404,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func propose(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft applies whatever multiplier the caller sends (a 400 percent spike shipped),
+	// TODO: this starter applies whatever multiplier the caller sends (a 400 percent spike shipped),
 	// has no floor or ceiling so a price can be driven to zero, and upserts an unknown sku into a
-	// phantom price row. Review all three.
+	// phantom price row. Fix all three.
 	var body PriceRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -591,9 +591,9 @@ object Api {
     path("v1" / "prices") {
       post {
         entity(as[PriceRequest]) { body =>
-          // TODO: this draft applies whatever multiplier the caller sends (a 400 percent spike
+          // TODO: this starter applies whatever multiplier the caller sends (a 400 percent spike
           // shipped), has no floor or ceiling so a price can be driven to zero, and upserts an
-          // unknown sku into a phantom price row. Review all three.
+          // unknown sku into a phantom price row. Fix all three.
           val current = store.currentPrice(body.sku)
           val priceCents = (current * body.multiplier).toInt
           val row = store.upsert(body.sku, priceCents, body.reason)
@@ -711,9 +711,9 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/prices", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft applies whatever multiplier the caller sends (a 400 percent spike shipped),
+    // TODO: this starter applies whatever multiplier the caller sends (a 400 percent spike shipped),
     // has no floor or ceiling so a price can be driven to zero, and upserts an unknown sku into a
-    // phantom price row. Review all three.
+    // phantom price row. Fix all three.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -840,5 +840,5 @@ int main() {
     'The bound is derived, never hardcoded: `bound = current + direction * current * headroom_bp / 10_000`, clamped by the floor and the ceiling, and returned in the 409 body so the caller can retry with a legal price instead of guessing what the limit was.',
     '`price_cents` is a target, not a factor. Keeping the multiplier out of the request is the point: a caller cannot express "double it" in a way the platform can check against the current price and the window headroom.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a system that moves money. The draft reads fine because the demo sends a multiplier of 1.0 against a sku that exists. Three separate defects are being checked. First, the request has to express a target price, because a multiplier is a change the platform cannot compare against its own guardrails without first trusting the caller's arithmetic. Second, the absolute floor and ceiling are the last line of defense: they hold even when the window accounting is wrong, which is exactly what happens under concurrency. Third, a rejection has to explain itself — \`bound_cents\` is what turns a 409 from a dead end into a retry the caller can compute. The phantom sku is the quiet one: an upsert on the write path lets a typo create a price row, and every later read, catalog export and experiment has to reason about a sku that was never in the catalog. Real platforms add a comparable-to-price check, per-category guardrail recipes from config, and a two-person approval for changes above a threshold.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a system that moves money. The starter reads fine because the demo sends a multiplier of 1.0 against a sku that exists. Three separate defects are being checked. First, the request has to express a target price, because a multiplier is a change the platform cannot compare against its own guardrails without first trusting the caller's arithmetic. Second, the absolute floor and ceiling are the last line of defense: they hold even when the window accounting is wrong, which is exactly what happens under concurrency. Third, a rejection has to explain itself — \`bound_cents\` is what turns a 409 from a dead end into a retry the caller can compute. The phantom sku is the quiet one: an upsert on the write path lets a typo create a price row, and every later read, catalog export and experiment has to reason about a sku that was never in the catalog. Real platforms add a comparable-to-price check, per-category guardrail recipes from config, and a two-person approval for changes above a threshold.`,
 };

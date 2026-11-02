@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'redis', 'eval', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a version comes back and the
+**Starting point.** The starter is working code: a version comes back and the
 demo shows the lineage. It hides the two fields that decide a serving decision and it serves any
-tenant's model. Review it like the service owner, fix it, and prove the fix with the checks below.
+tenant's model. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement the read endpoint consumers resolve their serving decision through:
 
@@ -20,13 +20,13 @@ Implement the read endpoint consumers resolve their serving decision through:
   \`pools\` (each with the \`active:{pool}\` pointer it currently resolves to) and the
   \`eval_record\` that opened its gate: \`{eval_id, score, threshold, passed}\`.
 - The \`eval_record\` is **always** attached, including when the score is **below** threshold. The
-  draft attaches it only when \`passed\` is true, so a consumer cannot tell a gate that was never
+  starter attaches it only when \`passed\` is true, so a consumer cannot tell a gate that was never
   opened from one that was opened and failed.
 - A **private model is 404 for a foreign tenant** — the registry is per-tenant and a foreign name
-  must be indistinguishable from a missing one. The draft serves any tenant’s private metadata.
+  must be indistinguishable from a missing one. The starter serves any tenant’s private metadata.
 - The read is served through a cache keyed on the **active pointer**, with a **short TTL**
   (\`READ_TTL_S = 5\`): a promotion changes the pointer, so the next read misses the stale entry and
-  the new version is visible within seconds. The draft caches per version for an hour, so a
+  the new version is visible within seconds. The starter caches per version for an hour, so a
   promotion is invisible to consumers for most of an hour.
 
 **Failure mode the checks target.** A read after a promotion must return the new active version, a
@@ -66,7 +66,7 @@ record, and a cache key that follows the promotion.`,
       id: 'eval-always',
       title: 'Attaches the eval record even when the score failed',
       detail:
-        'The eval record is attached unconditionally, not only when `passed` is true. The draft gates it behind `if passed`, so a failing eval vanishes and a reviewer cannot tell the gate was never opened.',
+        'The eval record is attached unconditionally, not only when `passed` is true. The starter gates it behind `if passed`, so a failing eval vanishes and a reviewer cannot tell the gate was never opened.',
       match: {
         python: {all: [/eval_record/], none: [/if\s+record[^\n]*passed/]},
         typescript: {all: [/eval_record/], none: [/if\s*\(\s*record[^\n]*passed/]},
@@ -79,7 +79,7 @@ record, and a cache key that follows the promotion.`,
       id: 'threshold-included',
       title: 'Returns the eval threshold alongside the score',
       detail:
-        'The eval record carries `score` and `threshold` (and the derived `passed`), so a consumer sees how close a failing eval was. The draft returns nothing when the score was low.',
+        'The eval record carries `score` and `threshold` (and the derived `passed`), so a consumer sees how close a failing eval was. The starter returns nothing when the score was low.',
       match: {
         python: {all: [/threshold/]},
         typescript: {all: [/threshold/]},
@@ -92,7 +92,7 @@ record, and a cache key that follows the promotion.`,
       id: 'tenant-404',
       title: 'Answers 404 for a foreign tenant’s private model',
       detail:
-        'The model’s owner is compared with the request tenant and a foreign model answers **404**, indistinguishable from a missing one. The draft serves any tenant’s private metadata.',
+        'The model’s owner is compared with the request tenant and a foreign model answers **404**, indistinguishable from a missing one. The starter serves any tenant’s private metadata.',
       match: {
         python: {all: [/assert_visible/, /404/]},
         typescript: {all: [/assertVisible/, /404/]},
@@ -105,7 +105,7 @@ record, and a cache key that follows the promotion.`,
       id: 'fresh-promotion',
       title: 'Keys the cache on the active pointer with a short TTL',
       detail:
-        'The cache key carries the current `active:{pool}` pointer and the entry expires in 5 seconds, so a promotion invalidates the stale read. The draft caches per version for an hour, hiding promotions.',
+        'The cache key carries the current `active:{pool}` pointer and the entry expires in 5 seconds, so a promotion invalidates the stale read. The starter caches per version for an hour, hiding promotions.',
       match: {
         python: {all: [/active:\{pool\}/, /READ_TTL_S\s*=\s*5/]},
         typescript: {all: [/active:\$\{pool\}/, /READ_TTL_S\s*=\s*5/]},
@@ -143,7 +143,7 @@ models = ModelStore()
 
 @app.get("/v1/models/{name}/versions/{v}")
 def read_version(name: str, v: str) -> dict:
-    # TODO: the draft omits the eval record when its score was below threshold, serves any tenant's
+    # TODO: the starter omits the eval record when its score was below threshold, serves any tenant's
     # private model, and caches per version for an hour. Attach the eval record unconditionally,
     # answer 404 for a foreign tenant, and key the cache on the active:{pool} pointer with a short
     # READ_TTL_S so a promotion is visible within seconds.
@@ -230,7 +230,7 @@ def read_version(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/models/{name}/versions/{v}: a model-generated draft that caches for an hour. */
+      starter: `/** GET /v1/models/{name}/versions/{v}: flawed code that caches for an hour. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -242,7 +242,7 @@ const r = new Redis('redis://redis:6379');
 const CACHE_TTL_S = 3600;
 
 app.get('/v1/models/:name/versions/:v', async (request, reply) => {
-  // TODO: the draft omits the eval record when its score was below threshold, serves any tenant's
+  // TODO: the starter omits the eval record when its score was below threshold, serves any tenant's
   // private model, and caches per version for an hour. Attach the eval record unconditionally,
   // answer 404 for a foreign tenant, and key the cache on the active:{pool} pointer with a short
   // READ_TTL_S so a promotion is visible within seconds.
@@ -352,7 +352,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readVersion(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft omits the eval record when its score was below threshold, serves any tenant's
+	// TODO: the starter omits the eval record when its score was below threshold, serves any tenant's
 	// private model, and caches per version for an hour. Attach the eval record unconditionally,
 	// answer 404 for a foreign tenant, and key the cache on the active:{pool} pointer with a short
 	// readTTLS so a promotion is visible within seconds.
@@ -494,7 +494,7 @@ object VersionRead {
   val route: Route =
     path("v1" / "models" / Segment / "versions" / Segment) { (name, version) =>
       get {
-        // TODO: the draft omits the eval record when its score was below threshold, serves any
+        // TODO: the starter omits the eval record when its score was below threshold, serves any
         // tenant's private model, and caches per version for an hour. Attach the eval record
         // unconditionally, answer 404 for a foreign tenant, and key the cache on the
         // active:{pool} pointer with a short ReadTtlS so a promotion is visible within seconds.
@@ -604,7 +604,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/models/([^/]+)/versions/([^/]+)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft omits the eval record when its score was below threshold, serves any
+    // TODO: the starter omits the eval record when its score was below threshold, serves any
     // tenant's private model, and caches per version for an hour. Attach the eval record
     // unconditionally, answer 404 for a foreign tenant, and key the cache on the active:{pool}
     // pointer with a short kReadTtlS so a promotion is visible within seconds.
@@ -718,9 +718,9 @@ int main() {
     },
   },
   hints: [
-    'Attach the eval record unconditionally — a score below threshold is the record a reviewer most needs. The draft’s `if passed` gate is what turns a failed eval into a missing one, and a consumer cannot tell a gate that never opened from one that opened and failed.',
+    'Attach the eval record unconditionally — a score below threshold is the record a reviewer most needs. The starter’s `if passed` gate is what turns a failed eval into a missing one, and a consumer cannot tell a gate that never opened from one that opened and failed.',
     'Authorize the read exactly like the write: compare `record.owner_tenant` with the request tenant before a single key is read, and answer `404` so a foreign model is indistinguishable from a missing one.',
     'Put the active pointer in the cache key and keep the TTL short. `mread:{tenant}:{name}:{v}:{pointer}` changes the moment a promotion swaps `active:{pool}`, so the next read misses the stale entry and the new version is visible within `READ_TTL_S` seconds — not within an hour.',
   ],
-  debrief: `The interview question behind this step is whether the read path tells the truth. Two fields decide a serving decision and the draft hides both: the eval record disappears whenever it failed, and the active pointer is missing entirely, so a consumer cannot see which version a pool is actually serving. The cache is the subtle one: an hourly TTL keyed per version makes a promotion invisible for most of an hour, which is long enough for a fleet to look healthy while half of it serves the old bytes. Keying the cache on the pointer and a five-second TTL makes the promotion visible within seconds. Real registries add an immutable view per version, a signed lineage document, and a read that returns the promotion history so a consumer can reconstruct why a version is serving.`,
+  debrief: `The interview question behind this step is whether the read path tells the truth. Two fields decide a serving decision and the starter hides both: the eval record disappears whenever it failed, and the active pointer is missing entirely, so a consumer cannot see which version a pool is actually serving. The cache is the subtle one: an hourly TTL keyed per version makes a promotion invisible for most of an hour, which is long enough for a fleet to look healthy while half of it serves the old bytes. Keying the cache on the pointer and a five-second TTL makes the promotion visible within seconds. Real registries add an immutable view per version, a signed lineage document, and a read that returns the promotion history so a consumer can reconstruct why a version is serving.`,
 };

@@ -8,9 +8,9 @@ export const summarizerEndpointStep: Step = {
   focus: ['client', 'api', 'rules', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body and returns a summary. It compiles, it serves the demo, and it hides four production flaws.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body and returns
+a summary. It compiles, it serves the demo, and it hides four production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/summaries\` with body \`{"source_ref": "…", "content": "…", "band": "medium"}\`.
 
@@ -32,7 +32,7 @@ Implement \`POST /v1/summaries\` with body \`{"source_ref": "…", "content": "�
   returns the stored summary with **200** and \`"replayed": true\` instead of summarizing twice.
 - Log the decision with tenant, source reference, band and byte count — never the source text.
 
-**Failure mode the checks target.** The draft resolves the band by searching the source text, so the
+**Failure mode the checks target.** The starter resolves the band by searching the source text, so the
 document chooses its own length and style and any tenant can get a 20-word "board summary" of a
 contract by writing the right sentence. It has no byte cap, so one request can push an unbounded
 source through the model. It ignores \`Idempotency-Key\`, so a client retry summarizes and bills
@@ -66,7 +66,7 @@ pipeline on every request.`,
       id: 'source-cap',
       title: 'Enforces the 1 MiB source cap with a chunking pointer',
       detail:
-        'A source over `1 << 20` bytes is **413** and the error names the chunked write path (`chunking` + `chunk_bytes`), so a big source is routed to chunks rather than pushed through the model. The draft accepts any size.',
+        'A source over `1 << 20` bytes is **413** and the error names the chunked write path (`chunking` + `chunk_bytes`), so a big source is routed to chunks rather than pushed through the model. The starter accepts any size.',
       match: {
         python: {all: [/MAX_SOURCE_BYTES/, /status_code\s*=\s*413/, /chunking/, /chunk_bytes|CHUNK_BYTES/]},
         typescript: {all: [/MAX_SOURCE_BYTES/, /code\(\s*413\s*\)/, /chunking/, /chunk_bytes|CHUNK_BYTES/]},
@@ -79,7 +79,7 @@ pipeline on every request.`,
       id: 'band-authority',
       title: 'Resolves the band from the platform, never from the source text',
       detail:
-        'The target length comes from the platform table `BAND_TARGETS` and the source is folded in as `<source>` data; the draft’s band-from-text resolver (`detect_band`) is gone, so instruction-like text in a document cannot set its own length or style.',
+        'The target length comes from the platform table `BAND_TARGETS` and the source is folded in as `<source>` data; the starter’s band-from-text resolver (`detect_band`) is gone, so instruction-like text in a document cannot set its own length or style.',
       match: {
         python: {all: [/BAND_TARGETS/, /<source>/], none: [/detect_band/]},
         typescript: {all: [/BAND_TARGETS/, /<source>/], none: [/detectBand/]},
@@ -92,7 +92,7 @@ pipeline on every request.`,
       id: 'idempotent-replay',
       title: 'Keys replays by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the summary is stored under `(tenant, key)`; a replay returns the stored summary marked `replayed` instead of summarizing twice. The draft ignores the header completely.',
+        '`Idempotency-Key` is required and the summary is stored under `(tenant, key)`; a replay returns the stored summary marked `replayed` instead of summarizing twice. The starter ignores the header completely.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
@@ -105,7 +105,7 @@ pipeline on every request.`,
       id: 'no-content-log',
       title: 'Logs the decision, never the source',
       detail:
-        'The submission is logged with tenant, source reference, band and byte count; the source text never reaches a log line. The draft logs `content` on every request.',
+        'The submission is logged with tenant, source reference, band and byte count; the source text never reaches a log line. The starter logs `content` on every request.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*content/]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*content/]},
@@ -145,8 +145,8 @@ def detect_band(content: str) -> str | None:
 
 @app.post("/v1/summaries")
 def summarize(body: SummaryRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft lets the source text pick the band, accepts any size (no 1 MiB cap and no
-    # chunking pointer), ignores Idempotency-Key, and logs the source content. Review all four.
+    # TODO: this starter lets the source text pick the band, accepts any size (no 1 MiB cap and no
+    # chunking pointer), ignores Idempotency-Key, and logs the source content. Fix all four.
     band = detect_band(body.content) or body.band
     prompt = f"Summarize in {band} style.\\n{body.content}"
     logger.info("summarize tenant=%s band=%s content=%r", tenant, band, body.content)
@@ -246,7 +246,7 @@ def summarize(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/summaries: a model-generated draft that lets the source text pick the band. */
+      starter: `/** POST /v1/summaries: flawed code that lets the source text pick the band. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -265,8 +265,8 @@ function detectBand(content: string): string | null {
 }
 
 app.post('/v1/summaries', async (request, reply) => {
-  // TODO: this draft lets the source text pick the band, accepts any size (no 1 MiB cap and no
-  // chunking pointer), ignores Idempotency-Key, and logs the source content. Review all four.
+  // TODO: this starter lets the source text pick the band, accepts any size (no 1 MiB cap and no
+  // chunking pointer), ignores Idempotency-Key, and logs the source content. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as SummaryBody;
   const band = detectBand(body.content) ?? body.band ?? 'medium';
@@ -396,8 +396,8 @@ func detectBand(content string) string {
 }
 
 func summarize(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft lets the source text pick the band, accepts any size (no 1 MiB cap and no
-	// chunking pointer), ignores Idempotency-Key, and logs the source content. Review all four.
+	// TODO: this starter lets the source text pick the band, accepts any size (no 1 MiB cap and no
+	// chunking pointer), ignores Idempotency-Key, and logs the source content. Fix all four.
 	var body SummaryBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -566,7 +566,7 @@ object SummarizerApi extends DefaultJsonProtocol {
       path("v1" / "summaries") {
         post {
           entity(as[String]) { raw =>
-            // TODO: this draft lets the source text pick the band, accepts any size (no 1 MiB cap
+            // TODO: this starter lets the source text pick the band, accepts any size (no 1 MiB cap
             // and no chunking pointer), ignores Idempotency-Key, and logs the source content.
             val body = raw.parseJson.convertTo[SummaryBody]
             val band = detectBand(body.content).getOrElse(body.band)
@@ -697,8 +697,8 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/summaries", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft lets the source text pick the band, accepts any size (no 1 MiB cap and no
-    // chunking pointer), ignores Idempotency-Key, and logs the source content. Review all four.
+    // TODO: this starter lets the source text pick the band, accepts any size (no 1 MiB cap and no
+    // chunking pointer), ignores Idempotency-Key, and logs the source content. Fix all four.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -835,8 +835,8 @@ int main() {
     'One MiB is a request cap, not a model limit: answer `413` with the chunked write path (`chunking`, `chunk_bytes`) so the caller can send the source in 64 KiB chunks instead of giving up on it.',
     'A retry must never summarize twice: require `Idempotency-Key`, store the summary under `(tenant, key)` and return the stored one with `"replayed": true`.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a
-summarizer. The draft reads fine because the demo sends a small, well-behaved document from one
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a summarizer.
+The starter reads fine because the demo sends a small, well-behaved document from one
 caller. Four separate defects are being checked: the source cap (a cheap rejection before the model
 call, answered with the chunked write path instead of a wall), the band resolved from the platform —
 the subtle one, because "the text told me to" is exactly how a summarizer gets prompt-injected into

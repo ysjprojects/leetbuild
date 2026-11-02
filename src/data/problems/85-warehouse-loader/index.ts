@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Warehouse loader on the AI-era track: the course is not "write rows into a warehouse", it is the
- * review you owe a model-generated loader before it claims a table is loaded. A manifest that is the
- * unit of work → gap-less Redis progress committed atomically with the completion flag → idempotent
- * merges over gRPC under a deadline → table-keyed load events with an outbox → a report whose counts
- * reconcile against the warehouse.
+ * Warehouse loader: the course is not "write rows into a warehouse", it is the debugging you owe a
+ * loader before it claims a table is loaded. A manifest that is the unit of work → gap-less Redis
+ * progress committed atomically with the completion flag → idempotent merges over gRPC under a
+ * deadline → table-keyed load events with an outbox → a report whose counts reconcile against the
+ * warehouse.
  */
 export const warehouseLoaderProblem: Problem = {
   id: 'warehouse-loader',
@@ -19,7 +19,6 @@ export const warehouseLoaderProblem: Problem = {
   tagline: 'Load data into the warehouse exactly once per manifest, with reconciled counts.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Warehouse Loader
 
@@ -66,12 +65,12 @@ One service, **loaderd**, with five pieces:
    rejected with reasons, and table-scoped freshness — with an unexplained read-write delta flagged
    instead of hidden.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it loads the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real data
-platform: read the draft against the failure modes, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw: it compiles, it loads the happy path, and
+it looks right. Your job in every step is the job you will have on a real data platform: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

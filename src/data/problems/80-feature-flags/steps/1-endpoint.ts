@@ -8,9 +8,10 @@ export const endpointStep: Step = {
   focus: ['api', 'schema', 'store'],
   task: `## Task
 
-A flag is not a boolean in a config file; it is a rule set with a schema. \`POST /v1/flags\` creates one,
-and the schema registry decides what a valid rule may say. The starter is the model-generated draft:
-it parses the body and echoes it back. It compiles, it serves the demo, and it hides three flaws.
+**Starting point.** A flag is not a boolean in a config file; it is a rule set with a schema.
+\`POST /v1/flags\` creates one, and the schema registry decides what a valid rule may say. The starter
+is working code: it parses the body and echoes it back. It compiles, it serves the demo, and it
+hides three flaws.
 
 Implement \`POST /v1/flags\` for body \`{"key": "checkout-redesign", "type": "boolean", "default": false,
 "rules": [{"attribute": "country", "operator": "eq", "value": "US"}]}\`.
@@ -27,7 +28,7 @@ Implement \`POST /v1/flags\` for body \`{"key": "checkout-redesign", "type": "bo
   Idempotency-Key)\` returns the original flag **and its original version**.
 - A successful create returns **201** with \`{"key": …, "version": 1, "default": …, "rules": […]}\`.
 
-**The subtle flaw.** The draft silently turns a missing default into \`false\`, accepts any attribute
+**The subtle flaw.** The starter silently turns a missing default into \`false\`, accepts any attribute
 name so an unknown attribute becomes a dead rule, and writes a fresh version on every retry. The dead
 rule is the quiet one: nothing errors, and the flag simply behaves as if the rule were not there.`,
   sequence: {
@@ -59,7 +60,7 @@ rule is the quiet one: nothing errors, and the flag simply behaves as if the rul
       id: 'registry',
       title: 'Validates rules against the schema registry',
       detail:
-        'A rule attribute must be a registered user attribute and its operator must exist for the flag type; an unknown attribute is **422**. The draft accepts any attribute name, so an unknown attribute silently never matches.',
+        'A rule attribute must be a registered user attribute and its operator must exist for the flag type; an unknown attribute is **422**. The starter accepts any attribute name, so an unknown attribute silently never matches.',
       match: {
         python: {all: [/ATTRIBUTES/, /OPERATORS/]},
         typescript: {all: [/ATTRIBUTES/, /OPERATORS/]},
@@ -72,7 +73,7 @@ rule is the quiet one: nothing errors, and the flag simply behaves as if the rul
       id: 'default',
       title: 'Rejects a missing default',
       detail:
-        'The default is mandatory: a create whose body carries no `default` is **422**, never a silent `false`. The draft reads an absent field as `false`.',
+        'The default is mandatory: a create whose body carries no `default` is **422**, never a silent `false`. The starter reads an absent field as `false`.',
       match: {
         python: {all: [/model_fields_set/]},
         typescript: {all: [/hasOwnProperty\.call\(\s*body\s*,\s*['"]default['"]\s*\)/]},
@@ -85,7 +86,7 @@ rule is the quiet one: nothing errors, and the flag simply behaves as if the rul
       id: 'idempotent',
       title: 'Idempotency-Key makes a replay return the original version',
       detail:
-        'A retry with the same `(key, Idempotency-Key)` returns the stored flag and its stored version. The draft has no idempotency, so a retry forks the flag.',
+        'A retry with the same `(key, Idempotency-Key)` returns the stored flag and its stored version. The starter has no idempotency, so a retry forks the flag.',
       match: {
         python: {all: [/Idempotency-Key/]},
         typescript: {all: [/idempotency-key/i]},
@@ -131,7 +132,7 @@ class FlagRequest(BaseModel):
 
 @app.post("/v1/flags")
 def create(body: FlagRequest) -> JSONResponse:
-    # TODO: this draft defaults to enabled when no rule matches, accepts rules that reference
+    # TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
     # attributes the system never provides, and writes a new version on every retry.
     return JSONResponse(
         {"key": body.key, "default": body.default, "rules": [r.model_dump() for r in body.rules]}
@@ -226,7 +227,7 @@ interface FlagRequest {
 }
 
 app.post('/v1/flags', async (req, reply) => {
-  // TODO: this draft defaults to enabled when no rule matches, accepts rules that reference
+  // TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
   // attributes the system never provides, and writes a new version on every retry.
   const body = req.body as FlagRequest;
   return reply.code(200).send({
@@ -314,7 +315,7 @@ type FlagRequest struct {
 }
 
 func createFlag(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft defaults to enabled when no rule matches, accepts rules that reference
+	// TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
 	// attributes the system never provides, and writes a new version on every retry.
 	var body FlagRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -432,7 +433,7 @@ case class FlagRequest(key: String, \`type\`: String, default: Option[JsValue], 
 def createFlag: Route = path("v1" / "flags") {
   post {
     entity(as[FlagRequest]) { body =>
-      // TODO: this draft defaults to enabled when no rule matches, accepts rules that reference
+      // TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
       // attributes the system never provides, and writes a new version on every retry.
       complete(Map(
         "key" -> body.key.toJson,
@@ -509,7 +510,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/flags", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft defaults to enabled when no rule matches, accepts rules that reference
+    // TODO: this starter defaults to enabled when no rule matches, accepts rules that reference
     // attributes the system never provides, and writes a new version on every retry.
     json body = json::parse(req.body);
     json out = {
@@ -593,5 +594,5 @@ int main() {
     'An absent `default` is not `false`. Check whether the field was *provided*, not whether it is truthy — a flag with no default has no defined behavior when no rule matches.',
     'Idempotency is keyed by `(flag key, Idempotency-Key)`. On a replay return the stored flag **and its stored version**, so a client retry cannot fork the flag.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends a well-formed flag and never retries. Three defects are checked: schema validation (a dead attribute reference looks configured but never matches), an explicit default (an absent default must not silently become \`false\`), and idempotency keyed by flag so a retry cannot fork it. Real flag services add a schema-registry version, per-type operator sets, and a dry-run endpoint that evaluates a rule set against sample users before it is stored.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends a well-formed flag and never retries. Three defects are checked: schema validation (a dead attribute reference looks configured but never matches), an explicit default (an absent default must not silently become \`false\`), and idempotency keyed by flag so a retry cannot fork it. Real flag services add a schema-registry version, per-type operator sets, and a dry-run endpoint that evaluates a rule set against sample users before it is stored.`,
 };

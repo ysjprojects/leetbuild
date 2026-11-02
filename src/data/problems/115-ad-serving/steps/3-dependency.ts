@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['server', 'exchange', 'house', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the exchange client: it opens
+**Starting point.** The starter is working code for the exchange client: it opens
 a channel, calls \`SelectAd\` with a deadline and maps the bid into the serve response. It hides two
-production flaws that only show up when the exchange is slow. Review it like the service owner, fix
+production flaws that only show up when the exchange is slow. Debug it like the service owner, fix
 it, and prove the fix with the checks below.
 
 Implement \`select(placement, user_hash)\` — the only hop a serve makes outside this service.
@@ -26,7 +26,7 @@ Implement \`select(placement, user_hash)\` — the only hop a serve makes outsid
 - Other status codes are not the exchange being down: propagate them instead of quietly filling the
   slot with house inventory.
 
-**Failure mode the checks target.** The draft returns \`{"ad": None}\` on a timeout — an empty slot
+**Failure mode the checks target.** The starter returns \`{"ad": None}\` on a timeout — an empty slot
 that nobody is billed for and nobody sees in a report — and it hides a second flaw: it loops over
 \`SelectAd\` inside the same request, so a slow exchange adds the deadline to the page load twice
 over. Both are deadline bugs, and both look fine in a demo where the exchange always answers on the
@@ -47,7 +47,7 @@ first try.`,
       id: 'deadline',
       title: 'Calls the exchange under a 150 ms deadline',
       detail:
-        'The hop carries a hard 150 ms deadline (`EXCHANGE_DEADLINE_MS`): the caller gets an answer or a deadline error inside the page-load budget. The draft already sets it — it is the retry and the empty slot around it that are wrong.',
+        'The hop carries a hard 150 ms deadline (`EXCHANGE_DEADLINE_MS`): the caller gets an answer or a deadline error inside the page-load budget. The starter already sets it — it is the retry and the empty slot around it that are wrong.',
       match: {
         python: {all: [/EXCHANGE_DEADLINE_MS\s*=\s*150/, /timeout\s*=/]},
         typescript: {all: [/EXCHANGE_DEADLINE_MS\s*=\s*150/, /\bdeadline\b/]},
@@ -60,7 +60,7 @@ first try.`,
       id: 'no-inline-retry',
       title: 'Makes exactly one exchange call per serve',
       detail:
-        'No loop over `SelectAd`, no backoff, no sleep inside the request: a slow exchange costs one deadline, not several. The draft loops until it has tried `MAX_ATTEMPTS` times, so page load pays the deadline again for every extra call.',
+        'No loop over `SelectAd`, no backoff, no sleep inside the request: a slow exchange costs one deadline, not several. The starter loops until it has tried `MAX_ATTEMPTS` times, so page load pays the deadline again for every extra call.',
       match: {
         python: {all: [/SelectAd/], none: [/\bfor\s+attempt\b/, /MAX_ATTEMPTS/, /\bretry\b/]},
         typescript: {all: [/SelectAd/], none: [/\bfor\s*\([^)]*attempt/, /MAX_ATTEMPTS/, /\bretry\b/]},
@@ -73,7 +73,7 @@ first try.`,
       id: 'house-fallback',
       title: 'Serves the house ad, marked, when the exchange times out',
       detail:
-        'A `DEADLINE_EXCEEDED` (or `UNAVAILABLE`) response is a house ad with `fallback: true`, not an empty slot. The draft answers `{"ad": null}` and the impression simply disappears.',
+        'A `DEADLINE_EXCEEDED` (or `UNAVAILABLE`) response is a house ad with `fallback: true`, not an empty slot. The starter answers `{"ad": null}` and the impression simply disappears.',
       match: {
         python: {all: [/HOUSE_AD_CREATIVE/, /fallback/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/HOUSE_AD_CREATIVE/, /fallback/, /DEADLINE_EXCEEDED/]},
@@ -127,9 +127,9 @@ class ExchangeClient:
         self._stub = stub
 
     def select(self, placement: str, user_hash: str) -> dict:
-        # TODO: this draft returns an empty slot when the exchange times out, so the ad is lost
+        # TODO: this starter returns an empty slot when the exchange times out, so the ad is lost
         # silently, and it calls SelectAd up to MAX_ATTEMPTS times inside the request, adding the
-        # deadline to the page load again and again. Review both flaws.
+        # deadline to the page load again and again. Fix both flaws.
         last_error = None
         for attempt in range(MAX_ATTEMPTS):
             try:
@@ -208,7 +208,7 @@ def house_ad(fallback_reason: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Exchange client: a model-generated draft that hides two deadline bugs. */
+      starter: `/** Exchange client: flawed code that hides two deadline bugs. */
 import * as grpc from '@grpc/grpc-js';
 
 const EXCHANGE_DEADLINE_MS = 150;
@@ -232,9 +232,9 @@ export class ExchangeClient {
   constructor(private readonly client: grpc.Client) {}
 
   select(placement: string, userHash: string): Promise<Selection> {
-    // TODO: this draft returns an empty slot when the exchange times out, so the ad is lost
+    // TODO: this starter returns an empty slot when the exchange times out, so the ad is lost
     // silently, and it calls selectAd up to MAX_ATTEMPTS times inside the request, adding the
-    // deadline to the page load again and again. Review both flaws.
+    // deadline to the page load again and again. Fix both flaws.
     const call = (attempt: number): Promise<Selection> =>
       new Promise((resolve, reject) => {
         this.client.makeUnaryRequest(
@@ -380,9 +380,9 @@ type ExchangeClient struct {
 }
 
 func (c *ExchangeClient) Select(ctx context.Context, placement, userHash string) (Selection, error) {
-	// TODO: this draft returns an empty slot when the exchange times out, so the ad is lost
+	// TODO: this starter returns an empty slot when the exchange times out, so the ad is lost
 	// silently, and it calls SelectAd up to maxAttempts times inside the request, adding the
-	// deadline to the page load again and again. Review both flaws.
+	// deadline to the page load again and again. Fix both flaws.
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		callCtx, cancel := context.WithTimeout(ctx, exchangeDeadlineMs*time.Millisecond)
@@ -495,9 +495,9 @@ class ExchangeClient(stub: ExchangeServiceGrpc.ExchangeServiceStub)(implicit ec:
   import ExchangeClient._
 
   def select(placement: String, userHash: String): Future[Selection] = {
-    // TODO: this draft returns an empty slot when the exchange times out, so the ad is lost
+    // TODO: this starter returns an empty slot when the exchange times out, so the ad is lost
     // silently, and it calls selectAd up to MaxAttempts times inside the request, adding the
-    // deadline to the page load again and again. Review both flaws.
+    // deadline to the page load again and again. Fix both flaws.
     def call(attempt: Int): Future[Selection] =
       stub
         .withDeadlineAfter(ExchangeDeadlineMs, TimeUnit.MILLISECONDS)
@@ -600,9 +600,9 @@ class ExchangeClient {
   explicit ExchangeClient(std::shared_ptr<ads::Exchange::Stub> stub) : stub_(std::move(stub)) {}
 
   Selection Select(const std::string& placement, const std::string& userHash) {
-    // TODO: this draft returns an empty slot when the exchange times out, so the ad is lost
+    // TODO: this starter returns an empty slot when the exchange times out, so the ad is lost
     // silently, and it calls SelectAd up to kMaxAttempts times inside the request, adding the
-    // deadline to the page load again and again. Review both flaws.
+    // deadline to the page load again and again. Fix both flaws.
     grpc::Status last_status;
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
       grpc::ClientContext context;
@@ -701,8 +701,8 @@ class ExchangeClient {
   },
   hints: [
     'Write the failure policy before the call: which status codes mean "the exchange is not answering" (DEADLINE_EXCEEDED, UNAVAILABLE) and which ones must propagate (INVALID_ARGUMENT, PERMISSION_DENIED). Only the first group earns a fallback.',
-    'The fallback is a house creative, not an absence: return a real ad with `price_micros = 0`, `fallback: true` and the reason. An empty slot is invisible in every report, which is why it survives review.',
+    'The fallback is a house creative, not an absence: return a real ad with `price_micros = 0`, `fallback: true` and the reason. An empty slot is invisible in every report, which is why it survives for so long.',
     'One call per serve. If you find yourself inside a loop, remember that the caller already has a latency budget: a second SelectAd spends it again and the user waits twice for an auction that has already lost.',
   ],
-  debrief: `The interviewer is testing your failure policy for a hard dependency. The draft is the shape most candidates write first: a call with a deadline, then a loop "just in case", then a null when everything fails. Both choices are wrong in the same direction — they trade a deterministic user experience for a chance at a slightly better bid. The fix is to make the timeout part of the product: a house creative fills the slot, the response says it is a fallback and why, and the impression kind keeps house inventory out of campaign billing. Real exchanges add a circuit breaker so a dead upstream is not probed on every request, deadline propagation from the inbound request (the remaining budget, not a fresh 150 ms), hedged requests at the second percentile instead of blind retries, and a bid floor below which the house ad wins anyway.`,
+  debrief: `The interviewer is testing your failure policy for a hard dependency. The starter is the shape most candidates write first: a call with a deadline, then a loop "just in case", then a null when everything fails. Both choices are wrong in the same direction — they trade a deterministic user experience for a chance at a slightly better bid. The fix is to make the timeout part of the product: a house creative fills the slot, the response says it is a fallback and why, and the impression kind keeps house inventory out of campaign billing. Real exchanges add a circuit breaker so a dead upstream is not probed on every request, deadline propagation from the inbound request (the remaining budget, not a fresh 150 ms), hedged requests at the second percentile instead of blind retries, and a bid floor below which the house ad wins anyway.`,
 };

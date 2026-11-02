@@ -8,13 +8,13 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db', 'support'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the profile read: it resolves the
-id, authenticates the caller and returns a profile, so the demo looks finished. It answers with the same
-payload for every authenticated caller — the owner's contact data goes to anyone who asks — the projection
-it builds for the world carries the email, the phone and the name, and it never reports the verification
-state, so an account that has not proved its address reads as complete as a verified one. It also has no
-support path: nothing records who looked at whose record. Review it like the service owner, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter is working code for the profile read: it resolves the id,
+authenticates the caller and returns a profile, so the demo looks finished. It answers with the
+same payload for every authenticated caller — the owner's contact data goes to anyone who asks —
+the projection it builds for the world carries the email, the phone and the name, and it never
+reports the verification state, so an account that has not proved its address reads as complete as
+a verified one. It also has no support path: nothing records who looked at whose record. Debug it
+like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/users/{id}\`, the read behind the profile page and the support console:
 
@@ -69,7 +69,7 @@ as a verified one.`,
       id: 'read-route',
       title: 'Registers GET /v1/users/{id}',
       detail:
-        'The profile read exists on `GET /v1/users/{id}` and its response carries the projection the console renders. The draft already answers this route, so this check passes on it — the four below are where it fails.',
+        'The profile read exists on `GET /v1/users/{id}` and its response carries the projection the console renders. The starter already answers this route, so this check passes on it — the four below are where it fails.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/users\/\{user_id\}["']/, /"user"/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/users\/:userId['"]/, /user:/]},
@@ -82,7 +82,7 @@ as a verified one.`,
       id: 'owner-scope',
       title: 'Returns the full record only to its owner',
       detail:
-        'The caller id is compared to the path id in `is_owner(caller_id, user_id)` and the owner’s copy comes from `owner_view(account)`; every other caller gets `public_projection(account)`. The draft answers the same payload for both, so the owner’s contact data goes to anyone with a token.',
+        'The caller id is compared to the path id in `is_owner(caller_id, user_id)` and the owner’s copy comes from `owner_view(account)`; every other caller gets `public_projection(account)`. The starter answers the same payload for both, so the owner’s contact data goes to anyone with a token.',
       match: {
         python: {all: [/def is_owner\(/, /caller_id\s*==\s*user_id/, /owner_view\(/]},
         typescript: {all: [/function isOwner\(/, /callerId\s*===\s*userId/, /ownerView\(/]},
@@ -95,7 +95,7 @@ as a verified one.`,
       id: 'public-projection',
       title: 'The public projection carries no contact data',
       detail:
-        'The public view is built by `public_projection(account)` from the allowlist `PUBLIC_FIELDS`, so no email, phone or name key can appear in it. The draft ships the owner’s contact data in the projection every caller receives.',
+        'The public view is built by `public_projection(account)` from the allowlist `PUBLIC_FIELDS`, so no email, phone or name key can appear in it. The starter ships the owner’s contact data in the projection every caller receives.',
       match: {
         python: {
           all: [/def public_projection\(/, /PUBLIC_FIELDS/],
@@ -120,7 +120,7 @@ as a verified one.`,
       id: 'verification-state',
       title: 'Every projection carries the verification state',
       detail:
-        '`verification_state(account)` normalises the stored value against `VERIFICATION_STATES`, and both `owner_view` and `public_projection` add it, so an unverified account never reads as complete. The draft omits it entirely.',
+        '`verification_state(account)` normalises the stored value against `VERIFICATION_STATES`, and both `owner_view` and `public_projection` add it, so an unverified account never reads as complete. The starter omits it entirely.',
       match: {
         python: {all: [/def verification_state\(/, /VERIFICATION_STATES/, /"verification_state"/]},
         typescript: {all: [/function verificationState\(/, /VERIFICATION_STATES/, /verification_state/]},
@@ -133,7 +133,7 @@ as a verified one.`,
       id: 'support-audit',
       title: 'Support reads go through an audited tool',
       detail:
-        'A caller whose `X-Role` is in `SUPPORT_ROLES` reaches the record only through `audit_lookup(caller_id, user_id, reason)`, which writes the lookup **before** the record is returned; `X-Support-Reason` is required. The draft has no support path and no audit at all.',
+        'A caller whose `X-Role` is in `SUPPORT_ROLES` reaches the record only through `audit_lookup(caller_id, user_id, reason)`, which writes the lookup **before** the record is returned; `X-Support-Reason` is required. The starter has no support path and no audit at all.',
       match: {
         python: {
           all: [/SUPPORT_ROLES/, /def audit_lookup\(/, /X-Role/, /audit_lookup\(caller_id/],
@@ -184,9 +184,9 @@ def profile_payload(account: dict) -> dict:
 
 @app.get("/v1/users/{user_id}")
 def read_user(user_id: str, caller_id: str = Header(default="", alias="X-User-Id")) -> JSONResponse:
-    # TODO: this draft hands the same payload to every caller: the owner's contact data goes to
+    # TODO: this starter hands the same payload to every caller: the owner's contact data goes to
     # anyone who asks, the email and the phone sit in the "public" projection, and the verification
-    # state is never reported. Review all three flaws.
+    # state is never reported. Fix all three flaws.
     if not caller_id:
         raise HTTPException(status_code=401, detail="missing X-User-Id")
     account = store.get_user(user_id)
@@ -271,7 +271,7 @@ def read_user(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/users/:userId: a model-generated draft that serves one payload to every caller. */
+      starter: `/** GET /v1/users/:userId: flawed code that serves one payload to every caller. */
 import Fastify from 'fastify';
 
 import {store} from './account_store';
@@ -287,9 +287,9 @@ function profilePayload(account: Record<string, unknown>): Record<string, unknow
 }
 
 app.get('/v1/users/:userId', async (request, reply) => {
-  // TODO: this draft hands the same payload to every caller: the owner's contact data goes to
+  // TODO: this starter hands the same payload to every caller: the owner's contact data goes to
   // anyone who asks, the email and the phone sit in the "public" projection, and the verification
-  // state is never reported. Review all three flaws.
+  // state is never reported. Fix all three flaws.
   const {userId} = request.params as {userId: string};
   const callerId = (request.headers['x-user-id'] as string | undefined) ?? '';
   if (callerId === '') return reply.code(401).send({error: 'missing X-User-Id'});
@@ -356,7 +356,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// GET /v1/users/{id}: a model-generated draft that serves one payload to every caller.
+      starter: `// GET /v1/users/{id}: flawed code that serves one payload to every caller.
 package main
 
 import (
@@ -383,9 +383,9 @@ func profilePayload(account map[string]any) map[string]any {
 }
 
 func readUser(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft hands the same payload to every caller: the owner's contact data goes to
+	// TODO: this starter hands the same payload to every caller: the owner's contact data goes to
 	// anyone who asks, the email and the phone sit in the "public" projection, and the verification
-	// state is never reported. Review all three flaws.
+	// state is never reported. Fix all three flaws.
 	userID := r.PathValue("id")
 	callerID := r.Header.Get("X-User-Id")
 	if callerID == "" {
@@ -554,9 +554,9 @@ object UserReadApi {
     path("v1" / "users" / Segment) { userId =>
       get {
         headerValueByName("X-User-Id") { _ =>
-          // TODO: this draft hands the same payload to every caller: the owner's contact data goes to
+          // TODO: this starter hands the same payload to every caller: the owner's contact data goes to
           // anyone who asks, the email and the phone sit in the "public" projection, and the
-          // verification state is never reported. Review all three flaws.
+          // verification state is never reported. Fix all three flaws.
           store.get(userId) match {
             case Some(account) => complete(StatusCodes.OK, JsObject("user" -> profilePayload(account)))
             case None          => complete(StatusCodes.NotFound, """{"error":"no such user"}""")
@@ -680,9 +680,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/users/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft hands the same payload to every caller: the owner's contact data goes to
+    // TODO: this starter hands the same payload to every caller: the owner's contact data goes to
     // anyone who asks, the email and the phone sit in the "public" projection, and the verification
-    // state is never reported. Review all three flaws.
+    // state is never reported. Fix all three flaws.
     const auto user_id = req.matches[1].str();
     const auto caller_id = req.get_header_value("X-User-Id");
     if (caller_id.empty()) {
@@ -799,5 +799,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you review a read endpoint as a disclosure decision, not as a lookup. The draft is convincing because the demo has one user looking at their own profile, so the scoping bug never fires. Three defects are being checked, and each one is a different answer to "who may see what". First, the viewer: a profile has exactly one owner, and the comparison that decides it — \`is_owner(caller_id, user_id)\` — is the difference between an identity service and an enumeration endpoint. Second, the projection: the owner's copy is the stored row, so it may carry everything; the public copy is an allowlist (\`PUBLIC_FIELDS\`) with a single builder, because a projection built by subtraction (take the row, drop the password) silently grows a field the day someone adds one to the row. Third, the verification state: it belongs in *every* payload, owner or public, because it is the field the rest of the platform keys its decisions on — an account that never proved its address must not read as complete. Support is the fourth contract and the one candidates forget: the people who legitimately need to read someone else's record are exactly the people whose access must be attributable, so the support branch is gated on \`SUPPORT_ROLES\` and goes through \`audit_lookup\` *before* the record leaves the service. Real systems add more: field-level access rules keyed to scopes rather than roles, response signing so a cached projection cannot be edited, per-viewer rate limits so enumeration is visible, and an audit record written to an append-only store with the reason code and the request id so a lookup can be replayed years later. The habit to take away is the one this step is built on: the read path is where a service's disclosure policy actually lives, so name every viewer, build every payload from an allowlist, and audit every exception.`,
+  debrief: `The interviewer is testing whether you debug a read endpoint as a disclosure decision, not as a lookup. The starter is convincing because the demo has one user looking at their own profile, so the scoping bug never fires. Three defects are being checked, and each one is a different answer to "who may see what". First, the viewer: a profile has exactly one owner, and the comparison that decides it — \`is_owner(caller_id, user_id)\` — is the difference between an identity service and an enumeration endpoint. Second, the projection: the owner's copy is the stored row, so it may carry everything; the public copy is an allowlist (\`PUBLIC_FIELDS\`) with a single builder, because a projection built by subtraction (take the row, drop the password) silently grows a field the day someone adds one to the row. Third, the verification state: it belongs in *every* payload, owner or public, because it is the field the rest of the platform keys its decisions on — an account that never proved its address must not read as complete. Support is the fourth contract and the one candidates forget: the people who legitimately need to read someone else's record are exactly the people whose access must be attributable, so the support branch is gated on \`SUPPORT_ROLES\` and goes through \`audit_lookup\` *before* the record leaves the service. Real systems add more: field-level access rules keyed to scopes rather than roles, response signing so a cached projection cannot be edited, per-viewer rate limits so enumeration is visible, and an audit record written to an append-only store with the reason code and the request id so a lookup can be replayed years later. The habit to take away is the one this step is built on: the read path is where a service's disclosure policy actually lives, so name every viewer, build every payload from an allowlist, and audit every exception.`,
 };

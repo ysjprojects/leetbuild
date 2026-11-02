@@ -7,12 +7,11 @@ import {experimentEventsStep} from './steps/4-events';
 import {experimentReadStep} from './steps/5-read';
 
 /**
- * Experiment platform on the AI-era track: the course is not "read the A/B dashboard", it is the
- * review you owe a model-generated experiment service before anyone ships a decision on it. Splits
- * and the assignment unit frozen at start → one deterministic Redis bucket per unit that never
- * re-randomizes → guardrail checks over gRPC that pause a ramp instead of ignoring it → exposure
- * events keyed by experiment with a unit dedupe before publish → a report that refuses to name a
- * winner on a peek or on a mismatched split.
+ * Experiment platform: the course is not "read the A/B dashboard", it is the debugging you owe an
+ * experiment service before anyone ships a decision on it. Splits and the assignment unit frozen at
+ * start → one deterministic Redis bucket per unit that never re-randomizes → guardrail checks over
+ * gRPC that pause a ramp instead of ignoring it → exposure events keyed by experiment with a unit
+ * dedupe before publish → a report that refuses to name a winner on a peek or on a mismatched split.
  */
 export const experimentsPlatformProblem: Problem = {
   id: 'experiments-platform',
@@ -20,7 +19,6 @@ export const experimentsPlatformProblem: Problem = {
   tagline: 'A/B experiments with frozen assignment, guardrails and reports that resist peeking.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Experiment Platform
 
@@ -72,12 +70,12 @@ One service, **expd**, with five pieces:
    mismatch above **2 %** reported as a blocking caveat, and every lift shown with its confidence
    interval.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real experiment feature: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

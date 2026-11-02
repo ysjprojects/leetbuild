@@ -7,12 +7,12 @@ import {changeEventsStep} from './steps/4-events';
 import {pullReadStep} from './steps/5-read';
 
 /**
- * Sync engine on the AI-era track: the course is not "upload a file to a server", it is the review
- * you owe a model-generated sync layer before it eats a day of a user's work. A push validated
- * against a base revision the server actually issued → per-device cursors that advance with the
- * batch they represent under a monotonic watermark → three-way merges over gRPC that surface
- * conflicts instead of picking a winner → document-keyed change events with an outbox → a pull
- * endpoint whose watermark covers exactly the entries it returned.
+ * Sync engine: the course is not "upload a file to a server", it is the debugging you owe a sync
+ * layer before it eats a day of a user's work. A push validated against a base revision the server
+ * actually issued → per-device cursors that advance with the batch they represent under a monotonic
+ * watermark → three-way merges over gRPC that surface conflicts instead of picking a winner →
+ * document-keyed change events with an outbox → a pull endpoint whose watermark covers exactly the
+ * entries it returned.
  */
 export const syncEngineProblem: Problem = {
   id: 'sync-engine',
@@ -20,7 +20,6 @@ export const syncEngineProblem: Problem = {
   tagline: 'Bidirectional sync that detects conflicts honestly and resumes from a watermark.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Sync Engine
 
@@ -66,12 +65,13 @@ One service, **syncd**, with five pieces:
    rather than offset-based, answering with a watermark that covers exactly the entries returned so
    a device that hits the cap resumes instead of skipping.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it syncs the demo
-document, and it sounds confident. Your job in every step is the job you will have on a real sync
-feature: read the draft against the failure modes a returning laptop produces, name the subtle one,
-fix it, and prove the fix with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw. It compiles, it syncs the demo document,
+and it looks right. Your job in every step is the job you will have on a real sync feature: debug
+the starter against the failure modes a returning laptop produces, name the subtle one, fix it,
+optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on your
+version.
 
 ## Left out on purpose
 

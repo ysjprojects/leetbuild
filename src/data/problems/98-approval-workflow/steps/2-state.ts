@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'policy'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a decision is recorded, the
+**Starting point.** The starter is working code: a decision is recorded, the
 chain moves on, and the demo approval completes in two clicks. It counts approvals instead of
-stepping through them, and it puts an hour of expiry on an approval that waits weeks. Review it,
+stepping through them, and it puts an hour of expiry on an approval that waits weeks. Debug it,
 fix it, and prove the fix.
 
 Implement the decision path \`POST /v1/requests/{id}/decision\` with body
@@ -35,7 +35,7 @@ Implement the decision path \`POST /v1/requests/{id}/decision\` with body
 - Answer \`{"request_id", "step_index", "advanced", "reason"}\`: \`advanced\` is true only for the
   call that actually moved the chain.
 
-**Failure mode the checks target.** The draft treats the length of an approvals list as the step
+**Failure mode the checks target.** The starter treats the length of an approvals list as the step
 index, so one approver clicking twice — or a client retrying a timed-out decision — advances two
 steps and a three-step chain completes with one signature. Nothing checks that the actor is the
 current step's approver, so any participant can decide out of order. And the state key carries a
@@ -68,7 +68,7 @@ silently disappears and the next decision answers 404.`,
       id: 'cas-script',
       title: 'Advances the state hash with one atomic Lua script',
       detail:
-        'The state is a hash (`HGET`/`HSET`) and the whole decision — read, compare, write, advance — runs inside a single `EVAL`/`NewScript` call. The draft reads the blob, appends to a list and writes it back, so two decisions interleave.',
+        'The state is a hash (`HGET`/`HSET`) and the whole decision — read, compare, write, advance — runs inside a single `EVAL`/`NewScript` call. The starter reads the blob, appends to a list and writes it back, so two decisions interleave.',
       match: {
         python: {all: [/ADVANCE_LUA/, /\.eval\(/, /HGET/, /HSET/]},
         typescript: {all: [/ADVANCE_LUA/, /\.eval\(/, /HGET/, /HSET/]},
@@ -81,7 +81,7 @@ silently disappears and the next decision answers 404.`,
       id: 'single-step',
       title: 'Compares the step index and advances exactly one step',
       detail:
-        'The script refuses a decision whose `step_index` no longer matches the stored index and, when it matches, writes `next_index = index + 1`. The draft sets the index to the number of items in an approvals list, so a duplicate approval skips a step.',
+        'The script refuses a decision whose `step_index` no longer matches the stored index and, when it matches, writes `next_index = index + 1`. The starter sets the index to the number of items in an approvals list, so a duplicate approval skips a step.',
       match: {
         python: {all: [/tonumber\(ARGV\[1\]\) ~= index/, /next_index = index \+ 1/]},
         typescript: {all: [/tonumber\(ARGV\[1\]\) ~= index/, /next_index = index \+ 1/]},
@@ -94,7 +94,7 @@ silently disappears and the next decision answers 404.`,
       id: 'duplicate-noop',
       title: 'A repeated decision is a no-op',
       detail:
-        'The per-step decision field is written with `HSETNX`, so a second identical decision changes nothing and returns `duplicate decision` instead of advancing. The draft appends and advances, so the duplicate counts as a signature.',
+        'The per-step decision field is written with `HSETNX`, so a second identical decision changes nothing and returns `duplicate decision` instead of advancing. The starter appends and advances, so the duplicate counts as a signature.',
       match: {
         python: {all: [/HSETNX/, /duplicate decision/]},
         typescript: {all: [/HSETNX/, /duplicate decision/]},
@@ -107,7 +107,7 @@ silently disappears and the next decision answers 404.`,
       id: 'persistent-state',
       title: 'The state key never expires mid-flow',
       detail:
-        'The state hash is created without a TTL and `PERSIST`ed on every advance. The draft puts an hour of expiry on the key, so a long approval disappears and the next decision answers 404.',
+        'The state hash is created without a TTL and `PERSIST`ed on every advance. The starter puts an hour of expiry on the key, so a long approval disappears and the next decision answers 404.',
       match: {
         python: {all: [/PERSIST/], none: [/\bTTL_S\b/, /\bsetex\(/]},
         typescript: {all: [/PERSIST/], none: [/\bTTL_S\b/, /['"]EX['"]/]},
@@ -160,8 +160,8 @@ def approvals_key(request_id: str) -> str:
 
 
 def start_chain(request_id: str, approvers: list[str]) -> None:
-    # TODO: this draft keeps the state in an expiring blob and counts an approvals list to find
-    # the step index. Review the expiry, the missing compare-and-swap and the missing approver
+    # TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
+    # the step index. Check the expiry, the missing compare-and-swap and the missing approver
     # check.
     r.set(
         state_key(request_id),
@@ -269,7 +269,7 @@ def decide(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/requests/{id}/decision: a model-generated draft that counts approvals. */
+      starter: `/** POST /v1/requests/{id}/decision: flawed code that counts approvals. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -294,8 +294,8 @@ export const stateKey = (requestId: string): string => \`approval:\${requestId}:
 export const approvalsKey = (requestId: string): string => \`approval:\${requestId}:approvals\`;
 
 export async function startChain(requestId: string, approvers: string[]): Promise<void> {
-  // TODO: this draft keeps the state in an expiring blob and counts an approvals list to find
-  // the step index. Review the expiry, the missing compare-and-swap and the missing approver
+  // TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
+  // the step index. Check the expiry, the missing compare-and-swap and the missing approver
   // check.
   const state: ChainState = {step_index: 0, step_count: approvers.length, status: 'in_progress'};
   await r.set(stateKey(requestId), JSON.stringify(state), 'EX', TTL_S);
@@ -430,8 +430,8 @@ func stateKey(requestID string) string { return "approval:" + requestID + ":stat
 func approvalsKey(requestID string) string { return "approval:" + requestID + ":approvals" }
 
 func startChain(ctx context.Context, requestID string, approvers []string) error {
-	// TODO: this draft keeps the state in an expiring blob and counts an approvals list to find
-	// the step index. Review the expiry, the missing compare-and-swap and the missing approver
+	// TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
+	// the step index. Check the expiry, the missing compare-and-swap and the missing approver
 	// check.
 	payload, _ := json.Marshal(map[string]any{
 		"step_index": 0,
@@ -628,8 +628,8 @@ object State {
   def approvalsKey(requestId: String): String = s"approval:$requestId:approvals"
 
   def startChain(requestId: String, approvers: List[String]): Unit = {
-    // TODO: this draft keeps the state in an expiring blob and counts an approvals list to find
-    // the step index. Review the expiry, the missing compare-and-swap and the missing approver
+    // TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
+    // the step index. Check the expiry, the missing compare-and-swap and the missing approver
     // check.
     val payload = s"""{"step_index":0,"step_count":\${approvers.size},"status":"in_progress"}"""
     jedis.setex(stateKey(requestId), TtlSeconds, payload)
@@ -794,8 +794,8 @@ std::string stateKey(const std::string& requestId) { return "approval:" + reques
 std::string approvalsKey(const std::string& requestId) { return "approval:" + requestId + ":approvals"; }
 
 void startChain(sw::redis::Redis& redis, const std::string& requestId, const std::vector<std::string>& approvers) {
-  // TODO: this draft keeps the state in an expiring blob and counts an approvals list to find
-  // the step index. Review the expiry, the missing compare-and-swap and the missing approver
+  // TODO: this starter keeps the state in an expiring blob and counts an approvals list to find
+  // the step index. Check the expiry, the missing compare-and-swap and the missing approver
   // check.
   const json state = {{"step_index", 0}, {"step_count", approvers.size()}, {"status", "in_progress"}};
   redis.setex(stateKey(requestId), kTtlSeconds, state.dump());

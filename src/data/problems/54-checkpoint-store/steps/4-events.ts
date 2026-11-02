@@ -8,7 +8,7 @@ export const checkpointEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an event on the
+**Starting point.** The starter is working code: it produces an event on the
 happy path and the topic fills up, so the demo shows checkpoints arriving. Three production
 contracts are broken. Find them, fix them, and prove the fix with the checks below.
 
@@ -26,7 +26,7 @@ verification publishes one \`checkpoint.event\`.
 - The producer is **idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
   plus a stable key), so a retry of a produce cannot duplicate a record.
 - When the broker rejects the produce, the event goes to the **outbox** instead of being dropped. The
-  draft lets the exception escape and the event is lost, which is exactly the case an outage makes
+  starter lets the exception escape and the event is lost, which is exactly the case an outage makes
   common.
 
 **Failure mode the checks target.** A run-keyed topic is what makes per-run ordering possible at
@@ -54,7 +54,7 @@ record. All three are invisible in a demo where the broker is up and the process
       id: 'run-key',
       title: 'Keys every event by training run',
       detail:
-        'The message key is the training run, so one run’s events land in one partition and stay ordered. The draft keys by upload id, which scatters a run’s checkpoints across partitions.',
+        'The message key is the training run, so one run’s events land in one partition and stay ordered. The starter keys by upload id, which scatters a run’s checkpoints across partitions.',
       match: {
         python: {all: [/key=run_id/]},
         typescript: {all: [/key:\s*runId/]},
@@ -67,7 +67,7 @@ record. All three are invisible in a demo where the broker is up and the process
       id: 'commit-after-marker',
       title: 'Publishes the commit only after the marker is durable',
       detail:
-        'The commit marker is written first and the event is published after it, so the topic never announces a commit that a crash rolled back. The draft publishes first and persists the marker afterwards.',
+        'The commit marker is written first and the event is published after it, so the topic never announces a commit that a crash rolled back. The starter publishes first and persists the marker afterwards.',
       match: {
         python: {order: [/write_commit_marker\(/, /publish_event\(/]},
         typescript: {order: [/writeCommitMarker\(/, /publishEvent\(/]},
@@ -80,7 +80,7 @@ record. All three are invisible in a demo where the broker is up and the process
       id: 'outbox-on-reject',
       title: 'Falls back to the outbox when the produce is rejected',
       detail:
-        'A rejected produce writes an outbox row instead of losing the event. The draft lets the broker error escape the request, so an outage silently drops checkpoint records.',
+        'A rejected produce writes an outbox row instead of losing the event. The starter lets the broker error escape the request, so an outage silently drops checkpoint records.',
       match: {
         python: {all: [/insert_outbox\(/]},
         typescript: {all: [/insertOutbox\(/]},
@@ -93,7 +93,7 @@ record. All three are invisible in a demo where the broker is up and the process
       id: 'event-fields',
       title: 'Carries step number, chunk count and digest',
       detail:
-        'The event payload holds the run’s step number, the chunk count and the digest, so a consumer can act without the weights. The draft publishes only an id and an index.',
+        'The event payload holds the run’s step number, the chunk count and the digest, so a consumer can act without the weights. The starter publishes only an id and an index.',
       match: {
         python: {all: [/"chunks"/, /"digest"/, /"step"/]},
         typescript: {all: [/chunks:/, /digest:/, /step:/]},
@@ -135,7 +135,7 @@ class ChunkEvent(BaseModel):
 
 @app.post("/v1/runs/{run_id}/checkpoints")
 def commit(run_id: str, body: ChunkEvent, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft keys by upload id instead of the training run, publishes the commit event
+    # TODO: this starter keys by upload id instead of the training run, publishes the commit event
     # before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
     # publish after the marker, carry the step, chunk count and digest, and write an outbox row when
     # the produce fails.
@@ -211,7 +211,7 @@ def commit(run_id: str, body: CheckpointEvent, tenant: str = Header(alias="X-Ten
 `,
     },
     typescript: {
-      starter: `/** checkpoint.event: a model-generated draft that keys by upload id and publishes early. */
+      starter: `/** checkpoint.event: flawed code that keys by upload id and publishes early. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -228,7 +228,7 @@ interface ChunkEvent {
 }
 
 app.post('/v1/runs/:runId/checkpoints', async (request, reply) => {
-  // TODO: this draft keys by upload id instead of the training run, publishes the commit event
+  // TODO: this starter keys by upload id instead of the training run, publishes the commit event
   // before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
   // publish after the marker, carry the step, chunk count and digest, and write an outbox row when
   // the produce fails.
@@ -333,7 +333,7 @@ func commit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft keys by upload id instead of the training run, publishes the commit event
+	// TODO: this starter keys by upload id instead of the training run, publishes the commit event
 	// before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
 	// publish after the marker, carry the step, chunk count and digest, and write an outbox row when
 	// the produce fails.
@@ -447,7 +447,7 @@ object Events {
   val producer = new KafkaProducer[String, String](props)
 
   def commit(runId: String, uploadId: String, index: Int): Unit = {
-    // TODO: this draft keys by upload id instead of the training run, publishes the commit event
+    // TODO: this starter keys by upload id instead of the training run, publishes the commit event
     // before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
     // publish after the marker, carry the step, chunk count and digest, and write an outbox row when
     // the produce fails.
@@ -499,7 +499,7 @@ object Events {
 using json = nlohmann::json;
 
 void Commit(const std::string& runId, const std::string& uploadId, int index, RdKafka::Producer& producer) {
-  // TODO: this draft keys by upload id instead of the training run, publishes the commit event
+  // TODO: this starter keys by upload id instead of the training run, publishes the commit event
   // before the commit marker is durable, and lets a broker rejection drop the event. Key by run,
   // publish after the marker, carry the step, chunk count and digest, and write an outbox row when
   // the produce fails.
@@ -555,5 +555,5 @@ void Commit(const std::string& runId, int step, int chunks, const std::string& d
     'Order the two writes: the marker is what a resume trusts, so `writeCommitMarker(...)` runs first and `publishEvent(...)` after it. An event is a notification about durable state, never a substitute for it.',
     'Durability is three separate things: an idempotent producer with `acks=all` so a retry cannot duplicate a record, a key that stays the same across retries, and an outbox row when the broker rejects the produce. The outbox is what makes a broker outage a delay instead of a missing checkpoint record.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated event path for ordering and durability. The draft produces a record and the topic fills up, which is all a demo needs; what a platform needs is that the topic is a truthful, ordered log of committed state. That gives three rules: partition by the entity whose order matters (the run), publish after the durable state rather than before it, and never let a broker rejection delete an event. Real platforms add a schema registry so the payload cannot drift, a per-run event id for consumer-side deduplication, a relay that drains the outbox in key order, and retention per topic because checkpoint events outlive the checkpoints they describe.`,
+  debrief: `The interviewer is testing whether you can debug an event path for ordering and durability. The starter produces a record and the topic fills up, which is all a demo needs; what a platform needs is that the topic is a truthful, ordered log of committed state. That gives three rules: partition by the entity whose order matters (the run), publish after the durable state rather than before it, and never let a broker rejection delete an event. Real platforms add a schema registry so the payload cannot drift, a per-run event id for consumer-side deduplication, a relay that drains the outbox in key order, and retention per topic because checkpoint events outlive the checkpoints they describe.`,
 };

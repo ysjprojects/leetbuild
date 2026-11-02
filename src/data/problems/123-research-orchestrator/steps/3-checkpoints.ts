@@ -8,11 +8,11 @@ export const checkpointsStep: Step = {
   focus: ['lead', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it records the plan, stores
+**Starting point.** The starter is working code: it records the plan, stores
 each subagent's result as it lands and counts tool calls against the budget. In a demo on one
 process it looks exactly like a checkpoint store. It hides three production flaws: the state lives
 in process memory, the tool counter races, and the tool is called before the budget is charged.
-Review it, fix it, and prove the fix.
+Debug it, fix it, and prove the fix.
 
 Implement the lead agent's checkpoint store:
 
@@ -65,7 +65,7 @@ report, not a limit.`,
       id: 'checkpoint-key',
       title: 'Stores the job record under research:{job_id}',
       detail:
-        'The job record and each result are written to Redis hashes under `research:{job_id}` (and `research:{job_id}:results`) with `HSET`. The draft keeps both in a process-local dictionary that a restart empties.',
+        'The job record and each result are written to Redis hashes under `research:{job_id}` (and `research:{job_id}:results`) with `HSET`. The starter keeps both in a process-local dictionary that a restart empties.',
       match: {
         python: {all: [/research:\{job_id\}/, /\.hset\(/]},
         typescript: {all: [/research:\$\{jobId\}/, /\.hset\(/]},
@@ -78,7 +78,7 @@ report, not a limit.`,
       id: 'ttl',
       title: 'Checkpoint keys expire after 24 hours',
       detail:
-        'Every checkpoint write is followed by an `EXPIRE` of `CHECKPOINT_TTL_S = 86400`, so an abandoned or finished job leaves Redis. The draft has no expiry at all.',
+        'Every checkpoint write is followed by an `EXPIRE` of `CHECKPOINT_TTL_S = 86400`, so an abandoned or finished job leaves Redis. The starter has no expiry at all.',
       match: {
         python: {all: [/CHECKPOINT_TTL_S\s*=\s*86400/, /\.expire\(/]},
         typescript: {all: [/CHECKPOINT_TTL_S\s*=\s*86400/, /\.expire\(/]},
@@ -91,7 +91,7 @@ report, not a limit.`,
       id: 'resume',
       title: 'Resumes from the last checkpoint',
       detail:
-        '`resume(job_id)` reads the record and the results with `HGETALL` and returns only the pending tasks. The draft’s `pending_tasks` reads the in-memory dictionary, which is empty after a restart, so the lead starts over.',
+        '`resume(job_id)` reads the record and the results with `HGETALL` and returns only the pending tasks. The starter’s `pending_tasks` reads the in-memory dictionary, which is empty after a restart, so the lead starts over.',
       match: {
         python: {all: [/def resume\(/, /\.hgetall\(/]},
         typescript: {all: [/function resume\(/, /\.hgetall\(/]},
@@ -117,7 +117,7 @@ report, not a limit.`,
       id: 'reserve-first',
       title: 'Reserves before the tool is called',
       detail:
-        'The reservation runs before `call_tool`; an over-budget subagent never reaches the tool. The draft calls the tool first and counts afterwards, so the budget cannot stop anything.',
+        'The reservation runs before `call_tool`; an over-budget subagent never reaches the tool. The starter calls the tool first and counts afterwards, so the budget cannot stop anything.',
       match: {
         python: {order: [/reserve_tool_call\(/, /call_tool\(/]},
         typescript: {order: [/reserveToolCall\(/, /callTool\(/]},
@@ -136,8 +136,8 @@ class BudgetExceeded(Exception):
     """The job has used every tool call its effort level allows."""
 
 
-# TODO: this draft keeps every checkpoint in process memory, counts tool calls with a racy
-# in-memory increment, and charges the budget after the tool has already run. Review all three.
+# TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
+# in-memory increment, and charges the budget after the tool has already run. Fix all three.
 JOBS: dict[str, dict] = {}
 
 
@@ -231,7 +231,7 @@ def tool_call(job_id: str, name: str, args: dict) -> str:
 `,
     },
     typescript: {
-      starter: `/** Checkpoints: a model-generated draft that keeps the job state in process memory. */
+      starter: `/** Checkpoints: flawed code that keeps the job state in process memory. */
 import {callTool} from './tool_calls';
 
 export interface Task {
@@ -255,8 +255,8 @@ interface JobState {
 
 export class BudgetExceeded extends Error {}
 
-// TODO: this draft keeps every checkpoint in process memory, counts tool calls with a racy
-// in-memory increment, and charges the budget after the tool has already run. Review all three.
+// TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
+// in-memory increment, and charges the budget after the tool has already run. Fix all three.
 const JOBS = new Map<string, JobState>();
 
 export function startJob(jobId: string, plan: Task[], budget: Budget): void {
@@ -389,8 +389,8 @@ type jobState struct {
 
 var ErrBudgetExceeded = errors.New("tool-call budget exceeded")
 
-// TODO: this draft keeps every checkpoint in process memory, counts tool calls with a racy
-// in-memory increment, and charges the budget after the tool has already run. Review all three.
+// TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
+// in-memory increment, and charges the budget after the tool has already run. Fix all three.
 var (
 	jobs   = map[string]*jobState{}
 	jobsMu sync.Mutex
@@ -569,8 +569,8 @@ object Checkpoints {
     var toolCalls: Int = 0
   }
 
-  // TODO: this draft keeps every checkpoint in process memory, counts tool calls with a racy
-  // in-memory increment, and charges the budget after the tool has already run. Review all three.
+  // TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
+  // in-memory increment, and charges the budget after the tool has already run. Fix all three.
   private val jobs = mutable.Map.empty[String, JobState]
 
   def startJob(jobId: String, plan: List[Task], budget: Budget): Unit =
@@ -694,8 +694,8 @@ struct JobState {
   int tool_calls = 0;
 };
 
-// TODO: this draft keeps every checkpoint in process memory, counts tool calls with a racy
-// in-memory increment, and charges the budget after the tool has already run. Review all three.
+// TODO: this starter keeps every checkpoint in process memory, counts tool calls with a racy
+// in-memory increment, and charges the budget after the tool has already run. Fix all three.
 std::map<std::string, JobState> jobs;
 std::mutex jobsMutex;
 

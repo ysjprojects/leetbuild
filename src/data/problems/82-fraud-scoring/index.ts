@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Fraud scoring on the AI-era track: the course is the review you owe a model-generated scoring
- * service before it decides who gets approved. Server-derived features and an account check with a
- * transaction dedupe → one atomic Redis velocity window per card and device → a model call with a
- * 300 ms deadline and a bounded rules fallback instead of a zero → account-keyed score events that
- * carry a feature digest and move the alerting counters before the offset commit → a case read that
- * masks the account's card data and scopes every lookup to the caller's tenant.
+ * Fraud scoring: the course is the debugging you owe a scoring service before it decides who gets
+ * approved. Server-derived features and an account check with a transaction dedupe → one atomic
+ * Redis velocity window per card and device → a model call with a 300 ms deadline and a bounded
+ * rules fallback instead of a zero → account-keyed score events that carry a feature digest and
+ * move the alerting counters before the offset commit → a case read that masks the account's card
+ * data and scopes every lookup to the caller's tenant.
  */
 export const fraudScoringProblem: Problem = {
   id: 'fraud-scoring',
@@ -20,7 +20,7 @@ export const fraudScoringProblem: Problem = {
   tagline: 'Score transactions fast with velocity truth, fail-safe degradation and PII-safe cases.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Fraud Scoring
 
@@ -66,12 +66,12 @@ One service, **scorer**, with five pieces:
    for a case that belongs to another tenant, and raw card data only through a separately audited
    tool.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real scoring feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

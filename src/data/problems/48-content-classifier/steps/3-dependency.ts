@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['classifier', 'model', 'rules'],
   task: `## Task
 
-The starter is a plausible model-generated draft: when the model is healthy it returns labels, so the
+The starter is working code: when the model is healthy it returns labels, so the
 demo passes. Every failure path is wrong. Find the flaws, fix them, and prove the fix.
 
 Implement \`classify(text, taxonomy_version)\` for the classifier's model layer:
@@ -92,7 +92,7 @@ whether the fallback is any good.`,
       id: 'rules-fallback',
       title: 'Falls back to the deterministic keyword rules',
       detail:
-        'When the model cannot answer, a keyword rules pass produces the labels instead of the failure propagating. The draft has nothing to fall back to and answers a constant.',
+        'When the model cannot answer, a keyword rules pass produces the labels instead of the failure propagating. The starter has nothing to fall back to and answers a constant.',
       match: {
         python: {all: [/def rules_classify\(/, /KEYWORD_RULES/]},
         typescript: {all: [/function rulesClassify\(/, /KEYWORD_RULES/]},
@@ -105,7 +105,7 @@ whether the fallback is any good.`,
       id: 'refusal-terminal',
       title: 'A refusal is terminal, attempts are bounded',
       detail:
-        'A refusal stops the retry loop immediately and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are attempted again, bounded by `MAX_ATTEMPTS = 3`. The draft retries a refusal until the deadline.',
+        'A refusal stops the retry loop immediately and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are attempted again, bounded by `MAX_ATTEMPTS = 3`. The starter retries a refusal until the deadline.',
       match: {
         python: {all: [/REFUSAL/, /MAX_ATTEMPTS\s*=\s*3/], none: [/while\s+True/]},
         typescript: {all: [/REFUSAL/, /MAX_ATTEMPTS\s*=\s*3/], none: [/while\s*\(\s*true\s*\)/]},
@@ -118,7 +118,7 @@ whether the fallback is any good.`,
       id: 'no-safe-default',
       title: 'Never answers a safe label with no evidence',
       detail:
-        'A failure never produces an unevidenced constant: the rules pass returns real keyword labels or the review bucket. The draft answers `safe` and the pipeline treats it as a real classification.',
+        'A failure never produces an unevidenced constant: the rules pass returns real keyword labels or the review bucket. The starter answers `safe` and the pipeline treats it as a real classification.',
       match: {
         python: {all: [/REVIEW_LABEL/], none: [/["']safe["']/]},
         typescript: {all: [/REVIEW_LABEL/], none: [/['"]safe['"]/]},
@@ -140,9 +140,9 @@ models = providers_pb2_grpc.ClassifierStub(channel)
 
 
 def classify(text: str, taxonomy_version: str) -> dict:
-    # TODO: this draft retries a refusal until the deadline and maps every failure to the label
+    # TODO: this starter retries a refusal until the deadline and maps every failure to the label
     # "safe" with no provenance, so an outage launders everything past review. It also calls the
-    # model with no deadline at all. Review it.
+    # model with no deadline at all. Fix it.
     while True:
         try:
             reply = models.Classify(providers_pb2.ClassifyRequest(text=text))
@@ -207,7 +207,7 @@ def classify(text: str, taxonomy_version: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** gRPC model client: a model-generated draft that hides outages behind a constant label. */
+      starter: `/** gRPC model client: flawed code that hides outages behind a constant label. */
 import * as grpc from '@grpc/grpc-js';
 
 import {ClassifierClient} from './gen/classifier_grpc_pb';
@@ -215,9 +215,9 @@ import {ClassifyRequest} from './gen/classifier_pb';
 
 const client = new ClassifierClient('models:9000', grpc.credentials.createInsecure());
 
-// TODO: this draft retries a refusal until the deadline and maps every failure to the label "safe"
+// TODO: this starter retries a refusal until the deadline and maps every failure to the label "safe"
 // with no provenance, so an outage launders everything past review. It also calls the model with
-// no deadline at all. Review it.
+// no deadline at all. Fix it.
 export async function classify(text: string, taxonomyVersion: string): Promise<Result> {
   while (true) {
     try {
@@ -313,9 +313,9 @@ var conn, _ = grpc.Dial("models:9000", grpc.WithInsecure())
 
 var models = classifierv1.NewClassifierClient(conn)
 
-// TODO: this draft retries a refusal until the deadline and maps every failure to the label "safe"
+// TODO: this starter retries a refusal until the deadline and maps every failure to the label "safe"
 // with no provenance, so an outage launders everything past review. It also calls the model with
-// no deadline at all. Review it.
+// no deadline at all. Fix it.
 func Classify(ctx context.Context, text, taxonomyVersion string) (Result, error) {
 	for {
 		reply, err := models.Classify(ctx, &classifierv1.ClassifyRequest{Text: text})
@@ -420,9 +420,9 @@ object ModelClient {
   val channel = ManagedChannelBuilder.forAddress("models", 9000).usePlaintext().build()
   val models: ClassifierGrpc.ClassifierBlockingStub = ClassifierGrpc.blockingStub(channel)
 
-  // TODO: this draft retries a refusal until the deadline and maps every failure to the label
+  // TODO: this starter retries a refusal until the deadline and maps every failure to the label
   // "safe" with no provenance, so an outage launders everything past review. It also calls the
-  // model with no deadline at all. Review it.
+  // model with no deadline at all. Fix it.
   def classify(text: String, taxonomyVersion: String): Result = {
     var done = false
     var result: Result = null
@@ -506,9 +506,9 @@ object ModelClient {
 
 #include "classifier.grpc.pb.h"
 
-// TODO: this draft retries a refusal until the deadline and maps every failure to the label "safe"
+// TODO: this starter retries a refusal until the deadline and maps every failure to the label "safe"
 // with no provenance, so an outage launders everything past review. It also calls the model with
-// no deadline at all. Review it.
+// no deadline at all. Fix it.
 Result Classify(const std::string& text, const std::string& taxonomyVersion) {
   while (true) {
     grpc::ClientContext ctx;
@@ -596,5 +596,5 @@ Result Classify(const std::string& text, const std::string& taxonomyVersion) {
     'Retryability is a property of the status, not of “it threw”: read the status code, retry only `UNAVAILABLE` and `DEADLINE_EXCEEDED` up to three times, and treat a refusal like any other decision — return it now, because the model will answer the same way on the next attempt.',
     'The fallback is a real classifier, not a placeholder: run the keyword rules, and when nothing matches return the review bucket. Tag the result with provenance and increment a fallback counter, so the outage shows up as a metric spike instead of an unexplained drop in label quality.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated dependency layer where the failure policy is the deliverable. Three defects are being checked: the deadline (a call without one converts a slow dependency into an outage of your own service), the retry policy (retrying a terminal refusal burns the deadline on an answer that will not change), and the failure representation (a constant label with no provenance is a silent data-quality bug — nothing downstream, and no metric, can tell it apart from a real classification). The fallback itself is the fourth idea: when the model is gone, the service must still produce evidence-based labels, which is exactly what a small deterministic rules pass gives you. Real classifiers add a per-label confidence, a sampled human review of fallback results, and a circuit breaker so a hard-down model is not called three times per request forever.`,
+  debrief: `The interviewer is testing whether you can debug a dependency layer where the failure policy is the deliverable. Three defects are being checked: the deadline (a call without one converts a slow dependency into an outage of your own service), the retry policy (retrying a terminal refusal burns the deadline on an answer that will not change), and the failure representation (a constant label with no provenance is a silent data-quality bug — nothing downstream, and no metric, can tell it apart from a real classification). The fallback itself is the fourth idea: when the model is gone, the service must still produce evidence-based labels, which is exactly what a small deterministic rules pass gives you. Real classifiers add a per-label confidence, a sampled human review of fallback results, and a circuit breaker so a hard-down model is not called three times per request forever.`,
 };

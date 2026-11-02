@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['generator', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes an admitted record
+**Starting point.** The starter is working code: it publishes an admitted record
 and the consumer moves a counter, so the pipeline looks wired. It keys the event so one recipe's
 admissions arrive out of order, it copies the generated content into a retained topic, and it
 announces the admission before the record exists anywhere. Find the flaws, fix them, and prove the
@@ -19,7 +19,7 @@ admitted:
 
 - Publish **exactly one** \`synthetic.record\` event per admission with the **recipe id as the
   message key** — \`key=record["recipe_id"]\` — so every admission of one recipe lands in one
-  partition and stays ordered. The draft keys by record id, which scatters a recipe's admissions and
+  partition and stays ordered. The starter keys by record id, which scatters a recipe's admissions and
   destroys the order a reviewer needs to reconstruct what a recipe produced.
 - The payload carries **\`seed_digest\`** and **\`judge_score\`**, plus the record, job and entity ids.
   \`seed_digest\` is the **sha256 of the seed record the generated record came from** — computed here,
@@ -30,7 +30,7 @@ admitted:
   plus required acks \`all\`, KafkaJS's \`idempotent: true\` with \`acks: -1\`, and a hash balancer for
   the key), so a retried produce cannot double an admission.
 - The admission is **persisted before it is published**: \`admissions.put(record)\` runs before
-  \`produce\`/\`send\`, and only then is the event published. The draft acknowledges the record and
+  \`produce\`/\`send\`, and only then is the event published. The starter acknowledges the record and
   never persists it, so a crash leaves an event for a record that does not exist.
 
 **Failure mode the checks target.** The key is the subtle one: keying by record id still works in a
@@ -69,7 +69,7 @@ publishing before persisting is the durability bug — an event is a promise tha
       id: 'recipe-key',
       title: 'Keys every admission by recipe id',
       detail:
-        'The message key is the recipe id, so one recipe\u2019s admissions share a partition and arrive in order. The draft keys by record id, scattering a recipe across partitions.',
+        'The message key is the recipe id, so one recipe\u2019s admissions share a partition and arrive in order. The starter keys by record id, scattering a recipe across partitions.',
       match: {
         python: {all: [/synthetic\.record/, /key=record\["recipe_id"\]/]},
         typescript: {all: [/synthetic\.record/, /key:\s*recipeId/]},
@@ -95,7 +95,7 @@ publishing before persisting is the durability bug — an event is a promise tha
       id: 'digest-only',
       title: 'Carries digests and scores, never generated content',
       detail:
-        'The event carries `seed_digest` and `judge_score`; the generated text, the seed text and any other content stay out of the payload and the logs. The draft copies the generated content into a retained topic.',
+        'The event carries `seed_digest` and `judge_score`; the generated text, the seed text and any other content stay out of the payload and the logs. The starter copies the generated content into a retained topic.',
       match: {
         python: {all: [/seed_digest/, /judge_score/], none: [/generated_text|seed_text|record_text/]},
         typescript: {all: [/seed_digest/, /judge_score/], none: [/generated_text|seed_text|record_text/]},
@@ -108,7 +108,7 @@ publishing before persisting is the durability bug — an event is a promise tha
       id: 'digest-of-seed',
       title: 'Computes the seed digest from the seed record',
       detail:
-        '`seed_digest` is the sha256 of the seed record the generated record came from, computed at publish time, so an admitted record resolves back to a seed without the seed text travelling. The draft has no digest at all.',
+        '`seed_digest` is the sha256 of the seed record the generated record came from, computed at publish time, so an admitted record resolves back to a seed without the seed text travelling. The starter has no digest at all.',
       match: {
         python: {all: [/sha256/, /seed_digest/]},
         typescript: {all: [/createHash\(/, /seed_digest/]},
@@ -121,7 +121,7 @@ publishing before persisting is the durability bug — an event is a promise tha
       id: 'persist-before-publish',
       title: 'Persists the admission before publishing it',
       detail:
-        '`admissions.put(record)` runs before the produce, so an event never describes a record that was not stored. The draft announces the admission and never persists it.',
+        '`admissions.put(record)` runs before the produce, so an event never describes a record that was not stored. The starter announces the admission and never persists it.',
       match: {
         python: {order: [/admissions\.put\(/, /producer\.produce\(/]},
         typescript: {order: [/admissions\.put\(/, /producer\.send\(/]},
@@ -133,7 +133,7 @@ publishing before persisting is the durability bug — an event is a promise tha
   ],
   code: {
     python: {
-      starter: `"""publish_admission: a model-generated draft that keys by record id and ships the content."""
+      starter: `"""publish_admission: flawed code that keys by record id and ships the content."""
 import json
 import logging
 
@@ -147,7 +147,7 @@ TOPIC = "synthetic.record"
 
 
 def publish_admission(record: dict) -> None:
-    # TODO: this draft keys the event by the record id instead of the recipe id, copies the generated
+    # TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
     # content into the payload and the logs, carries no seed digest and no judge score, and announces
     # the admission before the record is persisted. The producer has no idempotence and no delivery
     # guarantee.
@@ -207,7 +207,7 @@ def publish_admission(record: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** synthetic.record: a model-generated draft that keys by record id and ships the content. */
+      starter: `/** synthetic.record: flawed code that keys by record id and ships the content. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'synthd', brokers: ['kafka:9092']});
@@ -222,7 +222,7 @@ interface GeneratedRecord {
 }
 
 export async function publishAdmission(record: GeneratedRecord): Promise<void> {
-  // TODO: this draft keys the event by the record id instead of the recipe id, copies the generated
+  // TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
   // content into the payload and the logs, carries no seed digest and no judge score, and announces
   // the admission before the record is persisted. The producer has no idempotence and no delivery
   // guarantee.
@@ -288,7 +288,7 @@ export async function publishAdmission(record: GeneratedRecord): Promise<void> {
 `,
     },
     go: {
-      starter: `// synthetic.record: a model-generated draft that keys by record id and ships the content.
+      starter: `// synthetic.record: flawed code that keys by record id and ships the content.
 package main
 
 import (
@@ -311,7 +311,7 @@ type GeneratedRecord struct {
 }
 
 func publishAdmission(ctx context.Context, record GeneratedRecord) error {
-	// TODO: this draft keys the event by the record id instead of the recipe id, copies the generated
+	// TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
 	// content into the payload and the logs, carries no seed digest and no judge score, and announces
 	// the admission before the record is persisted. The writer has no idempotence and no delivery
 	// guarantee.
@@ -402,7 +402,7 @@ func publishAdmission(ctx context.Context, record GeneratedRecord) error {
 `,
     },
     scala: {
-      starter: `// synthetic.record: a model-generated draft that keys by record id and ships the content.
+      starter: `// synthetic.record: flawed code that keys by record id and ships the content.
 import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
@@ -421,7 +421,7 @@ object Records {
   val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
   def publishAdmission(record: GeneratedRecord): Unit = {
-    // TODO: this draft keys the event by the record id instead of the recipe id, copies the generated
+    // TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
     // content into the payload and the logs, carries no seed digest and no judge score, and announces
     // the admission before the record is persisted. The producer has no idempotence and no delivery
     // guarantee.
@@ -498,7 +498,7 @@ object Records {
 `,
     },
     cpp: {
-      starter: `// synthetic.record: a model-generated draft that keys by record id and ships the content.
+      starter: `// synthetic.record: flawed code that keys by record id and ships the content.
 #include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
@@ -517,7 +517,7 @@ struct GeneratedRecord {
 };
 
 void publishAdmission(RdKafka::Producer& producer, const GeneratedRecord& record) {
-  // TODO: this draft keys the event by the record id instead of the recipe id, copies the generated
+  // TODO: this starter keys the event by the record id instead of the recipe id, copies the generated
   // content into the payload and the logs, carries no seed digest and no judge score, and announces
   // the admission before the record is persisted. The producer has no idempotence and no delivery
   // guarantee.

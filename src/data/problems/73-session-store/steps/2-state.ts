@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it writes a session record to Redis and
-removes the old one when a session is rotated. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it writes a session record to Redis and
+removes the old one when a session is rotated. It compiles, it serves the demo, and it hides three
+production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement the session record for \`sessiond\` in Redis under the key \`session:{id}\`.
 
@@ -50,7 +50,7 @@ until someone remembers to delete it. Storing the raw token turns a Redis dump i
       id: 'sliding-ttl',
       title: 'Refreshes the sliding idle timeout on use',
       detail:
-        'Every touch resets the key TTL to `SLIDING_TTL_S` with `EXPIRE`, so an active session is not logged out while an idle one is. The draft sets one long TTL at write time and never refreshes it.',
+        'Every touch resets the key TTL to `SLIDING_TTL_S` with `EXPIRE`, so an active session is not logged out while an idle one is. The starter sets one long TTL at write time and never refreshes it.',
       match: {
         python: {all: [/SLIDING_TTL_S/, /expire\(/]},
         typescript: {all: [/SLIDING_TTL_S/, /expire\(/]},
@@ -63,7 +63,7 @@ until someone remembers to delete it. Storing the raw token turns a Redis dump i
       id: 'absolute-cap',
       title: 'Keeps a hard absolute cap the refresh cannot extend',
       detail:
-        'The record carries `created_at` and the touch compares the age against `ABSOLUTE_TTL_S`, so a session past the cap is dead even if it is used every minute. The draft has neither the constant nor the creation time.',
+        'The record carries `created_at` and the touch compares the age against `ABSOLUTE_TTL_S`, so a session past the cap is dead even if it is used every minute. The starter has neither the constant nor the creation time.',
       match: {
         python: {all: [/ABSOLUTE_TTL_S/, /created_at/]},
         typescript: {all: [/ABSOLUTE_TTL_S/, /created_at/]},
@@ -76,7 +76,7 @@ until someone remembers to delete it. Storing the raw token turns a Redis dump i
       id: 'atomic-rotate',
       title: 'Rotates the id in one atomic step',
       detail:
-        'The replacement write and the retirement of the old id run as one `EVAL` (or one `MULTI`/`EXEC`), so a crash cannot leave two live ids. The draft writes and deletes in separate commands.',
+        'The replacement write and the retirement of the old id run as one `EVAL` (or one `MULTI`/`EXEC`), so a crash cannot leave two live ids. The starter writes and deletes in separate commands.',
       match: {
         python: {all: [/\.eval\(/]},
         typescript: {all: [/\.eval\(/]},
@@ -89,7 +89,7 @@ until someone remembers to delete it. Storing the raw token turns a Redis dump i
       id: 'hash-token',
       title: 'Stores a token hash, never the raw token',
       detail:
-        'The record keeps `token_hash` derived from the token; the raw token is never written to Redis. The draft stores the token field verbatim.',
+        'The record keeps `token_hash` derived from the token; the raw token is never written to Redis. The starter stores the token field verbatim.',
       match: {
         python: {all: [/sha256\(/, /token_hash/]},
         typescript: {all: [/createHash\(/, /token_hash/]},
@@ -583,5 +583,5 @@ bool touch_session(RedisClient& redis, const std::string& session_id, json& out)
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated state layer for the failure modes that only appear under concurrency or time. Three defects are being checked: a rotation spread across two commands is not atomic, so a crash between them leaves two live ids; a TTL set once at login is not a sliding idle timeout and, without a creation time, there is no hard cap on how long a stolen token lives; and a raw token in Redis turns a cache dump into a credential leak. The habits to name out loud are: keep the record self-describing enough to enforce the cap without a second read, push the write-and-retire into one atomic step, and hash anything secret before it touches storage. Real session stores add a rotation counter in the value, a short-lived tombstone for the retired id so an in-flight request is not broken, and per-key monitoring so an unusually long-lived session pages on-call.`,
+  debrief: `The interviewer is testing whether you can debug a state layer for the failure modes that only appear under concurrency or time. Three defects are being checked: a rotation spread across two commands is not atomic, so a crash between them leaves two live ids; a TTL set once at login is not a sliding idle timeout and, without a creation time, there is no hard cap on how long a stolen token lives; and a raw token in Redis turns a cache dump into a credential leak. The habits to name out loud are: keep the record self-describing enough to enforce the cap without a second read, push the write-and-retire into one atomic step, and hash anything secret before it touches storage. Real session stores add a rotation counter in the value, a short-lived tombstone for the retired id so an in-flight request is not broken, and per-key monitoring so an unusually long-lived session pages on-call.`,
 };

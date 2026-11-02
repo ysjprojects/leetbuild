@@ -10,7 +10,7 @@ const ITEMS: readonly {mode: Mode; href: string; label: string; short: string}[]
 
 /**
  * The product's two modes: the regular course catalogue, and a timed mock interview where the
- * learner starts from a flawed AI draft and has an offline AI pair. A link, not client state, so
+ * learner starts from a flawed patch and has an offline AI pair. A link, not client state, so
  * every mode has its own address and Back returns to the other one.
  */
 const ModeSwitch: FC<{mode: Mode; className?: string}> = memo(({mode, className = ''}) => (

@@ -7,8 +7,8 @@ import {promptDetectStep} from './steps/3-prompt-detect';
 import {firewallEventsStep} from './steps/4-firewall-events';
 
 /**
- * Cloudflare's Firewall for AI on the AI-era track: the WAF-style layer in front of an LLM
- * application, reviewed as a model-generated draft. The prompt found by a configured JSON path,
+ * Cloudflare's Firewall for AI: the WAF-style layer in front of an LLM
+ * application, debugged like production. The prompt found by a configured JSON path,
  * capped and scored → one atomic per-key window before any detector or model cost → a 1–99
  * injection score plus topic tags under a 150 ms deadline, failing closed → one event per decision
  * on a key-hashed topic, with the response scanned for card numbers and API keys before the
@@ -18,10 +18,10 @@ export const aiFirewallProblem: Problem = {
   id: 'ai-firewall',
   title: 'AI Firewall',
   tagline:
-    "Cloudflare's Firewall for AI: a proxy that scores every prompt 1–99, rate-limits every key, fails closed and redacts the answer — reviewed like production.",
+    "Cloudflare's Firewall for AI: a proxy that scores every prompt 1–99, rate-limits every key, fails closed and redacts the answer — debugged like production.",
   difficulty: 'easy',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 45,
   company: CLOUDFLARE,
   sources: [
@@ -101,12 +101,12 @@ One service, **aifw**, with four pieces:
    API key**, an idempotent producer with \`acks=all\`, no user or model text in the event, and
    the response scanned for **card numbers and API keys** and redacted before the client sees it.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

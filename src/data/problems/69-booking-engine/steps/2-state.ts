@@ -8,9 +8,9 @@ export const bookingStateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads the slot map, checks
+**Starting point.** The starter is working code: it reads the slot map, checks
 it, writes the hold. It works when one person books at a time, which is not a property of a booking
-engine. Review it like the service owner, fix it, and prove the fix with the checks below.
+engine. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 A hold is one row per slot in a Redis hash, and taking one is a single atomic transition.
 
@@ -32,7 +32,7 @@ A hold is one row per slot in a Redis hash, and taking one is a single atomic tr
 - \`release_hold\` is the sweeper's path and it is guarded: it deletes a slot field only while it
   still points at **this** hold, so a slot that a later request already re-booked is never freed.
 
-**Failure mode the checks target.** The draft does \`HEXISTS\` in the handler and \`HSET\` afterwards,
+**Failure mode the checks target.** The starter does \`HEXISTS\` in the handler and \`HSET\` afterwards,
 so two concurrent bookings both observe a free slot and both win — the exact double-booking this
 course is about. Its hold key has no expiry, so every abandoned checkout blocks a slot forever, and
 it deletes the hold key on cancellation without checking who owns the slot.`,
@@ -57,7 +57,7 @@ it deletes the hold key on cancellation without checking who owns the slot.`,
       id: 'atomic-hold',
       title: 'Checks and takes the slot map inside one Lua script',
       detail:
-        'The decision and the write are one `EVAL`/`EVALSHA` run over the slot map and the hold key — `HEXISTS` then `HSET` inside the same script. The draft asks Redis `HEXISTS` from the client and writes the hold in a later call, so two requests race.',
+        'The decision and the write are one `EVAL`/`EVALSHA` run over the slot map and the hold key — `HEXISTS` then `HSET` inside the same script. The starter asks Redis `HEXISTS` from the client and writes the hold in a later call, so two requests race.',
       match: {
         python: {all: [/TAKE_HOLD_SCRIPT/, /redis\.call\('HEXISTS'/, /redis\.call\('HSET'/], none: [/\.hexists\(/]},
         typescript: {all: [/TAKE_HOLD_SCRIPT/, /redis\.call\('HEXISTS'/, /redis\.call\('HSET'/], none: [/\.hexists\(/]},
@@ -70,7 +70,7 @@ it deletes the hold key on cancellation without checking who owns the slot.`,
       id: 'hold-ttl',
       title: 'Expires the hold after the 900 s payment window',
       detail:
-        'The hold key is written with `EX ttl` from a `900`-second constant, so an abandoned checkout frees its slots when the window closes. The draft writes a hold key that never expires.',
+        'The hold key is written with `EX ttl` from a `900`-second constant, so an abandoned checkout frees its slots when the window closes. The starter writes a hold key that never expires.',
       match: {
         python: {all: [/HOLD_TTL_S/, /redis\.call\('SET', hold_key, 'held', 'EX', ttl\)/]},
         typescript: {all: [/HOLD_TTL_S/, /redis\.call\('SET', hold_key, 'held', 'EX', ttl\)/]},
@@ -83,7 +83,7 @@ it deletes the hold key on cancellation without checking who owns the slot.`,
       id: 'single-winner',
       title: 'Lets exactly one of two concurrent requests win',
       detail:
-        'The script returns `0` when any requested slot is already present and the caller turns that into a `slot_taken` conflict, so a losing request takes nothing at all. The draft writes the slots it could check and returns a plain boolean.',
+        'The script returns `0` when any requested slot is already present and the caller turns that into a `slot_taken` conflict, so a losing request takes nothing at all. The starter writes the slots it could check and returns a plain boolean.',
       match: {
         python: {all: [/return 0/, /slot_taken/, /def reserve\(/]},
         typescript: {all: [/return 0/, /slot_taken/, /function reserve\(/]},
@@ -96,7 +96,7 @@ it deletes the hold key on cancellation without checking who owns the slot.`,
       id: 'release-guarded',
       title: 'Frees a slot only while it still points at this hold',
       detail:
-        'The release path runs in a script and deletes a slot field only when its value is still this hold id, so a slot a later request re-booked is never freed. The draft deletes the hold key and leaves the map alone.',
+        'The release path runs in a script and deletes a slot field only when its value is still this hold id, so a slot a later request re-booked is never freed. The starter deletes the hold key and leaves the map alone.',
       match: {
         python: {all: [/def release_hold\(/, /local released = 0/, /redis\.call\('HDEL'/, /== hold_id/]},
         typescript: {all: [/function releaseHold\(/, /local released = 0/, /redis\.call\('HDEL'/, /== hold_id/]},
@@ -109,7 +109,7 @@ it deletes the hold key on cancellation without checking who owns the slot.`,
       id: 'confirm-converts',
       title: 'Converts a confirmed hold without re-entering the free set',
       detail:
-        'Confirmation rewrites each slot field to `booked:{booking_id}` and rewrites the hold key without a TTL, so the payment window can never expire a booking back into the free set. The draft just drops the hold key.',
+        'Confirmation rewrites each slot field to `booked:{booking_id}` and rewrites the hold key without a TTL, so the payment window can never expire a booking back into the free set. The starter just drops the hold key.',
       match: {
         python: {
           all: [/def confirm_hold\(/, /'booked:' \.\. booking_id/, /redis\.call\('SET', hold_key, 'confirmed'\)/],
@@ -135,7 +135,7 @@ def slots_key(resource_id: str) -> str:
 
 
 def take_hold(resource_id: str, slot_fields: list[str], hold_id: str) -> bool:
-    # TODO: this draft checks the slot map with HEXISTS from the client and writes the hold in a
+    # TODO: this starter checks the slot map with HEXISTS from the client and writes the hold in a
     # later call, so two concurrent requests both see a free slot and both book; its hold key has
     # no TTL, so an abandoned checkout blocks the slot forever; and confirming just deletes the
     # hold key. Make the take atomic, give the hold a TTL of 900 seconds, and convert the hold.
@@ -253,7 +253,7 @@ export function slotsKey(resourceId: string): string {
 }
 
 export async function takeHold(resourceId: string, slotFields: string[], holdId: string): Promise<boolean> {
-  // TODO: this draft checks the slot map with HEXISTS from the client and writes the hold in a
+  // TODO: this starter checks the slot map with HEXISTS from the client and writes the hold in a
   // later call, so two concurrent requests both see a free slot and both book; its hold key has no
   // TTL, so an abandoned checkout blocks the slot forever; and confirming just deletes the hold
   // key. Make the take atomic, give the hold a TTL of 900 seconds, and convert the hold.
@@ -385,7 +385,7 @@ func slotsKey(resourceID string) string {
 }
 
 func takeHold(ctx context.Context, resourceID string, slotFields []string, holdID string) (bool, error) {
-	// TODO: this draft checks the slot map with HExists from the client and writes the hold in a
+	// TODO: this starter checks the slot map with HExists from the client and writes the hold in a
 	// later call, so two concurrent requests both see a free slot and both book; its hold key has
 	// no TTL, so an abandoned checkout blocks the slot forever; and confirming just deletes the
 	// hold key. Make the take atomic, give the hold a TTL of 900 seconds, and convert the hold.
@@ -529,7 +529,7 @@ object HoldMap {
   def slotsKey(resourceId: String): String = s"resource:$resourceId:slots"
 
   def takeHold(resourceId: String, slotFields: Seq[String], holdId: String): Boolean = {
-    // TODO: this draft checks the slot map with hexists from the client and writes the hold in a
+    // TODO: this starter checks the slot map with hexists from the client and writes the hold in a
     // later call, so two concurrent requests both see a free slot and both book; its hold key has
     // no TTL, so an abandoned checkout blocks the slot forever; and confirming just deletes the
     // hold key. Make the take atomic, give the hold a TTL of 900 seconds, and convert the hold.
@@ -646,7 +646,7 @@ std::string slotsKey(const std::string& resourceId) { return "resource:" + resou
 
 bool takeHold(const std::string& resourceId, const std::vector<std::string>& slotFields,
               const std::string& holdId) {
-  // TODO: this draft checks the slot map with hexists from the client and writes the hold in a
+  // TODO: this starter checks the slot map with hexists from the client and writes the hold in a
   // later call, so two concurrent requests both see a free slot and both book; its hold key has no
   // TTL, so an abandoned checkout blocks the slot forever; and confirming just deletes the hold
   // key. Make the take atomic, give the hold a TTL of 900 seconds, and convert the hold.

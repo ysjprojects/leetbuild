@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Game matchmaking on the AI-era track: the course is not "queue players and pair them", it is the
- * review you owe a model-generated matchmaker before it puts a player in two games. Validated
- * tickets with a one-open-ticket rule → one atomic Redis claim over every participant ticket that
- * also keeps the depth counters honest → a gRPC allocation with a deadline and a certain, idempotent
- * release on failure → match-id-keyed lifecycle events with "started" only after every join and an
- * outbox behind a rejected produce → a participant-scoped read that shows pending joins as pending.
+ * Game matchmaking: the course is not "queue players and pair them", it is the debugging you owe a
+ * matchmaker before it puts a player in two games. Validated tickets with a one-open-ticket rule →
+ * one atomic Redis claim over every participant ticket that also keeps the depth counters honest →
+ * a gRPC allocation with a deadline and a certain, idempotent release on failure → match-id-keyed
+ * lifecycle events with "started" only after every join and an outbox behind a rejected produce → a
+ * participant-scoped read that shows pending joins as pending.
  */
 export const gameMatchmakingProblem: Problem = {
   id: 'game-matchmaking',
@@ -20,7 +20,6 @@ export const gameMatchmakingProblem: Problem = {
   tagline: 'Skill-based matches that cannot duplicate players and release tickets on failure.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Game Matchmaking
 
@@ -68,12 +67,12 @@ One service, **matchmakerd**, with five pieces:
 5. \`GET /v1/matches/{id}\`: the roster, the server assignment, the per-player join state and the
    state-machine position, scoped to participants, with claimed-but-not-joined shown as pending.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real matchmaking feature: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Deduplication on the AI-era track: the course is not "call a similarity API", it is the review
- * you owe a model-generated dedupe layer before it merges a tenant's records. A tenant-scoped check
- * → one atomic Redis insert-and-check per key set → a similarity call with a deadline that degrades
- * to exact-only → dataset-keyed events carrying key hashes with an outbox → a cluster read that
- * refuses to bridge weak pairs without review and returns evidence for every link.
+ * Deduplication: the course is not "call a similarity API", it is the debugging you owe a dedupe
+ * layer before it merges a tenant's records. A tenant-scoped check → one atomic Redis
+ * insert-and-check per key set → a similarity call with a deadline that degrades to exact-only →
+ * dataset-keyed events carrying key hashes with an outbox → a cluster read that refuses to bridge
+ * weak pairs without review and returns evidence for every link.
  */
 export const dedupeServiceProblem: Problem = {
   id: 'dedupe-service',
@@ -19,7 +19,6 @@ export const dedupeServiceProblem: Problem = {
   tagline: 'Find duplicates by exact and fuzzy keys without cross-tenant leakage.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Deduplication
 
@@ -62,12 +61,12 @@ One service, **dedupd**, with five pieces:
 5. \`GET /v1/clusters/{id}\`: the member records, the per-pair merge evidence and the merge history,
    where a weak pair cannot bridge clusters without review and a foreign cluster is **404**.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real dedupe feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

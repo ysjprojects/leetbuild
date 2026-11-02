@@ -46,7 +46,7 @@ BrandLockup.displayName = 'BrandLockup';
 
 /** Copy the landing page opens with — real text, so it is already in place while the rest loads. */
 export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
-  ({stats = ['real systems', '5 languages', 'AI-era track', '1337 points']}) => (
+  ({stats = ['real systems', '5 languages', 'AI systems', '1337 points']}) => (
     <section className="border-ink-700 relative overflow-hidden border-b">
       <div
         aria-hidden

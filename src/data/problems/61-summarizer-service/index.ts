@@ -7,13 +7,13 @@ import {summarizerEventsStep} from './steps/4-events';
 import {summarizerReadStep} from './steps/5-read';
 
 /**
- * Summarization service on the AI-era track: the course is not "call a model and print a
- * paragraph", it is the review you owe a model-generated summarizer before anyone reads its output
- * as fact. A source reference with a hard byte cap and a length band that only the platform may
- * choose → a Redis progress record whose rolling summary and chunk counter move atomically under a
- * content hash → a gRPC call with a deadline whose failure becomes a labelled extractive fallback →
- * one `summary.done` event keyed by source hash carrying numbers and no text → a read that returns
- * sentence-level citations and marks the ones an edit invalidated stale.
+ * Summarization service: the course is not "call a model and print a paragraph", it is the
+ * debugging you owe a summarizer before anyone reads its output as fact. A source reference with a
+ * hard byte cap and a length band that only the platform may choose → a Redis progress record whose
+ * rolling summary and chunk counter move atomically under a content hash → a gRPC call with a
+ * deadline whose failure becomes a labelled extractive fallback → one `summary.done` event keyed by
+ * source hash carrying numbers and no text → a read that returns sentence-level citations and marks
+ * the ones an edit invalidated stale.
  */
 export const summarizerServiceProblem: Problem = {
   id: 'summarizer-service',
@@ -21,7 +21,7 @@ export const summarizerServiceProblem: Problem = {
   tagline: 'Summaries with bounded inputs, versioned length rules and no hallucinated events.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Summarization Service
 
@@ -71,12 +71,12 @@ One service, **summarizerd**, with five pieces:
 5. \`GET /v1/summaries/{id}\`: the summary with sentence-level citations into the named source hash,
    stale marking for citations into chunks an edit changed, and a \`404\` for another tenant's id.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

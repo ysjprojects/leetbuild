@@ -8,7 +8,7 @@ export const billingCursorStep: Step = {
   focus: ['billing', 'redis', 'processor', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it bills a period, records a
+**Starting point.** The starter is working code: it bills a period, records a
 marker and returns the charge reference, so the happy path passes. The run hides a lost race, a
 marker that cannot be reconciled, and an expiry that reopens a closed period. Find them, fix them,
 and prove the fix with the checks below.
@@ -35,7 +35,7 @@ Implement the billing run for one \`(subscription, period)\`:
   recharges a period that was already billed and closed.
 - Log the run with subscription, period and reference — never the customer's payment details.
 
-**Failure mode the checks target.** The draft charges before it claims anything, writes a bare
+**Failure mode the checks target.** The starter charges before it claims anything, writes a bare
 \`done\` marker afterwards, and gives that marker a month-long expiry. Every one of those is
 invisible in a demo that runs once and never crashes: the second run of the demo sees the marker, and
 the demo never crosses a month boundary.`,
@@ -67,7 +67,7 @@ the demo never crosses a month boundary.`,
       id: 'atomic-claim',
       title: 'Claims the run marker atomically before doing anything else',
       detail:
-        'The marker is claimed with a single `SET … NX` (one round trip), so exactly one runner per `(subscription, period)` can proceed. The draft has no claim at all — it charges first and writes the marker afterwards, so two retries can both charge.',
+        'The marker is claimed with a single `SET … NX` (one round trip), so exactly one runner per `(subscription, period)` can proceed. The starter has no claim at all — it charges first and writes the marker afterwards, so two retries can both charge.',
       match: {
         python: {all: [/claim_marker\(/, /nx=True/]},
         typescript: {all: [/claimMarker\(/, /['"]NX['"]/]},
@@ -80,7 +80,7 @@ the demo never crosses a month boundary.`,
       id: 'claim-before-charge',
       title: 'Claims the marker before the charge',
       detail:
-        'The claim happens before the processor call in the source order, so a run that cannot claim never charges. The draft charges first and records the marker afterwards.',
+        'The claim happens before the processor call in the source order, so a run that cannot claim never charges. The starter charges first and records the marker afterwards.',
       match: {
         python: {order: [/claim_marker\(/, /charge_invoice\(/]},
         typescript: {order: [/claimMarker\(/, /chargeInvoice\(/]},
@@ -93,7 +93,7 @@ the demo never crosses a month boundary.`,
       id: 'confirm-reference',
       title: 'Confirms the marker with the invoice reference',
       detail:
-        'After the charge the marker records the charge reference (`charged:{invoice_ref}`), so the marker and the charge reconcile. The draft writes a bare `done`, which cannot answer “was this period charged, and under which charge?”.',
+        'After the charge the marker records the charge reference (`charged:{invoice_ref}`), so the marker and the charge reconcile. The starter writes a bare `done`, which cannot answer “was this period charged, and under which charge?”.',
       match: {
         python: {all: [/confirm_marker\(/, /invoice_ref/], order: [/charge_invoice\(/, /confirm_marker\(/]},
         typescript: {all: [/confirmMarker\(/, /invoiceRef/], order: [/chargeInvoice\(/, /confirmMarker\(/]},
@@ -106,7 +106,7 @@ the demo never crosses a month boundary.`,
       id: 'closed-period-guard',
       title: 'Refuses a closed period without an explicit adjustment',
       detail:
-        'A period whose end is in the past answers **409** with `{"action_required": "adjustment"}` unless the caller passes the adjustment action, and an unconfirmed claim is reconciled with the processor instead of being charged again. The draft has neither guard.',
+        'A period whose end is in the past answers **409** with `{"action_required": "adjustment"}` unless the caller passes the adjustment action, and an unconfirmed claim is reconciled with the processor instead of being charged again. The starter has neither guard.',
       match: {
         python: {all: [/PERIOD_CLOSED/, /adjustment/, /409/]},
         typescript: {all: [/PERIOD_CLOSED/, /adjustment/, /409/]},
@@ -119,7 +119,7 @@ the demo never crosses a month boundary.`,
       id: 'marker-persists',
       title: 'The marker outlives the period it guards',
       detail:
-        'The run marker is keyed by `(subscription, period_start)` and carries no expiry, so a late retry can still see that the period was billed. The draft expires it after a month, and a retry after that expiry recharges a closed period.',
+        'The run marker is keyed by `(subscription, period_start)` and carries no expiry, so a late retry can still see that the period was billed. The starter expires it after a month, and a retry after that expiry recharges a closed period.',
       match: {
         python: {all: [/marker_key\(/, /subscription_id/, /period_start/], none: [/MONTH_TTL_S/]},
         typescript: {all: [/markerKey\(/, /subscriptionId/, /periodStart/], none: [/MONTH_TTL_S/]},
@@ -169,7 +169,7 @@ def charge_invoice(invoice) -> str:
 
 
 def run_billing(subscription_id: str, period, action: str | None = None) -> dict:
-    # TODO: a model-generated draft. It charges first and only then writes the marker, claims
+    # TODO: flawed code. It charges first and only then writes the marker, claims
     # nothing atomically, records a bare "done" with no charge reference, expires the marker after a
     # month, and has no guard for a closed period and no reconciliation for an in-flight run.
     invoice_ref = charge_invoice(period.invoice)
@@ -268,7 +268,7 @@ def start_run(body: RunRequest, tenant: str = Header(alias="X-Tenant-Id")) -> di
 `,
     },
     typescript: {
-      starter: `/** The billing run for one (subscription, period): a model-generated draft. */
+      starter: `/** The billing run for one (subscription, period): flawed code. */
 import {Redis} from 'ioredis';
 import Fastify from 'fastify';
 
@@ -303,7 +303,7 @@ export async function runBilling(
   period: Period,
   action?: string,
 ): Promise<{status: string; reference?: string}> {
-  // TODO: a model-generated draft. It charges first and only then writes the marker, claims nothing
+  // TODO: flawed code. It charges first and only then writes the marker, claims nothing
   // atomically, records a bare 'done' with no charge reference, expires the marker after a month,
   // and has no guard for a closed period and no reconciliation for an in-flight run.
   const invoiceRef = await chargeInvoice(period.invoice);
@@ -439,7 +439,7 @@ func ChargeInvoice(invoice Invoice) (string, error) {
 
 // RunBilling bills one period of one subscription.
 func RunBilling(ctx context.Context, subscriptionID string, period Period, action string) (map[string]any, error) {
-	// TODO: a model-generated draft. It charges first and only then writes the marker, claims
+	// TODO: flawed code. It charges first and only then writes the marker, claims
 	// nothing atomically, records a bare "done" with no charge reference, expires the marker after a
 	// month, and has no guard for a closed period and no reconciliation for an in-flight run.
 	invoiceRef, err := ChargeInvoice(period.Invoice)
@@ -610,7 +610,7 @@ object BillingRun {
     processor.Charge(ChargeRequest(invoice.id, invoice.amount_cents)).chargeId
 
   def runBilling(subscriptionId: String, period: Period, action: Option[String]): Map[String, String] = {
-    // TODO: a model-generated draft. It charges first and only then writes the marker, claims
+    // TODO: flawed code. It charges first and only then writes the marker, claims
     // nothing atomically, records a bare "done" with no charge reference, expires the marker after a
     // month, and has no guard for a closed period and no reconciliation for an in-flight run.
     val invoiceRef = chargeInvoice(period.invoice)
@@ -750,7 +750,7 @@ std::string chargeInvoice(const Invoice& invoice) {
 
 // RunBilling bills one period of one subscription.
 json runBilling(const std::string& subscription_id, const Period& period, const std::string& action) {
-  // TODO: a model-generated draft. It charges first and only then writes the marker, claims nothing
+  // TODO: flawed code. It charges first and only then writes the marker, claims nothing
   // atomically, records a bare "done" with no charge reference, expires the marker after a month,
   // and has no guard for a closed period and no reconciliation for an in-flight run.
   const auto invoice_reference = chargeInvoice(period.invoice);

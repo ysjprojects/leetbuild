@@ -8,9 +8,9 @@ export const alertClientStep: Step = {
   focus: ['monitor', 'alerting', 'evaluator'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a threshold is crossed, an alert
-is raised and the on-call is paged. It hides three flaws, and the first one is why the page storm
-happened. Review it, fix it, and prove the fix.
+**Starting point.** The starter is working code: a threshold is crossed, an alert is raised and the
+on-call is paged. It hides three flaws, and the first one is why the page storm happened. Debug it,
+fix it, and prove the fix.
 
 When an evaluated window crosses the alert threshold, the monitor raises an alert over **gRPC**:
 
@@ -18,14 +18,14 @@ When an evaluated window crosses the alert threshold, the monitor raises an aler
   slow alerting service cannot pin the evaluator or the queue behind it.
 - The alert is **deduplicated per (monitor, window) with a cooldown**: the key
   \`alert:{monitor_id}:{window}\` is claimed with a **write-once** set carrying \`COOLDOWN_S = 300\`
-  seconds of expiry, and the claim happens **before** the call. The draft raises one alert per batch
+  seconds of expiry, and the claim happens **before** the call. The starter raises one alert per batch
   tick above the threshold, which is 400 pages an hour from one monitor.
 - The payload carries the **evidence**: the metric, the distance, the threshold, **both window
   boundaries** and the **sample counts** on each side (\`sample_count\`, \`baseline_sample_count\`). The
-  draft sends the distance alone, so a responder cannot judge significance.
+  starter sends the distance alone, so a responder cannot judge significance.
 - A failed call is **retried with backoff** (\`MAX_ATTEMPTS = 3\`, exponential from \`BACKOFF_MS\`),
   never dropped silently: after the attempts are exhausted the claim is released and a
-  \`alert:pending:{monitor_id}\` marker records the alert for the next evaluation. The draft calls once
+  \`alert:pending:{monitor_id}\` marker records the alert for the next evaluation. The starter calls once
   and logs the failure.
 
 **Failure mode the checks target.** An alert storm is a monitor that is technically correct and
@@ -60,7 +60,7 @@ alert — it throttles ticks, not drift.`,
       id: 'deadline',
       title: 'Every attempt carries a one-second deadline',
       detail:
-        'The call is created with a 1-second deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. The draft has none, so a stalled alerting service holds the evaluator open indefinitely.',
+        'The call is created with a 1-second deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. The starter has none, so a stalled alerting service holds the evaluator open indefinitely.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1\.0/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -73,7 +73,7 @@ alert — it throttles ticks, not drift.`,
       id: 'dedupe-cooldown',
       title: 'Claims one alert per (monitor, window) with a cooldown',
       detail:
-        'The dedupe key `alert:{monitor_id}:{window}` is claimed with a write-once set that also carries the `COOLDOWN_S` expiry (`nx=True`, `NX`, `SetNX`, `SetParams…nx()`, `UpdateType::NOT_EXIST`). The draft alerts on every tick, so one crossing pages forever.',
+        'The dedupe key `alert:{monitor_id}:{window}` is claimed with a write-once set that also carries the `COOLDOWN_S` expiry (`nx=True`, `NX`, `SetNX`, `SetParams…nx()`, `UpdateType::NOT_EXIST`). The starter alerts on every tick, so one crossing pages forever.',
       match: {
         python: {all: [/COOLDOWN_S/, /nx=True/, /alert_key\(/]},
         typescript: {all: [/COOLDOWN_S/, /['"]NX['"]/, /alertKey\(/]},
@@ -86,7 +86,7 @@ alert — it throttles ticks, not drift.`,
       id: 'payload-evidence',
       title: 'Sends the counts and both window boundaries',
       detail:
-        'The request carries `sample_count`, `baseline_sample_count`, `window_start` and `window_end` alongside the distance and threshold. The draft sends the distance alone, so nobody can tell 20 samples from 20 000.',
+        'The request carries `sample_count`, `baseline_sample_count`, `window_start` and `window_end` alongside the distance and threshold. The starter sends the distance alone, so nobody can tell 20 samples from 20 000.',
       match: {
         python: {all: [/sample_count/, /baseline_sample_count/, /window_start/, /window_end/]},
         typescript: {all: [/sample_count/, /baseline_sample_count/, /window_start/, /window_end/]},
@@ -99,7 +99,7 @@ alert — it throttles ticks, not drift.`,
       id: 'retry-backoff',
       title: 'Retries the failed alert with backoff instead of dropping it',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and spaced by an exponential backoff built from `BACKOFF_MS`/`BACKOFF_S`. The draft makes exactly one call, logs the failure and loses the alert that mattered.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and spaced by an exponential backoff built from `BACKOFF_MS`/`BACKOFF_S`. The starter makes exactly one call, logs the failure and loses the alert that mattered.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /BACKOFF_S/, /time\.sleep\(/]},
         typescript: {all: [/MAX_ATTEMPTS/, /BACKOFF_MS/, /setTimeout\(/]},
@@ -112,7 +112,7 @@ alert — it throttles ticks, not drift.`,
       id: 'claim-before-call',
       title: 'Claims the dedupe key before raising the alert',
       detail:
-        'The key is claimed before the alert call, so a second tick that sees the claim skips the page; claiming after the call leaves a window where two concurrent ticks both alert. The draft has no claim at all.',
+        'The key is claimed before the alert call, so a second tick that sees the claim skips the page; claiming after the call leaves a window where two concurrent ticks both alert. The starter has no claim at all.',
       match: {
         python: {order: [/alert_key\(/, /alerting\.Raise\(/]},
         typescript: {order: [/alertKey\(/, /alerting\.Raise\(/]},
@@ -147,8 +147,8 @@ def evaluate(
     window_end: int,
     counts: dict[str, int],
 ) -> bool:
-    # TODO: this draft alerts on every batch tick above the threshold with no dedupe and no cooldown,
-    # sends a payload without the sample counts, and drops the alert when the call fails. Review all
+    # TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
+    # sends a payload without the sample counts, and drops the alert when the call fails. Fix all
     # three.
     if distance < THRESHOLD:
         return False
@@ -230,7 +230,7 @@ def raise_alert(
 `,
     },
     typescript: {
-      starter: `/** Alert evaluation over gRPC: a model-generated draft. */
+      starter: `/** Alert evaluation over gRPC: flawed code. */
 import {alerting, type AlertRequest} from './alerting';
 
 const THRESHOLD = 0.2;
@@ -243,8 +243,8 @@ export async function evaluate(
   window_end: number,
   counts: Record<string, number>,
 ): Promise<boolean> {
-  // TODO: this draft alerts on every batch tick above the threshold with no dedupe and no cooldown,
-  // sends a payload without the sample counts, and drops the alert when the call fails. Review all
+  // TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
+  // sends a payload without the sample counts, and drops the alert when the call fails. Fix all
   // three.
   if (distance < THRESHOLD) return false;
   const request: AlertRequest = {monitor_id: monitorId, metric, distance};
@@ -338,8 +338,8 @@ const threshold = 0.2
 var alerting pb.AlertingClient
 
 func evaluate(ctx context.Context, monitorID, metric string, distance float64, window int64, counts map[string]int64) bool {
-	// TODO: this draft alerts on every batch tick above the threshold with no dedupe and no cooldown,
-	// sends a payload without the sample counts, and drops the alert when the call fails. Review all
+	// TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
+	// sends a payload without the sample counts, and drops the alert when the call fails. Fix all
 	// three.
 	if distance < threshold {
 		return false
@@ -455,8 +455,8 @@ object AlertClient {
       windowEnd: Long,
       counts: Map[String, Long],
   ): Boolean = {
-    // TODO: this draft alerts on every batch tick above the threshold with no dedupe and no cooldown,
-    // sends a payload without the sample counts, and drops the alert when the call fails. Review all
+    // TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
+    // sends a payload without the sample counts, and drops the alert when the call fails. Fix all
     // three.
     if (distance < Threshold) {
       return false
@@ -555,8 +555,8 @@ bool evaluate(const std::string& monitorId,
               double distance,
               long window,
               const std::map<std::string, long>& counts) {
-  // TODO: this draft alerts on every batch tick above the threshold with no dedupe and no cooldown,
-  // sends a payload without the sample counts, and drops the alert when the call fails. Review all
+  // TODO: this starter alerts on every batch tick above the threshold with no dedupe and no cooldown,
+  // sends a payload without the sample counts, and drops the alert when the call fails. Fix all
   // three.
   if (distance < kThreshold) return false;
   AlertRequest request;

@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Product catalog on the AI-era track: the course is not "CRUD a product", it is the review you owe
- * a model-generated publishing path before a shopper sees it. A draft version distinct from the
- * published one → one atomic Redis pointer swap → media and pricing validated under a deadline
- * before anything is published → product-keyed catalog events emitted after the snapshot commits →
- * a storefront read that serves the published version with cache headers naming it.
+ * Product catalog: the course is not "CRUD a product", it is the debugging you owe a publishing
+ * path before a shopper sees it. A draft version distinct from the published one → one atomic
+ * Redis pointer swap → media and pricing validated under a deadline before anything is published →
+ * product-keyed catalog events emitted after the snapshot commits → a storefront read that serves
+ * the published version with cache headers naming it.
  */
 export const productCatalogProblem: Problem = {
   id: 'product-catalog',
@@ -19,7 +19,6 @@ export const productCatalogProblem: Problem = {
   tagline: 'Published products that are versioned, atomically swapped and never half-visible.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Product Catalog
 
@@ -64,12 +63,12 @@ One service, **catalogd**, with five pieces:
 5. \`GET /v1/products/{id}\`: the published version for the caller's channel with cache headers that
    carry the version, and drafts only through a separate preview scope.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

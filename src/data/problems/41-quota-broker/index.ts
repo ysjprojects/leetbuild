@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Quota broker on the AI-era track: the course is not "count GPUs in a database", it is the review
- * you owe a model-generated capacity broker before it hands out scarce accelerators. Recorded,
- * authorized reservations → one atomic Redis take per (team, window) with an expiring key and a
- * real release → a deadline-bounded capacity confirmation that denies when it is unsure → team-keyed
- * quota events carrying amounts instead of identities, with an outbox → a read that reports the same
- * numbers the reserve path enforces.
+ * Quota broker: the course is not "count GPUs in a database", it is the debugging you owe a
+ * capacity broker before it hands out scarce accelerators. Recorded, authorized reservations → one
+ * atomic Redis take per (team, window) with an expiring key and a real release → a
+ * deadline-bounded capacity confirmation that denies when it is unsure → team-keyed quota events
+ * carrying amounts instead of identities, with an outbox → a read that reports the same numbers
+ * the reserve path enforces.
  */
 export const quotaBrokerProblem: Problem = {
   id: 'quota-broker',
@@ -20,7 +20,7 @@ export const quotaBrokerProblem: Problem = {
   tagline: 'Reserve scarce AI capacity per team atomically, deny when unsure and never over-issue.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Quota Broker
 
@@ -67,12 +67,12 @@ One service, the quota broker, with five pieces:
 5. \`GET /v1/quotas/{team}\`: quota, reserved, consumed and available read from the same ledger the
    reserve path writes, tenant-scoped, with the window required and validated.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

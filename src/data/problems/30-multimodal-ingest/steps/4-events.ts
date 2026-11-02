@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['ingest', 'kafka', 'consumer', 'indexer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds the event, publishes it
+**Starting point.** The starter is working code: it builds the event, publishes it
 to \`asset.indexed\` and the consumer reacts. It hides a partition key that is not the asset, a payload
 that carries a permanent URL, and a publish that happens before anything is readable. Find them, fix
 them, and prove the fix.
@@ -22,12 +22,12 @@ Implement the \`asset.indexed\` producer used after an asset is embedded.
   \`degraded\`. It never carries a **URL** — a permanent object URL in a retained topic is a read
   credential that outlives the asset, the tenant and the retention policy.
 - Publish **after** the index write confirms: a consumer that reacts to an event must be able to read
-  the asset it names. The draft produces first and indexes second, so the consumer races the writer.
+  the asset it names. The starter produces first and indexes second, so the consumer races the writer.
 - The producer is idempotent and waits for the leader: \`acks=all\` with \`enable.idempotence\`
   (\`idempotent: true\` in kafkajs, \`RequiredAcks: RequireAll\` in kafka-go). A retry after a timeout
   must not duplicate an event, and a broker that has not acknowledged must not look like success.
 - When the produce is **rejected**, write an **outbox row** (\`asset_events_outbox\`) with the topic,
-  key, payload and error, and let the relay republish it. The draft drops the event on the floor.
+  key, payload and error, and let the relay republish it. The starter drops the event on the floor.
 
 **Failure mode the checks target.** The URL is the subtle one: the demo works, the consumer works, and
 the payload looks helpful. What it actually does is hand a durable, replayable pointer to the original
@@ -61,7 +61,7 @@ usually loses.`,
       id: 'topic-key',
       title: 'Publishes asset.indexed keyed by asset id',
       detail:
-        'The record goes to the `asset.indexed` topic with the asset id as its key, so one asset’s events share a partition. The draft keys by uploader, which orders unrelated assets against each other.',
+        'The record goes to the `asset.indexed` topic with the asset id as its key, so one asset’s events share a partition. The starter keys by uploader, which orders unrelated assets against each other.',
       match: {
         python: {all: [/asset\.indexed/, /key=asset_id/]},
         typescript: {all: [/asset\.indexed/, /key: assetId/]},
@@ -87,7 +87,7 @@ usually loses.`,
       id: 'publish-after-index',
       title: 'Publishes only after the index write confirms',
       detail:
-        'The index upsert comes first and the produce second, in both the source order and the call order. The draft produces first, so a consumer can react to an asset it cannot read yet.',
+        'The index upsert comes first and the produce second, in both the source order and the call order. The starter produces first, so a consumer can react to an asset it cannot read yet.',
       match: {
         python: {order: [/\.upsert\(/, /\.produce\(/]},
         typescript: {order: [/\.upsert\(/, /\.send\(/]},
@@ -125,7 +125,7 @@ usually loses.`,
   ],
   code: {
     python: {
-      starter: `"""events.py — the asset.indexed event. A model-generated draft."""
+      starter: `"""events.py — the asset.indexed event. The starter."""
 
 import json
 
@@ -137,7 +137,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_indexed(event: dict) -> None:
-    # TODO: this draft keys by uploader instead of the asset, ships the permanent object URL into a
+    # TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
     # retained topic, publishes before the index write confirms, and drops the event when the
     # broker rejects it.
     payload = json.dumps(
@@ -225,7 +225,7 @@ def ingest(index, store, asset: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** events.ts — the asset.indexed event. A model-generated draft. */
+      starter: `/** events.ts — the asset.indexed event. The starter. */
 import {Kafka} from 'kafkajs';
 
 export const TOPIC = 'asset.indexed';
@@ -239,7 +239,7 @@ interface AssetEvent {
 }
 
 export async function publishIndexed(event: AssetEvent): Promise<void> {
-  // TODO: this draft keys by uploader instead of the asset, ships the permanent object URL into a
+  // TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
   // retained topic, publishes before the index write confirms, and drops the event when the broker
   // rejects it.
   await producer.send({
@@ -349,7 +349,7 @@ var writer = &kafka.Writer{
 }
 
 func publishIndexed(ctx context.Context, event IndexedEvent) error {
-	// TODO: this draft keys by uploader instead of the asset, ships the permanent object URL into a
+	// TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
 	// retained topic, publishes before the index write confirms, and drops the event when the
 	// broker rejects it.
 	payload, err := json.Marshal(map[string]any{
@@ -456,7 +456,7 @@ object Events {
   private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
   def publishIndexed(event: IndexedEvent): Unit = {
-    // TODO: this draft keys by uploader instead of the asset, ships the permanent object URL into a
+    // TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
     // retained topic, publishes before the index write confirms, and drops the event when the
     // broker rejects it.
     val payload = s"""{"asset_id":"\${event.asset_id}","uploader":"\${event.uploader}","object_url":"https://objects.internal/\${event.asset_id}.png"}"""
@@ -537,7 +537,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 auto producer = make_producer();
 
 void publish_indexed(const json& event) {
-  // TODO: this draft keys by uploader instead of the asset, ships the permanent object URL into a
+  // TODO: this starter keys by uploader instead of the asset, ships the permanent object URL into a
   // retained topic, publishes before the index write confirms, and drops the event when the broker
   // rejects it.
   const auto uploader = event.at("uploader").get<std::string>();
@@ -627,7 +627,7 @@ void ingest(IndexClient& index, const Asset& asset) {
 `,
     },
   },
-  debrief: `The interviewer is testing what an event is allowed to contain. The draft's payload is the shape a
+  debrief: `The interviewer is testing what an event is allowed to contain. The starter's payload is the shape a
 model reaches for when it is asked to "notify the rest of the platform": the id, who did it, and where
 the file is. That last field is the bug — a URL that lives for weeks in a retained, replicated topic is
 a read credential nobody signed, and the read endpoint's 15-minute expiry is bypassed by whoever reads

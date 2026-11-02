@@ -7,8 +7,8 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Returns processing on the AI-era track: the course is not "accept a return and refund it", it is
- * the review you owe a model-generated returns service before it counts a customer's money twice.
+ * Returns processing: the course is not "accept a return and refund it", it is
+ * the debugging you owe a returns service before it counts a customer's money twice.
  * Measured eligibility → atomic returnable quantities → inspection that gates refunds → events
  * keyed by return → a read that never shows a refund the processor has not confirmed.
  */
@@ -18,7 +18,6 @@ export const returnsProcessingProblem: Problem = {
   tagline: 'Return requests measured against policy, inspected before refunds and visible end to end.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Returns Processing
 
@@ -58,12 +57,12 @@ One service, **returnsd**, with five pieces:
 5. \`GET /v1/returns/{id}\`: the return's state, grade, refund linkage and original order line,
    scoped to the order's owner, where \`refunded\` means the processor confirmed it.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

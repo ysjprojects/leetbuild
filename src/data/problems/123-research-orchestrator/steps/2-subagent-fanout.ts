@@ -8,10 +8,10 @@ export const subagentFanoutStep: Step = {
   focus: ['lead', 'subagent'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it asks the planner for
+**Starting point.** The starter is working code: it asks the planner for
 subtasks, runs each through \`Subagent.Run\` and synthesises the replies. It compiles, it answers the
 demo query, and it hides four production flaws — the four the source names when it describes what
-went wrong with its early lead agents. Review it, fix it, and prove the fix.
+went wrong with its early lead agents. Debug it, fix it, and prove the fix.
 
 Implement \`run_research(job_id, query, budget)\` for the lead agent:
 
@@ -77,7 +77,7 @@ the synthesis degrades without any error being raised.`,
       id: 'parallel',
       title: 'Runs subagents in parallel batches of at most five',
       detail:
-        'Subagents run concurrently — `asyncio.gather`, `Promise.all`, a `WaitGroup`, `Future.sequence`, `std::async` — in windows of `MAX_PARALLEL_SUBAGENTS = 5`. The draft awaits each subagent before starting the next.',
+        'Subagents run concurrently — `asyncio.gather`, `Promise.all`, a `WaitGroup`, `Future.sequence`, `std::async` — in windows of `MAX_PARALLEL_SUBAGENTS = 5`. The starter awaits each subagent before starting the next.',
       match: {
         python: {all: [/MAX_PARALLEL_SUBAGENTS\s*=\s*5/, /asyncio\.gather\(/]},
         typescript: {all: [/MAX_PARALLEL_SUBAGENTS\s*=\s*5/, /Promise\.all\(/]},
@@ -90,7 +90,7 @@ the synthesis degrades without any error being raised.`,
       id: 'fanout-cap',
       title: 'Caps the fan-out by the job budget',
       detail:
-        'The number of subagents is bounded by `budget.max_subagents` — the plan is cut to it and the batch width is `min(MAX_PARALLEL_SUBAGENTS, budget.max_subagents)`. The draft runs every task the planner returns.',
+        'The number of subagents is bounded by `budget.max_subagents` — the plan is cut to it and the batch width is `min(MAX_PARALLEL_SUBAGENTS, budget.max_subagents)`. The starter runs every task the planner returns.',
       match: {
         python: {all: [/min\([^)]*max_subagents/, /\[\s*:\s*budget\["max_subagents"\]\s*\]/]},
         typescript: {all: [/Math\.min\([^)]*max_subagents/, /\.slice\(\s*0\s*,\s*budget\.max_subagents\s*\)/]},
@@ -103,7 +103,7 @@ the synthesis degrades without any error being raised.`,
       id: 'task-spec',
       title: 'Each task carries objective, output format, tools and boundaries',
       detail:
-        'The `Run` request is built with all four fields of the task description the source prescribes: `objective`, `output_format`, `tools`, `boundaries`. The draft sends only the objective.',
+        'The `Run` request is built with all four fields of the task description the source prescribes: `objective`, `output_format`, `tools`, `boundaries`. The starter sends only the objective.',
       match: {
         python: {all: [/objective=/, /output_format=/, /tools=/, /boundaries=/]},
         typescript: {all: [/objective:/, /output_format:/, /tools:/, /boundaries:/]},
@@ -116,7 +116,7 @@ the synthesis degrades without any error being raised.`,
       id: 'condense',
       title: 'Carries the condensed findings, never the transcript',
       detail:
-        'Synthesis receives `findings` cut to `MAX_FINDINGS_CHARS = 4000` per subagent; `transcript` is never read. The draft forwards the whole transcript into the lead’s context.',
+        'Synthesis receives `findings` cut to `MAX_FINDINGS_CHARS = 4000` per subagent; `transcript` is never read. The starter forwards the whole transcript into the lead’s context.',
       match: {
         python: {all: [/MAX_FINDINGS_CHARS\s*=\s*4000/, /\.findings/], none: [/\.transcript/]},
         typescript: {all: [/MAX_FINDINGS_CHARS\s*=\s*4000/, /\.findings/], none: [/\.transcript/]},
@@ -148,8 +148,8 @@ def synthesize(query: str, notes: list[str]) -> str:
 
 
 async def run_research(job_id: str, query: str, budget: dict) -> str:
-    # TODO: this draft runs subagents one after another with no deadline, lets the planner decide
-    # how many to spawn, sends a bare objective, and forwards each transcript. Review all four.
+    # TODO: this starter runs subagents one after another with no deadline, lets the planner decide
+    # how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
     notes: list[str] = []
     for task in plan(query):
         request = agents_pb2.RunRequest(job_id=job_id, task_id=task["id"], objective=task["objective"])
@@ -209,7 +209,7 @@ async def run_research(job_id: str, query: str, budget: dict) -> str:
 `,
     },
     typescript: {
-      starter: `/** Lead agent: a model-generated draft that runs subagents one at a time and keeps their transcripts. */
+      starter: `/** Lead agent: flawed code that runs subagents one at a time and keeps their transcripts. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -242,8 +242,8 @@ export interface Budget {
 }
 
 export async function runResearch(jobId: string, query: string, budget: Budget): Promise<string> {
-  // TODO: this draft runs subagents one after another with no deadline, lets the planner decide
-  // how many to spawn, sends a bare objective, and forwards each transcript. Review all four.
+  // TODO: this starter runs subagents one after another with no deadline, lets the planner decide
+  // how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
   const notes: string[] = [];
   for (const task of plan(query)) {
     const reply = await new Promise<RunReply>((resolve, reject) => {
@@ -364,8 +364,8 @@ type Task struct {
 func plan(ctx context.Context, query string) ([]Task, error)      { return nil, nil }
 func synthesize(ctx context.Context, query string, notes []string) (string, error) { return "", nil }
 
-// TODO: this draft runs subagents one after another with no deadline, lets the planner decide
-// how many to spawn, sends a bare objective, and forwards each transcript. Review all four.
+// TODO: this starter runs subagents one after another with no deadline, lets the planner decide
+// how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
 func runResearch(ctx context.Context, client pb.SubagentClient, jobID, query string, budget Budget) (string, error) {
 	tasks, err := plan(ctx, query)
 	if err != nil {
@@ -480,8 +480,8 @@ object LeadAgent {
   def plan(query: String): List[Task] = ???
   def synthesize(query: String, notes: List[String]): String = ???
 
-  // TODO: this draft runs subagents one after another with no deadline, lets the planner decide
-  // how many to spawn, sends a bare objective, and forwards each transcript. Review all four.
+  // TODO: this starter runs subagents one after another with no deadline, lets the planner decide
+  // how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
   def runResearch(jobId: String, query: String, budget: Budget): String = {
     val notes = plan(query).map { task =>
       val reply = subagents.run(RunRequest(jobId = jobId, taskId = task.id, objective = task.objective))
@@ -569,8 +569,8 @@ struct Task {
 std::vector<Task> plan(const std::string& query);
 std::string synthesize(const std::string& query, const std::vector<std::string>& notes);
 
-// TODO: this draft runs subagents one after another with no deadline, lets the planner decide
-// how many to spawn, sends a bare objective, and forwards each transcript. Review all four.
+// TODO: this starter runs subagents one after another with no deadline, lets the planner decide
+// how many to spawn, sends a bare objective, and forwards each transcript. Fix all four.
 std::string runResearch(Subagent::Stub* subagents, const std::string& jobId, const std::string& query, const Budget& budget) {
   std::vector<std::string> notes;
   for (const auto& task : plan(query)) {

@@ -8,7 +8,7 @@ export const sessionStateStep: Step = {
   focus: ['gateway', 'redis', 'tts'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: on the happy path it records
+**Starting point.** The starter is working code: on the happy path it records
 the speaker and the playback offset and the call sounds right. It hides a race and a TTL bug. Find
 them, fix them, and prove the fix.
 
@@ -57,7 +57,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'atomic-barge-in',
       title: 'Barge-in is one atomic transition',
       detail:
-        'The speaker change, the turn index and the truncation of `tts_offset` happen inside one Lua script executed with `EVAL`. The draft issues two separate writes, so a frame can land between them and the agent speaks over the user.',
+        'The speaker change, the turn index and the truncation of `tts_offset` happen inside one Lua script executed with `EVAL`. The starter issues two separate writes, so a frame can land between them and the agent speaks over the user.',
       match: {
         python: {all: [/BARGE_IN_LUA/, /\.eval\(/]},
         typescript: {all: [/BARGE_IN_LUA/, /\.eval\(/]},
@@ -70,7 +70,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'ttl-refresh',
       title: 'Turn state expires after 30 idle seconds and is refreshed',
       detail:
-        'The state key gets a 30-second TTL and every frame refreshes it: `EXPIRE` runs inside the write. The draft never expires the key, so a dead session keeps a Redis hash forever.',
+        'The state key gets a 30-second TTL and every frame refreshes it: `EXPIRE` runs inside the write. The starter never expires the key, so a dead session keeps a Redis hash forever.',
       match: {
         python: {all: [/STATE_TTL_S/, /EXPIRE/]},
         typescript: {all: [/STATE_TTL_S/, /EXPIRE/]},
@@ -83,7 +83,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'fields',
       title: 'Keeps speaker, turn index and TTS offset together',
       detail:
-        'The hash carries `current_speaker`, `turn_index` and `tts_offset`, so a reader can tell who is speaking and where playback stopped. The draft stores only the speaker and an offset, so the turn index is re-derived and the two fields drift apart.',
+        'The hash carries `current_speaker`, `turn_index` and `tts_offset`, so a reader can tell who is speaking and where playback stopped. The starter stores only the speaker and an offset, so the turn index is re-derived and the two fields drift apart.',
       match: {
         python: {all: [/current_speaker/, /turn_index/, /tts_offset/]},
         typescript: {all: [/current_speaker/, /turn_index/, /tts_offset/]},
@@ -96,7 +96,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'truncate',
       title: 'Truncates the TTS stream at the delivered token',
       detail:
-        '`barge_in(session_id, delivered_tokens)` returns the `truncated_offset` (python `truncated_offset`, other languages `truncatedOffset`) that the gateway stops the stream at. The draft keeps playing the sentence the user just interrupted.',
+        '`barge_in(session_id, delivered_tokens)` returns the `truncated_offset` (python `truncated_offset`, other languages `truncatedOffset`) that the gateway stops the stream at. The starter keeps playing the sentence the user just interrupted.',
       match: {
         python: {all: [/barge_in\(/, /truncated_offset/]},
         typescript: {all: [/bargeIn\(/, /truncatedOffset/]},
@@ -109,7 +109,7 @@ a long answer, so both halves of the TTL contract matter.`,
       id: 'read-atomic',
       title: 'Reads the whole turn state in one round trip',
       detail:
-        'Speaker, turn index and offset are read with one `HMGET`, so the gateway never renders a state that is half updated. The draft reads the fields one at a time with `HGET`.',
+        'Speaker, turn index and offset are read with one `HMGET`, so the gateway never renders a state that is half updated. The starter reads the fields one at a time with `HGET`.',
       match: {
         python: {all: [/[Hh][Mm][Gg][Ee][Tt]\(/]},
         typescript: {all: [/[Hh][Mm][Gg][Ee][Tt]\(/]},
@@ -257,7 +257,7 @@ def session_state(session_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Turn state for one voice session: a model-generated draft that writes both fields by hand. */
+      starter: `/** Turn state for one voice session: flawed code that writes both fields by hand. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

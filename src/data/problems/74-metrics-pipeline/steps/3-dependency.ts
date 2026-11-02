@@ -8,10 +8,10 @@ export const dependencyStep: Step = {
   focus: ['api', 'shards'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it fans the flush out to every
+**Starting point.** The starter is working code: it fans the flush out to every
 shard, retries all of them after any failure and answers with one success bit. It compiles, it passes
 the demo because every shard is healthy and the first attempt lands, and it hides a double count, a
-retry storm and a lost window. Review it like the owner of the flush path, fix it, and prove the fix
+retry storm and a lost window. Debug it like the owner of the flush path, fix it, and prove the fix
 with the checks below.
 
 Windows aggregated in the window store are flushed to the shard writers over **gRPC** with
@@ -32,7 +32,7 @@ Windows aggregated in the window store are flushed to the shard writers over **g
 - The flush is complete only when every shard has accepted every window it owns. One shard's
   snippet succeeding is not completion.
 
-**Failure mode the checks target.** The draft loops every shard on every attempt and collapses the
+**Failure mode the checks target.** The starter loops every shard on every attempt and collapses the
 answers into one boolean. So a single failed shard re-sends windows the other shards already
 accepted — the rollup double-counts a minute that was already written — and a flush where one shard
 succeeded is reported as complete, so the windows nobody accepted are dropped and the minute quietly
@@ -68,7 +68,7 @@ the shard cannot tell a replay from a new window.`,
       id: 'deadline',
       title: 'Every shard call carries its own 2-second deadline',
       detail:
-        'Each `WriteWindows` goes out with a deadline taken from one constant — `FLUSH_DEADLINE_MS = 2000` — so a hung shard fails alone. The draft sends every call with no deadline at all, so one stuck shard holds the flush until the caller gives up.',
+        'Each `WriteWindows` goes out with a deadline taken from one constant — `FLUSH_DEADLINE_MS = 2000` — so a hung shard fails alone. The starter sends every call with no deadline at all, so one stuck shard holds the flush until the caller gives up.',
       match: {
         python: {all: [/FLUSH_DEADLINE_MS = 2000/, /timeout=FLUSH_DEADLINE_MS \/ 1000/]},
         typescript: {all: [/FLUSH_DEADLINE_MS = 2000/, /deadline: Date\.now\(\) \+ FLUSH_DEADLINE_MS/]},
@@ -93,7 +93,7 @@ the shard cannot tell a replay from a new window.`,
       id: 'per-shard-result',
       title: 'The flush reports which shards accepted which windows',
       detail:
-        'The result is keyed by shard and carries the accepted window ids, not a single success boolean. The draft returns one bit, so a partial flush is indistinguishable from a complete one and nothing can be resumed.',
+        'The result is keyed by shard and carries the accepted window ids, not a single success boolean. The starter returns one bit, so a partial flush is indistinguishable from a complete one and nothing can be resumed.',
       match: {
         python: {all: [/accepted_by_shard/, /dict\[str, list\[str\]\]/], none: [/-> bool\b/]},
         typescript: {all: [/acceptedByShard/, /Record<string, string\[\]>/], none: [/Promise<boolean>/]},
@@ -109,7 +109,7 @@ the shard cannot tell a replay from a new window.`,
       id: 'retry-failed-only',
       title: 'Retries iterate only the failed shards',
       detail:
-        'The retry loop is driven by the set of shards that did not answer accepted, and a shard leaves that set once it accepts — so an accepted window is never sent twice. The draft loops every shard on every attempt, which is how a healthy shard gets a window it already counted.',
+        'The retry loop is driven by the set of shards that did not answer accepted, and a shard leaves that set once it accepts — so an accepted window is never sent twice. The starter loops every shard on every attempt, which is how a healthy shard gets a window it already counted.',
       match: {
         python: {
           all: [/failed = dict\(windows\)/, /for shard in sorted\(failed\)/],
@@ -134,7 +134,7 @@ the shard cannot tell a replay from a new window.`,
       id: 'partial-resumable',
       title: 'A partial flush is visible and resumable',
       detail:
-        'Whatever the shards did not accept comes back as pending windows per shard, which is what the caller resumes on the next tick. The draft marks the flush complete the moment one shard’s snippet succeeds, so the unaccepted windows are lost.',
+        'Whatever the shards did not accept comes back as pending windows per shard, which is what the caller resumes on the next tick. The starter marks the flush complete the moment one shard’s snippet succeeds, so the unaccepted windows are lost.',
       match: {
         python: {all: [/result\.pending_by_shard\[shard\] = pending/], none: [/\breturn True\b/]},
         typescript: {all: [/result\.pendingByShard\[shard\] = failed\[shard\]/], none: [/\breturn true;/]},
@@ -147,7 +147,7 @@ the shard cannot tell a replay from a new window.`,
       id: 'window-id-idempotent',
       title: 'Windows carry an id the shard can dedupe by',
       detail:
-        'Each window travels as a window id (`{series}@{boundary}`) and the request sets `dedupe_by_window_id`, so an accepted window that races a retry is a no-op at the shard. The draft sends bare values with no id, so a re-sent window is counted twice.',
+        'Each window travels as a window id (`{series}@{boundary}`) and the request sets `dedupe_by_window_id`, so an accepted window that races a retry is a no-op at the shard. The starter sends bare values with no id, so a re-sent window is counted twice.',
       match: {
         python: {all: [/dedupe_by_window_id=True/, /window_ids/], none: [/windows=windows\[shard\]/]},
         typescript: {all: [/dedupeByWindowId: true/, /windowIds/], none: [/windows: windows\[shard\]/]},
@@ -169,7 +169,7 @@ RETRIES = 2
 
 
 def flush_windows(channels, boundary: int, windows: dict[str, list[str]]) -> bool:
-    # TODO: this draft retries every shard after any failure, sends windows without an id and
+    # TODO: this starter retries every shard after any failure, sends windows without an id and
     # reports one success bit, so a retry re-sends accepted windows and a partial flush looks
     # complete.
     for _ in range(RETRIES + 1):
@@ -263,7 +263,7 @@ export async function flushWindows(
   boundary: number,
   windows: Record<string, string[]>,
 ): Promise<boolean> {
-  // TODO: this draft retries every shard after any failure, sends windows without an id and
+  // TODO: this starter retries every shard after any failure, sends windows without an id and
   // reports one success bit, so a retry re-sends accepted windows and a partial flush looks complete.
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     let ok = false;
@@ -388,7 +388,7 @@ var shardWriters = map[string]string{"shard-a": "shard-a:9090", "shard-b": "shar
 // flushWindows sends the boundary to every shard, retries all of them after any failure and
 // answers with one success bit.
 func flushWindows(ctx context.Context, boundary int64, windows map[string][]string) bool {
-	// TODO: this draft retries every shard after any failure, sends windows without an id and
+	// TODO: this starter retries every shard after any failure, sends windows without an id and
 	// reports one success bit, so a retry re-sends accepted windows and a partial flush looks
 	// complete.
 	for attempt := 0; attempt <= retries; attempt++ {
@@ -512,7 +512,7 @@ object ShardFlush {
   val ShardWriters: Map[String, ManagedChannel] = Map.empty
   val MaxRetries: Int = 2
 
-  // TODO: this draft retries every shard after any failure, sends windows without an id and reports
+  // TODO: this starter retries every shard after any failure, sends windows without an id and reports
   // one success bit, so a retry re-sends accepted windows and a partial flush looks complete.
   def flushWindows(boundary: Long, windows: Map[String, Seq[String]]): Boolean = {
     var attempt = 0
@@ -629,7 +629,7 @@ static const int kMaxRetries = 2;
 
 static bool flush_windows(const std::map<std::string, std::shared_ptr<metrics::MetricsWriter::Stub>>& stubs,
                           long boundary, const std::map<std::string, std::vector<std::string>>& windows) {
-  // TODO: this draft retries every shard after any failure, sends windows without an id and reports
+  // TODO: this starter retries every shard after any failure, sends windows without an id and reports
   // one success bit, so a retry re-sends accepted windows and a partial flush looks complete.
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
     bool ok = false;
@@ -720,5 +720,5 @@ static FlushResult flush_windows(const std::map<std::string, std::shared_ptr<met
     'The response is the retry plan. Keep the accepted window ids per shard, drop the shards that answered accepted out of the failed set, and loop over what is left — a loop over all shards re-sends windows that are already counted.',
     'Give every window an id and let the shard dedupe it. Then a partial flush is just data: return the pending windows per shard so the next tick resumes them, and treat the flush as complete only when every shard accepted everything it owns.',
   ],
-  debrief: `The interviewer is testing whether you can review a fan-out client the way you would review a fan-out server call. The draft reads fine because the demo has healthy shards and one attempt always lands: it loops every shard on every retry, collapses the answers into one boolean, never sets a deadline, and sends windows as bare values. Five defects are checked here. A missing per-shard deadline lets one hung shard hold the flush past its budget; a single success bit makes a partial flush look complete, so nobody resumes it; a retry over all shards re-sends windows a shard already accepted and double-counts the minute; without a pending set the unaccepted windows are dropped rather than resumed; and without a window id the shard cannot tell a replay from a new window, which makes any retry unsafe. Real flush paths add jittered backoff with a per-shard attempt budget and a cap on how many windows fit in one call, an idempotency key carried by the window itself so the shard's write is a no-op on replay, and a reconciliation pass that compares each shard's accepted set against the window store before the boundary is closed.`,
+  debrief: `The interviewer is testing whether you can debug a fan-out client with the same care you would give a fan-out server call. The starter reads fine because the demo has healthy shards and one attempt always lands: it loops every shard on every retry, collapses the answers into one boolean, never sets a deadline, and sends windows as bare values. Five defects are checked here. A missing per-shard deadline lets one hung shard hold the flush past its budget; a single success bit makes a partial flush look complete, so nobody resumes it; a retry over all shards re-sends windows a shard already accepted and double-counts the minute; without a pending set the unaccepted windows are dropped rather than resumed; and without a window id the shard cannot tell a replay from a new window, which makes any retry unsafe. Real flush paths add jittered backoff with a per-shard attempt budget and a cap on how many windows fit in one call, an idempotency key carried by the window itself so the shard's write is a no-op on replay, and a reconciliation pass that compares each shard's accepted set against the window store before the boundary is closed.`,
 };

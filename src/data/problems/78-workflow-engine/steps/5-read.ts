@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'engine', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it answers
+**Starting point.** The starter is working code: it answers
 \`GET /v1/runs/{id}\` with the definition's newest step names and calls that the run's progress. It
-compiles, it serves the demo, and it hides three production flaws. Review it like the engine owner,
+compiles, it serves the demo, and it hides three production flaws. Debug it like the engine owner,
 fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/runs/{run_id}\`, the one read an operator makes while a run is stuck.
@@ -30,7 +30,7 @@ Implement \`GET /v1/runs/{run_id}\`, the one read an operator makes while a run 
   \`lease_holder\` and \`lease_age_s\`, so an operator knows which worker to look at instead of
   guessing. A moving run reports no lease at all.
 
-**Failure mode the checks target.** The draft resolves the definition's newest step list and calls
+**Failure mode the checks target.** The starter resolves the definition's newest step list and calls
 it the run's progress, so after any publish an operator reads a step the run is not on and debugs
 the wrong thing; it drops pending effects from the body, so the one field that explains a stuck run
 is missing; and it looks the run up by id alone, so any tenant can read any other tenant's run. All
@@ -74,7 +74,7 @@ three are invisible in the demo and obvious in an incident.`,
       id: 'route',
       title: 'Registers GET /v1/runs/{id}',
       detail:
-        '`GET /v1/runs/{run_id}` is registered. The draft registers the same route, so this check is the floor the other four build on.',
+        '`GET /v1/runs/{run_id}` is registered. The starter registers the same route, so this check is the floor the other four build on.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/runs\/\{run_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/runs\/:runId['"]/]},
@@ -87,7 +87,7 @@ three are invisible in the demo and obvious in an incident.`,
       id: 'tenant-scope',
       title: 'Scopes the run to the calling tenant',
       detail:
-        'The tenant comes from `X-Tenant-Id` (a missing tenant is **401**) and the run is fetched with `store.get(tenant, run_id)`; a run that belongs to another tenant, or does not exist, is **404** — never 403 and never a body, so run ids cannot be probed for existence. The draft looks the run up by id alone.',
+        'The tenant comes from `X-Tenant-Id` (a missing tenant is **401**) and the run is fetched with `store.get(tenant, run_id)`; a run that belongs to another tenant, or does not exist, is **404** — never 403 and never a body, so run ids cannot be probed for existence. The starter looks the run up by id alone.',
       match: {
         python: {all: [/X-Tenant-Id/, /store\.get\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/x-tenant-id/, /store\.get\(/, /code\(\s*404\s*\)/]},
@@ -100,7 +100,7 @@ three are invisible in the demo and obvious in an incident.`,
       id: 'pending',
       title: 'Reports the effects that are still pending',
       detail:
-        '`pending_effects` is the pinned steps whose effect never completed, computed as `ledger.incomplete(run_id, run.pinned_steps)`. The draft omits the field entirely, so the one thing an operator needs to know about a stuck run is missing.',
+        '`pending_effects` is the pinned steps whose effect never completed, computed as `ledger.incomplete(run_id, run.pinned_steps)`. The starter omits the field entirely, so the one thing an operator needs to know about a stuck run is missing.',
       match: {
         python: {all: [/pending_effects/, /ledger\.incomplete\(/]},
         typescript: {all: [/pending_effects/, /ledger\.incomplete\(/]},
@@ -113,7 +113,7 @@ three are invisible in the demo and obvious in an incident.`,
       id: 'stall',
       title: 'Names the lease holder and its age for a stalled run',
       detail:
-        'A run that has not advanced for longer than `STALL_AFTER_S` reports `lease_holder` and `lease_age_s`, so the operator knows which worker to look at. The draft reports no lease at all.',
+        'A run that has not advanced for longer than `STALL_AFTER_S` reports `lease_holder` and `lease_age_s`, so the operator knows which worker to look at. The starter reports no lease at all.',
       match: {
         python: {all: [/lease_holder/, /lease_age_s/, /STALL_AFTER_S/]},
         typescript: {all: [/lease_holder/, /lease_age_s/, /STALL_AFTER_S/]},
@@ -126,7 +126,7 @@ three are invisible in the demo and obvious in an incident.`,
       id: 'view',
       title: 'Reads the run checkpoint, not the newest definition',
       detail:
-        "The body reports the run's own `current_step` and `checkpoint_at`, and never the newest definition's step names. The draft calls `store.latest(...)` and answers with the definition instead of the run.",
+        "The body reports the run's own `current_step` and `checkpoint_at`, and never the newest definition's step names. The starter calls `store.latest(...)` and answers with the definition instead of the run.",
       match: {
         python: {all: [/current_step/, /checkpoint_at/], none: [/store\.latest\(/]},
         typescript: {all: [/current_step/, /checkpoint_at/], none: [/store\.latest\(/]},
@@ -158,9 +158,9 @@ store = RunStore()
 
 @app.get("/v1/runs/{run_id}")
 def read_run(run_id: str) -> JSONResponse:
-    # TODO: this draft answers from the newest definition's step names instead of the run's
+    # TODO: this starter answers from the newest definition's step names instead of the run's
     # checkpoint, hides the effects that are still pending, and serves any tenant's run - there is
-    # no tenant scope and no 404. Review all three.
+    # no tenant scope and no 404. Fix all three.
     definition = store.latest(run_id)
     logger.info("run read run=%s", run_id)
     return JSONResponse(
@@ -230,7 +230,7 @@ def read_run(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/runs/:runId: a model-generated draft that answers from the newest definition. */
+      starter: `/** GET /v1/runs/:runId: flawed code that answers from the newest definition. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -246,9 +246,9 @@ export const store: RunStore = {
 };
 
 app.get('/v1/runs/:runId', async (request, reply) => {
-  // TODO: this draft answers from the newest definition's step names instead of the run's
+  // TODO: this starter answers from the newest definition's step names instead of the run's
   // checkpoint, hides the effects that are still pending, and serves any tenant's run - there is
-  // no tenant scope and no 404. Review all three.
+  // no tenant scope and no 404. Fix all three.
   const {runId} = request.params as {runId: string};
   const definition = await store.latest(runId);
   request.log.info({runId}, 'run read');
@@ -344,9 +344,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft answers from the newest definition's step names instead of the run's
+	// TODO: this starter answers from the newest definition's step names instead of the run's
 	// checkpoint, hides the effects that are still pending, and serves any tenant's run - there is
-	// no tenant scope and no 404. Review all three.
+	// no tenant scope and no 404. Fix all three.
 	runID := r.PathValue("runId")
 	steps, _ := store.Latest(r.Context(), runID)
 	if steps == nil {
@@ -501,9 +501,9 @@ object RunReadApi {
   val route: Route =
     path("v1" / "runs" / Segment) { runId =>
       get {
-        // TODO: this draft answers from the newest definition's step names instead of the run's
+        // TODO: this starter answers from the newest definition's step names instead of the run's
         // checkpoint, hides the effects that are still pending, and serves any tenant's run -
-        // there is no tenant scope and no 404. Review all three.
+        // there is no tenant scope and no 404. Fix all three.
         val steps = store.latest(runId).map(_.steps).getOrElse(Nil)
         system.log.info(s"run read run=$runId")
         complete(
@@ -622,7 +622,7 @@ object RunReadApi {
 
 using json = nlohmann::json;
 
-// The draft stores definitions, not runs: the newest step list is all it can answer with.
+// The starter stores definitions, not runs: the newest step list is all it can answer with.
 struct DefinitionStore {
   std::optional<std::vector<std::string>> latest(const std::string& run_id);
 };
@@ -633,9 +633,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/runs/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft answers from the newest definition's step names instead of the run's
+    // TODO: this starter answers from the newest definition's step names instead of the run's
     // checkpoint, hides the effects that are still pending, and serves any tenant's run - there is
-    // no tenant scope and no 404. Review all three.
+    // no tenant scope and no 404. Fix all three.
     const auto runId = req.matches[1].str();
     const auto steps = store.latest(runId);
     json run = {
@@ -733,5 +733,5 @@ int main() {
     "The run's state lives in the checkpoint hash: `current_step`, `checkpoint_at`, `lease_holder`, `lease_at`, `last_error`. The definition's step names are a property of a version and change the moment someone publishes, so resolving them here reports a step the run is not on. The pinned steps are only an input to the ledger, never the answer.",
     'A stalled run is the one case where the lease matters: compare `now - checkpoint_at` against `STALL_AFTER_S` and only past it add `lease_holder` and `lease_age_s` (`now - lease_at`). Fill `pending_effects` from `ledger.incomplete(run_id, run.pinned_steps)` and report `last_error` as `null`, not by dropping the key.',
   ],
-  debrief: `The interviewer is testing whether you can review a read model over state that another component owns. The draft reads fine because the demo publishes one version, starts one run and never publishes again: the definition's step list and the run's step happen to agree, so nobody notices that the endpoint is describing the wrong object. Once a version 4 exists, an operator debugging version 3 is looking at a step the run will never execute, and the incident review blames the engine. The second defect is about the question an operator actually asks — a stalled run is not stuck because of where it is but because of what it is waiting on, and that is the ledger's answer, so a read that omits pending effects sends the operator to the wrong system. The third is tenancy: a run id is a guessable identifier, and a lookup that ignores the tenant turns a read endpoint into a cross-tenant leak, which is why a foreign run must answer 404 rather than 403 — a 403 confirms the id exists. In production this endpoint also reads from a replica or a projection rather than the coordination Redis, returns a cursor-friendly error summary instead of one error string, and treats a lease that is old but whose holder is still heartbeating as a different case from one whose holder has vanished.`,
+  debrief: `The interviewer is testing whether you can debug a read model over state that another component owns. The starter reads fine because the demo publishes one version, starts one run and never publishes again: the definition's step list and the run's step happen to agree, so nobody notices that the endpoint is describing the wrong object. Once a version 4 exists, an operator debugging version 3 is looking at a step the run will never execute, and the incident review blames the engine. The second defect is about the question an operator actually asks — a stalled run is not stuck because of where it is but because of what it is waiting on, and that is the ledger's answer, so a read that omits pending effects sends the operator to the wrong system. The third is tenancy: a run id is a guessable identifier, and a lookup that ignores the tenant turns a read endpoint into a cross-tenant leak, which is why a foreign run must answer 404 rather than 403 — a 403 confirms the id exists. In production this endpoint also reads from a replica or a projection rather than the coordination Redis, returns a cursor-friendly error summary instead of one error string, and treats a lease that is old but whose holder is still heartbeating as a different case from one whose holder has vanished.`,
 };

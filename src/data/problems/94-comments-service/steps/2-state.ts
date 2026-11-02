@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it writes the comment, bumps a
+**Starting point.** The starter is working code: it writes the comment, bumps a
 counter and pushes the thread onto a trending set. It compiles, the counters look right in a demo,
-and it hides two production flaws. Review it like the service owner, fix it, and prove the fix with
+and it hides two production flaws. Debug it like the service owner, fix it, and prove the fix with
 the checks below.
 
 Implement the counter and cache side of a comment write.
@@ -35,7 +35,7 @@ Implement the counter and cache side of a comment write.
   script or a restored backup: the counter must be derivable from the comments, so the store — not
   Redis — is the source of truth.
 
-**Failure mode the checks target.** The draft increments the thread counter with a **separate
+**Failure mode the checks target.** The starter increments the thread counter with a **separate
 command after the write**, so the two can disagree: crash after the insert and before the
 \`INCR\` and the thread silently loses a comment that is really there. And its hot-thread key omits
 the tenant (\`trending:threads\`), so one tenant's trending thread surfaces on another tenant's
@@ -67,7 +67,7 @@ single-threaded test.`,
       id: 'atomic',
       title: 'Commits the counters with the write in one script',
       detail:
-        'A single Lua script (`COMMIT_COMMENT_LUA`) bumps the counters inside the same transaction as the insert. The draft increments with a separate command after the write, so a crash between the two undercounts the thread permanently.',
+        'A single Lua script (`COMMIT_COMMENT_LUA`) bumps the counters inside the same transaction as the insert. The starter increments with a separate command after the write, so a crash between the two undercounts the thread permanently.',
       match: {
         python: {all: [/COMMIT_COMMENT_LUA/, /\.eval\(/, /INCR/]},
         typescript: {all: [/COMMIT_COMMENT_LUA/, /\.eval\(/, /INCR/]},
@@ -93,7 +93,7 @@ single-threaded test.`,
       id: 'hot-tenant',
       title: 'Scopes the hot-thread key to the tenant',
       detail:
-        'The hot set is `hot:{tenant}`. The draft uses one shared `trending:threads` key, so one tenant’s trending list is served to every other tenant.',
+        'The hot set is `hot:{tenant}`. The starter uses one shared `trending:threads` key, so one tenant’s trending list is served to every other tenant.',
       match: {
         python: {all: [/hot:\{tenant\}/]},
         typescript: {all: [/hot:\$\{tenant\}/]},
@@ -159,7 +159,7 @@ store = CommentStore()
 
 @app.post("/v1/comments")
 def create_comment(body: CommentRequest, tenant: str = Header(default="", alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft increments the thread counter with a separate command after the write, so a
+    # TODO: this starter increments the thread counter with a separate command after the write, so a
     # crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
     comment = {"thread_id": body.thread_id, "parent_id": body.parent_id, "text": body.text}
     store.insert(comment)
@@ -266,7 +266,7 @@ def hot_threads(tenant: str) -> list[str]:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/comments: a model-generated draft that counts after the write. */
+      starter: `/** POST /v1/comments: flawed code that counts after the write. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -284,7 +284,7 @@ interface CommentBody {
 }
 
 app.post('/v1/comments', async (request, reply) => {
-  // TODO: this draft increments the thread counter with a separate command after the write, so a
+  // TODO: this starter increments the thread counter with a separate command after the write, so a
   // crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as CommentBody;
@@ -417,7 +417,7 @@ func createComment(rw http.ResponseWriter, r *http.Request) {
 		rw.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	// TODO: this draft increments the thread counter with a separate command after the write, so a
+	// TODO: this starter increments the thread counter with a separate command after the write, so a
 	// crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
 	_ = store.Insert(r.Context(), &comment)
 	rdb.Incr(r.Context(), "thread_count:"+comment.ThreadID)
@@ -565,7 +565,7 @@ object CommentState {
   val jedis = new Jedis("redis", 6379)
   val store = CommentStore.open()
 
-  // TODO: this draft increments the thread counter with a separate command after the write, so a
+  // TODO: this starter increments the thread counter with a separate command after the write, so a
   // crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
   def createComment(tenant: String, comment: Comment): Long = {
     store.insert(comment)
@@ -660,7 +660,7 @@ struct Comment {
 
 CommentStore store;
 
-// TODO: this draft increments the thread counter with a separate command after the write, so a
+// TODO: this starter increments the thread counter with a separate command after the write, so a
 // crash between the two undercounts the thread, and it keeps one tenant-less hot-thread key.
 long long createComment(sw::redis::Redis& redis, const std::string& tenant, const Comment& comment) {
   store.insert(comment);

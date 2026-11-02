@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it returns the stored job and the demo shows a
+The starter is working code: it returns the stored job and the demo shows a
 result, so the read path looks done. It reports the wrong profile, serves the wrong tenant, and hands
 out output nobody verified. Find the flaws, fix them, and prove the fix.
 
@@ -17,7 +17,7 @@ Implement \`GET /v1/sandbox/jobs/{job_id}\`:
 - The tenant comes from \`X-Tenant-Id\` (**401** when missing). The job must belong to that tenant —
   a job id from another tenant is **404**, not a 403 that confirms the id exists and not a 200.
 - Only a **finished** job has a result: a queued or running job answers **409**, so a reader can
-  never mistake "not done yet" for "done". The draft returns whatever the record holds.
+  never mistake "not done yet" for "done". The starter returns whatever the record holds.
 - Report the isolation profile the runner **actually used** (\`used_profile\`), not the one the
   submitter requested. Provenance means the read path describes what ran, not what was asked for.
 - The response carries \`exit_code\` and \`usage\` (wall time, CPU time, peak memory, and whether the
@@ -25,7 +25,7 @@ Implement \`GET /v1/sandbox/jobs/{job_id}\`:
 - Every output is returned as a **digest-verified download**: recompute the digest of the stored
   output and compare it with the recorded one before publishing a URL. On mismatch answer **500**
   and serve nothing — a result whose bytes do not match its digest is not a result.
-- The draft also reads an expired job’s leftovers: a job whose lease lapsed without a result is not
+- The starter also reads an expired job’s leftovers: a job whose lease lapsed without a result is not
   a finished job, and the **409/404** path above must catch it.
 
 **Failure mode the checks target.** A read path that trusts the record is the last place a mistake
@@ -70,7 +70,7 @@ from reading another tenant’s program output by guessing an id.`,
       id: 'used-profile',
       title: 'Reports the isolation profile actually used',
       detail:
-        'The response carries the runner’s `used_profile`, not the profile the submitter requested. The draft reports the requested one, so a container that started weaker reads as if it had been isolated.',
+        'The response carries the runner’s `used_profile`, not the profile the submitter requested. The starter reports the requested one, so a container that started weaker reads as if it had been isolated.',
       match: {
         python: {all: [/used_profile/]},
         typescript: {all: [/used_profile/]},
@@ -83,7 +83,7 @@ from reading another tenant’s program output by guessing an id.`,
       id: 'digest-verify',
       title: 'Verifies the output digest before serving it',
       detail:
-        'The stored output is re-hashed and compared with the recorded digest (`verify_digest`); a mismatch is a 500 with no download. The draft hands out the raw output nobody checked.',
+        'The stored output is re-hashed and compared with the recorded digest (`verify_digest`); a mismatch is a 500 with no download. The starter hands out the raw output nobody checked.',
       match: {
         python: {all: [/def verify_digest\(/, /DIGEST_MISMATCH/]},
         typescript: {all: [/function verifyDigest/, /DIGEST_MISMATCH/]},
@@ -96,7 +96,7 @@ from reading another tenant’s program output by guessing an id.`,
       id: 'tenant-scope',
       title: 'A foreign or unknown job is 404',
       detail:
-        'The job id is looked up **with** the tenant, and a job belonging to someone else is **404**. The draft serves any tenant’s job by id — a cross-tenant read of another team’s program output.',
+        'The job id is looked up **with** the tenant, and a job belonging to someone else is **404**. The starter serves any tenant’s job by id — a cross-tenant read of another team’s program output.',
       match: {
         python: {all: [/tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/tenant/, /code\(\s*404\s*\)/]},
@@ -109,7 +109,7 @@ from reading another tenant’s program output by guessing an id.`,
       id: 'finished-only',
       title: 'Serves a result only for a finished job',
       detail:
-        'A queued, running or lease-expired job answers **409**, so the reader can tell "not done" from "done with no output". The draft returns a 200 for any record it finds.',
+        'A queued, running or lease-expired job answers **409**, so the reader can tell "not done" from "done with no output". The starter returns a 200 for any record it finds.',
       match: {
         python: {all: [/JOB_FINISHED/, /status_code\s*=\s*409/]},
         typescript: {all: [/JOB_FINISHED/, /code\(\s*409\s*\)/]},
@@ -219,7 +219,7 @@ def read_job(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/sandbox/jobs/:id: a model-generated draft that serves any job it finds. */
+      starter: `/** GET /v1/sandbox/jobs/:id: flawed code that serves any job it finds. */
 import Fastify from 'fastify';
 
 import {store} from './job_store';

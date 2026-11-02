@@ -8,11 +8,10 @@ export const dependencyStep: Step = {
   focus: ['api', 'demand', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: while the demand model
-answers, the happy path publishes a price and the demo passes. The failure paths are wrong — the
-draft serves its own cached suggestion as if it had just been computed, retries a deterministic
-constraint rejection, and gives the model no deadline at all. Review it, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter is working code: while the demand model answers, the happy path
+publishes a price and the demo passes. The failure paths are wrong — the starter serves its own
+cached suggestion as if it had just been computed, retries a deterministic constraint rejection,
+and gives the model no deadline at all. Debug it, fix it, and prove the fix with the checks below.
 
 Implement \`publish_from_demand(store, cache, sku, window, reason, update_id)\` for the demand client:
 
@@ -27,7 +26,7 @@ Implement \`publish_from_demand(store, cache, sku, window, reason, update_id)\` 
 - Every published price names its \`source\` (\`"demand-model"\` or \`"last-approved"\`) and its
   \`updated_at\`, so the storefront and the audit trail can tell a fresh computation from a fallback.
 
-**Failure mode the checks target.** The draft keeps the model’s last suggestion in a module-level
+**Failure mode the checks target.** The starter keeps the model’s last suggestion in a module-level
 variable and serves it on timeout with a fresh \`now()\`, no \`stale\` marker and no source, so a
 broken model freezes an experimental price into production as if it were newly computed. It also
 retries a \`FAILED_PRECONDITION\` constraint rejection, and it sends \`Estimate\` with no deadline at
@@ -55,7 +54,7 @@ all. Each of those is silent in a demo and loud in production.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `{deadline: …}`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. The draft sends `Estimate` with no deadline at all, so a hung model holds the request open forever.',
+    'The deadline is an argument on the call itself (`timeout=`, `{deadline: …}`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. The starter sends `Estimate` with no deadline at all, so a hung model holds the request open forever.',
     'A timeout is not a reason to serve the cached suggestion: read `last_approved(sku)` from the price store and republish that row with its own `updated_at` and `stale=true`, so the storefront can see how old the number it is charging really is.',
     'Retryability is a property of the status, not of “it threw”: compare the error’s code against `UNAVAILABLE` / `DEADLINE_EXCEEDED` and return `FAILED_PRECONDITION` — or anything else — to the caller immediately, because a constraint rejection is deterministic and a retry cannot change it.',
   ],
@@ -64,7 +63,7 @@ all. Each of those is silent in a demo and loud in production.`,
       id: 'deadline',
       title: 'Every Estimate call carries a 700 ms deadline',
       detail:
-        'The demand call is created with `DEADLINE_MS = 700` as a call timeout: `timeout=`, `{deadline: Date.now() + DEADLINE_MS}`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. Without it a stuck demand model pins the pricing worker until the caller gives up. The draft sends the call with no deadline.',
+        'The demand call is created with `DEADLINE_MS = 700` as a call timeout: `timeout=`, `{deadline: Date.now() + DEADLINE_MS}`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. Without it a stuck demand model pins the pricing worker until the caller gives up. The starter sends the call with no deadline.',
       match: {
         python: {all: [/DEADLINE_MS\s*=\s*700/, /timeout\s*=\s*DEADLINE_MS/, /\.Estimate\(/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*700/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.Estimate\(/]},
@@ -77,7 +76,7 @@ all. Each of those is silent in a demo and loud in production.`,
       id: 'last-approved-fallback',
       title: 'A timeout republishes the last approved price',
       detail:
-        'A `DEADLINE_EXCEEDED` (or `UNAVAILABLE`) call falls back to the price store’s `last_approved(sku)` and republishes that row instead of serving a cached suggestion. The draft’s module-level suggestion cache must be gone: a broken model cannot be allowed to keep publishing its last idea.',
+        'A `DEADLINE_EXCEEDED` (or `UNAVAILABLE`) call falls back to the price store’s `last_approved(sku)` and republishes that row instead of serving a cached suggestion. The starter’s module-level suggestion cache must be gone: a broken model cannot be allowed to keep publishing its last idea.',
       match: {
         python: {
           all: [/StatusCode\.DEADLINE_EXCEEDED/, /store\.last_approved\(/, /store\.publish\(/],
@@ -118,7 +117,7 @@ all. Each of those is silent in a demo and loud in production.`,
       id: 'terminal-rejection',
       title: 'A constraint rejection is terminal, not retried',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retryable. `FAILED_PRECONDITION` — the model refusing a proposal its guardrails reject — returns to the caller immediately, because a retry cannot change a deterministic answer. The draft retries every error, including the rejection.',
+        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retryable. `FAILED_PRECONDITION` — the model refusing a proposal its guardrails reject — returns to the caller immediately, because a retry cannot change a deterministic answer. The starter retries every error, including the rejection.',
       match: {
         python: {
           all: [
@@ -166,7 +165,7 @@ all. Each of those is silent in a demo and loud in production.`,
       id: 'provenance',
       title: 'Every published price names its source and a timestamp',
       detail:
-        'A published price carries `source` (`"demand-model"` or `"last-approved"`) and a timestamp (`updated_at`), so the storefront and the audit trail can tell a fresh computation from a fallback. The draft writes the model version with no source and no timestamp.',
+        'A published price carries `source` (`"demand-model"` or `"last-approved"`) and a timestamp (`updated_at`), so the storefront and the audit trail can tell a fresh computation from a fallback. The starter writes the model version with no source and no timestamp.',
       match: {
         python: {all: [/"demand-model"/, /"last-approved"/, /updated_at/]},
         typescript: {all: [/['"]demand-model['"]/, /['"]last-approved['"]/, /updated_at/]},
@@ -272,7 +271,7 @@ def publish_from_demand(store, cache, sku: str, window: int, reason: str, update
 `,
     },
     typescript: {
-      starter: `/** Demand client: a model-generated draft that caches the last suggestion and serves it on failure. */
+      starter: `/** Demand client: flawed code that caches the last suggestion and serves it on failure. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -824,5 +823,5 @@ PublishedPrice publish_from_demand(
 `,
     },
   },
-  debrief: `The demand model is an untrusted dependency with a deadline, and this step is the review you owe it. Three decisions separate a safe client from the draft. First, the deadline: a 700 ms budget on the call itself bounds one stuck model instead of letting it pin the pricing worker — a model that hangs is the normal failure, not the exceptional one. Second, the fallback: when the deadline fires, the honest answer is the last price the platform actually approved, republished with \`stale=true\` and the approved row's original \`updated_at\`. Serving the model's own last suggestion as if it were freshly computed is how a broken deployment freezes an experimental price into production — the number looks current, the reasoning is gone, and nobody can tell from the storefront. Third, the retryable set: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are worth another attempt, but \`FAILED_PRECONDITION\` is the model refusing a proposal its guardrails reject — a deterministic answer that no retry can change, so retrying it only burns the deadline and hides the rejection from the operator. Provenance closes the loop: every published price names \`source\` and \`updated_at\`, so the audit trail and the storefront can distinguish a computed price from a fallback long after the incident. Real clients add jittered backoff, a per-sku single-flight so concurrent estimates share one call, and a fallback that degrades further — to the last approved price with an operator alert — when the model stays down past the window.`,
+  debrief: `The demand model is an untrusted dependency with a deadline, and this step is the debugging you owe it. Three decisions separate a safe client from the starter. First, the deadline: a 700 ms budget on the call itself bounds one stuck model instead of letting it pin the pricing worker — a model that hangs is the normal failure, not the exceptional one. Second, the fallback: when the deadline fires, the honest answer is the last price the platform actually approved, republished with \`stale=true\` and the approved row's original \`updated_at\`. Serving the model's own last suggestion as if it were freshly computed is how a broken deployment freezes an experimental price into production — the number looks current, the reasoning is gone, and nobody can tell from the storefront. Third, the retryable set: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are worth another attempt, but \`FAILED_PRECONDITION\` is the model refusing a proposal its guardrails reject — a deterministic answer that no retry can change, so retrying it only burns the deadline and hides the rejection from the operator. Provenance closes the loop: every published price names \`source\` and \`updated_at\`, so the audit trail and the storefront can distinguish a computed price from a fallback long after the incident. Real clients add jittered backoff, a per-sku single-flight so concurrent estimates share one call, and a fallback that degrades further — to the last approved price with an operator alert — when the model stays down past the window.`,
 };

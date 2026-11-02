@@ -8,10 +8,10 @@ export const endpointStep: Step = {
   focus: ['client', 'search', 'engine'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers \`GET /v1/search\`,
+**Starting point.** The starter is working code: it registers \`GET /v1/search\`,
 reads the text query, the filter string and the page size off the request, and hands them to the
-query engine. It compiles, it serves the demo, and it hides four production flaws. Review it like
-the service owner, fix it, and prove the fix with the checks below.
+query engine. It compiles, it serves the demo, and it hides four production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/search\` with query parameters \`q\`, \`filters\`, \`page_size\` and the
 authenticated \`X-Tenant-Id\` header.
@@ -22,7 +22,7 @@ authenticated \`X-Tenant-Id\` header.
   \`{"brand", "category", "in_stock", "min_price", "max_price"}\`. An unknown field is **400** and
   the response names the offending field and lists the allowed set. Only allowlisted fields reach
   the engine.
-- \`page_size\` is an integer from **1** to **100** (**400** above the cap). The draft accepts
+- \`page_size\` is an integer from **1** to **100** (**400** above the cap). The starter accepts
   \`page_size=10000\`, so one call can ask the index for the whole catalog.
 - The engine query is assembled by a helper (\`build_engine_query\` / \`buildEngineQuery\`) from the
   **validated** fields and the tenant, never by interpolating the caller's filter string. The tenant
@@ -63,7 +63,7 @@ only from values that survived the allowlist.`,
       id: 'query-cap',
       title: 'Caps the text query at 256 bytes',
       detail:
-        '`q` must be non-empty and at most `1 << 8` bytes of UTF-8; anything larger is **400**. The draft forwards an unbounded query to the engine.',
+        '`q` must be non-empty and at most `1 << 8` bytes of UTF-8; anything larger is **400**. The starter forwards an unbounded query to the engine.',
       match: {
         python: {all: [/MAX_QUERY_BYTES/, /status_code\s*=\s*400/, /encode\("utf-8"\)/]},
         typescript: {all: [/MAX_QUERY_BYTES/, /code\(\s*400\s*\)/, /Buffer\.byteLength/]},
@@ -76,7 +76,7 @@ only from values that survived the allowlist.`,
       id: 'page-cap',
       title: 'Caps the page size at 100',
       detail:
-        '`page_size` is an integer from 1 to 100; the draft accepts `page_size=10000`, so one request can pull the whole catalog out of the index.',
+        '`page_size` is an integer from 1 to 100; the starter accepts `page_size=10000`, so one request can pull the whole catalog out of the index.',
       match: {
         python: {all: [/MAX_PAGE_SIZE/, /page_size/]},
         typescript: {all: [/MAX_PAGE_SIZE/, /pageSize/]},
@@ -89,7 +89,7 @@ only from values that survived the allowlist.`,
       id: 'filter-allowlist',
       title: 'Rejects unknown filter fields with the allowed set',
       detail:
-        'Filter keys are checked against the per-tenant allowlist; an unknown field is **400** and the message names the field and the allowed set. The draft passes the filter string through, so any index field is addressable.',
+        'Filter keys are checked against the per-tenant allowlist; an unknown field is **400** and the message names the field and the allowed set. The starter passes the filter string through, so any index field is addressable.',
       match: {
         python: {all: [/ALLOWED_FILTER_FIELDS/, /status_code\s*=\s*400/, /unknown filter/]},
         typescript: {all: [/ALLOWED_FILTER_FIELDS/, /code\(\s*400\s*\)/, /unknown filter/]},
@@ -102,7 +102,7 @@ only from values that survived the allowlist.`,
       id: 'engine-scoping',
       title: 'Builds the engine query from validated fields, tenant-scoped',
       detail:
-        "The engine query is assembled by `buildEngineQuery` from the validated filter fields and the tenant, never from the caller's raw filter string. The draft interpolates the string, so a filter can address a field outside the tenant's catalog.",
+        "The engine query is assembled by `buildEngineQuery` from the validated filter fields and the tenant, never from the caller's raw filter string. The starter interpolates the string, so a filter can address a field outside the tenant's catalog.",
       match: {
         python: {all: [/def build_engine_query\(/, /tenant/]},
         typescript: {all: [/function buildEngineQuery\(/, /tenant/]},
@@ -140,8 +140,8 @@ def search(
     page_size: int = Query(default=10),
     tenant: str = Header(default="", alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft forwards the caller's filter string straight to the engine, caps neither the
-    # query nor the page size, and lets a filter name any index field. Review all four.
+    # TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
+    # query nor the page size, and lets a filter name any index field. Fix all four.
     parsed = json.loads(filters)
     results = engine.search(q, parsed, page_size)
     logger.info("search tenant=%s q=%r filters=%r", tenant, q, filters)
@@ -213,7 +213,7 @@ def search(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/search: a model-generated draft that hands the filter string to the engine. */
+      starter: `/** GET /v1/search: flawed code that hands the filter string to the engine. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -228,8 +228,8 @@ const engine = {
 };
 
 app.get('/v1/search', async (request, reply) => {
-  // TODO: this draft forwards the caller's filter string straight to the engine, caps neither the
-  // query nor the page size, and lets a filter name any index field. Review all four.
+  // TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
+  // query nor the page size, and lets a filter name any index field. Fix all four.
   const {q = '', filters = '{}', page_size = '10'} = request.query as Record<string, string>;
   const tenant = request.headers['x-tenant-id'] as string;
   const results = await engine.search(q, JSON.parse(filters), Number(page_size));
@@ -334,8 +334,8 @@ func search(rw http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	filters := r.URL.Query().Get("filters")
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
-	// TODO: this draft forwards the caller's filter string straight to the engine, caps neither the
-	// query nor the page size, and lets a filter name any index field. Review all four.
+	// TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
+	// query nor the page size, and lets a filter name any index field. Fix all four.
 	results := engineSearch(q, filters, pageSize)
 	log.Printf("search tenant=%s q=%q filters=%q", tenant, q, filters)
 	writeJSON(rw, http.StatusOK, map[string]any{"results": results, "page_size": pageSize})
@@ -482,7 +482,7 @@ object SearchApi {
       get {
         parameters("q".?, "filters".?, "page_size".as[Int].?) { (qOpt, filtersOpt, sizeOpt) =>
           headerValueByName("X-Tenant-Id") { tenant =>
-            // TODO: this draft forwards the caller's filter string straight to the engine, caps
+            // TODO: this starter forwards the caller's filter string straight to the engine, caps
             // neither the query nor the page size, and lets a filter name any index field.
             val q = qOpt.getOrElse("")
             val filters = filtersOpt.getOrElse("{}")
@@ -596,8 +596,8 @@ int main() {
     const auto q = req.get_param_value("q");
     const auto filters = req.get_param_value("filters");
     const int pageSize = req.has_param("page_size") ? std::stoi(req.get_param_value("page_size")) : 10;
-    // TODO: this draft forwards the caller's filter string straight to the engine, caps neither the
-    // query nor the page size, and lets a filter name any index field. Review all four.
+    // TODO: this starter forwards the caller's filter string straight to the engine, caps neither the
+    // query nor the page size, and lets a filter name any index field. Fix all four.
     const auto results = engineSearch(q, filters, pageSize);
     std::cerr << "search tenant=" << tenant << " q=" << q << " filters=" << filters << "\\n";
     res.status = 200;
@@ -708,5 +708,5 @@ int main() {
     "The allowlist is the whole point: collect the requested keys, diff them against the allowed set, and on a difference return `400` naming the field and listing the allowed set. Only then copy the surviving keys into a fresh object — never pass the caller's object through.",
     'Build the engine query in one helper that takes the validated fields and the tenant. If the raw filter text is never a parameter of that helper, an injection has nowhere to live; the check looks for exactly that helper.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends a well-formed query with no filters and a small page. Four defects are being checked: the byte cap on the text query (cheap rejection before the index pays for it), the page cap (8000 results is not a page), the per-tenant filter allowlist (a crafted key must not address a field the tenant cannot see), and the assembly of the engine query from validated values only. The allowlist and the query-assembly helper are two halves of one idea: the caller supplies data, the server decides which fields exist. Real search services add typed filter values (a price is a number, a range is two numbers), per-tenant field visibility driven by the catalog, and a query-language version so old clients cannot smuggle retired fields.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends a well-formed query with no filters and a small page. Four defects are being checked: the byte cap on the text query (cheap rejection before the index pays for it), the page cap (8000 results is not a page), the per-tenant filter allowlist (a crafted key must not address a field the tenant cannot see), and the assembly of the engine query from validated values only. The allowlist and the query-assembly helper are two halves of one idea: the caller supplies data, the server decides which fields exist. Real search services add typed filter values (a price is a number, a range is two numbers), per-tenant field visibility driven by the catalog, and a query-language version so old clients cannot smuggle retired fields.`,
 };

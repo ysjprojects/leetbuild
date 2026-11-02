@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['discovery', 'kafka', 'consumer', 'reaper'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an event every
+**Starting point.** The starter is working code: it produces an event every
 time something happens, and the topic has events in it. Three flaws hide behind that. The key is the
 instance, so one service's membership is scattered across partitions; the expire event is published
 before the TTL has actually lapsed, so the stream announces something that may never happen; and
@@ -38,7 +38,7 @@ Implement the membership publisher for the topic \`discovery.event\`.
 
 **Failure mode the checks target.** Discovery events are not logs; they are the change feed of a
 state machine. Keying by instance breaks the ordering that state machine assumes. Publishing the
-expiry when the heartbeat is renewed inverts cause and effect — the draft emits \`expired\` right
+expiry when the heartbeat is renewed inverts cause and effect — the starter emits \`expired\` right
 after \`EXPIRE\`, so the consumer drops the instance from its cache while the instance is alive and
 healthy. And a publish path with no outbox converts every broker hiccup into a permanent
 divergence between the registry and everything that mirrors it.
@@ -81,7 +81,7 @@ key's TTL has lapsed, and a rejected produce leaves an outbox row keyed by the s
       id: 'service-key',
       title: 'Events are keyed by service',
       detail:
-        "Every discovery event is produced with the **service name as the message key**, so one service's transitions land in one partition and arrive in order. The draft keys by instance id and scatters the membership stream.",
+        "Every discovery event is produced with the **service name as the message key**, so one service's transitions land in one partition and arrive in order. The starter keys by instance id and scatters the membership stream.",
       match: {
         python: {all: [/discovery\.event/, /key=service/]},
         typescript: {all: [/discovery\.event/, /key:\s*service\b/]},
@@ -94,7 +94,7 @@ key's TTL has lapsed, and a rejected produce leaves an outbox row keyed by the s
       id: 'transition',
       title: 'Expiry is published at the real transition',
       detail:
-        'The `expired` event comes from the reaper after the heartbeat TTL has actually lapsed (`TTL < 0` on the registry key), not from the heartbeat that just renewed it. The draft publishes an expiry that has not happened.',
+        'The `expired` event comes from the reaper after the heartbeat TTL has actually lapsed (`TTL < 0` on the registry key), not from the heartbeat that just renewed it. The starter publishes an expiry that has not happened.',
       match: {
         python: {all: [/sweep_expired/, /\.ttl\(/]},
         typescript: {all: [/sweepExpired/, /\.ttl\(/]},
@@ -107,7 +107,7 @@ key's TTL has lapsed, and a rejected produce leaves an outbox row keyed by the s
       id: 'reason',
       title: 'The payload names the instance and the reason',
       detail:
-        'The event carries `kind`, `instance_id`, `metadata_version` and `reason`, so a consumer can explain a membership change without reading a registry entry that may already be gone. The draft ships `{"stage", "instance_id", "address"}`.',
+        'The event carries `kind`, `instance_id`, `metadata_version` and `reason`, so a consumer can explain a membership change without reading a registry entry that may already be gone. The starter ships `{"stage", "instance_id", "address"}`.',
       match: {
         python: {all: [/kind/, /reason/, /metadata_version/]},
         typescript: {all: [/kind/, /reason/, /metadata_version/]},
@@ -120,7 +120,7 @@ key's TTL has lapsed, and a rejected produce leaves an outbox row keyed by the s
       id: 'outbox',
       title: 'A rejected produce lands in the outbox',
       detail:
-        'When the broker refuses the produce, the event is written to the outbox keyed by the service with its payload and attempt counter instead of being dropped. The draft has no outbox at all.',
+        'When the broker refuses the produce, the event is written to the outbox keyed by the service with its payload and attempt counter instead of being dropped. The starter has no outbox at all.',
       match: {
         python: {all: [/class Outbox/, /outbox\.write\(/]},
         typescript: {all: [/class Outbox/, /outbox\.write\(/]},
@@ -133,7 +133,7 @@ key's TTL has lapsed, and a rejected produce leaves an outbox row keyed by the s
       id: 'durable-producer',
       title: 'The producer is idempotent and acks all',
       detail:
-        'The producer is configured for durability — idempotence on and `acks=all` (`RequireAll`, `MaxAttempts` in kafka-go) — so a retry cannot duplicate or reorder a membership transition. The draft runs on defaults.',
+        'The producer is configured for durability — idempotence on and `acks=all` (`RequireAll`, `MaxAttempts` in kafka-go) — so a retry cannot duplicate or reorder a membership transition. The starter runs on defaults.',
       match: {
         python: {all: [/enable\.idempotence/, /acks/]},
         typescript: {all: [/idempotent/, /acks/]},
@@ -171,9 +171,9 @@ def publish(service: str, stage: str, instance: dict) -> None:
 
 
 def heartbeat(service: str, instance: dict) -> None:
-    # TODO: this draft keys events by instance id, publishes the expire event right after renewing
+    # TODO: this starter keys events by instance id, publishes the expire event right after renewing
     # the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-    # Review all three.
+    # Fix all three.
     key = f"sd:{service}:{instance['instance_id']}"
     r.expire(key, TTL_SECONDS)
     publish(service, "expired", instance)
@@ -241,7 +241,7 @@ def on_probe(service: str, instance: dict, healthy: bool) -> None:
 `,
     },
     typescript: {
-      starter: `/** discovery.event: a model-generated draft that fires events and forgets them. */
+      starter: `/** discovery.event: flawed code that fires events and forgets them. */
 import {Kafka} from 'kafkajs';
 import Redis from 'ioredis';
 
@@ -268,9 +268,9 @@ async function publish(service: string, stage: string, instance: InstanceRecord)
 }
 
 export async function heartbeat(service: string, instance: InstanceRecord): Promise<void> {
-  // TODO: this draft keys events by instance id, publishes the expire event right after renewing
+  // TODO: this starter keys events by instance id, publishes the expire event right after renewing
   // the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-  // Review all three.
+  // Fix all three.
   const key = \`sd:\${service}:\${instance.instance_id}\`;
   await redis.expire(key, 30);
   await publish(service, 'expired', instance);
@@ -405,9 +405,9 @@ func publish(ctx context.Context, service, stage string, instance InstanceRecord
 }
 
 func heartbeat(ctx context.Context, service string, instance InstanceRecord) {
-	// TODO: this draft keys events by instance id, publishes the expire event right after renewing
+	// TODO: this starter keys events by instance id, publishes the expire event right after renewing
 	// the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-	// Review all three.
+	// Fix all three.
 	key := "sd:" + service + ":" + instance.InstanceID
 	redisClient.Expire(ctx, key, 30*time.Second)
 	if err := publish(ctx, service, "expired", instance); err != nil {
@@ -538,9 +538,9 @@ object Events {
     s"""{"stage":"$stage","service":"$service","instance_id":"\${instance.instance_id}","address":"\${instance.address}"}"""
 
   def heartbeat(service: String, instance: InstanceRecord): Unit = {
-    // TODO: this draft keys events by instance id, publishes the expire event right after renewing
+    // TODO: this starter keys events by instance id, publishes the expire event right after renewing
     // the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-    // Review all three.
+    // Fix all three.
     val key = "sd:" + service + ":" + instance.instance_id
     jedis.expire(key, TtlSeconds.toLong)
     producer.send(new ProducerRecord[String, String](DiscoveryEventTopic, instance.instance_id, payload(service, "expired", instance)))
@@ -649,9 +649,9 @@ void publish(rd_kafka_t* producer, const std::string& service, const std::string
 }
 
 int main() {
-  // TODO: this draft keys events by instance id, publishes the expire event right after renewing
+  // TODO: this starter keys events by instance id, publishes the expire event right after renewing
   // the TTL that keeps the instance alive, and has no outbox when the broker refuses the produce.
-  // Review all three.
+  // Fix all three.
   auto* kafka = producer();
   const InstanceRecord instance{"checkout-3", "10.4.2.7", 12};
   redis.expire("sd:checkout:checkout-3", std::chrono::seconds(kTtlSeconds));
@@ -755,5 +755,5 @@ int main() {
     'The reaper owns `expired`. In the heartbeat path you have just renewed the key; publishing `expired` there announces a transition that never happened. Read the key after the fact (`TTL < 0`, or a keyspace notification) and publish what you observed.',
     'Wrap the produce and write the outbox row on rejection, keyed by the service like the message — that row is what the replay job reads. Put the reason in the payload, so the consumer never has to look up an instance the transition just removed.',
   ],
-  debrief: `The interviewer is testing whether you treat a change feed as a state machine’s input rather than as logging. Three things follow from that. First, ordering: a membership stream is per service, so the key must be the service; keying by instance scatters \`registered → excluded → readmitted\` and the consumer applies them out of order, which is how caches end up believing an instance is out while it is serving. Second, truth at the transition: publishing \`expired\` from the heartbeat path — the draft’s most confident-looking bug — inverts cause and effect, because the event announces an expiry that the renewal just prevented. Third, durability: membership history is what rebuilds every consumer’s cache, so a rejected produce has to become a row, not a log line. Real systems add a schema registry so no producer can smuggle new fields in, a replay job that reads the outbox in service order, and per-service lag alerting because a silent partition is exactly the failure the outbox is there to make visible.`,
+  debrief: `The interviewer is testing whether you treat a change feed as a state machine’s input rather than as logging. Three things follow from that. First, ordering: a membership stream is per service, so the key must be the service; keying by instance scatters \`registered → excluded → readmitted\` and the consumer applies them out of order, which is how caches end up believing an instance is out while it is serving. Second, truth at the transition: publishing \`expired\` from the heartbeat path — the starter’s most confident-looking bug — inverts cause and effect, because the event announces an expiry that the renewal just prevented. Third, durability: membership history is what rebuilds every consumer’s cache, so a rejected produce has to become a row, not a log line. Real systems add a schema registry so no producer can smuggle new fields in, a replay job that reads the outbox in service order, and per-service lag alerting because a silent partition is exactly the failure the outbox is there to make visible.`,
 };

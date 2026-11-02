@@ -8,7 +8,7 @@ export const feedbackEventsStep: Step = {
   focus: ['router', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it produces an event on the happy path and the
+The starter is working code: it produces an event on the happy path and the
 consumer updates counters, so the demo shows numbers moving. Three production contracts are broken.
 Find them, fix them, and prove the fix.
 
@@ -55,7 +55,7 @@ correctness for exactly-once *looking* code.`,
       id: 'tenant-key',
       title: 'Keyed by tenant, id is the request id',
       detail:
-        'The message key is the tenant (partition by tenant), and the event carries the request id as its id. The draft keys by the request id, so one tenant’s events scatter across partitions and lose order.',
+        'The message key is the tenant (partition by tenant), and the event carries the request id as its id. The starter keys by the request id, so one tenant’s events scatter across partitions and lose order.',
       match: {
         python: {all: [/key=tenant/, /request_id/]},
         typescript: {all: [/key:\s*tenant\b/, /request_id|requestId/]},
@@ -81,7 +81,7 @@ correctness for exactly-once *looking* code.`,
       id: 'no-text',
       title: 'No prompt or message text in the event or logs',
       detail:
-        'Neither the event payload nor any log line carries the prompt or message text. The draft logs the prompt and copies it into the event — a leak that is retained and replicated with the topic.',
+        'Neither the event payload nor any log line carries the prompt or message text. The starter logs the prompt and copies it into the event — a leak that is retained and replicated with the topic.',
       match: {
         python: {none: [/\bprompt\b/i]},
         typescript: {none: [/\bprompt\b/i]},
@@ -94,7 +94,7 @@ correctness for exactly-once *looking* code.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -107,7 +107,7 @@ correctness for exactly-once *looking* code.`,
       id: 'counters-before-commit',
       title: 'Updates counters before committing the offset',
       detail:
-        'The consumer runs `HINCRBY` on the quality counters before committing the offset; committing first makes a crash lose the counter update forever. The draft commits first.',
+        'The consumer runs `HINCRBY` on the quality counters before committing the offset; committing first makes a crash lose the counter update forever. The starter commits first.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -241,7 +241,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** route.feedback: a model-generated draft that keys by request id and commits too early. */
+      starter: `/** route.feedback: flawed code that keys by request id and commits too early. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -671,5 +671,5 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by tenant and one tenant’s events arrive in order; key by request id and they do not. Second, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer must apply its state change before the offset commit, or a crash between them loses the update permanently. Third, a broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes, the same pattern the ingest path uses. The prompt leak is the quiet one: the topic retains and replicates whatever you write into it. Real platforms add schema registry validation, per-tenant partition quotas, and dead-letter topics for permanently unprocessable events.`,
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by tenant and one tenant’s events arrive in order; key by request id and they do not. Second, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer must apply its state change before the offset commit, or a crash between them loses the update permanently. Third, a broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes, the same pattern the ingest path uses. The prompt leak is the quiet one: the topic retains and replicates whatever you write into it. Real platforms add schema registry validation, per-tenant partition quotas, and dead-letter topics for permanently unprocessable events.`,
 };

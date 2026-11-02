@@ -8,8 +8,8 @@ export const dependencyStep: Step = {
   focus: ['collector', 'storage', 'quarantine'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads the assembled state,
-sends it to storage and returns "flushed". Storage is fast and healthy in the demo, so the draft looks
+**Starting point.** The starter is working code: it reads the assembled state,
+sends it to storage and returns "flushed". Storage is fast and healthy in the demo, so the starter looks
 correct and even tidy — the write is issued immediately. During a storage slowdown it is the worst
 code in the system: it deletes the only copy of the trace and then retries a rejection it can never
 satisfy.
@@ -20,10 +20,10 @@ Implement \`flush(tenant, trace_id)\` → the storage write half of the assembly
   tenant and the trace id. An empty state is nothing to flush: answer
   \`{flushed: false, kept: false, quarantined: false, attempts: 0}\` without calling storage.
 - Every attempt carries a **2 000 ms deadline**, and at most **3 attempts** are made, and only for
-  the statuses that are worth retrying: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. The draft has no
+  the statuses that are worth retrying: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. The starter has no
   deadline and retries everything forever, so one slow storage turns the flush loop into a hot loop
   with no bound on the number of calls.
-- The Redis assembly state is deleted **only after storage confirms the write**. The draft deletes
+- The Redis assembly state is deleted **only after storage confirms the write**. The starter deletes
   first, so a timeout erases the only copy of the trace and the next cycle has nothing to retry: the
   trace disappears from the system entirely, which is exactly the "suspiciously fast path" a reader
   later sees.
@@ -37,7 +37,7 @@ Implement \`flush(tenant, trace_id)\` → the storage write half of the assembly
 
 **Failure mode the checks target.** The ordering of \`DEL\` and \`Write\` is the whole step: a delete
 before the call is a delete of data that storage may never have received. Around it sit the two
-failure policies a generated client usually gets wrong — an unbounded retry loop with no deadline,
+failure policies a first-version client usually gets wrong — an unbounded retry loop with no deadline,
 and a retry of a status that is a permanent answer.`,
   sequence: {
     participants: ['Trace Collector', 'Redis', 'Span storage'],
@@ -72,7 +72,7 @@ and a retry of a status that is a permanent answer.`,
       id: 'deadline',
       title: 'Every attempt carries a 2-second deadline',
       detail:
-        'The write is issued with a 2 000 ms deadline on the call itself, so a slow storage cannot park the flusher. The draft calls storage with no deadline at all.',
+        'The write is issued with a 2 000 ms deadline on the call itself, so a slow storage cannot park the flusher. The starter calls storage with no deadline at all.',
       match: {
         python: {all: [/WRITE_DEADLINE_MS\s*=\s*2000/, /timeout=/]},
         typescript: {all: [/WRITE_DEADLINE_MS\s*=\s*2000/, /deadline:/]},
@@ -85,7 +85,7 @@ and a retry of a status that is a permanent answer.`,
       id: 'delete-after-confirm',
       title: 'Deletes the assembly state only after storage confirms',
       detail:
-        'The delete is issued after the write returns OK, so a failed or timed-out write leaves the trace in Redis. The draft deletes before it calls storage, which is how a timeout loses the trace entirely.',
+        'The delete is issued after the write returns OK, so a failed or timed-out write leaves the trace in Redis. The starter deletes before it calls storage, which is how a timeout loses the trace entirely.',
       match: {
         python: {order: [/stub\.Write\(/, /r\.delete\(/]},
         typescript: {order: [/writer\.Write\(/, /r\.del\(/]},
@@ -98,7 +98,7 @@ and a retry of a status that is a permanent answer.`,
       id: 'timeout-keeps',
       title: 'A timeout keeps the trace for the next cycle',
       detail:
-        'A `DEADLINE_EXCEEDED` that exhausts the attempts leaves the state in Redis and answers `kept: true`, so the trace survives a storage slowdown. The draft has already deleted it.',
+        'A `DEADLINE_EXCEEDED` that exhausts the attempts leaves the state in Redis and answers `kept: true`, so the trace survives a storage slowdown. The starter has already deleted it.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/, /"kept"/, /MAX_ATTEMPTS/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /kept/, /MAX_ATTEMPTS/]},
@@ -111,7 +111,7 @@ and a retry of a status that is a permanent answer.`,
       id: 'quarantine-schema',
       title: 'A schema rejection quarantines the trace',
       detail:
-        'An `INVALID_ARGUMENT` moves the payload to `quarantine:{trace_id}` under a long TTL and stops retrying it; the draft retries the rejection on every flush. The count of retryable attempts is also bounded.',
+        'An `INVALID_ARGUMENT` moves the payload to `quarantine:{trace_id}` under a long TTL and stops retrying it; the starter retries the rejection on every flush. The count of retryable attempts is also bounded.',
       match: {
         python: {all: [/INVALID_ARGUMENT/, /quarantine/, /QUARANTINE_TTL_S/, /RETRYABLE/]},
         typescript: {all: [/INVALID_ARGUMENT/, /quarantine/, /QUARANTINE_TTL_S/, /RETRYABLE/]},
@@ -124,7 +124,7 @@ and a retry of a status that is a permanent answer.`,
       id: 'bounded-retries',
       title: 'Retries only the statuses worth retrying, at most 3 times',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried, and the loop stops after `MAX_ATTEMPTS` (3); everything else is answered immediately. The draft loops forever on any error.',
+        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried, and the loop stops after `MAX_ATTEMPTS` (3); everything else is answered immediately. The starter loops forever on any error.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3/, /RETRYABLE/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3/, /RETRYABLE/, /grpc\.status\.UNAVAILABLE/]},
@@ -152,7 +152,7 @@ stub = storage_pb2_grpc.TraceWriterStub(channel)
 
 def flush(tenant: str, trace_id: str) -> dict:
     """Write the assembled trace to storage and report what happened to it."""
-    # TODO: the draft deletes the assembly state before the write is confirmed, so a storage
+    # TODO: the starter deletes the assembly state before the write is confirmed, so a storage
     # timeout erases the only copy of the trace; it retries a schema rejection on every flush, and
     # it has no deadline at all. Delete only after the confirmation, quarantine a rejection, and
     # bound the retries to the statuses that are worth retrying.
@@ -241,7 +241,7 @@ def flush(tenant: str, trace_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Trace storage write: a model-generated draft that deletes first and never gives up. */
+      starter: `/** Trace storage write: flawed code that deletes first and never gives up. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {Redis} from 'ioredis';
@@ -266,7 +266,7 @@ export interface FlushResult {
 }
 
 export async function flush(tenant: string, traceId: string): Promise<FlushResult> {
-  // TODO: the draft deletes the assembly state before the write is confirmed, so a storage timeout
+  // TODO: the starter deletes the assembly state before the write is confirmed, so a storage timeout
   // erases the only copy of the trace; it retries a schema rejection on every flush, and it has no
   // deadline at all. Delete only after the confirmation, quarantine a rejection, and bound the
   // retries to the statuses that are worth retrying.
@@ -374,7 +374,7 @@ var (
 )
 
 func flush(ctx context.Context, tenant, traceID string) (map[string]any, error) {
-	// TODO: the draft deletes the assembly state before the write is confirmed, so a storage
+	// TODO: the starter deletes the assembly state before the write is confirmed, so a storage
 	// timeout erases the only copy of the trace; it retries a schema rejection on every flush, and
 	// it has no deadline at all. Delete only after the confirmation, quarantine a rejection, and
 	// bound the retries to the statuses that are worth retrying.
@@ -478,7 +478,7 @@ object TraceWriterClient {
   val stub = StorageGrpc.blockingStub(ManagedChannelBuilder.forAddress("storage", 9000).usePlaintext().build())
 
   def flush(tenant: String, traceId: String): Map[String, Any] = {
-    // TODO: the draft deletes the assembly state before the write is confirmed, so a storage
+    // TODO: the starter deletes the assembly state before the write is confirmed, so a storage
     // timeout erases the only copy of the trace; it retries a schema rejection on every flush, and
     // it has no deadline at all. Delete only after the confirmation, quarantine a rejection, and
     // bound the retries to the statuses that are worth retrying.
@@ -595,7 +595,7 @@ std::unique_ptr<sw::redis::Redis> redis;
 std::unique_ptr<Storage::TraceWriter::Stub> stub;
 
 json flush(const std::string& tenant, const std::string& traceId) {
-  // TODO: the draft deletes the assembly state before the write is confirmed, so a storage timeout
+  // TODO: the starter deletes the assembly state before the write is confirmed, so a storage timeout
   // erases the only copy of the trace; it retries a schema rejection on every flush, and it has no
   // deadline at all. Delete only after the confirmation, quarantine a rejection, and bound the
   // retries to the statuses that are worth retrying.
@@ -703,5 +703,5 @@ json flush(const std::string& tenant, const std::string& traceId) {
 `,
     },
   },
-  debrief: `The interviewer is asking where the boundary of a durable write sits. "Storage has the trace" is only true once the RPC has returned OK, so the delete is the statement that the copy is redundant — issue it any earlier and a timeout turns a retryable incident into data loss. That is the whole bug behind a suspiciously fast trace: the collector deleted its state, storage never received it, and the reader believed an empty trace rather than a missing one. Around the ordering sit the two policies a generated client gets wrong most often. A deadline per attempt is what stops one slow storage from parking every flusher; a bounded retry set is what stops a permanent answer from being asked again forever; and quarantine is the only honest place for a payload the schema has rejected — visible to a human, out of the retry loop, and out of the live trace store. Real collectors add jittered backoff between attempts, a write-ahead spool for slow storage, and per-status metrics so "kept" is an alarm rather than a number in a return value.`,
+  debrief: `The interviewer is asking where the boundary of a durable write sits. "Storage has the trace" is only true once the RPC has returned OK, so the delete is the statement that the copy is redundant — issue it any earlier and a timeout turns a retryable incident into data loss. That is the whole bug behind a suspiciously fast trace: the collector deleted its state, storage never received it, and the reader believed an empty trace rather than a missing one. Around the ordering sit the two policies a storage client gets wrong most often. A deadline per attempt is what stops one slow storage from parking every flusher; a bounded retry set is what stops a permanent answer from being asked again forever; and quarantine is the only honest place for a payload the schema has rejected — visible to a human, out of the retry loop, and out of the live trace store. Real collectors add jittered backoff between attempts, a write-ahead spool for slow storage, and per-status metrics so "kept" is an alarm rather than a number in a return value.`,
 };

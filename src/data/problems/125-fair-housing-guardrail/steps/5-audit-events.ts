@@ -8,10 +8,10 @@ export const auditEventsStep: Step = {
   focus: ['guard', 'kafka', 'consumer', 'audit'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every decision produces an
+**Starting point.** The starter is working code: every decision produces an
 event and a consumer writes it to the audit store, so the compliance dashboard fills up. Four
 production contracts are broken, and one of them turns the audit trail itself into the data leak.
-Review it, fix it, and prove the fix.
+Debug it, fix it, and prove the fix.
 
 \`audit(...)\` is called after every guard decision; the consumer turns the events into the
 append-only record a compliance review reads.
@@ -57,7 +57,7 @@ store that must be complete the one that is not.`,
       id: 'conversation-key',
       title: 'Keyed by conversation, id is a fresh UUID',
       detail:
-        'The message key is the conversation id so one conversation’s decisions stay ordered, and the event carries its own `event_id`. The draft keys by the event id and scatters a conversation across partitions.',
+        'The message key is the conversation id so one conversation’s decisions stay ordered, and the event carries its own `event_id`. The starter keys by the event id and scatters a conversation across partitions.',
       match: {
         python: {all: [/key=conversation_id/, /event_id/]},
         typescript: {all: [/key:\s*conversationId\b/, /event_id|eventId/]},
@@ -83,7 +83,7 @@ store that must be complete the one that is not.`,
       id: 'no-text',
       title: 'The event carries a hash, never the text',
       detail:
-        'The payload has `text_hash`, scores and ids; the raw text appears nowhere in the file — not in the event, not in a log line. The draft copies the user’s text into a topic retained for months.',
+        'The payload has `text_hash`, scores and ids; the raw text appears nowhere in the file — not in the event, not in a log line. The starter copies the user’s text into a topic retained for months.',
       match: {
         python: {all: [/text_hash/], none: [/\btext\b/i]},
         typescript: {all: [/text_hash/], none: [/\btext\b/i]},
@@ -96,7 +96,7 @@ store that must be complete the one that is not.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) in the error branch instead of dropping the event. The draft ignores the broker result.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) in the error branch instead of dropping the event. The starter ignores the broker result.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*(\(|\{)/]},
@@ -109,7 +109,7 @@ store that must be complete the one that is not.`,
       id: 'append-before-commit',
       title: 'Appends to the audit store before committing the offset',
       detail:
-        'The consumer appends the row and then commits the offset; committing first makes a crash lose the row forever. The draft commits first.',
+        'The consumer appends the row and then commits the offset; committing first makes a crash lose the row forever. The starter commits first.',
       match: {
         python: {order: [/audit_store\.append\(/, /consumer\.commit\(/]},
         typescript: {order: [/auditStore\.append\(/, /commitOffsets\(/]},
@@ -257,7 +257,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** fairhousing.audit: a model-generated draft that keys by event id and ships the user's words. */
+      starter: `/** fairhousing.audit: flawed code that keys by event id and ships the user's words. */
 import {randomUUID} from 'node:crypto';
 
 import {Kafka} from 'kafkajs';
@@ -837,5 +837,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you treat the audit trail as the compliance artifact it is. An audit row is the only proof of what the guard decided, under which policy, for which conversation — so losing one (commit before append, a dropped produce) or duplicating one (a non-idempotent retry) is a correctness failure, not a logging nit. Four defects are being checked: the conversation as the partition key so a review reads input and output decisions in order; producer idempotence with acks=all; the outbox for the broker's bad day; and append-then-commit in the consumer. The text in the payload is the one that matters most and the one the draft gets most wrong: a topic retained for months and mirrored to the data platform is the worst place for a user's question about protected classes, and the hash gives the reviewer everything they need to join against the decision cache and the sampled human-review set the post describes. Real systems add a schema registry for the event, a policy checksum beside the version, and a periodic reconciliation that counts decisions against audit rows.`,
+  debrief: `The interviewer is checking whether you treat the audit trail as the compliance artifact it is. An audit row is the only proof of what the guard decided, under which policy, for which conversation — so losing one (commit before append, a dropped produce) or duplicating one (a non-idempotent retry) is a correctness failure, not a logging nit. Four defects are being checked: the conversation as the partition key so a review reads input and output decisions in order; producer idempotence with acks=all; the outbox for the broker's bad day; and append-then-commit in the consumer. The text in the payload is the one that matters most and the one the starter gets most wrong: a topic retained for months and mirrored to the data platform is the worst place for a user's question about protected classes, and the hash gives the reviewer everything they need to join against the decision cache and the sampled human-review set the post describes. Real systems add a schema registry for the event, a policy checksum beside the version, and a periodic reconciliation that counts decisions against audit rows.`,
 };

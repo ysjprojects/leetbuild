@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['dashboard', 'ingest', 'registry', 'tsdb'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a dashboard asks for a
+**Starting point.** The starter is working code: a dashboard asks for a
 device's series and gets points back, so the chart draws. It hides three production flaws, and the
 first one is the outage the on-call engineer caused by refreshing a dashboard. Find them, fix them,
 and prove the fix with the checks below.
@@ -30,7 +30,7 @@ Implement \`GET /v1/devices/{device_id}/series?metric=…&from=…&to=…\`:
   (\`true\` when the newest point is older than **300** seconds, or when there are none). A silent
   device must be visible as silent, not as a flat line.
 
-**Failure mode the checks target.** The draft passes \`from=0\` and a far-future \`to\` straight to
+**Failure mode the checks target.** The starter passes \`from=0\` and a far-future \`to\` straight to
 the store, returns raw points without downsampling, and answers for any device id in any fleet —
 three ways for one dashboard to read another team's fleet, and one way to take the store down.`,
   sequence: {
@@ -82,7 +82,7 @@ three ways for one dashboard to read another team's fleet, and one way to take t
       id: 'range-cap',
       title: 'Caps the range at 24 hours before the store call',
       detail:
-        'A range longer than `86400` seconds is **400**, and the check runs before `store.query` — the store must never see an unbounded window. The draft passes `from = 0` and a far-future `to` straight through, so one request scans years.',
+        'A range longer than `86400` seconds is **400**, and the check runs before `store.query` — the store must never see an unbounded window. The starter passes `from = 0` and a far-future `to` straight through, so one request scans years.',
       match: {
         python: {all: [/MAX_RANGE_S\s*=\s*86400/, /status_code\s*=\s*400/], order: [/MAX_RANGE_S/, /store\.query\(/]},
         typescript: {all: [/MAX_RANGE_S\s*=\s*86400/, /code\(\s*400\s*\)/], order: [/MAX_RANGE_S/, /store\.query\(/]},
@@ -98,7 +98,7 @@ three ways for one dashboard to read another team's fleet, and one way to take t
       id: 'downsample',
       title: 'Downsamples past 1000 points and names the method',
       detail:
-        'A series longer than `MAX_POINTS = 1000` is downsampled and the response names the method (`lttb`). The draft returns every raw point, so a day of a chatty device is hundreds of thousands of rows and a spike-preserving method is never involved.',
+        'A series longer than `MAX_POINTS = 1000` is downsampled and the response names the method (`lttb`). The starter returns every raw point, so a day of a chatty device is hundreds of thousands of rows and a spike-preserving method is never involved.',
       match: {
         python: {all: [/MAX_POINTS\s*=\s*1000/, /lttb/]},
         typescript: {all: [/MAX_POINTS\s*=\s*1000/, /lttb/]},
@@ -111,7 +111,7 @@ three ways for one dashboard to read another team's fleet, and one way to take t
       id: 'staleness',
       title: 'Reports the newest point’s age and staleness',
       detail:
-        'The response carries `age_seconds` (the age of the newest point) and `stale` (true when it is old, or when there are no points). The draft reports neither, so a device that went silent an hour ago is indistinguishable from a steady one.',
+        'The response carries `age_seconds` (the age of the newest point) and `stale` (true when it is old, or when there are no points). The starter reports neither, so a device that went silent an hour ago is indistinguishable from a steady one.',
       match: {
         python: {all: [/age_seconds/, /stale/]},
         typescript: {all: [/age_seconds/, /stale/]},
@@ -124,7 +124,7 @@ three ways for one dashboard to read another team's fleet, and one way to take t
       id: 'fleet-scope',
       title: 'Scopes the lookup to the caller’s fleet',
       detail:
-        'The device row’s fleet is compared with the `X-Fleet-Id` header and a mismatch is **404**, exactly like an unknown device. The draft serves any device id it is given, so one fleet can read another fleet’s series.',
+        'The device row’s fleet is compared with the `X-Fleet-Id` header and a mismatch is **404**, exactly like an unknown device. The starter serves any device id it is given, so one fleet can read another fleet’s series.',
       match: {
         python: {all: [/device\["fleet"\]/, /status_code\s*=\s*404/]},
         typescript: {all: [/device\.fleet/, /code\(\s*404\s*\)/]},
@@ -152,7 +152,7 @@ store = SeriesStore()
 
 @app.get("/v1/devices/{device_id}/series")
 def series(device_id: str, metric: str, to_s: int | None = None) -> dict:
-    # TODO: the draft accepts an open-ended range that scans years, returns every raw point without
+    # TODO: the starter accepts an open-ended range that scans years, returns every raw point without
     # downsampling, and serves any device id it is given, including one from another fleet.
     points = store.query(device_id, metric, 0, to_s or 4_102_444_800)
     return {"device_id": device_id, "metric": metric, "points": points}
@@ -226,7 +226,7 @@ def series(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/devices/{id}/series: a model-generated draft with an open-ended range. */
+      starter: `/** GET /v1/devices/{id}/series: flawed code with an open-ended range. */
 import Fastify from 'fastify';
 
 import {store} from './deps';
@@ -234,7 +234,7 @@ import {store} from './deps';
 export const app = Fastify();
 
 app.get('/v1/devices/:device_id/series', async (request, reply) => {
-  // TODO: the draft accepts an open-ended range that scans years, returns every raw point without
+  // TODO: the starter accepts an open-ended range that scans years, returns every raw point without
   // downsampling, and serves any device id it is given, including one from another fleet.
   const params = request.params as {device_id: string};
   const query = request.query as {metric?: string; to?: string};
@@ -326,7 +326,7 @@ func (s *SeriesStore) Query(ctx context.Context, deviceID, metric string, fromS,
 var store = &SeriesStore{}
 
 func series(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft accepts an open-ended range that scans years, returns every raw point without
+	// TODO: the starter accepts an open-ended range that scans years, returns every raw point without
 	// downsampling, and serves any device id it is given, including one from another fleet.
 	deviceID := r.PathValue("device_id")
 	toS, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
@@ -478,7 +478,7 @@ object DeviceSeries {
     path("v1" / "devices" / Segment / "series") { deviceId =>
       get {
         parameter("metric", "to") { (metric, toRaw) =>
-          // TODO: the draft accepts an open-ended range that scans years, returns every raw point
+          // TODO: the starter accepts an open-ended range that scans years, returns every raw point
           // without downsampling, and serves any device id it is given, including another fleet's.
           val to = toRaw.toLong
           val points = store.query(deviceId, metric, 0, to)
@@ -575,7 +575,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/devices/([^/]+)/series)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft accepts an open-ended range that scans years, returns every raw point without
+    // TODO: the starter accepts an open-ended range that scans years, returns every raw point without
     // downsampling, and serves any device id it is given, including one from another fleet.
     const auto deviceId = req.matches[1].str();
     const auto toS = req.has_param("to") ? std::stoll(req.get_param_value("to")) : 4102444800LL;

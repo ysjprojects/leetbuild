@@ -8,7 +8,7 @@ export const endpointStep: Step = {
   focus: ['sdk', 'collector', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the ingest route,
+**Starting point.** The starter is working code: it registers the ingest route,
 decodes the body, hands the span to the assembler and answers \`202\`. It serves the demo because the
 demo's SDK sends a 32-character trace id, a parent that is never itself, and a duration that happens
 to be small. Three of those assumptions are wrong in production and one of them silently changes the
@@ -25,8 +25,8 @@ Implement \`POST /v1/spans\` with body
   cycle: the assembler never resolves a root for that trace and every read of it waits forever.
 - \`duration_ms\` is an integer from **0** to **1 800 000**; negative or larger values are **422**.
   The unit is part of the contract: the body carries \`duration_ms\`, the response reports
-  \`"duration_unit": "ms"\`, and a body that sends \`duration\` or \`duration_s\` (seconds, as the SDK
-  that generated this draft emits) is **422** rather than silently stored as a millisecond value.
+  \`"duration_unit": "ms"\`, and a body that sends \`duration\` or \`duration_s\` (seconds, as the
+  demo's SDK emits) is **422** rather than silently stored as a millisecond value.
 - \`service\` is a non-empty string of at most **64** characters and \`start_ms\` is a non-negative
   epoch millisecond.
 - The span reaches the assembler (\`store.insert_span\`) **only after** every guard has passed, and the
@@ -36,7 +36,7 @@ Implement \`POST /v1/spans\` with body
 **Failure mode the checks target.** Every one of these defects is invisible until it matters. A
 32-hex id with a missing character is just another string to Redis, so the span lands under a key
 nobody will ever read; a self-parent hides one broken SDK behind a trace that never assembles; and a
-draft that reads \`duration\` as milliseconds turns a 412-second checkout into a 412-millisecond one,
+starter that reads \`duration\` as milliseconds turns a 412-second checkout into a 412-millisecond one,
 which is exactly the number an incident review will believe.`,
   sequence: {
     participants: ['Traces SDK', 'Trace Collector', 'Redis'],
@@ -81,7 +81,7 @@ which is exactly the number an incident review will believe.`,
       id: 'id-shape',
       title: 'Rejects malformed trace and span ids',
       detail:
-        'Both id shapes are checked (32 hex for a trace, 16 hex for a span and its parent) and a malformed id is **422**. The draft stores whatever string arrives, so a truncated id becomes a trace nobody can read.',
+        'Both id shapes are checked (32 hex for a trace, 16 hex for a span and its parent) and a malformed id is **422**. The starter stores whatever string arrives, so a truncated id becomes a trace nobody can read.',
       match: {
         python: {all: [/TRACE_ID_RE/, /SPAN_ID_RE/, /status_code\s*=\s*422/]},
         typescript: {all: [/TRACE_ID_RE/, /SPAN_ID_RE/, /code\(\s*422\s*\)/]},
@@ -94,7 +94,7 @@ which is exactly the number an incident review will believe.`,
       id: 'self-parent',
       title: 'A span cannot be its own parent',
       detail:
-        'A body whose `parent_span_id` equals its `span_id` is **422**: an accepted cycle means the trace never resolves a root. The draft stores it without a word.',
+        'A body whose `parent_span_id` equals its `span_id` is **422**: an accepted cycle means the trace never resolves a root. The starter stores it without a word.',
       match: {
         python: {all: [/body\.parent_span_id\s*==\s*body\.span_id/, /status_code\s*=\s*422/]},
         typescript: {all: [/(parentId|parent_span_id)\s*===\s*(spanId|body\.span_id)/, /code\(\s*422\s*\)/]},
@@ -107,7 +107,7 @@ which is exactly the number an incident review will believe.`,
       id: 'duration-unit',
       title: 'The duration unit is explicit and enforced',
       detail:
-        'The span carries `duration_ms`, the response reports `duration_unit`, and a body that sends a seconds field (`duration` / `duration_s`) or an out-of-range value is **422**. The draft reads `duration` as if it were milliseconds.',
+        'The span carries `duration_ms`, the response reports `duration_unit`, and a body that sends a seconds field (`duration` / `duration_s`) or an out-of-range value is **422**. The starter reads `duration` as if it were milliseconds.',
       match: {
         python: {all: [/DURATION_UNIT\s*=\s*"ms"/, /MAX_DURATION_MS/, /extra\s*=\s*"forbid"/]},
         typescript: {all: [/DURATION_UNIT\s*=\s*'ms'/, /MAX_DURATION_MS/, /ALLOWED_FIELDS/]},
@@ -159,7 +159,7 @@ store = SpanStore()
 
 @app.post("/v1/spans")
 def ingest(body: SpanIn, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft trusts whatever the SDK sends. It checks neither id shape, accepts a span
+    # TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
     # whose parent is itself, and reads the SDK's duration (seconds) as if it were milliseconds.
     # Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
     span = {
@@ -260,7 +260,7 @@ def ingest(body: SpanIn, tenant: str | None = Header(default=None, alias="X-Tena
 `,
     },
     typescript: {
-      starter: `/** POST /v1/spans: a model-generated draft that trusts the SDK's own units. */
+      starter: `/** POST /v1/spans: flawed code that trusts the SDK's own units. */
 import Fastify from 'fastify';
 
 import {store} from './span_store';
@@ -277,7 +277,7 @@ interface SpanBody {
 }
 
 app.post('/v1/spans', async (request, reply) => {
-  // TODO: this draft trusts whatever the SDK sends. It checks neither id shape, accepts a span
+  // TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
   // whose parent is itself, and reads the SDK's \`duration\` (seconds) as if it were milliseconds.
   // Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
   const tenant = request.headers['x-tenant-id'] as string;
@@ -417,7 +417,7 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts whatever the SDK sends. It checks neither id shape, accepts a span
+	// TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
 	// whose parent is itself, and reads the SDK's duration (seconds) as if it were milliseconds.
 	// Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
 	span := map[string]any{
@@ -603,7 +603,7 @@ object Api {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[SpanIn]) { body =>
-            // TODO: this draft trusts whatever the SDK sends. It checks neither id shape, accepts a
+            // TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a
             // span whose parent is itself, and reads the SDK's duration (seconds) as if it were
             // milliseconds. Validate the ids, reject a self-parent, name the unit, then store.
             val span = Map[String, Any](
@@ -744,7 +744,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft trusts whatever the SDK sends. It checks neither id shape, accepts a span
+    // TODO: this starter trusts whatever the SDK sends. It checks neither id shape, accepts a span
     // whose parent is itself, and reads the SDK's duration (seconds) as if it were milliseconds.
     // Validate the ids, reject a self-parent, name the unit explicitly, and only then store.
     const double duration = body.value("duration", 0.0);
@@ -881,5 +881,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you review a generated ingest handler at the trust boundary, and the tell is that every defect is a *shape* problem rather than a crash. Ids are the join key of the whole system: a trace id that is the wrong length does not fail anywhere, it simply produces a trace that no query will ever find, which is worse than an error because it looks like data loss during an incident. The self-parent is the cycle case that turns an assembly algorithm into an infinite expectation: the trace waits for a root that cannot exist. The unit is the quietest one and the most dangerous: a span whose duration is read in the wrong unit makes a slow path look fast, and a latency dashboard is exactly the artefact an on-call engineer trusts to decide whether to roll back. Real collectors add clock-skew correction between the SDK's \`start_ms\` and the collector's receipt, parse the W3C \`traceparent\` header, cap per-tenant ingest rates, and decide sampling at the edge — but all of that assumes the ids and units survived the door.`,
+  debrief: `The interviewer is testing whether you can debug an ingest handler at the trust boundary, and the tell is that every defect is a *shape* problem rather than a crash. Ids are the join key of the whole system: a trace id that is the wrong length does not fail anywhere, it simply produces a trace that no query will ever find, which is worse than an error because it looks like data loss during an incident. The self-parent is the cycle case that turns an assembly algorithm into an infinite expectation: the trace waits for a root that cannot exist. The unit is the quietest one and the most dangerous: a span whose duration is read in the wrong unit makes a slow path look fast, and a latency dashboard is exactly the artefact an on-call engineer trusts to decide whether to roll back. Real collectors add clock-skew correction between the SDK's \`start_ms\` and the collector's receipt, parse the W3C \`traceparent\` header, cap per-tenant ingest rates, and decide sampling at the edge — but all of that assumes the ids and units survived the door.`,
 };

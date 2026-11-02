@@ -7,12 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Secrets rotation on the AI-era track: the course is not "store a string in a vault", it is the
- * review you owe a model-generated rotation path before it takes a deployment down. A write-once
- * create endpoint with a rotation interval → one atomic Redis pointer swap with a bounded overlap
- * → a gRPC gate that makes every consumer prove it can read the new version → a keyed,
- * material-free lifecycle log published after the swap → a metadata-only read that no flag can
- * widen.
+ * Secrets rotation: the course is not "store a string in a vault", it is the debugging you owe a
+ * rotation path before it takes a deployment down. A write-once create endpoint with a rotation
+ * interval → one atomic Redis pointer swap with a bounded overlap → a gRPC gate that makes every
+ * consumer prove it can read the new version → a keyed, material-free lifecycle log published after
+ * the swap → a metadata-only read that no flag can widen.
  */
 export const secretsRotationProblem: Problem = {
   id: 'secrets-rotation',
@@ -20,7 +19,6 @@ export const secretsRotationProblem: Problem = {
   tagline: 'Secrets that rotate with an overlap window and are revoked exactly once.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Secrets Rotation
 
@@ -67,14 +65,14 @@ One service, **secretd**, with five pieces:
    windows and consumer acceptance — behind the \`secrets\` scope, with a closed query allowlist so
    no flag can ever surface material.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real rotation
-path: read the draft against the failure modes, name the subtle one, fix it, and prove the fix with
-checks that fail on the draft and pass on your version. The mock scenario in this course is the
-incident that produced it: a rotation that retired the old version before consumers verified, and an
-audit line that carried the new material in plaintext.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real rotation path: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version. The mock scenario in this course is
+the incident that produced it: a rotation that retired the old version before consumers verified,
+and an audit line that carried the new material in plaintext.
 
 ## Left out on purpose
 

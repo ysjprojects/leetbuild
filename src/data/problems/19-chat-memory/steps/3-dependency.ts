@@ -8,15 +8,15 @@ export const dependencyStep: Step = {
   focus: ['api', 'summarizer', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a summary eventually appears, so the demo passes.
+The starter is working code: a summary eventually appears, so the demo passes.
 It has no deadline, no attempt bound, no shared span identity and no write guard. Find the flaws,
 fix them, and prove the fix.
 
 Implement the summarizer call the append path makes once the buffer overflows:
 
 - The oldest span is summarized over **gRPC**. Every attempt carries a **1.5-second deadline**. The
-  draft has none, so one slow summarizer pins the worker and everything queued behind it.
-- At most **2 attempts** per span. The draft retries every error forever, so a provider outage
+  starter has none, so one slow summarizer pins the worker and everything queued behind it.
+- At most **2 attempts** per span. The starter retries every error forever, so a provider outage
   becomes a hot loop; a bounded retry fails fast and lets the next worker try.
 - The span identity is deterministic:
   \`summary:{tenant}:{session}:{first_turn_id}:{last_turn_id}\`. Two workers that pick up the same
@@ -68,7 +68,7 @@ deterministic key with a guarded write.`,
       id: 'deadline',
       title: 'Gives every attempt a 1.5-second deadline',
       detail:
-        'Each RPC carries a 1500 ms deadline. The draft has none, so a slow summarizer blocks the worker indefinitely.',
+        'Each RPC carries a 1500 ms deadline. The starter has none, so a slow summarizer blocks the worker indefinitely.',
       match: {
         python: {all: [/DEADLINE_MS/, /timeout=/]},
         typescript: {all: [/DEADLINE_MS/, /deadline/]},
@@ -81,7 +81,7 @@ deterministic key with a guarded write.`,
       id: 'bounded-attempts',
       title: 'Stops after two attempts',
       detail:
-        'The retry loop is bounded by an attempt cap of 2. The draft retries every RPC forever, so a provider outage becomes a hot loop.',
+        'The retry loop is bounded by an attempt cap of 2. The starter retries every RPC forever, so a provider outage becomes a hot loop.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /range\(MAX_ATTEMPTS\)/]},
         typescript: {all: [/MAX_ATTEMPTS/, /attempt\s*<\s*MAX_ATTEMPTS/]},
@@ -107,7 +107,7 @@ deterministic key with a guarded write.`,
       id: 'nx-write',
       title: 'Writes the summary once with SET NX',
       detail:
-        'The summary is stored with a not-exists guard and the handler returns the stored value; the draft overwrites unconditionally, so a stale retry replaces a newer summary.',
+        'The summary is stored with a not-exists guard and the handler returns the stored value; the starter overwrites unconditionally, so a stale retry replaces a newer summary.',
       match: {
         python: {all: [/nx=True/]},
         typescript: {all: [/['"]NX['"]/]},
@@ -210,7 +210,7 @@ def make_summary(id: str, span: Span, tenant: str = Header(alias="X-Tenant-Id"))
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/summaries: a model-generated draft that retries every RPC forever. */
+      starter: `/** POST /v1/sessions/:id/summaries: flawed code that retries every RPC forever. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -658,7 +658,7 @@ int main() {
   },
   debrief: `The interview question behind this step is the failure policy of a dependent call. A summarizer
 is a slow, failure-prone dependency: it can be late, it can be down, and two workers can ask it the
-same thing at once. The draft handles none of the three. A per-attempt deadline stops one slow
+same thing at once. The starter handles none of the three. A per-attempt deadline stops one slow
 reply from pinning a worker; an attempt cap stops an outage from becoming a hot loop; a
 deterministic span identity makes concurrent summarizers collide on one key instead of producing
 two summaries for one span; and a guarded write makes the loser of the race read the winner's

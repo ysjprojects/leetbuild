@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the queue route,
-parses the body and answers **201**. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the queue route, parses the body and
+answers **201**. It compiles, it serves the demo, and it hides three production flaws. Debug it
+like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/matchmaking/tickets\` with body \`{"skill": 1520, "party": ["p2", "p3"]}\`.
 
@@ -30,7 +30,7 @@ Implement \`POST /v1/matchmaking/tickets\` with body \`{"skill": 1520, "party": 
 - Log the decision with the player, the ticket id and the bucket — this is the entry point of the
   queue, so its key and its ordering are what on-call asks about first.
 
-**Failure mode the checks target.** The draft enqueues whatever it is handed: a party of six, a
+**Failure mode the checks target.** The starter enqueues whatever it is handed: a party of six, a
 negative rating, and a second ticket for a player who is already waiting. Each one corrupts the pool
 in a different way — the oversized party creates a roster no server can seat, the out-of-band rating
 creates an unreachable bucket, and the duplicate ticket is how one player ends up in two games. The
@@ -66,7 +66,7 @@ first one.`,
       id: 'player-required',
       title: 'Authenticates the player',
       detail:
-        'The player is required — **401** when `X-Player-Id` is absent or empty — and it is the key the ticket is registered under. The draft reads the header and trusts whatever it finds, so a missing player creates a ticket nobody owns.',
+        'The player is required — **401** when `X-Player-Id` is absent or empty — and it is the key the ticket is registered under. The starter reads the header and trusts whatever it finds, so a missing player creates a ticket nobody owns.',
       match: {
         python: {all: [/X-Player-Id/, /status_code\s*=\s*401/]},
         typescript: {all: [/x-player-id/, /code\(\s*401\s*\)/]},
@@ -79,7 +79,7 @@ first one.`,
       id: 'party-cap',
       title: 'Caps the party at five members',
       detail:
-        'The party holds at most `MAX_PARTY_SIZE` (**5**) members and anything larger is **400**. The draft takes the party as given, so a six-member party produces a roster the allocator can never seat.',
+        'The party holds at most `MAX_PARTY_SIZE` (**5**) members and anything larger is **400**. The starter takes the party as given, so a six-member party produces a roster the allocator can never seat.',
       match: {
         python: {all: [/MAX_PARTY_SIZE/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_PARTY_SIZE/, /code\(\s*400\s*\)/]},
@@ -92,7 +92,7 @@ first one.`,
       id: 'skill-band',
       title: 'Keeps the rating inside the supported band',
       detail:
-        '`skill` is bounded by `SKILL_MIN` and `SKILL_MAX` before the ticket reaches a bucket. The draft enqueues any number, including negatives, so the ticket lands in a bucket no opponent will ever join.',
+        '`skill` is bounded by `SKILL_MIN` and `SKILL_MAX` before the ticket reaches a bucket. The starter enqueues any number, including negatives, so the ticket lands in a bucket no opponent will ever join.',
       match: {
         python: {all: [/SKILL_MIN/, /SKILL_MAX/]},
         typescript: {all: [/SKILL_MIN/, /SKILL_MAX/]},
@@ -105,7 +105,7 @@ first one.`,
       id: 'one-open-ticket',
       title: 'Allows one open ticket per player',
       detail:
-        'The pointer `{OPEN_TICKET}:{player}` is set with `NX` for every participant, and a second ticket for a player who already holds one is **409** carrying the **original ticket id**. The draft has no such guard, so a player can be claimed into two matches at once.',
+        'The pointer `{OPEN_TICKET}:{player}` is set with `NX` for every participant, and a second ticket for a player who already holds one is **409** carrying the **original ticket id**. The starter has no such guard, so a player can be claimed into two matches at once.',
       match: {
         python: {all: [/OPEN_TICKET/, /status_code\s*=\s*409/, /ticket_id/]},
         typescript: {all: [/OPEN_TICKET/, /code\(\s*409\s*\)/, /ticketId/]},
@@ -141,7 +141,7 @@ def create_ticket(
     body: TicketRequest,
     player: str = Header(default="", alias="X-Player-Id"),
 ) -> dict:
-    # TODO: this draft lets a party grow past five members, lets one player hold unlimited open
+    # TODO: this starter lets a party grow past five members, lets one player hold unlimited open
     # tickets so they can be matched into two games at once, and enqueues any skill value including
     # negatives. Guard the party size, the skill band and the one-open-ticket rule before the ticket
     # reaches the pool.
@@ -240,7 +240,7 @@ def create_ticket(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/matchmaking/tickets: a model-generated draft that enqueues whatever it is handed. */
+      starter: `/** POST /v1/matchmaking/tickets: flawed code that enqueues whatever it is handed. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -258,7 +258,7 @@ interface TicketRequest {
 }
 
 app.post('/v1/matchmaking/tickets', async (request, reply) => {
-  // TODO: this draft lets a party grow past five members, lets one player hold unlimited open
+  // TODO: this starter lets a party grow past five members, lets one player hold unlimited open
   // tickets so they can be matched into two games at once, and enqueues any skill value including
   // negatives. Guard the party size, the skill band and the one-open-ticket rule before the ticket
   // reaches the pool.
@@ -389,7 +389,7 @@ func createTicket(rw http.ResponseWriter, req *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft lets a party grow past five members, lets one player hold unlimited open
+	// TODO: this starter lets a party grow past five members, lets one player hold unlimited open
 	// tickets so they can be matched into two games at once, and enqueues any skill value including
 	// negatives. Guard the party size, the skill band and the one-open-ticket rule before the ticket
 	// reaches the pool.
@@ -579,7 +579,7 @@ object MatchmakingApi {
       post {
         headerValueByName("X-Player-Id") { player =>
           entity(as[TicketRequest]) { body =>
-            // TODO: this draft lets a party grow past five members, lets one player hold unlimited
+            // TODO: this starter lets a party grow past five members, lets one player hold unlimited
             // open tickets so they can be matched into two games at once, and enqueues any skill
             // value including negatives. Guard the party size, the skill band and the one-open-ticket
             // rule before the ticket reaches the pool.
@@ -712,7 +712,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/matchmaking/tickets", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft lets a party grow past five members, lets one player hold unlimited open
+    // TODO: this starter lets a party grow past five members, lets one player hold unlimited open
     // tickets so they can be matched into two games at once, and enqueues any skill value including
     // negatives. Guard the party size, the skill band and the one-open-ticket rule before the ticket
     // reaches the pool.
@@ -843,5 +843,5 @@ int main() {
     'The one-open-ticket rule needs a pointer **per participant**, not just the owner: the party members are players too and can be queued elsewhere. `SET {OPEN_TICKET}:{pid} ticket_id NX EX TICKET_TTL_S` is the guard; when the set fails, read the pointer to return the original ticket id.',
     'Clamp the rating before you derive the bucket. `bucket = clamp(skill) // BUCKET_WIDTH` keeps the band in one place, and an out-of-band rating can no longer create a bucket that no opponent will ever join. Keep `SKILL_MIN` and `SKILL_MAX` as named constants so the band is a policy, not a literal.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated write path on the entry point of a queue. The draft reads fine because the demo posts well-formed requests from one player who never retries. Three defects are being checked: the party cap (a six-member party is a roster the allocator cannot seat), the skill band (an out-of-band or negative rating lands the ticket in a bucket nobody joins, so the player waits forever), and the one-open-ticket rule. The last one is the subtle one: the ticket id is minted by the server, and without a pointer keyed by the player there is nothing that stops the same player — or a member of their party — from being enqueued twice and claimed into two rosters. The check on the original ticket id matters too: a 409 that says "you already have a ticket" without telling the caller which one is useless to a client that has to poll. Real queues add a ticket TTL, a per-bucket \`SKILL_MIN\`/band policy, and a party-wide "ready check" so the whole party is claimed or none of it is — which is exactly the next step.`,
+  debrief: `The interviewer is testing whether you can debug a write path on the entry point of a queue. The starter reads fine because the demo posts well-formed requests from one player who never retries. Three defects are being checked: the party cap (a six-member party is a roster the allocator cannot seat), the skill band (an out-of-band or negative rating lands the ticket in a bucket nobody joins, so the player waits forever), and the one-open-ticket rule. The last one is the subtle one: the ticket id is minted by the server, and without a pointer keyed by the player there is nothing that stops the same player — or a member of their party — from being enqueued twice and claimed into two rosters. The check on the original ticket id matters too: a 409 that says "you already have a ticket" without telling the caller which one is useless to a client that has to poll. Real queues add a ticket TTL, a per-bucket \`SKILL_MIN\`/band policy, and a party-wide "ready check" so the whole party is claimed or none of it is — which is exactly the next step.`,
 };

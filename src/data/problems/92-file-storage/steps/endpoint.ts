@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers \`POST /v1/files\`,
+**Starting point.** The starter is working code: it registers \`POST /v1/files\`,
 reads \`size\` and \`mime\` from the body, and returns an upload id. It compiles, it serves the demo, and
-it hides three production flaws. Review it like the service owner, fix it, and prove the fix with the
+it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the
 checks below.
 
 Implement the upload handshake:
@@ -69,7 +69,7 @@ tenant is a capability anyone who guesses or leaks the id can use.`,
       id: 'tenant-scope',
       title: 'Binds every upload to the tenant that created it',
       detail:
-        'A missing tenant is **401** and an upload id used by another tenant is **403**. The draft stores no tenant on the session and answers a foreign upload id happily.',
+        'A missing tenant is **401** and an upload id used by another tenant is **403**. The starter stores no tenant on the session and answers a foreign upload id happily.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /status_code\s*=\s*403/, /session\["tenant"\]/]},
         typescript: {all: [/code\(\s*401\s*\)/, /code\(\s*403\s*\)/, /session\.tenant/]},
@@ -82,7 +82,7 @@ tenant is a capability anyone who guesses or leaks the id can use.`,
       id: 'mime-sniff',
       title: 'Sniffs the mime instead of trusting the declaration',
       detail:
-        'The mime must be in the allowlist (**415** otherwise) and the finalize path records the type sniffed from the bytes. The draft accepts any mime and never sniffs.',
+        'The mime must be in the allowlist (**415** otherwise) and the finalize path records the type sniffed from the bytes. The starter accepts any mime and never sniffs.',
       match: {
         python: {all: [/ALLOWED_MIME/, /sniff_mime/, /status_code\s*=\s*415/]},
         typescript: {all: [/ALLOWED_MIME/, /sniffMime/, /code\(\s*415\s*\)/]},
@@ -95,7 +95,7 @@ tenant is a capability anyone who guesses or leaks the id can use.`,
       id: 'declared-size',
       title: 'Aborts a stream that exceeds its declared size',
       detail:
-        'The declared size is capped at 5 GiB and the stream is counted as it arrives; passing the declared size aborts the upload with **413**. The draft lets the stream run and never compares the counts.',
+        'The declared size is capped at 5 GiB and the stream is counted as it arrives; passing the declared size aborts the upload with **413**. The starter lets the stream run and never compares the counts.',
       match: {
         python: {all: [/declared_size/, /actual_bytes/, /MAX_UPLOAD_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/declaredSize/, /actualBytes/, /MAX_UPLOAD_BYTES/, /code\(\s*413\s*\)/]},
@@ -108,7 +108,7 @@ tenant is a capability anyone who guesses or leaks the id can use.`,
       id: 'quota-reserve',
       title: 'Checks the declaration against the tenant quota',
       detail:
-        'The declared size is compared with the tenant’s remaining quota and an over-quota declaration is rejected before the session is created. The draft creates the upload without ever reading the quota.',
+        'The declared size is compared with the tenant’s remaining quota and an over-quota declaration is rejected before the session is created. The starter creates the upload without ever reading the quota.',
       match: {
         python: {all: [/quota_remaining/, /declared_size/]},
         typescript: {all: [/quotaRemaining/, /declaredSize/]},
@@ -149,7 +149,7 @@ async def initiate(request: Request, x_tenant_id: str = Header(default="")):
     body = await request.json()
     size = body.get("size", 0)
     mime = body.get("mime", "application/octet-stream")
-    # TODO: this draft trusts the declared size, sniffs no mime and stores no tenant on the
+    # TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
     # session. The quota is never read and a stream may run past its declared size.
     upload_id = "up_" + uuid.uuid4().hex
     store.create(upload_id, size, mime)
@@ -292,7 +292,7 @@ export function registerUploadApi(app: FastifyInstance): void {
     const tenant = req.headers['x-tenant-id'] as string | undefined;
     if (!tenant) return reply.code(401).send({error: 'missing X-Tenant-Id'});
     const body = req.body as {size?: number; mime?: string};
-    // TODO: this draft trusts the declared size, sniffs no mime and stores no tenant on the
+    // TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
     // session. The quota is never read and a stream may run past its declared size.
     const uploadId = 'up_' + randomUUID();
     store.create({uploadId, size: body.size ?? 0, mime: body.mime ?? ''});
@@ -435,7 +435,7 @@ func initiate(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts the declared size, sniffs no mime and stores no tenant on the
+	// TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
 	// session. The quota is never read and a stream may run past its declared size.
 	session := Session{UploadID: "up_" + uuidString(), Size: body.Size, Mime: body.Mime}
 	store.Create(session)
@@ -645,7 +645,7 @@ object UploadApi {
             if (!tenantOpt.exists(_.nonEmpty)) {
               complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
             } else {
-              // TODO: this draft trusts the declared size, sniffs no mime and stores no tenant
+              // TODO: this starter trusts the declared size, sniffs no mime and stores no tenant
               // on the session. The quota is never read and a stream may run past its size.
               val uploadId = "up_" + UUID.randomUUID().toString
               store.create(Session(uploadId, "", body.size, 0, body.mime))
@@ -804,7 +804,7 @@ int main() {
       return;
     }
     json body = json::parse(req.body, nullptr, false);
-    // TODO: this draft trusts the declared size, sniffs no mime and stores no tenant on the
+    // TODO: this starter trusts the declared size, sniffs no mime and stores no tenant on the
     // session. The quota is never read and a stream may run past its declared size.
     const auto uploadId = "up_" + uuidString();
     store.create(uploadId, body.value("size", 0L), body.value("mime", std::string()));
@@ -956,5 +956,5 @@ int main() {
     'The declared size is a promise, not a fact. Count bytes as the stream arrives and abort the moment the count passes the declaration — otherwise the client decides how much it stores and how much quota it spends.',
     'The finalize response records the type sniffed from the leading bytes. If the object says `image/png` but the magic bytes say `%PDF`, the sniffed type is the truth you store and index on.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated upload handshake at the trust boundary. The draft reads fine because the demo declares an honest size, sends a friendly mime, and never leaks an upload id. Three separate defects are being checked: the declared size is verified against the stream rather than trusted; the mime is sniffed rather than echoed; and the upload id is bound to its tenant so a leaked id is not a capability. Real services add a per-tenant quota reservation that is released on abort, a pre-signed URL with a short TTL so the API never proxies the bytes, and an object-store-side size check so a bypassed API cannot store more than it promised.`,
+  debrief: `The interviewer is testing whether you can debug an upload handshake at the trust boundary. The starter reads fine because the demo declares an honest size, sends a friendly mime, and never leaks an upload id. Three separate defects are being checked: the declared size is verified against the stream rather than trusted; the mime is sniffed rather than echoed; and the upload id is bound to its tenant so a leaked id is not a capability. Real services add a per-tenant quota reservation that is released on abort, a pre-signed URL with a short TTL so the API never proxies the bytes, and an object-store-side size check so a bypassed API cannot store more than it promised.`,
 };

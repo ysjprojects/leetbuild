@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: an event reaches the topic and
+**Starting point.** The starter is working code: an event reaches the topic and
 the trail consumer writes it down, so the demo shows approvals flowing through Kafka. The key, the
-payload and the order of the two writes are all wrong. Review it, fix it, and prove the fix.
+payload and the order of the two writes are all wrong. Debug it, fix it, and prove the fix.
 
 Implement the event path for submit, decision, delegation and completion events. \`publish_event(
 request_id, kind, step, actor, actor_role, decision)\` is the one code path they all take.
@@ -33,7 +33,7 @@ request_id, kind, step, actor, actor_role, decision)\` is the one code path they
 - The trail consumer writes the step into \`approval:{request_id}:trail\` and commits its offset
   after that write, so a crash between the two replays the record instead of losing it.
 
-**Failure mode the checks target.** The draft keys by approver, so one request's events are ordered
+**Failure mode the checks target.** The starter keys by approver, so one request's events are ordered
 only within a partition that no longer corresponds to the request. It copies the \`why\` text and the
 attachment list into a retained topic, which is a data leak with a very long tail. And it acks the
 produce before the state commit, so the trail can contain a step the state never recorded.`,
@@ -59,7 +59,7 @@ produce before the state commit, so the trail can contain a step the state never
       id: 'request-key',
       title: 'Keyed by the request id, carrying ids and enums',
       detail:
-        'The message key is the request id, so every event of one chain lands in one partition and stays ordered, and the payload carries `step` and `actor_role`. The draft keys by the approver, so one request’s chain is scattered.',
+        'The message key is the request id, so every event of one chain lands in one partition and stays ordered, and the payload carries `step` and `actor_role`. The starter keys by the approver, so one request’s chain is scattered.',
       match: {
         python: {all: [/key=request_id/, /actor_role/]},
         typescript: {all: [/key:\s*requestId/, /actor_role/]},
@@ -85,7 +85,7 @@ produce before the state commit, so the trail can contain a step the state never
       id: 'no-content',
       title: 'No why text and no attachments in the event',
       detail:
-        'Nothing that carries request content — the `why` field, an attachment list, a file name — reaches the topic or the logs. The draft copies both into a retained, replicated topic.',
+        'Nothing that carries request content — the `why` field, an attachment list, a file name — reaches the topic or the logs. The starter copies both into a retained, replicated topic.',
       match: {
         python: {none: [/\bwhy\b/, /attachment/i]},
         typescript: {none: [/\bwhy\b/, /attachment/i]},
@@ -98,7 +98,7 @@ produce before the state commit, so the trail can contain a step the state never
       id: 'publish-after-commit',
       title: 'Publishes only after the state commit',
       detail:
-        'A decision commits the step in Redis (`state.commit_step` / `commitStep` / `CommitStep`) before the produce, so a crash between the two replays the decision instead of reporting a step that was never recorded. The draft acks the broker first and commits afterwards.',
+        'A decision commits the step in Redis (`state.commit_step` / `commitStep` / `CommitStep`) before the produce, so a crash between the two replays the decision instead of reporting a step that was never recorded. The starter acks the broker first and commits afterwards.',
       match: {
         python: {order: [/state\.commit_step\(/, /producer\.produce\(/]},
         typescript: {order: [/state\.commitStep\(/, /producer\.send\(/]},
@@ -163,8 +163,8 @@ def publish_event(
     attachments: list[str],
     decision: str = "",
 ) -> dict:
-    # TODO: this draft keys by the approver, copies the why text and the attachments into the
-    # payload, and acknowledges the broker before the step is committed in state. Review all three.
+    # TODO: this starter keys by the approver, copies the why text and the attachments into the
+    # payload, and acknowledges the broker before the step is committed in state. Fix all three.
     event = {
         "request_id": request_id,
         "kind": kind,
@@ -274,7 +274,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** approval.event: a model-generated draft keyed by approver that still commits after the ack. */
+      starter: `/** approval.event: flawed code keyed by approver that still commits after the ack. */
 import {Kafka} from 'kafkajs';
 
 import {state} from './state';
@@ -310,8 +310,8 @@ export async function publishEvent(
   attachments: string[],
   decision = '',
 ): Promise<Record<string, unknown>> {
-  // TODO: this draft keys by the approver, copies the why text and the attachments into the
-  // payload, and acknowledges the broker before the step is committed in state. Review all three.
+  // TODO: this starter keys by the approver, copies the why text and the attachments into the
+  // payload, and acknowledges the broker before the step is committed in state. Fix all three.
   const event = {
     request_id: requestId,
     kind,
@@ -460,8 +460,8 @@ type EventBody struct {
 }
 
 func publishEvent(ctx context.Context, body EventBody) (map[string]any, error) {
-	// TODO: this draft keys by the approver, copies the why text and the attachments into the
-	// payload, and acknowledges the broker before the step is committed in state. Review all three.
+	// TODO: this starter keys by the approver, copies the why text and the attachments into the
+	// payload, and acknowledges the broker before the step is committed in state. Fix all three.
 	event := map[string]any{
 		"request_id":  body.RequestID,
 		"kind":        body.Kind,
@@ -608,8 +608,8 @@ object Events {
   }
 
   def publishEvent(event: ApprovalEvent): Unit = {
-    // TODO: this draft keys by the approver, copies the why text and the attachments into the
-    // payload, and acknowledges the broker before the step is committed in state. Review all three.
+    // TODO: this starter keys by the approver, copies the why text and the attachments into the
+    // payload, and acknowledges the broker before the step is committed in state. Fix all three.
     val payload = event.toJson.compactPrint
     try {
       producer.send(new ProducerRecord[String, String](Topic, event.actor, payload))
@@ -729,8 +729,8 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: this draft keys by the approver, copies the why text and the attachments into the payload,
-// and acknowledges the broker before the step is committed in state. Review all three.
+// TODO: this starter keys by the approver, copies the why text and the attachments into the payload,
+// and acknowledges the broker before the step is committed in state. Fix all three.
 void publishEvent(
     const std::string& requestId,
     const std::string& kind,

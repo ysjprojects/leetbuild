@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['meter', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it publishes the usage and the consumer moves the
+The starter is working code: it publishes the usage and the consumer moves the
 ledger, so finance sees rows appear. Four production contracts are broken. Find them, fix them, and
 prove the fix.
 
@@ -17,7 +17,7 @@ prove the fix.
 
 - Publish exactly one \`billing.usage\` event per report with the **tenant id as the message key**.
   Partitioning by tenant is what keeps one tenant's ledger ordered and lets a downstream consumer
-  replay a tenant's events without interleaving another's. The draft keys by **model**, so one
+  replay a tenant's events without interleaving another's. The starter keys by **model**, so one
   tenant's charges are spread across partitions and their order is whatever the broker chose.
 - The event **carries the \`Idempotency-Key\`** it was metered under, alongside \`usage_id\`,
   \`tenant_id\`, \`model\`, \`input_tokens\`, \`output_tokens\` and \`cost_micros\`. Downstream billing
@@ -31,7 +31,7 @@ prove the fix.
   with the hash balancer in Go.
 - When the broker rejects the produce, write the event to the **outbox** instead of dropping it or
   failing the request: a relay republishes outbox rows when the broker recovers, so an outage costs
-  latency, not revenue. The draft ignores the produce result and reports success either way.
+  latency, not revenue. The starter ignores the produce result and reports success either way.
 
 **Failure mode the checks target.** Keying by model scatters one tenant's ledger for no reason;
 omitting the idempotency key makes every produce retry a potential double charge; the completion
@@ -54,7 +54,7 @@ runs, weeks later.`,
       id: 'tenant-key',
       title: 'Keyed by tenant so one ledger stays ordered',
       detail:
-        'The message key is the tenant id, so a tenant’s events share a partition and arrive in order. The draft keys by model, which scatters a tenant’s charges across partitions and gives up the ordering the ledger reconciles against.',
+        'The message key is the tenant id, so a tenant’s events share a partition and arrive in order. The starter keys by model, which scatters a tenant’s charges across partitions and gives up the ordering the ledger reconciles against.',
       match: {
         python: {all: [/billing\.usage/, /key=tenant/]},
         typescript: {all: [/billing\.usage/, /key:\s*tenant/]},
@@ -67,7 +67,7 @@ runs, weeks later.`,
       id: 'idempotency-embedded',
       title: 'Embeds the Idempotency-Key in the event',
       detail:
-        'The payload carries the `Idempotency-Key` the usage was metered under, so downstream billing dedupes a retried produce into one charge. The draft takes the header and drops it, so a retry bills the same tokens twice.',
+        'The payload carries the `Idempotency-Key` the usage was metered under, so downstream billing dedupes a retried produce into one charge. The starter takes the header and drops it, so a retry bills the same tokens twice.',
       match: {
         python: {all: [/billing\.usage/, /idempotency_key/]},
         typescript: {all: [/billing\.usage/, /idempotency_key/]},
@@ -93,7 +93,7 @@ runs, weeks later.`,
       id: 'outbox-fallback',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce inserts an outbox row for a relay to republish instead of dropping the event. The draft ignores the produce result — and the broker error with it — so the charge is simply gone.',
+        'A rejected produce inserts an outbox row for a relay to republish instead of dropping the event. The starter ignores the produce result — and the broker error with it — so the charge is simply gone.',
       match: {
         python: {all: [/insert_outbox\(/, /except KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\{/]},
@@ -106,7 +106,7 @@ runs, weeks later.`,
       id: 'no-content',
       title: 'No prompt or completion text in the event or the logs',
       detail:
-        'The event carries ids, counts and cost — never the completion or prompt text, and never a log line with it either. The draft logs and publishes `output_text`, putting tenant content into a topic that is retained and replicated.',
+        'The event carries ids, counts and cost — never the completion or prompt text, and never a log line with it either. The starter logs and publishes `output_text`, putting tenant content into a topic that is retained and replicated.',
       match: {
         python: {all: [/billing\.usage/], none: [/output_text|OutputText/]},
         typescript: {all: [/billing\.usage/], none: [/output_text|OutputText/]},
@@ -228,7 +228,7 @@ def publish_usage(
 `,
     },
     typescript: {
-      starter: `/** publish_usage: a model-generated draft that keys by model and drops failures. */
+      starter: `/** publish_usage: flawed code that keys by model and drops failures. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 

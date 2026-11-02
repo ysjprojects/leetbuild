@@ -9,7 +9,7 @@ import {type FC, memo} from 'react';
 
 const TITLE = 'AI-assisted mock interview — LeetBuild';
 const DESCRIPTION =
-  'Practice the AI-era interview loop: start from a flawed model-generated draft, use an offline AI pair to review it, fix the code under a clock, and submit to the same checks the judge uses.';
+  'Practice the interview loop under a clock: start from a flawed patch, debug it with an offline AI pair, fix the code, and submit to the same checks the judge uses.';
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL;
 
 // CodeMirror is browser-only; the experience never renders on the server.

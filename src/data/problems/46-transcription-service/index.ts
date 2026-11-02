@@ -7,12 +7,12 @@ import {transcriptionEventsStep} from './steps/4-events';
 import {transcriptionReadStep} from './steps/5-read';
 
 /**
- * Transcription service on the AI-era track: the course is not "send audio to an ASR model", it is
- * the review you owe a model-generated long-audio pipeline before it bills a tenant three times for
- * one bad minute. Metadata-validated, idempotent job creation → one atomic, expiring chunk-progress
- * set per job → a deadline-bounded gRPC chunk stream that resumes from its own offset → segment
- * events keyed by job and redacted before publish → a read path that reports partial honestly and
- * scopes every id to its tenant.
+ * Transcription service: the course is not "send audio to an ASR model", it is the debugging you
+ * owe a long-audio pipeline before it bills a tenant three times for one bad minute.
+ * Metadata-validated, idempotent job creation → one atomic, expiring chunk-progress set per job →
+ * a deadline-bounded gRPC chunk stream that resumes from its own offset → segment events keyed by
+ * job and redacted before publish → a read path that reports partial honestly and scopes every id
+ * to its tenant.
  */
 export const transcriptionServiceProblem: Problem = {
   id: 'transcription-service',
@@ -20,7 +20,7 @@ export const transcriptionServiceProblem: Problem = {
   tagline: 'Long-audio transcription with chunked progress, redaction and honest partial results.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Transcription Service
 
@@ -73,12 +73,12 @@ One service, **transcribed**, with five pieces:
    stored segments, a refusal to report \`done\` while any chunk is failed or pending, a \`404\` for a
    missing or foreign id, and cursor pagination past the first page of segments.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

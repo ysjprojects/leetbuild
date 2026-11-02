@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces a \`suggest.event\`
-for every impression and selection. It compiles, the topic fills in the demo, and it hides three
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it produces a \`suggest.event\` for every
+impression and selection. It compiles, the topic fills in the demo, and it hides three production
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement the suggestion event producer behind \`GET /v1/autocomplete\`.
 
@@ -29,7 +29,7 @@ Implement the suggestion event producer behind \`GET /v1/autocomplete\`.
 **Failure mode the checks target.** Keying by prefix scatters one tenant's events across partitions,
 so ordering is gone and per-session sequences look shuffled. Publishing the raw prefix text ships a
 possible name into a retained, replicated topic — the exact place a search term should never be. The
-subtle one is the swallowed produce failure: the draft catches the exception, logs it and moves on,
+subtle one is the swallowed produce failure: the starter catches the exception, logs it and moves on,
 so during a broker hiccup the metrics silently lose the events the product makes decisions on.`,
   sequence: {
     participants: ['Autocomplete API', 'suggest.event', 'Event consumer'],
@@ -52,7 +52,7 @@ so during a broker hiccup the metrics silently lose the events the product makes
       id: 'tenant-key',
       title: 'Keys events by tenant',
       detail:
-        "Events publish to `suggest.event` keyed by tenant, so one tenant's events share a partition and stay ordered. The draft keys by prefix, scattering them.",
+        "Events publish to `suggest.event` keyed by tenant, so one tenant's events share a partition and stay ordered. The starter keys by prefix, scattering them.",
       match: {
         python: {all: [/"suggest\.event"/, /key\s*=\s*tenant/]},
         typescript: {all: [/'suggest\.event'/, /key:\s*tenant/]},
@@ -65,7 +65,7 @@ so during a broker hiccup the metrics silently lose the events the product makes
       id: 'prefix-hash',
       title: 'Carries a prefix hash, never the raw prefix',
       detail:
-        'The payload carries `prefix_hash`, a hash of `(tenant, prefix)`, and never the raw prefix text. The draft publishes the raw prefix "for relevance tuning".',
+        'The payload carries `prefix_hash`, a hash of `(tenant, prefix)`, and never the raw prefix text. The starter publishes the raw prefix "for relevance tuning".',
       match: {
         python: {all: [/prefix_hash/, /sha256/], none: [/"prefix"\s*:\s*prefix\b/]},
         typescript: {all: [/prefixHash/, /createHash/], none: [/prefix:\s*prefix\b/]},
@@ -78,7 +78,7 @@ so during a broker hiccup the metrics silently lose the events the product makes
       id: 'durable',
       title: 'Writes the outbox when the broker rejects the produce',
       detail:
-        'A produce failure writes an outbox row for replay instead of dropping the event. The draft swallows the exception and loses the event.',
+        'A produce failure writes an outbox row for replay instead of dropping the event. The starter swallows the exception and loses the event.',
       match: {
         python: {all: [/OUTBOX/, /except\s+Exception/]},
         typescript: {all: [/OUTBOX/, /catch\s*\(/]},
@@ -91,7 +91,7 @@ so during a broker hiccup the metrics silently lose the events the product makes
       id: 'idempotent-producer',
       title: 'Produces idempotently with acks=all',
       detail:
-        'The producer is configured idempotent with `acks=all`, so a retry cannot duplicate an event. The draft uses the defaults.',
+        'The producer is configured idempotent with `acks=all`, so a retry cannot duplicate an event. The starter uses the defaults.',
       match: {
         python: {all: [/"enable\.idempotence"\s*:\s*True/, /"acks"\s*:\s*"all"/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -104,7 +104,7 @@ so during a broker hiccup the metrics silently lose the events the product makes
       id: 'payload-fields',
       title: 'Carries the prefix hash, position and latency',
       detail:
-        'The payload carries the prefix hash, the position in the suggestion list and the latency in milliseconds. The draft carries the raw prefix and the two numbers.',
+        'The payload carries the prefix hash, the position in the suggestion list and the latency in milliseconds. The starter carries the raw prefix and the two numbers.',
       match: {
         python: {all: [/prefix_hash/, /"position"/, /"latency_ms"/]},
         typescript: {all: [/prefix_hash/, /position/, /latency_ms/]},
@@ -122,7 +122,7 @@ TOPIC = "suggest.event"
 
 
 def publish(producer, tenant: str, prefix: str, position: int, latency_ms: int) -> None:
-    # TODO: this draft keys by prefix so one tenant's events scatter across partitions, publishes
+    # TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
     # the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
     payload = json.dumps({"prefix": prefix, "position": position, "latency_ms": latency_ms})
     try:
@@ -188,7 +188,7 @@ export async function publish(
   position: number,
   latency_ms: number,
 ): Promise<void> {
-  // TODO: this draft keys by prefix so one tenant's events scatter across partitions, publishes
+  // TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
   // the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
   try {
     await producer.send({
@@ -258,7 +258,7 @@ import (
 const topic = "suggest.event"
 
 func Publish(ctx context.Context, writer *kafka.Writer, tenant, prefix string, position, latencyMs int) error {
-	// TODO: this draft keys by prefix so one tenant's events scatter across partitions, publishes
+	// TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
 	// the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
 	payload, err := json.Marshal(map[string]any{"prefix": prefix, "position": position, "latency_ms": latencyMs})
 	if err != nil {
@@ -332,7 +332,7 @@ object Events {
   val Topic = "suggest.event"
 
   def publish(producer: KafkaProducer[String, String], tenant: String, prefix: String, position: Int, latencyMs: Int): Unit = {
-    // TODO: this draft keys by prefix so one tenant's events scatter across partitions, publishes
+    // TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
     // the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
     val payload = s"""{"prefix":"$prefix","position":$position,"latency_ms":$latencyMs}"""
     try {
@@ -386,7 +386,7 @@ object Events {
 const std::string kTopic = "suggest.event";
 
 void publish(RdKafka::Producer& producer, const std::string& tenant, const std::string& prefix, int position, int latencyMs) {
-  // TODO: this draft keys by prefix so one tenant's events scatter across partitions, publishes
+  // TODO: this starter keys by prefix so one tenant's events scatter across partitions, publishes
   // the raw prefix text for "relevance tuning", and lets a producer exception drop the event.
   const std::string payload = "{\\"prefix\\":\\"" + prefix + "\\",\\"position\\":" + std::to_string(position) +
                               ",\\"latency_ms\\":" + std::to_string(latencyMs) + "}";
@@ -433,5 +433,5 @@ void publish(RdKafka::Producer& producer, const std::string& tenant, const std::
     'Hash the prefix keyed by tenant so the same name from two tenants is not one joinable hash, and never log or publish the raw text. The event carries the hash, the position and the latency; that is enough for relevance tuning.',
     'Do not swallow a produce failure. Write the event to the outbox and let the replay publish it with the same key; keep the producer idempotent with `acks=all` so the replay cannot double-count.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated analytics producer at the privacy boundary. The draft reads fine because the demo has one tenant and a healthy broker. Three defects are being checked. Keying by prefix scatters a tenant's events across partitions, so ordering — the thing the topic is for — is gone. Publishing the raw prefix ships user text into a retained, replicated topic, which is where a search term must never be; the fix is a tenant-keyed hash that stays joinable without the text. The subtle one is the swallowed produce failure: the draft catches the exception and logs it, so during a broker hiccup the events that the product's trend decisions depend on are silently missing. Real pipelines add an outbox with a replayer, a schema registry so a future producer cannot smuggle content into the topic, and a metric on outbox depth so a hiccup is visible.`,
+  debrief: `The interviewer is testing whether you can debug an analytics producer at the privacy boundary. The starter reads fine because the demo has one tenant and a healthy broker. Three defects are being checked. Keying by prefix scatters a tenant's events across partitions, so ordering — the thing the topic is for — is gone. Publishing the raw prefix ships user text into a retained, replicated topic, which is where a search term must never be; the fix is a tenant-keyed hash that stays joinable without the text. The subtle one is the swallowed produce failure: the starter catches the exception and logs it, so during a broker hiccup the events that the product's trend decisions depend on are silently missing. Real pipelines add an outbox with a replayer, a schema registry so a future producer cannot smuggle content into the topic, and a metric on outbox depth so a hiccup is visible.`,
 };

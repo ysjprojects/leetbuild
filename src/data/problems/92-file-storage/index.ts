@@ -7,11 +7,11 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * File storage on the AI-era track: the course is not "upload a file", it is the review you owe a
- * model-generated storage service before a tenant's quota, bytes and links are trusted. A validated
- * upload handshake that counts the stream against its declaration → one atomic Redis reservation with
- * a TTL → object-store writes with chunk-scoped retries and a commit-gated completion → file events
- * keyed by file id with no user text → a signed, tenant-scoped, audited download URL.
+ * File storage: the course is not "upload a file", it is the debugging you owe a storage service
+ * before a tenant's quota, bytes and links are trusted. A validated upload handshake that counts
+ * the stream against its declaration → one atomic Redis reservation with a TTL → object-store
+ * writes with chunk-scoped retries and a commit-gated completion → file events keyed by file id
+ * with no user text → a signed, tenant-scoped, audited download URL.
  */
 export const fileStorageProblem: Problem = {
   id: 'file-storage',
@@ -19,7 +19,6 @@ export const fileStorageProblem: Problem = {
   tagline: 'Uploads that respect quota, resume cleanly and never expose permanent links.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# File Storage
 
@@ -61,12 +60,12 @@ One service, **stored**, with five pieces:
 5. \`GET /v1/files/{id}\`: the file's tenant is checked against the caller (a foreign id is \`404\`), the
    response is a signed URL that expires in 10 minutes, and the issuance is audited with the requester.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,23 +8,23 @@ export const dependencyStep: Step = {
   focus: ['auditd', 'signer', 'queue'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the signer, catches
+**Starting point.** The starter is working code: it calls the signer, catches
 errors and returns a record. It compiles, the happy path signs every record, and it hides three
-flaws that only matter on the day the signer is down. Review it, fix it, and prove the fix.
+flaws that only matter on the day the signer is down. Debug it, fix it, and prove the fix.
 
 Implement the receipt client that every append goes through:
 
 - Call the signing service over gRPC with a **500 ms** deadline on every attempt, and at most
   \`MAX_ATTEMPTS = 2\` attempts, so one record can never hold the append path open.
 - Retry **only** \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. A key-not-found is not a transient
-  failure: the draft loops on \`NOT_FOUND\` until its own 30-second budget runs out, which turns a
+  failure: the starter loops on \`NOT_FOUND\` until its own 30-second budget runs out, which turns a
   permanent configuration error into an outage.
 - A **permanent** error (\`PERMISSION_DENIED\`, for example) is surfaced to operators — reported and
   \`raise\`/\`throw\`n — never silently swallowed.
 - On an exhausted retry window the record is marked \`unsigned\` and written to the
-  \`audit:signing_queue\` so a background worker can sign it later. The draft drops the receipt on
+  \`audit:signing_queue\` so a background worker can sign it later. The starter drops the receipt on
   error and marks the record **verified** anyway, so the trail claims a signature it never had.
-- Never cache a signing failure globally. The draft flips one process-wide flag on the first error,
+- Never cache a signing failure globally. The starter flips one process-wide flag on the first error,
   so every later record — for every tenant — is silently skipped.
 - Return \`{"record_id", "receipt", "status"}\` where \`status\` is \`signed\` or \`unsigned\`.
 
@@ -62,7 +62,7 @@ global failure flag turns one tenant’s transient error into everyone’s perma
       id: 'deadline',
       title: 'One 500 ms deadline per signing attempt',
       detail:
-        'Each `Sign` call carries a **500** ms deadline. The draft has a single 30-second budget with no per-attempt deadline, so one hung signer stalls the append path.',
+        'Each `Sign` call carries a **500** ms deadline. The starter has a single 30-second budget with no per-attempt deadline, so one hung signer stalls the append path.',
       match: {
         python: {all: [/500/, /timeout|deadline/i]},
         typescript: {all: [/500/, /deadline|timeout/i]},
@@ -75,7 +75,7 @@ global failure flag turns one tenant’s transient error into everyone’s perma
       id: 'unsigned-queue',
       title: 'A failed receipt queues the record as unsigned',
       detail:
-        'When the retry window is exhausted the record is marked `unsigned` and written to the `signing_queue` for a later worker. The draft marks it verified and drops the receipt.',
+        'When the retry window is exhausted the record is marked `unsigned` and written to the `signing_queue` for a later worker. The starter marks it verified and drops the receipt.',
       match: {
         python: {all: [/unsigned/, /signing_queue/]},
         typescript: {all: [/unsigned/, /signing_queue/]},
@@ -88,7 +88,7 @@ global failure flag turns one tenant’s transient error into everyone’s perma
       id: 'retryable-only',
       title: 'Only UNAVAILABLE and DEADLINE_EXCEEDED are retried',
       detail:
-        'The retry set is the transient pair; a permanent code stops immediately. The draft retries `NOT_FOUND` until its budget runs out, so a misconfiguration looks like an outage.',
+        'The retry set is the transient pair; a permanent code stops immediately. The starter retries `NOT_FOUND` until its budget runs out, so a misconfiguration looks like an outage.',
       match: {
         python: {all: [/UNAVAILABLE/], none: [/NOT_FOUND/]},
         typescript: {all: [/UNAVAILABLE/], none: [/NOT_FOUND/]},
@@ -101,7 +101,7 @@ global failure flag turns one tenant’s transient error into everyone’s perma
       id: 'surface-permanent',
       title: 'A permanent error is surfaced to operators',
       detail:
-        'A non-retryable permission failure is reported and raised, not swallowed. The draft catches every error the same way, so a broken signer credential is invisible.',
+        'A non-retryable permission failure is reported and raised, not swallowed. The starter catches every error the same way, so a broken signer credential is invisible.',
       match: {
         python: {all: [/report_permanent/, /PERMISSION_DENIED/]},
         typescript: {all: [/reportPermanent/, /PERMISSION_DENIED/]},
@@ -114,7 +114,7 @@ global failure flag turns one tenant’s transient error into everyone’s perma
       id: 'bounded-window',
       title: 'The retry window is bounded',
       detail:
-        '`MAX_ATTEMPTS` bounds the attempts, so every record is either signed or queued within one short window. The draft loops without a bound.',
+        '`MAX_ATTEMPTS` bounds the attempts, so every record is either signed or queued within one short window. The starter loops without a bound.',
       match: {
         python: {all: [/MAX_ATTEMPTS/]},
         typescript: {all: [/MAX_ATTEMPTS/]},
@@ -135,7 +135,7 @@ log = logging.getLogger("auditd.signing")
 
 
 def request_receipt(stub, conn, record_id: str, record_digest: str) -> dict:
-    # TODO: the draft drops every error, marks the record verified anyway, retries NOT_FOUND until
+    # TODO: the starter drops every error, marks the record verified anyway, retries NOT_FOUND until
     # its 30-second budget expires and caches the first failure process-wide. Give each attempt a
     # 500 ms deadline, retry only the transient codes, and queue the record as unsigned.
     deadline = time.monotonic() + 30
@@ -200,7 +200,7 @@ def request_receipt(stub, conn, record_id: str, record_digest: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** A model-generated receipt client that marks first and asks questions later. */
+      starter: `/** A receipt client that marks first and asks questions later. */
 import * as grpc from '@grpc/grpc-js';
 import {status} from '@grpc/grpc-js';
 
@@ -212,7 +212,7 @@ export async function requestReceipt(
   recordId: string,
   recordDigest: string,
 ): Promise<Record<string, unknown>> {
-  // TODO: the draft drops every error, marks the record verified anyway, retries NOT_FOUND until
+  // TODO: the starter drops every error, marks the record verified anyway, retries NOT_FOUND until
   // its 30-second budget expires and caches the first failure process-wide. Give each attempt a
   // 500 ms deadline, retry only the transient codes, and queue the record as unsigned.
   const until = Date.now() + 30_000;
@@ -301,7 +301,7 @@ import (
 var signingDown bool
 
 func requestReceipt(ctx context.Context, client SignerClient, db *sql.DB, recordID, recordDigest string) (map[string]any, error) {
-	// TODO: the draft drops every error, marks the record verified anyway, retries NotFound until
+	// TODO: the starter drops every error, marks the record verified anyway, retries NotFound until
 	// its 30-second budget expires and caches the first failure process-wide. Give each attempt a
 	// 500 ms deadline, retry only the transient codes, and queue the record as unsigned.
 	until := time.Now().Add(30 * time.Second)
@@ -392,7 +392,7 @@ import io.grpc.{Status, StatusRuntimeException}
 object ReceiptClient {
   var signingDown = false
 
-  // TODO: the draft drops every error, marks the record verified anyway, retries NOT_FOUND until
+  // TODO: the starter drops every error, marks the record verified anyway, retries NOT_FOUND until
   // its 30-second budget expires and caches the first failure process-wide. Give each attempt a
   // 500 ms deadline, retry only the transient codes, and queue the record as unsigned.
   def requestReceipt(conn: java.sql.Connection, recordId: String, recordDigest: String, stub: SignerStub): Map[String, Any] = {
@@ -468,7 +468,7 @@ object ReceiptClient {
 bool signing_down = false;
 
 std::map<std::string, std::string> request_receipt(pqxx::work& tx, const std::string& record_id, const std::string& record_digest, Signer::Stub& stub) {
-  // TODO: the draft drops every error, marks the record verified anyway, retries NOT_FOUND until
+  // TODO: the starter drops every error, marks the record verified anyway, retries NOT_FOUND until
   // its 30-second budget expires and caches the first failure process-wide. Give each attempt a
   // 500 ms deadline, retry only the transient codes, and queue the record as unsigned.
   const auto until = std::chrono::system_clock::now() + std::chrono::seconds(30);
@@ -546,5 +546,5 @@ nlohmann::json request_receipt(pqxx::work& tx, const std::string& record_id, con
     'One deadline per attempt, not one for the loop. `timeout=0.5`, `{deadline: Date.now() + 500}`, `context.WithTimeout(ctx, 500*time.Millisecond)`, `withDeadlineAfter(500, MILLISECONDS)`, or `context.set_deadline(now + 500ms)` — and `MAX_ATTEMPTS = 2` above the loop so the window is bounded and observable.',
     'The honest state after a failed window is `unsigned`, written to the `signing_queue`. "Unsigned but queued" is a debt a worker repays; "verified" is a statement the record cannot support, and a process-wide failure flag makes one tenant’s bad minute into every tenant’s permanent one.',
   ],
-  debrief: `The interviewer is testing failure policy on an evidence path, where the wrong default is worse than an outage. The draft optimises for "the append never fails", so it converts every signing error into a verified record — which is exactly the outcome an audit trail exists to prevent. The fix is a classification: transient errors get a short, bounded retry with a per-attempt deadline; permanent errors are surfaced because no amount of retrying will fix a credential; and exhaustion produces an explicit \`unsigned\` state with a queue row, so the gap is visible and repairable. The insidious defect is the global flag: caching one failure across all records and tenants turns a single bad minute into a silent, systemic loss of receipts. Real systems add a signing worker with exponential backoff, a receipt TTL, and an alert on the age of the oldest unsigned record.`,
+  debrief: `The interviewer is testing failure policy on an evidence path, where the wrong default is worse than an outage. The starter optimises for "the append never fails", so it converts every signing error into a verified record — which is exactly the outcome an audit trail exists to prevent. The fix is a classification: transient errors get a short, bounded retry with a per-attempt deadline; permanent errors are surfaced because no amount of retrying will fix a credential; and exhaustion produces an explicit \`unsigned\` state with a queue row, so the gap is visible and repairable. The insidious defect is the global flag: caching one failure across all records and tenants turns a single bad minute into a silent, systemic loss of receipts. Real systems add a signing worker with exponential backoff, a receipt TTL, and an alert on the age of the oldest unsigned record.`,
 };

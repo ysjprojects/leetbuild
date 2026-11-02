@@ -8,7 +8,7 @@ export const refundReadStep: Step = {
   focus: ['finance', 'api', 'records', 'ledger', 'psp'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the endpoint returns a number
+**Starting point.** The starter is working code: the endpoint returns a number
 and the support tool renders it, so the demo passes. The number is the cache, not the truth, and the
 endpoint answers about anybody's payment. Find the flaws, fix them, and prove the fix.
 
@@ -19,7 +19,7 @@ Implement the read endpoint finance and support reconcile against:
   must be indistinguishable from a missing one.
 - The reported \`refunded_minor\` is reconstructed from the **durable refund records**
   (\`records.sum_refunds(payment_id)\`), never from the Redis ledger alone: a crash between the PSP's
-  success and the refund row must not make the customer's refunds vanish. The draft returns the
+  success and the refund row must not make the customer's refunds vanish. The starter returns the
   ledger's number, so it understates every refund that is settled but not yet written.
 - The Redis ledger is **matched against the records** in the same response: report
   \`drift_minor = refunded_minor - ledger.refunded_total(payment_id)\` and
@@ -28,7 +28,7 @@ Implement the read endpoint finance and support reconcile against:
 - Every refund still \`PENDING\` is **reconciled with the PSP** before it is reported
   (\`GetRefund(refund_id)\`, 5-second deadline): a settled refund folds into the total as
   \`CONFIRMED\` with its PSP reference, a rejected one is dropped from the total, and an unanswered
-  one stays \`PENDING\`. The draft hides pending refunds entirely.
+  one stays \`PENDING\`. The starter hides pending refunds entirely.
 - Every refund row carries \`refund_id\`, \`amount_minor\`, \`reason_code\`, \`psp_ref\` and
   \`status\`; the body also carries \`paid_minor\`, \`remaining_minor\` and \`pending_minor\` so
   support can answer "how much is still to come?" without opening the ledger.
@@ -66,7 +66,7 @@ answering without an ownership check lets any tenant read another merchant's ref
       id: 'tenant-scope',
       title: 'Authorizes the read and 404s a foreign payment',
       detail:
-        'The payment is loaded and its owner compared with the authenticated tenant before anything is read; a foreign payment answers **404**. The draft serves any payment id the path names.',
+        'The payment is loaded and its owner compared with the authenticated tenant before anything is read; a foreign payment answers **404**. The starter serves any payment id the path names.',
       match: {
         python: {all: [/assert_tenant_owns/, /status_code\s*=\s*404/]},
         typescript: {all: [/assertTenantOwns/, /statusCode\s*=\s*404/]},
@@ -79,7 +79,7 @@ answering without an ownership check lets any tenant read another merchant's ref
       id: 'durable-total',
       title: 'Reconstructs the total from the durable records',
       detail:
-        'The reported total comes from the refund records (`records.sum_refunds`), so a refund that is settled at the PSP but not yet written cannot disappear from the balance. The draft reports the ledger alone.',
+        'The reported total comes from the refund records (`records.sum_refunds`), so a refund that is settled at the PSP but not yet written cannot disappear from the balance. The starter reports the ledger alone.',
       match: {
         python: {all: [/records\.sum_refunds\(/, /refunded_minor/]},
         typescript: {all: [/records\.sumRefunds\(/, /refunded_minor/]},
@@ -92,7 +92,7 @@ answering without an ownership check lets any tenant read another merchant's ref
       id: 'ledger-match',
       title: 'Matches the ledger and reports the drift',
       detail:
-        'The response compares the durable total with `ledger.refunded_total(payment_id)` and carries `drift_minor` (and whether the ledger reconciled), so drift is visible instead of silent. The draft never compares the two.',
+        'The response compares the durable total with `ledger.refunded_total(payment_id)` and carries `drift_minor` (and whether the ledger reconciled), so drift is visible instead of silent. The starter never compares the two.',
       match: {
         python: {all: [/ledger\.refunded_total\(/, /drift_minor/]},
         typescript: {all: [/ledger\.refundedTotal\(/, /drift_minor/]},
@@ -105,7 +105,7 @@ answering without an ownership check lets any tenant read another merchant's ref
       id: 'pending-reconciled',
       title: 'Reconciles pending refunds with the PSP before answering',
       detail:
-        'Every row still `PENDING` is asked about at the PSP (`GetRefund`) before it is reported, and the unsettled amount is called out as `pending_minor`. The draft hides pending refunds and their references.',
+        'Every row still `PENDING` is asked about at the PSP (`GetRefund`) before it is reported, and the unsettled amount is called out as `pending_minor`. The starter hides pending refunds and their references.',
       match: {
         python: {all: [/GetRefund/, /pending_minor/]},
         typescript: {all: [/GetRefund/, /pending_minor/]},
@@ -118,7 +118,7 @@ answering without an ownership check lets any tenant read another merchant's ref
       id: 'refund-rows',
       title: 'Every refund carries its PSP reference and status',
       detail:
-        'Each refund row carries `refund_id`, `amount_minor`, `reason_code`, `psp_ref` and `status`, so a reviewer can point at the provider reference for a specific refund. The draft returns ids and amounts only.',
+        'Each refund row carries `refund_id`, `amount_minor`, `reason_code`, `psp_ref` and `status`, so a reviewer can point at the provider reference for a specific refund. The starter returns ids and amounts only.',
       match: {
         python: {all: [/"refund_id":/, /"psp_ref":/, /"status":/]},
         typescript: {all: [/refund_id:\s*row\.refund_id/, /psp_ref:/, /status:/]},
@@ -157,9 +157,9 @@ ledger = RefundLedger()
 
 @app.get("/v1/payments/{payment_id}/refunds")
 def read_refunds(payment_id: str) -> JSONResponse:
-    # TODO: this draft reports the Redis ledger alone, so a crash between the PSP's success and the
+    # TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
     # refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-    # their references, and serves any tenant's payment. Review all four.
+    # their references, and serves any tenant's payment. Fix all four.
     refunded_minor = ledger.refunded_total(payment_id)
     logger.info("refunds read payment=%s", payment_id)
     return JSONResponse(
@@ -293,7 +293,7 @@ def read_refunds(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/payments/:id/refunds: a model-generated draft that reports the cache. */
+      starter: `/** GET /v1/payments/:id/refunds: flawed code that reports the cache. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -302,9 +302,9 @@ const r = new Redis('redis://redis:6379');
 
 app.get('/v1/payments/:paymentId/refunds', async (request, reply) => {
   const {paymentId} = request.params as {paymentId: string};
-  // TODO: this draft reports the Redis ledger alone, so a crash between the PSP's success and the
+  // TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
   // refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-  // their references, and serves any tenant's payment. Review all four.
+  // their references, and serves any tenant's payment. Fix all four.
   const cached = await r.hget(\`refunded:\${paymentId}\`, 'refunded');
   const refunded_minor = cached === null ? 0 : Number(cached);
   return reply.code(200).send({
@@ -416,9 +416,9 @@ var rdb *redis.Client
 func readRefunds(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	paymentID := r.PathValue("payment_id")
-	// TODO: this draft reports the Redis ledger alone, so a crash between the PSP's success and the
+	// TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
 	// refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-	// their references, and serves any tenant's payment. Review all four.
+	// their references, and serves any tenant's payment. Fix all four.
 	cached, _ := rdb.HGet(ctx, "refunded:"+paymentID, "refunded").Int64()
 	body, _ := json.Marshal(map[string]any{
 		"payment_id":     paymentID,
@@ -591,9 +591,9 @@ object Read {
   val route: Route =
     path("v1" / "payments" / Segment / "refunds") { paymentId =>
       get {
-        // TODO: this draft reports the Redis ledger alone, so a crash between the PSP's success and
+        // TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and
         // the refund row understates the refunds; it never reconciles pending refunds with the PSP,
-        // hides their references, and serves any tenant's payment. Review all four.
+        // hides their references, and serves any tenant's payment. Fix all four.
         val cached = Option(jedis.hget(s"refunded:$paymentId", "refunded")).map(_.toLong).getOrElse(0L)
         complete(StatusCodes.OK, s"""{"payment_id":"$paymentId","refunded_minor":$cached}""")
       }
@@ -758,9 +758,9 @@ int main() {
 
   svr.Get("/v1/payments/([^/]+)/refunds", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto payment_id = req.matches[1].str();
-    // TODO: this draft reports the Redis ledger alone, so a crash between the PSP's success and the
+    // TODO: this starter reports the Redis ledger alone, so a crash between the PSP's success and the
     // refund row understates the refunds; it never reconciles pending refunds with the PSP, hides
-    // their references, and serves any tenant's payment. Review all four.
+    // their references, and serves any tenant's payment. Fix all four.
     auto cached = redis.hget("refunded:" + payment_id, "refunded");
     const long long refunded_minor = cached ? std::stoll(*cached) : 0;
     res.status = 200;
@@ -925,5 +925,5 @@ int main() {
     'The records are the source of truth and the ledger is a cache: take `refunded_minor` from `records.sum_refunds(payment_id)`, compare it with `ledger.refunded_total(payment_id)` and publish `drift_minor`. A response that only echoes the cache can never be reconciled against the provider.',
     'Reconcile before you answer: for every row whose status is `PENDING`, ask the PSP with `GetRefund(refund_id)`, fold a settled answer in as `CONFIRMED` with its `psp_ref`, drop a rejected one from the total, and report what is still unknown as `pending_minor`. Support needs the provider reference, not a promise.',
   ],
-  debrief: `The interviewer is testing whether you can tell a cache from the truth in a system whose whole job is money. The durable refund records are the ledger of record; Redis is a fast copy of it, and a read endpoint that reports the copy alone lies exactly when the service crashed between the PSP's success and the row write — the failure the reconciliation worker exists to repair. Matching the two in the response (\`drift_minor\`, \`ledger_reconciled\`) turns a silent disagreement into an alarm and gives the worker its input. Reconciling pending refunds before answering is the second half: a refund the PSP already applied must not be shown as missing, and support needs its provider reference to talk to the customer. The ownership check is the plain one that generated endpoints forget: a read is still a read of one tenant's money, and a foreign payment id answers 404. Real services add an append-only refund log with monotonic offsets, a per-payment reconciliation interval, and a metric on both drift and pending age.`,
+  debrief: `The interviewer is testing whether you can tell a cache from the truth in a system whose whole job is money. The durable refund records are the ledger of record; Redis is a fast copy of it, and a read endpoint that reports the copy alone lies exactly when the service crashed between the PSP's success and the row write — the failure the reconciliation worker exists to repair. Matching the two in the response (\`drift_minor\`, \`ledger_reconciled\`) turns a silent disagreement into an alarm and gives the worker its input. Reconciling pending refunds before answering is the second half: a refund the PSP already applied must not be shown as missing, and support needs its provider reference to talk to the customer. The ownership check is the plain one that read endpoints forget: a read is still a read of one tenant's money, and a foreign payment id answers 404. Real services add an append-only refund log with monotonic offsets, a per-payment reconciliation interval, and a metric on both drift and pending age.`,
 };

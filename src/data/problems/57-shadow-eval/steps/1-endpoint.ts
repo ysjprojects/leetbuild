@@ -8,9 +8,9 @@ export const shadowEndpointStep: Step = {
   focus: ['client', 'shadow', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the config route,
+**Starting point.** The starter is working code: it registers the config route,
 parses the body and stores a config. It compiles, it serves the demo, and it hides the flaw that
-makes a shadow dangerous — the candidate path can act. Review it like the service owner, fix it, and
+makes a shadow dangerous — the candidate path can act. Debug it like the service owner, fix it, and
 prove the fix with the checks below.
 
 Implement \`POST /v1/shadow/configs\` with body
@@ -33,7 +33,7 @@ comparison will track.
 - Return the stored config with its \`config_id\`, \`status\` and namespace; log ids and the share,
   never the request body.
 
-**Failure mode the checks target.** The draft shares the production request object with the
+**Failure mode the checks target.** The starter shares the production request object with the
 candidate and lets the candidate write to the same idempotency store, so one shadow response can
 consume the very key production needs for the real request. It also accepts any share and any metric
 set, and never checks the tenant, so a shadow can be pushed to 100 percent of traffic with metrics
@@ -66,7 +66,7 @@ nothing downstream understands.`,
       id: 'share',
       title: 'Caps the traffic share at 1..20 percent',
       detail:
-        'The share is validated as an integer between 1 and 20 inclusive; anything outside is **400**. The draft stores whatever percentage the caller sends, so a shadow can become 100 percent of live traffic.',
+        'The share is validated as an integer between 1 and 20 inclusive; anything outside is **400**. The starter stores whatever percentage the caller sends, so a shadow can become 100 percent of live traffic.',
       match: {
         python: {all: [/MIN_SHARE\s*=\s*1/, /MAX_SHARE\s*=\s*20/, /status_code\s*=\s*400/]},
         typescript: {all: [/MIN_SHARE\s*=\s*1/, /MAX_SHARE\s*=\s*20/, /code\(\s*400\s*\)/]},
@@ -79,7 +79,7 @@ nothing downstream understands.`,
       id: 'tenant',
       title: 'Requires the tenant and a candidate version',
       detail:
-        'A missing `X-Tenant-Id` is **401** and an empty `candidate_version` is **400**. The draft reads the tenant header but never rejects its absence, and it stores an empty candidate version without complaint.',
+        'A missing `X-Tenant-Id` is **401** and an empty `candidate_version` is **400**. The starter reads the tenant header but never rejects its absence, and it stores an empty candidate version without complaint.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/, /candidate_version/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/, /candidate_version/]},
@@ -92,7 +92,7 @@ nothing downstream understands.`,
       id: 'isolate',
       title: 'Writes only into the shadow analytics namespace',
       detail:
-        'The shadow writes into its own `shadow:analytics` namespace and rejects a production idempotency key (prefix `prod:`) with **409**. The draft writes the candidate result into the same idempotency store production uses, so a shadow response consumes the key production needs.',
+        'The shadow writes into its own `shadow:analytics` namespace and rejects a production idempotency key (prefix `prod:`) with **409**. The starter writes the candidate result into the same idempotency store production uses, so a shadow response consumes the key production needs.',
       match: {
         python: {all: [/SHADOW_NS/, /PRODUCTION_KEY_PREFIX/, /status_code\s*=\s*409/]},
         typescript: {all: [/SHADOW_NS/, /PRODUCTION_KEY_PREFIX/, /code\(\s*409\s*\)/]},
@@ -105,7 +105,7 @@ nothing downstream understands.`,
       id: 'metrics',
       title: 'Validates the metric set against an allow-list',
       detail:
-        '`metrics` must be a non-empty subset of the allowed set, and an unknown metric is **400**. The draft stores any metric names, so the comparison later divides by metrics nothing produces.',
+        '`metrics` must be a non-empty subset of the allowed set, and an unknown metric is **400**. The starter stores any metric names, so the comparison later divides by metrics nothing produces.',
       match: {
         python: {all: [/ALLOWED_METRICS/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_METRICS/, /code\(\s*400\s*\)/]},
@@ -149,9 +149,9 @@ def create_shadow_config(
     tenant: str = Header(alias="X-Tenant-Id"),
     idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JSONResponse:
-    # TODO: the draft shares the production request object with the candidate and writes the shadow
+    # TODO: the starter shares the production request object with the candidate and writes the shadow
     # answer into the production idempotency store, accepts any share and any metric, and never
-    # checks that the tenant is present. Review all four.
+    # checks that the tenant is present. Fix all four.
     config = {
         "config_id": str(uuid.uuid4()),
         "candidate_version": body.candidate_version,
@@ -240,7 +240,7 @@ def create_shadow_config(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/shadow/configs: a model-generated draft that lets the shadow act. */
+      starter: `/** POST /v1/shadow/configs: flawed code that lets the shadow act. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -256,9 +256,9 @@ interface ShadowConfigBody {
 }
 
 app.post('/v1/shadow/configs', async (request, reply) => {
-  // TODO: the draft shares the production request object with the candidate and writes the shadow
+  // TODO: the starter shares the production request object with the candidate and writes the shadow
   // answer into the production idempotency store, accepts any share and any metric, and never
-  // checks that the tenant is present. Review all four.
+  // checks that the tenant is present. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const idemKey = request.headers['idempotency-key'] as string | undefined;
   const body = request.body as ShadowConfigBody;
@@ -370,9 +370,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createShadowConfig(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft shares the production request object with the candidate and writes the shadow
+	// TODO: the starter shares the production request object with the candidate and writes the shadow
 	// answer into the production idempotency store, accepts any share and any metric, and never
-	// checks that the tenant is present. Review all four.
+	// checks that the tenant is present. Fix all four.
 	tenant := r.Header.Get("X-Tenant-Id")
 	idemKey := r.Header.Get("Idempotency-Key")
 	var body ShadowConfigRequest
@@ -526,9 +526,9 @@ object ShadowApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ShadowConfig]) { body =>
-            // TODO: the draft shares the production request object with the candidate and writes
+            // TODO: the starter shares the production request object with the candidate and writes
             // the shadow answer into the production idempotency store, accepts any share and any
-            // metric, and never checks that the tenant is present. Review all four.
+            // metric, and never checks that the tenant is present. Fix all four.
             val configId = UUID.randomUUID().toString
             configStore.put(tenant, configId)
             configStore.put(s"$tenant:shadow", configId)
@@ -631,9 +631,9 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/shadow/configs", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft shares the production request object with the candidate and writes the shadow
+    // TODO: the starter shares the production request object with the candidate and writes the shadow
     // answer into the production idempotency store, accepts any share and any metric, and never
-    // checks that the tenant is present. Review all four.
+    // checks that the tenant is present. Fix all four.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto idemKey = req.get_header_value("Idempotency-Key");
     json body = json::parse(req.body, nullptr, false);
@@ -758,5 +758,5 @@ int main() {
     'The namespace is the safety property: the shadow may write only under `shadow:analytics:{config_id}:`. A production idempotency key (`prod:` prefix) is not a cache hint — answering it would let the shadow consume the key the real request needs, so it is a 409.',
     'Keep the config response honest: `config_id`, `status: "observe_only"` and the namespace, plus the share in the log. Never echo the request body back — the body can carry caller-controlled fields you did not validate.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated endpoint for the property that defines a shadow: it must be incapable of acting. The draft looks fine because it answers 200 and stores a config, but it shares the production request object with the candidate and writes into the production idempotency store, so a shadow response can consume the key the real request needs — the shadow has reached production through the back door. The other three defects are cheaper to see and just as real: an uncapped share can turn a shadow into all of traffic, an unvalidated metric set breaks the comparison downstream, and a missing tenant check makes the config anonymous. Real shadow runners add a server-side share rollout, a signed config version, and a per-config kill switch that is checked before the candidate is even called.`,
+  debrief: `The interviewer is testing whether you can debug an endpoint for the property that defines a shadow: it must be incapable of acting. The starter looks fine because it answers 200 and stores a config, but it shares the production request object with the candidate and writes into the production idempotency store, so a shadow response can consume the key the real request needs — the shadow has reached production through the back door. The other three defects are cheaper to see and just as real: an uncapped share can turn a shadow into all of traffic, an unvalidated metric set breaks the comparison downstream, and a missing tenant check makes the config anonymous. Real shadow runners add a server-side share rollout, a signed config version, and a per-config kill switch that is checked before the candidate is even called.`,
 };

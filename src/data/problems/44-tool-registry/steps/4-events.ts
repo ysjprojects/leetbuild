@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['registry', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes a
+**Starting point.** The starter is working code: it publishes a
 \`tool.lifecycle\` event on every registration and promotion, and the demo timeline shows the catalog
-moving. Four production contracts are broken. Review it like the platform owner, fix it, and prove
+moving. Four production contracts are broken. Debug it like the platform owner, fix it, and prove
 the fix with the checks below.
 
 \`publish_lifecycle(tool, version, side_effect, manifest)\` is the helper every
@@ -19,7 +19,7 @@ topic.
 
 - The record **key is the tool name**. The key is the partition key: keyed by tool, one tool’s
   registered → validated → promoted → revoked history lands on one partition in order, which is the
-  only way a consumer can replay "promoted 4, revoked → 3" correctly. The draft keys by the owner
+  only way a consumer can replay "promoted 4, revoked → 3" correctly. The starter keys by the owner
   team, so two teams’ tools interleave and a tool’s own events lose their order.
 - The payload carries the **version**, the **side-effect class** and the **validator outcome** —
   \`validated\` or \`rejected\`, taken from the sandbox verdict, never a hard-coded state. No sandbox
@@ -35,7 +35,7 @@ topic.
   a relay republishes, instead of announcing it as promoted. A produce the broker rejects lands in
   the outbox too — a lifecycle event is never dropped.
 
-**Failure mode the checks target.** The draft reads as complete because the happy path publishes
+**Failure mode the checks target.** The starter reads as complete because the happy path publishes
 something for every transition, but the key is the wrong field, the payload ships the sandbox log
 with a best-effort regex redaction that misses any credential in an unexpected shape, the event is
 produced before the verdict exists, and there is no outbox at all — so a rejected version and a
@@ -87,7 +87,7 @@ broker outage both end as silence in the audit trail.`,
       id: 'key',
       title: 'Record keyed by the tool name',
       detail:
-        'The Kafka record key is the tool name (`key=tool`, `key: tool`, `[]byte(tool)`, `ProducerRecord(Topic, tool, …)`, `tool.data()`), not the owner team — partition by tool keeps one tool’s lifecycle history ordered. The draft keys by the owner team, so two teams’ tools share a partition.',
+        'The Kafka record key is the tool name (`key=tool`, `key: tool`, `[]byte(tool)`, `ProducerRecord(Topic, tool, …)`, `tool.data()`), not the owner team — partition by tool keeps one tool’s lifecycle history ordered. The starter keys by the owner team, so two teams’ tools share a partition.',
       match: {
         python: {all: [/key=tool\b/, /tool\.lifecycle/]},
         typescript: {all: [/key:\s*tool\b/, /tool\.lifecycle/]},
@@ -100,7 +100,7 @@ broker outage both end as silence in the audit trail.`,
       id: 'payload',
       title: 'Version, side-effect class and the validator outcome',
       detail:
-        'The event carries `version`, `side_effect` and `outcome` taken from the validator verdict — not a hard-coded state. The draft writes `"promoted"` into the payload before any validator has run.',
+        'The event carries `version`, `side_effect` and `outcome` taken from the validator verdict — not a hard-coded state. The starter writes `"promoted"` into the payload before any validator has run.',
       match: {
         python: {
           all: [
@@ -127,7 +127,7 @@ broker outage both end as silence in the audit trail.`,
       id: 'after-validation',
       title: 'Produce runs after the validation verdict',
       detail:
-        'The produce is issued after `sandbox.validate(...)` has returned, and after the promotion is recorded for a validated version, so an event can never precede or contradict the verdict. The draft publishes first and validates afterwards, which lets the topic announce a promotion that then fails validation.',
+        'The produce is issued after `sandbox.validate(...)` has returned, and after the promotion is recorded for a validated version, so an event can never precede or contradict the verdict. The starter publishes first and validates afterwards, which lets the topic announce a promotion that then fails validation.',
       match: {
         python: {order: [/sandbox\.validate\(/, /producer\.produce\(/]},
         typescript: {order: [/sandbox\.validate\(/, /producer\.send\(/]},
@@ -140,7 +140,7 @@ broker outage both end as silence in the audit trail.`,
       id: 'no-secrets',
       title: 'No sandbox logs or credentials in the event',
       detail:
-        'Nothing writes sandbox log lines or credentials into the payload: the topic is retained and replicated, so the log outlives the request that produced it. The draft ships the sandbox log with a best-effort regex redaction that misses any credential the sandbox printed in another shape.',
+        'Nothing writes sandbox log lines or credentials into the payload: the topic is retained and replicated, so the log outlives the request that produced it. The starter ships the sandbox log with a best-effort regex redaction that misses any credential the sandbox printed in another shape.',
       match: {
         python: {none: [/sandbox_log/, /redact/i]},
         typescript: {none: [/sandbox_log/, /redact/i]},
@@ -153,7 +153,7 @@ broker outage both end as silence in the audit trail.`,
       id: 'outbox',
       title: 'Rejections and failed produces land in the outbox',
       detail:
-        'A rejected verdict and a produce the broker refuses both write an outbox row (`insert_outbox`/`insertOutbox`) that a relay republishes, so the rejection is auditable even when the broker is down. The draft drops both.',
+        'A rejected verdict and a produce the broker refuses both write an outbox row (`insert_outbox`/`insertOutbox`) that a relay republishes, so the rejection is auditable even when the broker is down. The starter drops both.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+KafkaException|verdict\.outcome\s*!=\s*"validated"/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*[{(]|!==\s*'validated'/]},
@@ -299,7 +299,7 @@ def publish_lifecycle(tool: str, version: str, side_effect: str, manifest: dict)
 `,
     },
     typescript: {
-      starter: `/** tool.lifecycle: a model-generated draft that keys by owner team and publishes before validating. */
+      starter: `/** tool.lifecycle: flawed code that keys by owner team and publishes before validating. */
 import {Kafka} from 'kafkajs';
 
 import {registry, sandbox} from './clients';
@@ -830,7 +830,7 @@ by the tool name, one tool’s registered → validated → promoted → revoked
 partition in order; keyed by the owner team, it interleaves with every other tool that team owns,
 and a consumer replaying the topic can no longer reconstruct what was live when. Publication order
 is a correctness contract: validate, record the promotion, then publish, so the topic can never
-announce a version the sandbox has not passed — the draft publishes first and validates afterwards,
+announce a version the sandbox has not passed — the starter publishes first and validates afterwards,
 which turns the topic into a source of lies the moment a candidate fails. The payload is a retention
 contract: the topic holds every event on every replica for days, so the sandbox log behind a
 best-effort regex redaction is a leak waiting for a credential in an unexpected shape; the fix is to

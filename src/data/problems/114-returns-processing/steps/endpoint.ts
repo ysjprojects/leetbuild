@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it parses the body, looks up
+**Starting point.** The starter is working code: it parses the body, looks up
 the order line, and registers the return. It compiles, it serves the demo, and it approves returns
-that policy says are closed. Review it like the service owner, fix it, and prove the fix with the
+that policy says are closed. Debug it like the service owner, fix it, and prove the fix with the
 checks below.
 
 Implement \`POST /v1/returns\` with body
@@ -28,11 +28,11 @@ Implement \`POST /v1/returns\` with body
 - \`reason_code\` must be one of \`damaged\`, \`wrong_item\`, \`not_as_described\`, \`late_delivery\`,
   \`changed_mind\` (**400** otherwise). The first three require a \`photo_ref\`; a claim without
   evidence is **400**.
-- A caller-supplied eligibility flag in the body is **ignored**. The draft approves when the body
+- A caller-supplied eligibility flag in the body is **ignored**. The starter approves when the body
   says the customer promised the return was late; the server decides eligibility, never the client.
 - The registration is logged with the tenant, the line and the quantity — never the photo reference.
 
-**Failure mode the checks target.** The draft trusts a body flag the client controls, so a closed
+**Failure mode the checks target.** The starter trusts a body flag the client controls, so a closed
 line is reopened by a sentence. It never subtracts earlier returns, so the same line is returned
 three times over. It never reads the policy window, so "it was late" becomes a refund. And it never
 validates the reason code or its evidence.`,
@@ -81,7 +81,7 @@ validates the reason code or its evidence.`,
       id: 'window',
       title: 'Rejects an out-of-window return with the window dates',
       detail:
-        'Eligibility is computed from `delivered_at` plus the `policy_window` days, and a return requested after the window closes is **422** carrying `delivered_at` and `window_ends`. The draft approves on the customer’s word and never computes the window.',
+        'Eligibility is computed from `delivered_at` plus the `policy_window` days, and a return requested after the window closes is **422** carrying `delivered_at` and `window_ends`. The starter approves on the customer’s word and never computes the window.',
       match: {
         python: {all: [/POLICY_WINDOW_DAYS/, /window_end/, /delivered_at/, /status_code\s*=\s*422/]},
         typescript: {all: [/POLICY_WINDOW_DAYS/, /windowEnd/, /delivered_at|deliveredAt/, /code\(\s*422\s*\)/]},
@@ -94,7 +94,7 @@ validates the reason code or its evidence.`,
       id: 'quantity',
       title: 'Caps quantity at what remains returnable',
       detail:
-        'The quantity is checked against the ordered quantity minus what earlier returns already consumed, and an over-return is **409** with `remaining`. The draft compares nothing and lets a line be returned past its ordered quantity.',
+        'The quantity is checked against the ordered quantity minus what earlier returns already consumed, and an over-return is **409** with `remaining`. The starter compares nothing and lets a line be returned past its ordered quantity.',
       match: {
         python: {all: [/already_returned/, /remaining/, /status_code\s*=\s*409/]},
         typescript: {all: [/alreadyReturned/, /remaining/, /code\(\s*409\s*\)/]},
@@ -107,7 +107,7 @@ validates the reason code or its evidence.`,
       id: 'no-client-flag',
       title: 'Ignores the caller’s eligibility flag',
       detail:
-        'Eligibility is never read from the request body. The draft approves when the caller sends its own `eligible` flag, which lets a client reopen a closed line by asserting it.',
+        'Eligibility is never read from the request body. The starter approves when the caller sends its own `eligible` flag, which lets a client reopen a closed line by asserting it.',
       match: {
         python: {none: [/\bbody\.eligible\b/]},
         typescript: {none: [/\bbody\.eligible\b/]},
@@ -120,7 +120,7 @@ validates the reason code or its evidence.`,
       id: 'reason-photo',
       title: 'Validates the reason code and its evidence',
       detail:
-        '`reason_code` is checked against the allowed set and the damage reasons require a `photo_ref`. The draft accepts any reason string and any claim without evidence.',
+        '`reason_code` is checked against the allowed set and the damage reasons require a `photo_ref`. The starter accepts any reason string and any claim without evidence.',
       match: {
         python: {all: [/ALLOWED_REASON_CODES/, /PHOTO_REQUIRED_REASONS/, /photo_ref/]},
         typescript: {all: [/ALLOWED_REASON_CODES/, /PHOTO_REQUIRED_REASONS/, /photo_ref|photoRef/]},
@@ -174,7 +174,7 @@ store = ReturnsStore()
 
 @app.post("/v1/returns")
 def create_return(body: ReturnRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: the draft trusts the caller's eligible flag, never checks the policy window, never
+    # TODO: the starter trusts the caller's eligible flag, never checks the policy window, never
     # subtracts what earlier returns already consumed, and does not validate the reason code.
     line = store.line(body.order_line_id)
     if line is None:
@@ -266,7 +266,7 @@ def create_return(body: ReturnRequest, tenant: str = Header(alias="X-Tenant-Id")
 `,
     },
     typescript: {
-      starter: `/** POST /v1/returns: a model-generated draft that trusts the caller's eligibility flag. */
+      starter: `/** POST /v1/returns: flawed code that trusts the caller's eligibility flag. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -295,7 +295,7 @@ const store = {
 };
 
 app.post('/v1/returns', async (request, reply) => {
-  // TODO: the draft trusts the caller's eligible flag, never checks the policy window, never
+  // TODO: the starter trusts the caller's eligible flag, never checks the policy window, never
   // subtracts what earlier returns already consumed, and does not validate the reason code.
   const body = request.body as ReturnBody;
   const line = await store.line(body.order_line_id);
@@ -430,7 +430,7 @@ func createReturn(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: the draft trusts the caller's Eligible flag, never checks the policy window, never
+	// TODO: the starter trusts the caller's Eligible flag, never checks the policy window, never
 	// subtracts what earlier returns already consumed, and does not validate the reason code.
 	line, err := store.Line(r.Context(), body.OrderLineID)
 	if err != nil {
@@ -623,7 +623,7 @@ object ReturnApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ReturnRequest]) { body =>
-            // TODO: the draft trusts the caller's eligible flag, never checks the policy window,
+            // TODO: the starter trusts the caller's eligible flag, never checks the policy window,
             // never subtracts what earlier returns already consumed, and does not validate the reason code.
             store.line(body.order_line_id) match {
               case None =>
@@ -752,7 +752,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: the draft trusts the caller's eligible flag, never checks the policy window, never
+    // TODO: the starter trusts the caller's eligible flag, never checks the policy window, never
     // subtracts what earlier returns already consumed, and does not validate the reason code.
     const auto orderLineId = body.value("order_line_id", std::string());
     const auto line = store.line(orderLineId);
@@ -875,5 +875,5 @@ int main() {
     'The quantity you compare against is not the ordered quantity: it is the ordered quantity minus every quantity earlier returns already consumed. Compute `remaining` from the store and reject anything above it with **409**, so a line can never be returned past its ordered quantity.',
     'The body may carry a flag named `eligible` or anything like it — ignore it. If you find yourself reading a request field to decide eligibility, the client is deciding policy. The only inputs are the line, the window, and the quantities already returned.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends a well-formed request from one customer whose order just shipped. Three defects are being checked: computed eligibility (a policy window over \`delivered_at\`, not a caller assertion), cumulative quantities (what remains after earlier returns, not the ordered quantity), and validated evidence (an allowed reason code, and a photo for the damage reasons). The quiet one is the body flag: letting a client assert eligibility turns every return into a formality. Real services add per-region windows from config, a reasons table with evidence requirements, and a reconciliation job that compares registered returns against the ledger.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends a well-formed request from one customer whose order just shipped. Three defects are being checked: computed eligibility (a policy window over \`delivered_at\`, not a caller assertion), cumulative quantities (what remains after earlier returns, not the ordered quantity), and validated evidence (an allowed reason code, and a photo for the damage reasons). The quiet one is the body flag: letting a client assert eligibility turns every return into a formality. Real services add per-region windows from config, a reasons table with evidence requirements, and a reconciliation job that compares registered returns against the ledger.`,
 };

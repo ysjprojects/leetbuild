@@ -8,9 +8,9 @@ export const readStatsStep: Step = {
   focus: ['api', 'redis', 'db', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the stats route,
-reads a few counters and returns a hit ratio. It looks like observability and it is actually a way to
-miss an incident. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the stats route, reads a few counters
+and returns a hit ratio. It looks like observability and it is actually a way to miss an incident.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/rerank/cache/stats\`:
 
@@ -25,7 +25,7 @@ Implement \`GET /v1/rerank/cache/stats\`:
   retrieval-order fallback is visible alongside the unscored share.
 - Keep the hit ratio, but compute it from per-version counters.
 
-**Failure mode the checks target.** The draft returns one global \`hit_ratio\`, omits the unscored
+**Failure mode the checks target.** The starter returns one global \`hit_ratio\`, omits the unscored
 share entirely, and computes latency from client-observed samples that include the queue wait — so
 silent degradation looks like success and a real model slowdown is indistinguishable from a busy
 worker pool.`,
@@ -59,7 +59,7 @@ worker pool.`,
       id: 'unscored-share',
       title: 'Reports the unscored batch share',
       detail:
-        'Failed batches are counted and surfaced as `unscored_share`, so silent degradation cannot read as success. The draft omits it.',
+        'Failed batches are counted and surfaced as `unscored_share`, so silent degradation cannot read as success. The starter omits it.',
       match: {
         python: {all: [/unscored_share/, /unscored_batches/]},
         typescript: {all: [/unscored_share/, /unscoredBatches/]},
@@ -72,7 +72,7 @@ worker pool.`,
       id: 'per-version',
       title: 'Breaks the stats down per model version',
       detail:
-        'Each entry carries its `model_version` and is built per version, so a mixed fleet cannot hide the version that regressed. The draft reports one global ratio.',
+        'Each entry carries its `model_version` and is built per version, so a mixed fleet cannot hide the version that regressed. The starter reports one global ratio.',
       match: {
         python: {all: [/model_version/, /stats_for_version/]},
         typescript: {all: [/modelVersion/, /statsForVersion/]},
@@ -85,7 +85,7 @@ worker pool.`,
       id: 'queue-latency',
       title: 'Reports queue latency separately',
       detail:
-        'The queue wait is measured and reported on its own, so a slow queue is not charged to the model. The draft uses client-observed times that include the queue.',
+        'The queue wait is measured and reported on its own, so a slow queue is not charged to the model. The starter uses client-observed times that include the queue.',
       match: {
         python: {all: [/["']queue["']\s*:\s*latency_percentiles/]},
         typescript: {all: [/queue:\s*latencyPercentiles/]},
@@ -118,7 +118,7 @@ app = FastAPI()
 
 @app.get("/v1/rerank/cache/stats")
 def stats() -> JSONResponse:
-    # TODO: this draft reports one global hit ratio, omits the unscored batch share so silent
+    # TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
     # degradation looks like success, and computes latency from client-observed times that include
     # the queue wait. Break it down per model version and keep the two latency boundaries apart.
     hits = int(redis.get("rerank:hits") or 0)
@@ -185,7 +185,7 @@ def stats(tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSO
 const app = Fastify();
 
 app.get('/v1/rerank/cache/stats', async (_request, reply) => {
-  // TODO: this draft reports one global hit ratio, omits the unscored batch share so silent
+  // TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
   // degradation looks like success, and computes latency from client-observed times that include
   // the queue wait. Break it down per model version and keep the two latency boundaries apart.
   const hits = Number((await rdb.get('rerank:hits')) ?? 0);
@@ -256,7 +256,7 @@ import (
 )
 
 func stats(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reports one global hit ratio, omits the unscored batch share so silent
+	// TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
 	// degradation looks like success, and computes latency from client-observed times that include
 	// the queue wait. Break it down per model version and keep the two latency boundaries apart.
 	hits := readCounter("rerank:hits")
@@ -367,7 +367,7 @@ object StatsApi extends DefaultJsonProtocol {
   val jedis = new Jedis("redis", 6379)
 
   def stats: JsObject = {
-    // TODO: this draft reports one global hit ratio, omits the unscored batch share so silent
+    // TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
     // degradation looks like success, and computes latency from client-observed times that include
     // the queue wait. Break it down per model version and keep the two latency boundaries apart.
     val hits = counter("rerank:hits")
@@ -465,7 +465,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/rerank/cache/stats", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reports one global hit ratio, omits the unscored batch share so silent
+    // TODO: this starter reports one global hit ratio, omits the unscored batch share so silent
     // degradation looks like success, and computes latency from client-observed times that include
     // the queue wait. Break it down per model version and keep the two latency boundaries apart.
     const auto hits = readCounter("rerank:hits");
@@ -548,7 +548,7 @@ int main() {
     'The unscored share is the number that would have caught this incident. Count failed batches alongside batches and return the ratio, next to the fallback share.',
   ],
   debrief: `The interviewer is testing whether you can design the numbers that explain a regression rather than the
-numbers that look good. The draft reads fine because in the demo nothing fails and the model is fast.
+numbers that look good. The starter reads fine because in the demo nothing fails and the model is fast.
 Three defects are being checked: one global hit ratio (a version-specific regression hides in the
 mix), a missing unscored share (silent degradation reads as success), and client-observed latency
 (the queue wait is charged to the model). Splitting queue and model latency is the same discipline as

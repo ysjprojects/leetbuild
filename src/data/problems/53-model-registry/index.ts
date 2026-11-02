@@ -7,8 +7,8 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Model registry on the AI-era track: the course is not "store a model name in a database", it is
- * the review you owe a model-generated registry before a serving pool trusts it with traffic.
+ * Model registry: the course is not "store a model name in a database", it is
+ * the debugging you owe a registry before a serving pool trusts it with traffic.
  * Verified, idempotent registration with real lineage → an atomic Redis stage-and-pointer swap →
  * a gRPC serving probe that gates promotion on a matching digest → model-keyed events published
  * after the commit with an outbox → a version read that always attaches the eval record.
@@ -19,7 +19,7 @@ export const modelRegistryProblem: Problem = {
   tagline: 'Model versions with lineage, immutable artifacts and promotion gates.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Model Registry
 
@@ -66,12 +66,12 @@ One service, **registryd**, with five pieces:
    tenant's private model; and a cache keyed on the active pointer with a short TTL so a promotion
    is visible within seconds.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

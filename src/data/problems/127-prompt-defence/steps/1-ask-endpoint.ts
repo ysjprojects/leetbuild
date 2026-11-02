@@ -8,9 +8,9 @@ export const askEndpointStep: Step = {
   focus: ['client', 'api', 'docs'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, loads
+**Starting point.** The starter is working code: it registers the route, loads
 the document, caps the question and forwards it to the model. It compiles, it answers the demo
-question, and it hides four production flaws. Review it like the owner of the ask-a-question
+question, and it hides four production flaws. Debug it like the owner of the ask-a-question
 feature, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/ask\` with body \`{"document_id": "…", "question": "…"}\`.
@@ -71,7 +71,7 @@ quiet one: the question is user content and must never be written verbatim.`,
       id: 'token-cap',
       title: 'Caps the question at 512 tokens, not characters',
       detail:
-        'The question is encoded with the `cl100k_base` tokenizer and more than `MAX_QUESTION_TOKENS = 512` is **413**. The draft counts characters, so a few hundred encoded backspaces — each one a token — pass the cap.',
+        'The question is encoded with the `cl100k_base` tokenizer and more than `MAX_QUESTION_TOKENS = 512` is **413**. The starter counts characters, so a few hundred encoded backspaces — each one a token — pass the cap.',
       match: {
         python: {
           all: [/MAX_QUESTION_TOKENS\s*=\s*512/, /encoding\.encode\(/, /status_code\s*=\s*413/],
@@ -99,7 +99,7 @@ quiet one: the question is user content and must never be written verbatim.`,
       id: 'control-chars',
       title: 'Strips control characters and their escape strings',
       detail:
-        'A `CONTROL_CHARS` pattern covering the raw characters `\\x00`–`\\x08`, `\\x0b`–`\\x1f`, `\\x7f` and the two-character escapes `\\b` / `\\r` is applied by `strip_controls` before the question is measured or used. The draft forwards the text untouched.',
+        'A `CONTROL_CHARS` pattern covering the raw characters `\\x00`–`\\x08`, `\\x0b`–`\\x1f`, `\\x7f` and the two-character escapes `\\b` / `\\r` is applied by `strip_controls` before the question is measured or used. The starter forwards the text untouched.',
       match: {
         python: {all: [/CONTROL_CHARS\s*=/, /strip_controls\(/]},
         typescript: {all: [/CONTROL_CHARS\s*=/, /stripControls\(/]},
@@ -112,7 +112,7 @@ quiet one: the question is user content and must never be written verbatim.`,
       id: 'repeat-ratio',
       title: 'Rejects repeated token sequences with 422',
       detail:
-        '`repeat_ratio` measures the share of the question covered by the most repeated 1–3 token sequence; at `MIN_REPEAT_TOKENS = 64` or more, a ratio above `MAX_REPEAT_RATIO = 0.5` is **422**. The draft has no repetition check at all.',
+        '`repeat_ratio` measures the share of the question covered by the most repeated 1–3 token sequence; at `MIN_REPEAT_TOKENS = 64` or more, a ratio above `MAX_REPEAT_RATIO = 0.5` is **422**. The starter has no repetition check at all.',
       match: {
         python: {
           all: [/MAX_REPEAT_RATIO\s*=\s*0\.5/, /MIN_REPEAT_TOKENS\s*=\s*64/, /repeat_ratio\(/, /status_code\s*=\s*422/],
@@ -138,7 +138,7 @@ quiet one: the question is user content and must never be written verbatim.`,
       id: 'auth-idempotency',
       title: 'Authenticates the user and keys retries by (user, Idempotency-Key)',
       detail:
-        'A missing `X-User-Id` is **401**; `Idempotency-Key` is required and the answer is stored under `(user, key)` so a replay returns it instead of asking the model again. The draft ignores both.',
+        'A missing `X-User-Id` is **401**; `Idempotency-Key` is required and the answer is stored under `(user, key)` so a replay returns it instead of asking the model again. The starter ignores both.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/code\(\s*401\s*\)/, /idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -180,8 +180,8 @@ docs = DocumentStore()
 
 @app.post("/v1/ask")
 def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
-    # TODO: this draft caps the question in characters, forwards control characters and repeated
-    # tokens to the template, ignores Idempotency-Key and logs the question. Review all four.
+    # TODO: this starter caps the question in characters, forwards control characters and repeated
+    # tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
     if len(body.question) > MAX_QUESTION_CHARS:
         raise HTTPException(status_code=413, detail="question too long")
     document = docs.get(body.document_id)
@@ -295,7 +295,7 @@ def ask(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ask: a model-generated draft that caps characters and forwards the text as is. */
+      starter: `/** POST /v1/ask: flawed code that caps characters and forwards the text as is. */
 import Fastify from 'fastify';
 
 import {docs} from './docs';
@@ -311,8 +311,8 @@ interface AskBody {
 }
 
 app.post('/v1/ask', async (request, reply) => {
-  // TODO: this draft caps the question in characters, forwards control characters and repeated
-  // tokens to the template, ignores Idempotency-Key and logs the question. Review all four.
+  // TODO: this starter caps the question in characters, forwards control characters and repeated
+  // tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
   const user = request.headers['x-user-id'] as string;
   const body = request.body as AskBody;
   if (body.question.length > MAX_QUESTION_CHARS) return reply.code(413).send({error: 'question too long'});
@@ -449,8 +449,8 @@ func ask(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft caps the question in characters, forwards control characters and repeated
-	// tokens to the template, ignores Idempotency-Key and logs the question. Review all four.
+	// TODO: this starter caps the question in characters, forwards control characters and repeated
+	// tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
 	if len(body.Question) > maxQuestionChars {
 		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "question too long"})
 		return
@@ -661,7 +661,7 @@ object AskApi {
       post {
         headerValueByName("X-User-Id") { user =>
           entity(as[AskRequest]) { body =>
-            // TODO: this draft caps the question in characters, forwards control characters and
+            // TODO: this starter caps the question in characters, forwards control characters and
             // repeated tokens to the template, ignores Idempotency-Key and logs the question.
             if (body.question.length > MaxQuestionChars) {
               complete(StatusCodes.RequestEntityTooLarge, """{"error":"question too long"}""")
@@ -815,8 +815,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft caps the question in characters, forwards control characters and repeated
-    // tokens to the template, ignores Idempotency-Key and logs the question. Review all four.
+    // TODO: this starter caps the question in characters, forwards control characters and repeated
+    // tokens to the template, ignores Idempotency-Key and logs the question. Fix all four.
     const auto question = body.value("question", std::string());
     if (question.size() > kMaxQuestionChars) {
       res.status = 413;
@@ -985,5 +985,5 @@ int main() {
     'The source’s point is that the model sees tokens, not characters: 450 JSON-encoded backspaces are 450 tokens. Encode the normalised question with `cl100k_base` and compare the length to 512. For the repeat ratio, count every 1-, 2- and 3-token window; the largest `count × n / len` is how much of the question one phrase covers.',
     'The idempotency lookup is keyed by `(user, key)` and returns the stored decision with 200 before the document is loaded. Log user, document id and token count only — the question is user content, so it never goes into a log line verbatim.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of an LLM feature. The draft reads fine because the demo sends short, clean questions. Four defects are being checked: caps counted in the unit the model counts in (tokens), normalisation of control characters and their escape strings before anything is measured, detection of repeated 1–3 token sequences by the share of the input they cover, and authentication plus idempotency keyed by user so a retry cannot ask the model twice. The log line is the one candidates miss: the question is user content and must never be logged verbatim. Real services add a tokenizer per model, an allow-list for legitimate control characters in code-review use cases (the source names that trade-off), and a per-document token budget so the context cannot crowd out the instructions.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of an LLM feature. The starter reads fine because the demo sends short, clean questions. Four defects are being checked: caps counted in the unit the model counts in (tokens), normalisation of control characters and their escape strings before anything is measured, detection of repeated 1–3 token sequences by the share of the input they cover, and authentication plus idempotency keyed by user so a retry cannot ask the model twice. The log line is the one candidates miss: the question is user content and must never be logged verbatim. Real services add a tokenizer per model, an allow-list for legitimate control characters in code-review use cases (the source names that trade-off), and a per-document token budget so the context cannot crowd out the instructions.`,
 };

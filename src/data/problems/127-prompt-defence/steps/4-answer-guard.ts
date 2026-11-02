@@ -8,7 +8,7 @@ export const answerGuardStep: Step = {
   focus: ['api', 'model', 'client'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the model layer and
+**Starting point.** The starter is working code: it calls the model layer and
 returns what came back, so the demo shows answers. Nothing between the model and the user checks
 the answer. Five production flaws; find them, fix them, prove the fix.
 
@@ -31,8 +31,8 @@ returns \`{answer, spans}\`:
   the document.
 - Only an answer with no signals is returned, with its spans.
 
-**Failure mode the checks target.** The draft trusts the model: a diverged reply, a leaked
-instruction block or a memorised e-mail address goes straight to the user, and the draft writes the
+**Failure mode the checks target.** The starter trusts the model: a diverged reply, a leaked
+instruction block or a memorised e-mail address goes straight to the user, and the starter writes the
 answer into the log on the way. Each guard is cheap; the signature is what lets the next step count
 attacks without ever storing what the model said.`,
   sequence: {
@@ -66,7 +66,7 @@ attacks without ever storing what the model said.`,
       id: 'grounding',
       title: 'Every cited span is a substring of the document',
       detail:
-        '`is_grounded(spans, document)` requires at least one span and every span to be contained in the document. The draft never looks at the spans.',
+        '`is_grounded(spans, document)` requires at least one span and every span to be contained in the document. The starter never looks at the spans.',
       match: {
         python: {all: [/is_grounded\(/, /span in document/]},
         typescript: {all: [/isGrounded\(/, /document\.includes\(/]},
@@ -79,7 +79,7 @@ attacks without ever storing what the model said.`,
       id: 'secrets',
       title: 'Scans the answer for secrets and PII the document does not contain',
       detail:
-        'A `SECRET_PATTERNS` table (AWS key `AKIA[0-9A-Z]{16}`, private-key header, e-mail, SSN, card) runs over the answer; a match absent from the document is a signal. The draft has no output scan.',
+        'A `SECRET_PATTERNS` table (AWS key `AKIA[0-9A-Z]{16}`, private-key header, e-mail, SSN, card) runs over the answer; a match absent from the document is a signal. The starter has no output scan.',
       match: {
         python: {all: [/SECRET_PATTERNS\s*=/, /AKIA\[0-9A-Z\]\{16\}/, /PRIVATE KEY/, /secret_hits\(/]},
         typescript: {all: [/SECRET_PATTERNS\b/, /AKIA\[0-9A-Z\]\{16\}/, /PRIVATE KEY/, /secretHits\(/]},
@@ -92,7 +92,7 @@ attacks without ever storing what the model said.`,
       id: 'degeneration',
       title: 'Treats a repeating answer as divergence',
       detail:
-        'The answer’s tokens are measured with `repeat_ratio`; above `MAX_OUTPUT_REPEAT_RATIO = 0.4` the answer is a `degenerate` signal. The draft returns a looping reply as if it were an answer.',
+        'The answer’s tokens are measured with `repeat_ratio`; above `MAX_OUTPUT_REPEAT_RATIO = 0.4` the answer is a `degenerate` signal. The starter returns a looping reply as if it were an answer.',
       match: {
         python: {all: [/MAX_OUTPUT_REPEAT_RATIO\s*=\s*0\.4/, /repeat_ratio\(/, /encoding\.encode\(/]},
         typescript: {all: [/MAX_OUTPUT_REPEAT_RATIO\s*=\s*0\.4/, /repeatRatio\(/, /encoding\.encode\(/]},
@@ -105,7 +105,7 @@ attacks without ever storing what the model said.`,
       id: 'refuse',
       title: 'Refuses with fixed text when any signal fires',
       detail:
-        '`signals_for(document, result)` collects the signals and `refuse(...)` answers with the fixed `REFUSAL` text and `refused: true`; only an empty signal list returns the model’s answer. The draft has no refusal path.',
+        '`signals_for(document, result)` collects the signals and `refuse(...)` answers with the fixed `REFUSAL` text and `refused: true`; only an empty signal list returns the model’s answer. The starter has no refusal path.',
       match: {
         python: {all: [/REFUSAL\s*=/, /def refuse\(/, /signals_for\(/, /"refused":\s*True/]},
         typescript: {all: [/REFUSAL\s*=/, /function refuse\(/, /signalsFor\(/, /refused:\s*true/]},
@@ -118,7 +118,7 @@ attacks without ever storing what the model said.`,
       id: 'signature-log',
       title: 'Logs a signature, never the answer or the document',
       detail:
-        'A refusal logs user, document hash, signal names and a SHA-256 signature; no log line on either path carries the answer text or the document. The draft logs the answer on every request.',
+        'A refusal logs user, document hash, signal names and a SHA-256 signature; no log line on either path carries the answer text or the document. The starter logs the answer on every request.',
       match: {
         python: {
           all: [/signature/, /logger\.warning\(/],
@@ -163,7 +163,7 @@ docs = DocumentStore()
 
 @app.post("/v1/ask")
 def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse:
-    # TODO: this draft returns whatever the model says: no grounding check on the spans, no
+    # TODO: this starter returns whatever the model says: no grounding check on the spans, no
     # secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
     document = docs.get(body.document_id)
     if document is None:
@@ -274,7 +274,7 @@ def ask(body: AskRequest, user: str = Header(alias="X-User-Id")) -> JSONResponse
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ask: a model-generated draft that returns whatever the model says. */
+      starter: `/** POST /v1/ask: flawed code that returns whatever the model says. */
 import Fastify from 'fastify';
 
 import {docs} from './docs';
@@ -288,7 +288,7 @@ interface AskBody {
 }
 
 app.post('/v1/ask', async (request, reply) => {
-  // TODO: this draft returns whatever the model says: no grounding check on the spans, no
+  // TODO: this starter returns whatever the model says: no grounding check on the spans, no
   // secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
   const user = request.headers['x-user-id'] as string;
   const body = request.body as AskBody;
@@ -429,7 +429,7 @@ func ask(rw http.ResponseWriter, r *http.Request) {
 		Question   string \`json:"question"\`
 	}{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this draft returns whatever the model says: no grounding check on the spans, no
+	// TODO: this starter returns whatever the model says: no grounding check on the spans, no
 	// secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
 	document, ok := docs.Get(body.DocumentID)
 	if !ok {
@@ -634,7 +634,7 @@ object AnswerGuard {
       post {
         headerValueByName("X-User-Id") { user =>
           entity(as[AskRequest]) { body =>
-            // TODO: this draft returns whatever the model says: no grounding check on the spans,
+            // TODO: this starter returns whatever the model says: no grounding check on the spans,
             // no secret/PII scan, no degeneration check, no refusal path, and the answer goes
             // into the log.
             docs.get(body.document_id) match {
@@ -787,7 +787,7 @@ int main() {
     const auto user = req.get_header_value("X-User-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this draft returns whatever the model says: no grounding check on the spans, no
+    // TODO: this starter returns whatever the model says: no grounding check on the spans, no
     // secret/PII scan, no degeneration check, no refusal path, and the answer goes into the log.
     const auto document = docs.get(body.value("document_id", std::string()));
     if (!document) {
@@ -947,5 +947,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat model output as untrusted input. The draft looks finished because a cooperative model gives good answers; the source's second post shows the other case — a model that has diverged into a memorised passage or a looped phrase — and nothing in the draft would notice. Three guards cover it: grounding ties the answer to the document the user is allowed to read, the secret table catches the memorised PII and keys the source warns about, and the repeat ratio on the output is the same signal as on the input, pointed the other way. Refusal is a function with fixed text so the user never sees the model's slip, and the signature is a stable, text-free fingerprint of the incident that the next step can count. Real guards add a second-model judge for groundedness beyond substring matching, a per-document secret allow-list, and a quarantine of refused answers for human review under access control.`,
+  debrief: `The interviewer is testing whether you treat model output as untrusted input. The starter looks finished because a cooperative model gives good answers; the source's second post shows the other case — a model that has diverged into a memorised passage or a looped phrase — and nothing in the starter would notice. Three guards cover it: grounding ties the answer to the document the user is allowed to read, the secret table catches the memorised PII and keys the source warns about, and the repeat ratio on the output is the same signal as on the input, pointed the other way. Refusal is a function with fixed text so the user never sees the model's slip, and the signature is a stable, text-free fingerprint of the incident that the next step can count. Real guards add a second-model judge for groundedness beyond substring matching, a per-document secret allow-list, and a quarantine of refused answers for human review under access control.`,
 };

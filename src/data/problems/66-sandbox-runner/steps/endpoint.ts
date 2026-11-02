@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and answers \`202 queued\`, so the demo submits a job. It trusts everything the caller says.
-Review it like the platform owner, fix it, and prove the fix with the checks below.
+Debug it like the platform owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/sandbox/jobs\` with body
 \`{"code": "…", "entry_point": "main.py", "profile": "gvisor", "needs": ["filesystem"]}\`.
@@ -32,7 +32,7 @@ Implement \`POST /v1/sandbox/jobs\` with body
 - Never echo the code back in the response or a log line; the response carries the job id, the
   profile and a digest of the code.
 
-**Failure mode the checks target.** The draft accepts any profile string, treats an undeclared
+**Failure mode the checks target.** The starter accepts any profile string, treats an undeclared
 \`network\` need as allowed, and keys nothing, so a retried submit queues the body again. The
 capability half is the quiet one: "the job said it needed the network" is not a permission, it is a
 request, and the profile is the thing that decides.`,
@@ -69,7 +69,7 @@ request, and the profile is the thing that decides.`,
       id: 'code-cap',
       title: 'Caps the submitted code at 256 KiB',
       detail:
-        'A body over `1 << 18` bytes is **413** before anything is stored. The draft accepts any size, so the platform hands the container service an arbitrarily large program.',
+        'A body over `1 << 18` bytes is **413** before anything is stored. The starter accepts any size, so the platform hands the container service an arbitrarily large program.',
       match: {
         python: {all: [/MAX_CODE_BYTES\s*=\s*1\s*<<\s*18/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_CODE_BYTES\s*=\s*1\s*<<\s*18/, /code\(\s*413\s*\)/]},
@@ -82,7 +82,7 @@ request, and the profile is the thing that decides.`,
       id: 'profile-allowlist',
       title: 'Rejects an unknown isolation profile',
       detail:
-        '`profile` is checked against the allowlist and an unknown value is **400** — the caller picks a strength, not a runtime. The draft stores whatever profile string arrives and reports it back.',
+        '`profile` is checked against the allowlist and an unknown value is **400** — the caller picks a strength, not a runtime. The starter stores whatever profile string arrives and reports it back.',
       match: {
         python: {all: [/ALLOWED_PROFILES/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_PROFILES/, /code\(\s*400\s*\)/]},
@@ -95,7 +95,7 @@ request, and the profile is the thing that decides.`,
       id: 'capability-deny',
       title: 'Capabilities are default-deny against the profile',
       detail:
-        'Each declared need must be a known capability **and** granted by the requested profile; otherwise **400**. The draft treats an undeclared request for the network as allowed, which is exactly how a job reaches the metadata service.',
+        'Each declared need must be a known capability **and** granted by the requested profile; otherwise **400**. The starter treats an undeclared request for the network as allowed, which is exactly how a job reaches the metadata service.',
       match: {
         python: {all: [/ALLOWED_CAPABILITIES/, /PROFILE_CAPABILITIES/]},
         typescript: {all: [/ALLOWED_CAPABILITIES/, /PROFILE_CAPABILITIES/]},
@@ -108,7 +108,7 @@ request, and the profile is the thing that decides.`,
       id: 'idempotent-replay',
       title: 'Replays return the original job id',
       detail:
-        '`Idempotency-Key` is required, the stored job is looked up before a new one is created, and a replay answers with the original job id instead of queueing the code again. The draft ignores the header and re-executes the whole job on every retry.',
+        '`Idempotency-Key` is required, the stored job is looked up before a new one is created, and a replay answers with the original job id instead of queueing the code again. The starter ignores the header and re-executes the whole job on every retry.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.lookup\(/], order: [/store\.lookup\(/, /store\.create\(/]},
         typescript: {all: [/idempotency-key/, /store\.lookup\(/], order: [/store\.lookup\(/, /store\.create\(/]},
@@ -240,7 +240,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sandbox/jobs: a model-generated draft that believes whatever the caller declares. */
+      starter: `/** POST /v1/sandbox/jobs: flawed code that believes whatever the caller declares. */
 import Fastify from 'fastify';
 import {randomUUID} from 'node:crypto';
 

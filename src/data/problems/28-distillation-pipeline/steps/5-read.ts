@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it has a route, it returns counts, and the
+**Starting point.** The starter is working code: it has a route, it returns counts, and the
 dashboard shows a healthy percentage. Both invariants are broken. Find them, fix them, and prove the
 fix.
 
@@ -68,7 +68,7 @@ change when the filter is fixed mid-run.`,
       id: 'reconcile',
       title: 'Reconciles accepted + rejected against sampled',
       detail:
-        'The report checks `accepted + rejected == sampled` and answers an error when it does not, instead of publishing numbers that disagree with the past. The draft computes `accepted` from the sampled count and the failures it happens to have counted.',
+        'The report checks `accepted + rejected == sampled` and answers an error when it does not, instead of publishing numbers that disagree with the past. The starter computes `accepted` from the sampled count and the failures it happens to have counted.',
       match: {
         python: {all: [/reconcile/, /accepted \+ rejected/]},
         typescript: {all: [/reconcile/, /accepted \+ rejected/]},
@@ -81,7 +81,7 @@ change when the filter is fixed mid-run.`,
       id: 'reasons',
       title: 'Reports the rejection reasons by name',
       detail:
-        'The reply carries the `reasons` breakdown read from `distill:reasons:{job_id}` beside the `rejected` count, so a rejection rate can be explained. The draft reports a single rejected number and nothing about why.',
+        'The reply carries the `reasons` breakdown read from `distill:reasons:{job_id}` beside the `rejected` count, so a rejection rate can be explained. The starter reports a single rejected number and nothing about why.',
       match: {
         python: {all: [/reasons/, /rejected/]},
         typescript: {all: [/reasons/, /rejected/]},
@@ -94,7 +94,7 @@ change when the filter is fixed mid-run.`,
       id: 'implausible-rate',
       title: 'Flags an acceptance rate above 95 percent',
       detail:
-        'An acceptance rate above `UNRELIABLE_ACCEPTANCE_RATE` (0.95) is flagged as implausible rather than reported as a clean run, with a note to review a sample by hand. The draft has no ceiling at all: the better the number, the happier the response.',
+        'An acceptance rate above `UNRELIABLE_ACCEPTANCE_RATE` (0.95) is flagged as implausible rather than reported as a clean run, with a note to review a sample by hand. The starter has no ceiling at all: the better the number, the happier the response.',
       match: {
         python: {all: [/UNRELIABLE_ACCEPTANCE_RATE/, /flag/]},
         typescript: {all: [/UNRELIABLE_ACCEPTANCE_RATE/, /flag/]},
@@ -107,7 +107,7 @@ change when the filter is fixed mid-run.`,
       id: 'live-counters',
       title: 'Reads the live counters and reports the revision',
       detail:
-        'The counts are read from Redis at request time (`HGETALL`) and the report carries the revision it was read at (`updated_at`), so a late failure shows up in the next report. The draft serves a copy written when the job started.',
+        'The counts are read from Redis at request time (`HGETALL`) and the report carries the revision it was read at (`updated_at`), so a late failure shows up in the next report. The starter serves a copy written when the job started.',
       match: {
         python: {all: [/hgetall/, /updated_at/]},
         typescript: {all: [/hgetall/, /updated_at/]},
@@ -132,9 +132,9 @@ REPORT_CACHE: dict[str, dict] = {}
 
 @app.get("/v1/distill/jobs/{job_id}")
 def read_job(job_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft serves the report it cached when the job started, and it counts accepted as
+    # TODO: this starter serves the report it cached when the job started, and it counts accepted as
     # sampled minus the failures it remembers, so the duplicates the dedupe filter removed are
-    # silently counted as good training data. Review both.
+    # silently counted as good training data. Fix both.
     report = REPORT_CACHE.get(job_id)
     if report is None:
         report = {"job_id": job_id, "sampled": 0, "accepted": 0, "rejected": 0}
@@ -222,7 +222,7 @@ def read_job(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/distill/jobs/{id}: a model-generated draft that serves a stale report. */
+      starter: `/** GET /v1/distill/jobs/{id}: flawed code that serves a stale report. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -230,9 +230,9 @@ export const app = Fastify();
 const REPORT_CACHE: Record<string, Record<string, number | string>> = {};
 
 app.get('/v1/distill/jobs/:job_id', async (request, reply) => {
-  // TODO: this draft serves the report it cached when the job started, and it counts accepted as
+  // TODO: this starter serves the report it cached when the job started, and it counts accepted as
   // sampled minus the failures it remembers, so the duplicates the dedupe filter removed are
-  // silently counted as good training data. Review both.
+  // silently counted as good training data. Fix both.
   const {job_id: jobId} = request.params as {job_id: string};
   const report = REPORT_CACHE[jobId] ?? {job_id: jobId, sampled: 0, accepted: 0, rejected: 0};
   const sampled = Number(report.sampled ?? 0);
@@ -318,9 +318,9 @@ var reportCache = map[string]map[string]any{}
 
 func readJob(rw http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobID")
-	// TODO: this draft serves the report it cached when the job started, and it counts accepted as
+	// TODO: this starter serves the report it cached when the job started, and it counts accepted as
 	// sampled minus the failures it remembers, so the duplicates the dedupe filter removed are
-	// silently counted as good training data. Review both.
+	// silently counted as good training data. Fix both.
 	report, ok := reportCache[jobID]
 	if !ok {
 		report = map[string]any{"job_id": jobID, "sampled": 0, "accepted": 0, "rejected": 0}
@@ -456,9 +456,9 @@ object AcceptanceReport {
   val route: Route =
     path("v1" / "distill" / "jobs" / Segment) { jobId =>
       get {
-        // TODO: this draft serves the report it cached when the job started, and it counts accepted
+        // TODO: this starter serves the report it cached when the job started, and it counts accepted
         // as sampled minus the failures it remembers, so the duplicates the dedupe filter removed
-        // are silently counted as good training data. Review both.
+        // are silently counted as good training data. Fix both.
         val cached = reportCache.getOrElse(jobId, Map("sampled" -> 0, "accepted" -> 0, "rejected" -> 0))
         val sampled = cached("sampled")
         val rejected = cached("rejected")
@@ -566,9 +566,9 @@ int main() {
 
   svr.Get(R"(/v1/distill/jobs/(.*))", [](const httplib::Request& req, httplib::Response& res) {
     const auto jobId = req.matches[1].str();
-    // TODO: this draft serves the report it cached when the job started, and it counts accepted as
+    // TODO: this starter serves the report it cached when the job started, and it counts accepted as
     // sampled minus the failures it remembers, so the duplicates the dedupe filter removed are
-    // silently counted as good training data. Review both.
+    // silently counted as good training data. Fix both.
     const auto found = reportCache.find(jobId);
     json report = found == reportCache.end()
                       ? json{{"job_id", jobId}, {"sampled", 0}, {"accepted", 0}, {"rejected", 0}}
@@ -676,5 +676,5 @@ int main() {
 `,
     },
   },
-  debrief: `This is the step that decides whether a distillation run is believed. The draft passes a dashboard review because the number it reports is high; the bug is that it computed \`accepted\` as "everything that did not fail loudly", so the samples the dedupe filter removed — the ones that would have taught the student nothing — are counted as good data, which is exactly the failure the mock interview describes. The second bug is time: a report cached at job start cannot see a rejection that happened after it, so a run can look clean forever. The habits to name out loud are: read the counters live and carry their revision, reconcile the counts instead of deriving one from another, report why samples were rejected, and treat a suspiciously high acceptance rate as a reason to look rather than a reason to celebrate. Real platforms add per-slice breakdowns (by dataset shard, by teacher version), confidence bounds on the rate, and a stored sample of what the filter rejected.`,
+  debrief: `This is the step that decides whether a distillation run is believed. The starter looks fine on the dashboard because the number it reports is high; the bug is that it computed \`accepted\` as "everything that did not fail loudly", so the samples the dedupe filter removed — the ones that would have taught the student nothing — are counted as good data, which is exactly the failure the mock interview describes. The second bug is time: a report cached at job start cannot see a rejection that happened after it, so a run can look clean forever. The habits to name out loud are: read the counters live and carry their revision, reconcile the counts instead of deriving one from another, report why samples were rejected, and treat a suspiciously high acceptance rate as a reason to look rather than a reason to celebrate. Real platforms add per-slice breakdowns (by dataset shard, by teacher version), confidence bounds on the rate, and a stored sample of what the filter rejected.`,
 };

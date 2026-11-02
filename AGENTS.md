@@ -11,8 +11,8 @@ Two modes share one app:
 
 | Address           | Mode              | What it is                                                                                       |
 | ----------------- | ----------------- | ------------------------------------------------------------------------------------------------ |
-| `/`               | Practice          | The catalogue: the systems courses and drills, the deep-learning problems, the AI-era courses.   |
-| `/mock-interview` | AI mock interview | Timed scenarios that start from a flawed AI draft, with an offline AI pair, checks and a report. |
+| `/`               | Practice          | The catalogue: the systems courses and drills, the debugging courses, the deep-learning problems. |
+| `/mock-interview` | AI mock interview | Timed scenarios that start from a flawed patch, with an offline AI pair, checks and a report.     |
 
 The switch between them is `src/components/ModeSwitch.tsx`. The mock scenarios are
 `src/data/mock.ts`; the experience is `src/components/MockInterview.tsx`.
@@ -63,9 +63,13 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
 
 ## Content rules
 
-- Every problem has `Problem.track?: 'systems' | 'dllm' | 'ai'`; omitted means the systems track.
-- The AI-era courses are `src/data/problems/16-ai-gateway/` and `17-rag-service/`. Their starters
-  are plausible model-generated drafts with a real flaw; their solutions are the review fix.
+- Every problem has `Problem.track?: 'systems' | 'dllm'`; omitted means the systems track. A systems
+  course whose system has a model at its core carries `tag: 'ai-systems'` (the _AI Systems_ chip).
+- The debugging courses (`src/data/problems/16-ai-gateway/` through `127-prompt-defence/`) start every
+  step from working code with a flaw: the learner debugs it, fixes it, optimizes what is wasteful and
+  proves the fix. Their copy never calls the starter a model's draft (`yarn verify` rejects
+  `model-generated`, `AI-generated`, `AI draft`, `AI-era` and `Review premise`); the statement has a
+  "## The debugging habit" section and every step opens with a `**Starting point.**` paragraph.
 - All five languages are mandatory in every step of a course. A deep-learning problem (`track: 'dllm'`)
   fixes one language instead — `language: 'python'` (PyTorch) or `'cuda'` — and its steps carry code
   and matchers for that language only; it has no harness, and its reference solution is a complete
@@ -86,11 +90,11 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   dated by its creation) and the posts or docs that explain it, each with its `kind`, `venue` and
   what the problem takes from it. Every link is checked against the live page, never written from
   memory; `yarn verify` enforces the shape.
-- The AI-era courses currently use static review checks only. The classic courses have Python,
+- The debugging courses currently use static review checks only. The classic courses have Python,
   TypeScript, Go and C++ harnesses that execute in the browser runtime (Go's: `goruntime/`, rebuilt
   into the committed `public/go/runtime.wasm.gz` by `yarn build:go` after any change there; C++'s:
   `cppruntime/`, rebuilt into the committed `public/cpp/runtime.pack.gz` by `yarn build:cpp`, and
-  `yarn verify` needs Node 24 to run it). If you add AI-era harnesses, keep the checks
+  `yarn verify` needs Node 24 to run it). If you add harnesses to a debugging course, keep the checks
   outcome-based and update the README.
 
 ## Pull requests

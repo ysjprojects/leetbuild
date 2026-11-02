@@ -8,10 +8,10 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db', 'refunds'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the return page fetches a
+**Starting point.** The starter is working code: the return page fetches a
 return and renders a state, so the demo looks finished. It reports a return refunded the moment a
 refund is initiated, it hides the refund whenever the processor failed it, and it serves any return
-to any caller. Review it, fix it, and prove the fix with the checks below.
+to any caller. Debug it, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/returns/{return_id}\`, the read behind the customer's return page:
 
@@ -60,7 +60,7 @@ one.`,
       id: 'read-route',
       title: 'Serves GET /v1/returns/{id} with the return and its order line',
       detail:
-        'The read is registered on `GET /v1/returns/{id}` and the payload names the return and the order line it was registered against. The draft already answers this route, so this check passes on it — the four below are where it fails.',
+        'The read is registered on `GET /v1/returns/{id}` and the payload names the return and the order line it was registered against. The starter already answers this route, so this check passes on it — the four below are where it fails.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/returns\/\{return_id\}["']/, /order_line_id/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/returns\/:returnId['"]/, /order_line_id/]},
@@ -73,7 +73,7 @@ one.`,
       id: 'confirmed-state',
       title: 'Calls a return refunded only once the processor confirmed',
       detail:
-        "`state_from_refund()` derives the state from the processor's record: `confirmed` → `refunded`, `failed` → `refund_failed`, an initiated refund → `awaiting_refund`. The draft reports `refunded` the moment a refund exists, so the page promises money that has not moved.",
+        "`state_from_refund()` derives the state from the processor's record: `confirmed` → `refunded`, `failed` → `refund_failed`, an initiated refund → `awaiting_refund`. The starter reports `refunded` the moment a refund exists, so the page promises money that has not moved.",
       match: {
         python: {all: [/def state_from_refund\(/, /CONFIRMED/, /"refunded"/, /awaiting_refund/]},
         typescript: {all: [/function stateFromRefund\(/, /CONFIRMED/, /refunded/, /awaiting_refund/]},
@@ -86,7 +86,7 @@ one.`,
       id: 'refund-linkage',
       title: 'Keeps the refund linkage visible when the refund failed',
       detail:
-        '`refund_linkage()` returns `{refund_id, state}` for every refund the return has, failed ones included, and no branch drops it. The draft omits the linkage when the refund state is `failed`, hiding exactly the outcome a support agent opens the return for.',
+        '`refund_linkage()` returns `{refund_id, state}` for every refund the return has, failed ones included, and no branch drops it. The starter omits the linkage when the refund state is `failed`, hiding exactly the outcome a support agent opens the return for.',
       match: {
         python: {
           all: [/def refund_linkage\(/, /refund_id/, /FAILED/],
@@ -105,7 +105,7 @@ one.`,
       id: 'owner-scope',
       title: 'Answers 404 for a return that belongs to another tenant',
       detail:
-        "`load_return(return_id, tenant)` returns **404** when the row is missing **or** its `tenant_id` is not the caller's — the same refusal in both cases, so a foreign id cannot be probed. The draft serves any return to any caller.",
+        "`load_return(return_id, tenant)` returns **404** when the row is missing **or** its `tenant_id` is not the caller's — the same refusal in both cases, so a foreign id cannot be probed. The starter serves any return to any caller.",
       match: {
         python: {all: [/status_code\s*=\s*404/, /def load_return\(/, /tenant_id/]},
         typescript: {all: [/\b404\b/, /function loadReturn\(/, /tenant_id/]},
@@ -118,7 +118,7 @@ one.`,
       id: 'order-line',
       title: 'Carries the original order line: its id and its facts',
       detail:
-        "`order_line_facts()` loads the line by `order_line_id` and the payload carries the line's `sku`, `ordered_quantity` and `delivered_at`. The draft echoes the id it snapshotted at registration and nothing the customer can recognize.",
+        "`order_line_facts()` loads the line by `order_line_id` and the payload carries the line's `sku`, `ordered_quantity` and `delivered_at`. The starter echoes the id it snapshotted at registration and nothing the customer can recognize.",
       match: {
         python: {all: [/def order_line_facts\(/, /order_line_id/, /"sku"/, /delivered_at/]},
         typescript: {all: [/function orderLineFacts\(/, /order_line_id/, /sku/, /delivered_at/]},
@@ -154,7 +154,7 @@ store = ReturnsStore()
 
 @app.get("/v1/returns/{return_id}")
 def read_return(return_id: str) -> JSONResponse:
-    # TODO: this draft calls a return refunded as soon as a refund is initiated, drops the refund
+    # TODO: this starter calls a return refunded as soon as a refund is initiated, drops the refund
     # linkage when the refund failed, and serves any return to any caller. Confirm the refund with
     # the processor, keep failed linkages visible, and scope the read to the order's owner.
     row = store.get(return_id) or {}
@@ -254,7 +254,7 @@ def read_return(return_id: str, tenant: str | None = Header(default=None, alias=
 `,
     },
     typescript: {
-      starter: `/** GET /v1/returns/:returnId: a model-generated draft that trusts the refund as it is initiated. */
+      starter: `/** GET /v1/returns/:returnId: flawed code that trusts the refund as it is initiated. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -293,7 +293,7 @@ class ReturnsStore {
 const store = new ReturnsStore();
 
 app.get('/v1/returns/:returnId', async (request, reply) => {
-  // TODO: this draft calls a return refunded as soon as a refund is initiated, drops the refund
+  // TODO: this starter calls a return refunded as soon as a refund is initiated, drops the refund
   // linkage when the refund failed, and serves any return to any caller. Confirm the refund with
   // the processor, keep failed linkages visible, and scope the read to the order's owner.
   const {returnId} = request.params as {returnId: string};
@@ -469,7 +469,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readReturn(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft calls a return refunded as soon as a refund is initiated, drops the refund
+	// TODO: this starter calls a return refunded as soon as a refund is initiated, drops the refund
 	// linkage when the refund failed, and serves any return to any caller. Confirm the refund with
 	// the processor, keep failed linkages visible, and scope the read to the order's owner.
 	returnID := r.PathValue("return_id")
@@ -681,7 +681,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "returns" / Segment) { returnId =>
       get {
-        // TODO: this draft calls a return refunded as soon as a refund is initiated, drops the
+        // TODO: this starter calls a return refunded as soon as a refund is initiated, drops the
         // refund linkage when the refund failed, and serves any return to any caller. Confirm the
         // refund with the processor, keep failed linkages visible, and scope the read to the
         // order's owner.
@@ -826,7 +826,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/returns/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft calls a return refunded as soon as a refund is initiated, drops the refund
+    // TODO: this starter calls a return refunded as soon as a refund is initiated, drops the refund
     // linkage when the refund failed, and serves any return to any caller. Confirm the refund with
     // the processor, keep failed linkages visible, and scope the read to the order's owner.
     const auto returnId = req.matches[1].str();
@@ -944,7 +944,7 @@ int main() {
   hints: [
     'Scope the read in the loader: `load_return(return_id, tenant)` answers 404 when the row is missing **or** its `tenant_id` is someone else’s. Answering 403 for the other tenant’s return confirms the id exists, which is exactly what an enumeration attempt is looking for.',
     'Initiation is not confirmation. `state_from_refund()` reads the processor’s record: `confirmed` → `refunded`, `failed` → `refund_failed`, anything else → `awaiting_refund`. The moment a refund id exists the page may say *awaiting*, never *refunded*.',
-    'Carry the linkage however the refund ended: `refund_linkage()` always yields `{refund_id, state}` — a failed refund is the case a support agent opens the return for. And build `order_line` from the line loader, not from the snapshot the draft took at registration.',
+    'Carry the linkage however the refund ended: `refund_linkage()` always yields `{refund_id, state}` — a failed refund is the case a support agent opens the return for. And build `order_line` from the line loader, not from the snapshot the starter took at registration.',
   ],
   debrief: `The interview question is what a read owes its callers. The state a customer sees must be the state the money is in: initiation is an event, confirmation is the fact, and only the processor can confirm — so the read derives \`refunded\` from the refund record instead of recording optimism at registration. Failures are the same argument in reverse: hiding a failed refund hides the support ticket, so the linkage travels with the return however the refund ended. The owner check is the third half of the contract: a read scoped to the order's owner answers 404 for a foreign id, because 403 confirms that the id exists. Real services add a refund-status callback so the read never polls the processor on the request path, and keep an \`order_line\` join so the page can show what was actually bought.`,
 };

@@ -8,10 +8,10 @@ export const stateStep: Step = {
   focus: ['redis', 'api'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the Redis layer behind the
-queue: it queues a job and lets a worker start it. It compiles, the happy path works, and it hides
-the flaw that oversubscribes a cluster. Review it like the platform owner, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter is working code for the Redis layer behind the queue: it queues a
+job and lets a worker start it. It compiles, the happy path works, and it hides the flaw that
+oversubscribes a cluster. Debug it like the platform owner, fix it, and prove the fix with the
+checks below.
 
 The fine-tune queue keeps each team's compute budget in a Redis pool keyed \`pool:{team}\` and each
 job's reservation in a hash keyed \`reservation:{job_id}\` with the fields \`reserved\`, \`spent\`
@@ -31,7 +31,7 @@ and \`released\`.
 - **Cancellation frees the whole reservation.** \`cancel(team, job_id)\` frees the full reserved
   amount, spent or not.
 
-**Failure mode the checks target.** A draft that reserves nothing until the worker starts lets ten
+**Failure mode the checks target.** A queue that reserves nothing until the worker starts lets ten
 submissions pass the same check and then all start, so the cluster is oversubscribed before anyone
 notices. A completion callback that runs twice — the normal case for an at-least-once delivery — hands
 the same remainder back twice, so the pool silently grows and the next job over-commits it. The
@@ -55,7 +55,7 @@ believe the pool can cover them.`,
       id: 'reserve-at-submit',
       title: 'Reserves the budget when the job is submitted',
       detail:
-        'The submission takes the amount out of `pool:{team}` before it queues the job, so a submission the pool cannot cover is rejected instead of started later. The draft queues first and reserves never.',
+        'The submission takes the amount out of `pool:{team}` before it queues the job, so a submission the pool cannot cover is rejected instead of started later. The starter queues first and reserves never.',
       match: {
         python: {all: [/RESERVE_LUA/, /def reserve\(/, /reserve\(team, job_id, amount\)/]},
         typescript: {all: [/RESERVE_LUA/, /function reserve\(/, /reserve\(team, jobId, amount\)/]},
@@ -68,7 +68,7 @@ believe the pool can cover them.`,
       id: 'atomic-script',
       title: 'Reserves and releases with atomic Redis scripts',
       detail:
-        'Both transitions run as one `EVAL` each, so the read, compare and write cannot interleave with another worker. The draft reads the pool and decrements it in separate commands.',
+        'Both transitions run as one `EVAL` each, so the read, compare and write cannot interleave with another worker. The starter reads the pool and decrements it in separate commands.',
       match: {
         python: {all: [/eval\(RESERVE_LUA/, /eval\(RELEASE_LUA/, /redis\.call\(/]},
         typescript: {all: [/eval\(RESERVE_LUA/, /eval\(RELEASE_LUA/, /redis\.call\(/]},
@@ -81,7 +81,7 @@ believe the pool can cover them.`,
       id: 'start-guard',
       title: 'A job cannot start without its reservation',
       detail:
-        '`start` reads `reservation:{job_id}` and refuses to run a job whose reservation is gone. The draft starts whatever the queue hands it.',
+        '`start` reads `reservation:{job_id}` and refuses to run a job whose reservation is gone. The starter starts whatever the queue hands it.',
       match: {
         python: {all: [/def start\(/, /reservation:/, /reserved is None/]},
         typescript: {all: [/function start\(/, /reservation:/, /reserved === null/]},
@@ -94,7 +94,7 @@ believe the pool can cover them.`,
       id: 'release-idempotent',
       title: 'A retried completion releases the remainder only once',
       detail:
-        'The release script reads the `released` flag and returns early when it is already set, so an at-least-once completion callback cannot return the remainder twice. The draft increments the pool unconditionally.',
+        'The release script reads the `released` flag and returns early when it is already set, so an at-least-once completion callback cannot return the remainder twice. The starter increments the pool unconditionally.',
       match: {
         python: {all: [/'released'/, /HGET/, /released == 1/]},
         typescript: {all: [/'released'/, /HGET/, /released == 1/]},
@@ -107,7 +107,7 @@ believe the pool can cover them.`,
       id: 'cancel-frees',
       title: 'A cancelled job frees its full reservation',
       detail:
-        '`cancel` zeroes `spent` and releases, so the whole reservation returns to the pool. The draft releases an amount the worker happens to pass, not the reservation it holds.',
+        '`cancel` zeroes `spent` and releases, so the whole reservation returns to the pool. The starter releases an amount the worker happens to pass, not the reservation it holds.',
       match: {
         python: {all: [/def cancel\(/, /"spent", 0/]},
         typescript: {all: [/function cancel\(/, /'spent', 0/]},
@@ -119,7 +119,7 @@ believe the pool can cover them.`,
   ],
   code: {
     python: {
-      starter: `"""Redis-backed fine-tune queue (model-generated draft)."""
+      starter: `"""Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts."""
 import redis
 
 client = redis.Redis(decode_responses=True)
@@ -207,7 +207,7 @@ def cancel(team: str, job_id: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** Redis-backed fine-tune queue (model-generated draft). */
+      starter: `/** Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts. */
 import {Redis} from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://redis:6379');
@@ -292,7 +292,7 @@ export {submit, start, complete, cancel};
 `,
     },
     go: {
-      starter: `// Package state is the Redis-backed fine-tune queue (model-generated draft).
+      starter: `// Package state is the Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts.
 package state
 
 import (
@@ -494,7 +494,7 @@ object State {
 `,
     },
     cpp: {
-      starter: `// Redis-backed fine-tune queue (model-generated draft).
+      starter: `// Redis-backed fine-tune queue: flawed code that reserves nothing until the worker starts.
 #include <sw/redis++/redis++.h>
 
 #include <string>
@@ -587,5 +587,5 @@ long long Cancel(Redis& client, const std::string& team, const std::string& job_
     'The completion callback is delivered at least once, so the release must be idempotent: set a `released` flag in the same script and return early when it is already set, or the remainder is handed back twice.',
     'Cancellation frees the whole reservation: zero `spent` and run the same release script so the pool gets back everything that was held.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated state layer against concurrency and delivery semantics. The draft reads fine because one worker starts one job. Four separate defects are being checked: the reservation must happen at submission so a job cannot be started without one; the reserve and release must each be one atomic script so two workers cannot both pass the same balance check; the release must return only the remainder and be idempotent against a redelivered completion; and cancellation must free the whole reservation. The quiet one is the redelivered callback — at-least-once delivery is normal, and a non-idempotent release turns it into free budget. Real systems also lease the reservation with a TTL so a worker that dies mid-job does not strand the pool.`,
+  debrief: `The interviewer is testing whether you can debug a state layer against concurrency and delivery semantics. The starter reads fine because one worker starts one job. Four separate defects are being checked: the reservation must happen at submission so a job cannot be started without one; the reserve and release must each be one atomic script so two workers cannot both pass the same balance check; the release must return only the remainder and be idempotent against a redelivered completion; and cancellation must free the whole reservation. The quiet one is the redelivered callback — at-least-once delivery is normal, and a non-idempotent release turns it into free budget. Real systems also lease the reservation with a TTL so a worker that dies mid-job does not strand the pool.`,
 };

@@ -8,9 +8,9 @@ export const fimCallStep: Step = {
   focus: ['api', 'model'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the model service is
+**Starting point.** The starter is working code: when the model service is
 healthy it returns a completion, so the demo passes. It hides four flaws: the prompt it builds, the
-call it makes, the way it retries, and what it shows. Review it, fix it, and prove the fix.
+call it makes, the way it retries, and what it shows. Debug it, fix it, and prove the fix.
 
 Implement \`complete(prefix, suffix, snippets, language)\` for the model service at \`model:9000\`:
 
@@ -69,7 +69,7 @@ puts an empty or half-finished line in front of the developer.`,
       id: 'retry-once',
       title: 'At most two attempts, only on UNAVAILABLE',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retried; every other status is returned immediately. The draft retries every error five times.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retried; every other status is returned immediately. The starter retries every error five times.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2/, /StatusCode\.UNAVAILABLE/], none: [/range\(5\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2/, /status\.UNAVAILABLE/], none: [/attempt\s*<\s*5/]},
@@ -82,7 +82,7 @@ puts an empty or half-finished line in front of the developer.`,
       id: 'fim-order',
       title: 'Sends prefix and suffix as separate fields',
       detail:
-        'The request sets `prefix` and `suffix` separately so the model fills in the middle. The draft concatenates `prefix + suffix` into the prefix field and sends an empty suffix.',
+        'The request sets `prefix` and `suffix` separately so the model fills in the middle. The starter concatenates `prefix + suffix` into the prefix field and sends an empty suffix.',
       match: {
         python: {all: [/prefix\s*=\s*prefix/, /suffix\s*=\s*suffix/], none: [/prefix\s*\+\s*suffix/]},
         typescript: {all: [/\{prefix,\s*suffix,/], none: [/prefix\s*\+\s*suffix/]},
@@ -95,7 +95,7 @@ puts an empty or half-finished line in front of the developer.`,
       id: 'filter',
       title: 'Generates 3 candidates and shows at most 3 after filtering',
       detail:
-        'The request asks for `N_CANDIDATES = 3`; `filter_candidates` drops empty, `truncated` and duplicate candidates and returns at most n in the model’s order. The draft asks for one and shows it unchecked.',
+        'The request asks for `N_CANDIDATES = 3`; `filter_candidates` drops empty, `truncated` and duplicate candidates and returns at most n in the model’s order. The starter asks for one and shows it unchecked.',
       match: {
         python: {all: [/N_CANDIDATES\s*=\s*3/, /def filter_candidates\(/, /\.truncated/], none: [/candidates\[0\]/]},
         typescript: {
@@ -120,9 +120,9 @@ model = completion_pb2_grpc.CompletionStub(channel)
 
 
 def complete(prefix: str, suffix: str, snippets: list[str], language: str) -> list[str]:
-    # TODO: this draft glues the suffix onto the prefix so the model cannot fill in the middle,
+    # TODO: this starter glues the suffix onto the prefix so the model cannot fill in the middle,
     # calls without a deadline, retries every failure five times, and shows the first candidate
-    # even when it is empty or cut off. Review all four.
+    # even when it is empty or cut off. Fix all four.
     prompt = "\\n".join(snippets) + "\\n" + prefix + suffix
     for _ in range(5):
         try:
@@ -174,7 +174,7 @@ def complete(prefix: str, suffix: str, snippets: list[str], language: str) -> li
 `,
     },
     typescript: {
-      starter: `/** Model call: a model-generated draft that glues the suffix onto the prefix and retries everything. */
+      starter: `/** Model call: flawed code that glues the suffix onto the prefix and retries everything. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -204,9 +204,9 @@ const {completion} = grpc.loadPackageDefinition(protoLoader.loadSync('completion
 const model = new completion.Completion('model:9000', grpc.credentials.createInsecure());
 
 export async function complete(prefix: string, suffix: string, snippets: string[], language: string): Promise<string[]> {
-  // TODO: this draft glues the suffix onto the prefix so the model cannot fill in the middle,
+  // TODO: this starter glues the suffix onto the prefix so the model cannot fill in the middle,
   // calls without a deadline, retries every failure five times, and shows the first candidate
-  // even when it is empty or cut off. Review all four.
+  // even when it is empty or cut off. Fix all four.
   const prompt = snippets.join('\\n') + '\\n' + prefix + suffix;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
@@ -308,9 +308,9 @@ import (
 
 var model pb.CompletionClient
 
-// TODO: this draft glues the suffix onto the prefix so the model cannot fill in the middle,
+// TODO: this starter glues the suffix onto the prefix so the model cannot fill in the middle,
 // calls without a deadline, retries every failure five times, and shows the first candidate
-// even when it is empty or cut off. Review all four.
+// even when it is empty or cut off. Fix all four.
 func complete(ctx context.Context, prefix, suffix string, snippets []string, language string) ([]string, error) {
 	prompt := strings.Join(snippets, "\\n") + "\\n" + prefix + suffix
 	var err error
@@ -386,9 +386,9 @@ func complete(ctx context.Context, prefix, suffix string, snippets []string, lan
 object FimCall {
   val stub = CompletionGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
 
-  // TODO: this draft glues the suffix onto the prefix so the model cannot fill in the middle,
+  // TODO: this starter glues the suffix onto the prefix so the model cannot fill in the middle,
   // calls without a deadline, retries every failure five times, and shows the first candidate
-  // even when it is empty or cut off. Review all four.
+  // even when it is empty or cut off. Fix all four.
   def complete(prefix: String, suffix: String, snippets: Seq[String], language: String): List[String] = {
     val prompt = snippets.mkString("\\n") + "\\n" + prefix + suffix
     var attempt = 0
@@ -457,9 +457,9 @@ object FimCall {
 
 std::unique_ptr<Completion::Stub> model;
 
-// TODO: this draft glues the suffix onto the prefix so the model cannot fill in the middle,
+// TODO: this starter glues the suffix onto the prefix so the model cannot fill in the middle,
 // calls without a deadline, retries every failure five times, and shows the first candidate
-// even when it is empty or cut off. Review all four.
+// even when it is empty or cut off. Fix all four.
 std::vector<std::string> complete(
     const std::string& prefix,
     const std::string& suffix,
@@ -543,5 +543,5 @@ std::vector<std::string> complete(
 `,
     },
   },
-  debrief: `The interviewer is probing two things at once: do you know what the model call is for, and what its worst case is. The FIM flaw is the first: GitHub's post explains that telling the model which side of the cursor is which, instead of feeding it a document that ends at the cursor, raised acceptance by 10 %, and the draft quietly undoes it. The deadline, the bounded retry and the retryable set are the worst-case answers: one attempt is bounded at 300 ms, the call at two attempts, and only a model that says it is unavailable is asked again. The filter is the product answer from the same diagram — n completions are generated and at most n are shown — and it is where real systems put the contextual filter model and the public-code filter. Production clients add jittered backoff, a breaker per model deployment, and a cache keyed by a hash of the prompt so the same window never pays for the same completion twice.`,
+  debrief: `The interviewer is probing two things at once: do you know what the model call is for, and what its worst case is. The FIM flaw is the first: GitHub's post explains that telling the model which side of the cursor is which, instead of feeding it a document that ends at the cursor, raised acceptance by 10 %, and the starter quietly undoes it. The deadline, the bounded retry and the retryable set are the worst-case answers: one attempt is bounded at 300 ms, the call at two attempts, and only a model that says it is unavailable is asked again. The filter is the product answer from the same diagram — n completions are generated and at most n are shown — and it is where real systems put the contextual filter model and the public-code filter. Production clients add jittered backoff, a breaker per model deployment, and a cache keyed by a hash of the prompt so the same window never pays for the same completion twice.`,
 };

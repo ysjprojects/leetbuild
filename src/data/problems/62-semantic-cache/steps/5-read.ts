@@ -8,23 +8,22 @@ export const readStep: Step = {
   focus: ['client', 'cache', 'stats', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a hit rate comes back and the
-dashboard looks healthy. It authorizes nothing, it counts every tenant and every model version in
-one global bucket, it never says how old the answers are, and it merges the near-duplicate
-automated traffic that a semantic cache is best at serving. Review it like the service owner, fix
-it, and prove the fix.
+**Starting point.** The starter is working code: a hit rate comes back and the dashboard looks
+healthy. It authorizes nothing, it counts every tenant and every model version in one global bucket,
+it never says how old the answers are, and it merges the near-duplicate automated traffic that a
+semantic cache is best at serving. Debug it like the service owner, fix it, and prove the fix.
 
 Implement \`GET /v1/semantic-cache/{tenant}/stats?model_version=2024-06\`, the report the on-call
 engineer reads before deciding the cache is healthy:
 
 - The caller is authenticated by \`X-Tenant-Id\`: a missing header is **401**, and a caller whose
-  tenant is not the tenant in the path is **403**. The draft answers for whatever tenant the path
+  tenant is not the tenant in the path is **403**. The starter answers for whatever tenant the path
   names, so one customer can read another customer's hit rate.
 - \`model_version\` is required and non-empty (**400** otherwise), and the counters live in one hash
   per \`(tenant, model_version)\` pair: \`stats_key(tenant, model_version)\` →
   \`stats:{tenant}:{model_version}\` — the same hash the stats consumer maintains per result event
   (\`hits_total\`, \`misses_total\`, \`automated_hits\`, \`automated_total\`, \`hits_older_than_1h\`,
-  \`similarity_sum\`). The draft reads a single \`stats:all\` hash, so every tenant and every model
+  \`similarity_sum\`). The starter reads a single \`stats:all\` hash, so every tenant and every model
   version is reported as one number and a regression in one version hides in another's traffic.
 - The **automated near-duplicate traffic is reported separately, never merged**: the lookup path
   records the class a lookup declared in \`X-Client-Class\`, so the response carries \`hit_rate_automated\`
@@ -95,7 +94,7 @@ a health dashboard stays green while human traffic misses.`,
       id: 'tenant-authz',
       title: 'Refuses another tenant’s stats',
       detail:
-        'The caller in `X-Tenant-Id` may only read its own tenant: missing → **401**, a different tenant → **403**. The draft answers for whatever tenant the path names, so any caller can read another customer’s hit rate.',
+        'The caller in `X-Tenant-Id` may only read its own tenant: missing → **401**, a different tenant → **403**. The starter answers for whatever tenant the path names, so any caller can read another customer’s hit rate.',
       match: {
         python: {all: [/alias=["']X-Tenant-Id["']/, /caller\s*!=\s*tenant/, /status_code\s*=\s*403/]},
         typescript: {all: [/x-tenant-id/, /caller\s*!==\s*tenant/, /code\(\s*403\s*\)/]},
@@ -108,7 +107,7 @@ a health dashboard stays green while human traffic misses.`,
       id: 'age',
       title: 'Reports the share of hits older than an hour',
       detail:
-        '`hits_older_than_1h` counts the hits whose entry outlived `HIT_FRESHNESS_SECONDS` (`3600`) and the response carries `aging_hits` and `hits_older_than_1h_share`. The draft reports no age at all, so a cache answering from week-old entries reads as healthy.',
+        '`hits_older_than_1h` counts the hits whose entry outlived `HIT_FRESHNESS_SECONDS` (`3600`) and the response carries `aging_hits` and `hits_older_than_1h_share`. The starter reports no age at all, so a cache answering from week-old entries reads as healthy.',
       match: {
         python: {all: [/HIT_FRESHNESS_SECONDS/, /hits_older_than_1h/, /aging_hits/]},
         typescript: {all: [/HIT_FRESHNESS_SECONDS/, /hits_older_than_1h/, /aging_hits/]},
@@ -121,7 +120,7 @@ a health dashboard stays green while human traffic misses.`,
       id: 'automated',
       title: 'Separates the automated near-duplicate traffic',
       detail:
-        'The lookup path records the class it saw from `X-Client-Class`, so the report carries `hit_rate_automated` (`automated_hits` ÷ `automated_total`) and `automated_share` beside the overall `hit_rate`. The draft merges both classes into one rate, so near-duplicate automation inflates the number the team reads.',
+        'The lookup path records the class it saw from `X-Client-Class`, so the report carries `hit_rate_automated` (`automated_hits` ÷ `automated_total`) and `automated_share` beside the overall `hit_rate`. The starter merges both classes into one rate, so near-duplicate automation inflates the number the team reads.',
       match: {
         python: {all: [/automated_hits/, /hit_rate_automated/, /automated_share/, /X-Client-Class/]},
         typescript: {all: [/automated_hits/, /hit_rate_automated/, /automated_share/, /X-Client-Class/]},
@@ -134,7 +133,7 @@ a health dashboard stays green while human traffic misses.`,
       id: 'scope',
       title: 'Counts per tenant and model version',
       detail:
-        'The counters come from `stats_key(tenant, model_version)` → `stats:{tenant}:{model_version}`, the hash the stats consumer maintains, so no tenant and no model version shares a number with another. The draft reads one `stats:all` hash.',
+        'The counters come from `stats_key(tenant, model_version)` → `stats:{tenant}:{model_version}`, the hash the stats consumer maintains, so no tenant and no model version shares a number with another. The starter reads one `stats:all` hash.',
       match: {
         python: {all: [/def stats_key\(/, /hgetall\(\s*stats_key\(/], none: [/stats:all/]},
         typescript: {all: [/function statsKey\(/, /hgetall\(\s*statsKey\(/], none: [/stats:all/]},
@@ -146,7 +145,7 @@ a health dashboard stays green while human traffic misses.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/semantic-cache/{tenant}/stats: a model-generated draft with one global counter."""
+      starter: `"""GET /v1/semantic-cache/{tenant}/stats: flawed code with one global counter."""
 import redis
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -157,9 +156,9 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/semantic-cache/{tenant}/stats")
 def read_stats(tenant: str, model_version: str) -> JSONResponse:
-    # TODO: this draft reads one global stats:all hash, so every tenant and every model version is
+    # TODO: this starter reads one global stats:all hash, so every tenant and every model version is
     # reported as one number; it answers for whatever tenant the path names; it reports a single
-    # hit rate with no automated split; and it never says how old the hits are. Review all four.
+    # hit rate with no automated split; and it never says how old the hits are. Fix all four.
     counters = r.hgetall("stats:all")
     hits = int(counters.get("hits", 0) or 0)
     misses = int(counters.get("misses", 0) or 0)
@@ -253,7 +252,7 @@ def read_stats(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/semantic-cache/:tenant/stats: a model-generated draft with one global counter. */
+      starter: `/** GET /v1/semantic-cache/:tenant/stats: flawed code with one global counter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -261,9 +260,9 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/semantic-cache/:tenant/stats', async (request, reply) => {
-  // TODO: this draft reads one global stats:all hash, so every tenant and every model version is
+  // TODO: this starter reads one global stats:all hash, so every tenant and every model version is
   // reported as one number; it answers for whatever tenant the path names; it reports a single
-  // hit rate with no automated split; and it never says how old the hits are. Review all four.
+  // hit rate with no automated split; and it never says how old the hits are. Fix all four.
   const {tenant} = request.params as {tenant: string};
   const {model_version: modelVersion = ''} = request.query as {model_version?: string};
   const counters = await r.hgetall('stats:all');
@@ -370,9 +369,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func readStats(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.PathValue("tenant")
 	modelVersion := r.URL.Query().Get("model_version")
-	// TODO: this draft reads one global stats:all hash, so every tenant and every model version is
+	// TODO: this starter reads one global stats:all hash, so every tenant and every model version is
 	// reported as one number; it answers for whatever tenant the path names; it reports a single
-	// hit rate with no automated split; and it never says how old the hits are. Review all four.
+	// hit rate with no automated split; and it never says how old the hits are. Fix all four.
 	counters, err := rdb.HGetAll(r.Context(), "stats:all").Result()
 	if err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
@@ -516,10 +515,10 @@ object StatsApi {
     path("v1" / "semantic-cache" / Segment / "stats") { tenant =>
       get {
         parameter("model_version") { modelVersion =>
-          // TODO: this draft reads one global stats:all hash, so every tenant and every model
+          // TODO: this starter reads one global stats:all hash, so every tenant and every model
           // version is reported as one number; it answers for whatever tenant the path names; it
           // reports a single hit rate with no automated split; and it never says how old the hits
-          // are. Review all four.
+          // are. Fix all four.
           val counters = jedis.hgetAll("stats:all").asScala.toMap
           val hits = counters.getOrElse("hits", "0").toLong
           val misses = counters.getOrElse("misses", "0").toLong
@@ -626,9 +625,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/semantic-cache/([^/]+)/stats)", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reads one global stats:all hash, so every tenant and every model version is
+    // TODO: this starter reads one global stats:all hash, so every tenant and every model version is
     // reported as one number; it answers for whatever tenant the path names; it reports a single
-    // hit rate with no automated split; and it never says how old the hits are. Review all four.
+    // hit rate with no automated split; and it never says how old the hits are. Fix all four.
     const auto tenant = req.matches[1].str();
     const auto modelVersion = req.get_param_value("model_version");
     std::unordered_map<std::string, std::string> counters;

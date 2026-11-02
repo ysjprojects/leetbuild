@@ -8,8 +8,8 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: an action is published and the item moves on. The
-draft puts the wrong data on a durable topic and gets the durability order backwards. Find the
+**Starting point.** The starter is working code: an action is published and the item moves on. It
+puts the wrong data on a durable topic and gets the durability order backwards. Find the
 three defects, fix them, and prove the fix.
 
 Implement the \`moderation.action\` path:
@@ -19,17 +19,17 @@ Implement the \`moderation.action\` path:
   across partitions, so two consumers can apply its actions out of order and a later restore can
   resurrect a removal.
 - The payload must never contain the **reporter's identity** or the **verbatim report detail**.
-  The draft ships both "so downstream fraud can review", which copies a private statement about a
+  The starter ships both "so downstream fraud can review", which copies a private statement about a
   person into a retained, replicated, widely-readable topic.
 - The producer is **idempotent** with \`acks=all\`, so a retry after a timeout does not publish the
   same action twice.
 - When the broker rejects the produce, the event goes to an **outbox** instead of being dropped —
   the moderation decision and its audit trail must not depend on the broker being up.
-- The consumer **persists the action before it commits the offset**. The draft commits first, so a
+- The consumer **persists the action before it commits the offset**. The starter commits first, so a
   crash between the two replays the event into a no-op and the removal is never recorded.
 
 **Failure mode the checks target.** A Kafka topic is durable, replicated and long-lived, so it is
-the last place that should ever hold a reporter's identity or their words. The draft fails on data
+the last place that should ever hold a reporter's identity or their words. The starter fails on data
 minimisation, on ordering (the wrong key), and on the crash window between the commit and the
 persist.`,
   sequence: {
@@ -57,7 +57,7 @@ persist.`,
       id: 'keyed-by-content',
       title: 'Keys every event by content id',
       detail:
-        'The producer key is the **content id**, so one item’s actions share a partition and stay in order. The draft keys by reporter, which scatters one item’s history and lets a later event overtake an earlier one.',
+        'The producer key is the **content id**, so one item’s actions share a partition and stay in order. The starter keys by reporter, which scatters one item’s history and lets a later event overtake an earlier one.',
       match: {
         python: {all: [/moderation\.action/, /content_key\(/]},
         typescript: {all: [/moderation\.action/, /contentKey\(/]},
@@ -70,7 +70,7 @@ persist.`,
       id: 'reporter-stripped',
       title: 'Ships no reporter identity and no free text',
       detail:
-        'The event is built from the content id, the action, the rule and the reviewer role only — never `reporter_id` and never the report `detail`. The draft includes both so “fraud can review”, copying private data into a durable topic.',
+        'The event is built from the content id, the action, the rule and the reviewer role only — never `reporter_id` and never the report `detail`. The starter includes both so “fraud can review”, copying private data into a durable topic.',
       match: {
         python: {all: [/build_event\(/], none: [/reporter_id/, /detail/]},
         typescript: {all: [/buildEvent\(/], none: [/reporter_id/, /reporterId/, /detail/]},
@@ -83,7 +83,7 @@ persist.`,
       id: 'idempotent-producer',
       title: 'Produces idempotently with acks=all',
       detail:
-        'The producer is configured with `acks=all` and idempotence enabled, so a retry after a timeout cannot publish the same action twice. The draft uses the client defaults and can duplicate on every retry.',
+        'The producer is configured with `acks=all` and idempotence enabled, so a retry after a timeout cannot publish the same action twice. The starter uses the client defaults and can duplicate on every retry.',
       match: {
         python: {all: [/acks/, /enable_idempotence/]},
         typescript: {all: [/acks/, /idempotent/]},
@@ -96,7 +96,7 @@ persist.`,
       id: 'outbox',
       title: 'Writes an outbox row when the produce fails',
       detail:
-        'A rejected produce inserts the event into the outbox instead of dropping it. The draft ignores the failure, so an action that is live in the product has no record anywhere.',
+        'A rejected produce inserts the event into the outbox instead of dropping it. The starter ignores the failure, so an action that is live in the product has no record anywhere.',
       match: {
         python: {all: [/outbox\.insert\(/]},
         typescript: {all: [/outbox\.insert\(/]},
@@ -109,7 +109,7 @@ persist.`,
       id: 'persist-before-commit',
       title: 'Persists the action before committing the offset',
       detail:
-        'The consumer writes the action and only then commits the offset. The draft commits first, so a crash in between replays the event and the removal is never durably recorded.',
+        'The consumer writes the action and only then commits the offset. The starter commits first, so a crash in between replays the event and the removal is never durably recorded.',
       match: {
         python: {order: [/store\.put_action\(/, /consumer\.commit\(/]},
         typescript: {order: [/store\.putAction\(/, /commitOffsets\(/]},
@@ -130,7 +130,7 @@ consumer = KafkaConsumer("moderation.action", group_id="moderation-writers")
 
 
 def publish(content_id: str, reporter_id: str, action: str, rule: str, detail: str) -> None:
-    # TODO: this draft keys by reporter, ships the reporter id and the verbatim detail in the
+    # TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
     # payload, has no acks or idempotence, skips the outbox, and commits before it persists.
     payload = {"action": action, "rule": rule, "reporter_id": reporter_id, "detail": detail}
     producer.send("moderation.action", key=reporter_id, value=json.dumps(payload).encode())
@@ -179,7 +179,7 @@ def apply_action(record) -> None:
 `,
     },
     typescript: {
-      starter: `/** Moderation events: a model-generated draft that ships the reporter and commits first. */
+      starter: `/** Moderation events: flawed code that ships the reporter and commits first. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'moderation-writers', brokers: ['kafka:9092']});
@@ -194,7 +194,7 @@ export async function publish(
   rule: string,
   detail: string,
 ): Promise<void> {
-  // TODO: this draft keys by reporter, ships the reporter id and the verbatim detail in the
+  // TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
   // payload, has no acks or idempotence, skips the outbox, and commits before it persists.
   const payload = {action, rule, reporter_id: reporterId, detail};
   await producer.send({topic: 'moderation.action', messages: [{key: reporterId, value: JSON.stringify(payload)}]});
@@ -267,7 +267,7 @@ import (
 const topic = "moderation.action"
 
 func publish(producer sarama.SyncProducer, contentID, reporterID, action, rule, detail string) error {
-	// TODO: this draft keys by reporter, ships the reporter id and the verbatim detail in the
+	// TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
 	// payload, has no acks or idempotence, skips the outbox, and commits before it persists.
 	payload, _ := json.Marshal(map[string]string{
 		"action": action, "rule": rule, "reporter_id": reporterID, "detail": detail,
@@ -357,7 +357,7 @@ object ModerationEvents {
   val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
   def publish(contentId: String, reporterId: String, action: String, rule: String, detail: String): Unit = {
-    // TODO: this draft keys by reporter, ships the reporter id and the verbatim detail in the
+    // TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
     // payload, has no acks or idempotence, skips the outbox, and commits before it persists.
     val payload = s"""{"action":"$action","rule":"$rule","reporter_id":"$reporterId","detail":"$detail"}"""
     producer.send(new ProducerRecord[String, String](Topic, reporterId, payload))
@@ -415,7 +415,7 @@ const std::string kTopic = "moderation.action";
 
 void publish(rd_kafka_t* producer, const std::string& contentId, const std::string& reporterId,
              const std::string& action, const std::string& rule, const std::string& detail) {
-  // TODO: this draft keys by reporter, ships the reporter id and the verbatim detail in the
+  // TODO: this starter keys by reporter, ships the reporter id and the verbatim detail in the
   // payload, has no acks or idempotence, skips the outbox, and commits before it persists.
   const auto payload = "{\\"action\\":\\"" + action + "\\",\\"rule\\":\\"" + rule + "\\",\\"reporter_id\\":\\"" +
                        reporterId + "\\",\\"detail\\":\\"" + detail + "\\"}";
@@ -475,5 +475,5 @@ void applyAction(ActionStore& store, rd_kafka_message_t* message, rd_kafka_t* co
     'A topic is retained, replicated and read far beyond the moderation service, so treat it as public within the company. The reporter id and the verbatim report text belong in the case store, not on `moderation.action`; if fraud needs them, they join on the case id under their own access control.',
     'Durability is an order, not a flag: persist the action, then commit the offset. `enable_idempotence` with `acks=all` keeps a retry from duplicating the event, and an outbox row keeps the audit trail alive when the broker is the thing that failed.',
   ],
-  debrief: `The interviewer is testing whether you can review a publish path that is durable and widely read. The draft reads fine because the demo runs against a healthy broker and one consumer. Three defects are being checked: data minimisation on a retained topic (no reporter identity, no free text), ordering by the right key (a reporter key loses one item’s order), and the crash window (persist before commit, or an action that happened in the product never lands in the record). Real systems add a schema registry that rejects any field outside the allowlist, an outbox drainer with its own idempotency key, and a replay tool that re-applies a content id’s history to rebuild the case file.`,
+  debrief: `The interviewer is testing whether you can debug a publish path that is durable and widely read. The starter reads fine because the demo runs against a healthy broker and one consumer. Three defects are being checked: data minimisation on a retained topic (no reporter identity, no free text), ordering by the right key (a reporter key loses one item’s order), and the crash window (persist before commit, or an action that happened in the product never lands in the record). Real systems add a schema registry that rejects any field outside the allowlist, an outbox drainer with its own idempotency key, and a replay tool that re-applies a content id’s history to rebuild the case file.`,
 };

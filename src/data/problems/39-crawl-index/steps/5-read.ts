@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'crawler', 'redis', 'index'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it answers with counts, a percentage and an HTTP
+**Starting point.** The starter is working code: it answers with counts, a percentage and an HTTP
 200, so a dashboard has something to draw. The number it draws is not true. Find the flaws, fix
 them, and prove the fix.
 
@@ -17,13 +17,13 @@ healthy:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when missing), and a job
   that belongs to a **different tenant is 404** — never 403, which would confirm the job exists. The
-  draft serves any job to any caller.
+  starter serves any job to any caller.
 - The counts — \`fetched\`, \`refused\`, \`pending\`, \`indexed\` — come from the **live frontier**,
-  not from a report cached on a timer. The draft refreshes its cached copy hourly, so an operator
+  not from a report cached on a timer. The starter refreshes its cached copy hourly, so an operator
   watching a crawl that just died sees a stale picture.
 - \`oldest_pending_age_s\` is the age of the oldest URL still waiting, and it drives an explicit
   **\`stalled\`** flag: \`stalled = pending > 0 and oldest_pending_age_s > STALL_AFTER_S\`. A crawl
-  whose counts have not moved is “in progress” to the draft and “stalled” to an operator.
+  whose counts have not moved is “in progress” to the starter and “stalled” to an operator.
 - \`coverage\` is honest: **refused pages are excluded from it**. It is
   \`indexed / (fetched + pending)\` — never \`1.0\` just because the queue drained, because a crawl
   that refused half a site and fetched the rest has not covered half a site.
@@ -70,7 +70,7 @@ stall that is not a field cannot be alerted on, so the first person to notice is
       id: 'live-counts',
       title: 'Reports live frontier counts, not a cached snapshot',
       detail:
-        'The counts are read from the frontier on every request, along with the oldest pending age. The draft serves a report cached for an hour, so an operator sees a picture from the last refresh.',
+        'The counts are read from the frontier on every request, along with the oldest pending age. The starter serves a report cached for an hour, so an operator sees a picture from the last refresh.',
       match: {
         python: {all: [/frontier\.counts\(/, /oldest_pending/], none: [/cached/]},
         typescript: {all: [/frontier\.counts\(/, /oldestPending/], none: [/cached/]},
@@ -83,7 +83,7 @@ stall that is not a field cannot be alerted on, so the first person to notice is
       id: 'coverage',
       title: 'Coverage excludes refused pages',
       detail:
-        'The report returns a `refused` count and a `coverage` that excludes those pages from the work actually done: `indexed / (fetched + pending)`. The draft claims 100% as soon as the queue drains, refusals and all.',
+        'The report returns a `refused` count and a `coverage` that excludes those pages from the work actually done: `indexed / (fetched + pending)`. The starter claims 100% as soon as the queue drains, refusals and all.',
       match: {
         python: {all: [/coverage/, /refused/]},
         typescript: {all: [/coverage/, /refused/]},
@@ -96,7 +96,7 @@ stall that is not a field cannot be alerted on, so the first person to notice is
       id: 'stall-flag',
       title: 'The oldest pending age drives a stall flag',
       detail:
-        'The report exposes `oldest_pending_age_s` and a `stalled` flag computed from it against `STALL_AFTER_S`. The draft has neither, so a crawl that stopped is indistinguishable from one that is working.',
+        'The report exposes `oldest_pending_age_s` and a `stalled` flag computed from it against `STALL_AFTER_S`. The starter has neither, so a crawl that stopped is indistinguishable from one that is working.',
       match: {
         python: {all: [/oldest_pending_age_s\(/, /stalled\s*=/]},
         typescript: {all: [/oldestPendingAgeS\(/, /stalled\s*=/]},
@@ -109,7 +109,7 @@ stall that is not a field cannot be alerted on, so the first person to notice is
       id: 'foreign-404',
       title: 'A foreign job id is 404',
       detail:
-        'A job that exists but belongs to another tenant answers **404**, the same as an unknown job. The draft serves any job to any caller.',
+        'A job that exists but belongs to another tenant answers **404**, the same as an unknown job. The starter serves any job to any caller.',
       match: {
         python: {all: [/job\.tenant\s*!=\s*tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/job\.tenant\s*!==\s*tenant/, /code\(\s*404\s*\)/]},
@@ -134,7 +134,7 @@ cached_reports: dict = {}
 
 @app.get("/v1/crawl/jobs/{job_id}")
 def report(job_id: str) -> JSONResponse:
-    # TODO: this draft serves a counter cached for an hour, claims 100 percent once the queue
+    # TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
     # drains even if pages were refused, never says how long the oldest pending URL has waited,
     # and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
     # expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
@@ -182,7 +182,7 @@ def report(job_id: str, tenant: str | None = Header(default=None, alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** Job report: a model-generated draft that serves a cached counter to any caller. */
+      starter: `/** Job report: flawed code that serves a cached counter to any caller. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -192,7 +192,7 @@ const CACHE_TTL_MS = 3600 * 1000;
 const cachedReports = new Map<string, {report: Record<string, number>; refreshedAt: number}>();
 
 app.get('/v1/crawl/jobs/:job_id', async (request, reply) => {
-  // TODO: this draft serves a counter cached for an hour, claims 100 percent once the queue
+  // TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
   // drains even if pages were refused, never says how long the oldest pending URL has waited,
   // and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
   // expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
@@ -286,7 +286,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func jobReport(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves a counter cached for an hour, claims 100 percent once the queue
+	// TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
 	// drains even if pages were refused, never says how long the oldest pending URL has waited,
 	// and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
 	// expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
@@ -411,7 +411,7 @@ object JobReportApi {
   val route: Route =
     path("v1" / "crawl" / "jobs" / Segment) { jobId =>
       get {
-        // TODO: this draft serves a counter cached for an hour, claims 100 percent once the queue
+        // TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
         // drains even if pages were refused, never says how long the oldest pending URL has
         // waited, and serves any job to any caller. Read the live frontier, keep refused pages out
         // of coverage, expose the pending age and a stall flag, and 404 a job that belongs to
@@ -526,7 +526,7 @@ constexpr long long kCacheTtlS = 3600;
 std::map<std::string, json> cachedReports;
 
 void jobReport(const httplib::Request& req, httplib::Response& res) {
-  // TODO: this draft serves a counter cached for an hour, claims 100 percent once the queue
+  // TODO: this starter serves a counter cached for an hour, claims 100 percent once the queue
   // drains even if pages were refused, never says how long the oldest pending URL has waited,
   // and serves any job to any caller. Read the live frontier, keep refused pages out of coverage,
   // expose the pending age and a stall flag, and 404 a job that belongs to another tenant.
@@ -601,5 +601,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether a read path can be reviewed as carefully as a write path. The draft is a dashboard-shaped endpoint: it returns numbers, and the numbers move. Three defects are being checked: a cached counter that reports the past, a coverage percentage that treats refusal as progress, and a missing stall signal that leaves “nothing has moved” invisible until a customer notices. The tenancy check is the quiet one: a 403 on a foreign job would confirm the id exists, so the honest answer for a job that is not yours is the same 404 you give for a job that does not exist. Real crawl consoles also break the numbers down per host, expose the frontier's oldest and newest pending URLs, and show the last refusal rule per host so an operator can see why coverage stopped moving.`,
+  debrief: `The interviewer is testing whether a read path can be debugged as carefully as a write path. The starter is a dashboard-shaped endpoint: it returns numbers, and the numbers move. Three defects are being checked: a cached counter that reports the past, a coverage percentage that treats refusal as progress, and a missing stall signal that leaves “nothing has moved” invisible until a customer notices. The tenancy check is the quiet one: a 403 on a foreign job would confirm the id exists, so the honest answer for a job that is not yours is the same 404 you give for a job that does not exist. Real crawl consoles also break the numbers down per host, expose the frontier's oldest and newest pending URLs, and show the last refusal rule per host so an operator can see why coverage stopped moving.`,
 };

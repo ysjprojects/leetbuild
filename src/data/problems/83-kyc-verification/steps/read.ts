@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db', 'storage'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the status route,
+**Starting point.** The starter is working code: it registers the status route,
 reads the case and returns it together with a document URL. It compiles, it serves the demo, and it
-hides three production flaws. Review it like the service owner, fix it, and prove the fix with the
+hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the
 checks below.
 
 Implement \`GET /v1/applicants/{id}/status\`, the read the applicant app polls after a submission.
@@ -18,13 +18,13 @@ The caller is the authenticated tenant in \`X-Tenant-Id\`.
 
 - The lookup is scoped to that tenant: an applicant whose case belongs to another tenant is **404**,
   the same answer as an applicant that does not exist, so the read cannot confirm that someone
-  else's case exists. The draft calls \`store.get(applicant_id)\`, so any caller can read any
+  else's case exists. The starter calls \`store.get(applicant_id)\`, so any caller can read any
   applicant.
 - \`reasons\` are the **customer-facing** reason codes, mapped from the vendor's internal vocabulary
   through \`PUBLIC_REASONS\`; an internal code with no public mapping never leaves the service. The
-  draft returns the vendor's own codes, so the app explains a refusal in the vendor's language.
+  starter returns the vendor's own codes, so the app explains a refusal in the vendor's language.
 - Document images never come back as permanent links: each document carries a **short-lived signed
-  link** with an \`expires_at\`, so a URL copied out of a response stops working. The draft returns
+  link** with an \`expires_at\`, so a URL copied out of a response stops working. The starter returns
   the permanent storage URL itself.
 - The response reports whether the case is \`degraded\` — a vendor timeout or error sent it to a
   human — and whether it is awaiting manual review, so the app can say "still deciding" instead of
@@ -57,7 +57,7 @@ alive.`,
       id: 'route',
       title: 'Serves GET /v1/applicants/{id}/status',
       detail:
-        'Register the read route on `GET /v1/applicants/{id}/status`. The draft already serves it, so this one is free — every other check has to fail on the draft.',
+        'Register the read route on `GET /v1/applicants/{id}/status`. The starter already serves it, so this one is free — every other check has to fail on the starter.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/applicants\/\{[^"']+\}\/status["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/applicants\/:[^'"]+\/status['"]/]},
@@ -70,7 +70,7 @@ alive.`,
       id: 'tenant-scope',
       title: 'Returns 404 for an applicant outside the caller’s tenant',
       detail:
-        'The case is looked up under `(tenant, applicant)` with the tenant taken from `X-Tenant-Id`, so an applicant that exists only for another tenant is **404** — the same answer as an applicant nobody has. The draft calls `store.get(applicant_id)`, so any caller can read any applicant.',
+        'The case is looked up under `(tenant, applicant)` with the tenant taken from `X-Tenant-Id`, so an applicant that exists only for another tenant is **404** — the same answer as an applicant nobody has. The starter calls `store.get(applicant_id)`, so any caller can read any applicant.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /store\.get\(\s*tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /store\.get\(\s*tenant/]},
@@ -83,7 +83,7 @@ alive.`,
       id: 'public-reasons',
       title: 'Maps vendor codes to the customer-facing reason set',
       detail:
-        'Reason codes leave the service mapped through `PUBLIC_REASONS` (or `REASON_MAP`): a small, stable, customer-facing set. The draft returns `vendor_reason_codes` verbatim, so the app explains a refusal in the vendor’s internal vocabulary and any taxonomy change breaks it.',
+        'Reason codes leave the service mapped through `PUBLIC_REASONS` (or `REASON_MAP`): a small, stable, customer-facing set. The starter returns `vendor_reason_codes` verbatim, so the app explains a refusal in the vendor’s internal vocabulary and any taxonomy change breaks it.',
       match: {
         python: {all: [/PUBLIC_REASONS|REASON_MAP/]},
         typescript: {all: [/PUBLIC_REASONS|REASON_MAP/]},
@@ -96,7 +96,7 @@ alive.`,
       id: 'signed-link',
       title: 'Hands document access out as a short-lived signed link',
       detail:
-        'Each document is returned as a link signed by storage with a TTL — `signed`/`presign` plus an expiry — never the permanent object URL. The draft returns the storage URL itself, so a link that leaks into a screenshot, a share or an index keeps working forever.',
+        'Each document is returned as a link signed by storage with a TTL — `signed`/`presign` plus an expiry — never the permanent object URL. The starter returns the storage URL itself, so a link that leaks into a screenshot, a share or an index keeps working forever.',
       match: {
         python: {all: [/signed|Signed|presign|Presign|signUrl|sign_url/, /expire|expires|EXPIRES|ttl|TTL/]},
         typescript: {all: [/signed|Signed|presign|Presign|signUrl|sign_url/, /expire|expires|EXPIRES|ttl|TTL/]},
@@ -109,7 +109,7 @@ alive.`,
       id: 'degraded-flag',
       title: 'Reports whether the case is degraded or awaiting a human',
       detail:
-        'The response carries `degraded` — a vendor timeout or error left the case for a human — and whether it is awaiting manual review. The draft omits both, so the app cannot tell "still deciding" from a final answer and shows a verdict the service does not have.',
+        'The response carries `degraded` — a vendor timeout or error left the case for a human — and whether it is awaiting manual review. The starter omits both, so the app cannot tell "still deciding" from a final answer and shows a verdict the service does not have.',
       match: {
         python: {all: [/degraded/, /manual/i]},
         typescript: {all: [/degraded/, /manual/i]},
@@ -147,7 +147,7 @@ storage = DocumentStorage()
 def status(applicant_id: str) -> JSONResponse:
     # TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
     # customer-facing reason set, hand document access out through storage's link API, and report
-    # the state a vendor failure leaves the case in. Review all four.
+    # the state a vendor failure leaves the case in. Fix all four.
     case = store.get(applicant_id)
     if case is None:
         raise HTTPException(status_code=404, detail="unknown applicant")
@@ -226,7 +226,7 @@ def status(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/applicants/:id/status: a model-generated draft that serves any caller. */
+      starter: `/** GET /v1/applicants/:id/status: flawed code that serves any caller. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -256,7 +256,7 @@ export const storage: DocumentStorage = {url: async ref => ref};
 app.get('/v1/applicants/:applicantId/status', async (request, reply) => {
   // TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
   // customer-facing reason set, hand document access out through storage's link API, and report
-  // the state a vendor failure leaves the case in. Review all four.
+  // the state a vendor failure leaves the case in. Fix all four.
   const {applicantId} = request.params as {applicantId: string};
   const caseRecord = await store.get(applicantId);
   if (caseRecord === null) return reply.code(404).send({error: 'unknown applicant'});
@@ -394,7 +394,7 @@ func readStatus(rw http.ResponseWriter, r *http.Request) {
 	applicantID := r.PathValue("id")
 	// TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
 	// customer-facing reason set, hand document access out through storage's link API, and report
-	// the state a vendor failure leaves the case in. Review all four.
+	// the state a vendor failure leaves the case in. Fix all four.
 	caseRecord, err := store.Get(r.Context(), applicantID)
 	if err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
@@ -569,7 +569,7 @@ object StatusRead {
       get {
         // TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
         // customer-facing reason set, hand document access out through storage's link API, and
-        // report the state a vendor failure leaves the case in. Review all four.
+        // report the state a vendor failure leaves the case in. Fix all four.
         store.get(applicantId) match {
           case None =>
             complete(StatusCodes.NotFound, JsObject("error" -> JsString("unknown applicant")))
@@ -730,7 +730,7 @@ int main() {
     const std::string applicantId = req.matches[1];
     // TODO: scope the lookup to the caller's tenant, map the vendor's internal codes onto the
     // customer-facing reason set, hand document access out through storage's link API, and report
-    // the state a vendor failure leaves the case in. Review all four.
+    // the state a vendor failure leaves the case in. Fix all four.
     const auto caseRecord = store.get(applicantId);
     if (!caseRecord) {
       writeJson(res, 404, R"({"error":"unknown applicant"})");

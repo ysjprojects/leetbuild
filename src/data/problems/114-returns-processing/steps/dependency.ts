@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'warehouse', 'refunds'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it asks the warehouse to grade
+**Starting point.** The starter is working code: it asks the warehouse to grade
 the returned item, gets an answer on the happy path, and settles the return. It compiles, it serves
-the demo, and on a bad day it pays customers for items nobody inspected. Review it like the service
+the demo, and on a bad day it pays customers for items nobody inspected. Debug it like the service
 owner, fix it, and prove the fix with the checks below.
 
 Implement the settlement path that runs once a return is registered — grade the item at the
@@ -23,7 +23,7 @@ warehouse, then pay what the grade allows:
   **3 attempts**. \`INVALID_ARGUMENT\` and \`NOT_FOUND\` are **terminal**: asking the same question
   again gets the same refusal.
 - When no grade arrives, the return is left in \`awaiting-inspection\` and the refund processor is
-  **not called**. The draft reads a timeout as "nothing wrong with the item" and requests the full
+  **not called**. The starter reads a timeout as "nothing wrong with the item" and requests the full
   refund, so every warehouse outage pays out an unverified claim.
 - The amount follows the grade: a \`sellable\` grade refunds the full line value
   (\`order_total_cents * quantity\`) while a \`damaged\` grade refunds **50%** of it. A verdict is an
@@ -31,7 +31,7 @@ warehouse, then pay what the grade allows:
 - The refund is requested **only after a grade arrives**, and \`refunded\` is written once the
   processor accepts the refund — the state records what happened, not what was attempted.
 
-**Failure mode the checks target.** A warehouse outage becomes an automatic payout: the draft turns
+**Failure mode the checks target.** A warehouse outage becomes an automatic payout: the starter turns
 \`DEADLINE_EXCEEDED\` into a full refund for an item that was never inspected. It also treats a
 \`damaged\` verdict as if it were transient, asking again until the answer is \`sellable\`, and it
 computes the refund without the grade, so the policy for damaged goods never applies.`,
@@ -86,7 +86,7 @@ computes the refund without the grade, so the policy for damaged goods never app
       id: 'hold-on-timeout',
       title: 'A timeout holds the refund in awaiting-inspection',
       detail:
-        'When the attempts end without a grade — a slow warehouse gives `DEADLINE_EXCEEDED` — the return is written as `awaiting-inspection` and the refund is held. The draft assumes the item is sellable, so the same outage pays an unverified claim in full.',
+        'When the attempts end without a grade — a slow warehouse gives `DEADLINE_EXCEEDED` — the return is written as `awaiting-inspection` and the refund is held. The starter assumes the item is sellable, so the same outage pays an unverified claim in full.',
       match: {
         python: {
           all: [
@@ -142,7 +142,7 @@ computes the refund without the grade, so the policy for damaged goods never app
       id: 'damaged-amount',
       title: 'The grade decides the amount: damaged pays half',
       detail:
-        'The refund is computed from the verdict: `sellable` refunds the whole line value (`order_total_cents * quantity`), `damaged` refunds the damaged percentage (50%) of it. The draft ignores the grade and always pays the full line.',
+        'The refund is computed from the verdict: `sellable` refunds the whole line value (`order_total_cents * quantity`), `damaged` refunds the damaged percentage (50%) of it. The starter ignores the grade and always pays the full line.',
       match: {
         python: {
           all: [
@@ -190,7 +190,7 @@ computes the refund without the grade, so the policy for damaged goods never app
       id: 'terminal-not-retried',
       title: 'Only UNAVAILABLE and DEADLINE_EXCEEDED are retried',
       detail:
-        'The attempt loop is bounded and continues only for the transient statuses (`UNAVAILABLE`, `DEADLINE_EXCEEDED`); `INVALID_ARGUMENT` and `NOT_FOUND` leave it as failures, and a `damaged` verdict ends it with an answer. The draft loops until the grade is `sellable`, so a damaged item is inspected again and a terminal refusal is retried.',
+        'The attempt loop is bounded and continues only for the transient statuses (`UNAVAILABLE`, `DEADLINE_EXCEEDED`); `INVALID_ARGUMENT` and `NOT_FOUND` leave it as failures, and a `damaged` verdict ends it with an answer. The starter loops until the grade is `sellable`, so a damaged item is inspected again and a terminal refusal is retried.',
       match: {
         python: {
           all: [
@@ -318,7 +318,7 @@ def set_state(return_id: str, state: str) -> None:
 
 def settle_return(return_id: str, order_line_id: str, quantity: int, order_total_cents: int) -> str:
     request = warehouse_pb2.GradeItemRequest(order_line_id=order_line_id, quantity=quantity)
-    # TODO: the draft keeps asking until the grade is sellable and reads a timeout as "sellable",
+    # TODO: the starter keeps asking until the grade is sellable and reads a timeout as "sellable",
     # so a warehouse outage refunds the customer in full without an inspection.
     grade = None
     attempts = 0
@@ -462,7 +462,7 @@ export async function settleReturn(
   orderTotalCents: number,
 ): Promise<string> {
   const request: GradeItemRequest = {order_line_id: orderLineId, quantity};
-  // TODO: the draft keeps asking until the grade is sellable and reads a timeout as "sellable",
+  // TODO: the starter keeps asking until the grade is sellable and reads a timeout as "sellable",
   // so a warehouse outage refunds the customer in full without an inspection.
   let grade: string | null = null;
   for (let attempt = 0; attempt < GRADE_ATTEMPTS && grade !== GRADE_SELLABLE; attempt++) {
@@ -615,7 +615,7 @@ func setState(ctx context.Context, returnID, state string) error {
 
 func settleReturn(ctx context.Context, returnID, orderLineID string, quantity int, orderTotalCents int64) (string, error) {
 	req := &warehousepb.GradeItemRequest{OrderLineId: orderLineID, Quantity: uint32(quantity)}
-	// TODO: the draft keeps asking until the grade is sellable and reads a timeout as "sellable",
+	// TODO: the starter keeps asking until the grade is sellable and reads a timeout as "sellable",
 	// so a warehouse outage refunds the customer in full without an inspection.
 	grade := ""
 	for attempt := 0; attempt < gradeAttempts && grade != gradeSellable; attempt++ {
@@ -759,7 +759,7 @@ object Settlement {
 
   def settleReturn(returnId: String, orderLineId: String, quantity: Int, orderTotalCents: Long): String = {
     val request = GradeItemRequest(orderLineId = orderLineId, quantity = quantity)
-    // TODO: the draft keeps asking until the grade is sellable and reads a timeout as "sellable",
+    // TODO: the starter keeps asking until the grade is sellable and reads a timeout as "sellable",
     // so a warehouse outage refunds the customer in full without an inspection.
     var grade = ""
     var attempt = 0
@@ -878,7 +878,7 @@ std::string settleReturn(const std::string& returnId, const std::string& orderLi
   returns::GradeItemRequest request;
   request.set_order_line_id(orderLineId);
   request.set_quantity(quantity);
-  // TODO: the draft keeps asking until the grade is sellable and reads a timeout as "sellable",
+  // TODO: the starter keeps asking until the grade is sellable and reads a timeout as "sellable",
   // so a warehouse outage refunds the customer in full without an inspection.
   std::string grade;
   for (int attempt = 0; attempt < kGradeAttempts && grade != kGradeSellable; ++attempt) {
@@ -999,5 +999,5 @@ std::string settleReturn(const std::string& returnId, const std::string& orderLi
     'One bounded attempt loop with one status decision inside it: retryable (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) → wait and try again; terminal (`INVALID_ARGUMENT`, `NOT_FOUND`) → fail; a reply → return the grade. A `damaged` verdict arrives as a *successful* reply, so it never reaches the retry branch.',
     'Decide the amount from the verdict before calling the processor: the full line value for `sellable`, the damaged percentage for `damaged`. If the loop ends without a grade, write `awaiting-inspection` and return — the refund call must not be reachable from that branch, and `refunded` is written only after the processor accepts.',
   ],
-  debrief: `The interviewer is testing whether you can gate a side effect on somebody else’s verdict. A grade is an answer, so the refund is a consequence of it — which means three separate things have to hold: the call has a deadline, a timeout means *unknown* rather than *fine*, and only the transient statuses are worth asking again. The draft fails all three in one direction: it reads "no answer" as "nothing wrong", pays the customer in full, and keeps re-asking after a damaged verdict until the answer is convenient. Retrying a terminal status is the same mistake in the other direction — it burns the budget on a question whose answer cannot change. Production systems park the return in \`awaiting-inspection\` (a queue a human or a second inspection pass drains), classify statuses in one place so an idempotent retry is never accidental, and reconcile refunds against the processor instead of trusting the state they wrote locally.`,
+  debrief: `The interviewer is testing whether you can gate a side effect on somebody else’s verdict. A grade is an answer, so the refund is a consequence of it — which means three separate things have to hold: the call has a deadline, a timeout means *unknown* rather than *fine*, and only the transient statuses are worth asking again. The starter fails all three in one direction: it reads "no answer" as "nothing wrong", pays the customer in full, and keeps re-asking after a damaged verdict until the answer is convenient. Retrying a terminal status is the same mistake in the other direction — it burns the budget on a question whose answer cannot change. Production systems park the return in \`awaiting-inspection\` (a queue a human or a second inspection pass drains), classify statuses in one place so an idempotent retry is never accidental, and reconcile refunds against the processor instead of trusting the state they wrote locally.`,
 };

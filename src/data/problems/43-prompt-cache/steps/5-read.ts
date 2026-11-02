@@ -8,9 +8,9 @@ export const cacheReadStep: Step = {
   focus: ['client', 'cache', 'consumer', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: one endpoint, one number, and a
+**Starting point.** The starter is working code: one endpoint, one number, and a
 dashboard that looks great because it averages everybody. Its three flaws are the three ways a ratio
-lies — a global slice, a price that lives in the code, and a tenant check that does not exist. Review
+lies — a global slice, a price that lives in the code, and a tenant check that does not exist. Debug
 it, fix it, and prove the fix.
 
 Implement \`GET /v1/cache/stats\` — the endpoint a rollout decision reads before it trusts a cache.
@@ -19,27 +19,27 @@ Implement \`GET /v1/cache/stats\` — the endpoint a rollout decision reads befo
   fill path: a stats endpoint that answers for whoever asks is a metrics endpoint that reports
   somebody else’s traffic.
 - **\`?tenant=\` must match the caller.** A request for another tenant’s slice is **403**
-  \`{"error": "forbidden"}\` — not an empty result, not a 404. The draft serves any tenant’s numbers to
+  \`{"error": "forbidden"}\` — not an empty result, not a 404. The starter serves any tenant’s numbers to
   any caller, which turns the ratio into a cross-tenant traffic oracle.
 - **One slice per prompt version, for the caller’s tenant only.** Read the version set the fill path
   maintains (\`pc:versions:{tenant}\`) and, for each version, the counters the consumer updates
-  (\`pc:access:{tenant}:{version}\` → \`hits\`, \`misses\`, \`tokens_saved\`, \`fill_latency_ms\`). The draft
+  (\`pc:access:{tenant}:{version}\` → \`hits\`, \`misses\`, \`tokens_saved\`, \`fill_latency_ms\`). The starter
   reports a single \`global\` ratio over every tenant and version, so the tenant that pays for
   everybody else’s misses reads exactly like the tenant the cache is actually saving.
 - **The hit ratio is \`hits / (hits + misses)\` per slice**, computed from those same counters — never
   from hits alone, and never from a separate "total requests" number that can drift. Differences
   between the two counters are the only honest signal a rollout has.
-- **\`fill_latency_ms\` is an average the events carry**, not the handler’s own duration. The draft
+- **\`fill_latency_ms\` is an average the events carry**, not the handler’s own duration. The starter
   measures how long the stats handler took and calls it fill latency; the number that matters is how
   long the *misses* took, which is what the event’s \`latency_ms\` records.
 - **Savings come from a versioned rate table.** \`savings_usd = tokens_saved / 1000 * RATE_TABLE[version]\`
-  with a default row for versions the table does not list yet. The draft multiplies by a hardcoded
+  with a default row for versions the table does not list yet. The starter multiplies by a hardcoded
   \`rate = 0.002\`, so a provider price change silently rewrites history and the finance number cannot
   be reproduced from a version.
 - The response is \`{"tenant", "versions": [{"version", "hit_ratio", "fill_latency_ms", "savings_usd"}]}\`.
 
 **Failure mode the checks target.** A ratio is only as trustworthy as its slice and its price. The
-draft’s global number hides the tenant that is subsidising everyone else, its hardcoded price makes the
+starter’s global number hides the tenant that is subsidising everyone else, its hardcoded price makes the
 savings line unauditable, and its missing tenant check leaks all of it to anyone with a request.`,
   sequence: {
     participants: ['Operator', 'Prompt Cache', 'Redis'],
@@ -83,7 +83,7 @@ savings line unauditable, and its missing tenant check leaks all of it to anyone
       id: 'per-tenant-version-slice',
       title: 'Reports one slice per prompt version for the caller’s tenant',
       detail:
-        'The endpoint reads `pc:versions:{tenant}` and, per version, the counters at `pc:access:{tenant}:{version}`. The draft reports one `global` ratio over every tenant and version, so one tenant’s misses are hidden behind another tenant’s hits.',
+        'The endpoint reads `pc:versions:{tenant}` and, per version, the counters at `pc:access:{tenant}:{version}`. The starter reports one `global` ratio over every tenant and version, so one tenant’s misses are hidden behind another tenant’s hits.',
       match: {
         python: {all: [/def stats_for_tenant\(/, /pc:access:\{tenant\}:\{version\}/], none: [/global/]},
         typescript: {all: [/function statsForTenant\(/, /pc:access:\$\{tenant\}:\$\{version\}/], none: [/global/]},
@@ -96,7 +96,7 @@ savings line unauditable, and its missing tenant check leaks all of it to anyone
       id: 'foreign-tenant-403',
       title: 'A foreign tenant slice is 403',
       detail:
-        'A `?tenant=` that differs from the authenticated tenant is answered `403 {"error": "forbidden"}` — an explicit refusal, not an empty slice. The draft serves any tenant’s slice to any caller.',
+        'A `?tenant=` that differs from the authenticated tenant is answered `403 {"error": "forbidden"}` — an explicit refusal, not an empty slice. The starter serves any tenant’s slice to any caller.',
       match: {
         python: {all: [/\b403\b/, /requested != tenant/]},
         typescript: {all: [/\.code\(\s*403\s*\)|\b403\b/, /requested !== tenant/]},
@@ -109,7 +109,7 @@ savings line unauditable, and its missing tenant check leaks all of it to anyone
       id: 'ratio-from-counters',
       title: 'Hit ratio is hits / (hits + misses) per slice',
       detail:
-        'Each slice computes `hit_ratio` from the two counters the consumer writes — `total = hits + misses`, then `hits / total` (0 when there is no traffic). The draft divides a global hits counter by a global misses counter it never updates.',
+        'Each slice computes `hit_ratio` from the two counters the consumer writes — `total = hits + misses`, then `hits / total` (0 when there is no traffic). The starter divides a global hits counter by a global misses counter it never updates.',
       match: {
         python: {all: [/total = hits \+ misses/, /hit_ratio/]},
         typescript: {all: [/const total = hits \+ misses/, /hit_ratio/]},
@@ -122,7 +122,7 @@ savings line unauditable, and its missing tenant check leaks all of it to anyone
       id: 'rate-table',
       title: 'Savings use a versioned rate table, not a hardcoded price',
       detail:
-        '`savings_usd` is `tokens_saved / 1000 * RATE_TABLE[version]` with a default row for unlisted versions, so a price change is a table change. The draft multiplies by a literal rate, which makes the savings number impossible to reproduce later.',
+        '`savings_usd` is `tokens_saved / 1000 * RATE_TABLE[version]` with a default row for unlisted versions, so a price change is a table change. The starter multiplies by a literal rate, which makes the savings number impossible to reproduce later.',
       match: {
         python: {all: [/RATE_TABLE = \{/, /RATE_TABLE\.get\(version/], none: [/rate = 0\.0/]},
         typescript: {all: [/RATE_TABLE: Record<number, number> = \{/, /RATE_TABLE\[version\]/], none: [/rate = 0\.0/]},
@@ -135,7 +135,7 @@ savings line unauditable, and its missing tenant check leaks all of it to anyone
       id: 'fill-latency',
       title: 'Reports the misses’ latency, not the handler’s',
       detail:
-        '`fill_latency_ms` comes from the counters the events maintain, so it describes how long cache misses take. The draft reports its own `handler_duration_ms` under the cache’s name, which tells a rollout nothing about the miss path.',
+        '`fill_latency_ms` comes from the counters the events maintain, so it describes how long cache misses take. The starter reports its own `handler_duration_ms` under the cache’s name, which tells a rollout nothing about the miss path.',
       match: {
         python: {all: [/"fill_latency_ms"/], none: [/handler_duration/, /perf_counter\(\)/]},
         typescript: {all: [/fill_latency_ms/], none: [/handler_duration/]},
@@ -157,7 +157,7 @@ store = Redis.from_url("redis://cache:6379/0")
 
 @app.get("/v1/cache/stats")
 async def cache_stats(request: Request) -> JSONResponse:
-    # TODO: the draft reports one global ratio over every tenant, serves any tenant's slice to any
+    # TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
     # caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if
     # it were the fill latency.
     tenant = request.headers.get("x-tenant-id")
@@ -223,7 +223,7 @@ async def cache_stats(request: Request) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/cache/stats: a model-generated dashboard endpoint with one global number. */
+      starter: `/** GET /v1/cache/stats: a dashboard endpoint with one global number. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -231,7 +231,7 @@ export const app = Fastify();
 const store = new Redis('redis://cache:6379');
 
 app.get('/v1/cache/stats', async (request, reply) => {
-  // TODO: the draft reports one global ratio over every tenant, serves any tenant's slice to any
+  // TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
   // caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if
   // it were the fill latency.
   const startedAt = Date.now();
@@ -316,7 +316,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TODO: the draft reports one global ratio over every tenant, serves any tenant's slice to any
+// TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
 // caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if it
 // were the fill latency.
 func cacheStats(r *redis.Client) http.HandlerFunc {
@@ -436,7 +436,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 
 object CacheStats {
-  // TODO: the draft reports one global ratio over every tenant, serves any tenant's slice to any
+  // TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
   // caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if
   // it were the fill latency.
   val routes: Route = get {
@@ -514,7 +514,7 @@ object CacheStats {
 
 using json = nlohmann::json;
 
-// TODO: the draft reports one global ratio over every tenant, serves any tenant's slice to any
+// TODO: the starter reports one global ratio over every tenant, serves any tenant's slice to any
 // caller, prices the savings with a hardcoded rate, and reports the handler's own duration as if it
 // were the fill latency.
 void register_cache_stats(httplib::Server& server, sw::redis::Redis& cache) {
@@ -594,5 +594,5 @@ void register_cache_stats(httplib::Server& server, sw::redis::Redis& cache) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell the difference between a metric and a claim. A cache ratio decides whether a prompt version gets more traffic, which means it has to be defensible line by line: the slice must be the caller’s own tenant *and* version (otherwise one tenant’s misses are paid for by another’s hits), the price must be a row attached to the version (otherwise the savings figure cannot be recomputed after a price change), and the latency must describe the misses rather than the query that reported them. The draft is what a generated dashboard looks like when it is written for a demo: a single impressive number, a price typed into the expression, and no tenant check at all — which is why the last of those three is the one that turns a metrics endpoint into a disclosure.`,
+  debrief: `The interviewer is testing whether you can tell the difference between a metric and a claim. A cache ratio decides whether a prompt version gets more traffic, which means it has to be defensible line by line: the slice must be the caller’s own tenant *and* version (otherwise one tenant’s misses are paid for by another’s hits), the price must be a row attached to the version (otherwise the savings figure cannot be recomputed after a price change), and the latency must describe the misses rather than the query that reported them. The starter is what a dashboard looks like when it is written for a demo: a single impressive number, a price typed into the expression, and no tenant check at all — which is why the last of those three is the one that turns a metrics endpoint into a disclosure.`,
 };

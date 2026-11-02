@@ -3,8 +3,8 @@ import type {Language, Problem, Step} from '@/lib/types';
 import {problems} from './problems';
 
 /**
- * A mock interview is a timed, curated slice of an AI-era course: an interviewer brief, a flawed
- * AI draft, and a clock. The scenario points at a real step so the task, starter and checks are
+ * A mock interview is a timed slice of a course: an interviewer brief, a flawed patch to debug,
+ * and a clock. The scenario points at a real step so the task, starter and checks are
  * the same ones the course uses; the extra fields are the interview framing and the debrief.
  */
 export interface MockScenario {
@@ -44,10 +44,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You are the AI platform engineer on call. Two requests from the same tenant arrived together, both passed the daily token check, and both reached the provider. The model-generated patch below looks right in a demo. Review it, fix it, and prove the fix.',
+      'You are the AI platform engineer on call. Two requests from the same tenant arrived together, both passed the daily token check, and both reached the provider. The patch below looks right in a demo. Debug it, fix it, and prove the fix.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft does GET, a client-side comparison, then DECRBY. Two concurrent requests both see the same remaining budget, so both pass. The key also has no TTL, so the daily spend never resets. The 429 lacks Retry-After and X-RateLimit-Remaining, leaving the client to hammer the gateway.',
+      'The patch does GET, a client-side comparison, then DECRBY. Two concurrent requests both see the same remaining budget, so both pass. The key also has no TTL, so the daily spend never resets. The 429 lacks Retry-After and X-RateLimit-Remaining, leaving the client to hammer the gateway.',
     testIdea:
       'Fire two reservations concurrently for the same tenant with enough budget for only one. Exactly one must succeed, and the remaining budget must never go below zero. Advance the clock a day and assert the key starts fresh.',
     followUps: [
@@ -66,10 +66,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A customer closed the tab in the middle of an answer. The gateway kept generating and billing for another 40 seconds. The AI draft streams correctly on the happy path, but it only notices a disconnect after the stream ends. Find the flaw, fix it, and prove it.',
+      'A customer closed the tab in the middle of an answer. The gateway kept generating and billing for another 40 seconds. The patch streams correctly on the happy path, but it only notices a disconnect after the stream ends. Find the flaw, fix it, and prove it.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The draft writes SSE frames but never checks whether the client is still there, and it never closes the upstream generator. Cancelling the HTTP response is not enough: the gRPC stream keeps producing tokens until the server stops reading. The fix has to check the request, stop iteration, and close the upstream call.',
+      'The patch writes SSE frames but never checks whether the client is still there, and it never closes the upstream generator. Cancelling the HTTP response is not enough: the gRPC stream keeps producing tokens until the server stops reading. The fix has to check the request, stop iteration, and close the upstream call.',
     testIdea:
       'Open the stream, cancel the client after the first frame, and assert the provider call is cancelled and no further tokens are read. Then assert a completed stream still ends with [DONE].',
     followUps: [
@@ -88,7 +88,7 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'RAG backend engineer · 25 min',
     minutes: 25,
     prompt:
-      'A support agent saw a citation from another tenant’s document. The AI draft retrieves from one global lexical index and caches the result under a key built only from the query. Review the tenant boundary, fix it, and prove it.',
+      'A support agent saw a citation from another tenant’s document. The patch retrieves from one global lexical index and caches the result under a key built only from the query. Debug the tenant boundary, fix it, and prove it.',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
       'A global index is a data leak: filtering after ranking still touches another tenant’s candidates and can return them when the filter is forgotten. The cache key is worse — the same query from two tenants reads the same cached answer. Tenant belongs in the index key, the vector filter, the cache key, and the citation payload.',
@@ -110,7 +110,7 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Applied AI engineer · 25 min',
     minutes: 25,
     prompt:
-      'A grounded answer cited a source that does not contain the quoted sentence. The AI draft concatenates retrieved text into the system prompt and trusts the model’s citation objects. Review the prompt boundary and the citation path, fix them, and prove the fix.',
+      'A grounded answer cited a source that does not contain the quoted sentence. The patch concatenates retrieved text into the system prompt and trusts the model’s citation objects. Debug the prompt boundary and the citation path, fix them, and prove the fix.',
     signals: ['Verify', 'Secure', 'Evaluate'],
     aiNote:
       'Retrieved text is data, not policy: putting it in the system prompt lets a poisoned document rewrite the rules. A model-authored citation is a claim, not evidence; the server must check that the quote is a literal substring of the stored chunk and build the citation from stored offsets. If nothing survives, the only honest answer is a refusal.',
@@ -128,14 +128,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'model-router',
     stepId: 'route-endpoint',
     title: 'The route endpoint that trusts its caller',
-    blurb: "The draft returns the caller's policy as the model name — fix the trust boundary.",
+    blurb: "The patch returns the caller's policy as the model name — fix the trust boundary.",
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You are the AI platform engineer on call. A tenant\'s integration sent `policy: "gpt-4o"` and the draft echoed it back as the model name, so any client can select any model the provider serves. The same handler also skips the prompt caps and the Idempotency-Key. Review it, fix it, and prove the fix.',
+      'You are the AI platform engineer on call. A tenant\'s integration sent `policy: "gpt-4o"` and the patch echoed it back as the model name, so any client can select any model the provider serves. The same handler also skips the prompt caps and the Idempotency-Key. Debug it, fix it, and prove the fix.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      "The draft treats the caller's `policy` string as the model name, validates neither the 256 KiB prompt cap nor `max_tokens`, ignores `Idempotency-Key` so a client retry routes twice, and logs the prompt on every request.",
+      "The patch treats the caller's `policy` string as the model name, validates neither the 256 KiB prompt cap nor `max_tokens`, ignores `Idempotency-Key` so a client retry routes twice, and logs the prompt on every request.",
     testIdea:
       'Post an unknown policy and expect 400; post a prompt over 256 KiB and expect 413; replay one request with the same Idempotency-Key and assert the second response is the stored decision rather than a new route.',
     followUps: [
@@ -150,14 +150,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'chat-memory',
     stepId: 'endpoint',
     title: 'The memory that grows forever',
-    blurb: 'The draft leaves the session buffer untrimmed, unexpired and shared across tenants.',
+    blurb: 'The patch leaves the session buffer untrimmed, unexpired and shared across tenants.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A tenant reported latency that grows through long sessions, and two tenants with colliding session ids saw each other in the buffer. The model-generated draft pushes turns onto a Redis list with no trim and no TTL and builds keys from the session id alone. Review it, fix it, and prove the buffer is bounded, expiring and tenant-scoped.',
+      'A tenant reported latency that grows through long sessions, and two tenants with colliding session ids saw each other in the buffer. The patch pushes turns onto a Redis list with no trim and no TTL and builds keys from the session id alone. Debug it, fix it, and prove the buffer is bounded, expiring and tenant-scoped.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The draft pushes each turn onto an unbounded Redis list with no TTL and no trim, builds the key without the tenant prefix so colliding session ids share a buffer, and appends without an idempotency key so a client retry writes the same turn twice.',
+      'The patch pushes each turn onto an unbounded Redis list with no TTL and no trim, builds the key without the tenant prefix so colliding session ids share a buffer, and appends without an idempotency key so a client retry writes the same turn twice.',
     testIdea:
       'Append 60 turns and assert the list holds 50; replay one append with the same Idempotency-Key and assert a single turn; read two tenants with the same session id and assert their buffers are disjoint.',
     followUps: [
@@ -172,14 +172,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'eval-harness',
     stepId: 'endpoint',
     title: 'The run that passed too early',
-    blurb: 'The draft calls a run green after a handful of samples and serves a stale report.',
+    blurb: 'The patch calls a run green after a handful of samples and serves a stale report.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A release shipped on an eval run that was marked passed after 12 of 500 samples, and the report endpoint kept serving a cached copy from before the last batch. The model-generated draft gates on a caller-supplied threshold and never invalidates its cache. Review it, fix it, and prove the gate only opens on a complete, current record.',
+      'A release shipped on an eval run that was marked passed after 12 of 500 samples, and the report endpoint kept serving a cached copy from before the last batch. The patch gates on a caller-supplied threshold and never invalidates its cache. Debug it, fix it, and prove the gate only opens on a complete, current record.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft marks the run passed as soon as any sample scores above the threshold, accepts a threshold override from the query string, and serves a report cached at run start so late failures never appear.',
+      'The patch marks the run passed as soon as any sample scores above the threshold, accepts a threshold override from the query string, and serves a report cached at run start so late failures never appear.',
     testIdea:
       'Start a run over 500 samples and assert it stays pending at 12 and at 199 scored samples; pass a threshold override and assert 400; finish the run below threshold and assert the report flips to failed immediately.',
     followUps: [
@@ -198,10 +198,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'After an embedding model upgrade, retrieval quality dropped because cached vectors from the old model were still served under the new model name. The model-generated draft hashes content only and returns cache hits regardless of version. Review it, fix it, and prove a version change cannot serve a stale vector.',
+      'After an embedding model upgrade, retrieval quality dropped because cached vectors from the old model were still served under the new model name. The patch hashes content only and returns cache hits regardless of version. Debug it, fix it, and prove a version change cannot serve a stale vector.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft keys the cache by content hash alone with no model version in the key or the value, so vectors from the previous model version are served forever after an upgrade, and the read path can return a wrong-dimension fallback as a 200.',
+      'The patch keys the cache by content hash alone with no model version in the key or the value, so vectors from the previous model version are served forever after an upgrade, and the read path can return a wrong-dimension fallback as a 200.',
     testIdea:
       'Embed one input under model v1, switch to v2, and assert the second call is a miss and produces a v2 vector; assert the v1 cache entry still exists for explicit v1 requests; force a fallback model and assert its dimension is refused under the v2 namespace.',
     followUps: [
@@ -220,10 +220,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A tenant spotted results in search that belonged to another tenant's private corpus. The model-generated draft keys the result cache by query hash alone and trusts a tenant field from the request body. Review it, fix it, and prove tenant isolation holds on every path including the cache.",
+      "A tenant spotted results in search that belonged to another tenant's private corpus. The patch keys the result cache by query hash alone and trusts a tenant field from the request body. Debug it, fix it, and prove tenant isolation holds on every path including the cache.",
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft builds the result cache key from the query hash and k only, so the first tenant to run a query populates an entry that the next tenant receives, and it reads the tenant filter from the request body instead of from auth.',
+      'The patch builds the result cache key from the query hash and k only, so the first tenant to run a query populates an entry that the next tenant receives, and it reads the tenant filter from the request body instead of from auth.',
     testIdea:
       "Run the same vector for two tenants and assert the returned ids are disjoint; send a body tenant that contradicts the authenticated tenant and assert 403; poison one tenant's cache entry and assert the other tenant is unaffected.",
     followUps: [
@@ -242,10 +242,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A prompt promotion was rolled back within seconds, but the pointer write and the tenant pins went through separately, so half the fleet kept serving the bad template. The same endpoint had promoted a version whose eval timed out. Review it, fix it, and prove rollback is atomic and eval-gated.',
+      'A prompt promotion was rolled back within seconds, but the pointer write and the tenant pins went through separately, so half the fleet kept serving the bad template. The same endpoint had promoted a version whose eval timed out. Debug it, fix it, and prove rollback is atomic and eval-gated.',
     signals: ['Specify', 'Evaluate', 'Secure'],
     aiNote:
-      'The draft writes the new global pointer and the tenant pins as separate commands, so a racing rollback leaves some readers pinned forward and some back, and it treats an eval timeout as an informal pass instead of a block.',
+      'The patch writes the new global pointer and the tenant pins as separate commands, so a racing rollback leaves some readers pinned forward and some back, and it treats an eval timeout as an informal pass instead of a block.',
     testIdea:
       'Promote and roll back concurrently and assert every reader resolves to exactly one version per tenant; stub the eval service to time out and assert the promotion is refused with the eval id in the error.',
     followUps: [
@@ -264,10 +264,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Finance found spend that did not match provider invoices, and a support engineer saw a tenant billed twice for one request after a retry. The model-generated draft increments per-model counters in separate commands and stores usage without any idempotency key. Review it, fix it, and prove counters, replay and reporting all agree.',
+      'Finance found spend that did not match provider invoices, and a support engineer saw a tenant billed twice for one request after a retry. The patch increments per-model counters in separate commands and stores usage without any idempotency key. Debug it, fix it, and prove counters, replay and reporting all agree.',
     signals: ['Specify', 'Verify', 'Operate'],
     aiNote:
-      "The draft increments each model's counter with a separate HINCRBY and sets no expiry, so concurrent writes can half-apply and the key never resets, and it stores usage without the Idempotency-Key so a retried report is recorded and billed twice.",
+      "The patch increments each model's counter with a separate HINCRBY and sets no expiry, so concurrent writes can half-apply and the key never resets, and it stores usage without the Idempotency-Key so a retried report is recorded and billed twice.",
     testIdea:
       'Replay the same usage report and assert one stored row and one billed amount; increment two model counters concurrently and assert the hash updates atomically; wait out the window and assert the counter key is gone.',
     followUps: [
@@ -286,10 +286,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "After a model rollout, last week's feedback silently moved to the new model because attribution fell back to the active version, and a double-clicked thumbs-up counted twice. The model-generated draft misattributes on lookup failure and dedupes with SISMEMBER-then-SADD. Review it, fix it, and prove feedback stays pinned to the request that earned it and counts once.",
+      "After a model rollout, last week's feedback silently moved to the new model because attribution fell back to the active version, and a double-clicked thumbs-up counted twice. The patch misattributes on lookup failure and dedupes with SISMEMBER-then-SADD. Debug it, fix it, and prove feedback stays pinned to the request that earned it and counts once.",
     signals: ['Specify', 'Verify', 'Secure'],
     aiNote:
-      'The draft attributes unattributable feedback to whatever model is active at read time, so a rollout rewrites the past, and its non-atomic dedupe lets a double submit store two ratings under a key that ignores the tenant.',
+      'The patch attributes unattributable feedback to whatever model is active at read time, so a rollout rewrites the past, and its non-atomic dedupe lets a double submit store two ratings under a key that ignores the tenant.',
     testIdea:
       'Submit feedback for a request served by v1 after v2 becomes active and assert the record still reads v1; double-submit concurrently and assert one row; stub attribution to time out and assert the rating is stored as unattributed.',
     followUps: [
@@ -304,14 +304,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'distillation-pipeline',
     stepId: 'endpoint',
     title: 'The distillation that learned from its own duplicates',
-    blurb: 'The draft drained budget on cache hits and double-counted nothing.',
+    blurb: 'The patch drained budget on cache hits and double-counted nothing.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "The student model regressed after a distillation run that fed it near-duplicate samples, and the job's dashboard showed more samples accepted than the budget could have paid for. The model-generated draft decrements budget before cache checks and never counts filtered duplicates. Review it, fix it, and prove the report reconciles and the filter holds.",
+      "The student model regressed after a distillation run that fed it near-duplicate samples, and the job's dashboard showed more samples accepted than the budget could have paid for. The patch decrements budget before cache checks and never counts filtered duplicates. Debug it, fix it, and prove the report reconciles and the filter holds.",
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft decrements the job budget before checking the dedupe cache, so repeated prompts drain the budget without new samples, and the report counts accepted as sampled minus hard failures, silently ignoring duplicates that the filter removed.',
+      'The patch decrements the job budget before checking the dedupe cache, so repeated prompts drain the budget without new samples, and the report counts accepted as sampled minus hard failures, silently ignoring duplicates that the filter removed.',
     testIdea:
       'Run a job over a dataset with 40 percent duplicate prompts and assert duplicates are rejected once, budget spent matches unique calls, and accepted plus rejected equals sampled.',
     followUps: [
@@ -330,10 +330,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A worker died mid-shard, the batch completed with 999 of 1000 shards, and the dashboard still said success because the shard was popped without a lease. The model-generated draft also counts a shard as done before flushing its output. Review it, fix it, and prove lost shards are reclaimed and honesty is enforced in the status.',
+      'A worker died mid-shard, the batch completed with 999 of 1000 shards, and the dashboard still said success because the shard was popped without a lease. The patch also counts a shard as done before flushing its output. Debug it, fix it, and prove lost shards are reclaimed and honesty is enforced in the status.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft pops shards with no lease, so a worker crash loses a shard from every set, and it publishes the completion event before flushing the output object, so the checksum can reference an unreadable file.',
+      'The patch pops shards with no lease, so a worker crash loses a shard from every set, and it publishes the completion event before flushing the output object, so the checksum can reference an unreadable file.',
     testIdea:
       'Kill a worker mid-shard and assert the shard is reclaimed by another worker; assert a batch with any non-terminal shard never reports success; assert the checksum of a published shard matches the flushed object.',
     followUps: [
@@ -352,10 +352,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Search became useless for one tenant after a vision outage: every uncaptioned image was indexed as the literal text an image, and permanent URLs leaked in events. The model-generated draft swallows generation errors and publishes raw object URLs. Review it, fix it, and prove failures are visible and access stays signed.',
+      'Search became useless for one tenant after a vision outage: every uncaptioned image was indexed as the literal text an image, and permanent URLs leaked in events. The patch swallows generation errors and publishes raw object URLs. Debug it, fix it, and prove failures are visible and access stays signed.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The draft catches every vision error and substitutes the literal string an image as the caption, so an outage converts into hundreds of poisoned retrievals, and its events carry permanent object URLs that bypass signed access.',
+      'The patch catches every vision error and substitutes the literal string an image as the caption, so an outage converts into hundreds of poisoned retrievals, and its events carry permanent object URLs that bypass signed access.',
     testIdea:
       "Stub the vision model to fail and assert the asset falls back to text-only indexing with a visible degraded flag, never a placeholder caption; inspect a published event for any URL field; request another tenant's asset id and assert 404.",
     followUps: [
@@ -370,14 +370,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'voice-agent',
     stepId: 'endpoint',
     title: 'The agent that interrupted itself',
-    blurb: 'Barge-in raced the TTS offset and the draft replayed audio on retry.',
+    blurb: 'Barge-in raced the TTS offset and the patch replayed audio on retry.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A user interrupted the agent and it kept talking to the end of the sentence; a reconnect later replayed the first two sentences of audio, and the client was billed for both. The model-generated draft updates barge-in state in two commands and restarts TTS from offset zero. Review it, fix it, and prove interruption is atomic and audio never replays.',
+      'A user interrupted the agent and it kept talking to the end of the sentence; a reconnect later replayed the first two sentences of audio, and the client was billed for both. The patch updates barge-in state in two commands and restarts TTS from offset zero. Debug it, fix it, and prove interruption is atomic and audio never replays.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft writes the speaker change and the TTS offset as separate commands, so a barge-in can land between them and the agent speaks over the user, and its TTS retry restarts the stream at the beginning, re-billing and re-playing delivered audio.',
+      'The patch writes the speaker change and the TTS offset as separate commands, so a barge-in can land between them and the agent speaks over the user, and its TTS retry restarts the stream at the beginning, re-billing and re-playing delivered audio.',
     testIdea:
       "Race a barge-in with an audio frame and assert the agent's stream is truncated at the current token; fail TTS mid-response and assert the retry resumes at the delivered offset or errors without replaying audio.",
     followUps: [
@@ -396,10 +396,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A single customer marked their own ticket critical every hour, and during a classifier outage the catch-all queue silently absorbed everything with no fallback metric. The model-generated draft honors body priority and hides the fallback path. Review it, fix it, and prove routing is server-side and fallback stays visible.',
+      'A single customer marked their own ticket critical every hour, and during a classifier outage the catch-all queue silently absorbed everything with no fallback metric. The patch honors body priority and hides the fallback path. Debug it, fix it, and prove routing is server-side and fallback stays visible.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      "The draft uses the request body's priority and queue when present, so callers route themselves, and its fallback path funnels everything into one queue while the summary omits any fallback share, so an outage looks like extra demand.",
+      "The patch uses the request body's priority and queue when present, so callers route themselves, and its fallback path funnels everything into one queue while the summary omits any fallback share, so an outage looks like extra demand.",
     testIdea:
       'Send a critical priority in the body and assert the assigned priority comes from classification; kill the classifier and assert keyword routing records a fallback reason; assert the summary reports the fallback share above zero during the outage.',
     followUps: [
@@ -418,10 +418,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A support escalation showed one user's recommendations rendering with another user's recently viewed items, because the draft read the user id from the request body. The same model returns an empty list whenever ranking times out. Review it, fix it, and prove identity comes from auth and degradation still recommends.",
+      "A support escalation showed one user's recommendations rendering with another user's recently viewed items, because the patch read the user id from the request body. The same model returns an empty list whenever ranking times out. Debug it, fix it, and prove identity comes from auth and degradation still recommends.",
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      "The draft resolves the user from the request body when present, so a caller can request any user's ranking, and it returns an empty list on ranking timeout with no fallback tag, so degradation is invisible to metrics.",
+      "The patch resolves the user from the request body when present, so a caller can request any user's ranking, and it returns an empty list on ranking timeout with no fallback tag, so degradation is invisible to metrics.",
     testIdea:
       'Send a body user id different from the authenticated one and assert it is ignored; force a ranking timeout and assert the response is popularity order with the fallback tag set and the tag appears in the impression event.',
     followUps: [
@@ -436,14 +436,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'moderation-service',
     stepId: 'endpoint',
     title: 'The report that doxxed the reporter',
-    blurb: 'The draft exposed reporter identity and auto-removed at 0.6 confidence.',
+    blurb: 'The patch exposed reporter identity and auto-removed at 0.6 confidence.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A reporter was harassed after a moderation case file showed their identity to the reported user, and borderline posts were auto-removed on weak classifier scores. The model-generated draft stores reporter data unredacted and auto-acts below a safe threshold. Review it, fix it, and prove reporter data is isolated and auto-actions need strong evidence.',
+      'A reporter was harassed after a moderation case file showed their identity to the reported user, and borderline posts were auto-removed on weak classifier scores. The patch stores reporter data unredacted and auto-acts below a safe threshold. Debug it, fix it, and prove reporter data is isolated and auto-actions need strong evidence.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft returns the case file to any caller who knows the id, embeds the reporter id and verbatim report text in the response and the action event, and auto-removes content from a 0.6 classifier score with no corroboration.',
+      'The patch returns the case file to any caller who knows the id, embeds the reporter id and verbatim report text in the response and the action event, and auto-removes content from a 0.6 classifier score with no corroboration.',
     testIdea:
       'Fetch a case id belonging to another tenant and assert 404; request a case as a non-surveyor and assert no reporter identifiers appear; feed the classifier a 0.7 score and assert the item lands in the human queue instead of auto-removal.',
     followUps: [
@@ -462,10 +462,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'During a detector outage, the redactor returned unredacted customer text with a warning header, and the audit topic contained sample values of the entities it removed. The model-generated draft fails open and logs removed values. Review it, fix it, and prove redaction fails closed and audits stay content-free.',
+      'During a detector outage, the redactor returned unredacted customer text with a warning header, and the audit topic contained sample values of the entities it removed. The patch fails open and logs removed values. Debug it, fix it, and prove redaction fails closed and audits stay content-free.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft catches detector errors and returns the original input with a degraded header, so an outage becomes a leak, and it publishes a sample of each removed value to the audit topic, putting the very data redaction exists to protect into a retained log.',
+      'The patch catches detector errors and returns the original input with a degraded header, so an outage becomes a leak, and it publishes a sample of each removed value to the audit topic, putting the very data redaction exists to protect into a retained log.',
     testIdea:
       "Stub the detector to fail and assert the response is a 503 with no text; run a redaction over an email address and assert the audit payload contains spans and counts but no address; request another tenant's document and assert 404.",
     followUps: [
@@ -481,13 +481,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The connector that replayed the whole vendor',
     blurb: 'A cursor with a TTL expired and the sync restarted from zero.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Integrations engineer · 20 min',
     minutes: 20,
     prompt:
-      "After a quiet weekend, a connector re-fetched three months of vendor history and tripped the vendor's rate limit, because the draft stored its cursor with a 24-hour TTL. The same draft retried 429s in a tight loop. Review it, fix it, and prove cursors are durable and retries are polite.",
+      "After a quiet weekend, a connector re-fetched three months of vendor history and tripped the vendor's rate limit, because the patch stored its cursor with a 24-hour TTL. The same patch retried 429s in a tight loop. Debug it, fix it, and prove cursors are durable and retries are polite.",
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft stores the sync cursor with a 24-hour TTL so a period of quiet silently resets it to the beginning of history, and it advances the cursor before the page is processed, so a crash can skip data as well as re-fetch it; the 429 handler retries with no backoff.',
+      'The patch stores the sync cursor with a 24-hour TTL so a period of quiet silently resets it to the beginning of history, and it advances the cursor before the page is processed, so a crash can skip data as well as re-fetch it; the 429 handler retries with no backoff.',
     testIdea:
       'Expire the cursor key and assert the next sync refuses to start rather than restarting from zero; crash between page commit and cursor move and assert the page is re-fetched and deduped; answer 429 and assert the next attempt waits with backoff.',
     followUps: [
@@ -503,13 +503,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The crawler that hammered one host',
     blurb: 'A global queue let one host absorb the whole rate budget.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Search infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'A blog host saw a thousand requests in a minute while the rest of the crawl idled, because the draft used one global queue with one shared rate bucket. The same draft retried 403s forever. Review it, fix it, and prove per-host politeness and terminal failure handling.',
+      'A blog host saw a thousand requests in a minute while the rest of the crawl idled, because the patch used one global queue with one shared rate bucket. The same patch retried 403s forever. Debug it, fix it, and prove per-host politeness and terminal failure handling.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft keeps a single global frontier and one rate bucket, so all crawl capacity can land on one host, and its retry policy treats a 403 as transient, replaying it forever while the shard head never advances.',
+      'The patch keeps a single global frontier and one rate bucket, so all crawl capacity can land on one host, and its retry policy treats a 403 as transient, replaying it forever while the shard head never advances.',
     testIdea:
       'Seed three hosts with different rates and assert requests per host match each bucket; answer 403 for one URL and assert it is recorded refused and popped; assert the frontier heads keep moving while a host is backed off.',
     followUps: [
@@ -525,13 +525,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The graph that split itself',
     blurb: 'Resolution timeouts were treated as mismatches and entities split.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Every hour the resolver was slow, the graph gained duplicate entities because the draft read a timeout as not a match, and a hub entity later made one query traverse millions of paths. The same draft deleted cache entries after edge writes so stale reads survived. Review it, fix it, and prove merges are deliberate, traversal bounded and caches safe.',
+      'Every hour the resolver was slow, the graph gained duplicate entities because the patch read a timeout as not a match, and a hub entity later made one query traverse millions of paths. The same patch deleted cache entries after edge writes so stale reads survived. Debug it, fix it, and prove merges are deliberate, traversal bounded and caches safe.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft maps resolution timeouts to not a match, silently spawning duplicates, and it invalidates the adjacency cache by deleting after the write, so a concurrent read can repopulate stale data that no later deletion cleans.',
+      'The patch maps resolution timeouts to not a match, silently spawning duplicates, and it invalidates the adjacency cache by deleting after the write, so a concurrent read can repopulate stale data that no later deletion cleans.',
     testIdea:
       'Stub resolution to time out and assert the pair is parked in review, not split; race a neighbor read against an edge write and assert the read reflects the new version once; request depth 5 and assert 400.',
     followUps: [
@@ -546,14 +546,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'quota-broker',
     stepId: 'endpoint',
     title: 'The GPU that was promised twice',
-    blurb: 'The draft reserved without recording, so two teams got the same capacity.',
+    blurb: 'The patch reserved without recording, so two teams got the same capacity.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two training jobs were scheduled onto the same four GPUs because the broker answered ok to both without recording either reservation, and a capacity-service timeout was treated as tacit approval. The model-generated draft does GET-then-INCRBY and fails open. Review it, fix it, and prove reservations are atomic and uncertainty denies.',
+      'Two training jobs were scheduled onto the same four GPUs because the broker answered ok to both without recording either reservation, and a capacity-service timeout was treated as tacit approval. The patch does GET-then-INCRBY and fails open. Debug it, fix it, and prove reservations are atomic and uncertainty denies.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft reads and then increments the reservation counter in separate commands, so concurrent requests both observe available capacity that only one can be granted, and a capacity-service timeout is treated as approval, silently double-booking the resource.',
+      'The patch reads and then increments the reservation counter in separate commands, so concurrent requests both observe available capacity that only one can be granted, and a capacity-service timeout is treated as approval, silently double-booking the resource.',
     testIdea:
       'Fire two concurrent reservations for the last unit and assert exactly one succeeds; time out the capacity service and assert a 503 with no ledger entry; release a reservation and assert the capacity is immediately reservable again.',
     followUps: [
@@ -572,10 +572,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "An auditor edited a record in the store and the verify endpoint still returned valid, because the draft never recomputed hashes. The same endpoint let any tenant verify against any other tenant's chain. Review it, fix it, and prove verification is real and tenant-scoped.",
+      "An auditor edited a record in the store and the verify endpoint still returned valid, because the patch never recomputed hashes. The same endpoint let any tenant verify against any other tenant's chain. Debug it, fix it, and prove verification is real and tenant-scoped.",
     signals: ['Secure', 'Verify', 'Evaluate'],
     aiNote:
-      "The draft's verify path checks only that the record and head keys exist and returns valid, with no hash recomputation or position linking, so any tampering passes; it also resolves chains without a tenant check.",
+      "The patch's verify path checks only that the record and head keys exist and returns valid, with no hash recomputation or position linking, so any tampering passes; it also resolves chains without a tenant check.",
     testIdea:
       'Tamper with one stored record and assert verification fails at that position; delete a middle record and assert the break is detected; verify a chain from another tenant and assert 404.',
     followUps: [
@@ -594,10 +594,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A tenant noticed completions referencing a product they do not use; the cache key omitted the tenant, so the first tenant to warm a popular prefix served everyone. The same cache refreshed TTLs on hit so a deprecated version never expired. Review it, fix it, and prove keys are tenant- and version-scoped.',
+      'A tenant noticed completions referencing a product they do not use; the cache key omitted the tenant, so the first tenant to warm a popular prefix served everyone. The same cache refreshed TTLs on hit so a deprecated version never expired. Debug it, fix it, and prove keys are tenant- and version-scoped.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      "The draft builds the cache key from the prefix hash alone and refreshes the value's TTL on every hit, so entries cross tenant boundaries and a hot deprecated version effectively never expires.",
+      "The patch builds the cache key from the prefix hash alone and refreshes the value's TTL on every hit, so entries cross tenant boundaries and a hot deprecated version effectively never expires.",
     testIdea:
       'Warm a prefix as tenant A, request it as tenant B and assert a miss; bump the prompt version and assert the old namespace stops serving; assert a hot entry still reports the original TTL rather than an extended one.',
     followUps: [
@@ -612,14 +612,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'tool-registry',
     stepId: 'endpoint',
     title: 'The tool that promoted itself',
-    blurb: 'The draft promoted a new tool version on a validation timeout.',
+    blurb: 'The patch promoted a new tool version on a validation timeout.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'An agent called a payment tool with a schema change that had never been validated, because the draft promoted it when the sandbox timed out and treated silence as success. The same draft let any service account register tools. Review it, fix it, and prove promotion requires a passing validation and registration requires the right role.',
+      'An agent called a payment tool with a schema change that had never been validated, because the patch promoted it when the sandbox timed out and treated silence as success. The same patch let any service account register tools. Debug it, fix it, and prove promotion requires a passing validation and registration requires the right role.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft treats a sandbox timeout as a pass and promotes the candidate version on it, and it allows any authenticated caller to register a tool, so an agent can mint a tool and then resolve it.',
+      'The patch treats a sandbox timeout as a pass and promotes the candidate version on it, and it allows any authenticated caller to register a tool, so an agent can mint a tool and then resolve it.',
     testIdea:
       'Stub the sandbox to time out and assert the previous version stays active with a recorded rejection; attempt registration as an unprivileged role and assert 403; pin an old catalog version and assert resolution still serves it.',
     followUps: [
@@ -638,10 +638,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A pipeline consumed thousands of unknown labels as real classifications after a model timeout, because the draft returned them with a 200 and no provenance. The same draft dereferenced caller-supplied object URLs. Review it, fix it, and prove degradation is explicit and references are scoped.',
+      'A pipeline consumed thousands of unknown labels as real classifications after a model timeout, because the patch returned them with a 200 and no provenance. The same patch dereferenced caller-supplied object URLs. Debug it, fix it, and prove degradation is explicit and references are scoped.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The draft maps model timeouts to a successful prediction of unknown with no provenance marker, so downstream consumers train on fabricated labels, and it fetches whatever object URL a caller supplies rather than enforcing the tenant storage prefix.',
+      'The patch maps model timeouts to a successful prediction of unknown with no provenance marker, so downstream consumers train on fabricated labels, and it fetches whatever object URL a caller supplies rather than enforcing the tenant storage prefix.',
     testIdea:
       'Force a timeout and assert the response marks the downgrade or fails, never a default label as a normal prediction; submit a foreign URL and assert 403 before the fetch; assert a result names the exact model version.',
     followUps: [
@@ -660,10 +660,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A two-hour recording was billed three times after a single chunk failed, because the draft restarted the entire transcription on any error. It also published raw text before redaction ran. Review it, fix it, and prove retries are per-chunk and redaction gates publishing.',
+      'A two-hour recording was billed three times after a single chunk failed, because the patch restarted the entire transcription on any error. It also published raw text before redaction ran. Debug it, fix it, and prove retries are per-chunk and redaction gates publishing.',
     signals: ['Operate', 'Verify', 'Secure'],
     aiNote:
-      'The draft restarts the whole transcription when any chunk fails, multiplying provider cost by the failure count, and it emits transcript segments before the redaction pass, so raw speech reaches the topic when redaction later fails.',
+      'The patch restarts the whole transcription when any chunk fails, multiplying provider cost by the failure count, and it emits transcript segments before the redaction pass, so raw speech reaches the topic when redaction later fails.',
     testIdea:
       'Fail one middle chunk and assert only that chunk re-runs; count provider calls across the runs; fail redaction and assert no segment was published with raw text.',
     followUps: [
@@ -682,10 +682,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A UI shipped untranslated English stamped as French because the draft returned the source text as a success when the MT service timed out, and the CDN cached it as localized. The same cache key ignored the tenant, so one customer's glossary translated another's content. Review it, fix it, and prove fallbacks are marked and caches are scoped.",
+      "A UI shipped untranslated English stamped as French because the patch returned the source text as a success when the MT service timed out, and the CDN cached it as localized. The same cache key ignored the tenant, so one customer's glossary translated another's content. Debug it, fix it, and prove fallbacks are marked and caches are scoped.",
     signals: ['Specify', 'Verify', 'Secure'],
     aiNote:
-      'The draft returns source text with a success status and the requested target locale when MT fails, so failures are indistinguishable from translations and get cached, and its glossary cache key ignores the tenant.',
+      'The patch returns source text with a success status and the requested target locale when MT fails, so failures are indistinguishable from translations and get cached, and its glossary cache key ignores the tenant.',
     testIdea:
       "Fail the MT call and assert the response carries an untranslated marker and a retriable status; assert the marked response is never cached; change tenant B's glossary and assert tenant A's translations are unaffected.",
     followUps: [
@@ -704,10 +704,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Downstream routing silently dropped content labeled with categories the taxonomy never contained, and during a model outage everything was classified safe with no record of why. The model-generated draft returns invented labels and conflates fallback with classification. Review it, fix it, and prove taxonomy binding and provenance.',
+      'Downstream routing silently dropped content labeled with categories the taxonomy never contained, and during a model outage everything was classified safe with no record of why. The patch returns invented labels and conflates fallback with classification. Debug it, fix it, and prove taxonomy binding and provenance.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft returns whatever label string the model produces without checking it against the taxonomy version, so invented labels flow downstream as real, and it maps every failure to the label safe with no provenance marker.',
+      'The patch returns whatever label string the model produces without checking it against the taxonomy version, so invented labels flow downstream as real, and it maps every failure to the label safe with no provenance marker.',
     testIdea:
       'Feed the model an invented label and assert the response routes it to review rather than returning it; kill the model and assert fallback provenance appears; edit a taxonomy and assert past classifications still name their original version.',
     followUps: [
@@ -726,10 +726,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Half a batch sat assigned to annotators who went home, because the draft assigned items with no lease expiry, and when the pre-label model went down the whole queue stopped. The same draft showed every annotator the labels of their peers. Review it, fix it, and prove leases return and degradation keeps the queue moving.',
+      'Half a batch sat assigned to annotators who went home, because the patch assigned items with no lease expiry, and when the pre-label model went down the whole queue stopped. The same patch showed every annotator the labels of their peers. Debug it, fix it, and prove leases return and degradation keeps the queue moving.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft marks items assigned permanently with no expiry, so abandoned work never returns to the pool, and it blocks assignment on pre-labeling, turning a model outage into a full labeling stop; it also exposes peer labels before submission.',
+      'The patch marks items assigned permanently with no expiry, so abandoned work never returns to the pool, and it blocks assignment on pre-labeling, turning a model outage into a full labeling stop; it also exposes peer labels before submission.',
     testIdea:
       'Assign an item and let the lease lapse and assert it returns to the pool; kill the pre-label model and assert items still assign with an unlabeled marker; submit as one annotator and assert peers still cannot see the label.',
     followUps: [
@@ -744,14 +744,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'dataset-registry',
     stepId: 'endpoint',
     title: 'The dataset that changed under training',
-    blurb: 'The draft let a version be overwritten and promoted on timeout.',
+    blurb: 'The patch let a version be overwritten and promoted on timeout.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two training runs on the same dataset name produced incomparable models, because the draft let the version hash be overwritten in place and promoted a candidate whose validation had timed out. The same endpoint handed out permanent object URLs. Review it, fix it, and prove versions are immutable and validation gates promotion.',
+      'Two training runs on the same dataset name produced incomparable models, because the patch let the version hash be overwritten in place and promoted a candidate whose validation had timed out. The same endpoint handed out permanent object URLs. Debug it, fix it, and prove versions are immutable and validation gates promotion.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      "The draft overwrites an existing version's pointer in place, so a hash no longer identifies its bytes, and it promotes candidates whose validation timed out, so unvalidated data reaches training under a clean version name.",
+      "The patch overwrites an existing version's pointer in place, so a hash no longer identifies its bytes, and it promotes candidates whose validation timed out, so unvalidated data reaches training under a clean version name.",
     testIdea:
       'Re-register an existing version and assert 409; time out validation and assert the previous version stays latest while the candidate is pending; assert a signed URL expires and cannot be replayed.',
     followUps: [
@@ -770,10 +770,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A priority boost duplicated a run, one copy was popped and its worker died during startup, and the dashboard said queued forever while the position drifted. The draft also killed preempted jobs before they could checkpoint. Review it, fix it, and prove starts are leased, preemptions checkpoint and state reconciles.',
+      'A priority boost duplicated a run, one copy was popped and its worker died during startup, and the dashboard said queued forever while the position drifted. The patch also killed preempted jobs before they could checkpoint. Debug it, fix it, and prove starts are leased, preemptions checkpoint and state reconciles.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft pops a run and treats it as started with no lease, so a crash between pop and process start loses the run silently, and it terminates preempted jobs immediately, discarding training progress instead of waiting for a checkpoint id.',
+      'The patch pops a run and treats it as started with no lease, so a crash between pop and process start loses the run silently, and it terminates preempted jobs immediately, discarding training progress instead of waiting for a checkpoint id.',
     testIdea:
       'Kill a worker between pop and start and assert the run returns to the queue; preempt a checkpointing job and assert the kill happens only after the checkpoint id; boost a priority concurrently and assert one queue position remains.',
     followUps: [
@@ -792,10 +792,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two inference workloads landed on the same GPU because the draft wrote the placement and decremented capacity as separate steps, and a node that had been dead for a week still received schedules. Review it, fix it, and prove allocation is atomic and dead nodes are unschedulable.',
+      'Two inference workloads landed on the same GPU because the patch wrote the placement and decremented capacity as separate steps, and a node that had been dead for a week still received schedules. Debug it, fix it, and prove allocation is atomic and dead nodes are unschedulable.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft decrements node capacity after committing the placement record, leaving a window where two schedules read the same free count, and its lack of heartbeat expiry keeps dead nodes in the scheduling set, so work lands on machines that will never run it.',
+      'The patch decrements node capacity after committing the placement record, leaving a window where two schedules read the same free count, and its lack of heartbeat expiry keeps dead nodes in the scheduling set, so work lands on machines that will never run it.',
     testIdea:
       'Fire two concurrent placements for the last GPU and assert one succeeds; expire a node heartbeat and assert no placement lands on it; crash between record and decrement and assert the counters reconcile on restart.',
     followUps: [
@@ -810,14 +810,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'model-registry',
     stepId: 'endpoint',
     title: 'The model that promoted on a timeout',
-    blurb: 'A serving probe timed out and the draft promoted anyway.',
+    blurb: 'A serving probe timed out and the patch promoted anyway.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A model version with a mismatched artifact digest reached half the fleet, because the draft promoted when the probe timeout hit and checked digests only at registration. The same draft cached pointers per process so instances disagreed. Review it, fix it, and prove promotion is gated on a verified probe.',
+      'A model version with a mismatched artifact digest reached half the fleet, because the patch promoted when the probe timeout hit and checked digests only at registration. The same patch cached pointers per process so instances disagreed. Debug it, fix it, and prove promotion is gated on a verified probe.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft treats a probe timeout as success and promotes without verifying the loaded artifact digest matches the registered one, and it keeps active pointers in process-local caches so a promotion is only visible to the instance that performed it.',
+      'The patch treats a probe timeout as success and promotes without verifying the loaded artifact digest matches the registered one, and it keeps active pointers in process-local caches so a promotion is only visible to the instance that performed it.',
     testIdea:
       'Time out the probe and assert the previous version keeps 100 percent traffic; load a mismatched digest and assert promotion is refused; promote then read from a second instance and assert it resolves the new version.',
     followUps: [
@@ -836,10 +836,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A training run resumed from a checkpoint whose middle chunk was corrupted, because the draft acknowledged chunks before the store verified checksums and its commit flag trusted a caller-supplied byte count. Review it, fix it, and prove acknowledgments mean durability and commits mean completeness.',
+      'A training run resumed from a checkpoint whose middle chunk was corrupted, because the patch acknowledged chunks before the store verified checksums and its commit flag trusted a caller-supplied byte count. Debug it, fix it, and prove acknowledgments mean durability and commits mean completeness.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      "The draft acknowledges each chunk as soon as it hands it to the store, so corruption is found only in a background pass long after a resume has consumed it, and its commit marker is derived from the caller's declared size rather than the verified chunk set.",
+      "The patch acknowledges each chunk as soon as it hands it to the store, so corruption is found only in a background pass long after a resume has consumed it, and its commit marker is derived from the caller's declared size rather than the verified chunk set.",
     testIdea:
       'Corrupt one chunk and assert the upload fails at verification rather than committing; lie about the byte count and assert the commit marker never sets; read the latest checkpoint while an upload is uncommitted and assert it is invisible.',
     followUps: [
@@ -858,10 +858,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A model scored suspiciously well offline and poorly in production, because the feature store served values computed after the training cutoff. The same backfill zero-filled partitions that timed out. Review it, fix it, and prove point-in-time correctness and honest backfills.',
+      'A model scored suspiciously well offline and poorly in production, because the feature store served values computed after the training cutoff. The same backfill zero-filled partitions that timed out. Debug it, fix it, and prove point-in-time correctness and honest backfills.',
     signals: ['Evaluate', 'Specify', 'Verify'],
     aiNote:
-      'The draft reads the latest value with no as-of guard, so a backfill against a past cutoff receives features computed later, inflating offline scores, and its offline path zero-fills timed-out partitions, turning infrastructure failures into plausible-looking data.',
+      'The patch reads the latest value with no as-of guard, so a backfill against a past cutoff receives features computed later, inflating offline scores, and its offline path zero-fills timed-out partitions, turning infrastructure failures into plausible-looking data.',
     testIdea:
       'Write a value with a timestamp after the cutoff and assert an as-of read returns the older value or nothing; time out a partition and assert it is reported missing, not zero-filled; bump a version and assert old cached keys are not read for the new version.',
     followUps: [
@@ -880,10 +880,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'An on-call got 400 pages in an hour from one monitor, because the draft evaluated on every batch with no cooldown and compared live traffic against a baseline that was itself live traffic. The same draft alerted on 20-sample batches. Review it, fix it, and prove alerts are significant and deduplicated.',
+      'An on-call got 400 pages in an hour from one monitor, because the patch evaluated on every batch with no cooldown and compared live traffic against a baseline that was itself live traffic. The same patch alerted on 20-sample batches. Debug it, fix it, and prove alerts are significant and deduplicated.',
     signals: ['Operate', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft writes the baseline into the same mutable sketch as live traffic, so the reference drifts with the signal and eventually nothing can be detected, and it alerts per batch tick with no cooldown or minimum sample size.',
+      'The patch writes the baseline into the same mutable sketch as live traffic, so the reference drifts with the signal and eventually nothing can be detected, and it alerts per batch tick with no cooldown or minimum sample size.',
     testIdea:
       'Feed one batch that crosses the threshold and assert one alert per window; feed a 20-sample batch and assert insufficient data; move live traffic and assert the baseline stays fixed.',
     followUps: [
@@ -898,14 +898,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'shadow-eval',
     stepId: 'endpoint',
     title: 'The shadow that slowed production',
-    blurb: 'The draft ran shadows inline with no deadline and no isolation.',
+    blurb: 'The patch ran shadows inline with no deadline and no isolation.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Production latency doubled during a semblance run because the draft called the candidate inline on the request thread with no deadline, and shadow traffic consumed tenants production rate limits. The same report declared a winner from twelve samples. Review it, fix it, and prove shadows cannot reach production in any way.',
+      'Production latency doubled during a semblance run because the patch called the candidate inline on the request thread with no deadline, and shadow traffic consumed tenants production rate limits. The same report declared a winner from twelve samples. Debug it, fix it, and prove shadows cannot reach production in any way.',
     signals: ['Operate', 'Evaluate', 'Verify'],
     aiNote:
-      "The draft makes the candidate call synchronously inside the production handler with no deadline and shares the tenant's production rate-limit buckets and idempotency store, so an unhealthy candidate both slows and starves the real path.",
+      "The patch makes the candidate call synchronously inside the production handler with no deadline and shares the tenant's production rate-limit buckets and idempotency store, so an unhealthy candidate both slows and starves the real path.",
     testIdea:
       'Stub the candidate to hang and assert production p99 is unchanged; exhaust the shadow budget and assert production quota is untouched; feed 12 pairs and assert the report says inconclusive.',
     followUps: [
@@ -924,10 +924,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A generated answer cited a quote that no longer existed, because the draft stored offsets without checking them and resolved by document id, so an update re-pointed every old citation at new text. The same store marked fetch failures valid. Review it, fix it, and prove spans resolve against immutable versions.',
+      'A generated answer cited a quote that no longer existed, because the patch stored offsets without checking them and resolved by document id, so an update re-pointed every old citation at new text. The same store marked fetch failures valid. Debug it, fix it, and prove spans resolve against immutable versions.',
     signals: ['Specify', 'Verify', 'Evaluate'],
     aiNote:
-      'The draft stores caller-provided offsets without validating them against the document bytes, and its cache and resolution key by document id instead of (document, version), so a document update silently rewrites what old citations point at.',
+      'The patch stores caller-provided offsets without validating them against the document bytes, and its cache and resolution key by document id instead of (document, version), so a document update silently rewrites what old citations point at.',
     testIdea:
       'Submit an offset whose bytes do not match the quote and assert 422; update the document and assert an old citation still resolves against its version; time out the fetch and assert broken status, not valid.',
     followUps: [
@@ -946,10 +946,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'Retrieval quality dropped without an alarm, because failed rerank batches were assigned neutral scores and low-value passages climbed. The same response truncated long passages silently and never reported it. Review it, fix it, and prove unscored is not a score.',
+      'Retrieval quality dropped without an alarm, because failed rerank batches were assigned neutral scores and low-value passages climbed. The same response truncated long passages silently and never reported it. Debug it, fix it, and prove unscored is not a score.',
     signals: ['Evaluate', 'Specify', 'Verify'],
     aiNote:
-      'The draft maps failed rerank batches to a neutral score, so infrastructure failures are indistinguishable from genuine mid-tier relevance and silently reorder results, and it truncates passages without a marker so scores describe text the model never saw.',
+      'The patch maps failed rerank batches to a neutral score, so infrastructure failures are indistinguishable from genuine mid-tier relevance and silently reorder results, and it truncates passages without a marker so scores describe text the model never saw.',
     testIdea:
       'Fail one batch of 64 and assert those passages are marked unscored and keep their retrieval order; truncate a 6 KiB passage and assert the response reports truncation; bump the model version and assert old scores are not served.',
     followUps: [
@@ -968,10 +968,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A board summary invented a revenue decline because the draft appended a partial rolling summary that claimed chunks it never processed, and a source edit silently reused an old summary. Review it, fix it, and prove progress is atomic and content-bound.',
+      'A board summary invented a revenue decline because the patch appended a partial rolling summary that claimed chunks it never processed, and a source edit silently reused an old summary. Debug it, fix it, and prove progress is atomic and content-bound.',
     signals: ['Evaluate', 'Operate', 'Verify'],
     aiNote:
-      'The draft commits the rolling summary and its chunk counter as separate writes, so a crash can produce a summary that claims coverage it never had, and its cache key omits the source content hash, so an edited source resumes and extends the previous summary.',
+      'The patch commits the rolling summary and its chunk counter as separate writes, so a crash can produce a summary that claims coverage it never had, and its cache key omits the source content hash, so an edited source resumes and extends the previous summary.',
     testIdea:
       'Crash between counter and summary writes and assert the reopened summary lists only completed chunks; edit the source and assert a new summary line starts; request a summary for a foreign tenant and assert 404.',
     followUps: [
@@ -990,10 +990,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A cached answer about refunds was served for a question about delivery, because the draft accepted a similarity threshold of zero from the caller and the tenant indexes were shared. Review it, fix it, and prove similarity floors and tenant scoping.',
+      'A cached answer about refunds was served for a question about delivery, because the patch accepted a similarity threshold of zero from the caller and the tenant indexes were shared. Debug it, fix it, and prove similarity floors and tenant scoping.',
     signals: ['Evaluate', 'Secure', 'Verify'],
     aiNote:
-      'The draft lets the caller set the similarity threshold with no floor, so a zero turns the nearest entry into a hit regardless of meaning, and it indexes all tenants in one vector index, so a similar question from one tenant can be answered with another tenant’s cached response.',
+      'The patch lets the caller set the similarity threshold with no floor, so a zero turns the nearest entry into a hit regardless of meaning, and it indexes all tenants in one vector index, so a similar question from one tenant can be answered with another tenant’s cached response.',
     testIdea:
       'Request with threshold zero and assert the service enforces its floor; insert two similar queries from different tenants and assert no cross-tenant hit; write an entry whose answer failed and assert no lookup hits it.',
     followUps: [
@@ -1012,10 +1012,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A spam wave was silently resolved by the queue itself when the enforcement service timed out, because the draft auto-resolved high-confidence items and treated a timeout as approval. The same draft stranded items when reviewers abandoned leases. Review it, fix it, and prove auto-resolution is a narrow granted class and leases return.',
+      'A spam wave was silently resolved by the queue itself when the enforcement service timed out, because the patch auto-resolved high-confidence items and treated a timeout as approval. The same patch stranded items when reviewers abandoned leases. Debug it, fix it, and prove auto-resolution is a narrow granted class and leases return.',
     signals: ['Operate', 'Secure', 'Verify'],
     aiNote:
-      'The draft auto-resolves on enforcement timeouts for any item above a 0.5 confidence, so an enforcement outage becomes a silent self-approval loop, and it assigns items without leases so a crashed reviewer strands work forever.',
+      'The patch auto-resolves on enforcement timeouts for any item above a 0.5 confidence, so an enforcement outage becomes a silent self-approval loop, and it assigns items without leases so a crashed reviewer strands work forever.',
     testIdea:
       'Time out enforcement and assert the item escalates to a human; abandon a lease and assert the item re-enters the queue; enqueue the same source twice and assert one item.',
     followUps: [
@@ -1034,10 +1034,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A fine-tune trained on an unregistered export, and the same job restarted three times from scratch after missed heartbeats, burning a week of GPU budget. The model-generated draft accepts raw data references and restarts silent trainers blind. Review it, fix it, and prove data is versioned and restarts resume.',
+      'A fine-tune trained on an unregistered export, and the same job restarted three times from scratch after missed heartbeats, burning a week of GPU budget. The patch accepts raw data references and restarts silent trainers blind. Debug it, fix it, and prove data is versioned and restarts resume.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft accepts a caller-supplied dataset file, bypassing registry provenance entirely, and restarts a trainer on a missed heartbeat from scratch rather than requesting a checkpoint, so transient unresponsiveness silently multiplies compute cost.',
+      'The patch accepts a caller-supplied dataset file, bypassing registry provenance entirely, and restarts a trainer on a missed heartbeat from scratch rather than requesting a checkpoint, so transient unresponsiveness silently multiplies compute cost.',
     testIdea:
       'Submit a raw file reference and assert 400; simulate a missed heartbeat and assert a checkpoint request precedes any restart; finish a job with a failing eval and assert it reports not promotable.',
     followUps: [
@@ -1052,14 +1052,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'red-team-runner',
     stepId: 'endpoint',
     title: 'The red-team that attacked production',
-    blurb: 'The draft resolved an arbitrary URL and probes hit production.',
+    blurb: 'The patch resolved an arbitrary URL and probes hit production.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A red-team run accidentally sent adversarial probes to production, because the draft accepted any target URL and never enforced the non-production registry. The same draft re-ran probes on retry and skipped coverage silently. Review it, fix it, and prove targets are registered and coverage is honest.',
+      'A red-team run accidentally sent adversarial probes to production, because the patch accepted any target URL and never enforced the non-production registry. The same patch re-ran probes on retry and skipped coverage silently. Debug it, fix it, and prove targets are registered and coverage is honest.',
     signals: ['Secure', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft accepts an arbitrary URL as a target with no registry check, so a typo in the target field points the entire probe set at production, and its probe dedupe is a non-atomic check-then-set that re-executes concurrent probes.',
+      'The patch accepts an arbitrary URL as a target with no registry check, so a typo in the target field points the entire probe set at production, and its probe dedupe is a non-atomic check-then-set that re-executes concurrent probes.',
     testIdea:
       'Submit a production URL and assert 400 before any probe is sent; fire the kill switch mid-run and assert every runner stops before its next probe; assert a run with skipped categories never reports pass.',
     followUps: [
@@ -1074,14 +1074,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'sandbox-runner',
     stepId: 'endpoint',
     title: 'The sandbox that leaked its host',
-    blurb: 'The draft allowed undeclared network and ran the default weaker profile.',
+    blurb: 'The patch allowed undeclared network and ran the default weaker profile.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A model-authored job reached the metadata service from the sandbox, because the draft allowed undeclared network access and ran with the default profile when the container start timed out. The same draft re-executed jobs on client retries. Review it, fix it, and prove capabilities are default-deny and isolation is enforced.',
+      'A model-authored job reached the metadata service from the sandbox, because the patch allowed undeclared network access and ran with the default profile when the container start timed out. The same patch re-executed jobs on client retries. Debug it, fix it, and prove capabilities are default-deny and isolation is enforced.',
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      'The draft treats undeclared capabilities as allowed and falls back to the default isolation profile on a container start timeout, so a slow start silently weakens the boundary, and replayed submissions re-execute the job body.',
+      'The patch treats undeclared capabilities as allowed and falls back to the default isolation profile on a container start timeout, so a slow start silently weakens the boundary, and replayed submissions re-execute the job body.',
     testIdea:
       'Submit code that attempts an undeclared network call and assert it is blocked; time out the container start and assert the job fails rather than running with a weaker profile; replay a submit and assert the job runs once.',
     followUps: [
@@ -1100,10 +1100,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A synthetic dataset passed review on total counts while containing ten thousand variants of one seed entity, and judge timeouts were admitted as fine. The model-generated draft throttles no entity and admits unscored records. Review it, fix it, and prove diversity is measured and scoring is complete.',
+      'A synthetic dataset passed review on total counts while containing ten thousand variants of one seed entity, and judge timeouts were admitted as fine. The patch throttles no entity and admits unscored records. Debug it, fix it, and prove diversity is measured and scoring is complete.',
     signals: ['Evaluate', 'Specify', 'Verify'],
     aiNote:
-      'The draft enforces only a global record cap with no per-entity throttle, so a recipe can collapse onto one prolific seed without any metric noticing, and it admits judge-timeout records as likely fine, converting infra flakiness into silent label noise.',
+      'The patch enforces only a global record cap with no per-entity throttle, so a recipe can collapse onto one prolific seed without any metric noticing, and it admits judge-timeout records as likely fine, converting infra flakiness into silent label noise.',
     testIdea:
       'Generate with a single dominant seed entity and assert per-entity limits throttle it; time out the judge and assert the record is parked and counted; trace a sampled admitted record back to its seed digest.',
     followUps: [
@@ -1122,10 +1122,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A compromised page redirected the agent to an internal address and the draft followed it, because only the initial URL was checked. The same draft retried clicks and double-submitted a form. Review it, fix it, and prove every navigation is re-validated and actions are idempotent.',
+      'A compromised page redirected the agent to an internal address and the patch followed it, because only the initial URL was checked. The same patch retried clicks and double-submitted a form. Debug it, fix it, and prove every navigation is re-validated and actions are idempotent.',
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      "The draft validates only the session's start URL and then follows any redirect or subresource the page requests, so a hostile page can reach internal services, and it retries click actions blindly, turning a timeout into a duplicate submission.",
+      "The patch validates only the session's start URL and then follows any redirect or subresource the page requests, so a hostile page can reach internal services, and it retries click actions blindly, turning a timeout into a duplicate submission.",
     testIdea:
       'Serve a redirect to an off-profile address and assert the navigation is blocked and recorded; time out a click and assert the agent checks page state before deciding to retry; inspect an event for typed values.',
     followUps: [
@@ -1141,13 +1141,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The slot that was booked twice',
     blurb: 'Check-then-write holds let two bookings win one slot.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two team members booked the same room for the same hour, because the draft read the slot map, checked it in the handler, and wrote the hold in a separate step. The same draft never expired abandoned holds. Review it, fix it, and prove holds are atomic and expiry works.',
+      'Two team members booked the same room for the same hour, because the patch read the slot map, checked it in the handler, and wrote the hold in a separate step. The same patch never expired abandoned holds. Debug it, fix it, and prove holds are atomic and expiry works.',
     signals: ['Specify', 'Verify', 'Operate'],
     aiNote:
-      'The draft checks slot availability with a read and writes the hold with a later command, so concurrent requests both observe the same free map, and its hold key has no TTL, so an abandoned checkout blocks the slot permanently.',
+      'The patch checks slot availability with a read and writes the hold with a later command, so concurrent requests both observe the same free map, and its hold key has no TTL, so an abandoned checkout blocks the slot permanently.',
     testIdea:
       'Fire two concurrent bookings for one slot and assert exactly one succeeds; abandon a hold and assert it frees after its TTL; reschedule with a replayed key and assert one external calendar event.',
     followUps: [
@@ -1163,13 +1163,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The inventory that went negative',
     blurb: 'Read-check-write let the last unit sell twice.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Flash sale traffic sold the last unit three times over, because the draft read the stock counter, compared in the handler, and decremented after. The same draft released stock on warehouse timeouts. Review it, fix it, and prove the counter transition is atomic and timeouts keep holds.',
+      'Flash sale traffic sold the last unit three times over, because the patch read the stock counter, compared in the handler, and decremented after. The same patch released stock on warehouse timeouts. Debug it, fix it, and prove the counter transition is atomic and timeouts keep holds.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft reads available stock and then decrements in a second step, so concurrent buyers all spot the same free unit, and it releases the hold when the warehouse call times out, destroying a reservation whose confirmation may still arrive.',
+      'The patch reads available stock and then decrements in a second step, so concurrent buyers all spot the same free unit, and it releases the hold when the warehouse call times out, destroying a reservation whose confirmation may still arrive.',
     testIdea:
       'Race two reservations against the last unit and assert one success and a non-negative counter; time out the warehouse and assert the reservation is pending, not released; replay a confirmation and assert the hold releases once.',
     followUps: [
@@ -1185,13 +1185,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The refund that paid twice',
     blurb: 'A retry generated a new PSP idempotency key.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Payments engineer · 20 min',
     minutes: 20,
     prompt:
-      'A customer received two refunds for one return, because the draft generated a fresh idempotency key per PSP attempt and retried after a timeout. The same ledger let two partial refunds pass the same remaining balance. Review it, fix it, and prove retries share a key and the lifetime cap holds.',
+      'A customer received two refunds for one return, because the patch generated a fresh idempotency key per PSP attempt and retried after a timeout. The same ledger let two partial refunds pass the same remaining balance. Debug it, fix it, and prove retries share a key and the lifetime cap holds.',
     signals: ['Verify', 'Specify', 'Operate'],
     aiNote:
-      'The draft creates a new idempotency key for every PSP retry, so the provider sees two independent refunds, and its ledger check-then-add is non-atomic, so two concurrent partial refunds both pass against one remaining balance.',
+      'The patch creates a new idempotency key for every PSP retry, so the provider sees two independent refunds, and its ledger check-then-add is non-atomic, so two concurrent partial refunds both pass against one remaining balance.',
     testIdea:
       'Time out the PSP call and assert the retry carries the same key and the provider records one refund; race two partial refunds that together exceed the balance and assert one is refused; reconcile the read endpoint against PSP records after a crash.',
     followUps: [
@@ -1207,13 +1207,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The search that leaked filters',
     blurb: 'Raw filters hit fields outside the allowlist and caches ignored filters.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Search engineer · 20 min',
     minutes: 20,
     prompt:
-      'A crafted filter string surfaced unpublished products, and a cached unfiltered result set was served to a filtered query. The model-generated draft interpolates filter text into the engine query and caches by raw query string. Review it, fix it, and prove filters are allowlisted and cache keys are complete.',
+      'A crafted filter string surfaced unpublished products, and a cached unfiltered result set was served to a filtered query. The patch interpolates filter text into the engine query and caches by raw query string. Debug it, fix it, and prove filters are allowlisted and cache keys are complete.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft passes caller filter syntax through to the query engine, so fields outside the per-tenant allowlist are addressable, and its cache key omits filters, tenant and index version, so one result set answers queries it never matched.',
+      'The patch passes caller filter syntax through to the query engine, so fields outside the per-tenant allowlist are addressable, and its cache key omits filters, tenant and index version, so one result set answers queries it never matched.',
     testIdea:
       'Send a filter naming a forbidden field and assert 400; cache an unfiltered query then run the filtered version and assert a miss; force a shard timeout and assert partial is marked and duplicates are deduped.',
     followUps: [
@@ -1229,13 +1229,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The session that survived logout',
     blurb: 'Rotation was not atomic and revocation never reached the cache.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A user logged out but their token kept working for an hour, because the draft validated sessions against an hourly cache and extended it on auth-service failure. A crash during rotation also left two live sessions. Review it, fix it, and prove rotation is atomic and revocation is immediate.',
+      'A user logged out but their token kept working for an hour, because the patch validated sessions against an hourly cache and extended it on auth-service failure. A crash during rotation also left two live sessions. Debug it, fix it, and prove rotation is atomic and revocation is immediate.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft caches validation for an hour and fails open when the auth service is unavailable, so a revoked session keeps working, and its rotation writes the replacement before deleting the original in separate commands, so a crash leaves both live.',
+      'The patch caches validation for an hour and fails open when the auth service is unavailable, so a revoked session keeps working, and its rotation writes the replacement before deleting the original in separate commands, so a crash leaves both live.',
     testIdea:
       'Revoke a token and assert requests fail within the cache window; fail the auth service and assert requests are denied; crash between rotation writes and assert exactly one session id remains valid.',
     followUps: [
@@ -1251,13 +1251,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The metrics that counted half a batch',
     blurb: 'Partial batches and full-shard retries corrupted rollups.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      'Dashboards showed traffic dipping every night around deploys, because batch merges were per-sample and a crash applied half a batch, while retries re-sent windows to shards that already accepted them. The model-generated draft has no atomic merge and no window dedupe. Review it, fix it, and prove merges are whole and retries are per-shard.',
+      'Dashboards showed traffic dipping every night around deploys, because batch merges were per-sample and a crash applied half a batch, while retries re-sent windows to shards that already accepted them. The patch has no atomic merge and no window dedupe. Debug it, fix it, and prove merges are whole and retries are per-shard.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft merges each sample with its own INCRBY, so a crash leaves a silently partial batch, and when one shard fails it retries every shard, double-counting windows that already succeeded because nothing dedupes by window id.',
+      'The patch merges each sample with its own INCRBY, so a crash leaves a silently partial batch, and when one shard fails it retries every shard, double-counting windows that already succeeded because nothing dedupes by window id.',
     testIdea:
       'Crash mid-batch and assert the window contains either all deltas or none; fail one shard and assert only it is retried with the same window id; query a 9-day range and assert 400.',
     followUps: [
@@ -1273,13 +1273,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The logs that quietly truncated',
     blurb: 'Oversized records were cut silently and completeness was overclaimed.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      'An incident review found stack traces missing their final frames, because the draft truncated overly long records at 16 KiB with no marker, and the completeness page still said 100 percent. The same buffer had no back-pressure. Review it, fix it, and prove truncation is visible and completeness is honest.',
+      'An incident review found stack traces missing their final frames, because the patch truncated overly long records at 16 KiB with no marker, and the completeness page still said 100 percent. The same buffer had no back-pressure. Debug it, fix it, and prove truncation is visible and completeness is honest.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft truncates records silently, so consumers cannot tell a complete stack trace from a mangled one, and it counts only accepted records toward completeness, so rejected and shed records are invisible in the number.',
+      'The patch truncates records silently, so consumers cannot tell a complete stack trace from a mangled one, and it counts only accepted records toward completeness, so rejected and shed records are invisible in the number.',
     testIdea:
       'Ingest a 20 MiB record and assert the response marks truncation; shed a batch under pressure and assert completeness drops in the report; retry a shard-unavailable write and assert one document, not two.',
     followUps: [
@@ -1295,13 +1295,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The trace that lost a leg',
     blurb: 'Storage timeouts dropped traces and late roots duplicated trees.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      'Traces showed suspiciously fast checkout paths during a storage slowdown, because the draft deleted Redis state before the write confirmed and partial traces were rendered as complete. Late root spans also duplicated trees. Review it, fix it, and prove deletion follows confirmation and gaps are visible.',
+      'Traces showed suspiciously fast checkout paths during a storage slowdown, because the patch deleted Redis state before the write confirmed and partial traces were rendered as complete. Late root spans also duplicated trees. Debug it, fix it, and prove deletion follows confirmation and gaps are visible.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The draft deletes assembly state before storage acknowledges the write, so a timeout erases the only copy, and its non-atomic root recomputation lets a late-arriving root span create a second tree while readers observe the first.',
+      'The patch deletes assembly state before storage acknowledges the write, so a timeout erases the only copy, and its non-atomic root recomputation lets a late-arriving root span create a second tree while readers observe the first.',
     testIdea:
       'Time out storage and assert the trace survives for the next cycle; deliver a root span after children and assert one tree; read a trace with a missing child and assert the partial marker.',
     followUps: [
@@ -1317,13 +1317,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The job that ran at the same time as itself',
     blurb: 'Claims were split across commands and re-enqueues let two workers share a job.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A nightly billing job ran twice concurrently, because a slow worker's visibility timeout re-enqueued the job while the original was still running. A crash mid-claim also lost jobs with no trace. The model-generated draft claims non-atomically. Review it, fix it, and prove claims and returns are atomic.",
+      "A nightly billing job ran twice concurrently, because a slow worker's visibility timeout re-enqueued the job while the original was still running. A crash mid-claim also lost jobs with no trace. The patch claims non-atomically. Debug it, fix it, and prove claims and returns are atomic.",
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The draft moves a job out of the queue and marks it in-flight in separate writes, so a crash between them evaporates the job, and its timeout return is not atomic with the claim check, so a live slow worker and a fresh claimant can both hold the same job.',
+      'The patch moves a job out of the queue and marks it in-flight in separate writes, so a crash between them evaporates the job, and its timeout return is not atomic with the claim check, so a live slow worker and a fresh claimant can both hold the same job.',
     testIdea:
       'Kill a worker between claim steps and assert the job is still claimable; simulate a slow worker past its visibility timeout and assert the job cannot be double-claimed; feed a schema-invalid payload and assert it dead-letters on the first attempt.',
     followUps: [
@@ -1339,13 +1339,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The workflow that sent two welcome emails',
     blurb: 'Effect replays and unconditional checkpoints caused double effects.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A customer got two welcome emails and an order never shipped, because the draft retried a timed-out effect without the ledger and overwrote checkpoints unconditionally. The same run floated to a new definition mid-flight. Review it, fix it, and prove effects are exactly-once under replay.',
+      'A customer got two welcome emails and an order never shipped, because the patch retried a timed-out effect without the ledger and overwrote checkpoints unconditionally. The same run floated to a new definition mid-flight. Debug it, fix it, and prove effects are exactly-once under replay.',
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The draft retries side effects without consulting the effect ledger, so a timeout that actually sent the email sends it again, and it writes checkpoints unconditionally so a duplicate worker advances a run past a step whose effect never ran.',
+      'The patch retries side effects without consulting the effect ledger, so a timeout that actually sent the email sends it again, and it writes checkpoints unconditionally so a duplicate worker advances a run past a step whose effect never ran.',
     testIdea:
       'Crash after effect commit but before checkpoint advance and assert replay skips the effect; run two workers over one run and assert one advance; compare step events against the checkpoint trail for a completed run.',
     followUps: [
@@ -1361,13 +1361,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The job that fired 200 times',
     blurb: 'A scheduler pause was followed by a catch-up burst.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'After a ten-minute scheduler pause, a minutely job fired 200 catch-up executions in seconds and took down its downstream database. The model-generated draft retried each missed window and had no misfire policy. Review it, fix it, and prove misfires are policied, not stormed.',
+      'After a ten-minute scheduler pause, a minutely job fired 200 catch-up executions in seconds and took down its downstream database. The patch retried each missed window and had no misfire policy. Debug it, fix it, and prove misfires are policied, not stormed.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft treats every missed window as owed and fires them all as fast as retries allow, so any scheduler pause converts into a burst against the target, and its last-run check-then-write lets two instances fire one window during a rolling deploy.',
+      'The patch treats every missed window as owed and fires them all as fast as retries allow, so any scheduler pause converts into a burst against the target, and its last-run check-then-write lets two instances fire one window during a rolling deploy.',
     testIdea:
       'Pause the scheduler for ten windows and assert at most one catch-up fire under fire-once; deploy two instances simultaneously and assert one fire per window; assert skipped windows appear in history with their policy.',
     followUps: [
@@ -1383,13 +1383,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The flag that flipped per request',
     blurb: 'Per-flag caches and a keyless hash made rollouts inconsistent.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A canary flag flapped on and off for the same user, because the draft's bucket hash ignored the flag key and its cache updated one flag at a time. A kill switch also took minutes to reach one instance. Review it, fix it, and prove evaluation is deterministic and kill switches land fast.",
+      "A canary flag flapped on and off for the same user, because the patch's bucket hash ignored the flag key and its cache updated one flag at a time. A kill switch also took minutes to reach one instance. Debug it, fix it, and prove evaluation is deterministic and kill switches land fast.",
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft buckets users with a hash that omits the flag key, so every flag applies the identical split and users fall in the same tail everywhere, and it rewrites cache entries per flag so readers observe a torn rule set mid-update; an older snapshot can also overwrite a kill memo with no version ordering.',
+      'The patch buckets users with a hash that omits the flag key, so every flag applies the identical split and users fall in the same tail everywhere, and it rewrites cache entries per flag so readers observe a torn rule set mid-update; an older snapshot can also overwrite a kill memo with no version ordering.',
     testIdea:
       'Evaluate one user ten times across a version change and assert no flip without a rule change; swap a snapshot mid-read and assert every evaluation used one full version; issue a kill switch and assert every instance observes it within the staleness bound.',
     followUps: [
@@ -1405,13 +1405,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The experiment that re-randomized users',
     blurb: 'Editable splits re-bucketed users mid-flight and reports peeked.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Experimentation platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A rollout looked great because an operator shifted traffic mid-experiment, and the final report ignored a metric whose traffic had gone 70/30 instead of 50/50. The model-generated draft recomputes buckets against a mutable salt and never checks sample ratio mismatch. Review it, fix it, and prove assignment is frozen and reports are honest.',
+      'A rollout looked great because an operator shifted traffic mid-experiment, and the final report ignored a metric whose traffic had gone 70/30 instead of 50/50. The patch recomputes buckets against a mutable salt and never checks sample ratio mismatch. Debug it, fix it, and prove assignment is frozen and reports are honest.',
     signals: ['Specify', 'Evaluate', 'Verify'],
     aiNote:
-      'The draft derives buckets from a hash over a salt that changes when splits are edited, so users move between variants mid-experiment and treatment effects are contaminated, and the report happily names a winner on a peek or on a mismatched split.',
+      'The patch derives buckets from a hash over a salt that changes when splits are edited, so users move between variants mid-experiment and treatment effects are contaminated, and the report happily names a winner on a peek or on a mismatched split.',
     testIdea:
       'Edit the split mid-experiment and assert the request is rejected; evaluate one unit before and after a salt change and assert the variant is unchanged; feed 70/30 traffic and assert the winner call is blocked with an SRM caveat.',
     followUps: [
@@ -1430,10 +1430,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'During a model outage, approvals spiked because the draft mapped timeouts to risk zero, and a probe account nudged its own features upward by sending them in the request body. The same case detail exposed full card numbers. Review it, fix it, and prove degradation is rules-based and features are server-side.',
+      'During a model outage, approvals spiked because the patch mapped timeouts to risk zero, and a probe account nudged its own features upward by sending them in the request body. The same case detail exposed full card numbers. Debug it, fix it, and prove degradation is rules-based and features are server-side.',
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      'The draft treats a scoring timeout as risk zero, turning an outage into an approval wave, and it accepts caller-supplied risk features, so the entity being scored can declare itself safe; case detail also leaks full card numbers.',
+      'The patch treats a scoring timeout as risk zero, turning an outage into an approval wave, and it accepts caller-supplied risk features, so the entity being scored can declare itself safe; case detail also leaks full card numbers.',
     testIdea:
       'Time out the model and assert a rules-based score with the fallback marker; send body features and assert the stored score ignores them; inspect a case response for any unmasked card number.',
     followUps: [
@@ -1449,13 +1449,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The KYC that approved on a timeout',
     blurb: 'Timeout meant approved, and document URLs never expired.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Risk platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A burst of auto-approvals hit during a vendor outage, and permanent document URLs were indexed by a search engine after a leak. The model-generated draft maps vendor timeouts to approved and returns unexpiring links. Review it, fix it, and prove failure means humans and links expire.',
+      'A burst of auto-approvals hit during a vendor outage, and permanent document URLs were indexed by a search engine after a leak. The patch maps vendor timeouts to approved and returns unexpiring links. Debug it, fix it, and prove failure means humans and links expire.',
     signals: ['Secure', 'Verify', 'Specify'],
     aiNote:
-      'The draft maps vendor timeouts and errors to approved to protect conversion, creating a path where an outage silently verifies applicants, and its status responses carry permanent document URLs that survive any share.',
+      'The patch maps vendor timeouts and errors to approved to protect conversion, creating a path where an outage silently verifies applicants, and its status responses carry permanent document URLs that survive any share.',
     testIdea:
       'Time out the vendor and assert the case lands in manual review marked degraded; exceed the attempt cap concurrently and assert the sixth attempt is refused atomically; assert a document link expires and cannot be replayed.',
     followUps: [
@@ -1471,13 +1471,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The product that half published',
     blurb: 'Per-field swaps and best-effort renditions tore the page.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Shoppers saw a new price with the old description for a full hour, and one SKU published without its main image because the draft treated renditions as best-effort. The model-generated draft swaps fields into a shared hash. Review it, fix it, and prove publishing is atomic and all-or-nothing.',
+      'Shoppers saw a new price with the old description for a full hour, and one SKU published without its main image because the patch treated renditions as best-effort. The patch swaps fields into a shared hash. Debug it, fix it, and prove publishing is atomic and all-or-nothing.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft applies publish changes field by field into the shared catalog hash, so readers observe a product assembled from two versions, and it declares publish success when one rendition lands, leaving the storefront with missing media.',
+      'The patch applies publish changes field by field into the shared catalog hash, so readers observe a product assembled from two versions, and it declares publish success when one rendition lands, leaving the storefront with missing media.',
     testIdea:
       'Swap a price and title concurrently and read repeatedly to assert every read shows one full version; fail the main rendition and assert the publish is held back; inspect storefront responses for draft fields.',
     followUps: [
@@ -1493,13 +1493,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The load that counted itself done',
     blurb: 'Completion was marked before partitions committed and merges doubled.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A finance table was missing two partitions while the load reported complete, and a retried merge doubled a day of orders. The model-generated draft marks complete at read time and appends on retry. Review it, fix it, and prove completion follows partitions and retries are idempotent.',
+      'A finance table was missing two partitions while the load reported complete, and a retried merge doubled a day of orders. The patch marks complete at read time and appends on retry. Debug it, fix it, and prove completion follows partitions and retries are idempotent.',
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The draft flips the completion flag when the source file is read rather than when the final partition commits, so readers can consume a load that is missing data, and its merge retry re-runs an append, duplicating rows on every timeout.',
+      'The patch flips the completion flag when the source file is read rather than when the final partition commits, so readers can consume a load that is missing data, and its merge retry re-runs an append, duplicating rows on every timeout.',
     testIdea:
       'Crash after reading the manifest and assert the load is not visible as complete; force a merge timeout and assert one row set after the retry; compare reported written counts against the warehouse.',
     followUps: [
@@ -1515,13 +1515,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The stream that skipped a weekend',
     blurb: 'A cursor TTL reset the LSN and batches were skipped under pressure.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "An incident review showed a tenant's changes missing for two days, because the draft stored the LSN with a TTL and skipped failing batches to keep up. The same stream keyed by table, scrambling per-row order. Review it, fix it, and prove the cursor never skips and order holds per row.",
+      "An incident review showed a tenant's changes missing for two days, because the patch stored the LSN with a TTL and skipped failing batches to keep up. The same stream keyed by table, scrambling per-row order. Debug it, fix it, and prove the cursor never skips and order holds per row.",
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The draft keeps the confirmed LSN in an expiring cache key, so a quiet period resets the stream to the source head and the backlog is never delivered, and under lag it skips failed batches and advances the cursor, silently losing changes rather than applying back-pressure.',
+      'The patch keeps the confirmed LSN in an expiring cache key, so a quiet period resets the stream to the source head and the backlog is never delivered, and under lag it skips failed batches and advances the cursor, silently losing changes rather than applying back-pressure.',
     testIdea:
       'Expire the cursor key and assert the subscription halts rather than resuming at the head; fail a mid-stream batch and assert it retries from its first LSN; publish changes to one row and assert consumers see them in order.',
     followUps: [
@@ -1537,13 +1537,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The replica that replayed history',
     blurb: 'Offsets expired and retries applied twice.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'A target region re-applied three months of changes after a quiet period, and a duplicated apply created orphan rows, because the draft stored offsets with a TTL and dropped the change id on some retry paths. Review it, fix it, and prove offsets are durable and applies are idempotent.',
+      'A target region re-applied three months of changes after a quiet period, and a duplicated apply created orphan rows, because the patch stored offsets with a TTL and dropped the change id on some retry paths. Debug it, fix it, and prove offsets are durable and applies are idempotent.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft keeps per-shard offsets in an expiring cache key, so idleness silently rewinds a shard to zero, and its apply retry path omits the change id, so an apply that succeeded before the timeout is applied a second time.',
+      'The patch keeps per-shard offsets in an expiring cache key, so idleness silently rewinds a shard to zero, and its apply retry path omits the change id, so an apply that succeeded before the timeout is applied a second time.',
     testIdea:
       'Expire the offset key and assert replication halts or resumes from the confirmed offset, not zero; time out an apply and assert the retry carries the same change id and the target shows one row; sample digests across regions after a divergence test.',
     followUps: [
@@ -1559,13 +1559,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The purge that never propagated',
     blurb: 'Accepted meant done, and a wildcard purged the whole domain.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Edge infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'A pricing fix stayed broken on some edges for six hours because the draft marked the purge done at provider acceptance, and a normal-token wildcard purge hammered the origin into an outage. Review it, fix it, and prove status is honest and blast radius is gated.',
+      'A pricing fix stayed broken on some edges for six hours because the patch marked the purge done at provider acceptance, and a normal-token wildcard purge hammered the origin into an outage. Debug it, fix it, and prove status is honest and blast radius is gated.',
     signals: ['Operate', 'Verify', 'Secure'],
     aiNote:
-      'The draft reports done when the provider accepts the request, so propagation failures are invisible and on-call believes the cache is clean, and it lets a normal token request a domain-wide wildcard, turning one request into an origin stampede.',
+      'The patch reports done when the provider accepts the request, so propagation failures are invisible and on-call believes the cache is clean, and it lets a normal token request a domain-wide wildcard, turning one request into an origin stampede.',
     testIdea:
       'Return partial failure from the provider and assert the status reports partially failed with paths; request a wildcard with a normal token and assert 403; retry a purge with the same key and assert the provider is called once.',
     followUps: [
@@ -1581,13 +1581,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The discovery that routed to ghosts',
     blurb: 'Expired instances stayed routable and deploy swaps collided.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Infrastructure engineer · 20 min',
     minutes: 20,
     prompt:
-      'Traffic kept landing on dead instances for minutes after a crash, and a deploy briefly had two instances claiming the same identity with different metadata. The model-generated draft refreshes TTL without metadata and returns instances by registration rather than health. Review it, fix it, and prove membership is heartbeat- and health-true.',
+      'Traffic kept landing on dead instances for minutes after a crash, and a deploy briefly had two instances claiming the same identity with different metadata. The patch refreshes TTL without metadata and returns instances by registration rather than health. Debug it, fix it, and prove membership is heartbeat- and health-true.',
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      "The draft renews a heartbeat with a bare EXPIRE, so a replaced instance's stale metadata lives on as long as anything renews it, and it registers the replacement before deregistering the original, so two addresses occupy one identity during a deploy window.",
+      "The patch renews a heartbeat with a bare EXPIRE, so a replaced instance's stale metadata lives on as long as anything renews it, and it registers the replacement before deregistering the original, so two addresses occupy one identity during a deploy window.",
     testIdea:
       'Stop heartbeats and assert the instance leaves the routable set within the interval bound; register a replacement while the old one is live and assert one address per identity; probe-fail an instance and assert it is excluded and later readmitted.',
     followUps: [
@@ -1603,13 +1603,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The email that ignored an unsubscribe',
     blurb: 'Suppression expired and hard bounces were retried.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Messaging platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A customer who unsubscribed received three more campaigns, because the draft kept suppression in an expiring cache, and a hard bounce was retried for a week. A timeout resend delivered duplicates with a fresh message id. Review it, fix it, and prove suppression is durable and retries are idempotent.',
+      'A customer who unsubscribed received three more campaigns, because the patch kept suppression in an expiring cache, and a hard bounce was retried for a week. A timeout resend delivered duplicates with a fresh message id. Debug it, fix it, and prove suppression is durable and retries are idempotent.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The draft keeps suppression in a TTL cache, so an unsubscribe is forgotten after an hour, and it retries hard bounces and resends after timeouts under a new message id, delivering duplicates and ignoring terminal signals.',
+      'The patch keeps suppression in a TTL cache, so an unsubscribe is forgotten after an hour, and it retries hard bounces and resends after timeouts under a new message id, delivering duplicates and ignoring terminal signals.',
     testIdea:
       'Suppress a recipient and assert sends are refused after the cache TTL; return a hard bounce and assert exactly one relay attempt; time out a relay and assert the reconciliation uses the original message id.',
     followUps: [
@@ -1625,13 +1625,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The invite that would not stop',
     blurb: 'Infinite recurrence and fresh idempotency tokens per retry.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'One badly formed RRULE consumed an entire calendar worker for an hour, and a timezone correction re-invited 400 attendees who all responded again because retries used fresh tokens. The model-generated draft ignores unknown rule parts. Review it, fix it, and prove expansion terminates and notifications are idempotent.',
+      'One badly formed RRULE consumed an entire calendar worker for an hour, and a timezone correction re-invited 400 attendees who all responded again because retries used fresh tokens. The patch ignores unknown rule parts. Debug it, fix it, and prove expansion terminates and notifications are idempotent.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft accepts recurrence rules with no terminating condition and unknown parts silently dropped, so one tenant can create an expansion that never ends, and its notification retries mint new idempotency tokens, so a single update fans out into duplicate invites.',
+      'The patch accepts recurrence rules with no terminating condition and unknown parts silently dropped, so one tenant can create an expansion that never ends, and its notification retries mint new idempotency tokens, so a single update fans out into duplicate invites.',
     testIdea:
       'Submit FREQ=SECONDLY with no end and assert 422; retry a notification and assert one invite per attendee; change only the timezone and assert no full re-invite is sent.',
     followUps: [
@@ -1647,13 +1647,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The upload that grieved the quota',
     blurb: 'Bytes were counted before storage and whole restarts re-sent everything.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Storage engineer · 20 min',
     minutes: 20,
     prompt:
-      "A tenant's quota filled with data that never landed because the draft counted chunks before they were stored, and a flaky connection cost a multi-gigabyte re-upload per failed chunk. The model-generated draft also returned a permanent file URL. Review it, fix it, and prove accounting follows storage and retries are chunk-scoped.",
+      "A tenant's quota filled with data that never landed because the patch counted chunks before they were stored, and a flaky connection cost a multi-gigabyte re-upload per failed chunk. The patch also returned a permanent file URL. Debug it, fix it, and prove accounting follows storage and retries are chunk-scoped.",
     signals: ['Operate', 'Specify', 'Verify'],
     aiNote:
-      'The draft increments quota when a chunk is acknowledged rather than when it is stored, so crash loops consume quota for bytes that do not exist, and its retry path restarts the entire multipart upload instead of the failed chunk.',
+      'The patch increments quota when a chunk is acknowledged rather than when it is stored, so crash loops consume quota for bytes that do not exist, and its retry path restarts the entire multipart upload instead of the failed chunk.',
     testIdea:
       'Crash a chunk after ack and assert quota reflects stored bytes only; fail one chunk and assert the retry re-sends only that chunk; assert a download URL is dead after 10 minutes and that issuance is audited.',
     followUps: [
@@ -1669,13 +1669,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The sync that ate a day of work',
     blurb: 'Stale bases overwrote edits and merges picked winners.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A laptop returned from a long weekend and its push overwrote a week of edits from another device, because the draft ignored the base revision and resolved merge failures last-write-wins. The same cursor advanced before apply, losing its own batch on a crash. Review it, fix it, and prove conflicts are surfaced and cursors follow apply.',
+      'A laptop returned from a long weekend and its push overwrote a week of edits from another device, because the patch ignored the base revision and resolved merge failures last-write-wins. The same cursor advanced before apply, losing its own batch on a crash. Debug it, fix it, and prove conflicts are surfaced and cursors follow apply.',
     signals: ['Verify', 'Specify', 'Operate'],
     aiNote:
-      "The draft applies pushes without checking the base revision against the server's history, so an arbitrarily stale client overwrites newer state, and it resolves merge timeouts with last-write-wins, converting infrastructure failure into silent data loss.",
+      "The patch applies pushes without checking the base revision against the server's history, so an arbitrarily stale client overwrites newer state, and it resolves merge timeouts with last-write-wins, converting infrastructure failure into silent data loss.",
     testIdea:
       'Push with a month-old base and assert per-document conflicts, not overwrites; crash between apply and cursor advance and assert the batch is re-sent; hit the pull cap and assert the watermark covers exactly the returned entries.',
     followUps: [
@@ -1691,13 +1691,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The thread that showed one comment twice',
     blurb: 'Offset pagination and a cache key without the tenant.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      "Users saw the same comment twice and missed another while scrolling a busy thread, and one tenant's trending list leaked into a second tenant's homepage because the cache key was unscoped. The draft counts comments after the write. Review it, fix it, and prove pagination is stable and caches are scoped.",
+      "Users saw the same comment twice and missed another while scrolling a busy thread, and one tenant's trending list leaked into a second tenant's homepage because the cache key was unscoped. The patch counts comments after the write. Debug it, fix it, and prove pagination is stable and caches are scoped.",
     signals: ['Specify', 'Verify', 'Secure'],
     aiNote:
-      "The draft paginates by offset, so concurrent inserts shift the window and comments are duplicated or skipped mid-scroll, and its hot-thread cache key omits the tenant, letting one tenant's trends surface in another tenant's feed.",
+      "The patch paginates by offset, so concurrent inserts shift the window and comments are duplicated or skipped mid-scroll, and its hot-thread cache key omits the tenant, letting one tenant's trends surface in another tenant's feed.",
     testIdea:
       'Page through a thread while concurrently posting and assert every comment appears exactly once; increment across a crash and assert the counter reconciles with the store; warm a hot thread for tenant A and assert tenant B sees its own list.',
     followUps: [
@@ -1713,13 +1713,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The change that charged two plans in one day',
     blurb: 'Proration double-billed the switch day and retries re-charged.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Payments engineer · 20 min',
     minutes: 20,
     prompt:
-      'A plan change on the 31st billed both plans for that day, and a processor timeout retry created a second charge under a fresh idempotency key. The billing run also charged before recording its marker. Review it, fix it, and prove proration is exclusive and charging is idempotent.',
+      'A plan change on the 31st billed both plans for that day, and a processor timeout retry created a second charge under a fresh idempotency key. The billing run also charged before recording its marker. Debug it, fix it, and prove proration is exclusive and charging is idempotent.',
     signals: ['Specify', 'Verify', 'Operate'],
     aiNote:
-      'The draft prorates with a fixed 30-day divisor and charges both plans on the switch day, and its billing run charges before claiming its idempotency marker and retries timeouts under fresh keys, so retries can double-charge.',
+      'The patch prorates with a fixed 30-day divisor and charges both plans on the switch day, and its billing run charges before claiming its idempotency marker and retries timeouts under fresh keys, so retries can double-charge.',
     testIdea:
       'Change plans mid-month and assert the two line amounts sum to exactly one month; crash between charge and marker and assert the retry run does not charge again; time out a charge and assert reconciliation precedes any retry.',
     followUps: [
@@ -1735,13 +1735,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The ticket that two agents answered',
     blurb: 'Assignment races and duplicated CRM notes.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two agents answered the same ticket simultaneously because the draft assigned with a plain SET, and each answer landed twice in the CRM because sync retries used fresh keys. The same read exposed internal notes to the customer. Review it, fix it, and prove assignment is exclusive, sync is idempotent and visibility holds.',
+      'Two agents answered the same ticket simultaneously because the patch assigned with a plain SET, and each answer landed twice in the CRM because sync retries used fresh keys. The same read exposed internal notes to the customer. Debug it, fix it, and prove assignment is exclusive, sync is idempotent and visibility holds.',
     signals: ['Operate', 'Secure', 'Verify'],
     aiNote:
-      'The draft marks assignment with a non-atomic SET so both agents believe they own the ticket, and its CRM sync creates a new note per retry instead of keying by note id, duplicating replies; timeline reads ignore requester visibility.',
+      'The patch marks assignment with a non-atomic SET so both agents believe they own the ticket, and its CRM sync creates a new note per retry instead of keying by note id, duplicating replies; timeline reads ignore requester visibility.',
     testIdea:
       'Race two agent claims and assert one lease; retry a CRM sync three times and assert one CRM note; fetch a ticket as a requester and assert no internal notes appear.',
     followUps: [
@@ -1757,13 +1757,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The form that delivered one lead twice',
     blurb: 'Fresh idempotency keys and raw HTML in fields.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A marketing CRM received duplicate leads after webhook retries produced new keys, and a stored HTML field rendered as script on the admin dashboard. The captcha token was also replayable. Review it, fix it, and prove delivery is keyed and inputs are inert.',
+      'A marketing CRM received duplicate leads after webhook retries produced new keys, and a stored HTML field rendered as script on the admin dashboard. The captcha token was also replayable. Debug it, fix it, and prove delivery is keyed and inputs are inert.',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
-      'The draft retries each handler under a fresh idempotency key, so downstream systems create duplicate records, and it stores raw markup that the admin UI renders, turning a public form into a stored-XSS vector; captcha consumption is non-atomic.',
+      'The patch retries each handler under a fresh idempotency key, so downstream systems create duplicate records, and it stores raw markup that the admin UI renders, turning a public form into a stored-XSS vector; captcha consumption is non-atomic.',
     testIdea:
       'Replay a submission and assert the handler is invoked once per key; submit script markup and assert it renders inert in the admin view; race two captcha replays and assert one is rejected.',
     followUps: [
@@ -1779,13 +1779,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The approval that approved itself',
     blurb: 'The requester named their own approvers and states advanced twice.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      "A spend request was approved by the requester's own account because the draft accepted caller-named approvers, and one approver's double-click advanced two steps of the chain. Review it, fix it, and prove approvers come from policy and one decision moves one step.",
+      "A spend request was approved by the requester's own account because the patch accepted caller-named approvers, and one approver's double-click advanced two steps of the chain. Debug it, fix it, and prove approvers come from policy and one decision moves one step.",
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The draft resolves approvers from the request body instead of the pinned policy, so a requester can name a friendly or themselves, and its advance logic accepts any approval item from a list, so a duplicated decision skips a step entirely.',
+      'The patch resolves approvers from the request body instead of the pinned policy, so a requester can name a friendly or themselves, and its advance logic accepts any approval item from a list, so a duplicated decision skips a step entirely.',
     testIdea:
       'Submit with caller-named approvers and assert policy resolution overrides them; double-decide as one approver and assert the chain advances one step; time out eligibility and assert the decision is denied.',
     followUps: [
@@ -1801,13 +1801,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The route that survived rush hour',
     blurb: 'Cache keys lacked the traffic epoch and fallbacks served stale routes.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Navigation kept recommending a highway exit that had been closed for hours, because the draft cached routes without a traffic epoch and served an old route whenever the engine timed out. The same cache never hit on raw float coordinates. Review it, fix it, and prove cache freshness and honest degradation.',
+      'Navigation kept recommending a highway exit that had been closed for hours, because the patch cached routes without a traffic epoch and served an old route whenever the engine timed out. The same cache never hit on raw float coordinates. Debug it, fix it, and prove cache freshness and honest degradation.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft builds cache keys from raw floating-point coordinates so hits essentially never occur, while the entries that do exist omit any traffic epoch, so once a key matches it serves an arbitrarily old route as current; engine timeouts are answered with those stale routes and no marker.',
+      'The patch builds cache keys from raw floating-point coordinates so hits essentially never occur, while the entries that do exist omit any traffic epoch, so once a key matches it serves an arbitrarily old route as current; engine timeouts are answered with those stale routes and no marker.',
     testIdea:
       'Compute the same route twice with a tiny coordinate difference and assert a hit with cell rounding; advance the epoch and assert recomputation; time out the engine and assert a marked degraded estimate, not a cached route.',
     followUps: [
@@ -1823,13 +1823,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The car that teleported backward',
     blurb: 'Last-write-wins updates and dropped geofence checks.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'The dispatch map showed a truck six blocks behind its actual position, because a delayed cellular update wrote last and won, and a warehouse geofence alert never fired when the check call timed out. Review it, fix it, and prove positions compare by timestamp and alerts cannot be lost or doubled.',
+      'The dispatch map showed a truck six blocks behind its actual position, because a delayed cellular update wrote last and won, and a warehouse geofence alert never fired when the check call timed out. Debug it, fix it, and prove positions compare by timestamp and alerts cannot be lost or doubled.',
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      "The draft writes the latest-arriving position regardless of its timestamp, so delayed packets roll a vehicle's state backward, and it drops geofence checks on timeout, then retries them under fresh keys so a generated alert can duplicate.",
+      "The patch writes the latest-arriving position regardless of its timestamp, so delayed packets roll a vehicle's state backward, and it drops geofence checks on timeout, then retries them under fresh keys so a generated alert can duplicate.",
     testIdea:
       'Deliver a new position then a delayed older one and assert the newer state stands; time out a geofence check and assert it retries under the same sequence key; check the snapshot freshness bound across lazily refreshed vehicles.',
     followUps: [
@@ -1845,13 +1845,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The telemetry that scaled a graph to zero',
     blurb: 'Wild values and double-counted retries poisoned rollups.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Observability engineer · 20 min',
     minutes: 20,
     prompt:
-      "A dashboard metric collapsed to zero after one device sent a 64-bit overflow value, and retried batches doubled a fleet's totals because the store had no batch dedupe. The draft validates nothing before acking. Review it, fix it, and prove validation precedes acks and retries are batch-scoped.",
+      "A dashboard metric collapsed to zero after one device sent a 64-bit overflow value, and retried batches doubled a fleet's totals because the store had no batch dedupe. The patch validates nothing before acking. Debug it, fix it, and prove validation precedes acks and retries are batch-scoped.",
     signals: ['Verify', 'Specify', 'Operate'],
     aiNote:
-      'The draft acknowledges batches before validating, so out-of-range values and unknown devices are silently absorbed into aggregates that then look plausible, and on a partial store failure it re-sends the whole batch, double-counting the points that already landed.',
+      'The patch acknowledges batches before validating, so out-of-range values and unknown devices are silently absorbed into aggregates that then look plausible, and on a partial store failure it re-sends the whole batch, double-counting the points that already landed.',
     testIdea:
       'Send an out-of-range reading and assert the batch is rejected with the metric named; fail one sub-batch and assert only it is retried under the same batch id; query a 3-day range and assert 400.',
     followUps: [
@@ -1867,13 +1867,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The door that unlocked twice',
     blurb: 'Replayed commands and shadow overwrites.',
-    role: 'AI platform engineer · 20 min',
+    role: 'IoT platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "One unlock command executed twice after a gateway retry repeated it, and a device reporting its old configuration erased an operator's settings change. An offline device was also hammered with retries for days. Review it, fix it, and prove command identity and shadow versions hold.",
+      "One unlock command executed twice after a gateway retry repeated it, and a device reporting its old configuration erased an operator's settings change. An offline device was also hammered with retries for days. Debug it, fix it, and prove command identity and shadow versions hold.",
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      "The draft discards the command's idempotency id, so a retried delivery re-executes side effects like unlocking a door, and it overwrites the desired document with whatever the device reports, so intent is silently reverted instead of flagging divergence.",
+      "The patch discards the command's idempotency id, so a retried delivery re-executes side effects like unlocking a door, and it overwrites the desired document with whatever the device reports, so intent is silently reverted instead of flagging divergence.",
     testIdea:
       'Replay one command id and assert one execution; report a stale device version and assert desired survives with divergence listed; leave a device offline past its window and assert the queue drops the command rather than retrying forever.',
     followUps: [
@@ -1889,13 +1889,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The player who was in two games',
     blurb: 'Ticket claims were not atomic and failures stranded tickets.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Game backend engineer · 20 min',
     minutes: 20,
     prompt:
-      "A player spawned into two matches simultaneously, because the draft claimed tickets one at a time and a retry rebuilt a roster from the same pool, and a failed server allocation left a whole roster's tickets claimed forever. Review it, fix it, and prove claims are all-or-nothing and releases are certain.",
+      "A player spawned into two matches simultaneously, because the patch claimed tickets one at a time and a retry rebuilt a roster from the same pool, and a failed server allocation left a whole roster's tickets claimed forever. Debug it, fix it, and prove claims are all-or-nothing and releases are certain.",
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The draft claims tickets sequentially, so a mid-claim failure or a concurrent matchmaker leaves one player in two rosters, and a failed allocation never releases the claimed tickets, stranding players in a queue position that no longer exists.',
+      'The patch claims tickets sequentially, so a mid-claim failure or a concurrent matchmaker leaves one player in two rosters, and a failed allocation never releases the claimed tickets, stranding players in a queue position that no longer exists.',
     testIdea:
       'Race two matchmakers over an overlapping pool and assert no player appears twice; fail allocation and assert every participant ticket returns to the pool and can be matched again; count pool depth against the ticket set.',
     followUps: [
@@ -1911,13 +1911,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The video with a hole at minute nine',
     blurb: 'Segments were marked done before encoding and corrupt input retried forever.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Media platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A finished video glitched at minute nine, because the draft marked a segment done before its encode returned and the crashed worker was never retried, while a corrupt segment elsewhere looped the job for hours. Review it, fix it, and prove completion follows encoding and failures classify.',
+      'A finished video glitched at minute nine, because the patch marked a segment done before its encode returned and the crashed worker was never retried, while a corrupt segment elsewhere looped the job for hours. Debug it, fix it, and prove completion follows encoding and failures classify.',
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The draft marks segments complete when they are claimed rather than when the encode returns, so a worker crash leaves a hole that the manifest still reports as full, and it retries corrupt input indefinitely instead of classifying it as terminal.',
+      'The patch marks segments complete when they are claimed rather than when the encode returns, so a worker crash leaves a hole that the manifest still reports as full, and it retries corrupt input indefinitely instead of classifying it as terminal.',
     testIdea:
       'Kill a worker mid-segment and assert the segment is re-encoded and the manifest is gapless; corrupt one input segment and assert the job fails with that index after bounded attempts; replay a submit and assert one job.',
     followUps: [
@@ -1933,13 +1933,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The search box that suggested a person',
     blurb: 'Raw prefixes got cached and one-off queries trended.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Search engineer · 20 min',
     minutes: 20,
     prompt:
-      "A private individual's name appeared in autocomplete after one search and then stayed cached, because the draft cached raw prefixes forever and promoted single-occurrence queries as trends. The same endpoint returned thousands of matches for long prefixes. Review it, fix it, and prove caches are capped and trends have floors.",
+      "A private individual's name appeared in autocomplete after one search and then stayed cached, because the patch cached raw prefixes forever and promoted single-occurrence queries as trends. The same endpoint returned thousands of matches for long prefixes. Debug it, fix it, and prove caches are capped and trends have floors.",
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft caches every prefix with no TTL or cap, so a single sensitive query becomes a permanent suggestion, and the trending path has no occurrence floor or sensitive-category filter, turning one search into a global trend.',
+      'The patch caches every prefix with no TTL or cap, so a single sensitive query becomes a permanent suggestion, and the trending path has no occurrence floor or sensitive-category filter, turning one search into a global trend.',
     testIdea:
       'Walk ten thousand distinct prefixes and assert the cache cap evicts oldest while memory stays bounded; search a one-off term and assert it never trends without the floor; assert a cached prefix expires with its TTL.',
     followUps: [
@@ -1955,13 +1955,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The duplicate that crossed a tenant boundary',
     blurb: 'A global similarity index leaked and weak pairs bridged clusters.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A tenant's dedupe check confirmed that another tenant held the same customer record, and two unrelated records merged because one weak pair bridged them. The draft checks membership and insert non-atomically. Review it, fix it, and prove comparison stays in-tenant and merges carry evidence.",
+      "A tenant's dedupe check confirmed that another tenant held the same customer record, and two unrelated records merged because one weak pair bridged them. The patch checks membership and insert non-atomically. Debug it, fix it, and prove comparison stays in-tenant and merges carry evidence.",
     signals: ['Secure', 'Verify', 'Specify'],
     aiNote:
-      'The draft runs fuzzy comparisons against a global index, so a check can confirm whether another tenant holds the same record and even name it, and it unions clusters transitively through any weak pair, letting low-confidence links collapse unrelated groups.',
+      'The patch runs fuzzy comparisons against a global index, so a check can confirm whether another tenant holds the same record and even name it, and it unions clusters transitively through any weak pair, letting low-confidence links collapse unrelated groups.',
     testIdea:
       'Check a record that exists for another tenant and assert a miss; build A-B strong and B-C weak and assert A and C never share a cluster without review; race two identical submissions and assert one winner.',
     followUps: [
@@ -1977,13 +1977,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The deploy that broke on rotation day',
     blurb: 'The old version was retired before consumers verified.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Security engineer · 20 min',
     minutes: 20,
     prompt:
-      'A rotation took down checkout for eleven minutes: the draft invalidated the old key the instant the new one activated, and a service that had cached the old material kept failing until it redeployed. An audit line also carried the new material in plaintext. Review it, fix it, and prove overlap and verification gate retirement.',
+      'A rotation took down checkout for eleven minutes: the patch invalidated the old key the instant the new one activated, and a service that had cached the old material kept failing until it redeployed. An audit line also carried the new material in plaintext. Debug it, fix it, and prove overlap and verification gate retirement.',
     signals: ['Operate', 'Secure', 'Verify'],
     aiNote:
-      'The draft invalidates the previous version at the same moment it activates the new one, leaving no overlap for consumers holding the old version, and its retirement path treats an unverified consumer as acceptable, so a fleet mid-deploy loses the ability to decrypt with no alert.',
+      'The patch invalidates the previous version at the same moment it activates the new one, leaving no overlap for consumers holding the old version, and its retirement path treats an unverified consumer as acceptable, so a fleet mid-deploy loses the ability to decrypt with no alert.',
     testIdea:
       'Activate a new version and assert the old one still decrypts until every registered consumer confirms the new one; simulate an unresponsive consumer and assert retirement is blocked with an alert; grep responses and logs for material.',
     followUps: [
@@ -1999,13 +1999,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The email that became two accounts',
     blurb: 'No normalization and an auto-verify path.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Identity engineer · 20 min',
     minutes: 20,
     prompt:
-      'One person ended up with two accounts because the draft compared raw email strings, and a third signup was auto-verified after the provider timed out, letting an unowned address login. Signup retries also kept creating accounts. Review it, fix it, and prove uniqueness and deliberate verification.',
+      'One person ended up with two accounts because the patch compared raw email strings, and a third signup was auto-verified after the provider timed out, letting an unowned address login. Signup retries also kept creating accounts. Debug it, fix it, and prove uniqueness and deliberate verification.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft compares raw address strings so case and alias variants become separate identities, and it marks accounts verified when the verification provider times out, converting a provider outage into a way to claim addresses that were never proven owned.',
+      'The patch compares raw address strings so case and alias variants become separate identities, and it marks accounts verified when the verification provider times out, converting a provider outage into a way to claim addresses that were never proven owned.',
     testIdea:
       'Sign up as Alice@x.com then alice@x.com and assert one account; time out the verification provider and assert the account stays unverified and cannot log in; replay a signup and assert the original user id.',
     followUps: [
@@ -2021,13 +2021,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The permission that survived revocation',
     blurb: 'Delete-after-write cache invalidation resurrected revoked grants.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Security engineer · 20 min',
     minutes: 20,
     prompt:
-      'A removed contractor kept access for twenty minutes because a concurrent read repopulated the permission cache after the draft deleted it. The same service failed open on policy-engine timeouts and let team admins grant org-wide roles. Review it, fix it, and prove revocation is immediate and grants cannot escalate.',
+      'A removed contractor kept access for twenty minutes because a concurrent read repopulated the permission cache after the patch deleted it. The same service failed open on policy-engine timeouts and let team admins grant org-wide roles. Debug it, fix it, and prove revocation is immediate and grants cannot escalate.',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
-      'The draft invalidates the cache by deleting keys after a grant change, so a racing read can re-derive and store the pre-change set, and it falls back to cached allow when the policy engine times out, turning an outage into broad access.',
+      'The patch invalidates the cache by deleting keys after a grant change, so a racing read can re-derive and store the pre-change set, and it falls back to cached allow when the policy engine times out, turning an outage into broad access.',
     testIdea:
       "Revoke a permission and immediately call the same check on another connection and assert denial; time out the policy engine and assert denial; attempt a grant exceeding the assigner's permissions and assert 403.",
     followUps: [
@@ -2043,13 +2043,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The gateway that double-billed every retry',
     blurb: 'Retries counted twice and close ids re-minted.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Billing platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A customer's invoice showed twice their traffic, because the draft counted every gateway retry and then re-closed the billing period under a fresh close id. A crash also silently dropped the last minute of usage. Review it, fix it, and prove counts and closes are idempotent.",
+      "A customer's invoice showed twice their traffic, because the patch counted every gateway retry and then re-closed the billing period under a fresh close id. A crash also silently dropped the last minute of usage. Debug it, fix it, and prove counts and closes are idempotent.",
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The draft has no request-id dedupe, so gateway retries inflate usage, and its period close mints a new id per attempt, so a retry after a timeout can bill a period that already closed under a different id.',
+      'The patch has no request-id dedupe, so gateway retries inflate usage, and its period close mints a new id per attempt, so a retry after a timeout can bill a period that already closed under a different id.',
     testIdea:
       'Replay a usage report three times and assert one count; time out the billing flush and assert the period stays open and the retry reuses the close id; crash between response and count and assert the record and counter agree after recovery.',
     followUps: [
@@ -2065,13 +2065,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The upload that restarted from zero',
     blurb: 'Parts were marked stored before verification and the manifest double-counted.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Storage engineer · 20 min',
     minutes: 20,
     prompt:
-      "A mobile client on a flaky network re-uploaded an entire multi-gigabyte file after one part failed, because the draft's resume endpoint returned only a percentage and the client had no choice. A double-registered part also inflated the byte accounting. Review it, fix it, and prove resume is part-exact.",
+      "A mobile client on a flaky network re-uploaded an entire multi-gigabyte file after one part failed, because the patch's resume endpoint returned only a percentage and the client had no choice. A double-registered part also inflated the byte accounting. Debug it, fix it, and prove resume is part-exact.",
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The draft marks each part stored when the store accepts the write, not when the checksum verifies, so corruption is found at finalize and costs a full re-upload, and its non-idempotent manifest registration lets a re-sent part inflate the byte count.',
+      'The patch marks each part stored when the store accepts the write, not when the checksum verifies, so corruption is found at finalize and costs a full re-upload, and its non-idempotent manifest registration lets a re-sent part inflate the byte count.',
     testIdea:
       'Fail one part and assert only it is missing from the resume list; re-register the same part and assert the manifest bytes are unchanged; mark a part stored and then corrupt it and assert finalize fails with the part named.',
     followUps: [
@@ -2087,13 +2087,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The invoice that changed after it was paid',
     blurb: 'Finalized invoices were editable and tax timeouts issued zeros.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Payments engineer · 20 min',
     minutes: 20,
     prompt:
-      'An auditor found a paid invoice whose line items had been edited weeks later, and a batch of invoices had been issued with zero tax during a tax-service outage. Retried finalizes also minted duplicate invoices. Review it, fix it, and prove finals are immutable and tax gates. ',
+      'An auditor found a paid invoice whose line items had been edited weeks later, and a batch of invoices had been issued with zero tax during a tax-service outage. Retried finalizes also minted duplicate invoices. Debug it, fix it, and prove finals are immutable and tax gates. ',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
-      'The draft treats finalize as a state label rather than a lock, so updates still land on issued invoices and invalidate every downstream reconciliation, and it substitutes tax zero on timeout instead of holding, quietly under-charging in a way nobody reconciles.',
+      'The patch treats finalize as a state label rather than a lock, so updates still land on issued invoices and invalidate every downstream reconciliation, and it substitutes tax zero on timeout instead of holding, quietly under-charging in a way nobody reconciles.',
     testIdea:
       'Attempt to update a finalized invoice and assert 409; time out the tax call and assert finalize holds with a marker; replay finalize and assert one invoice and one number.',
     followUps: [
@@ -2109,13 +2109,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The package that un-delivered itself',
     blurb: 'Polls applied stale states and failures looked healthy.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Logistics backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A delivered shipment flipped back to in transit because a delayed carrier scan arrived after the delivery scan, and a truly stuck shipment looked in transit for days because the draft treated poll failures as no news. Review it, fix it, and prove transitions are monotonic and staleness is visible.',
+      'A delivered shipment flipped back to in transit because a delayed carrier scan arrived after the delivery scan, and a truly stuck shipment looked in transit for days because the patch treated poll failures as no news. Debug it, fix it, and prove transitions are monotonic and staleness is visible.',
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The draft writes whatever status the latest poll returns, so an out-of-order scan can regress a terminal shipment, and it maps poll failures to the previous status without any staleness marker, so a stalled carrier feed is invisible.',
+      'The patch writes whatever status the latest poll returns, so an out-of-order scan can regress a terminal shipment, and it maps poll failures to the previous status without any staleness marker, so a stalled carrier feed is invisible.',
     testIdea:
       'Deliver a shipment then deliver an older in-transit scan and assert the state stays delivered; fail carrier polls for an hour and assert the shipment surfaces as stale; attempt a second active shipment and assert 409.',
     followUps: [
@@ -2131,13 +2131,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The return that over-refunded a line',
     blurb: 'Non-atomic eligibility and auto-refund on timeouts.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'One order line was returned three times over because eligibility was checked and decremented in separate steps, and a warehouse outage refunded claims that were later graded unsellable. The draft also showed pending refunds as complete. Review it, fix it, and prove returns are counted and refunds are gated.',
+      'One order line was returned three times over because eligibility was checked and decremented in separate steps, and a warehouse outage refunded claims that were later graded unsellable. The patch also showed pending refunds as complete. Debug it, fix it, and prove returns are counted and refunds are gated.',
     signals: ['Verify', 'Operate', 'Secure'],
     aiNote:
-      'The draft reads remaining returnable quantity and registers the return in two steps, so concurrent returns overdraw the line, and it refunds on inspection timeouts, converting warehouse outages into automatic payouts for unverified claims.',
+      'The patch reads remaining returnable quantity and registers the return in two steps, so concurrent returns overdraw the line, and it refunds on inspection timeouts, converting warehouse outages into automatic payouts for unverified claims.',
     testIdea:
       'Race two returns against the last unit and assert one succeeds; time out inspection and assert the refund holds as awaiting inspection; move a refund to failed and assert the state does not read refunded.',
     followUps: [
@@ -2153,13 +2153,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The ad that followed one user everywhere',
     blurb: 'Frequency caps were not enforced and impressions counted at serve.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Ads platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'One user saw the same campaign on every page for an hour, and the advertiser was billed for impressions on pages the ad never rendered. The draft also served exhausted budgets during a burst. Review it, fix it, and prove caps, budget and counting are truthful.',
+      'One user saw the same campaign on every page for an hour, and the advertiser was billed for impressions on pages the ad never rendered. The patch also served exhausted budgets during a burst. Debug it, fix it, and prove caps, budget and counting are truthful.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft ignores frequency caps when ranking, so the highest bidder can saturate one user, and it counts an impression when the ad is served rather than when a render beacon confirms display, billing for ads that were never seen.',
+      'The patch ignores frequency caps when ranking, so the highest bidder can saturate one user, and it counts an impression when the ad is served rather than when a render beacon confirms display, billing for ads that were never seen.',
     testIdea:
       'Serve one user fifty times and assert the capped campaign stops appearing after the cap; exhaust a budget and assert no serve under a burst; drop a render beacon and assert no impression is counted.',
     followUps: [
@@ -2175,13 +2175,13 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'endpoint',
     title: 'The bidder that was always late',
     blurb: 'No deadline propagation and unreleased cap claims.',
-    role: 'AI platform engineer · 20 min',
+    role: 'Ads platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A bidder won almost nothing while looking healthy in dashboards, because bids arrived after auctions closed and losses were never counted; the same draft exhausted daily caps by never releasing claims on losses. Review it, fix it, and prove deadlines and claims are enforced.',
+      'A bidder won almost nothing while looking healthy in dashboards, because bids arrived after auctions closed and losses were never counted; the same patch exhausted daily caps by never releasing claims on losses. Debug it, fix it, and prove deadlines and claims are enforced.',
     signals: ['Operate', 'Evaluate', 'Verify'],
     aiNote:
-      "The draft runs every feature and model call to completion regardless of the auction's remaining budget, so bids systematically arrive after the close, and it claims spend at bid time without releasing on loss, silently burning the daily cap in minutes.",
+      "The patch runs every feature and model call to completion regardless of the auction's remaining budget, so bids systematically arrive after the close, and it claims spend at bid time without releasing on loss, silently burning the daily cap in minutes.",
     testIdea:
       'Set a 100 ms budget and a 200 ms feature stub and assert the response is a marked no-bid or degraded bid inside the budget; lose an auction and assert the cap claim returns; inspect stats for timeout and degradation shares.',
     followUps: [
@@ -2200,10 +2200,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A product's price jumped 400 percent in an hour because ten parallel updates each evaluated against the old price and all passed, and a model timeout froze an experimental price as production. Review it, fix it, and prove headroom is shared and sources are honest.",
+      "A product's price jumped 400 percent in an hour because ten parallel updates each evaluated against the old price and all passed, and a model timeout froze an experimental price as production. Debug it, fix it, and prove headroom is shared and sources are honest.",
     signals: ['Operate', 'Verify', 'Evaluate'],
     aiNote:
-      'The draft evaluates each update against the on-disk price in isolation, so N concurrent updates each within the per-update limit compound far past the intended per-window cap, and on a model timeout it serves the last suggestion with a fresh timestamp as if it were newly computed.',
+      'The patch evaluates each update against the on-disk price in isolation, so N concurrent updates each within the per-update limit compound far past the intended per-window cap, and on a model timeout it serves the last suggestion with a fresh timestamp as if it were newly computed.',
     testIdea:
       'Fire ten concurrent 15 percent updates and assert the cumulative move respects the 20 percent window bound; time out the model and assert the published price carries the stale marker and last approved value; inspect a storefront response for experiment prices.',
     followUps: [
@@ -2222,10 +2222,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You own the completion service behind the editor’s ghost text. A developer reported a suggestion that contained a function from a file they have never seen; another reported that completions ignore the helper open in the next tab; the Redis instance is at 90 % memory. The neighboring-tabs cache below was generated from a one-line description and merged because the demo showed context from other files. Review it, fix it, and prove the fix.',
+      'You own the completion service behind the editor’s ghost text. A developer reported a suggestion that contained a function from a file they have never seen; another reported that completions ignore the helper open in the next tab; the Redis instance is at 90 % memory. The neighboring-tabs cache below was merged because the demo showed context from other files. Debug it, fix it, and prove the fix.',
     signals: ['Secure', 'Evaluate', 'Operate', 'Verify'],
     aiNote:
-      'The draft keys tabs by file path only, so any developer with a `db/conn.py` open shares one entry — a cross-tenant leak. The entries have no TTL, so every closed tab stays in Redis forever. The match is an exact substring test on the cursor line, a bar so high that the feature includes nothing on most keystrokes, where GitHub’s A/B tests found a very low bar — even a weak best match — was what lifted acceptance. And it issues one GET per open tab on every keystroke instead of a single MGET.',
+      'The patch keys tabs by file path only, so any developer with a `db/conn.py` open shares one entry — a cross-tenant leak. The entries have no TTL, so every closed tab stays in Redis forever. The match is an exact substring test on the cursor line, a bar so high that the feature includes nothing on most keystrokes, where GitHub’s A/B tests found a very low bar — even a weak best match — was what lifted acceptance. And it issues one GET per open tab on every keystroke instead of a single MGET.',
     testIdea:
       'Two sessions each remember a tab at the same path with different contents; pick snippets for session A and assert only A’s text can appear. Remember a tab, advance the clock 601 s, assert the key is gone. Score a tab that shares two identifiers out of forty with the cursor window and assert it is still included as the best match. Count Redis commands for a request with eight open tabs and assert one MGET.',
     followUps: [
@@ -2241,14 +2241,14 @@ export const mockScenarios: readonly MockScenario[] = [
     stepId: 'prompt-detect',
     title: 'The firewall that blocks the wrong end of the scale',
     blurb:
-      'The detector scores 1–99 with 1 the most likely injection. The draft blocks high scores and allows every outage.',
+      'The detector scores 1–99 with 1 the most likely injection. The patch blocks high scores and allows every outage.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You own the firewall in front of a customer-facing assistant. The prompt validation service scores every prompt from 1 to 99 — 1 being the most likely injection — and tags it by topic. Last night the detector was down for twelve minutes and every prompt went through; this morning a prompt scored 4 and was forwarded. The model-generated client below looks right in a demo. Review it, fix it, and prove the fix.',
+      'You own the firewall in front of a customer-facing assistant. The prompt validation service scores every prompt from 1 to 99 — 1 being the most likely injection — and tags it by topic. Last night the detector was down for twelve minutes and every prompt went through; this morning a prompt scored 4 and was forwarded. The client below looks right in a demo. Debug it, fix it, and prove the fix.',
     signals: ['Specify', 'Secure', 'Verify'],
     aiNote:
-      'The draft compares the wrong way round: it blocks when the score is above 80, the benign end of the scale, so the prompts the detector is most sure about pass. It never reads the tags, so the topic rules are a no-op. The call carries no deadline, so a slow detector stalls every request. And the bare catch returns allow on any error, so a detector outage is a published off switch.',
+      'The patch compares the wrong way round: it blocks when the score is above 80, the benign end of the scale, so the prompts the detector is most sure about pass. It never reads the tags, so the topic rules are a no-op. The call carries no deadline, so a slow detector stalls every request. And the bare catch returns allow on any error, so a detector outage is a published off switch.',
     testIdea:
       'Stub Detect to return score 4 with no tags and assert the decision is block with reason score; return score 90 with tag politics and assert block with reason tag:politics. Make the stub sleep past 150 ms and assert block with reason detector-unavailable, then pass fail_open and assert allow; make it return INVALID_ARGUMENT and assert the error propagates.',
     followUps: [
@@ -2267,10 +2267,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Data platform engineer · 25 min',
     minutes: 25,
     prompt:
-      'You own the warehouse behind a text-to-SQL product. Yesterday a generated query joined a table nobody ACKed, another scanned every partition of a Tier-1 table for forty minutes, and a third returned zero rows because the model filtered on status = "Finished". The run endpoint below was generated by a model and ships the SQL as-is. Review it, add the guard, and prove it with the checks.',
+      'You own the warehouse behind a text-to-SQL product. Yesterday a model-written query joined a table nobody ACKed, another scanned every partition of a Tier-1 table for forty minutes, and a third returned zero rows because the model filtered on status = "Finished". The run endpoint below ships the SQL as-is. Debug it, add the guard, and prove it with the checks.',
     signals: ['Secure', 'Specify', 'Verify', 'Operate'],
     aiNote:
-      'The draft looks the record up and executes record["sql"]. It never checks that the statement is a single SELECT, that every FROM/JOIN target is in the ACKed list, that the WHERE clause filters on the partition column, or that the query has a LIMIT and a statement timeout. It also cannot report has_output, so a hallucinated filter that returns nothing looks identical to a success.',
+      'The patch looks the record up and executes record["sql"]. It never checks that the statement is a single SELECT, that every FROM/JOIN target is in the ACKed list, that the WHERE clause filters on the partition column, or that the query has a LIMIT and a statement timeout. It also cannot report has_output, so a hallucinated filter that returns nothing looks identical to a success.',
     testIdea:
       'Store four records: a clean SELECT over an ACKed table with a datestr filter; a SELECT that JOINs a table outside the ACKed list; a SELECT with no partition filter; and "SELECT 1; DROP TABLE trips". Only the first may reach the warehouse, with LIMIT 1000 appended and a 60 s timeout; the other three must answer 422 before any warehouse call, and the clean one must report has_output false when the warehouse returns no rows.',
     followUps: [
@@ -2289,10 +2289,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 25 min',
     minutes: 25,
     prompt:
-      'You own the Guardrails Framework behind the support assistant. Last night the guardrail service had a slow hour; every answer the model produced in that hour went out, including one that promised a full refund the policy does not allow. The model-generated gate below checks relevance and returns the answer. Review it, fix it, and prove the fix: every configured guardrail, in parallel, under one deadline, failing closed, escalating to a human on any verdict that is not PASS.',
+      'You own the Guardrails Framework behind the support assistant. Last night the guardrail service had a slow hour; every answer the model produced in that hour went out, including one that promised a full refund the policy does not allow. The gate below checks relevance and returns the answer. Debug it, fix it, and prove the fix: every configured guardrail, in parallel, under one deadline, failing closed, escalating to a human on any verdict that is not PASS.',
     signals: ['Secure', 'Specify', 'Verify', 'Operate'],
     aiNote:
-      'The draft runs one guardrail (relevance) with no deadline, catches the exception and continues as if it had passed, and on an explicit FAIL logs a warning and returns the draft anyway. Groundedness and pii never run. A guardrail outage is indistinguishable from no guardrail.',
+      'The patch runs one guardrail (relevance) with no deadline, catches the exception and continues as if it had passed, and on an explicit FAIL logs a warning and returns the patch anyway. Groundedness and pii never run. A guardrail outage is indistinguishable from no guardrail.',
     testIdea:
       'Stub the guardrail service so groundedness sleeps past 2 s and pii returns FAIL. Assert the gate returns within the deadline, that the verdict map has three entries with groundedness = ERROR, that handoff.escalate was called with those verdicts, and that the result field is absent from the response.',
     followUps: [
@@ -2311,10 +2311,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'You are the engineer on the metadata service that classifies every table in the lake. Yesterday a table with a passport_no column went from Tier 1 to Tier 4 and opened to the whole company; the audit trail shows a verification call and nothing else. The model-generated handler below is what served it. Review it, fix it, and prove the fix.',
+      'You are the engineer on the metadata service that classifies every table in the lake. Yesterday a table with a passport_no column went from Tier 1 to Tier 4 and opened to the whole company; the audit trail shows a verification call and nothing else. The handler below is what served it. Debug it, fix it, and prove the fix.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft reads X-User-Id but never checks it against the entity owner, so anyone can verify any table. It copies `tier` from the request body instead of deriving it from the tags and the privacy rules, so the caller sets the access level. It accepts any string as a tag, so an unknown tag has no rule and no tier. And it records nothing about who verified, so the incident has no name on it.',
+      'The patch reads X-User-Id but never checks it against the entity owner, so anyone can verify any table. It copies `tier` from the request body instead of deriving it from the tags and the privacy rules, so the caller sets the access level. It accepts any string as a tag, so an unknown tag has no rule and no tier. And it records nothing about who verified, so the incident has no name on it.',
     testIdea:
       'POST a verification for an entity whose owner is team-a with X-User-Id: team-b and assert 403. Then, as team-a, send `{"action": "edit", "tags": {"passport_no": "Personal.ID"}, "tier": 4}` and assert the response tier is 1 and the stored audit row names team-a. Send a tag outside the taxonomy and assert 400.',
     followUps: [
@@ -2333,10 +2333,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 25 min',
     minutes: 25,
     prompt:
-      'You are the platform engineer who owns the research orchestrator. A customer’s deep query took forty minutes, the lead agent lost its plan halfway through, and the bill showed sixty subagents for a job budgeted at ten. The model-generated lead agent below passes the demo. Review it against what the source says about delegation, parallelism and compression, fix it, and prove the fix.',
+      'You are the platform engineer who owns the research orchestrator. A customer’s deep query took forty minutes, the lead agent lost its plan halfway through, and the bill showed sixty subagents for a job budgeted at ten. The lead agent below passes the demo. Debug it against what the source says about delegation, parallelism and compression, fix it, and prove the fix.',
     signals: ['Delegate', 'Specify', 'Operate', 'Verify'],
     aiNote:
-      'The draft awaits each subagent before starting the next, runs every task the planner returns instead of cutting the plan to budget.max_subagents, calls Subagent.Run with no deadline, sends only an objective (no output format, tools or boundaries), and appends each reply’s full transcript — not its condensed findings — to the lead’s notes.',
+      'The patch awaits each subagent before starting the next, runs every task the planner returns instead of cutting the plan to budget.max_subagents, calls Subagent.Run with no deadline, sends only an objective (no output format, tools or boundaries), and appends each reply’s full transcript — not its condensed findings — to the lead’s notes.',
     testIdea:
       'Fake the subagent stub so each Run sleeps one second and returns a 50 000-character transcript with a 200-character findings field. With a plan of twelve tasks and a budget of ten, the fixed lead must finish in about two seconds (two batches of five), call Run exactly ten times with all four task fields set, and hand synthesis notes no longer than 4 000 characters each. Then make one stub hang: the batch must still return within 120 seconds with a “no result” note for that task.',
     followUps: [
@@ -2355,10 +2355,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Applied ML engineer · 25 min',
     minutes: 25,
     prompt:
-      'You own the loop behind a merchant assistant inside a store admin. Since the tool count passed thirty, the model picks the wrong tool more often, every prompt edit invalidates the provider cache, and last week one conversation looped for eleven minutes. The AI draft below works on the demo. Review the loop, fix it, and prove the fix.',
+      'You own the loop behind a merchant assistant inside a store admin. Since the tool count passed thirty, the model picks the wrong tool more often, every prompt edit invalidates the provider cache, and last week one conversation looped for eleven minutes. The patch below works on the demo. Debug the loop, fix it, and prove the fix.',
     signals: ['Specify', 'Secure', 'Operate', 'Verify'],
     aiNote:
-      'The draft concatenates every tool’s instructions into the system prompt and again into each tool description, so the prompt grows with the registry, conflicts with itself, and changes whenever any tool does. It loops with `while True`, sets no deadline on the model or tool calls, and invokes whatever tool name the model emits — including a product-writing tool for a staff account that only has read scopes. The fix is structural: a constant system prompt, a compact name-plus-description tool list, the invoked tool’s instructions passed in the next model call only, `MAX_TURNS`, per-call deadlines, a loop budget, and a `required_scope` check before every `Invoke`.',
+      'The patch concatenates every tool’s instructions into the system prompt and again into each tool description, so the prompt grows with the registry, conflicts with itself, and changes whenever any tool does. It loops with `while True`, sets no deadline on the model or tool calls, and invokes whatever tool name the model emits — including a product-writing tool for a staff account that only has read scopes. The fix is structural: a constant system prompt, a compact name-plus-description tool list, the invoked tool’s instructions passed in the next model call only, `MAX_TURNS`, per-call deadlines, a loop budget, and a `required_scope` check before every `Invoke`.',
     testIdea:
       'Stub the model to always return a tool call. Assert the loop ends after exactly six Complete calls and returns the tools used. Then stub a `fill_product_form` call for scopes `[read_customers]` and assert `Invoke` is never called and the next model request carries a `PERMISSION_DENIED` tool message. Finally assert the system field is byte-identical across all six requests and that `instructions` is non-empty only on the request that follows a successful invoke.',
     followUps: [
@@ -2377,10 +2377,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 25 min',
     minutes: 25,
     prompt:
-      "You own the Fair Housing guardrail in front of the real-estate assistant. Yesterday the classifier pods were overloaded for forty minutes; the dashboard shows zero blocks in that window and legal has asked why. The model-generated decision function below looks reasonable and the demo refuses the obvious queries. Review it against Zillow's design — stop list, fast classifier tuned for recall, a slower reader for the uncertain cases — fix it, and prove the fix.",
+      "You own the Fair Housing guardrail in front of the real-estate assistant. Yesterday the classifier pods were overloaded for forty minutes; the dashboard shows zero blocks in that window and legal has asked why. The decision function below looks reasonable and the demo refuses the obvious queries. Debug it against Zillow's design — stop list, fast classifier tuned for recall, a slower reader for the uncertain cases — fix it, and prove the fix.",
     signals: ['Specify', 'Secure', 'Operate', 'Verify'],
     aiNote:
-      'The draft catches every exception and returns allowed, so an outage is indistinguishable from approval. It has no stop list, so the phrases that must be caught every time depend on a probabilistic model. Its single 0.5 threshold optimises precision when the domain needs recall, and it calls the LLM judge on every request with no deadline, so the fast tier buys nothing and a slow judge pins the conversation.',
+      'The patch catches every exception and returns allowed, so an outage is indistinguishable from approval. It has no stop list, so the phrases that must be caught every time depend on a probabilistic model. Its single 0.5 threshold optimises precision when the domain needs recall, and it calls the LLM judge on every request with no deadline, so the fast tier buys nothing and a slow judge pins the conversation.',
     testIdea:
       'Point the classifier stub at a server that sleeps 2 s and assert the decision is blocked with reason guard_unavailable within ~250 ms. Feed a stop-list phrase and assert tier stoplist with zero RPCs. Return scores 0.40, 0.20 and 0.10 and assert blocked / judge called / allowed without a judge call.',
     followUps: [
@@ -2399,10 +2399,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'Catalog ML platform engineer · 25 min',
     minutes: 25,
     prompt:
-      'You own the catalog enrichment service. Overnight a new grocery merchant was onboarded and this morning search is showing "Doove" and "Dove Glow Co." as brands, a 500 ml body wash tagged as 500 lb, and every one of the 40 000 SKUs marked accepted — nothing reached the review queue. The model-generated extraction client below is what ran. Review it against the taxonomy we already have, fix it, and prove the fix.',
+      'You own the catalog enrichment service. Overnight a new grocery merchant was onboarded and this morning search is showing "Doove" and "Dove Glow Co." as brands, a 500 ml body wash tagged as 500 lb, and every one of the 40 000 SKUs marked accepted — nothing reached the review queue. The extraction client below is what ran. Debug it against the taxonomy we already have, fix it, and prove the fix.',
     signals: ['Specify', 'Verify', 'Evaluate', 'Operate'],
     aiNote:
-      'The draft sends the title alone and lets the model name any brand instead of retrieving the 20 nearest brands from the taxonomy and making it choose among them. It asks for free text and splits lines on ":", so a rephrased answer silently drops attributes. It has no deadline and no retry on UNAVAILABLE. It copies whatever brand, unit and category the model returns without checking them against the taxonomy, and it marks every result accepted, so the confidence gate that should route unresolved SKUs to human review never fires.',
+      'The patch sends the title alone and lets the model name any brand instead of retrieving the 20 nearest brands from the taxonomy and making it choose among them. It asks for free text and splits lines on ":", so a rephrased answer silently drops attributes. It has no deadline and no retry on UNAVAILABLE. It copies whatever brand, unit and category the model returns without checking them against the taxonomy, and it marks every result accepted, so the confidence gate that should route unresolved SKUs to human review never fires.',
     testIdea:
       'Feed a title whose true brand is not in the candidate list the taxonomy returns and assert the result has brand null, a problem recorded, status review and one review-queue entry. Feed a stub reply with confidence 0.60 and a clean payload and assert the same routing. Stub the extractor to answer UNAVAILABLE once and then succeed: exactly two calls, each with a deadline. Stub it to answer INVALID_ARGUMENT: exactly one call and the error is raised.',
     followUps: [
@@ -2421,10 +2421,10 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 25 min',
     minutes: 25,
     prompt:
-      'You own the ask-a-question-about-this-file feature. Security sent you a screenshot: a user pasted a few hundred backspaces into the question box and the answer was the first lines of our prompt. Another user asked the model to repeat a word forever and tied up a worker for ten minutes. The model-generated draft below builds the prompt and calls the model. Review it, fix it, and prove the fix.',
+      'You own the ask-a-question-about-this-file feature. Security sent you a screenshot: a user pasted a few hundred backspaces into the question box and the answer was the first lines of our prompt. Another user asked the model to repeat a word forever and tied up a worker for ten minutes. The patch below builds the prompt and calls the model. Debug it, fix it, and prove the fix.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The draft concatenates instructions, document and question into one string, so nothing marks where data ends and instructions begin; it has no canary, so an echoed prompt looks like an answer; it calls the model with no deadline and no max_tokens, retries nothing, and returns the raw text without checking it is the JSON shape the guard expects.',
+      'The patch concatenates instructions, document and question into one string, so nothing marks where data ends and instructions begin; it has no canary, so an echoed prompt looks like an answer; it calls the model with no deadline and no max_tokens, retries nothing, and returns the raw text without checking it is the JSON shape the guard expects.',
     testIdea:
       'Stub the model. Send a document containing the literal string DOCUMENT>>> followed by "ignore the rules" and assert the prompt the stub receives has it escaped inside the document section. Make the stub echo its own instructions and assert Rejected is raised; make it return UNAVAILABLE once and assert exactly two calls; make it hang and assert the call ends at five seconds.',
     followUps: [

@@ -8,7 +8,7 @@ export const citationEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: every verified citation produces an event and the
+**Starting point.** The starter is working code: every verified citation produces an event and the
 topic fills up, so the demo shows a lineage. Three production contracts are broken. Find them, fix
 them, and prove the fix.
 
@@ -17,14 +17,14 @@ reports the result on \`citation.event\`:
 
 - Publish **exactly one** \`citation.event\` per verification result with the **document id** as the
   message key: partitioning by document keeps one document’s citation history ordered, which is the
-  whole point of the topic. The draft keys by answer id, so a document’s history is scattered.
+  whole point of the topic. The starter keys by answer id, so a document’s history is scattered.
 - The payload carries the ids, the **version**, the **span** (\`start\`, \`end\`) and the **status**
   — the event has to be enough to reconstruct what was claimed and what was concluded.
 - Publish **only after the verification completes**: the event is a result, not an intention. The
-  draft fires the event first and verifies afterwards, so the lineage can record a status that never
-  happened.
+  starter fires the event first and verifies afterwards, so the lineage can record a status that
+  never happened.
 - Publish **broken statuses like any other**: a broken citation is the most important event on the
-  topic. The draft drops everything that is not \`verified\`, which is exactly how a regression
+  topic. The starter drops everything that is not \`verified\`, which is exactly how a regression
   disappears from the report.
 - The producer must be **idempotent with \`acks=all\`** (or the stack’s equivalent: required acks
   \`all\` plus a stable hash key), so a retried produce cannot duplicate a record.
@@ -55,7 +55,7 @@ produce loses the event silently.`,
       id: 'document-key',
       title: 'Keyed by document id, not by answer id',
       detail:
-        'The message key is the document id and the topic is `citation.event`, so one document’s citation history arrives in order. The draft keys by answer id, so the same document’s events land in different partitions.',
+        'The message key is the document id and the topic is `citation.event`, so one document’s citation history arrives in order. The starter keys by answer id, so the same document’s events land in different partitions.',
       match: {
         python: {all: [/CITATION_TOPIC/, /key=citation\["document_id"\]/]},
         typescript: {all: [/CITATION_TOPIC/, /key:\s*citation\.document_id/]},
@@ -68,7 +68,7 @@ produce loses the event silently.`,
       id: 'status-published',
       title: 'Broken statuses are published like any other',
       detail:
-        'The payload carries the citation’s status and there is no `verified`-only filter, so a broken citation reaches the lineage. The draft returns early on anything that is not verified and omits the status, hiding the regressions the topic exists for.',
+        'The payload carries the citation’s status and there is no `verified`-only filter, so a broken citation reaches the lineage. The starter returns early on anything that is not verified and omits the status, hiding the regressions the topic exists for.',
       match: {
         python: {all: [/"status":\s*citation\["status"\]/], none: [/citation\["status"\]\s*!=/]},
         typescript: {all: [/status:\s*citation\.status/], none: [/citation\.status\s*!==?\s*['"]verified['"]/]},
@@ -84,7 +84,7 @@ produce loses the event silently.`,
       id: 'verify-before-publish',
       title: 'Verifies before it publishes',
       detail:
-        'The verification runs first and the verified citation is what gets published. The draft publishes first (the produce call appears before any verification), so the topic can record a status that was never computed.',
+        'The verification runs first and the verified citation is what gets published. The starter publishes first (the produce call appears before any verification), so the topic can record a status that was never computed.',
       match: {
         python: {order: [/verify_citation\(/, /producer\.produce\(/]},
         typescript: {order: [/verifyCitation\(/, /producer\.send\(/]},
@@ -110,7 +110,7 @@ produce loses the event silently.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce inserts an outbox row (`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The draft ignores the broker result entirely.',
+        'A rejected produce inserts an outbox row (`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(?:KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -220,7 +220,7 @@ def verify_and_publish(tenant: str, citation: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** citation.event: a model-generated draft that keys by answer id and publishes too early. */
+      starter: `/** citation.event: flawed code that keys by answer id and publishes too early. */
 import {Kafka} from 'kafkajs';
 
 const CITATION_TOPIC = 'citation.event';
@@ -684,5 +684,5 @@ json verifyAndPublish(const std::string& tenant, const json& citation) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by document and one document’s citation history arrives in order; key by answer id and it does not. Second, publish the result, not the intent — sending the event before the verification means the topic can carry a status that was never computed, and quietly filtering out the broken ones means the topic carries only good news. The lineage is exactly where a regression has to appear. Third, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all so a retry cannot duplicate, and a rejected produce has to land in an outbox that a relay republishes, because the broker is not a database. Real platforms add a schema registry for the event contract, per-document partition quotas, and a consumer that rebuilds verification counters per document for the quality dashboard.`,
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by document and one document’s citation history arrives in order; key by answer id and it does not. Second, publish the result, not the intent — sending the event before the verification means the topic can carry a status that was never computed, and quietly filtering out the broken ones means the topic carries only good news. The lineage is exactly where a regression has to appear. Third, exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all so a retry cannot duplicate, and a rejected produce has to land in an outbox that a relay republishes, because the broker is not a database. Real platforms add a schema registry for the event contract, per-document partition quotas, and a consumer that rebuilds verification counters per document for the quality dashboard.`,
 };

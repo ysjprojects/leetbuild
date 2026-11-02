@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['ingest', 'kafka', 'rollup'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes an event per
+**Starting point.** The starter is working code: it publishes an event per
 window and the consumer sees data arrive, so the demo shows a topic filling up. Three production
 contracts are broken, and the first one silently reorders a fleet's stream. Find them, fix them, and
 prove the fix with the checks below.
@@ -17,7 +17,7 @@ Implement \`publish_rollup(device_id, window_start, buckets)\`, the ingest path'
 
 - Publish one \`telemetry.rollup\` event per device per window with the **device id as the message
   key**. The key is the partition key: one device’s events then land in one partition and keep their
-  order, which is what every consumer of a device’s history assumes. The draft keys by metric name,
+  order, which is what every consumer of a device’s history assumes. The starter keys by metric name,
   so a device’s events scatter across partitions and their order is gone.
 - The payload carries the **downsampled bucket result**: \`window_start\` and, per metric, the
   bucket **mean**, **count** and peak. It must **not** carry the raw samples — a topic that carries
@@ -69,7 +69,7 @@ a rollup that is simply lost.`,
       id: 'device-key',
       title: 'Publishes to telemetry.rollup keyed by device',
       detail:
-        'The message key is the device id (partition by device), so one device’s events stay on one partition and keep their order. The draft keys by the metric name, which scatters a device’s stream across partitions.',
+        'The message key is the device id (partition by device), so one device’s events stay on one partition and keep their order. The starter keys by the metric name, which scatters a device’s stream across partitions.',
       match: {
         python: {all: [/telemetry\.rollup/, /key=device_id/], none: [/key=metric/]},
         typescript: {all: [/telemetry\.rollup/, /key: deviceId/], none: [/key: metricName|key: metric/]},
@@ -88,7 +88,7 @@ a rollup that is simply lost.`,
       id: 'bucketed-payload',
       title: 'Carries bucket means and counts, never raw samples',
       detail:
-        'The payload is downsampled: bucket `mean` and `count` (and the peak) instead of the raw readings, and no `samples` array of untouched points. The draft publishes the raw samples and leaves the consumer to recompute.',
+        'The payload is downsampled: bucket `mean` and `count` (and the peak) instead of the raw readings, and no `samples` array of untouched points. The starter publishes the raw samples and leaves the consumer to recompute.',
       match: {
         python: {all: [/mean/, /count/], none: [/["']samples["']/]},
         typescript: {all: [/mean/, /count/], none: [/["']samples["']/]},
@@ -101,7 +101,7 @@ a rollup that is simply lost.`,
       id: 'window-bucket',
       title: 'Names the bucket window in the event',
       detail:
-        'The event carries `window_start` and its `buckets`, so a consumer knows which window each downsampled value belongs to. The draft has no window at all — its payload is a bag of raw points.',
+        'The event carries `window_start` and its `buckets`, so a consumer knows which window each downsampled value belongs to. The starter has no window at all — its payload is a bag of raw points.',
       match: {
         python: {all: [/window_start/, /buckets/]},
         typescript: {all: [/window_start/, /buckets/]},
@@ -114,7 +114,7 @@ a rollup that is simply lost.`,
       id: 'outbox',
       title: 'Falls back to the outbox when the broker rejects',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) instead of dropping the event or failing the caller. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) instead of dropping the event or failing the caller. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -127,7 +127,7 @@ a rollup that is simply lost.`,
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — Kafka’s `enable.idempotence` with `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer — and the produce is flushed or awaited so a rejection is observable. The draft publishes fire-and-forget from a default producer, so a retry duplicates the rollup and a rejection is invisible.',
+        'The producer is configured for idempotence and `acks=all` — Kafka’s `enable.idempotence` with `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer — and the produce is flushed or awaited so a rejection is observable. The starter publishes fire-and-forget from a default producer, so a retry duplicates the rollup and a rejection is invisible.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/, /producer\.flush\(/]},
         typescript: {all: [/idempotent: true/, /acks: -1/, /await producer\.send\(/]},
@@ -162,7 +162,7 @@ class RollupWindow(BaseModel):
 
 @app.post("/v1/rollups")
 def publish(window: RollupWindow) -> dict:
-    # TODO: the draft keys by the metric name, so one device's events scatter across partitions and
+    # TODO: the starter keys by the metric name, so one device's events scatter across partitions and
     # lose their order; it publishes the raw samples for consumers to recompute; it runs a default
     # producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
     event = {
@@ -220,7 +220,7 @@ def publish_rollup(device_id: str, window_start: int, buckets: list[dict]) -> No
 `,
     },
     typescript: {
-      starter: `/** telemetry.rollup: a model-generated draft that keys by metric and ships raw samples. */
+      starter: `/** telemetry.rollup: flawed code that keys by metric and ships raw samples. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'telemetry-ingest', brokers: ['kafka:9092']});
@@ -233,7 +233,7 @@ interface Sample {
 }
 
 export async function publishRollup(deviceId: string, metricName: string, samples: Sample[]): Promise<void> {
-  // TODO: the draft keys by the metric name, so one device's events scatter across partitions and
+  // TODO: the starter keys by the metric name, so one device's events scatter across partitions and
   // lose their order; it publishes the raw samples for consumers to recompute; it runs a default
   // producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
   const event = {device_id: deviceId, metric: metricName, samples};
@@ -309,7 +309,7 @@ type Sample struct {
 }
 
 func publishRollup(ctx context.Context, deviceID, metricName string, samples []Sample) error {
-	// TODO: the draft keys by the metric name, so one device's events scatter across partitions and
+	// TODO: the starter keys by the metric name, so one device's events scatter across partitions and
 	// lose their order; it publishes the raw samples for consumers to recompute; it runs a default
 	// producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
 	event := map[string]any{"device_id": deviceID, "metric": metricName, "samples": samples}
@@ -380,7 +380,7 @@ import spray.json._
 object RollupPublisher {
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: the draft keys by the metric name, so one device's events scatter across partitions and
+  // TODO: the starter keys by the metric name, so one device's events scatter across partitions and
   // lose their order; it publishes the raw samples for consumers to recompute; it runs a default
   // producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
   def publishRollup(deviceId: String, metricName: String, samples: List[Sample]): Unit = {
@@ -452,7 +452,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: the draft keys by the metric name, so one device's events scatter across partitions and
+// TODO: the starter keys by the metric name, so one device's events scatter across partitions and
 // lose their order; it publishes the raw samples for consumers to recompute; it runs a default
 // producer without idempotence; and it skips the outbox, so a broker rejection drops the window.
 void publishRollup(const std::string& deviceId, const std::string& metricName, const json& samples) {

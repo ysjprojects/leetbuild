@@ -8,8 +8,8 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the dedupe event publisher. It
-compiles, it works when the broker is healthy, and it hides three production flaws. Review it like the
+**Starting point.** The starter is working code for the dedupe event publisher. It compiles, it
+works when the broker is healthy, and it hides three production flaws. Debug it like the
 data-platform owner, fix it, and prove the fix with the checks below.
 
 Implement the publisher for \`dedupe.event\`.
@@ -22,7 +22,7 @@ Implement the publisher for \`dedupe.event\`.
 - Every produce that the broker rejects leaves an **outbox row** so the event can be replayed later
   instead of being lost.
 
-**Failure mode the checks target.** The draft keys by record, so one dataset's events scatter across
+**Failure mode the checks target.** The starter keys by record, so one dataset's events scatter across
 partitions and order is lost. It publishes raw names and emails "so reviewers can confirm the match",
 turning a retained topic into a copy of the record store. And it writes no outbox row, so a rejected
 produce is silently dropped.`,
@@ -54,7 +54,7 @@ produce is silently dropped.`,
       id: 'dataset-key',
       title: 'Keys the event by dataset id',
       detail:
-        "The message key is the dataset id, not the record id, so one dataset's events share a partition and stay ordered. The draft keys by record.",
+        "The message key is the dataset id, not the record id, so one dataset's events share a partition and stay ordered. The starter keys by record.",
       match: {
         python: {all: [/key\s*=\s*dataset_id/], none: [/key\s*=\s*record_id/]},
         typescript: {all: [/key\s*:\s*dataset/], none: [/key\s*:\s*record/]},
@@ -67,7 +67,7 @@ produce is silently dropped.`,
       id: 'hashed',
       title: 'Carries key hashes, never raw contents',
       detail:
-        'The payload carries `key_hashes` and the outcome; it never contains raw names, emails or content. The draft publishes raw fields so reviewers can confirm the match.',
+        'The payload carries `key_hashes` and the outcome; it never contains raw names, emails or content. The starter publishes raw fields so reviewers can confirm the match.',
       match: {
         python: {all: [/key_hashes/], none: [/["']name["']|["']email["']|["']content["']/]},
         typescript: {all: [/key_hashes/], none: [/["']name["']|["']email["']|["']content["']/]},
@@ -80,7 +80,7 @@ produce is silently dropped.`,
       id: 'outbox',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce leaves an outbox row so the event can be replayed later instead of being lost. The draft drops it.',
+        'A rejected produce leaves an outbox row so the event can be replayed later instead of being lost. The starter drops it.',
       match: {
         python: {all: [/outbox\.record\(/]},
         typescript: {all: [/outbox\.record\(/]},
@@ -93,7 +93,7 @@ produce is silently dropped.`,
       id: 'idempotent',
       title: 'Uses an idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotent delivery with `acks=all`, so a retried produce cannot duplicate an event. The draft configures neither.',
+        'The producer is configured for idempotent delivery with `acks=all`, so a retried produce cannot duplicate an event. The starter configures neither.',
       match: {
         python: {all: [/enable\.idempotence/, /acks/]},
         typescript: {all: [/idempotent/, /acks/]},
@@ -113,8 +113,8 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish(record: dict) -> None:
-    # TODO: this draft keys by record, publishes raw names and emails so reviewers can confirm the
-    # match, and writes no outbox row when the broker rejects the produce. Review all three.
+    # TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
+    # match, and writes no outbox row when the broker rejects the produce. Fix all three.
     record_id = record["record_id"]
     payload = {
         "record_id": record_id,
@@ -189,8 +189,8 @@ interface DedupeRecord {
 }
 
 async function publish(producer: Producer, record: DedupeRecord): Promise<void> {
-  // TODO: this draft keys by record, publishes raw names and emails so reviewers can confirm the
-  // match, and writes no outbox row when the broker rejects the produce. Review all three.
+  // TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
+  // match, and writes no outbox row when the broker rejects the produce. Fix all three.
   const payload = {
     record_id: record.record_id,
     name: record.name,
@@ -265,8 +265,8 @@ func NewWriter(brokers []string) *kafka.Writer {
 }
 
 func Publish(ctx context.Context, writer *kafka.Writer, record Record) error {
-	// TODO: this draft keys by record, publishes raw names and emails so reviewers can confirm the
-	// match, and writes no outbox row when the broker rejects the produce. Review all three.
+	// TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
+	// match, and writes no outbox row when the broker rejects the produce. Fix all three.
 	payload, err := json.Marshal(map[string]any{
 		"record_id": record.ID,
 		"name":      record.Name,
@@ -341,8 +341,8 @@ final case class DedupeRecord(record_id: String, name: String, email: String, co
 
 class DedupeEventPublisher(producer: KafkaProducer[String, String]) {
   def publish(record: DedupeRecord): Unit = {
-    // TODO: this draft keys by record, publishes raw names and emails so reviewers can confirm the
-    // match, and writes no outbox row when the broker rejects the produce. Review all three.
+    // TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
+    // match, and writes no outbox row when the broker rejects the produce. Fix all three.
     val payload =
       s"""{"record_id":"\${record.record_id}","name":"\${record.name}","email":"\${record.email}","content":"\${record.content}"}"""
     producer.send(new ProducerRecord[String, String]("dedupe.event", record.record_id, payload))
@@ -400,8 +400,8 @@ class DedupeEventPublisher {
   explicit DedupeEventPublisher(RdKafka::Producer& producer) : producer_(producer) {}
 
   void publish(const Record& record) {
-    // TODO: this draft keys by record, publishes raw names and emails so reviewers can confirm the
-    // match, and writes no outbox row when the broker rejects the produce. Review all three.
+    // TODO: this starter keys by record, publishes raw names and emails so reviewers can confirm the
+    // match, and writes no outbox row when the broker rejects the produce. Fix all three.
     const std::string payload = json{{"record_id", record.id},
                                      {"name", record.name},
                                      {"email", record.email},

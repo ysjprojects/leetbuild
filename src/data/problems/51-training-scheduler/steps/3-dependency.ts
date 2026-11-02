@@ -8,19 +8,19 @@ export const trainingDependencyStep: Step = {
   focus: ['scheduler', 'worker', 'cluster', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the preemption path: it
+**Starting point.** The starter is working code for the preemption path: it
 terminates the process and marks the run failed. It compiles, it frees the fleet, and it hides the
-flaw that costs the most GPU hours — it kills before it asks for a checkpoint. Review it like the
+flaw that costs the most GPU hours — it kills before it asks for a checkpoint. Debug it like the
 person who owns the training budget, fix it, and prove the fix with the checks below.
 
 Implement the scheduler's preemption path: when higher-priority work arrives, the running job is
 asked to preempt over gRPC **before** anything is terminated.
 
 - The call is a gRPC \`Preempt(run_id)\` on the worker with a **grace deadline** of
-  \`GRACE_DEADLINE_S = 30\` seconds, enforced on the request and on the call itself. The draft never
+  \`GRACE_DEADLINE_S = 30\` seconds, enforced on the request and on the call itself. The starter never
   calls the worker: it terminates the process out of the scheduler, so the job cannot save anything.
 - The worker writes a checkpoint and replies with a **checkpoint id**. The process is terminated
-  **only after** that id is received (\`preempting\` → \`checkpointed\` → \`preempted\`). The draft
+  **only after** that id is received (\`preempting\` → \`checkpointed\` → \`preempted\`). The starter
   kills first and reports \`failed\`, so the last hours of training are gone with no checkpoint to
   resume from.
 - If no checkpoint id arrives before the grace deadline, the scheduler still terminates — but on the
@@ -33,7 +33,7 @@ asked to preempt over gRPC **before** anything is terminated.
 - The run's history must not contain a \`failed\` transition caused by preemption: preemption ends in
   \`preempted\`, carrying the checkpoint id when there is one.
 
-**Failure mode the checks target.** The draft looks right because the demo preempts a job that has
+**Failure mode the checks target.** The starter looks right because the demo preempts a job that has
 nothing worth saving. On a real fleet the order of the two calls is the whole product: terminate
 before the checkpoint id and every preemption throws away the training progress the checkpoint
 existed to keep. The second flaw is quieter — a worker that answers "no checkpoint support" is not an
@@ -70,7 +70,7 @@ Treating that answer as a retryable failure turns a scheduling decision into dat
       id: 'preempt-call',
       title: 'Asks the worker to preempt under a grace deadline',
       detail:
-        'The scheduler calls the worker’s gRPC `Preempt` with `GRACE_DEADLINE_S` = 30 and a deadline on the call. The draft terminates the process from the scheduler and never asks the worker.',
+        'The scheduler calls the worker’s gRPC `Preempt` with `GRACE_DEADLINE_S` = 30 and a deadline on the call. The starter terminates the process from the scheduler and never asks the worker.',
       match: {
         python: {all: [/GRACE_DEADLINE_S\s*=\s*30/, /\.preempt\(/, /timeout=/]},
         typescript: {all: [/GRACE_DEADLINE_S\s*=\s*30/, /\.preempt\(/, /deadline/]},
@@ -83,7 +83,7 @@ Treating that answer as a retryable failure turns a scheduling decision into dat
       id: 'checkpoint-first',
       title: 'Terminates only after a checkpoint id is received',
       detail:
-        'The checkpoint id from the worker is captured first and the process is stopped only afterwards, so the run can resume from that checkpoint. The draft kills immediately and marks the run `failed`.',
+        'The checkpoint id from the worker is captured first and the process is stopped only afterwards, so the run can resume from that checkpoint. The starter kills immediately and marks the run `failed`.',
       match: {
         python: {all: [/checkpoint_id/, /worker\.terminate\(/], order: [/checkpoint_id = /, /worker\.terminate\(/]},
         typescript: {all: [/checkpointId/, /worker\.terminate\(/], order: [/checkpointId = /, /worker\.terminate\(/]},
@@ -96,7 +96,7 @@ Treating that answer as a retryable failure turns a scheduling decision into dat
       id: 'grace-deadline',
       title: 'A checkpoint that never arrives ends on the deadline path',
       detail:
-        'When the grace deadline expires with no checkpoint id the scheduler still stops the job, but records `grace_deadline_exceeded` as the reason instead of losing the run silently. The draft has no deadline and no reason.',
+        'When the grace deadline expires with no checkpoint id the scheduler still stops the job, but records `grace_deadline_exceeded` as the reason instead of losing the run silently. The starter has no deadline and no reason.',
       match: {
         python: {
           all: [/GRACE_DEADLINE_S/, /grace_deadline_exceeded/, /worker\.terminate\(/],
@@ -124,7 +124,7 @@ Treating that answer as a retryable failure turns a scheduling decision into dat
       id: 'no-checkpoint-support',
       title: 'A worker without checkpoint support keeps running',
       detail:
-        'A reply with `checkpoint_supported` false sends the waiting run back to the queue behind the job instead of terminating it. The draft retries the preempt against a worker that cannot checkpoint, which is what turns one preemption into a kill.',
+        'A reply with `checkpoint_supported` false sends the waiting run back to the queue behind the job instead of terminating it. The starter retries the preempt against a worker that cannot checkpoint, which is what turns one preemption into a kill.',
       match: {
         python: {
           all: [/checkpoint_supported/, /NO_CHECKPOINT_REASON/, /queue\.enqueue\(/],
@@ -152,7 +152,7 @@ Treating that answer as a retryable failure turns a scheduling decision into dat
       id: 'no-immediate-kill',
       title: 'Preemption never reports the run as failed',
       detail:
-        'The preemption path moves the run to `preempted` (with the checkpoint id when there is one) and never writes a `failed` state for it. The draft’s kill-and-fail transition is what the check rejects.',
+        'The preemption path moves the run to `preempted` (with the checkpoint id when there is one) and never writes a `failed` state for it. The starter’s kill-and-fail transition is what the check rejects.',
       match: {
         python: {all: [/runs\.update_state\(/, /"preempted"/], none: [/update_state\([^)]*"failed"/]},
         typescript: {all: [/runs\.updateState\(/, /'preempted'/], none: [/updateState\([^)]*'failed'/]},
@@ -164,7 +164,7 @@ Treating that answer as a retryable failure turns a scheduling decision into dat
   ],
   code: {
     python: {
-      starter: `"""Preempt a running job: a model-generated draft that kills first and asks questions later."""
+      starter: `"""Preempt a running job: flawed code that kills first and asks questions later."""
 import logging
 
 logger = logging.getLogger("trainsched")
@@ -187,9 +187,9 @@ runs = RunStore()
 
 
 def preempt(run_id: str, pending_run: dict) -> str:
-    # TODO: this draft terminates the process immediately and marks the run failed, so a job that
+    # TODO: this starter terminates the process immediately and marks the run failed, so a job that
     # could have checkpointed loses hours of training; it also never asks the worker whether it can
-    # checkpoint at all. Review both before preemption ships.
+    # checkpoint at all. Fix both before preemption ships.
     worker.terminate(run_id, "preempted by higher priority")
     runs.update_state(run_id, "failed", reason="preempted")
     logger.info("preempted run_id=%s state=failed", run_id)
@@ -264,7 +264,7 @@ def preempt(run_id: str, pending_run: dict) -> str:
 `,
     },
     typescript: {
-      starter: `/** Preempt a running job: a model-generated draft that kills first and asks questions later. */
+      starter: `/** Preempt a running job: flawed code that kills first and asks questions later. */
 const log = {info: (fields: Record<string, unknown>): void => console.log(JSON.stringify(fields))};
 
 class WorkerClient {
@@ -283,9 +283,9 @@ const worker = new WorkerClient();
 const runs = new RunStore();
 
 export async function preempt(runId: string, pendingRun: {run_id: string; band: number}): Promise<string> {
-  // TODO: this draft terminates the process immediately and marks the run failed, so a job that
+  // TODO: this starter terminates the process immediately and marks the run failed, so a job that
   // could have checkpointed loses hours of training; it also never asks the worker whether it can
-  // checkpoint at all. Review both before preemption ships.
+  // checkpoint at all. Fix both before preemption ships.
   worker.terminate(runId, 'preempted by higher priority');
   runs.updateState(runId, 'failed', 'preempted');
   log.info({run_id: runId, state: 'failed'});
@@ -400,9 +400,9 @@ var (
 
 // Preempt frees a run's nodes for higher-priority work.
 func Preempt(ctx context.Context, runID string, pendingRun PendingRun) (string, error) {
-	// TODO: this draft terminates the process immediately and marks the run failed, so a job that
+	// TODO: this starter terminates the process immediately and marks the run failed, so a job that
 	// could have checkpointed loses hours of training; it also never asks the worker whether it can
-	// checkpoint at all. Review both before preemption ships.
+	// checkpoint at all. Fix both before preemption ships.
 	if err := worker.Terminate(ctx, runID, "preempted by higher priority"); err != nil {
 		return "", err
 	}
@@ -537,9 +537,9 @@ object PreemptClient {
   val worker = new WorkerClient
   val runs = new RunStore
 
-  // TODO: this draft terminates the process immediately and marks the run failed, so a job that
+  // TODO: this starter terminates the process immediately and marks the run failed, so a job that
   // could have checkpointed loses hours of training; it also never asks the worker whether it can
-  // checkpoint at all. Review both before preemption ships.
+  // checkpoint at all. Fix both before preemption ships.
   def preempt(runId: String, pendingRun: PendingRun): String = {
     worker.terminate(runId, "preempted by higher priority")
     runs.updateState(runId, "failed", Some("preempted"))
@@ -625,9 +625,9 @@ struct PendingRun {
   int band;
 };
 
-// TODO: this draft terminates the process immediately and marks the run failed, so a job that could
+// TODO: this starter terminates the process immediately and marks the run failed, so a job that could
 // have checkpointed loses hours of training; it also never asks the worker whether it can checkpoint
-// at all. Review both before preemption ships.
+// at all. Fix both before preemption ships.
 std::string preempt(WorkerClient* worker, RunStore* runs, const std::string& run_id, const PendingRun& pending_run) {
   worker->terminate(run_id, "preempted by higher priority");
   runs->updateState(run_id, "failed", "preempted");
@@ -716,8 +716,8 @@ std::string preempt(WorkerClient* worker, RunStore* runs, RunQueue* queue, const
     'The kill is the *second* step, never the first: capture `checkpoint_id`, move the run to `checkpointed`, then terminate with that id. If the deadline passes with no checkpoint, terminate anyway — but on that path, with `grace_deadline_exceeded` as the reason, so the loss is visible.',
     '`checkpoint_supported = false` is not an error to retry: it means the job has nothing to save, so leave it running and put the waiting run back in the queue behind it. Retrying the preempt is how a scheduling decision turns into an uncheckpointed kill.',
   ],
-  debrief: `The interviewer is testing whether you can review the two-call shape that makes preemption safe. The
-draft looks right because the demo preempts a job with nothing to lose: the kill frees the nodes, the
+  debrief: `The interviewer is testing whether you can debug the two-call shape that makes preemption safe. The
+starter looks right because the demo preempts a job with nothing to lose: the kill frees the nodes, the
 failed state shows up on a dashboard, and nobody notices there was never a checkpoint. The order of
 the calls is the flaw worth naming — a checkpoint id that arrives after the process is gone is worth
 nothing — and the grace deadline is what makes the wait bounded instead of an indefinite stall. The

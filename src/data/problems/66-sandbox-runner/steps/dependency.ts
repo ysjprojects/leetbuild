@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['runner', 'container', 'sandbox'],
   task: `## Task
 
-The starter is a plausible model-generated draft: when the container service is healthy and fast the
+The starter is working code: when the container service is healthy and fast the
 job starts, so the demo works. Every failure path weakens the boundary. Find them, fix them, and
 prove the fix.
 
@@ -19,7 +19,7 @@ container service:
   call itself. Without one, a wedged container service holds the runner forever.
 - The container service reports the **isolation profile it actually used**. If that profile ranks
   below the requested one, the runner **kills the container and aborts** the job: a downgrade is a
-  boundary failure, not a detail. The draft trusts the profile the container echoes.
+  boundary failure, not a detail. The starter trusts the profile the container echoes.
 - An **image rejection** (\`FAILED_PRECONDITION\` / \`INVALID_ARGUMENT\`) is **terminal**: it will
   never succeed, so it is returned to the caller immediately instead of being retried five times.
 - A **start timeout** (\`DEADLINE_EXCEEDED\`) **aborts the job**. It must never fall back to running
@@ -58,7 +58,7 @@ host with the network. Each is invisible until the pod it runs on cannot be trus
       id: 'deadline',
       title: 'Every attempt carries a 30-second deadline',
       detail:
-        '`Start` is called with a 30-second deadline on the call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`). The draft calls without one, so a stuck container service pins the runner.',
+        '`Start` is called with a 30-second deadline on the call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`). The starter calls without one, so a stuck container service pins the runner.',
       match: {
         python: {all: [/START_DEADLINE_S\s*=\s*30/, /timeout=START_DEADLINE_S/, /containers\.Start\(/]},
         typescript: {
@@ -73,7 +73,7 @@ host with the network. Each is invisible until the pod it runs on cannot be trus
       id: 'isolation-check',
       title: 'Refuses a container that reports a weaker profile',
       detail:
-        'The used profile is ranked against the requested one, and a weaker result kills the container and aborts the job (`ISOLATION_RANK` + `IsolationError`). The draft returns whatever the container echoes back.',
+        'The used profile is ranked against the requested one, and a weaker result kills the container and aborts the job (`ISOLATION_RANK` + `IsolationError`). The starter returns whatever the container echoes back.',
       match: {
         python: {all: [/ISOLATION_RANK/, /IsolationError/]},
         typescript: {all: [/ISOLATION_RANK/, /IsolationError/]},
@@ -86,7 +86,7 @@ host with the network. Each is invisible until the pod it runs on cannot be trus
       id: 'image-terminal',
       title: 'An image rejection is terminal',
       detail:
-        '`FAILED_PRECONDITION` / `INVALID_ARGUMENT` aborts the start immediately instead of being retried. The draft retries the rejection five times against a container service that will never accept the image.',
+        '`FAILED_PRECONDITION` / `INVALID_ARGUMENT` aborts the start immediately instead of being retried. The starter retries the rejection five times against a container service that will never accept the image.',
       match: {
         python: {all: [/FAILED_PRECONDITION/, /TERMINAL/, /raise IsolationError\(/]},
         typescript: {all: [/FAILED_PRECONDITION/, /INVALID_ARGUMENT/, /throw new IsolationError\(/]},
@@ -99,7 +99,7 @@ host with the network. Each is invisible until the pod it runs on cannot be trus
       id: 'no-downgrade',
       title: 'A start timeout never silently weakens isolation',
       detail:
-        '`DEADLINE_EXCEEDED` fails the job with an isolation error; there is no branch that reassigns the profile to the default and continues. The draft does exactly that when the start is slow.',
+        '`DEADLINE_EXCEEDED` fails the job with an isolation error; there is no branch that reassigns the profile to the default and continues. The starter does exactly that when the start is slow.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/, /IsolationError/], none: [/profile\s*=\s*["']runc["']/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /IsolationError/], none: [/profile\s*=\s*['"]runc['"]/i]},
@@ -112,7 +112,7 @@ host with the network. Each is invisible until the pod it runs on cannot be trus
       id: 'bounded-retries',
       title: 'Bounds attempts and retries only UNAVAILABLE',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retryable; there is no unbounded loop and no five-shot retry of a permanent failure. The draft loops five times on any error.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retryable; there is no unbounded loop and no five-shot retry of a permanent failure. The starter loops five times on any error.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2/, /range\(MAX_ATTEMPTS\)/], none: [/while\s+True/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2/, /attempt\s*<\s*MAX_ATTEMPTS/], none: [/while\s*\(\s*true\s*\)/]},
@@ -189,7 +189,7 @@ def start_container(job_id: str, image: str, requested_profile: str):
 `,
     },
     typescript: {
-      starter: `/** Start a container: a model-generated draft that trusts the profile the container echoes. */
+      starter: `/** Start a container: flawed code that trusts the profile the container echoes. */
 import {status} from '@grpc/grpc-js';
 
 class IsolationError extends Error {}

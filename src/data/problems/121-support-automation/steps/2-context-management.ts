@@ -8,10 +8,10 @@ export const contextManagementStep: Step = {
   focus: ['workflow', 'redis', 'llm'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the Runtime Context
+**Starting point.** The starter is working code for the Runtime Context
 Manager: it appends turns and tool outcomes to Redis, loads the user's data and fetches help
 articles, and the assembled context reaches the model, so the demo answers correctly. It hides
-five production flaws. Review it like the owner of the context store, fix it, and prove the fix.
+five production flaws. Debug it like the owner of the context store, fix it, and prove the fix.
 
 Implement the context store the Chain of Thought workflow reads before every \`Reason\` call and
 writes after every tool outcome:
@@ -25,7 +25,7 @@ writes after every tool outcome:
   unbounded or immortal key.
 - **Static context** is what the product declares: \`STATIC_CONTEXT\` names the fields
   (\`customer_name\`, \`user_role\`, \`current_trip\`) and the loader fetches only those. The
-  draft loads the whole user record — every field, including the ones no prompt should ever
+  starter loads the whole user record — every field, including the ones no prompt should ever
   contain.
 - **Dynamic context** comes from named retrievers in \`DYNAMIC_RETRIEVERS\` (\`help_articles\`),
   fetched per turn for the current question and cached under
@@ -66,7 +66,7 @@ matched an earlier question.`,
       id: 'scoped-key',
       title: 'Keys context by tenant and conversation',
       detail:
-        'The list key is `ctx:{tenant}:{conversation}`; no list is shared between conversations. The draft appends everything to one global `context` key and filters client-side.',
+        'The list key is `ctx:{tenant}:{conversation}`; no list is shared between conversations. The starter appends everything to one global `context` key and filters client-side.',
       match: {
         python: {all: [/ctx:\{tenant\}:\{conversation\}/], none: [/r\.(rpush|lrange)\(\s*"context"/]},
         typescript: {all: [/ctx:\$\{tenant\}:\$\{conversation\}/], none: [/r\.(rpush|lrange)\(\s*'context'/]},
@@ -79,7 +79,7 @@ matched an earlier question.`,
       id: 'ttl',
       title: 'Refreshes a 24-hour TTL on every write',
       detail:
-        '`CONTEXT_TTL_S = 86_400` and `EXPIRE` runs on every append, so a conversation’s context dies a day after its last turn. The draft never sets an expiry.',
+        '`CONTEXT_TTL_S = 86_400` and `EXPIRE` runs on every append, so a conversation’s context dies a day after its last turn. The starter never sets an expiry.',
       match: {
         python: {all: [/CONTEXT_TTL_S\s*=\s*86_?400/, /\.expire\(/]},
         typescript: {all: [/CONTEXT_TTL_S\s*=\s*86_?400/, /\.expire\(/]},
@@ -92,7 +92,7 @@ matched an earlier question.`,
       id: 'budget',
       title: 'Trims to 40 items inside one transaction',
       detail:
-        '`MAX_CONTEXT_ITEMS = 40` and `LTRIM` keep the newest items; `RPUSH`, `LTRIM` and `EXPIRE` run in one `MULTI`/pipeline. The draft appends without a bound, so the list — and the prompt built from it — grows forever.',
+        '`MAX_CONTEXT_ITEMS = 40` and `LTRIM` keep the newest items; `RPUSH`, `LTRIM` and `EXPIRE` run in one `MULTI`/pipeline. The starter appends without a bound, so the list — and the prompt built from it — grows forever.',
       match: {
         python: {all: [/MAX_CONTEXT_ITEMS\s*=\s*40/, /\.ltrim\(/, /\.pipeline\(/]},
         typescript: {all: [/MAX_CONTEXT_ITEMS\s*=\s*40/, /\.ltrim\(/, /\.multi\(\)/]},
@@ -105,7 +105,7 @@ matched an earlier question.`,
       id: 'declared',
       title: 'Loads only declared static context and named retrievers',
       detail:
-        '`STATIC_CONTEXT` names the fields the product declared and `DYNAMIC_RETRIEVERS` the retrievers it may run; the loader fetches those and nothing else. The draft calls `load_all` and puts the whole user record in the prompt.',
+        '`STATIC_CONTEXT` names the fields the product declared and `DYNAMIC_RETRIEVERS` the retrievers it may run; the loader fetches those and nothing else. The starter calls `load_all` and puts the whole user record in the prompt.',
       match: {
         python: {all: [/STATIC_CONTEXT/, /DYNAMIC_RETRIEVERS/], none: [/sources\.load_all\(/]},
         typescript: {all: [/STATIC_CONTEXT/, /DYNAMIC_RETRIEVERS/], none: [/sources\.loadAll\(/]},
@@ -118,7 +118,7 @@ matched an earlier question.`,
       id: 'retriever-cache',
       title: 'Caches dynamic context for five minutes, outside the history',
       detail:
-        'Retriever results are cached under `ctx:{tenant}:{conversation}:retr:{name}` with `SETEX` and `RETRIEVER_TTL_S = 300`, and are not appended to the conversation list. The draft writes the articles into the history, where they shape every later turn.',
+        'Retriever results are cached under `ctx:{tenant}:{conversation}:retr:{name}` with `SETEX` and `RETRIEVER_TTL_S = 300`, and are not appended to the conversation list. The starter writes the articles into the history, where they shape every later turn.',
       match: {
         python: {all: [/RETRIEVER_TTL_S\s*=\s*300/, /\.setex\(/]},
         typescript: {all: [/RETRIEVER_TTL_S\s*=\s*300/, /'EX',\s*RETRIEVER_TTL_S/]},
@@ -241,7 +241,7 @@ def assemble(tenant: str, conversation: str, user_id: str, question: str) -> dic
 `,
     },
     typescript: {
-      starter: `/** Context store: a model-generated draft that keeps every conversation in one list. */
+      starter: `/** Context store: flawed code that keeps every conversation in one list. */
 import {Redis} from 'ioredis';
 
 import {sources} from './sources';
@@ -761,5 +761,5 @@ json assemble(const std::string& tenant, const std::string& conversation, const 
     'Append is three commands that belong together: `RPUSH`, `LTRIM key -40 -1`, `EXPIRE key 86400`. Put them in one `MULTI`/pipeline so a crash after the push cannot leave the list unbounded or without a TTL; refreshing the expiry on every write is what makes the TTL "a day after the last turn".',
     'Static context is a declared tuple passed to `load`; dynamic context is a declared tuple of retriever names, each answered from `ctx:…:retr:{name}` with `SETEX 300` on a miss. Return the dynamic result alongside the history — never `RPUSH` it, or an article that matched one question becomes permanent context for every later one.',
   ],
-  debrief: `The interview question behind this step is what the model is allowed to see, and for how long. The draft answers "everything, forever": a global list, no trim, no expiry, the full user record, and retrieved articles promoted to permanent history. Each of those passes a demo and fails in production — the global key as a tenant-isolation bug and a read-amplification bug at once, the unbounded list as a prompt that eventually exceeds the model's window and bills for every stale item on every iteration, the undeclared fields as data the product never asked to put in a prompt, and the persisted retrieval as a slow drift toward answering yesterday's question. The post's split is the fix: a product declares its static context and names its retrievers, the Context Loader fetches exactly that, and the Runtime Context Manager keeps a bounded, expiring runtime context per LLM call. Real platforms add a token budget per assembly (drop the oldest items until the prompt fits), point-in-time retrieval for offline evaluation, and per-field redaction before anything reaches the model.`,
+  debrief: `The interview question behind this step is what the model is allowed to see, and for how long. The starter answers "everything, forever": a global list, no trim, no expiry, the full user record, and retrieved articles promoted to permanent history. Each of those passes a demo and fails in production — the global key as a tenant-isolation bug and a read-amplification bug at once, the unbounded list as a prompt that eventually exceeds the model's window and bills for every stale item on every iteration, the undeclared fields as data the product never asked to put in a prompt, and the persisted retrieval as a slow drift toward answering yesterday's question. The post's split is the fix: a product declares its static context and names its retrievers, the Context Loader fetches exactly that, and the Runtime Context Manager keeps a bounded, expiring runtime context per LLM call. Real platforms add a token budget per assembly (drop the oldest items until the prompt fits), point-in-time retrieval for offline evaluation, and per-field redaction before anything reaches the model.`,
 };

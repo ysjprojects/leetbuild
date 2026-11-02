@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'auth', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the body and returns a session id. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/sessions\` with body \`{"user_id": "…", "device_class": "…"}\`.
 
@@ -58,7 +58,7 @@ device.`,
       id: 'rotate',
       title: 'Elevation mints a new session id',
       detail:
-        'Elevating a session generates a fresh id instead of reusing the incoming `X-Session-Id`. The draft stores the record under the id it was handed.',
+        'Elevating a session generates a fresh id instead of reusing the incoming `X-Session-Id`. The starter stores the record under the id it was handed.',
       match: {
         python: {all: [/new_session_id\s*=\s*str\(uuid4\(\)\)/]},
         typescript: {all: [/newSessionId\s*=\s*randomUUID\(\)/]},
@@ -71,7 +71,7 @@ device.`,
       id: 'invalidate-old',
       title: 'The old id is invalidated in the same request',
       detail:
-        'When the request carries an old session id, its record is removed so exactly one id stays valid. The draft leaves the old id live.',
+        'When the request carries an old session id, its record is removed so exactly one id stays valid. The starter leaves the old id live.',
       match: {
         python: {all: [/delete\(f"session:\{old_id\}"\)/]},
         typescript: {all: [/redis\.del\(`session:\$\{oldId\}`\)/]},
@@ -84,7 +84,7 @@ device.`,
       id: 'device-from-token',
       title: 'The device class comes from the token, not the body',
       detail:
-        'The stored device class is the one asserted by the auth service. The draft takes `device_class` straight from the request body and trusts it.',
+        'The stored device class is the one asserted by the auth service. The starter takes `device_class` straight from the request body and trusts it.',
       match: {
         python: {
           all: [/request\.state\.claims/, /claims\.get\(\s*"device_class"\s*\)/],
@@ -100,7 +100,7 @@ device.`,
       id: 'auth-assertion',
       title: 'A session without a completed auth assertion is rejected',
       detail:
-        'A request whose auth assertion is missing or incomplete is **401** and creates nothing. The draft creates a session for any caller.',
+        'A request whose auth assertion is missing or incomplete is **401** and creates nothing. The starter creates a session for any caller.',
       match: {
         python: {all: [/auth_assertion/, /status_code\s*=\s*401/]},
         typescript: {all: [/auth_assertion/, /code\(\s*401\s*\)/]},
@@ -127,7 +127,7 @@ r = redis.Redis()
 
 @app.post("/v1/sessions")
 async def create_session(request: Request):
-    # TODO: the draft trusts the body's device class and reuses the incoming session id.
+    # TODO: the starter trusts the body's device class and reuses the incoming session id.
     body = await request.json()
     user_id = body.get("user_id")
     device_class = body.get("device_class")
@@ -167,7 +167,7 @@ const redis = new Redis();
 
 export async function sessionRoutes(app: FastifyInstance) {
   app.post('/v1/sessions', async (req, reply) => {
-    // TODO: the draft trusts the body's device class and reuses the incoming session id.
+    // TODO: the starter trusts the body's device class and reuses the incoming session id.
     const body = req.body as {user_id?: string; device_class?: string};
     const device_class = body.device_class;
     const sessionId = req.headers['x-session-id'] as string;
@@ -224,7 +224,7 @@ func RegisterRoutes(mux *http.ServeMux, rdb *redis.Client) {
 	mux.HandleFunc("POST /v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		var body createBody
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		// TODO: the draft trusts the body's device class and reuses the incoming session id.
+		// TODO: the starter trusts the body's device class and reuses the incoming session id.
 		sessionID := r.Header.Get("X-Session-Id")
 		record, _ := json.Marshal(map[string]string{"user_id": body.UserID, "device_class": body.DeviceClass})
 		rdb.Set(r.Context(), "session:"+sessionID, record, 0)
@@ -285,7 +285,7 @@ object SessionRoutes {
     path("v1" / "sessions") {
       post {
         entity(as[CreateBody]) { body =>
-          // TODO: the draft trusts the body's device class and reuses the incoming session id.
+          // TODO: the starter trusts the body's device class and reuses the incoming session id.
           val sessionId = "x-session-id"
           redis.set(s"session:$sessionId", s"""{"user_id":"\${body.user_id}","device_class":"\${body.device_class}"}""")
           complete(StatusCodes.OK, s"""{"session_id":"$sessionId","device_class":"\${body.device_class}"}""")
@@ -338,7 +338,7 @@ using json = nlohmann::json;
 
 void register_session_routes(httplib::Server& svr, RedisClient& redis) {
     svr.Post("/v1/sessions", [&redis](const httplib::Request& req, httplib::Response& res) {
-        // TODO: the draft trusts the body's device class and reuses the incoming session id.
+        // TODO: the starter trusts the body's device class and reuses the incoming session id.
         json body = json::parse(req.body);
         std::string device_class = body["device_class"];
         std::string session_id = req.get_header_value("X-Session-Id");
@@ -381,5 +381,5 @@ void register_session_routes(httplib::Server& svr, RedisClient& redis) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends well-formed requests from one device and never elevates. Three separate defects are being checked: the id handed in by the client is never an identity, so elevation must mint a new id and retire the old one in the same request; the device class must come from the validated claims, not from the body the caller controls; and a session cannot exist without a completed auth assertion. Real session layers add a rotation counter to the record, keep the old id in a short-lived tombstone so a mid-flight request is not broken, and bind the id to the auth service's rotation epoch.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one device and never elevates. Three separate defects are being checked: the id handed in by the client is never an identity, so elevation must mint a new id and retire the old one in the same request; the device class must come from the validated claims, not from the body the caller controls; and a session cannot exist without a completed auth assertion. Real session layers add a rotation counter to the record, keep the old id in a short-lived tombstone so a mid-flight request is not broken, and bind the id to the auth service's rotation epoch.`,
 };

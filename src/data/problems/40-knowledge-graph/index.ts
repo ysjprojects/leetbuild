@@ -7,11 +7,11 @@ import {graphEventsStep} from './steps/4-events';
 import {neighborReadStep} from './steps/5-read';
 
 /**
- * Knowledge graph on the AI-era track: the course is not "store two tables and join them", it is the
- * review you owe a model-generated graph layer before it corrupts a tenant's entity resolution.
- * Deliberate merges behind an explicit policy → a versioned adjacency cache that cannot race → a
- * resolution client that parks on a timeout instead of splitting → entity-keyed events with an
- * outbox and an idempotent replay → a neighbour endpoint whose traversal has hard stops.
+ * Knowledge graph: the course is not "store two tables and join them", it is the debugging you owe
+ * a graph layer before it corrupts a tenant's entity resolution. Deliberate merges behind an
+ * explicit policy → a versioned adjacency cache that cannot race → a resolution client that parks
+ * on a timeout instead of splitting → entity-keyed events with an outbox and an idempotent replay
+ * → a neighbour endpoint whose traversal has hard stops.
  */
 export const knowledgeGraphProblem: Problem = {
   id: 'knowledge-graph',
@@ -19,7 +19,6 @@ export const knowledgeGraphProblem: Problem = {
   tagline: 'Entities and edges that merge deliberately, cache safely and never traverse unbounded.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Knowledge Graph
 
@@ -59,12 +58,12 @@ One service, **graph-api**, with five pieces:
 5. \`GET /v1/entities/{id}/neighbors\`: depth bounded at 2, a 500-edge cap with a truncation marker,
    and a \`404\` for an entity that belongs to another tenant.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

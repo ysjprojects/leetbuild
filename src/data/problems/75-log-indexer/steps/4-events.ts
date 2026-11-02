@@ -8,10 +8,9 @@ export const eventsStep: Step = {
   focus: ['redis', 'writer', 'shard', 'kafka'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds an event, produces it
+**Starting point.** The starter is working code: it builds an event, produces it
 to \`log.indexed\` and commits the batch. It compiles, the topic fills up, and it hides three
-production flaws — one of them lets a pipeline that is dropping logs look complete. Review it like
-the service owner, fix it, and prove the fix with the checks below.
+production flaws — one of them lets a pipeline that is dropping logs look complete. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`publish_batch\` for one drained batch of records:
 
@@ -28,7 +27,7 @@ Implement \`publish_batch\` for one drained batch of records:
   republishes; never drop the event and never fail the write silently.
 - The payload carries tenant and service ids — never the log message text.
 
-**Failure mode the checks target.** The draft keys by the index shard, so a service's events scatter
+**Failure mode the checks target.** The starter keys by the index shard, so a service's events scatter
 across partitions and a consumer cannot reconstruct order; it publishes before the shard commits, so
 a crash between the produce and the commit leaves the ledger announcing a batch that was never
 indexed; and it drops the shed and rejected counts, so the same ledger reports 100 % while the ingest
@@ -53,7 +52,7 @@ path quietly discarded a fifth of the traffic.`,
       id: 'service-key',
       title: 'Keys every event by the service id',
       detail:
-        "The message key is the service id, so one service's events share a partition and stay ordered. The draft keys by the index shard, which interleaves every service the shard holds.",
+        "The message key is the service id, so one service's events share a partition and stay ordered. The starter keys by the index shard, which interleaves every service the shard holds.",
       match: {
         python: {all: [/key=service/]},
         typescript: {all: [/key:\s*service\b/]},
@@ -66,7 +65,7 @@ path quietly discarded a fifth of the traffic.`,
       id: 'after-commit',
       title: 'Produces only after the shard committed',
       detail:
-        '`commit_batch` runs before the produce, so an event never announces a batch the index does not hold. The draft produces first and commits afterwards, leaving the ledger ahead of the index across a crash.',
+        '`commit_batch` runs before the produce, so an event never announces a batch the index does not hold. The starter produces first and commits afterwards, leaving the ledger ahead of the index across a crash.',
       match: {
         python: {order: [/commit_batch\(/, /producer\.produce\(/]},
         typescript: {order: [/commitBatch\(/, /\.send\(/]},
@@ -79,7 +78,7 @@ path quietly discarded a fifth of the traffic.`,
       id: 'rejected-counts',
       title: 'Surfaces the shed and rejected counts',
       detail:
-        'The event carries `shed_count` and `rejected_count` next to the indexed count, so a pipeline that is dropping records cannot look complete. The draft omits both, which is exactly what made the incident review read 100 %.',
+        'The event carries `shed_count` and `rejected_count` next to the indexed count, so a pipeline that is dropping records cannot look complete. The starter omits both, which is exactly what made the incident review read 100 %.',
       match: {
         python: {all: [/shed_count/, /rejected_count/]},
         typescript: {all: [/shed_count/, /rejected_count/]},
@@ -105,7 +104,7 @@ path quietly discarded a fifth of the traffic.`,
       id: 'outbox-on-rejection',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A failed produce (`KafkaException` / non-`ERR_NO_ERROR` result) writes an outbox row that a relay republishes. The draft ignores the broker result, so a rejected event disappears with the request.',
+        'A failed produce (`KafkaException` / non-`ERR_NO_ERROR` result) writes an outbox row that a relay republishes. The starter ignores the broker result, so a rejected event disappears with the request.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -137,8 +136,8 @@ store = OutboxStore()
 
 
 def publish_batch(tenant: str, service: str, batch: dict, commit_batch) -> dict:
-    # TODO: this draft keys by the index shard, publishes before the shard commits, and leaves the
-    # shed and rejected counts out of the event, so a dropping pipeline looks complete. Review all
+    # TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
+    # shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
     # three.
     event = {
         "batch_id": batch["batch_id"],
@@ -199,7 +198,7 @@ def publish_batch(tenant: str, service: str, batch: dict, commit_batch) -> dict:
 `,
     },
     typescript: {
-      starter: `/** log.indexed publishing: a model-generated draft that keys by the index shard. */
+      starter: `/** log.indexed publishing: flawed code that keys by the index shard. */
 import {Kafka, type Producer} from 'kafkajs';
 
 const TOPIC = 'log.indexed';
@@ -227,8 +226,8 @@ export async function publishBatch(
   batch: CommittedBatch,
   commitBatch: (batchId: string) => Promise<void>,
 ): Promise<Record<string, unknown>> {
-  // TODO: this draft keys by the index shard, publishes before the shard commits, and leaves the
-  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Review all
+  // TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
+  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
   // three.
   const event = {
     batch_id: batch.batch_id,
@@ -325,8 +324,8 @@ var store = &OutboxStore{}
 
 // PublishBatch ships one log.indexed event for a drained batch.
 func PublishBatch(ctx context.Context, tenant, service string, batch CommittedBatch, commitBatch func(context.Context, string) error) (map[string]any, error) {
-	// TODO: this draft keys by the index shard, publishes before the shard commits, and leaves the
-	// shed and rejected counts out of the event, so a dropping pipeline looks complete. Review all
+	// TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
+	// shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
 	// three.
 	event := map[string]any{
 		"batch_id":       batch.BatchID,
@@ -421,8 +420,8 @@ object Events {
       indexSnapshot: Map[String, String]
   )
 
-  // TODO: this draft keys by the index shard, publishes before the shard commits, and leaves the
-  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Review all
+  // TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
+  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
   // three.
   def publishBatch(tenant: String, service: String, batch: CommittedBatch, commitBatch: String => Unit): Map[String, Any] = {
     val event = Map(
@@ -519,8 +518,8 @@ json publishBatch(
     const std::string& service,
     const json& batch,
     const std::function<void(const std::string&)>& commitBatch) {
-  // TODO: this draft keys by the index shard, publishes before the shard commits, and leaves the
-  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Review all
+  // TODO: this starter keys by the index shard, publishes before the shard commits, and leaves the
+  // shed and rejected counts out of the event, so a dropping pipeline looks complete. Fix all
   // three.
   const json event = {
       {"batch_id", batch["batch_id"]},
@@ -596,5 +595,5 @@ json publishBatch(
     'The produce order matters more than the retry policy here. Commit the shard batch first, then produce: an event that arrives before the index holds the data is a promise the ledger cannot keep, and a crash between the two leaves the completeness page claiming records that were never written.',
     'A broker is not a database. Check the produce result and, when it fails, insert an outbox row that a relay republishes with the same batch id; and put `shed_count` and `rejected_count` in the event so the consumer can see the records the ingest path never accepted.',
   ],
-  debrief: `The interviewer is checking the three things a generated Kafka snippet gets wrong. First, the key is a partition contract: keyed by service, one service's ingestion stream is ordered; keyed by the shard, every service on that shard interleaves, which is why the draft's consumers saw counts jump around. Second, publish-after-commit is what makes the event a statement of fact rather than an intention, and it is the difference between a ledger that lags and a ledger that lies. Third, completeness is only honest when the event carries everything: shedding is a policy decision, so the shed and rejected counts belong in the same event as the indexed count. The producer configuration is the fourth, quieter point — idempotence with acks=all is what makes a retried produce safe. Real platforms add schema-registry validation, per-tenant topic quotas, a relay that republishes outbox rows, and dead-letter events for the batches a human has to re-map.`,
+  debrief: `The interviewer is checking the three things a Kafka snippet gets wrong. First, the key is a partition contract: keyed by service, one service's ingestion stream is ordered; keyed by the shard, every service on that shard interleaves, which is why the starter's consumers saw counts jump around. Second, publish-after-commit is what makes the event a statement of fact rather than an intention, and it is the difference between a ledger that lags and a ledger that lies. Third, completeness is only honest when the event carries everything: shedding is a policy decision, so the shed and rejected counts belong in the same event as the indexed count. The producer configuration is the fourth, quieter point — idempotence with acks=all is what makes a retried produce safe. Real platforms add schema-registry validation, per-tenant topic quotas, a relay that republishes outbox rows, and dead-letter events for the batches a human has to re-map.`,
 };

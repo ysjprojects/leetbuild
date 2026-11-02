@@ -8,15 +8,15 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a trail comes back and the UI
+**Starting point.** The starter is working code: a trail comes back and the UI
 renders a chain, so the demo looks complete. It drops the steps that were skipped, it paints every
-step with one summary flag, and it answers for any tenant. Review it, fix it, and prove the fix.
+step with one summary flag, and it answers for any tenant. Debug it, fix it, and prove the fix.
 
 Implement \`GET /v1/requests/{id}\` — the read the UI, the auditor and the on-call engineer all use.
 
 - The tenant comes from \`X-Tenant-Id\` (**401** when missing) and the request is authorized like any
   other read: a request that belongs to another tenant answers **404**, exactly like one that does
-  not exist. The draft serves any request id in the path.
+  not exist. The starter serves any request id in the path.
 - The response reports the chain that was **pinned at submit time**: \`chain_version\` from the stored
   request, then one entry per step in chain order.
 - **Every step accounts for itself.** A step that was skipped appears with its **reason** — the
@@ -81,7 +81,7 @@ requester, the reasons and the amounts.`,
       id: 'skipped-steps',
       title: 'Skipped steps appear with their reasons',
       detail:
-        'The skipped steps of the pinned chain are carried into the response with the reason each was skipped, instead of being filtered out. The draft drops them, so a chain with skipped steps reads as complete.',
+        'The skipped steps of the pinned chain are carried into the response with the reason each was skipped, instead of being filtered out. The starter drops them, so a chain with skipped steps reads as complete.',
       match: {
         python: {all: [/skipped_steps/, /reason/]},
         typescript: {all: [/skippedSteps/, /reason/]},
@@ -94,7 +94,7 @@ requester, the reasons and the amounts.`,
       id: 'per-step-state',
       title: 'Each step reports its own state',
       detail:
-        'Every entry takes its state from that step’s own decision record through `step_state` / `stepState`: `pending` when nobody has decided yet, otherwise the decision. The draft stamps every step approved once any later step approved.',
+        'Every entry takes its state from that step’s own decision record through `step_state` / `stepState`: `pending` when nobody has decided yet, otherwise the decision. The starter stamps every step approved once any later step approved.',
       match: {
         python: {all: [/step_state\(/, /"pending"/]},
         typescript: {all: [/stepState\(/, /'pending'/]},
@@ -120,7 +120,7 @@ requester, the reasons and the amounts.`,
       id: 'chain-version-delegations',
       title: 'Reports the pinned chain version and the delegations',
       detail:
-        'The response carries the `chain_version` pinned at submit time and a `delegations` list naming, per step, who a decision was delegated from and who acted. The draft reports neither.',
+        'The response carries the `chain_version` pinned at submit time and a `delegations` list naming, per step, who a decision was delegated from and who acted. The starter reports neither.',
       match: {
         python: {all: [/chain_version/, /delegations/]},
         typescript: {all: [/chain_version/, /delegations/]},
@@ -157,9 +157,9 @@ def state_key(request_id: str) -> str:
 
 @app.get("/v1/requests/{id}")
 def read_request(id: str) -> JSONResponse:
-    # TODO: this draft filters the skipped steps out of the chain, stamps every step "approved" as
+    # TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
     # soon as one step approved, never checks the tenant, and reports neither the pinned chain
-    # version nor the delegations. Review all four.
+    # version nor the delegations. Fix all four.
     request = store.get(id)
     if request is None:
         return JSONResponse({"error": "unknown request"}, status_code=404)
@@ -258,7 +258,7 @@ def read_request(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/requests/{id}: a model-generated draft that hides what did not happen. */
+      starter: `/** GET /v1/requests/{id}: flawed code that hides what did not happen. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -283,9 +283,9 @@ export const store = {
 const stateKey = (requestId: string): string => \`approval:\${requestId}:state\`;
 
 app.get('/v1/requests/:id', async (request, reply) => {
-  // TODO: this draft filters the skipped steps out of the chain, stamps every step "approved" as
+  // TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
   // soon as one step approved, never checks the tenant, and reports neither the pinned chain
-  // version nor the delegations. Review all four.
+  // version nor the delegations. Fix all four.
   const {id} = request.params as {id: string};
   const stored = await store.get(id);
   if (stored === null) return reply.code(404).send({error: 'unknown request'});
@@ -418,9 +418,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readRequest(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft filters the skipped steps out of the chain, stamps every step "approved" as
+	// TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
 	// soon as one step approved, never checks the tenant, and reports neither the pinned chain
-	// version nor the delegations. Review all four.
+	// version nor the delegations. Fix all four.
 	id := r.PathValue("id")
 	request, err := store.Get(r.Context(), id)
 	if err != nil || request == nil {
@@ -635,9 +635,9 @@ object Read {
   val route: Route =
     path("v1" / "requests" / Segment) { id =>
       get {
-        // TODO: this draft filters the skipped steps out of the chain, stamps every step "approved"
+        // TODO: this starter filters the skipped steps out of the chain, stamps every step "approved"
         // as soon as one step approved, never checks the tenant, and reports neither the pinned
-        // chain version nor the delegations. Review all four.
+        // chain version nor the delegations. Fix all four.
         store.get(id) match {
           case None =>
             complete(StatusCodes.NotFound, """{"error":"unknown request"}""")
@@ -773,9 +773,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/requests/:id", [&redis](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft filters the skipped steps out of the chain, stamps every step "approved" as
+    // TODO: this starter filters the skipped steps out of the chain, stamps every step "approved" as
     // soon as one step approved, never checks the tenant, and reports neither the pinned chain
-    // version nor the delegations. Review all four.
+    // version nor the delegations. Fix all four.
     const auto id = req.path_params.at("id");
     const auto request = store.get(id);
     if (!request) {

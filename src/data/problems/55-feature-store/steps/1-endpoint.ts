@@ -8,22 +8,22 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it parses the body, stores the
+**Starting point.** The starter is working code: it parses the body, stores the
 definition and returns it. It compiles, it serves the demo, and it hides three production flaws.
-Review it like the platform owner, fix it, and prove the fix with the checks below.
+Debug it like the platform owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/features/definitions\` with body
 \`{"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}\`.
 
 - A definition is keyed by **(name, version)**. Registering an existing pair is **409**, and the
-  stored definition is returned untouched. The draft writes over the record, so a second registration
+  stored definition is returned untouched. The starter writes over the record, so a second registration
   silently changes the code both training and serving resolve to.
 - \`dtype\` is one of \`int64\`, \`float64\`, \`string\`, \`bool\` (**400** otherwise).
 - \`computation_ref\` is a pointer into the platform's compute registry, not free text: it is resolved
-  at registration time and a reference that names nothing is **422**. The draft accepts any string, so
+  at registration time and a reference that names nothing is **422**. The starter accepts any string, so
   the failure surfaces later, in a training job that has already read half a warehouse.
 - \`freshness_slo\` is the number of seconds within which a value must be recomputed. It is **required**
-  and must be positive (**400** when missing or \`null\`). The draft defaults it to \`null\`, and nothing
+  and must be positive (**400** when missing or \`null\`). The starter defaults it to \`null\`, and nothing
   downstream can alert on a definition that never declared how stale is too stale.
 - The response is the definition **as stored** — name, version, dtype, computation_ref, freshness_slo
   and the creation time — returned with **201**, not a restatement of the request body, so both
@@ -80,7 +80,7 @@ explicit SLO: validate everything before the write, and never overwrite a stored
       id: 'immutable-version',
       title: 'Treats (name, version) as immutable',
       detail:
-        'The store key is built from both `name` and `version`, an existing pair answers **409**, and the stored record is never overwritten. The draft keys by name only and mutates the definition in place.',
+        'The store key is built from both `name` and `version`, an existing pair answers **409**, and the stored record is never overwritten. The starter keys by name only and mutates the definition in place.',
       match: {
         python: {all: [/status_code\s*=\s*409/, /f"feature:\{body\.name\}:\{body\.version\}"/]},
         typescript: {all: [/code\(\s*409\s*\)/, /feature:\$\{body\.name\}:\$\{body\.version\}/]},
@@ -93,7 +93,7 @@ explicit SLO: validate everything before the write, and never overwrite a stored
       id: 'resolve-ref',
       title: 'Resolves computation_ref or answers 422',
       detail:
-        '`computation_ref` is looked up in the compute registry and a reference that does not resolve is **422**. The draft stores any string and lets the training job discover the typo.',
+        '`computation_ref` is looked up in the compute registry and a reference that does not resolve is **422**. The starter stores any string and lets the training job discover the typo.',
       match: {
         python: {all: [/COMPUTATION_REFS/, /status_code\s*=\s*422/]},
         typescript: {all: [/COMPUTATION_REFS/, /code\(\s*422\s*\)/]},
@@ -106,7 +106,7 @@ explicit SLO: validate everything before the write, and never overwrite a stored
       id: 'freshness-slo',
       title: 'Requires an explicit freshness SLO',
       detail:
-        'A missing, `null` or non-positive `freshness_slo` is **400**, and the stored definition carries the explicit value. The draft defaults it to `null`, so no consumer can alert on staleness.',
+        'A missing, `null` or non-positive `freshness_slo` is **400**, and the stored definition carries the explicit value. The starter defaults it to `null`, so no consumer can alert on staleness.',
       match: {
         python: {all: [/freshness_slo/, /status_code\s*=\s*400/]},
         typescript: {all: [/freshness_slo/, /code\(\s*400\s*\)/]},
@@ -119,7 +119,7 @@ explicit SLO: validate everything before the write, and never overwrite a stored
       id: 'stored-record',
       title: 'Stores and returns the canonical definition',
       detail:
-        'The handler writes the validated definition under the (name, version) key and answers **201** with that stored record. The draft answers 200 with a restatement of the request.',
+        'The handler writes the validated definition under the (name, version) key and answers **201** with that stored record. The starter answers 200 with a restatement of the request.',
       match: {
         python: {all: [/status_code\s*=\s*201/, /JSONResponse\(record/]},
         typescript: {all: [/code\(\s*201\s*\)/, /send\(record\)/]},
@@ -202,7 +202,7 @@ def register(body: Definition) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/features/definitions: a model-generated draft that overwrites whatever it is given. */
+      starter: `/** POST /v1/features/definitions: flawed code that overwrites whatever it is given. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

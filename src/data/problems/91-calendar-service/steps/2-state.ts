@@ -8,10 +8,10 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it lists the calendar's events,
-expands each one, memoises the expansion and drops the instances the caller has cancelled. It
-compiles, it serves the demo, and it hides the production flaws behind one cache key. Review it like
-the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it lists the calendar's events, expands each one,
+memoises the expansion and drops the instances the caller has cancelled. It compiles, it serves the
+demo, and it hides the production flaws behind one cache key. Debug it like the service owner, fix
+it, and prove the fix with the checks below.
 
 Implement the expansion and exception cache behind \`GET /v1/calendars/{id}/occurrences\` and
 \`POST /v1/calendars/{id}/exceptions\`:
@@ -90,7 +90,7 @@ cancelled occurrence; and a key with no TTL serves state that outlives the event
       id: 'range-key',
       title: 'Keys slices by (calendar, range, generation)',
       detail:
-        'The slice key is built from the calendar, the requested range and the generation (`EXPANSION_KEY` plus `expansion_key(calendar, start, end, generation)`). The draft keys by event id alone, so every range shares one slice and a new generation has nothing to point at.',
+        'The slice key is built from the calendar, the requested range and the generation (`EXPANSION_KEY` plus `expansion_key(calendar, start, end, generation)`). The starter keys by event id alone, so every range shares one slice and a new generation has nothing to point at.',
       match: {
         python: {all: [/EXPANSION_KEY = "exp:\{calendar\}:\{start\}:\{end\}:\{generation\}"/, /def expansion_key\(/]},
         typescript: {all: [/EXPANSION_KEY = 'exp'/, /function expansionKey\(/, /\$\{generation\}/]},
@@ -103,7 +103,7 @@ cancelled occurrence; and a key with no TTL serves state that outlives the event
       id: 'generation-sweep',
       title: 'One bump drops every range slice',
       detail:
-        'Invalidation is an `INCR` of the per-calendar generation plus a scan/delete across the `exp:{calendar}:*` prefix, so every slice of the old generations dies with one bump. The draft deletes only the single slice it happens to know about.',
+        'Invalidation is an `INCR` of the per-calendar generation plus a scan/delete across the `exp:{calendar}:*` prefix, so every slice of the old generations dies with one bump. The starter deletes only the single slice it happens to know about.',
       match: {
         python: {all: [/def invalidate_calendar\(/, /\.incr\(/, /scan_iter\(/, /\.delete\(/]},
         typescript: {all: [/function invalidateCalendar\(/, /\.incr\(/, /scanStream\(/, /\.del\(/]},
@@ -116,7 +116,7 @@ cancelled occurrence; and a key with no TTL serves state that outlives the event
       id: 'atomic-overlay',
       title: 'Overlays exceptions in the same EVAL',
       detail:
-        'One Lua `EVAL` reads the generation, the slice of that generation and the exceptions hash, drops `cancelled` instances and lets a moved instance override its start. The draft reads the expansion, then applies the exception in a second command, so a cancellation written mid-read is missed.',
+        'One Lua `EVAL` reads the generation, the slice of that generation and the exceptions hash, drops `cancelled` instances and lets a moved instance override its start. The starter reads the expansion, then applies the exception in a second command, so a cancellation written mid-read is missed.',
       match: {
         python: {all: [/READ_LUA/, /\.eval\(/, /HGETALL/, /'cancelled'/]},
         typescript: {all: [/READ_LUA/, /\.eval\(/, /HGETALL/, /'cancelled'/]},
@@ -129,7 +129,7 @@ cancelled occurrence; and a key with no TTL serves state that outlives the event
       id: 'ttl',
       title: 'Expansion and exception keys expire',
       detail:
-        'The slice is written with `EXPIRE ... EXPANSION_TTL_S` and the overlay with `EXPIRE ... EXCEPTION_TTL_S`, so no cache entry outlives the change that produced it. The draft sets no expiry at all.',
+        'The slice is written with `EXPIRE ... EXPANSION_TTL_S` and the overlay with `EXPIRE ... EXCEPTION_TTL_S`, so no cache entry outlives the change that produced it. The starter sets no expiry at all.',
       match: {
         python: {all: [/EXPANSION_TTL_S/, /EXCEPTION_TTL_S/, /\.expire\(/]},
         typescript: {all: [/EXPANSION_TTL_S/, /EXCEPTION_TTL_S/, /\.expire\(/]},
@@ -142,7 +142,7 @@ cancelled occurrence; and a key with no TTL serves state that outlives the event
       id: 'generation-bump',
       title: 'Bumps the generation before the write',
       detail:
-        'Every change `INCR`s the per-calendar generation before the new exception is written, and the read answer carries the generation it was served under. The draft writes the exception with no generation at all, so nothing orders a reader against a writer.',
+        'Every change `INCR`s the per-calendar generation before the new exception is written, and the read answer carries the generation it was served under. The starter writes the exception with no generation at all, so nothing orders a reader against a writer.',
       match: {
         python: {order: [/\.incr\(/, /\.hset\(/], all: [/"generation": generation/]},
         typescript: {order: [/\.incr\(/, /\.hset\(/], all: [/\{generation, occurrences\}/]},
@@ -180,9 +180,9 @@ def expand_event(event: dict, start: str, end: str) -> list[dict]:
 
 @app.get("/v1/calendars/{calendar}/occurrences")
 def read_occurrences(calendar: str, start: str = Query(), end: str = Query()) -> dict:
-    # TODO: this draft caches each event's expansion by event id with no range bounds and no
+    # TODO: this starter caches each event's expansion by event id with no range bounds and no
     # generation, filters the exceptions in a separate command after the expansion is read, and
-    # never expires anything. Review all four.
+    # never expires anything. Fix all four.
     occurrences: list[dict] = []
     for event in store.list_events(calendar):
         key = f"expansion:{event['id']}"
@@ -315,7 +315,7 @@ def apply_exception(calendar: str, body: ExceptionBody) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET occurrences + POST exceptions: a model-generated draft that caches by event id. */
+      starter: `/** GET occurrences + POST exceptions: flawed code that caches by event id. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -340,9 +340,9 @@ async function expandEvent(event: {id: string; rrule: string}, from: string, to:
 app.get('/v1/calendars/:calendar/occurrences', async (request, reply) => {
   const {calendar} = request.params as {calendar: string};
   const {start, end} = request.query as {start: string; end: string};
-  // TODO: this draft caches each event's expansion by event id with no range bounds and no
+  // TODO: this starter caches each event's expansion by event id with no range bounds and no
   // generation, filters the exceptions in a separate command after the expansion is read, and
-  // never expires anything. Review all four.
+  // never expires anything. Fix all four.
   const occurrences: Occurrence[] = [];
   for (const event of await store.listEvents(calendar)) {
     const key = \`expansion:\${event.id}\`;
@@ -535,9 +535,9 @@ func readOccurrences(rw http.ResponseWriter, r *http.Request) {
 	from := r.URL.Query().Get("start")
 	to := r.URL.Query().Get("end")
 	ctx := r.Context()
-	// TODO: this draft caches each event's expansion by event id with no range bounds and no
+	// TODO: this starter caches each event's expansion by event id with no range bounds and no
 	// generation, filters the exceptions in a separate command after the expansion is read, and
-	// never expires anything. Review all four.
+	// never expires anything. Fix all four.
 	events, _ := (&store{}).listEvents(ctx, calendar)
 	occurrences := []occurrence{}
 	for _, event := range events {
@@ -781,9 +781,9 @@ object StateApi {
 
   def expandEvent(event: String, from: String, to: String): List[Occurrence] = Nil
 
-  // TODO: this draft caches each event's expansion by event id with no range bounds and no
+  // TODO: this starter caches each event's expansion by event id with no range bounds and no
   // generation, filters the exceptions in a separate command after the expansion is read, and
-  // never expires anything. Review all four.
+  // never expires anything. Fix all four.
   val route: Route =
     path("v1" / "calendars" / Segment / "occurrences") { calendar =>
       get {
@@ -999,9 +999,9 @@ int main() {
     const auto calendar = req.matches[1].str();
     const auto from = req.get_param_value("start");
     const auto to = req.get_param_value("end");
-    // TODO: this draft caches each event's expansion by event id with no range bounds and no
+    // TODO: this starter caches each event's expansion by event id with no range bounds and no
     // generation, filters the exceptions in a separate command after the expansion is read, and
-    // never expires anything. Review all four.
+    // never expires anything. Fix all four.
     json occurrences = json::array();
     for (const auto& event : store.listEvents(calendar)) {
       const auto key = "expansion:" + event;

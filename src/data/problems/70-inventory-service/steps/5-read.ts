@@ -8,18 +8,18 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'sync'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the storefront gets a stock
+**Starting point.** The starter is working code: the storefront gets a stock
 number, the demo looks right, and the flaw only shows under load. It serves an \`on_hand\` that the
 warehouse sync refreshed at most an hour ago from an in-process cache, never subtracts the live
 holds, reports nothing about lag, and looks the sku up by id alone — so any tenant can read any
-tenant's sku. Review it like the service owner, fix it, and prove the fix with the checks below.
+tenant's sku. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/skus/{id}/stock\`, the number the storefront shows next to "add to cart":
 
 - \`available\`, \`reserved\` and \`on_hand\` are computed through the **same counter the reservation
   path decrements**: \`available\` is the live \`stock:{sku}\` value, \`reserved\` is every live
   \`hold:{sku}:*\` summed (the holds the reservation path sets with a TTL), and
-  \`on_hand = available + reserved\` — one source with three views. The draft recomputes nothing: it
+  \`on_hand = available + reserved\` — one source with three views. The starter recomputes nothing: it
   serves a cached count (\`ON_HAND_CACHE_TTL_S = 3600\`) and ignores the holds, so stock that is
   reserved but not yet sold reads as free, and the read disagrees with the reservation that was
   refused a second ago by exactly the writes since the last refresh.
@@ -31,7 +31,7 @@ Implement \`GET /v1/skus/{id}/stock\`, the number the storefront shows next to "
   \`stale = now − synced_at > SYNC_STALE_AFTER_S\` (60 s). A stale read still answers — the
   storefront decides what to show — but the lag is in the body.
 - The caller is a tenant (\`X-Tenant-Id\`): the sku is scoped through \`catalog.owner(sku)\`, and a
-  sku owned by another tenant — or by nobody — is **404** before any counter is read. The draft
+  sku owned by another tenant — or by nobody — is **404** before any counter is read. The starter
   looks the sku up by id alone, so one merchant can read another's stock.
 
 **Failure mode the checks target.** A cached on-hand is a second owner of a counter it does not
@@ -100,7 +100,7 @@ of these looks correct in the demo and lies under contention.`,
       id: 'route-read',
       title: 'Serves GET /v1/skus/{id}/stock',
       detail:
-        'The stock read is registered on `GET /v1/skus/{id}/stock` (the language’s path-parameter route) and its response carries `sku` and `on_hand` for that sku. The draft already answers this route, so this check passes on it — the four below are where it fails.',
+        'The stock read is registered on `GET /v1/skus/{id}/stock` (the language’s path-parameter route) and its response carries `sku` and `on_hand` for that sku. The starter already answers this route, so this check passes on it — the four below are where it fails.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/skus\/\{id\}\/stock["']/, /["']sku["']/, /["']on_hand["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/skus\/:id\/stock['"]/, /\bsku\b/, /\bon_hand\b/]},
@@ -115,7 +115,7 @@ of these looks correct in the demo and lies under contention.`,
       id: 'computed-fields',
       title: 'Reports available, reserved and on_hand from one source',
       detail:
-        '`available` is the live counter, `reserved` is every live hold on the sku summed by `reserved_for`/`reservedFor` over the `hold:{sku}:*` keys, and `on_hand` is `available + reserved` — one source, three fields. The draft serves `on_hand` alone and never looks at the holds, so reserved-but-unsold stock reads as free.',
+        '`available` is the live counter, `reserved` is every live hold on the sku summed by `reserved_for`/`reservedFor` over the `hold:{sku}:*` keys, and `on_hand` is `available + reserved` — one source, three fields. The starter serves `on_hand` alone and never looks at the holds, so reserved-but-unsold stock reads as free.',
       match: {
         python: {
           all: [
@@ -170,7 +170,7 @@ of these looks correct in the demo and lies under contention.`,
       id: 'live-counter',
       title: 'Reads the same counter the reservation path decrements',
       detail:
-        '`available` comes from the `stock:{sku}` key through the shared `counter_key`/`counterKey` helper — the counter the reservation path decrements — and no hourly cache-TTL read path (`ON_HAND_CACHE_TTL_S`, `cached_on_hand`) sits in front of it. The draft serves a count refreshed at most an hour ago, a second owner of the counter the reservation writes.',
+        '`available` comes from the `stock:{sku}` key through the shared `counter_key`/`counterKey` helper — the counter the reservation path decrements — and no hourly cache-TTL read path (`ON_HAND_CACHE_TTL_S`, `cached_on_hand`) sits in front of it. The starter serves a count refreshed at most an hour ago, a second owner of the counter the reservation writes.',
       match: {
         python: {
           all: [/def counter_key\(/, /f?["']stock:\{sku\}["']/, /\.get\(counter_key\(id\)\)/],
@@ -198,7 +198,7 @@ of these looks correct in the demo and lies under contention.`,
       id: 'staleness',
       title: 'Reports staleness against SYNC_STALE_AFTER_S',
       detail:
-        '`sync:updated_at` is compared with `now` and the response carries `synced_at`, `staleness_ms` and `stale`, true when the warehouse sync is older than `SYNC_STALE_AFTER_S` (60 s). The draft has no staleness field at all, so a warehouse that stopped syncing an hour ago is indistinguishable from one that synced a second ago.',
+        '`sync:updated_at` is compared with `now` and the response carries `synced_at`, `staleness_ms` and `stale`, true when the warehouse sync is older than `SYNC_STALE_AFTER_S` (60 s). The starter has no staleness field at all, so a warehouse that stopped syncing an hour ago is indistinguishable from one that synced a second ago.',
       match: {
         python: {
           all: [/["']sync:updated_at["']/, /SYNC_STALE_AFTER_S/, /["']stale["']\s*:/, /["']staleness_ms["']\s*:/],
@@ -213,7 +213,7 @@ of these looks correct in the demo and lies under contention.`,
       id: 'tenant-404',
       title: '404s a sku the tenant does not own',
       detail:
-        'The sku is scoped through `catalog.owner(sku)` and anything that is not the caller’s tenant — another owner, or no owner — is **404** before any counter is read. The draft looks the sku up by id alone, so any tenant can read any sku.',
+        'The sku is scoped through `catalog.owner(sku)` and anything that is not the caller’s tenant — another owner, or no owner — is **404** before any counter is read. The starter looks the sku up by id alone, so any tenant can read any sku.',
       match: {
         python: {all: [/X-Tenant-Id/, /catalog\.owner\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/x-tenant-id/, /catalog\.owner\(/, /code\(\s*404\s*\)/]},
@@ -251,7 +251,7 @@ def cached_on_hand(sku: str) -> int:
 
 @app.get("/v1/skus/{id}/stock")
 def read_stock(id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft serves an hourly-cached on-hand number, ignores the live holds, hides
+    # TODO: this starter serves an hourly-cached on-hand number, ignores the live holds, hides
     # warehouse lag, and looks the sku up by id alone so any tenant can read any sku. Read the
     # same live counter the reservation path decrements, report available and reserved, surface
     # staleness, and 404 a sku the caller's tenant does not own.
@@ -342,7 +342,7 @@ def read_stock(id: str, tenant: str | None = Header(default=None, alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** GET /v1/skus/{id}/stock: a model-generated draft that serves an hourly-cached on-hand. */
+      starter: `/** GET /v1/skus/{id}/stock: flawed code that serves an hourly-cached on-hand. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -363,7 +363,7 @@ function cachedOnHand(sku: string): number {
 }
 
 app.get('/v1/skus/:id/stock', async (request, reply) => {
-  // TODO: this draft serves an hourly-cached on-hand number, ignores the live holds, hides
+  // TODO: this starter serves an hourly-cached on-hand number, ignores the live holds, hides
   // warehouse lag, and looks the sku up by id alone so any tenant can read any sku. Read the same
   // live counter the reservation path decrements, report available and reserved, surface
   // staleness, and 404 a sku the caller's tenant does not own.
@@ -492,7 +492,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readStock(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves an hourly-cached on-hand number, ignores the live holds, hides
+	// TODO: this starter serves an hourly-cached on-hand number, ignores the live holds, hides
 	// warehouse lag, and looks the sku up by id alone so any tenant can read any sku. Read the
 	// same live counter the reservation path decrements, report available and reserved, surface
 	// staleness, and 404 a sku the caller's tenant does not own.
@@ -667,7 +667,7 @@ object StockRead {
   val route: Route =
     path("v1" / "skus" / Segment / "stock") { id =>
       get {
-        // TODO: this draft serves an hourly-cached on-hand number, ignores the live holds, hides
+        // TODO: this starter serves an hourly-cached on-hand number, ignores the live holds, hides
         // warehouse lag, and looks the sku up by id alone so any tenant can read any sku. Read
         // the same live counter the reservation path decrements, report available and reserved,
         // surface staleness, and 404 a sku the caller's tenant does not own.
@@ -825,7 +825,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/skus/([^/]+)/stock)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves an hourly-cached on-hand number, ignores the live holds, hides
+    // TODO: this starter serves an hourly-cached on-hand number, ignores the live holds, hides
     // warehouse lag, and looks the sku up by id alone so any tenant can read any sku. Read the
     // same live counter the reservation path decrements, report available and reserved, surface
     // staleness, and 404 a sku the caller's tenant does not own.
@@ -951,5 +951,5 @@ int main() {
     'Never hide lag: the warehouse sync stamps `sync:updated_at` in epoch seconds, and the read reports `synced_at` plus `staleness_ms` with `stale = now − synced_at > SYNC_STALE_AFTER_S` (60). A stale read still answers — the storefront decides what to show — but an hour of silence must be visible in the body, not inferred from a wrong number.',
     'Scope before you read: `catalog.owner(sku)` decides whether this tenant may see the sku at all. A foreign owner — or no owner — is **404** with no counters in the body, and ownership is resolved before the first Redis read so a scoping bug can never leak numbers.',
   ],
-  debrief: `The interviewer is testing the read side of the counter the reservation path owns: not “does it return a stock number” but “is it the number a reservation would be admitted against”. The draft fails the way a cache always fails — it becomes a second writer of a number it does not own: an hourly \`on_hand\` from the warehouse sync disagrees with \`stock:{sku}\` by exactly the holds and sales since the last refresh, and it ignores \`reserved\` entirely, so stock that is sold but not shipped reads as free. The fix is one source with three views: \`available\` is the live counter floored at zero by \`non_negative\` (what a reservation would still be granted), \`reserved\` is the live holds summed, and \`on_hand\` is their sum. Then the two properties a demo never shows. Freshness is explicit: \`sync:updated_at\` against \`SYNC_STALE_AFTER_S\` yields \`stale\` and \`staleness_ms\`, so a warehouse sync that stopped an hour ago is visible in the response instead of silently served. And scope comes before numbers: \`catalog.owner(sku)\` decides whether this tenant may see the sku at all, and a foreign or unknown sku is 404 with no counters. Real inventory reads add a per-warehouse watermark instead of one global timestamp, report in-transit and damaged units alongside reserved, and version the read so a cart total and a stock badge can be reasoned about together.`,
+  debrief: `The interviewer is testing the read side of the counter the reservation path owns: not “does it return a stock number” but “is it the number a reservation would be admitted against”. The starter fails the way a cache always fails — it becomes a second writer of a number it does not own: an hourly \`on_hand\` from the warehouse sync disagrees with \`stock:{sku}\` by exactly the holds and sales since the last refresh, and it ignores \`reserved\` entirely, so stock that is sold but not shipped reads as free. The fix is one source with three views: \`available\` is the live counter floored at zero by \`non_negative\` (what a reservation would still be granted), \`reserved\` is the live holds summed, and \`on_hand\` is their sum. Then the two properties a demo never shows. Freshness is explicit: \`sync:updated_at\` against \`SYNC_STALE_AFTER_S\` yields \`stale\` and \`staleness_ms\`, so a warehouse sync that stopped an hour ago is visible in the response instead of silently served. And scope comes before numbers: \`catalog.owner(sku)\` decides whether this tenant may see the sku at all, and a foreign or unknown sku is 404 with no counters. Real inventory reads add a per-warehouse watermark instead of one global timestamp, report in-transit and damaged units alongside reserved, and version the read so a cart total and a stock badge can be reasoned about together.`,
 };

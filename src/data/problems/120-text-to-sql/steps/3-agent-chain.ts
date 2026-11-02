@@ -8,7 +8,7 @@ export const agentChainStep: Step = {
   focus: ['api', 'agents', 'workspaces'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: with small tables and a
+**Starting point.** The starter is working code: with small tables and a
 healthy agent service it returns SQL, so the demo passes. It hides four production flaws: no
 deadline on any call, an unbounded retry of every error, no column pruning, and model output
 trusted as JSON. Find them, fix them, and prove the fix.
@@ -32,7 +32,7 @@ Implement the agent client the service uses after the user ACKs the tables — \
   \`parse_output\`: invalid JSON, a missing or non-string \`sql\` or \`explanation\`, or an empty
   \`sql\` is a \`GenerationError\`, not a crash in the handler.
 
-**Failure mode the checks target.** The draft retries forever on any error, so a permanent
+**Failure mode the checks target.** The starter retries forever on any error, so a permanent
 \`INVALID_ARGUMENT\` spins the worker against a provider that will never answer differently; with
 no deadline a slow generation holds the request open indefinitely; with no pruning the request
 that includes two wide tables fails intermittently on token size, which is exactly the bug that
@@ -68,7 +68,7 @@ malformed model answer into a 500 with a stack trace.`,
       id: 'deadlines',
       title: 'Classifier calls get 10 s, Generate gets 30 s',
       detail:
-        '`AGENT_DEADLINE_S = 10` is passed on `Intent`, `PickTables` and `PruneColumns`; `GENERATE_DEADLINE_S = 30` on `Generate`. The draft calls every agent without a deadline.',
+        '`AGENT_DEADLINE_S = 10` is passed on `Intent`, `PickTables` and `PruneColumns`; `GENERATE_DEADLINE_S = 30` on `Generate`. The starter calls every agent without a deadline.',
       match: {
         python: {
           all: [
@@ -101,7 +101,7 @@ malformed model answer into a 500 with a stack trace.`,
       id: 'retry-policy',
       title: 'At most two attempts, only UNAVAILABLE retried',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retried; every other status returns at once. The draft loops forever on any error.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retried; every other status returns at once. The starter loops forever on any error.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*2/, /range\(MAX_ATTEMPTS\)/, /StatusCode\.UNAVAILABLE/],
@@ -129,7 +129,7 @@ malformed model answer into a 500 with a stack trace.`,
       id: 'prune-when-large',
       title: 'Prunes columns when the schemas exceed the token budget',
       detail:
-        'When the estimate exceeds `SCHEMA_TOKEN_BUDGET = 24000`, `PruneColumns` runs and its skinnier schemas are what `Generate` receives. The draft never calls the prune agent, so wide tables fail intermittently on token size.',
+        'When the estimate exceeds `SCHEMA_TOKEN_BUDGET = 24000`, `PruneColumns` runs and its skinnier schemas are what `Generate` receives. The starter never calls the prune agent, so wide tables fail intermittently on token size.',
       match: {
         python: {all: [/SCHEMA_TOKEN_BUDGET\s*=\s*24_?000/, /\.PruneColumns\(/]},
         typescript: {all: [/SCHEMA_TOKEN_BUDGET\s*=\s*24_?000/, /\.PruneColumns\(/]},
@@ -142,7 +142,7 @@ malformed model answer into a 500 with a stack trace.`,
       id: 'prune-order',
       title: 'Estimates, prunes, then generates — in that order',
       detail:
-        '`estimate_tokens` (characters / 4) decides whether to prune, the prune call comes before `Generate`, and `Generate` is called with the schemas that came back. The draft has no estimate and generates from the raw schemas.',
+        '`estimate_tokens` (characters / 4) decides whether to prune, the prune call comes before `Generate`, and `Generate` is called with the schemas that came back. The starter has no estimate and generates from the raw schemas.',
       match: {
         python: {all: [/def estimate_tokens\(/], order: [/estimate_tokens\(/, /\.PruneColumns\(/, /\.Generate\(/]},
         typescript: {
@@ -158,7 +158,7 @@ malformed model answer into a 500 with a stack trace.`,
       id: 'parse-output',
       title: 'Parses the model output defensively',
       detail:
-        '`parse_output` parses the text as JSON inside a try, requires string `sql` and `explanation`, rejects an empty `sql`, and raises `GenerationError` otherwise. The draft indexes into the parsed text and crashes on the first malformed answer.',
+        '`parse_output` parses the text as JSON inside a try, requires string `sql` and `explanation`, rejects an empty `sql`, and raises `GenerationError` otherwise. The starter indexes into the parsed text and crashes on the first malformed answer.',
       match: {
         python: {
           all: [/def parse_output\(/, /json\.JSONDecodeError/, /isinstance\(\s*sql,\s*str\s*\)/, /GenerationError/],
@@ -296,7 +296,7 @@ def generate(question: str, workspace: str, tables: list[str]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Agent chain: a model-generated draft that retries everything forever and trusts the output. */
+      starter: `/** Agent chain: flawed code that retries everything forever and trusts the output. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

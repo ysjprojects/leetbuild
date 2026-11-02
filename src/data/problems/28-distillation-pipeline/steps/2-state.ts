@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it spends budget, counts samples and answers a
+**Starting point.** The starter is working code: it spends budget, counts samples and answers a
 verdict, so the demo dashboard moves. Two invariants are broken — one costs money, one loses
 correctness. Find them, fix them, and prove the fix.
 
@@ -57,7 +57,7 @@ and leave counts that disagree with the budget forever.`,
       id: 'dedupe-before-spend',
       title: 'Checks the dedupe set before it spends budget',
       detail:
-        '`SISMEMBER` on the dedupe set happens **before** any `DECRBY` on the budget, so a cached prompt costs nothing. The draft decrements first and only then looks at the cache, draining the budget on duplicates.',
+        '`SISMEMBER` on the dedupe set happens **before** any `DECRBY` on the budget, so a cached prompt costs nothing. The starter decrements first and only then looks at the cache, draining the budget on duplicates.',
       match: {
         python: {order: [/SISMEMBER/, /DECRBY/]},
         typescript: {order: [/SISMEMBER/, /DECRBY/]},
@@ -70,7 +70,7 @@ and leave counts that disagree with the budget forever.`,
       id: 'atomic-script',
       title: 'Moves budget and counters in one script',
       detail:
-        'One Lua script does the membership test, the budget decrement and every counter increment, registered and called from the client (`register_script` / `defineCommand` / `NewScript` / `eval`). The draft issues separate `DECRBY`/`HINCRBY` commands, so a crash between them leaves the job’s state inconsistent.',
+        'One Lua script does the membership test, the budget decrement and every counter increment, registered and called from the client (`register_script` / `defineCommand` / `NewScript` / `eval`). The starter issues separate `DECRBY`/`HINCRBY` commands, so a crash between them leaves the job’s state inconsistent.',
       match: {
         python: {all: [/register_script\(/, /redis\.call\(\s*['"]HINCRBY['"]/]},
         typescript: {all: [/defineCommand\(/, /redis\.call\(\s*['"]HINCRBY['"]/]},
@@ -83,7 +83,7 @@ and leave counts that disagree with the budget forever.`,
       id: 'hashed-prompt',
       title: 'Stores the prompt hash, never the prompt',
       detail:
-        'The dedupe set stores a SHA-256 of the prompt (`hashlib.sha256`, `createHash("sha256")`, `sha256.Sum256`, `MessageDigest.getInstance("SHA-256")`, `SHA256()`), and the hash is what `SISMEMBER` tests. The draft puts the raw prompt — tenant content — into a Redis key.',
+        'The dedupe set stores a SHA-256 of the prompt (`hashlib.sha256`, `createHash("sha256")`, `sha256.Sum256`, `MessageDigest.getInstance("SHA-256")`, `SHA256()`), and the hash is what `SISMEMBER` tests. The starter puts the raw prompt — tenant content — into a Redis key.',
       match: {
         python: {all: [/hashlib\.sha256\(/, /SISMEMBER/]},
         typescript: {all: [/createHash\(\s*'sha256'/, /SISMEMBER/]},
@@ -96,7 +96,7 @@ and leave counts that disagree with the budget forever.`,
       id: 'reject-reason',
       title: 'Records a reason for every rejection',
       detail:
-        'A rejection increments a named reason counter in `distill:reasons:{job_id}` — `duplicate` for a hash already seen, otherwise the outcome’s own reason. The draft counts rejections without saying why, so a run that rejected 40 percent of its samples cannot be explained afterwards.',
+        'A rejection increments a named reason counter in `distill:reasons:{job_id}` — `duplicate` for a hash already seen, otherwise the outcome’s own reason. The starter counts rejections without saying why, so a run that rejected 40 percent of its samples cannot be explained afterwards.',
       match: {
         python: {all: [/SISMEMBER/, /reason/]},
         typescript: {all: [/SISMEMBER/, /reason/]},
@@ -109,7 +109,7 @@ and leave counts that disagree with the budget forever.`,
       id: 'key-ttl',
       title: 'Expires the job keys from inside the script',
       detail:
-        'The script runs `EXPIRE` on the keys it touches with the caller’s `TTL_S`, so a finished or abandoned job stops holding memory. The draft sets no expiry at all and leaves every job’s budget and counters in Redis forever.',
+        'The script runs `EXPIRE` on the keys it touches with the caller’s `TTL_S`, so a finished or abandoned job stops holding memory. The starter sets no expiry at all and leaves every job’s budget and counters in Redis forever.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
@@ -132,8 +132,8 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def record(job_id: str, prompt: str, outcome: str) -> dict:
-    # TODO: this draft draws the budget down before it knows whether the call runs at all, stores
-    # the raw prompt in Redis, and moves the three counters with three separate commands. Review
+    # TODO: this starter draws the budget down before it knows whether the call runs at all, stores
+    # the raw prompt in Redis, and moves the three counters with three separate commands. Fix
     # all three: a crash between them leaves progress that no longer matches the budget.
     budget_key = BUDGET_PREFIX + job_id
     progress_key = PROGRESS_PREFIX + job_id
@@ -217,7 +217,7 @@ def record(job_id: str, prompt: str, outcome: str, reason: str = "none") -> dict
 `,
     },
     typescript: {
-      starter: `/** Job progress in Redis: a model-generated draft that spends before it checks. */
+      starter: `/** Job progress in Redis: flawed code that spends before it checks. */
 import Redis from 'ioredis';
 
 const CACHE_PREFIX = 'distill:seen:';
@@ -233,8 +233,8 @@ export interface SampleOutcome {
 }
 
 export async function record(jobId: string, prompt: string, outcome: string): Promise<SampleOutcome> {
-  // TODO: this draft draws the budget down before it knows whether the call runs at all, stores the
-  // raw prompt in Redis, and moves the three counters with three separate commands. Review all
+  // TODO: this starter draws the budget down before it knows whether the call runs at all, stores the
+  // raw prompt in Redis, and moves the three counters with three separate commands. Fix all
   // three: a crash between them leaves progress that no longer matches the budget.
   await redis.decrby(BUDGET_PREFIX + jobId, TOKENS_PER_CALL);
   if ((await redis.sismember(CACHE_PREFIX + jobId, prompt)) === 1) return {spent: 0, verdict: 'duplicate'};
@@ -345,8 +345,8 @@ type SampleOutcome struct {
 }
 
 func Record(ctx context.Context, rdb *redis.Client, jobID, prompt, outcome string) (SampleOutcome, error) {
-	// TODO: this draft draws the budget down before it knows whether the call runs at all, stores
-	// the raw prompt in Redis, and moves the three counters with three separate commands. Review all
+	// TODO: this starter draws the budget down before it knows whether the call runs at all, stores
+	// the raw prompt in Redis, and moves the three counters with three separate commands. Fix all
 	// three: a crash between them leaves progress that no longer matches the budget.
 	if err := rdb.DecrBy(ctx, budgetPrefix+jobID, tokensPerCall).Err(); err != nil {
 		return SampleOutcome{}, err
@@ -469,8 +469,8 @@ object JobState {
   val jedis = new Jedis("redis", 6379)
 
   def record(jobId: String, prompt: String, outcome: String): Unit = {
-    // TODO: this draft draws the budget down before it knows whether the call runs at all, stores
-    // the raw prompt in Redis, and moves the three counters with three separate commands. Review
+    // TODO: this starter draws the budget down before it knows whether the call runs at all, stores
+    // the raw prompt in Redis, and moves the three counters with three separate commands. Fix
     // all three: a crash between them leaves progress that no longer matches the budget.
     jedis.decrBy(BudgetPrefix + jobId, TokensPerCall)
     if (jedis.sismember(CachePrefix + jobId, prompt)) return
@@ -564,8 +564,8 @@ struct SampleOutcome {
 
 SampleOutcome record(sw::redis::Redis& redis, const std::string& jobId, const std::string& prompt,
                      const std::string& outcome) {
-  // TODO: this draft draws the budget down before it knows whether the call runs at all, stores the
-  // raw prompt in Redis, and moves the three counters with three separate commands. Review all
+  // TODO: this starter draws the budget down before it knows whether the call runs at all, stores the
+  // raw prompt in Redis, and moves the three counters with three separate commands. Fix all
   // three: a crash between them leaves progress that no longer matches the budget.
   redis.decrby(kBudgetPrefix + jobId, kTokensPerCall);
   if (redis.sismember(kCachePrefix + jobId, prompt)) return {0, "duplicate"};
@@ -660,5 +660,5 @@ SampleOutcome record(sw::redis::Redis& redis, const std::string& jobId, const st
 `,
     },
   },
-  debrief: `This is the step where a distillation run either has a budget or has a story about one. The draft passes review because the counters move and the demo shows a rate; what it hides is that a duplicate prompt costs a teacher call it never made, and that four separate commands are four chances to leave the budget and the counters disagreeing forever. The invariant to state out loud is "budget spent equals unique teacher calls that ran": the dedupe test comes first, the decrement happens once, and the counters move in the same script as the decrement. Real pipelines add near-duplicate detection on embeddings, a reservation before the call rather than after, and per-job keys hashed into a Redis Cluster slot so the script stays runnable.`,
+  debrief: `This is the step where a distillation run either has a budget or has a story about one. The starter looks correct because the counters move and the demo shows a rate; what it hides is that a duplicate prompt costs a teacher call it never made, and that four separate commands are four chances to leave the budget and the counters disagreeing forever. The invariant to state out loud is "budget spent equals unique teacher calls that ran": the dedupe test comes first, the decrement happens once, and the counters move in the same script as the decrement. Real pipelines add near-duplicate detection on embeddings, a reservation before the call rather than after, and per-job keys hashed into a Redis Cluster slot so the script stays runnable.`,
 };

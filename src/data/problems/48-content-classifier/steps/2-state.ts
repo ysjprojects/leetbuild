@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['classifier', 'redis', 'taxonomy'],
   task: `## Task
 
-The starter is a plausible model-generated draft: the first request fetches the taxonomy, the next
+The starter is working code: the first request fetches the taxonomy, the next
 one hits the cache, and the counters move, so the demo passes. The cache and the counters are both
 wrong. Find the flaws, fix them, and prove the fix.
 
@@ -79,7 +79,7 @@ the un-expired counter is an unbounded key space that grows one key per tenant p
       id: 'atomic-replace',
       title: 'Replaces the whole definition, never patches fields',
       detail:
-        'The write stores the entire serialized definition in one command. Patching fields with `HSET` keeps whatever was underneath, so a half-written taxonomy serves missing labels. The draft patches.',
+        'The write stores the entire serialized definition in one command. Patching fields with `HSET` keeps whatever was underneath, so a half-written taxonomy serves missing labels. The starter patches.',
       match: {
         python: {all: [/json\.dumps\(/, /r\.set\(/], none: [/hset/i]},
         typescript: {all: [/JSON\.stringify\(/, /\.set\(/], none: [/hset/i]},
@@ -130,9 +130,9 @@ def taxonomy_key(taxonomy_id: str) -> str:
 
 
 def cache_taxonomy(taxonomy_id: str, taxonomy: dict) -> None:
-    # TODO: this draft caches every tenant's taxonomy under the id alone and patches fields with
+    # TODO: this starter caches every tenant's taxonomy under the id alone and patches fields with
     # HSET, so one tenant's edit bleeds into another tenant's cached definition and a half-written
-    # taxonomy serves missing labels. The counters are written with no expiry at all. Review it.
+    # taxonomy serves missing labels. The counters are written with no expiry at all. Fix it.
     for label in taxonomy["labels"]:
         r.hset(taxonomy_key(taxonomy_id), label, "1")
 
@@ -194,7 +194,7 @@ def bump_counter(tenant: str, label: str, now: float | None = None) -> None:
 `,
     },
     typescript: {
-      starter: `/** Taxonomy cache and per-tenant counters: a model-generated draft with two caching bugs. */
+      starter: `/** Taxonomy cache and per-tenant counters: flawed code with two caching bugs. */
 import Redis from 'ioredis';
 
 export const r = new Redis({host: 'redis', port: 6379});
@@ -203,9 +203,9 @@ function taxonomyKey(taxonomyId: string): string {
   return \`taxonomy:\${taxonomyId}\`;
 }
 
-// TODO: this draft caches every tenant's taxonomy under the id alone and patches fields with HSET,
+// TODO: this starter caches every tenant's taxonomy under the id alone and patches fields with HSET,
 // so one tenant's edit bleeds into another tenant's cached definition and a half-written taxonomy
-// serves missing labels. The counters are written with no expiry at all. Review it.
+// serves missing labels. The counters are written with no expiry at all. Fix it.
 export async function cacheTaxonomy(taxonomyId: string, taxonomy: Taxonomy): Promise<void> {
   for (const label of taxonomy.labels) await r.hset(taxonomyKey(taxonomyId), label, '1');
 }
@@ -286,9 +286,9 @@ func taxonomyKey(taxonomyID string) string {
 	return "taxonomy:" + taxonomyID
 }
 
-// TODO: this draft caches every tenant's taxonomy under the id alone and patches fields with HSet,
+// TODO: this starter caches every tenant's taxonomy under the id alone and patches fields with HSet,
 // so one tenant's edit bleeds into another tenant's cached definition and a half-written taxonomy
-// serves missing labels. The counters are written with no expiry at all. Review it.
+// serves missing labels. The counters are written with no expiry at all. Fix it.
 func cacheTaxonomy(ctx context.Context, taxonomyID string, taxonomy Taxonomy) error {
 	for _, label := range taxonomy.Labels {
 		if err := r.HSet(ctx, taxonomyKey(taxonomyID), label, "1").Err(); err != nil {
@@ -384,9 +384,9 @@ object StateStore {
 
   def taxonomyKey(taxonomyId: String): String = s"taxonomy:$taxonomyId"
 
-  // TODO: this draft caches every tenant's taxonomy under the id alone and patches fields with
+  // TODO: this starter caches every tenant's taxonomy under the id alone and patches fields with
   // hset, so one tenant's edit bleeds into another tenant's cached definition and a half-written
-  // taxonomy serves missing labels. The counters are written with no expiry at all. Review it.
+  // taxonomy serves missing labels. The counters are written with no expiry at all. Fix it.
   def cacheTaxonomy(taxonomyId: String, taxonomy: Taxonomy): Unit = {
     taxonomy.labels.foreach(label => jedis.hset(taxonomyKey(taxonomyId), label, "1"))
   }
@@ -456,9 +456,9 @@ Redis r("tcp://redis:6379");
 
 std::string taxonomyKey(const std::string& taxonomyId) { return "taxonomy:" + taxonomyId; }
 
-// TODO: this draft caches every tenant's taxonomy under the id alone and patches fields with hset,
+// TODO: this starter caches every tenant's taxonomy under the id alone and patches fields with hset,
 // so one tenant's edit bleeds into another tenant's cached definition and a half-written taxonomy
-// serves missing labels. The counters are written with no expiry at all. Review it.
+// serves missing labels. The counters are written with no expiry at all. Fix it.
 void cacheTaxonomy(const std::string& taxonomyId, const Taxonomy& taxonomy) {
   for (const auto& label : taxonomy.labels) r.hset(taxonomyKey(taxonomyId), label, "1");
 }
@@ -524,5 +524,5 @@ void bumpCounter(const std::string& tenant, const std::string& label, long long 
     'Refresh the cache entry with one command that carries the whole value and the expiry (`SET key value EX 600`, `r.Set(ctx, key, data, 600s)`, `jedis.set(key, json, SetParams...ex(600))`). `HSET` mutates fields in place, so a removed label stays in the cache and a failed write leaves a half-patched definition.',
     'The window and its expiry are one idea: key the counter by the hour bucket, and in the same pipeline as the `HINCRBY` set `EXPIRE` to `3600 - now % 3600`. A fixed hour TTL from the first write is close, but the window that starts mid-hour would then outlive its own bucket.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated cache layer, where the bugs are invisible in a single-tenant demo. Three contracts are being checked: isolation (a cache key is a data boundary, and tenant data never shares one), atomicity of a cache write (a full replacement is one command; field patches are partial writes with a stale tail), and lifecycle (every key that represents a window must expire with that window, or the keyspace grows one key per tenant per hour forever). Real systems add cache versioning so a taxonomy edit invalidates by version rather than by time, a negative cache for missing taxonomies with a short TTL, and a metric on the miss rate so a cache stampede on a hot taxonomy is visible before it becomes a Redis outage.`,
+  debrief: `The interviewer is testing whether you can debug a cache layer, where the bugs are invisible in a single-tenant demo. Three contracts are being checked: isolation (a cache key is a data boundary, and tenant data never shares one), atomicity of a cache write (a full replacement is one command; field patches are partial writes with a stale tail), and lifecycle (every key that represents a window must expire with that window, or the keyspace grows one key per tenant per hour forever). Real systems add cache versioning so a taxonomy edit invalidates by version rather than by time, a negative cache for missing taxonomies with a short TTL, and a metric on the miss rate so a cache stampede on a hot taxonomy is visible before it becomes a Redis outage.`,
 };

@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['ingest', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it checks whether the content
+**Starting point.** The starter is working code: it checks whether the content
 hash was seen, counts the tenant's assets for the minute, and lets the demo through. It hides a race,
 a leak and a wrong order of operations. Find them, fix them, and prove the fix.
 
@@ -66,7 +66,7 @@ placed *after* the quota increment turns a harmless re-upload into a quota rejec
       id: 'dedupe-key',
       title: 'Keys dedupe and quota by tenant, hash and window',
       detail:
-        'The dedupe key is `ingest:dedupe:{tenant}:{content_hash}` and the counter is `ingest:quota:{tenant}:{window}`. The draft keys dedupe on the hash alone — so two tenants collide — and keeps one tenant-wide counter that never resets.',
+        'The dedupe key is `ingest:dedupe:{tenant}:{content_hash}` and the counter is `ingest:quota:{tenant}:{window}`. The starter keys dedupe on the hash alone — so two tenants collide — and keeps one tenant-wide counter that never resets.',
       match: {
         python: {all: [/ingest:dedupe:\{tenant\}:\{content_hash\}/, /ingest:quota:\{tenant\}:\{window\}/]},
         typescript: {all: [/ingest:dedupe:\$\{tenant\}:\$\{contentHash\}/, /ingest:quota:\$\{tenant\}:\$\{window\}/]},
@@ -118,7 +118,7 @@ placed *after* the quota increment turns a harmless re-upload into a quota rejec
       id: 'duplicate-first',
       title: 'A duplicate is answered before the quota is spent',
       detail:
-        'The script returns the stored asset for an existing dedupe key *before* it increments the counter, so a re-upload passes through the cache path even when the tenant is over quota. The draft charges first and dedupes afterwards.',
+        'The script returns the stored asset for an existing dedupe key *before* it increments the counter, so a re-upload passes through the cache path even when the tenant is over quota. The starter charges first and dedupes afterwards.',
       match: {
         python: {all: [/ingest:dedupe/], order: [/duplicate/, /'incr'/]},
         typescript: {all: [/ingest:dedupe/], order: [/duplicate/, /'incr'/]},
@@ -130,7 +130,7 @@ placed *after* the quota increment turns a harmless re-upload into a quota rejec
   ],
   code: {
     python: {
-      starter: `"""state.py — Redis dedupe and the ingest quota. A model-generated draft."""
+      starter: `"""state.py — Redis dedupe and the ingest quota. The starter."""
 
 import redis
 from fastapi import FastAPI, Header
@@ -150,7 +150,7 @@ class AssetRequest(BaseModel):
 
 
 def reserve(tenant: str, content_hash: str) -> tuple[bool, str]:
-    # TODO: this draft checks the dedupe key with one GET and increments the counter with a second
+    # TODO: this starter checks the dedupe key with one GET and increments the counter with a second
     # command, so two concurrent registrations both observe room that only one of them has; neither
     # key ever expires, and the dedupe key ignores the tenant.
     key = f"ingest:{content_hash}"
@@ -245,7 +245,7 @@ def create_asset(body: AssetRequest, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** state.ts — Redis dedupe and the ingest quota. A model-generated draft. */
+      starter: `/** state.ts — Redis dedupe and the ingest quota. The starter. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -261,7 +261,7 @@ interface AssetBody {
 }
 
 async function reserve(tenant: string, contentHash: string): Promise<[boolean, string]> {
-  // TODO: this draft checks the dedupe key with one GET and increments the counter with a second
+  // TODO: this starter checks the dedupe key with one GET and increments the counter with a second
   // command, so two concurrent registrations both observe room that only one of them has; neither
   // key ever expires, and the dedupe key ignores the tenant.
   const key = 'ingest:' + contentHash;
@@ -388,7 +388,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func reserve(ctx context.Context, tenant, contentHash string) (bool, string, error) {
-	// TODO: this draft checks the dedupe key with one GET and increments the counter with a second
+	// TODO: this starter checks the dedupe key with one GET and increments the counter with a second
 	// command, so two concurrent registrations both observe room that only one of them has; neither
 	// key ever expires, and the dedupe key ignores the tenant.
 	key := "ingest:" + contentHash
@@ -569,7 +569,7 @@ object IngestState {
   private val jedis = new Jedis("redis", 6379)
 
   def reserve(tenant: String, contentHash: String): (Boolean, String) = {
-    // TODO: this draft checks the dedupe key with one GET and increments the counter with a second
+    // TODO: this starter checks the dedupe key with one GET and increments the counter with a second
     // command, so two concurrent registrations both observe room that only one of them has; neither
     // key ever expires, and the dedupe key ignores the tenant.
     val key = s"ingest:$contentHash"
@@ -711,7 +711,7 @@ constexpr long long kQuotaLimit = 500;
 auto redis = sw::redis::Redis("tcp://redis:6379");
 
 bool reserve(const std::string& tenant, const std::string& contentHash, std::string& assetId) {
-  // TODO: this draft checks the dedupe key with one GET and increments the counter with a second
+  // TODO: this starter checks the dedupe key with one GET and increments the counter with a second
   // command, so two concurrent registrations both observe room that only one of them has; neither
   // key ever expires, and the dedupe key ignores the tenant.
   const std::string key = "ingest:" + contentHash;
@@ -844,7 +844,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can see the check-then-act shape in a cache path. The draft
+  debrief: `The interviewer is testing whether you can see the check-then-act shape in a cache path. The starter
 reads like a cache-aside implementation and it passes every sequential test; under concurrency the
 two commands are two decisions, and the tenant can spend a unit of quota twice. Moving them into one
 Lua script makes the read, the compare and both writes one decision, which is the only way a

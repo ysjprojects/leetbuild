@@ -8,18 +8,18 @@ export const readStep: Step = {
   focus: ['client', 'runner', 'db', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it reads a run, counts the critical findings, and
+**Starting point.** The starter is working code: it reads a run, counts the critical findings, and
 answers green when there are none. It also answers for runs that belong to someone else, and it
 quietly drops the categories that were never probed. Find the flaws, fix them, and prove the fix.
 
 Implement \`GET /v1/redteam/runs/{id}\`:
 
 - The run is **tenant-scoped**: a run that belongs to another tenant is **404**, exactly like a run
-  that does not exist. The draft returns any run to any caller.
+  that does not exist. The starter returns any run to any caller.
 - The report returns **coverage per category**, each with \`blocked\` and \`succeeded\` probe counts
   and an \`unfixed\` finding count, so a reader can see which categories actually ran.
 - A category skipped because the kill switch fired is reported as \`skipped\` (an **incomplete**
-  category, not a passing one) and the report carries a warning naming the kill switch. The draft
+  category, not a passing one) and the report carries a warning naming the kill switch. The starter
   hides skipped categories, so a run that covered two of five categories looks complete.
 - The run **cannot report \`pass\` while any category is skipped**: the status is \`incomplete\` in
   that case, however few findings were raised. Only a run with complete coverage and no unfixed
@@ -57,7 +57,7 @@ alone leaks another tenant's findings, their probe ids and their evidence refere
       id: 'coverage-by-category',
       title: 'Reports coverage per category',
       detail:
-        'The report carries a `coverage` list with `blocked` and `succeeded` probe counts and an `unfixed` finding count per category. The draft returns one critical count and nothing about coverage.',
+        'The report carries a `coverage` list with `blocked` and `succeeded` probe counts and an `unfixed` finding count per category. The starter returns one critical count and nothing about coverage.',
       match: {
         python: {all: [/coverage/, /blocked/, /succeeded/, /unfixed/]},
         typescript: {all: [/coverage/, /blocked/, /succeeded/, /unfixed/]},
@@ -70,7 +70,7 @@ alone leaks another tenant's findings, their probe ids and their evidence refere
       id: 'skipped-visible',
       title: 'Surfaces skipped categories with a warning',
       detail:
-        'A category skipped because the kill switch fired is marked `skipped` and the report warns with the reason. The draft drops skipped categories from the response entirely.',
+        'A category skipped because the kill switch fired is marked `skipped` and the report warns with the reason. The starter drops skipped categories from the response entirely.',
       match: {
         python: {all: [/skipped/, /kill switch fired/]},
         typescript: {all: [/skipped/, /kill switch fired/]},
@@ -83,7 +83,7 @@ alone leaks another tenant's findings, their probe ids and their evidence refere
       id: 'incomplete-not-pass',
       title: 'Refuses to report pass when a category was skipped',
       detail:
-        'The status is `incomplete` whenever `skipped_categories` is non-empty, regardless of how few findings there are. The draft reports `pass` as soon as no critical finding exists.',
+        'The status is `incomplete` whenever `skipped_categories` is non-empty, regardless of how few findings there are. The starter reports `pass` as soon as no critical finding exists.',
       match: {
         python: {all: [/skipped_categories/, /"incomplete"/]},
         typescript: {all: [/skippedCategories/, /'incomplete'/]},
@@ -96,7 +96,7 @@ alone leaks another tenant's findings, their probe ids and their evidence refere
       id: 'tenant-scoped-read',
       title: 'Serves only the caller’s runs',
       detail:
-        'The run is loaded and compared against the caller’s tenant; a foreign run is **404**, the same answer as a missing one. The draft loads by id and answers for any tenant.',
+        'The run is loaded and compared against the caller’s tenant; a foreign run is **404**, the same answer as a missing one. The starter loads by id and answers for any tenant.',
       match: {
         python: {all: [/tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/tenant/, /code\(\s*404\s*\)/]},
@@ -115,7 +115,7 @@ app = FastAPI()
 
 @app.get("/v1/redteam/runs/{run_id}")
 def get_run(run_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft answers any caller who knows a run id, reports pass as soon as there is no
+    # TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
     # critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
     # with a 404, report coverage per category, and make a run with skipped categories incomplete.
     run = run_store.get(run_id)
@@ -180,7 +180,7 @@ def get_run(run_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/redteam/runs/:runId: a model-generated draft that answers green by default. */
+      starter: `/** GET /v1/redteam/runs/:runId: flawed code that answers green by default. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -191,7 +191,7 @@ interface Finding {
 }
 
 app.get('/v1/redteam/runs/:runId', async (request, reply) => {
-  // TODO: this draft answers any caller who knows a run id, reports pass as soon as there is no
+  // TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
   // critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
   // with a 404, report coverage per category, and make a run with skipped categories incomplete.
   const {runId} = request.params as {runId: string};
@@ -293,7 +293,7 @@ type Finding struct {
 }
 
 func getRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft answers any caller who knows a run id, reports pass as soon as there is no
+	// TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
 	// critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
 	// with a 404, report coverage per category, and make a run with skipped categories incomplete.
 	runID := r.PathValue("runID")
@@ -451,7 +451,7 @@ object Read {
     path("v1" / "redteam" / "runs" / Segment) { runId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this draft answers any caller who knows a run id, reports pass as soon as there is
+          // TODO: this starter answers any caller who knows a run id, reports pass as soon as there is
           // no critical finding, and drops the categories a kill switch skipped. Scope the run to
           // the tenant with a 404, report coverage per category, and make a run with skipped
           // categories incomplete.
@@ -553,7 +553,7 @@ int main() {
   svr.Get("/v1/redteam/runs/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
     const auto runId = req.matches[1].str();
     const auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: this draft answers any caller who knows a run id, reports pass as soon as there is no
+    // TODO: this starter answers any caller who knows a run id, reports pass as soon as there is no
     // critical finding, and drops the categories a kill switch skipped. Scope the run to the tenant
     // with a 404, report coverage per category, and make a run with skipped categories incomplete.
     const auto run = runStore.get(runId);
@@ -663,5 +663,5 @@ int main() {
     '`skipped_categories` is the honest signal. If it is non-empty the answer is `incomplete`, and the response should say which categories and why (`kill switch fired`) — a warning the reader can act on beats a green badge they cannot trust.',
     'Scope the read by tenant and answer 404 for a foreign run. A 403 confirms the run exists, which is exactly the fact the other tenant does not want shared.',
   ],
-  debrief: `The interviewer is asking whether your report can be trusted when the run was cut short. The draft is the classic shape: it counts what went wrong and calls the absence of severity a success, which turns an aborted probe set into a green badge. Three contracts are checked here. Coverage is reported per category with blocked, succeeded and unfixed counts, so a reader can see where the run actually went. A skipped category is incomplete, and incomplete beats pass: no amount of quiet findings makes an untested category tested. And the read is tenant-scoped with a 404, because a report endpoint keyed by run id alone leaks another tenant's findings and evidence references. Real platforms add run-to-run comparison, a signed snapshot of the report at the moment a release decision was made, and an export that keeps the warnings attached to the numbers.`,
+  debrief: `The interviewer is asking whether your report can be trusted when the run was cut short. The starter is the classic shape: it counts what went wrong and calls the absence of severity a success, which turns an aborted probe set into a green badge. Three contracts are checked here. Coverage is reported per category with blocked, succeeded and unfixed counts, so a reader can see where the run actually went. A skipped category is incomplete, and incomplete beats pass: no amount of quiet findings makes an untested category tested. And the read is tenant-scoped with a 404, because a report endpoint keyed by run id alone leaks another tenant's findings and evidence references. Real platforms add run-to-run comparison, a signed snapshot of the report at the moment a release decision was made, and an export that keeps the warnings attached to the numbers.`,
 };

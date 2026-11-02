@@ -8,18 +8,18 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it looks up a key and returns
+**Starting point.** The starter is working code: it looks up a key and returns
 what it finds. Three things are wrong, and each one leaks data or a wrong vector. Find them and fix
 them.
 
 Implement \`GET /v1/embeddings/{content_hash}\`, the read the indexer and the retriever both use:
 
-- Resolve the **tenant from auth first**; a missing \`X-Tenant-Id\` is **401**. The draft looks the
+- Resolve the **tenant from auth first**; a missing \`X-Tenant-Id\` is **401**. The starter looks the
   vector up before it knows who is asking, so one tenant can read another's vector by guessing a hash.
 - Serve the vector **for the requested model version**. The key is the same
-  \`(tenant, model version, content hash)\` the write path used; the draft returns the first hit
+  \`(tenant, model version, content hash)\` the write path used; the starter returns the first hit
   regardless of version, so a \`v2\` request serves the \`v1\` vector.
-- A **miss is a 404** that points at the write path, not a 200 with an empty vector. The draft answers
+- A **miss is a 404** that points at the write path, not a 200 with an empty vector. The starter answers
   \`200 {"vector": []}\`, so callers cache an empty embedding as if it were real.
 - The response carries the **model version and the dimension** alongside the vector, so the caller can
   verify the shape instead of trusting it.
@@ -60,7 +60,7 @@ before auth leaks across tenants, dropping the version from the key serves stale
       id: 'tenant-auth',
       title: 'Resolves the tenant from auth first',
       detail:
-        "The tenant is read from `X-Tenant-Id` and an absent one is **401** before the cache is touched. The draft looks the vector up first, so a foreign tenant can read another's vector.",
+        "The tenant is read from `X-Tenant-Id` and an absent one is **401** before the cache is touched. The starter looks the vector up first, so a foreign tenant can read another's vector.",
       match: {
         python: {all: [/X-Tenant-Id/, /raise HTTPException/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
@@ -73,7 +73,7 @@ before auth leaks across tenants, dropping the version from the key serves stale
       id: 'version-scoped',
       title: 'Keys by model version so a v2 read never serves v1',
       detail:
-        'The read key includes the model version, so a request for another version is a miss. The draft returns the first hit regardless of version.',
+        'The read key includes the model version, so a request for another version is a miss. The starter returns the first hit regardless of version.',
       match: {
         python: {all: [/def read_key\(/, /model_version/]},
         typescript: {all: [/function readKey\(/, /modelVersion/]},
@@ -86,7 +86,7 @@ before auth leaks across tenants, dropping the version from the key serves stale
       id: 'miss-404',
       title: 'A miss is a 404 that points at the write path',
       detail:
-        'A cache miss returns **404** with a pointer to the write path, not a 200 with an empty vector. The draft teaches callers that an empty vector is valid.',
+        'A cache miss returns **404** with a pointer to the write path, not a 200 with an empty vector. The starter teaches callers that an empty vector is valid.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /write_path/]},
         typescript: {all: [/code\(\s*404\s*\)/, /write_path/]},
@@ -99,7 +99,7 @@ before auth leaks across tenants, dropping the version from the key serves stale
       id: 'reports-shape',
       title: 'Reports the model version and dimension',
       detail:
-        'The response carries the model version and the dimension beside the vector, so the caller can check the shape. The draft returns a bare vector.',
+        'The response carries the model version and the dimension beside the vector, so the caller can check the shape. The starter returns a bare vector.',
       match: {
         python: {all: [/model_version/, /dimension/]},
         typescript: {all: [/model_version/, /dimension/]},
@@ -124,8 +124,8 @@ MODEL_VERSION = "text-embedding-v1"
 
 @app.get("/v1/embeddings/{content_hash}")
 def read_embedding(content_hash: str) -> JSONResponse:
-    # TODO: check the tenant first (the draft looks the vector up first), keep the model version in
-    # the key (the draft returns the first hit regardless of version) and answer 404 on a miss
+    # TODO: check the tenant first (the starter looks the vector up first), keep the model version in
+    # the key (the starter returns the first hit regardless of version) and answer 404 on a miss
     # instead of 200 with an empty vector.
     entry = r.get(f"vector:{content_hash}")
     if entry is None:
@@ -184,8 +184,8 @@ const r = new Redis({host: 'redis', port: 6379});
 const MODEL_VERSION = 'text-embedding-v1';
 
 app.get('/v1/embeddings/:contentHash', async (request, reply) => {
-  // TODO: check the tenant first (the draft looks the vector up first), keep the model version in
-  // the key (the draft returns the first hit regardless of version) and answer 404 on a miss
+  // TODO: check the tenant first (the starter looks the vector up first), keep the model version in
+  // the key (the starter returns the first hit regardless of version) and answer 404 on a miss
   // instead of 200 with an empty vector.
   const {contentHash} = request.params as {contentHash: string};
   const entry = await r.get(\`vector:\${contentHash}\`);
@@ -237,8 +237,8 @@ import (
 const modelVersion = "text-embedding-v1"
 
 func handleRead(w http.ResponseWriter, r *http.Request) {
-	// TODO: check the tenant first (the draft looks the vector up first), keep the model version in
-	// the key (the draft returns the first hit regardless of version) and answer 404 on a miss
+	// TODO: check the tenant first (the starter looks the vector up first), keep the model version in
+	// the key (the starter returns the first hit regardless of version) and answer 404 on a miss
 	// instead of 200 with an empty vector.
 	contentHash := r.PathValue("contentHash")
 	entry, err := rdb.Get(r.Context(), "vector:"+contentHash).Result()
@@ -312,8 +312,8 @@ object ReadEndpoint {
   val route =
     path("v1" / "embeddings" / Segment) { contentHash =>
       get {
-        // TODO: check the tenant first (the draft looks the vector up first), keep the model version
-        // in the key (the draft returns the first hit regardless of version) and answer 404 on a
+        // TODO: check the tenant first (the starter looks the vector up first), keep the model version
+        // in the key (the starter returns the first hit regardless of version) and answer 404 on a
         // miss instead of 200 with an empty vector.
         store.get("vector:" + contentHash) match {
           case Some(stored) => complete(StatusCodes.OK, stored)
@@ -377,8 +377,8 @@ constexpr char kModelVersion[] = "text-embedding-v1";
 int main() {
   httplib::Server svr;
   svr.Get(R"(/v1/embeddings/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: check the tenant first (the draft looks the vector up first), keep the model version in
-    // the key (the draft returns the first hit regardless of version) and answer 404 on a miss
+    // TODO: check the tenant first (the starter looks the vector up first), keep the model version in
+    // the key (the starter returns the first hit regardless of version) and answer 404 on a miss
     // instead of 200 with an empty vector.
     const std::string contentHash = req.matches[1];
     auto entry = redis.get("vector:" + contentHash);

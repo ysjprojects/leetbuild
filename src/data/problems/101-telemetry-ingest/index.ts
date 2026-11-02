@@ -7,11 +7,11 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Telemetry ingest on the AI-era track: the course is not "accept a JSON body", it is the review
- * you owe a model-generated pipeline before it feeds a fleet's aggregates. Registry-bound devices
- * with in-range readings → one atomic Redis decision that covers the device's rate and its latest
- * value → batch-scoped time-series writes under a deadline → device-keyed bucketed rollups with an
- * outbox → a series read with a range cap, a named downsampling method and honest staleness.
+ * Telemetry ingest: the course is not "accept a JSON body", it is the debugging you owe a pipeline
+ * before it feeds a fleet's aggregates. Registry-bound devices with in-range readings → one atomic
+ * Redis decision that covers the device's rate and its latest value → batch-scoped time-series
+ * writes under a deadline → device-keyed bucketed rollups with an outbox → a series read with a
+ * range cap, a named downsampling method and honest staleness.
  */
 export const telemetryIngestProblem: Problem = {
   id: 'telemetry-ingest',
@@ -19,7 +19,6 @@ export const telemetryIngestProblem: Problem = {
   tagline: 'High-volume device telemetry with registry-bound devices and honest acks.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Telemetry Ingest
 
@@ -65,12 +64,12 @@ One service, **ingestd**, with five pieces:
    downsampling beyond 1000 points with the method named in the response, the newest point's age
    reported, and a device from another fleet answered as \`404\`.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real ingest
-edge: read the draft against the failure modes, name the subtle one, fix it, and prove the fix with
-checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real ingest edge: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

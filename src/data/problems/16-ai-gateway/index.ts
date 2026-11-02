@@ -8,7 +8,7 @@ import {usageEventsStep} from './steps/5-usage-events';
 
 /**
  * LLM gateway: the gateway every product team puts in front of a model provider. Each step starts
- * from a plausible AI-generated draft that passes the happy path, and asks the learner to review
+ * from working code that passes the happy path and hides one flaw, and asks the learner to debug
  * it: tighten the request contract, make the tenant budget atomic, stop paying for cancelled
  * streams, fail over without double-charging, and emit usage exactly once.
  */
@@ -19,7 +19,7 @@ export const aiGatewayProblem: Problem = {
     'One gateway in front of model providers: validated chat, atomic budgets, cancellable streams, safe failover, billed usage.',
   difficulty: 'easy',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 60,
   statement: `# LLM Gateway
 
@@ -34,7 +34,7 @@ OpenAI's edge, Anthropic's API, and every company's internal AI platform do the 
 they put a validated, authenticated boundary in front of the models; they enforce per-tenant rate
 and token budgets atomically; they cancel upstream work the moment a client goes away; and they
 account for every token exactly once, even when a provider times out or a broker is unavailable.
-The hard part is rarely the model call. It is the review of the code around it: the deadline that
+The hard part is rarely the model call. It is the debugging of the code around it: the deadline that
 was forgotten, the read-then-decrement that raced, the stream that kept generating after the user
 closed the tab, the retry that charged twice, the event that was dropped on a bad Kafka day.
 
@@ -53,12 +53,13 @@ One service, **gateway**, in five pieces:
 5. One **usage** event per request to Kafka, keyed by tenant, with an outbox fallback and a billing
    consumer that increments Redis before it commits.
 
-## The review premise
+## The debugging habit
 
-Every starter in this course is a plausible model-generated draft. It compiles, it passes the happy
+Every starter in this course is working code with a flaw. It compiles, it passes the happy
 path, and it reads like the examples in the provider's documentation. Your job is not to rewrite it
-from scratch: read it as a reviewer, find the subtle failure mode, make the smallest correct fix,
-and prove the fix with the checks.
+from scratch: debug it against the failure modes, name the subtle one, make the smallest correct
+fix, optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on
+your version.
 
 ## Left out on purpose
 

@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it returns a list of the
+**Starting point.** The starter is working code: it returns a list of the
 schedule's fires and a \`stalled: false\`, so the demo shows a history. It builds that history the
-wrong way round. Review it like the on-call engineer who has to read it, fix it, and prove the fix
+wrong way round. Debug it like the on-call engineer who has to read it, fix it, and prove the fix
 with the checks below.
 
 Implement \`GET /v1/schedules/{schedule_id}/history\`.
@@ -30,7 +30,7 @@ Implement \`GET /v1/schedules/{schedule_id}/history\`.
   (\`silent\` seconds since the last run). Derive it from the same expectation math, so a schedule
   with a five-minute cron is not called stalled after three minutes of quiet.
 
-**Failure mode the checks target.** The draft synthesizes history from successful fires only, so a
+**Failure mode the checks target.** The starter synthesizes history from successful fires only, so a
 schedule whose fire path has been broken for a week returns an empty list and \`stalled: false\` —
 the most dangerous shape a health read can take, because it looks exactly like a schedule that had
 nothing to do. It also shows no policy on a skipped row and never checks who owns the schedule.`,
@@ -68,7 +68,7 @@ nothing to do. It also shows no policy on a skipped row and never checks who own
       id: 'misfires',
       title: 'Missing windows appear as misfires with the policy',
       detail:
-        'Rows come from `expected_windows(cron, since, now)`: an expected window with no record is a `misfire` row carrying the schedule\u2019s `misfire_policy`. The draft lists only successful fires, so a broken schedule looks idle.',
+        'Rows come from `expected_windows(cron, since, now)`: an expected window with no record is a `misfire` row carrying the schedule\u2019s `misfire_policy`. The starter lists only successful fires, so a broken schedule looks idle.',
       match: {
         python: {all: [/expected_windows\(/, /"misfire"/, /misfire_policy/]},
         typescript: {all: [/expectedWindows\(/, /'misfire'/, /misfire_policy/]},
@@ -94,7 +94,7 @@ nothing to do. It also shows no policy on a skipped row and never checks who own
       id: 'stall-flag',
       title: 'Stall flag comes from expectation math',
       detail:
-        '`STALL_WINDOWS = 3` expected windows of silence set `stalled` from `silent` seconds since the last run, measured against the cron interval — not a hardcoded false. The draft always reports `stalled: false`.',
+        '`STALL_WINDOWS = 3` expected windows of silence set `stalled` from `silent` seconds since the last run, measured against the cron interval — not a hardcoded false. The starter always reports `stalled: false`.',
       match: {
         python: {all: [/STALL_WINDOWS\s*=\s*3/, /stalled/, /silent/]},
         typescript: {all: [/STALL_WINDOWS\s*=\s*3/, /stalled/, /silent/]},
@@ -107,7 +107,7 @@ nothing to do. It also shows no policy on a skipped row and never checks who own
       id: 'ownership-404',
       title: 'Another tenant’s schedule is 404',
       detail:
-        'The schedule is loaded by `(tenant, id)` and answered **404** when it is missing or owned by another tenant, so the read cannot be used to probe for someone else’s schedules. The draft looks the schedule up by id alone.',
+        'The schedule is loaded by `(tenant, id)` and answered **404** when it is missing or owned by another tenant, so the read cannot be used to probe for someone else’s schedules. The starter looks the schedule up by id alone.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /tenant/]},
@@ -145,9 +145,9 @@ def history(
     schedule_id: str,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft synthesizes history from successful fires only, so a broken schedule looks
+    # TODO: this starter synthesizes history from successful fires only, so a broken schedule looks
     # idle, shows no policy on a skipped row, and never checks that the schedule belongs to the
-    # calling tenant. Review all three.
+    # calling tenant. Fix all three.
     rows = [
         {"window": window, "outcome": "fired"}
         for window in store.fired_windows(schedule_id)
@@ -261,7 +261,7 @@ def history(
 `,
     },
     typescript: {
-      starter: `/** A model-generated draft that synthesizes history from successful fires. */
+      starter: `/** Schedule history: flawed code that synthesizes history from successful fires. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -274,9 +274,9 @@ interface HistoryStore {
 const store = {} as HistoryStore;
 
 app.get('/v1/schedules/:id/history', async (request, reply) => {
-  // TODO: this draft synthesizes history from successful fires only, so a broken schedule looks
+  // TODO: this starter synthesizes history from successful fires only, so a broken schedule looks
   // idle, shows no policy on a skipped row, and never checks that the schedule belongs to the
-  // calling tenant. Review all three.
+  // calling tenant. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const {id} = request.params as {id: string};
   const rows = (await store.firedWindows(id)).map(window => ({window, outcome: 'fired'}));
@@ -370,9 +370,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func scheduleHistory(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft synthesizes history from successful fires only, so a broken schedule looks
+	// TODO: this starter synthesizes history from successful fires only, so a broken schedule looks
 	// idle, shows no policy on a skipped row, and never checks that the schedule belongs to the
-	// calling tenant. Review all three.
+	// calling tenant. Fix all three.
 	tenant := r.Header.Get("X-Tenant-Id")
 	id := r.PathValue("id")
 	rows := make([]map[string]any, 0)
@@ -518,9 +518,9 @@ object HistoryApi {
     path("v1" / "schedules" / Segment / "history") { scheduleId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this draft synthesizes history from successful fires only, so a broken schedule
+          // TODO: this starter synthesizes history from successful fires only, so a broken schedule
           // looks idle, shows no policy on a skipped row, and never checks that the schedule
-          // belongs to the calling tenant. Review all three.
+          // belongs to the calling tenant. Fix all three.
           val rows = store.firedWindows(scheduleId).map { window =>
             Map("window" -> window, "outcome" -> "fired")
           }
@@ -645,9 +645,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/schedules/([^/]+)/history)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft synthesizes history from successful fires only, so a broken schedule looks
+    // TODO: this starter synthesizes history from successful fires only, so a broken schedule looks
     // idle, shows no policy on a skipped row, and never checks that the schedule belongs to the
-    // calling tenant. Review all three.
+    // calling tenant. Fix all three.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto scheduleId = req.matches[1];
     json rows = json::array();
@@ -785,5 +785,5 @@ int main() {
     'Carry the policy on every row. A `skipped` row with `policy` and `reason` is a decision the operator made; the same row without them is indistinguishable from data loss, which is why the history read and the fire path must agree on the same field.',
     'The stall flag is arithmetic: `silent = now - last_run` against `STALL_WINDOWS = 3` times the cron interval. Return it with `silent` so the reader can see the numbers behind the boolean, and look the schedule up by `(tenant, id)` so a 404 is also the answer for someone else\u2019s schedule.',
   ],
-  debrief: `The interviewer is testing what a health read is allowed to say. The draft passes because the demo schedule fired a minute ago. Four defects are checked: history derived from successes instead of expectations, no policy on the rows, an unbounded window, and an ownership check that is missing. The first one is the dangerous one: an empty list with \`stalled: false\` is the same response for a schedule that has nothing to do and a schedule whose fire path has been dead for a week. Real history reads also paginate, aggregate per day for long ranges, and cross-check the ledger against the ledger consumer's offset so a lost event is distinguishable from a window that never fired.`,
+  debrief: `The interviewer is testing what a health read is allowed to say. The starter passes because the demo schedule fired a minute ago. Four defects are checked: history derived from successes instead of expectations, no policy on the rows, an unbounded window, and an ownership check that is missing. The first one is the dangerous one: an empty list with \`stalled: false\` is the same response for a schedule that has nothing to do and a schedule whose fire path has been dead for a week. Real history reads also paginate, aggregate per day for long ranges, and cross-check the ledger against the ledger consumer's offset so a lost event is distinguishable from a window that never fired.`,
 };

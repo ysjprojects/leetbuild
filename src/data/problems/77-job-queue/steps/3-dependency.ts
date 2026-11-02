@@ -8,10 +8,10 @@ export const dependencyStep: Step = {
   focus: ['worker', 'effect', 'dlq', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the worker's execution path:
+**Starting point.** The starter is working code for the worker's execution path:
 it calls the executor over gRPC, retries the failure and eventually dead-letters the job. It
 compiles, it serves the demo, and it hides every flaw that decides whether a poison pill ever dies.
-Review it like the on-call engineer for the queue, fix it, and prove the fix with the checks below.
+Debug it like the on-call engineer for the queue, fix it, and prove the fix with the checks below.
 
 Implement the execution half of \`jobqd\`: one claimed job is driven through the
 \`jobrunner.JobRunner\` \`Execute\` RPC until it succeeds, is dead-lettered, or has spent its
@@ -20,7 +20,7 @@ attempts.
 - Only the **retryable** statuses earn another attempt: \`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`,
   \`RESOURCE_EXHAUSTED\` and \`ABORTED\`. A permanent status — \`INVALID_ARGUMENT\`,
   \`FAILED_PRECONDITION\`, \`PERMISSION_DENIED\`, \`NOT_FOUND\` — is decided once and dead-lettered on
-  the spot. The draft retries every error, so a payload the executor will reject forever is retried
+  the spot. The starter retries every error, so a payload the executor will reject forever is retried
   forever.
 - Attempts are bounded by \`MAX_ATTEMPTS = 5\` and spaced by exponential backoff:
   \`BACKOFF_BASE_MS = 1000\` doubling per attempt, capped at \`BACKOFF_CAP_MS = 30000\`, with the
@@ -31,10 +31,10 @@ attempts.
 - The call carries the claim's visibility timeout as its deadline (\`VISIBILITY_TIMEOUT_S = 60\`): a
   call that outlives its claim can be re-claimed by another worker while it is still running.
 - When the attempts are spent, the job moves to \`job_dead_letter\` with a \`reason\` and **every**
-  attempt's error, not just the last one. The draft buries the job with a single string and loses the
+  attempt's error, not just the last one. The starter buries the job with a single string and loses the
   history an operator needs to fix the payload.
 
-**Failure mode the checks target.** The draft looks right because the demo's executor fails once and
+**Failure mode the checks target.** The starter looks right because the demo's executor fails once and
 then succeeds. Two flaws hide underneath. Retrying a permanent error is an unbounded loop against an
 executor that has already rejected the payload: the worker slot never comes back, the job never
 dead-letters, and nothing pages anyone. Counting attempts in a local variable is the second: every
@@ -85,7 +85,7 @@ evidence missing when somebody has to fix the payload.`,
       id: 'execute-call',
       title: 'Drives the claimed job through JobRunner.Execute',
       detail:
-        'The worker client dials `jobrunner.JobRunner` and issues `Execute` for the claimed job — the one part of the shape the draft gets right. The deadline, the retry classification and the durable attempt count are what the rest of the checks review.',
+        'The worker client dials `jobrunner.JobRunner` and issues `Execute` for the claimed job — the one part of the shape the starter gets right. The deadline, the retry classification and the durable attempt count are what the rest of the checks cover.',
       match: {
         python: {all: [/JobRunner/, /\.Execute\(/]},
         typescript: {all: [/JobRunner/, /\.Execute\(/]},
@@ -98,7 +98,7 @@ evidence missing when somebody has to fix the payload.`,
       id: 'retryable-statuses',
       title: 'Retries only the retryable statuses; permanent errors bury on the spot',
       detail:
-        'A retryable set separates `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` and `ABORTED` from the permanent codes `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `PERMISSION_DENIED`, `NOT_FOUND`, and a permanent status dead-letters on the first attempt. The draft catches every error the same way and retries it, so a payload the executor rejects forever is retried forever.',
+        'A retryable set separates `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED` and `ABORTED` from the permanent codes `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `PERMISSION_DENIED`, `NOT_FOUND`, and a permanent status dead-letters on the first attempt. The starter catches every error the same way and retries it, so a payload the executor rejects forever is retried forever.',
       match: {
         python: {
           all: [
@@ -161,7 +161,7 @@ evidence missing when somebody has to fix the payload.`,
       id: 'backoff-schedule',
       title: 'Backs off exponentially from 1 s to a 30 s cap, recorded as next_retry_at',
       detail:
-        'The delay is `BACKOFF_BASE_MS = 1000` doubling per attempt and capped at `BACKOFF_CAP_MS = 30000`, and the moment the next attempt is due is written to `next_retry_at` so the schedule survives the crash too. The draft re-calls immediately and records no retry time.',
+        'The delay is `BACKOFF_BASE_MS = 1000` doubling per attempt and capped at `BACKOFF_CAP_MS = 30000`, and the moment the next attempt is due is written to `next_retry_at` so the schedule survives the crash too. The starter re-calls immediately and records no retry time.',
       match: {
         python: {
           all: [
@@ -199,7 +199,7 @@ evidence missing when somebody has to fix the payload.`,
       id: 'attempt-durable',
       title: 'The attempt row is written before the call; a restart resumes the count',
       detail:
-        '`MAX_ATTEMPTS = 5` bounds the job, and each attempt is a row in `job_attempts` written before the call (`begin_attempt`) with the count read back from the store on entry (`attempts`). The draft keeps the count in a local variable and writes the row after the call, so a worker restart resets the count to zero and the fifth attempt is never reached.',
+        '`MAX_ATTEMPTS = 5` bounds the job, and each attempt is a row in `job_attempts` written before the call (`begin_attempt`) with the count read back from the store on entry (`attempts`). The starter keeps the count in a local variable and writes the row after the call, so a worker restart resets the count to zero and the fifth attempt is never reached.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*5/, /store\.begin_attempt\(/, /store\.attempts\(/],
@@ -232,7 +232,7 @@ evidence missing when somebody has to fix the payload.`,
       id: 'dead-letter-history',
       title: 'Attempt 5 dead-letters with the reason and every attempt’s error',
       detail:
-        'When the attempts are spent the job moves to `job_dead_letter` with `max_attempts_exceeded` and the history of every attempt’s error, not just the last one. The draft’s dead letter carries a single `last_error` string, so the attempts that led there are lost.',
+        'When the attempts are spent the job moves to `job_dead_letter` with `max_attempts_exceeded` and the history of every attempt’s error, not just the last one. The starter’s dead letter carries a single `last_error` string, so the attempts that led there are lost.',
       match: {
         python: {
           all: [/dlq\.move\(/, /history/, /max_attempts_exceeded/],
@@ -264,7 +264,7 @@ evidence missing when somebody has to fix the payload.`,
   ],
   code: {
     python: {
-      starter: `"""Run a claimed job over gRPC: a model-generated draft that retries every failure forever."""
+      starter: `"""Run a claimed job over gRPC: flawed code that retries every failure forever."""
 import logging
 
 import grpc
@@ -295,7 +295,7 @@ dlq = DeadLetterQueue()
 
 
 def execute_job(job: dict) -> str:
-    # TODO: this draft retries every error in an unbounded loop, counts attempts in a local variable
+    # TODO: this starter retries every error in an unbounded loop, counts attempts in a local variable
     # so a worker restart forgets them, and dead-letters with only the last error string.
     attempts = 0
     last_error = ""
@@ -413,7 +413,7 @@ def execute_job(job: dict) -> str:
 `,
     },
     typescript: {
-      starter: `/** Run a claimed job over gRPC: a model-generated draft that retries every failure forever. */
+      starter: `/** Run a claimed job over gRPC: flawed code that retries every failure forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -449,7 +449,7 @@ const store = new JobStore();
 const dlq = new DeadLetterQueue();
 
 export async function executeJob(job: {job_id: string; type: string; payload: string}): Promise<string> {
-  // TODO: this draft retries every error in an unbounded loop, counts attempts in a local variable
+  // TODO: this starter retries every error in an unbounded loop, counts attempts in a local variable
   // so a worker restart forgets them, and dead-letters with only the last error string.
   let attempts = 0;
   let lastError = '';
@@ -638,7 +638,7 @@ var (
 
 // ExecuteJob drives one claimed job through the executor.
 func ExecuteJob(ctx context.Context, runner jobrunnerpb.JobRunnerClient, job Job) (string, error) {
-	// TODO: this draft retries every error in an unbounded loop, counts attempts in a local variable
+	// TODO: this starter retries every error in an unbounded loop, counts attempts in a local variable
 	// so a worker restart forgets them, and dead-letters with only the last error string.
 	attempts := 0
 	lastError := ""
@@ -823,7 +823,7 @@ object JobRunnerClient {
   val store = new JobStore
   val dlq = new DeadLetterQueue
 
-  // TODO: this draft retries every error in an unbounded loop, counts attempts in a local variable
+  // TODO: this starter retries every error in an unbounded loop, counts attempts in a local variable
   // so a worker restart forgets them, and dead-letters with only the last error string.
   def executeJob(job: Job): String = {
     var attempts = 0
@@ -960,7 +960,7 @@ class DeadLetterQueue {
   void move(const std::string& job_id, const std::string& reason, const std::string& last_error) {}
 };
 
-// TODO: this draft retries every error in an unbounded loop, counts attempts in a local variable so
+// TODO: this starter retries every error in an unbounded loop, counts attempts in a local variable so
 // a worker restart forgets them, and dead-letters with only the last error string.
 std::string executeJob(jobrunner::JobRunner::Stub* runner, JobStore* store, DeadLetterQueue* dlq, const Job& job) {
   int attempts = 0;
@@ -1105,9 +1105,9 @@ std::string executeJob(jobrunner::JobRunner::Stub* runner, JobStore* store, Dead
     },
   },
   hints: [
-    'Retryability is a property of the status, not of “it threw”: classify with a `RETRYABLE_STATUSES` set (`exc.code()`, `err.code`, `status.Code(err)`, `exc.getStatus.getCode`, `call.error_code()`), and send anything permanent straight to the dead-letter queue. The draft’s handler treats every failure the same, so an `INVALID_ARGUMENT` on a malformed payload spins forever.',
-    'The attempt count has to outlive the process: write the attempt row to `job_attempts` **before** the call and read the count back when the worker picks the job up, so `MAX_ATTEMPTS = 5` bounds the total across restarts instead of within one run. The draft’s local `attempts += 1` is back to zero after every deploy — that is the difference between a poison pill dying at five and living forever.',
-    'Backoff is `BACKOFF_BASE_MS * 2 ** (attempt - 1)` capped at `BACKOFF_CAP_MS`, written as `next_retry_at` so the schedule survives a crash too, and the dead-letter record carries the whole history list — every attempt’s error — beside the `reason`. The draft re-calls immediately and passes one `last_error` string.',
+    'Retryability is a property of the status, not of “it threw”: classify with a `RETRYABLE_STATUSES` set (`exc.code()`, `err.code`, `status.Code(err)`, `exc.getStatus.getCode`, `call.error_code()`), and send anything permanent straight to the dead-letter queue. The starter’s handler treats every failure the same, so an `INVALID_ARGUMENT` on a malformed payload spins forever.',
+    'The attempt count has to outlive the process: write the attempt row to `job_attempts` **before** the call and read the count back when the worker picks the job up, so `MAX_ATTEMPTS = 5` bounds the total across restarts instead of within one run. The starter’s local `attempts += 1` is back to zero after every deploy — that is the difference between a poison pill dying at five and living forever.',
+    'Backoff is `BACKOFF_BASE_MS * 2 ** (attempt - 1)` capped at `BACKOFF_CAP_MS`, written as `next_retry_at` so the schedule survives a crash too, and the dead-letter record carries the whole history list — every attempt’s error — beside the `reason`. The starter re-calls immediately and passes one `last_error` string.',
   ],
-  debrief: `The interviewer is asking one question under three names: which failures are worth another attempt, how many attempts is too many, and what does the next engineer inherit when the job finally dies. Classification is the first answer — a status set that separates \`UNAVAILABLE\` from \`INVALID_ARGUMENT\` — because retrying a permanent error turns one bad payload into an unbounded loop against an executor that has already decided, and no amount of waiting changes its mind. The durable attempt count is the second: the count lives in \`job_attempts\` and is written before the call, so a worker that restarts mid-attempt resumes at three instead of one and the poison pill actually reaches five. The dead-letter record is the third, and the one most teams skip: a job that moves to \`job_dead_letter\` carrying every attempt's error is a ticket somebody can act on; one carrying the last string alone is a shrug. The draft deserves to be believed because the demo's only failure is transient and the worker never restarts. Real workers add jitter to the backoff so a deploy does not synchronise the whole fleet into one retry storm, a heartbeat that extends the claim so an attempt can never outlive its visibility timeout, a replay path that re-runs dead letters with the side effect made idempotent, and an alert on the dead-letter rate — because a queue that buries jobs quietly is a queue that loses them quietly.`,
+  debrief: `The interviewer is asking one question under three names: which failures are worth another attempt, how many attempts is too many, and what does the next engineer inherit when the job finally dies. Classification is the first answer — a status set that separates \`UNAVAILABLE\` from \`INVALID_ARGUMENT\` — because retrying a permanent error turns one bad payload into an unbounded loop against an executor that has already decided, and no amount of waiting changes its mind. The durable attempt count is the second: the count lives in \`job_attempts\` and is written before the call, so a worker that restarts mid-attempt resumes at three instead of one and the poison pill actually reaches five. The dead-letter record is the third, and the one most teams skip: a job that moves to \`job_dead_letter\` carrying every attempt's error is a ticket somebody can act on; one carrying the last string alone is a shrug. The starter deserves to be believed because the demo's only failure is transient and the worker never restarts. Real workers add jitter to the backoff so a deploy does not synchronise the whole fleet into one retry storm, a heartbeat that extends the claim so an attempt can never outlive its visibility timeout, a replay path that re-runs dead letters with the side effect made idempotent, and an alert on the dead-letter rate — because a queue that buries jobs quietly is a queue that loses them quietly.`,
 };

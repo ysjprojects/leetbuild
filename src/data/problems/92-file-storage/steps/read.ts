@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'reader', 'redis', 'audit'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the download endpoint: it
+**Starting point.** The starter is working code for the download endpoint: it
 registers the route and returns a URL for the file. It compiles, the demo downloads work, and it hides
-three production flaws. Review it, fix it, and prove the fix with the checks below.
+three production flaws. Debug it, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/files/{id}\`:
 
@@ -59,7 +59,7 @@ reconstruct after an incident, when the question is exactly who read which objec
       id: 'signed-url',
       title: 'Returns a URL signed with the server key',
       detail:
-        'The URL is signed over path, expiry and tenant with the server’s signing key. The draft returns a plain public URL that anyone can mint.',
+        'The URL is signed over path, expiry and tenant with the server’s signing key. The starter returns a plain public URL that anyone can mint.',
       match: {
         python: {all: [/SIGNING_KEY/, /hmac\.new\(/]},
         typescript: {all: [/SIGNING_KEY/, /createHmac\(/]},
@@ -72,7 +72,7 @@ reconstruct after an incident, when the question is exactly who read which objec
       id: 'expiry',
       title: 'The signed URL expires after 10 minutes',
       detail:
-        'The signature carries an expiry `600` seconds out. The draft’s URL has no expiry, so it is a permanent capability.',
+        'The signature carries an expiry `600` seconds out. The starter’s URL has no expiry, so it is a permanent capability.',
       match: {
         python: {all: [/SIGNED_URL_TTL_S/, /expires/]},
         typescript: {all: [/SIGNED_URL_TTL_S/, /expires/]},
@@ -85,7 +85,7 @@ reconstruct after an incident, when the question is exactly who read which objec
       id: 'tenant-scope',
       title: 'A foreign file id is 404, not 403',
       detail:
-        'The file’s owning tenant is compared with the caller’s and a mismatch is **404**, so the endpoint never confirms that another tenant’s id exists. The draft serves any file id to any caller.',
+        'The file’s owning tenant is compared with the caller’s and a mismatch is **404**, so the endpoint never confirms that another tenant’s id exists. The starter serves any file id to any caller.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /record\["tenant"\]/]},
         typescript: {all: [/code\(\s*404\s*\)/, /record\.tenant/]},
@@ -98,7 +98,7 @@ reconstruct after an incident, when the question is exactly who read which objec
       id: 'audit',
       title: 'Every issuance is audited with the requester',
       detail:
-        'An `download_issued` record carrying the file, the tenant and the requesting user is appended before the URL leaves. The draft audits nothing.',
+        'An `download_issued` record carrying the file, the tenant and the requesting user is appended before the URL leaves. The starter audits nothing.',
       match: {
         python: {all: [/audit\.append\(/, /download_issued/]},
         typescript: {all: [/audit\.append\(/, /download_issued/]},
@@ -120,7 +120,7 @@ CDN_BASE = "https://cdn.example.com"
 
 @app.get("/v1/files/{file_id}")
 async def download(file_id: str, x_tenant_id: str = Header(default="")):
-    # TODO: this draft hands out a permanent public URL, serves any file id to any caller, and
+    # TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
     # audits nothing.
     return JSONResponse({"url": CDN_BASE + "/" + file_id}, status_code=200)
 `,
@@ -172,7 +172,7 @@ const CDN_BASE = 'https://cdn.example.com';
 
 export function registerDownloadApi(app: FastifyInstance): void {
   app.get('/v1/files/:fileId', async (req, reply) => {
-    // TODO: this draft hands out a permanent public URL, serves any file id to any caller, and
+    // TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
     // audits nothing.
     return reply.code(200).send({url: CDN_BASE + '/' + (req.params as {fileId: string}).fileId});
   });
@@ -216,7 +216,7 @@ import (
 )
 
 func download(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft hands out a permanent public URL, serves any file id to any caller, and
+	// TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
 	// audits nothing.
 	writeJSON(rw, http.StatusOK, map[string]string{"url": "https://cdn.example.com/" + r.PathValue("fileId")})
 }
@@ -294,7 +294,7 @@ object DownloadApi {
   val route: Route =
     path("v1" / "files" / Segment) { fileId =>
       get {
-        // TODO: this draft hands out a permanent public URL, serves any file id to any caller, and
+        // TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
         // audits nothing.
         complete(StatusCodes.OK, PublicUrl("https://cdn.example.com/" + fileId))
       }
@@ -367,7 +367,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/files/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft hands out a permanent public URL, serves any file id to any caller, and
+    // TODO: this starter hands out a permanent public URL, serves any file id to any caller, and
     // audits nothing.
     res.status = 200;
     res.set_content(json{{"url", kCdnBase + "/" + req.matches[1]}}.dump(), "application/json");
@@ -441,5 +441,5 @@ int main() {
     'Ten minutes is a budget, not a constant to admire: long enough for the browser to follow the redirect and start the transfer, short enough that a leaked link dies before it is useful. Return `expires_in` so the client knows when to ask again.',
     'Answer 404 for another tenant’s file, never 403. A 403 tells the caller the id exists and belongs to someone else; a 404 tells them nothing, and the audit record is where the attempt shows up instead.',
   ],
-  debrief: `The interviewer is testing whether you can review an access path, not just a storage path. The draft's "public URL" is the single most common generated shortcut and the most expensive: it turns a one-time read into a permanent capability. The fix has three parts — sign the URL so the CDN can verify it, give it a short expiry so a leak is bounded, and bind it to the tenant so the signature cannot be replayed. The audit record is the part candidates skip: it is what turns "someone read the object" into "this user read this object at this time". Real systems add per-object rate limits, a CDN-side check that the file's tenant still matches, and a key rotation that invalidates links older than the rotation window.`,
+  debrief: `The interviewer is testing whether you can debug an access path, not just a storage path. The starter's "public URL" is the single most common shortcut and the most expensive: it turns a one-time read into a permanent capability. The fix has three parts — sign the URL so the CDN can verify it, give it a short expiry so a leak is bounded, and bind it to the tenant so the signature cannot be replayed. The audit record is the part candidates skip: it is what turns "someone read the object" into "this user read this object at this time". Real systems add per-object rate limits, a CDN-side check that the file's tenant still matches, and a key rotation that invalidates links older than the rotation window.`,
 };

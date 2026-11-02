@@ -8,24 +8,24 @@ export const trainingStateStep: Step = {
   focus: ['scheduler', 'redis', 'worker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the queue half of
+**Starting point.** The starter is working code for the queue half of
 \`trainsched\`: a run goes in with \`ZADD <priority>\`, comes out with \`ZPOPMIN\`, and a boost writes a
 key of its own. It serves the demo — one run, one band, one worker — and it hides the two flaws this
 step is about: a start that never happened loses the run, and a priority boost leaves the run in two
-places at once. Review it like the person who owns the fleet, fix it, and prove the fix.
+places at once. Debug it like the person who owns the fleet, fix it, and prove the fix.
 
 Implement the Redis side of the scheduler: the queue a run waits in and the lease the scheduler holds
 while a worker starts it.
 
 - **One position per run, derived from the band and the age.** The queue is the sorted set
   \`training:queue\` and a run's score is \`band * EPOCH_MS + enqueued_at_ms\`, with \`band\`,
-  \`priority\`, \`enqueued_at_ms\` and \`state\` kept in the hash \`training:run:{run_id}\`. The draft
+  \`priority\`, \`enqueued_at_ms\` and \`state\` kept in the hash \`training:run:{run_id}\`. The starter
   scores the raw priority with no age term, so every run in a band ties on the same score and a run
   submitted a second ago can sort ahead of one that has been waiting an hour.
 - **A move is one member's score, never a second key.** \`boost(run_id, band)\` must move the run
   atomically: a Lua \`EVAL\` (a registered script, or an equivalent atomic \`ZADD\` that replaces the
   same member's score) that rewrites the run's score inside \`training:queue\` and the \`band\` field of
-  its hash together. The draft writes \`SET training:queue:{band}:{run_id}\`, so the sorted set the
+  its hash together. The starter writes \`SET training:queue:{band}:{run_id}\`, so the sorted set the
   scheduler actually polls keeps the old position and the boost lives in a key nobody reads.
 - **Starting a run is a lease, not a pop.** \`claim_start(run_id, worker)\` claims the run with
   \`SET training:lease:{run_id} <worker> NX EX LEASE_TTL_S\` (\`15 s\`) and records the deadline in
@@ -73,7 +73,7 @@ flaws are invisible to a single-run demo, and both are checked below.`,
       id: 'queue-position',
       title: 'Scores a position from the band and the enqueue time',
       detail:
-        'The position is `band * EPOCH_MS + enqueued_at_ms`, computed once by `position_score`, and `band`, `priority`, `enqueued_at_ms` and `state` are written to the run hash. The draft scores the raw priority, so a band 0 run with priority 9 and one with priority 7 differ by two points while nothing records that one of them waited an hour: the band must decide first and the millisecond only breaks ties inside it.',
+        'The position is `band * EPOCH_MS + enqueued_at_ms`, computed once by `position_score`, and `band`, `priority`, `enqueued_at_ms` and `state` are written to the run hash. The starter scores the raw priority, so a band 0 run with priority 9 and one with priority 7 differ by two points while nothing records that one of them waited an hour: the band must decide first and the millisecond only breaks ties inside it.',
       match: {
         python: {all: [/def position_score\(/, /band\s*\*\s*EPOCH_MS/, /['"]enqueued_at_ms['"]/, /['"]band['"]/]},
         typescript: {
@@ -88,7 +88,7 @@ flaws are invisible to a single-run demo, and both are checked below.`,
       id: 'single-position',
       title: 'A boost moves the run’s score instead of writing a second key',
       detail:
-        '`boost` runs one Lua `EVAL` (a registered script) that `ZSCORE`s the run, `ZADD`s the same member with its new score and updates the `band` field of the run hash, so the run occupies exactly one position no matter how two schedulers interleave. The draft writes `SET training:queue:{band}:{run_id}`: the sorted set the scheduler polls keeps the old member, and the same run now has two positions, one of which is invisible to every reader.',
+        '`boost` runs one Lua `EVAL` (a registered script) that `ZSCORE`s the run, `ZADD`s the same member with its new score and updates the `band` field of the run hash, so the run occupies exactly one position no matter how two schedulers interleave. The starter writes `SET training:queue:{band}:{run_id}`: the sorted set the scheduler polls keeps the old member, and the same run now has two positions, one of which is invisible to every reader.',
       match: {
         python: {all: [/MOVE_SCRIPT/, /\.eval\(\s*MOVE_SCRIPT/, /ZSCORE/, /ZADD/]},
         typescript: {all: [/MOVE_SCRIPT/, /\.eval\(\s*MOVE_SCRIPT/, /ZSCORE/, /ZADD/]},
@@ -101,7 +101,7 @@ flaws are invisible to a single-run demo, and both are checked below.`,
       id: 'start-lease',
       title: 'A start is claimed with a lease before the worker is asked',
       detail:
-        '`claim_start(run_id, worker)` claims the start with `SET training:lease:{run_id} <worker> NX EX LEASE_TTL_S` (`15 s`) and records the deadline in the `training:leases` sorted set, so a second scheduler that loses the claim leaves the run to its owner instead of starting it twice. The draft pops the run and calls it started: with no `NX`, no TTL and no deadline there is nothing to take over, and nothing that knows the start is still in flight.',
+        '`claim_start(run_id, worker)` claims the start with `SET training:lease:{run_id} <worker> NX EX LEASE_TTL_S` (`15 s`) and records the deadline in the `training:leases` sorted set, so a second scheduler that loses the claim leaves the run to its owner instead of starting it twice. The starter pops the run and calls it started: with no `NX`, no TTL and no deadline there is nothing to take over, and nothing that knows the start is still in flight.',
       match: {
         python: {all: [/LEASE_TTL_S/, /'NX'/, /'EX'/, /training:leases/, /ZADD/, /def claim_start\(/]},
         typescript: {all: [/LEASE_TTL_S/, /'NX'/, /'EX'/, /training:leases/, /ZADD/, /claimStart\(/]},
@@ -165,7 +165,7 @@ QUEUE_KEY = "training:queue"
 
 
 def queue_key(band: int, run_id: str) -> str:
-    """Where this draft parks a run after a boost."""
+    """Where this starter parks a run after a boost."""
     return f"training:queue:{band}:{run_id}"
 
 
@@ -176,7 +176,7 @@ class TrainingQueue:
         self.redis = redis
 
     def enqueue(self, run_id: str, band: int, priority: int) -> None:
-        # TODO: this draft scores the queue with the raw priority and no age term, so every run in
+        # TODO: this starter scores the queue with the raw priority and no age term, so every run in
         # a band ties; a boost writes a per-band key with SET instead of moving the run inside one
         # sorted set, so the run keeps its old position as well; and a start pops the run and calls
         # it started with no lease, so a worker that dies during startup orphans it.
@@ -335,7 +335,7 @@ class TrainingQueue:
 `,
     },
     typescript: {
-      starter: `/** The scheduler's Redis queue: a model-generated draft that pops a run and calls it started. */
+      starter: `/** The scheduler's Redis queue: flawed code that pops a run and calls it started. */
 import {Redis} from 'ioredis';
 
 export const r = new Redis('redis://redis:6379');
@@ -347,7 +347,7 @@ function queueKey(band: number, runId: string): string {
 }
 
 export async function enqueue(runId: string, band: number, priority: number): Promise<void> {
-  // TODO: this draft scores the queue with the raw priority and no age term, so every run in a band
+  // TODO: this starter scores the queue with the raw priority and no age term, so every run in a band
   // ties; a boost writes a per-band key with set instead of moving the run inside one sorted set, so
   // the run keeps its old position as well; and a start pops the run and calls it started with no
   // lease, so a worker that dies during startup orphans it.
@@ -501,7 +501,7 @@ func queueKey(band int, runID string) string {
 }
 
 func enqueue(ctx context.Context, rdb *redis.Client, runID string, band, priority int) error {
-	// TODO: this draft scores the queue with the raw priority and no age term, so every run in a
+	// TODO: this starter scores the queue with the raw priority and no age term, so every run in a
 	// band ties; a boost writes a per-band key with Set instead of moving the run inside one sorted
 	// set, so the run keeps its old position as well; and a start pops the run and calls it started
 	// with no lease, so a worker that dies during startup orphans it.
@@ -657,7 +657,7 @@ object TrainingQueue {
   def queueKey(band: Int, runId: String): String = s"training:queue:$band:$runId"
 
   def enqueue(runId: String, band: Int, priority: Int): Unit = {
-    // TODO: this draft scores the queue with the raw priority and no age term, so every run in a
+    // TODO: this starter scores the queue with the raw priority and no age term, so every run in a
     // band ties; a boost writes a per-band key with set instead of moving the run inside one sorted
     // set, so the run keeps its old position as well; and a start pops the run and calls it started
     // with no lease, so a worker that dies during startup orphans it.
@@ -804,7 +804,7 @@ std::string queueKey(int band, const std::string& runId) {
 }
 
 void enqueue(sw::redis::Redis& redis, const std::string& runId, int band, int priority) {
-  // TODO: this draft scores the queue with the raw priority and no age term, so every run in a band
+  // TODO: this starter scores the queue with the raw priority and no age term, so every run in a band
   // ties; a boost writes a per-band key with set instead of moving the run inside one sorted set, so
   // the run keeps its old position as well; and a start pops the run and calls it started with no
   // lease, so a worker that dies during startup orphans it.
@@ -933,7 +933,7 @@ long long reapExpired(sw::redis::Redis& redis, long long nowMs) {
     'A boost is a move, not an insert. `ZADD training:queue <new_score> <run_id>` on the same member replaces its score in place; put the `ZSCORE` read, that `ZADD` and the hash update in one script so the position in the sorted set and the `band` field can never disagree.',
     'Claim before you call the worker, and reap on a timer: `SET training:lease:{run_id} <worker> NX EX 15` plus `ZADD training:leases <deadline> <run_id>` is the claim; `ZRANGEBYSCORE training:leases 0 <now>` finds the leases nobody renewed, and each of those runs goes back to `training:queue` at `band * EPOCH_MS + enqueued_at_ms` with the band read from its own hash.',
   ],
-  debrief: `The interviewer is testing whether you can review a queue that is also a lock. The draft looks
+  debrief: `The interviewer is testing whether you can debug a queue that is also a lock. The starter looks
 right because the demo enqueues one run and starts it: nothing crashes, and no second scheduler
 exists to race the first. What it hides is that the pop is not a claim — the run leaves the queue
 before it leaves the machine, so a worker that dies during startup loses it silently and

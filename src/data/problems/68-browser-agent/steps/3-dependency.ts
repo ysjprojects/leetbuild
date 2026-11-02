@@ -8,11 +8,11 @@ export const dependencyStep: Step = {
   focus: ['worker', 'driver', 'profile'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it sends every action to the
+**Starting point.** The starter is working code: it sends every action to the
 driver through one \`for\` loop with a single \`RETRIES = 3\` constant and no deadline on any call, and
 the demo passes because the first click lands on a page that is already open. It hides a
 double-submitted form, a hung page that keeps receiving actions, and a retry policy that replays
-whatever side effect it is handed. Review it like the owner of the worker’s driver client, fix it,
+whatever side effect it is handed. Debug it like the owner of the worker’s driver client, fix it,
 and prove the fix with the checks below.
 
 Every action the step loop runs goes out over **gRPC** through the worker’s \`BrowserDriver\` stub
@@ -37,7 +37,7 @@ Every action the step loop runs goes out over **gRPC** through the worker’s \`
   it, so a retried attempt cannot silently double the side effect — the budget and resume contract
   the state step keeps in \`session:{id}\` stays true.
 
-**Failure mode the checks target.** The draft loops \`click\` and \`submit\` through the same
+**Failure mode the checks target.** The starter loops \`click\` and \`submit\` through the same
 three-attempt retry it uses for a \`navigate\`, sends every call with no deadline, and its \`RETRIES\`
 constant is the only policy it has. So a click whose deadline expired after the page already handled
 it is sent again — the form is submitted twice — a permanent \`INVALID_ARGUMENT\` is attempted three
@@ -71,7 +71,7 @@ customer-visible in production.`,
       id: 'deadline',
       title: 'Every driver call carries the 15 s deadline',
       detail:
-        'Each `Act`, `Snapshot`, `ClosePage` and `Navigate` goes out with the call’s own deadline taken from one constant — `DEADLINE_MS = 15_000` — and the returned status is checked. The draft sends every call with no deadline at all, so one stuck driver pins a worker for the rest of the session.',
+        'Each `Act`, `Snapshot`, `ClosePage` and `Navigate` goes out with the call’s own deadline taken from one constant — `DEADLINE_MS = 15_000` — and the returned status is checked. The starter sends every call with no deadline at all, so one stuck driver pins a worker for the rest of the session.',
       match: {
         python: {all: [/DEADLINE_MS = 15_000/, /timeout=DEADLINE_MS \/ 1000/]},
         typescript: {all: [/DEADLINE_MS = 15_000/, /deadline: Date\.now\(\) \+ DEADLINE_MS/]},
@@ -94,7 +94,7 @@ customer-visible in production.`,
       id: 'retry-policy',
       title: 'Retries are per action, never for a side effect',
       detail:
-        'The attempt bound comes from a per-action table, not a global flag: `RETRYABLE_ACTIONS` (`navigate`, `snapshot`, `wait`) gets up to 3 attempts while `click`, `submit` and `type` — named in `SIDE_EFFECTING_ACTIONS` — get exactly one. The draft’s single `RETRIES` constant loops every action three times, so a click and a submit are replayed like a navigate.',
+        'The attempt bound comes from a per-action table, not a global flag: `RETRYABLE_ACTIONS` (`navigate`, `snapshot`, `wait`) gets up to 3 attempts while `click`, `submit` and `type` — named in `SIDE_EFFECTING_ACTIONS` — get exactly one. The starter’s single `RETRIES` constant loops every action three times, so a click and a submit are replayed like a navigate.',
       match: {
         python: {
           all: [
@@ -138,7 +138,7 @@ customer-visible in production.`,
       id: 'verify-before-retry',
       title: 'Reads page state before retrying a timed-out click',
       detail:
-        'A timed-out side-effecting `Act` is followed by a `Snapshot` reading the page digest, and the `Act` is only sent again if the page proves the first click did not land — snapshot first, then maybe the retry. The draft goes straight back into `Act`, so a click the page already handled is sent a second time and the form is submitted twice.',
+        'A timed-out side-effecting `Act` is followed by a `Snapshot` reading the page digest, and the `Act` is only sent again if the page proves the first click did not land — snapshot first, then maybe the retry. The starter goes straight back into `Act`, so a click the page already handled is sent a second time and the form is submitted twice.',
       match: {
         python: {order: [/stub\.Snapshot\(/, /stub\.Act\(/], all: [/state\.digest/]},
         typescript: {order: [/stub\.snapshot\(/, /stub\.act\(/], all: [/state\.digest/]},
@@ -151,7 +151,7 @@ customer-visible in production.`,
       id: 'close-hung-page',
       title: 'Closes a hung page before the next action',
       detail:
-        'When the session is `hung`, `ClosePage` is called before any other action is started on it and the page-closed flag is set, so the next action runs on a fresh page instead of a socket that stopped answering. The draft leaves the hung page open and queues the next action on it anyway.',
+        'When the session is `hung`, `ClosePage` is called before any other action is started on it and the page-closed flag is set, so the next action runs on a fresh page instead of a socket that stopped answering. The starter leaves the hung page open and queues the next action on it anyway.',
       match: {
         python: {order: [/stub\.ClosePage\(/, /stub\.Act\(/], all: [/session\.hung/]},
         typescript: {order: [/stub\.closePage\(/, /stub\.act\(/], all: [/session\.hung/]},
@@ -164,7 +164,7 @@ customer-visible in production.`,
       id: 'status-retryable',
       title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED',
       detail:
-        'Retryability is a property of the returned status, not of “it threw”: a `RETRYABLE_STATUS` set names `UNAVAILABLE` and `DEADLINE_EXCEEDED`, every other code is returned to the caller immediately, and the retry branch matches the status against that set. The draft catches every error and continues, so a permanent `INVALID_ARGUMENT` is attempted three times.',
+        'Retryability is a property of the returned status, not of “it threw”: a `RETRYABLE_STATUS` set names `UNAVAILABLE` and `DEADLINE_EXCEEDED`, every other code is returned to the caller immediately, and the retry branch matches the status against that set. The starter catches every error and continues, so a permanent `INVALID_ARGUMENT` is attempted three times.',
       match: {
         python: {
           all: [
@@ -344,7 +344,7 @@ def execute_action(session, action: str, target: str, stub: BrowserDriverStub, b
 `,
     },
     typescript: {
-      starter: `/** Browser driver client: a model-generated draft that retries every action under one constant. */
+      starter: `/** Browser driver client: flawed code that retries every action under one constant. */
 const RETRIES = 3;
 const ACTIONS = ['navigate', 'click', 'type', 'submit', 'snapshot', 'wait'];
 
@@ -938,5 +938,5 @@ std::string execute_action(
     'Two gates make a retry legal: the action and the status. Keep a per-action table — `RETRYABLE_ACTIONS` = `navigate`, `snapshot`, `wait`, and `click`, `submit`, `type` get exactly one attempt — and treat only `UNAVAILABLE` and `DEADLINE_EXCEEDED` as retryable; a global `RETRIES = 3` applied to every action is what double-submits the form.',
     'A timed-out side effect may already have run: `Snapshot` the page and compare the digest against the target before deciding anything — snapshot first, retry only if the page proves the click did not land — and `ClosePage` a hung session before the next action, charging the budget once per accepted action.',
   ],
-  debrief: `The interviewer is testing whether you can read a retry policy as a statement about side effects: which actions may be attempted twice, under whose clock, and what the first attempt may already have done when the deadline expires. The draft looks fine because the driver answers on the first attempt in every demo — nothing about the deadline, the per-action table or the hung page shows up until a click is slow, a status is permanent, or a page stops answering. The fix has three data-driven decisions: one deadline constant applied to every call, a per-action retry table so a click and a submit are never replayed, and a status gate that revisits only UNAVAILABLE and DEADLINE_EXCEEDED. The subtle one is the timed-out side effect: a gRPC deadline says the socket gave up, not that the click did not land, so the worker reads page state with Snapshot and only replays once the page proves the action never happened — and closes a hung page before it starts anything else on that session. Real workers add jittered backoff between attempts, a per-action idempotency key so the driver can dedupe a verified replay, a screenshot before and after each side effect as evidence, and a session-level breaker so a driver that keeps hanging is taken out of rotation instead of retried.`,
+  debrief: `The interviewer is testing whether you can read a retry policy as a statement about side effects: which actions may be attempted twice, under whose clock, and what the first attempt may already have done when the deadline expires. The starter looks fine because the driver answers on the first attempt in every demo — nothing about the deadline, the per-action table or the hung page shows up until a click is slow, a status is permanent, or a page stops answering. The fix has three data-driven decisions: one deadline constant applied to every call, a per-action retry table so a click and a submit are never replayed, and a status gate that revisits only UNAVAILABLE and DEADLINE_EXCEEDED. The subtle one is the timed-out side effect: a gRPC deadline says the socket gave up, not that the click did not land, so the worker reads page state with Snapshot and only replays once the page proves the action never happened — and closes a hung page before it starts anything else on that session. Real workers add jittered backoff between attempts, a per-action idempotency key so the driver can dedupe a verified replay, a screenshot before and after each side effect as evidence, and a session-level breaker so a driver that keeps hanging is taken out of rotation instead of retried.`,
 };

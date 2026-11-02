@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the object-store client: it
+**Starting point.** The starter is working code for the object-store client: it
 calls \`PutChunk\`, retries on failure, and marks the file complete. It compiles, it works on a healthy
-network, and it hides three production flaws. Review it, fix it, and prove the fix with the checks
+network, and it hides three production flaws. Debug it, fix it, and prove the fix with the checks
 below.
 
 Implement the gRPC object-store client:
@@ -50,7 +50,7 @@ uploads as finished ones.`,
       id: 'chunk-deadline',
       title: 'Every chunk write runs under a 15-second deadline',
       detail:
-        '`PutChunk` carries a 15-second deadline. The draft calls the RPC with no deadline, so one stuck chunk holds the whole upload open.',
+        '`PutChunk` carries a 15-second deadline. The starter calls the RPC with no deadline, so one stuck chunk holds the whole upload open.',
       match: {
         python: {all: [/CHUNK_DEADLINE_S/, /timeout=/]},
         typescript: {all: [/CHUNK_DEADLINE_MS/, /deadline:/]},
@@ -63,7 +63,7 @@ uploads as finished ones.`,
       id: 'chunk-hash',
       title: 'A chunk carries its hash so the store can dedupe',
       detail:
-        'The `PutChunk` request includes the chunk’s SHA-256 so an identical chunk is written once. The draft sends the bytes with no hash, so every retry stores a duplicate.',
+        'The `PutChunk` request includes the chunk’s SHA-256 so an identical chunk is written once. The starter sends the bytes with no hash, so every retry stores a duplicate.',
       match: {
         python: {all: [/chunk_hash/, /PutChunk/]},
         typescript: {all: [/chunkHash/, /putChunk/]},
@@ -76,7 +76,7 @@ uploads as finished ones.`,
       id: 'chunk-scope',
       title: 'A retry re-sends only the failed chunk',
       detail:
-        'Retries are scoped to one chunk and only on the retryable statuses. The draft restarts the whole multipart upload on any failure, re-sending every byte the client already sent.',
+        'Retries are scoped to one chunk and only on the retryable statuses. The starter restarts the whole multipart upload on any failure, re-sending every byte the client already sent.',
       match: {
         python: {all: [/RETRYABLE/, /_retry_chunk/]},
         typescript: {all: [/RETRYABLE/, /retryChunk/]},
@@ -89,7 +89,7 @@ uploads as finished ones.`,
       id: 'commit-order',
       title: 'Completion waits for the store’s commit',
       detail:
-        'The file is marked complete only after `CommitMultipart` returns a confirmed commit. The draft marks it complete first, so an interrupted upload is already visible as finished.',
+        'The file is marked complete only after `CommitMultipart` returns a confirmed commit. The starter marks it complete first, so an interrupted upload is already visible as finished.',
       match: {
         python: {order: [/stub\.CommitMultipart\(/, /\._finalize_object\(/]},
         typescript: {order: [/stub\.commitMultipart\(/, /\.finalizeObject\(/]},
@@ -102,7 +102,7 @@ uploads as finished ones.`,
       id: 'listings',
       title: 'Only committed files appear in listings',
       detail:
-        'The listing filters on the committed state, so an upload interrupted before its commit is invisible to readers. The draft lists every upload row.',
+        'The listing filters on the committed state, so an upload interrupted before its commit is invisible to readers. The starter lists every upload row.',
       match: {
         python: {all: [/def list_files/, /committed/]},
         typescript: {all: [/listFiles/, /committed/]},
@@ -131,7 +131,7 @@ class ObjectStoreClient:
         return self.stub.PutChunk(PutChunkRequest(multipart_id=multipart_id, index=index, data=data))
 
     def upload_chunk(self, multipart_id, tenant, index, data):
-        # TODO: this draft retries by restarting the whole multipart upload and marks the file
+        # TODO: this starter retries by restarting the whole multipart upload and marks the file
         # finished before the store confirms the commit.
         try:
             return self._put_chunk(multipart_id, index, data)
@@ -233,7 +233,7 @@ export class ObjectStoreClient {
   }
 
   async uploadChunk(multipartId: string, tenant: string, index: number, data: Buffer): Promise<PutChunkResponse> {
-    // TODO: this draft retries by restarting the whole multipart upload and marks the file
+    // TODO: this starter retries by restarting the whole multipart upload and marks the file
     // finished before the store confirms the commit.
     try {
       return await this.putChunk(multipartId, index, data);
@@ -333,7 +333,7 @@ func (c *ObjectStoreClient) putChunk(ctx context.Context, multipartID string, in
 }
 
 func (c *ObjectStoreClient) uploadChunk(ctx context.Context, multipartID, tenant string, index int, data []byte) (*PutChunkResponse, error) {
-	// TODO: this draft retries by restarting the whole multipart upload and marks the file
+	// TODO: this starter retries by restarting the whole multipart upload and marks the file
 	// finished before the store confirms the commit.
 	response, err := c.putChunk(ctx, multipartID, index, data)
 	if err == nil {
@@ -466,7 +466,7 @@ class ObjectStoreClient(stub: ObjectStoreGrpc.ObjectStoreStub, index: FileIndex)
     stub.putChunk(PutChunkRequest(multipartId = multipartId, index = index, data = data)).map(_ => ())
 
   def uploadChunk(multipartId: String, tenant: String, index: Int, data: ByteString): Future[Unit] = {
-    // TODO: this draft retries by restarting the whole multipart upload and marks the file
+    // TODO: this starter retries by restarting the whole multipart upload and marks the file
     // finished before the store confirms the commit.
     putChunk(multipartId, index, data).recoverWith { case _: StatusRuntimeException =>
       restartUpload(tenant, data)
@@ -556,7 +556,7 @@ struct ObjectStoreClient {
 
   bool uploadChunk(const std::string& multipartId, const std::string& tenant, int index, const std::string& data,
                    PutChunkResponse* out) {
-    // TODO: this draft retries by restarting the whole multipart upload and marks the file
+    // TODO: this starter retries by restarting the whole multipart upload and marks the file
     // finished before the store confirms the commit.
     if (putChunk(multipartId, index, data, out)) return true;
     return restartUpload(tenant, data, out);
@@ -659,5 +659,5 @@ struct ObjectStoreClient {
     'The chunk hash is what makes the retry cheap. The store keeps a map from hash to object, so a re-sent chunk that already exists is acknowledged without writing bytes again — the retry costs a round-trip, not a re-upload.',
     'Order matters at the end: `CommitMultipart` first, then the local index. If you mark the file complete first, a reader can list a file whose bytes the store has not committed, and the listing is the first thing every client sees.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated retry path. The draft's retry reads like resilience and is the opposite: restarting the multipart upload re-sends gigabytes because one chunk failed. The fix is to make the retry the unit of work — one chunk, one hash, one deadline — so the store can dedupe and the client only pays for what it did not already send. The second half is ordering: a file is complete when the store says so, not when the client stops sending. Real clients add jitter to the retry backoff, a circuit breaker so one dead store does not absorb every chunk attempt, and a resumable manifest so a client that reconnects after a crash knows exactly which chunks are already committed.`,
+  debrief: `The interviewer is testing whether you can debug a retry path. The starter's retry reads like resilience and is the opposite: restarting the multipart upload re-sends gigabytes because one chunk failed. The fix is to make the retry the unit of work — one chunk, one hash, one deadline — so the store can dedupe and the client only pays for what it did not already send. The second half is ordering: a file is complete when the store says so, not when the client stops sending. Real clients add jitter to the retry backoff, a circuit breaker so one dead store does not absorb every chunk attempt, and a resumable manifest so a client that reconnects after a crash knows exactly which chunks are already committed.`,
 };

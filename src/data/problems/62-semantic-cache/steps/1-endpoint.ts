@@ -8,9 +8,9 @@ export const lookupEndpointStep: Step = {
   focus: ['client', 'cache', 'policy', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the lookup route, parses the
-body, and returns a cached answer. It compiles, it serves the demo, and it hides four production flaws. Review it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the lookup route, parses the body,
+and returns a cached answer. It compiles, it serves the demo, and it hides four production flaws.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/semantic-cache/lookup\` with body \`{"query_embedding": [..], "model_version": "2024-06", "threshold": 0.4, "query_hash": "..."}\`.
 
@@ -28,7 +28,7 @@ Implement \`POST /v1/semantic-cache/lookup\` with body \`{"query_embedding": [..
 **Failure mode the checks target.** A caller-supplied threshold of zero makes every cached entry a hit,
 so the cache "works" while returning the wrong answer for every prompt; the missing expiry check serves
 stale answers that the TTL was supposed to retire; and returning a bare answer hides the similarity and
-age that a caller needs to trust the hit. The draft also logs the raw embedding, shipping tenant query
+age that a caller needs to trust the hit. The starter also logs the raw embedding, shipping tenant query
 vectors into the log pipeline.`,
   sequence: {
     participants: ['Client', 'Semantic Cache', 'Serving policy', 'Redis vector index'],
@@ -69,7 +69,7 @@ vectors into the log pipeline.`,
       id: 'floor',
       title: 'Coerces a caller threshold to the service floor',
       detail:
-        'The requested threshold is clamped into `[SIMILARITY_FLOOR, MAX_SIMILARITY_THRESHOLD]` by `effective_threshold`, so a caller-sent `0` can never reach the search. The draft passes the raw value straight to the index.',
+        'The requested threshold is clamped into `[SIMILARITY_FLOOR, MAX_SIMILARITY_THRESHOLD]` by `effective_threshold`, so a caller-sent `0` can never reach the search. The starter passes the raw value straight to the index.',
       match: {
         python: {all: [/\bSIMILARITY_FLOOR\b/, /def effective_threshold\(/]},
         typescript: {all: [/\bSIMILARITY_FLOOR\b/, /function effectiveThreshold\(/]},
@@ -82,7 +82,7 @@ vectors into the log pipeline.`,
       id: 'expiry',
       title: 'Never serves an expired entry',
       detail:
-        'Entries are only served while `expires_at > now`, via the `is_live` predicate. The draft returns the entry without looking at its expiry, so a retired answer can still be served.',
+        'Entries are only served while `expires_at > now`, via the `is_live` predicate. The starter returns the entry without looking at its expiry, so a retired answer can still be served.',
       match: {
         python: {all: [/\bexpires_at\b/, /def is_live\(/]},
         typescript: {all: [/\bexpires_at\b/, /function isLive\(/]},
@@ -95,7 +95,7 @@ vectors into the log pipeline.`,
       id: 'hit-shape',
       title: 'A hit reports its similarity and entry age',
       detail:
-        'A hit payload carries `"similarity"` and `"age_seconds"` so the caller can judge the hit. The draft omits both and returns only the answer.',
+        'A hit payload carries `"similarity"` and `"age_seconds"` so the caller can judge the hit. The starter omits both and returns only the answer.',
       match: {
         python: {all: [/"similarity"/, /"age_seconds"/]},
         typescript: {all: [/similarity/, /age_seconds/]},
@@ -108,7 +108,7 @@ vectors into the log pipeline.`,
       id: 'miss',
       title: 'A miss is a miss, not an unverified hit',
       detail:
-        'A miss returns `hit: false` with a `null` similarity instead of an answer; the draft can only answer with an answer payload, so a caller cannot tell a miss from a hit.',
+        'A miss returns `hit: false` with a `null` similarity instead of an answer; the starter can only answer with an answer payload, so a caller cannot tell a miss from a hit.',
       match: {
         python: {all: [/"hit":\s*False/, /"similarity":\s*None/]},
         typescript: {all: [/hit:\s*false/, /similarity:\s*null/]},
@@ -151,8 +151,8 @@ def lookup(
     body: LookupRequest,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft trusts the caller's threshold, serves entries without checking expiry,
-    # reports neither similarity nor age, and logs the raw query embedding. Review all four.
+    # TODO: this starter trusts the caller's threshold, serves entries without checking expiry,
+    # reports neither similarity nor age, and logs the raw query embedding. Fix all four.
     if tenant is None or tenant == "":
         return JSONResponse({"error": "missing X-Tenant-Id"}, status_code=401)
     logger.info("lookup tenant=%s embedding=%r", tenant, body.query_embedding)
@@ -230,7 +230,7 @@ def lookup(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/semantic-cache/lookup: a model-generated draft that trusts the caller's threshold. */
+      starter: `/** POST /v1/semantic-cache/lookup: flawed code that trusts the caller's threshold. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -262,8 +262,8 @@ const index = {
 };
 
 app.post('/v1/semantic-cache/lookup', async (request, reply) => {
-  // TODO: this draft trusts the caller's threshold, serves entries without checking expiry,
-  // reports neither similarity nor age, and logs the raw query embedding. Review all four.
+  // TODO: this starter trusts the caller's threshold, serves entries without checking expiry,
+  // reports neither similarity nor age, and logs the raw query embedding. Fix all four.
   const tenant = request.headers['x-tenant-id'];
   if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const body = request.body as LookupBody;
@@ -391,8 +391,8 @@ func lookup(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts the caller's threshold, serves entries without checking expiry,
-	// reports neither similarity nor age, and logs the raw query embedding. Review all four.
+	// TODO: this starter trusts the caller's threshold, serves entries without checking expiry,
+	// reports neither similarity nor age, and logs the raw query embedding. Fix all four.
 	log.Printf("lookup tenant=%s embedding=%v", tenant, body.QueryEmbedding)
 	threshold := body.Threshold
 	entry, _ := index.Search(tenant, body.ModelVersion, body.QueryEmbedding, threshold)
@@ -531,8 +531,8 @@ object SemanticCacheApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[LookupRequest]) { body =>
-            // TODO: this draft trusts the caller's threshold, serves entries without checking expiry,
-            // reports neither similarity nor age, and logs the raw query embedding. Review all four.
+            // TODO: this starter trusts the caller's threshold, serves entries without checking expiry,
+            // reports neither similarity nor age, and logs the raw query embedding. Fix all four.
             system.log.info(s"lookup tenant=$tenant embedding=\${body.query_embedding}")
             val threshold = body.threshold
             index.search(tenant, body.model_version, body.query_embedding, threshold) match {
@@ -650,8 +650,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft trusts the caller's threshold, serves entries without checking expiry,
-    // reports neither similarity nor age, and logs the raw query embedding. Review all four.
+    // TODO: this starter trusts the caller's threshold, serves entries without checking expiry,
+    // reports neither similarity nor age, and logs the raw query embedding. Fix all four.
     const auto embedding = body.value("query_embedding", std::vector<double>{});
     std::cerr << "lookup tenant=" << tenant << " embedding=" << json(embedding).dump() << "\\n";
     const double threshold = body.value("threshold", 0.0);

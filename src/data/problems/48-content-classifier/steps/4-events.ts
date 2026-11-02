@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['classifier', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it produces an event on the happy path and the
+The starter is working code: it produces an event on the happy path and the
 consumer moves counters, so the demo shows numbers going up. Three production contracts are broken.
 Find them, fix them, and prove the fix.
 
@@ -56,7 +56,7 @@ commit-before-process trades correctness for code that only *looks* exactly-once
       id: 'tenant-key',
       title: 'Keyed by tenant on classify.result',
       detail:
-        'The message key is the tenant (partition by tenant), so one tenant’s events stay ordered on one partition. The draft keys by label, scattering a tenant across partitions.',
+        'The message key is the tenant (partition by tenant), so one tenant’s events stay ordered on one partition. The starter keys by label, scattering a tenant across partitions.',
       match: {
         python: {all: [/key=event\.tenant/, /"classify\.result"/]},
         typescript: {all: [/key:\s*event\.tenant\b/, /'classify\.result'/]},
@@ -69,7 +69,7 @@ commit-before-process trades correctness for code that only *looks* exactly-once
       id: 'text-hash',
       title: 'Carries a text hash, never the text',
       detail:
-        'The payload carries a SHA-256 digest of the text and no copy of the text itself. The draft embeds the body for spot audits — a leak that is retained and replicated with the topic.',
+        'The payload carries a SHA-256 digest of the text and no copy of the text itself. The starter embeds the body for spot audits — a leak that is retained and replicated with the topic.',
       match: {
         python: {all: [/text_hash/, /sha256/], none: [/"text"\s*:/]},
         typescript: {all: [/textHash/, /createHash\(['"]sha256['"]\)/], none: [/text:\s*event\.text\b/]},
@@ -82,7 +82,7 @@ commit-before-process trades correctness for code that only *looks* exactly-once
       id: 'event-fields',
       title: 'Event carries id, version, labels and provenance',
       detail:
-        'The payload carries the request id, the taxonomy version, the labels and the provenance of the result, so a consumer can reconstruct what happened without the text. The draft sends a single label and no provenance.',
+        'The payload carries the request id, the taxonomy version, the labels and the provenance of the result, so a consumer can reconstruct what happened without the text. The starter sends a single label and no provenance.',
       match: {
         python: {all: [/"request_id": event\.request_id/, /"provenance": event\.provenance/]},
         typescript: {all: [/requestId: event\.requestId/, /provenance: event\.provenance/]},
@@ -108,7 +108,7 @@ commit-before-process trades correctness for code that only *looks* exactly-once
       id: 'counters-before-commit',
       title: 'Updates counters before committing the offset',
       detail:
-        'The consumer runs `HINCRBY` on the counter before committing the offset; committing first makes a crash lose the increment forever. The draft commits first.',
+        'The consumer runs `HINCRBY` on the counter before committing the offset; committing first makes a crash lose the increment forever. The starter commits first.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -143,9 +143,9 @@ class ClassifyEvent(BaseModel):
 
 
 def publish(event: ClassifyEvent) -> None:
-    # TODO: this draft keys the event by label, so one tenant's events scatter across partitions and
+    # TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
     # per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-    # below commits the offset before it updates the counter. Review all three.
+    # below commits the offset before it updates the counter. Fix all three.
     payload = {
         "request_id": event.request_id,
         "tenant": event.tenant,
@@ -244,7 +244,7 @@ def run_consumer() -> None:
 `,
     },
     typescript: {
-      starter: `/** classify.result publisher and metrics consumer: a model-generated draft. */
+      starter: `/** classify.result publisher and metrics consumer: flawed code. */
 import {Kafka} from 'kafkajs';
 
 import Redis from 'ioredis';
@@ -263,9 +263,9 @@ interface ClassifyEvent {
   text: string;
 }
 
-// TODO: this draft keys the event by label, so one tenant's events scatter across partitions and
+// TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
 // per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-// below commits the offset before it updates the counter. Review all three.
+// below commits the offset before it updates the counter. Fix all three.
 export async function publish(event: ClassifyEvent): Promise<void> {
   const payload = {
     requestId: event.requestId,
@@ -370,9 +370,9 @@ type ClassifyEvent struct {
 	Text            string
 }
 
-// TODO: this draft keys the event by label, so one tenant's events scatter across partitions and
+// TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
 // per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-// below commits the offset before it updates the counter. Review all three.
+// below commits the offset before it updates the counter. Fix all three.
 func Publish(ctx context.Context, event ClassifyEvent) error {
 	payload := map[string]any{
 		"request_id":       event.RequestID,
@@ -533,9 +533,9 @@ object ClassifyEvents {
       text: String
   )
 
-  // TODO: this draft keys the event by label, so one tenant's events scatter across partitions and
+  // TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
   // per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-  // below commits the offset before it updates the counter. Review all three.
+  // below commits the offset before it updates the counter. Fix all three.
   def publish(event: ClassifyEvent): Unit = {
     val payload = ClassifyPayload(
       requestId = event.requestId,
@@ -662,9 +662,9 @@ struct ClassifyEvent {
   std::string text;
 };
 
-// TODO: this draft keys the event by label, so one tenant's events scatter across partitions and
+// TODO: this starter keys the event by label, so one tenant's events scatter across partitions and
 // per-tenant dashboards break, and it copies the text into the retained payload. The consumer
-// below commits the offset before it updates the counter. Review all three.
+// below commits the offset before it updates the counter. Fix all three.
 void publish(const ClassifyEvent& event) {
   json payload;
   payload["request_id"] = event.requestId;
@@ -761,5 +761,5 @@ void runConsumer() {
     'Hash the text at the boundary and put only the digest on the wire: the event carries ids, the taxonomy version, labels, provenance and `text_hash`. Anything else about the document belongs in the store the classifier read it from, behind its own access control and retention.',
     'The consumer order is the correctness half: `HINCRBY` first, `commitSync`/`commitOffsets` second. A crash in between then replays the record and re-applies an idempotent-in-effect increment, instead of losing the counter update because the offset already moved.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated event path, where each line looks pointless and each mistake is invisible until an incident. Four contracts are being checked: partition ownership (the key decides ordering, so a per-tenant consumer needs a per-tenant key), data minimisation (a retained, replicated topic is the last place content should live), producer semantics (idempotence plus \`acks=all\` is what makes a retry safe), and processing order (counters before the offset commit, because the offset is the durable marker of work you cannot redo). Real pipelines add a schema registry so the payload shape is enforced rather than agreed, a dead-letter topic for records the consumer cannot parse, and a compaction or retention policy per topic so the data lifecycle is a topic property and not a hope.`,
+  debrief: `The interviewer is testing whether you can debug an event path, where each line looks pointless and each mistake is invisible until an incident. Four contracts are being checked: partition ownership (the key decides ordering, so a per-tenant consumer needs a per-tenant key), data minimisation (a retained, replicated topic is the last place content should live), producer semantics (idempotence plus \`acks=all\` is what makes a retry safe), and processing order (counters before the offset commit, because the offset is the durable marker of work you cannot redo). Real pipelines add a schema registry so the payload shape is enforced rather than agreed, a dead-letter topic for records the consumer cannot parse, and a compaction or retention policy per topic so the data lifecycle is a topic property and not a hope.`,
 };

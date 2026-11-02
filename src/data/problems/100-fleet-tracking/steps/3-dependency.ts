@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'dispatch'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it opens a gRPC call to the
+**Starting point.** The starter is working code: it opens a gRPC call to the
 dispatch service, sends the position and swallows a timeout. It compiles, it serves the demo, and it
-hides two production flaws. Review it like the service owner, fix it, and prove the fix with the
+hides two production flaws. Debug it like the service owner, fix it, and prove the fix with the
 checks below.
 
 Implement the geofence/route-deviation check as a gRPC call with a bounded deadline and a durable
@@ -28,7 +28,7 @@ retry contract.
 - Dispatch must never receive a **stale** position: when the incoming position's timestamp is not
   newer than the vehicle's last dispatched timestamp, the check is skipped.
 
-**Failure mode the checks target.** The draft drops the check when the call times out, and the
+**Failure mode the checks target.** The starter drops the check when the call times out, and the
 natural "fix" — retrying with a fresh key — duplicates alerts. The checks verify the deadline, the
 sequence-derived idempotency key, the enqueue on failure, the absence of a fresh key, and the stale
 guard.`,
@@ -47,7 +47,7 @@ guard.`,
       id: 'deadline',
       title: 'Uses a 2-second deadline per check',
       detail:
-        'The call is bounded by a 2-second deadline, so a slow dispatch cannot hang ingest. The draft uses a one-second timeout and treats the result as final.',
+        'The call is bounded by a 2-second deadline, so a slow dispatch cannot hang ingest. The starter uses a one-second timeout and treats the result as final.',
       match: {
         python: {all: [/GEOFENCE_DEADLINE/, /timeout/]},
         typescript: {all: [/GEOFENCE_DEADLINE/, /deadline/]},
@@ -60,7 +60,7 @@ guard.`,
       id: 'idempotency-key',
       title: 'Keys the check by the position sequence',
       detail:
-        'The idempotency key is derived from the vehicle and the position `sequence`, so the first attempt and every retry carry the same key and an alert fires once. The draft sends no key.',
+        'The idempotency key is derived from the vehicle and the position `sequence`, so the first attempt and every retry carry the same key and an alert fires once. The starter sends no key.',
       match: {
         python: {all: [/idempotency_key/, /sequence/]},
         typescript: {all: [/idempotencyKey/, /sequence/]},
@@ -73,7 +73,7 @@ guard.`,
       id: 'enqueue-on-failure',
       title: 'Enqueues the check when the call fails',
       detail:
-        'A failed check is enqueued for retry instead of being dropped, so the alert is never lost. The draft (and the fix) must enqueue; the key choice is what the other checks test.',
+        'A failed check is enqueued for retry instead of being dropped, so the alert is never lost. The starter (and the fix) must enqueue; the key choice is what the other checks test.',
       match: {
         python: {all: [/queue\.enqueue\(/]},
         typescript: {all: [/queue\.enqueue\(/]},
@@ -86,7 +86,7 @@ guard.`,
       id: 'no-fresh-key',
       title: 'Never mints a fresh key on retry',
       detail:
-        'The key is stable across attempts. The draft generates a new identifier for each attempt, which lets a late retry fire a second alert.',
+        'The key is stable across attempts. The starter generates a new identifier for each attempt, which lets a late retry fire a second alert.',
       match: {
         python: {none: [/uuid|random/]},
         typescript: {none: [/randomUUID|uuid/]},
@@ -125,8 +125,8 @@ class RetryQueue:
 
 
 def check_geofence(channel, vehicle_id: str, position: dict, queue: RetryQueue) -> bool:
-    # TODO: this draft drops the check when the call times out and mints a fresh key on the retry
-    # path, which lets a late retry fire the alert twice. Review the deadline, the key and the
+    # TODO: this starter drops the check when the call times out and mints a fresh key on the retry
+    # path, which lets a late retry fire the alert twice. Check the deadline, the key and the
     # failure path.
     stub = dispatch_pb2_grpc.DispatchStub(channel)
     request = dispatch_pb2.GeofenceCheckRequest(
@@ -182,7 +182,7 @@ def check_geofence(
 `,
     },
     typescript: {
-      starter: `/** Geofence check: a model-generated draft that swallows the timeout. */
+      starter: `/** Geofence check: flawed code that swallows the timeout. */
 import {randomUUID} from 'node:crypto';
 
 import type {DispatchClient} from './generated/dispatch_grpc_pb';
@@ -205,8 +205,8 @@ export async function checkGeofence(
   position: Position,
   queue: RetryQueue,
 ): Promise<boolean> {
-  // TODO: this draft drops the check when the call times out and mints a fresh key on the retry
-  // path, which lets a late retry fire the alert twice. Review the deadline, the key and the
+  // TODO: this starter drops the check when the call times out and mints a fresh key on the retry
+  // path, which lets a late retry fire the alert twice. Check the deadline, the key and the
   // failure path.
   const {promise, resolve} = Promise.withResolvers<boolean>();
   client.checkGeofence({vehicleId, lat: position.lat, lon: position.lon}, (error: Error | null) => {
@@ -292,8 +292,8 @@ type Position struct {
 }
 
 func CheckGeofence(ctx context.Context, client pb.DispatchClient, vehicleID string, pos Position, queue RetryQueue) (bool, error) {
-	// TODO: this draft drops the check when the call times out and mints a fresh key on the retry
-	// path, which lets a late retry fire the alert twice. Review the deadline, the key and the
+	// TODO: this starter drops the check when the call times out and mints a fresh key on the retry
+	// path, which lets a late retry fire the alert twice. Check the deadline, the key and the
 	// failure path.
 	_, err := client.CheckGeofence(ctx, &pb.GeofenceCheckRequest{
 		VehicleId: vehicleID,
@@ -388,8 +388,8 @@ object GeofenceClient {
       position: Position,
       queue: RetryQueue,
   )(implicit ec: scala.concurrent.ExecutionContext): Future[Boolean] = {
-    // TODO: this draft drops the check when the call times out and mints a fresh key on the retry
-    // path, which lets a late retry fire the alert twice. Review the deadline, the key and the
+    // TODO: this starter drops the check when the call times out and mints a fresh key on the retry
+    // path, which lets a late retry fire the alert twice. Check the deadline, the key and the
     // failure path.
     client
       .checkGeofence(GeofenceCheckRequest(vehicleId = vehicleId, lat = position.lat, lon = position.lon))
@@ -475,8 +475,8 @@ Position checkGeofence(grpc::ChannelInterface* channel,
                        const std::string& vehicleId,
                        const Position& position,
                        RetryQueue* queue) {
-  // TODO: this draft drops the check when the call times out and mints a fresh key on the retry
-  // path, which lets a late retry fire the alert twice. Review the deadline, the key and the
+  // TODO: this starter drops the check when the call times out and mints a fresh key on the retry
+  // path, which lets a late retry fire the alert twice. Check the deadline, the key and the
   // failure path.
   auto stub = DispatchService::NewStub(channel->shared_from_this());
   grpc::ClientContext context;
@@ -549,5 +549,5 @@ bool checkGeofence(grpc::ChannelInterface* channel,
     'The idempotency key is `geofence:{vehicle_id}:{sequence}` and it is computed **before** the call, then passed both to the request and to the retry queue. The same value on every attempt is what makes the alert fire once.',
     'The stale guard is one comparison: `device_timestamp_ms <= last_dispatched_ts`. Skipping the call is correct — dispatch must not act on a position the map has already superseded.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated RPC call. The draft reads fine because the demo has a fast dispatch service that never times out. Two defects are being checked: dropping the check on failure (the alert is lost) and minting a fresh key on retry (the alert fires twice). The sequence-derived idempotency key is the piece that makes the retry safe: the dispatch service can dedupe on it, so "at least once" delivery becomes "exactly once" alerting. Real systems add an outbox for the enqueue itself, exponential backoff with jitter, and a per-vehicle dedupe window keyed by sequence.`,
+  debrief: `The interviewer is testing whether you can debug an RPC call. The starter reads fine because the demo has a fast dispatch service that never times out. Two defects are being checked: dropping the check on failure (the alert is lost) and minting a fresh key on retry (the alert fires twice). The sequence-derived idempotency key is the piece that makes the retry safe: the dispatch service can dedupe on it, so "at least once" delivery becomes "exactly once" alerting. Real systems add an outbox for the enqueue itself, exponential backoff with jitter, and a per-vehicle dedupe window keyed by sequence.`,
 };

@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['search', 'redis', 'catalog'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it hashes nothing, builds a
+**Starting point.** The starter is working code: it hashes nothing, builds a
 cache key out of the query string, stores the result set, and serves it back. It compiles, it speeds
-up the demo, and it hides three production flaws. Review it like the service owner, fix it, and prove
+up the demo, and it hides three production flaws. Debug it like the service owner, fix it, and prove
 the fix with the checks below.
 
 Implement the Redis query cache used by \`GET /v1/search\`.
@@ -25,13 +25,13 @@ Implement the Redis query cache used by \`GET /v1/search\`.
   (\`sha256\` / \`createHash\` / \`MessageDigest\` / FNV-1a) — so filter order cannot create two entries
   that mean the same thing.
 - Entries expire after **60 seconds** (\`CACHE_TTL_S = 60\` with \`setex\` / \`SET … EX\` / \`SetEx\`).
-  The draft expires nothing, so a price change never appears.
+  The starter expires nothing, so a price change never appears.
 - The current index version is read per request from Redis, and a catalog update **bumps** it
   (\`INCR catalog:index_version\`). The next request then misses without waiting for the TTL — that is
   the difference between a cache key and an eviction signal.
 
 **Failure mode the checks target.** A cache key is a contract: it must name everything the cached
-value depends on. The draft's key names one of five inputs, so a hit can be wrong — wrong filters,
+value depends on. The starter's key names one of five inputs, so a hit can be wrong — wrong filters,
 wrong tenant, wrong catalog version — and because nothing expires, the wrong answer is permanent.
 The fix is to derive the key from a normalized query and a canonical filter hash, include the tenant
 and the page, and let the index version rotate the key namespace on every catalog publish.`,
@@ -62,7 +62,7 @@ and the page, and let the index version rotate the key namespace on every catalo
       id: 'cache-key',
       title: 'The key covers tenant, query, filters, page and index version',
       detail:
-        "The cache key is derived from `(tenant, normalized q, filter hash, page, index version)`. The draft keys by the raw query alone, so a cached unfiltered result set answers a filtered request and one tenant reads another tenant's results.",
+        "The cache key is derived from `(tenant, normalized q, filter hash, page, index version)`. The starter keys by the raw query alone, so a cached unfiltered result set answers a filtered request and one tenant reads another tenant's results.",
       match: {
         python: {all: [/def cache_key\(/, /tenant/, /filter_hash/, /index_version/, /page/]},
         typescript: {all: [/function cacheKey\(/, /tenant/, /filterHash/, /indexVersion/, /page/]},
@@ -75,7 +75,7 @@ and the page, and let the index version rotate the key namespace on every catalo
       id: 'ttl',
       title: 'Entries expire after 60 seconds',
       detail:
-        'The cache writes with a 60-second TTL (`setex` / `SET … EX` / `SetEx`). The draft writes with no expiry, so the first answer is served until a deploy or a restart.',
+        'The cache writes with a 60-second TTL (`setex` / `SET … EX` / `SetEx`). The starter writes with no expiry, so the first answer is served until a deploy or a restart.',
       match: {
         python: {all: [/CACHE_TTL_S\s*=\s*60/, /\.setex\(/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*60/, /\.set\([^;\n]*'EX'/]},
@@ -88,7 +88,7 @@ and the page, and let the index version rotate the key namespace on every catalo
       id: 'normalized-query',
       title: 'Normalizes the query before keying',
       detail:
-        'The query is trimmed, lowercased and whitespace-collapsed before it enters the key, so `" Red  Shoes "` and `"red shoes"` share one entry. The draft keys the raw string.',
+        'The query is trimmed, lowercased and whitespace-collapsed before it enters the key, so `" Red  Shoes "` and `"red shoes"` share one entry. The starter keys the raw string.',
       match: {
         python: {all: [/def normalize_query\(/, /strip\(\)\.lower\(\)/]},
         typescript: {all: [/function normalizeQuery\(/, /trim\(\)\.toLowerCase\(\)/]},
@@ -101,7 +101,7 @@ and the page, and let the index version rotate the key namespace on every catalo
       id: 'filter-hash',
       title: 'Hashes filters canonically',
       detail:
-        'Filters enter the key as a deterministic digest over canonical (sorted-key) JSON, so `{a,b}` and `{b,a}` are one entry. The draft ignores filters entirely, which is the leak that serves unfiltered results to a filtered query.',
+        'Filters enter the key as a deterministic digest over canonical (sorted-key) JSON, so `{a,b}` and `{b,a}` are one entry. The starter ignores filters entirely, which is the leak that serves unfiltered results to a filtered query.',
       match: {
         python: {all: [/def filter_hash\(/, /hashlib/]},
         typescript: {all: [/function filterHash\(/, /createHash\(/]},
@@ -114,7 +114,7 @@ and the page, and let the index version rotate the key namespace on every catalo
       id: 'version-bump',
       title: 'Bumps the index version on a catalog update',
       detail:
-        'The index version is read per request and incremented when the catalog is republished (`INCR catalog:index_version`), so a price change appears within one TTL instead of being masked by an old key. The draft has no version at all.',
+        'The index version is read per request and incremented when the catalog is republished (`INCR catalog:index_version`), so a price change appears within one TTL instead of being masked by an old key. The starter has no version at all.',
       match: {
         python: {all: [/index_version/, /\.incr\(/]},
         typescript: {all: [/indexVersion/, /\.incr\(/]},
@@ -136,9 +136,9 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def search_cached(tenant: str, q: str, filters: dict, page: int, run_search):
-    # TODO: this draft keys by the raw query string alone and expires nothing, so a cached
+    # TODO: this starter keys by the raw query string alone and expires nothing, so a cached
     # unfiltered result set is served to a filtered request and one tenant's results to another,
-    # and a catalog update is never reflected. Review all three.
+    # and a catalog update is never reflected. Fix all three.
     key = f"search:{q}"
     hit = r.get(key)
     if hit is not None:
@@ -195,7 +195,7 @@ def search_cached(tenant: str, q: str, filters: dict, page: int, run_search):
 `,
     },
     typescript: {
-      starter: `/** Query cache: a model-generated draft keyed by the raw query string. */
+      starter: `/** Query cache: flawed code keyed by the raw query string. */
 import {createHash} from 'node:crypto';
 
 import {Redis} from 'ioredis';
@@ -209,9 +209,9 @@ export async function searchCached(
   page: number,
   runSearch: (q: string, filters: Record<string, unknown>, page: number) => Promise<unknown[]>,
 ): Promise<unknown[]> {
-  // TODO: this draft keys by the raw query string alone and expires nothing, so a cached
+  // TODO: this starter keys by the raw query string alone and expires nothing, so a cached
   // unfiltered result set is served to a filtered request and one tenant's results to another,
-  // and a catalog update is never reflected. Review all three.
+  // and a catalog update is never reflected. Fix all three.
   void createHash;
   const key = \`search:\${q}\`;
   const hit = await redis.get(key);
@@ -292,9 +292,9 @@ import (
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func searchCached(ctx context.Context, tenant, q string, filters map[string]any, page int, runSearch func() any) (any, error) {
-	// TODO: this draft keys by the raw query string alone and expires nothing, so a cached
+	// TODO: this starter keys by the raw query string alone and expires nothing, so a cached
 	// unfiltered result set is served to a filtered request and one tenant's results to another,
-	// and a catalog update is never reflected. Review all three.
+	// and a catalog update is never reflected. Fix all three.
 	key := fmt.Sprintf("search:%s", q)
 	hit, err := rdb.Get(ctx, key).Result()
 	if err == nil {
@@ -383,9 +383,9 @@ object QueryCache {
   val jedis = new Jedis("redis", 6379)
 
   def searchCached(tenant: String, q: String, filters: Map[String, String], page: Int)(runSearch: () => String): String = {
-    // TODO: this draft keys by the raw query string alone and expires nothing, so a cached
+    // TODO: this starter keys by the raw query string alone and expires nothing, so a cached
     // unfiltered result set is served to a filtered request and one tenant's results to another,
-    // and a catalog update is never reflected. Review all three.
+    // and a catalog update is never reflected. Fix all three.
     val key = s"search:$q"
     Option(jedis.get(key)) match {
       case Some(hit) => hit
@@ -446,9 +446,9 @@ using sw::redis::Redis;
 Redis redis("tcp://redis:6379");
 
 std::string searchCached(const std::string& tenant, const std::string& q, const std::string& filters, int page) {
-  // TODO: this draft keys by the raw query string alone and expires nothing, so a cached
+  // TODO: this starter keys by the raw query string alone and expires nothing, so a cached
   // unfiltered result set is served to a filtered request and one tenant's results to another,
-  // and a catalog update is never reflected. Review all three.
+  // and a catalog update is never reflected. Fix all three.
   const std::string key = "search:" + q;
   if (const auto hit = redis.get(key)) return *hit;
   const std::string results = "[]";
@@ -527,5 +527,5 @@ std::string search_cached(const std::string& tenant, const std::string& q, const
     'Normalization and a canonical filter hash are the same idea twice: reduce inputs that mean the same thing to one string. `json.dumps(filters, sort_keys=True)` / sorted entries before the digest is what stops `{brand,category}` and `{category,brand}` from being two entries.',
     'The index version is the eviction signal you control: read `catalog:index_version` on every request and `INCR` it from the catalog publisher. The TTL is the backstop for everything else — without it, the first value lives until a deploy.',
   ],
-  debrief: `The interviewer is asking whether you know what a cache key is for. The draft looks like a cache and behaves like a sticky note: one entry per query string, shared across tenants, blind to filters, and immortal. Each omission is a distinct bug — a filtered request served an unfiltered page, a cross-tenant read, and a price that never updates. The fix names every input, reduces equivalent inputs to one canonical form, and sets a TTL as the backstop. The index version is the interesting part: it lets a catalog publish invalidate the whole namespace atomically (\`INCR\`) without scanning keys or waiting out 60 seconds, which is why real systems keep a version in the key rather than deleting entries one by one.`,
+  debrief: `The interviewer is asking whether you know what a cache key is for. The starter looks like a cache and behaves like a sticky note: one entry per query string, shared across tenants, blind to filters, and immortal. Each omission is a distinct bug — a filtered request served an unfiltered page, a cross-tenant read, and a price that never updates. The fix names every input, reduces equivalent inputs to one canonical form, and sets a TTL as the backstop. The index version is the interesting part: it lets a catalog publish invalidate the whole namespace atomically (\`INCR\`) without scanning keys or waiting out 60 seconds, which is why real systems keep a version in the key rather than deleting entries one by one.`,
 };

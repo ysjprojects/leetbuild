@@ -8,9 +8,9 @@ export const adjacencyCacheStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the adjacency cache. It
+**Starting point.** The starter is working code for the adjacency cache. It
 reads through Redis, fills on a miss, and clears the key when an edge changes. It compiles, the demo
-is fast, and it hides three production flaws. Review it like the cache owner, fix it, and prove the
+is fast, and it hides three production flaws. Debug it like the cache owner, fix it, and prove the
 fix with the checks below.
 
 Implement the adjacency layer used by the API:
@@ -29,11 +29,11 @@ Implement the adjacency layer used by the API:
   version and reloads — never a double-apply, at most one operation's worth of work is visible.
 - Invalidation is \`bump_version\`, never a delete of the adjacency key.
 
-**Failure mode the checks target.** The draft deletes the cache entry *after* applying the edge.
+**Failure mode the checks target.** The starter deletes the cache entry *after* applying the edge.
 Between the read of the graph and the delete, or between the delete and a concurrent reader that
 already loaded the old list, a read can refill the key with the pre-change neighbours; the delete
 then lands on an entry that no longer describes the state and passes without effect, so the stale
-list survives until the TTL. The same draft keys without the tenant, so two tenants collide on one
+list survives until the TTL. The same starter keys without the tenant, so two tenants collide on one
 key, and it writes entries with no TTL, so a hot entity pins memory forever. Bumping a version
 counter has none of these races: the entry is never deleted, so there is nothing to refill into a
 window, and the counter is the single point of truth about which entry is current.`,
@@ -54,7 +54,7 @@ window, and the counter is the single point of truth about which entry is curren
       id: 'tenant-key',
       title: 'Keys the adjacency cache by (tenant, entity)',
       detail:
-        'Build the cache key with `adj_key(tenant, entity)` over an `adj:` prefix; two tenants never share a key. The draft keys by entity alone.',
+        'Build the cache key with `adj_key(tenant, entity)` over an `adj:` prefix; two tenants never share a key. The starter keys by entity alone.',
       match: {
         python: {all: [/def adj_key\(\s*tenant/, /"adj:/]},
         typescript: {all: [/function adjKey\(\s*tenant/, /'adj:'/]},
@@ -67,7 +67,7 @@ window, and the counter is the single point of truth about which entry is curren
       id: 'version-bump',
       title: 'Bumps a version counter instead of touching entries',
       detail:
-        'An edge change calls `bump_version` → `INCR` on `version_key(tenant)`. The draft has no counter at all, so nothing distinguishes a stale entry from a fresh one.',
+        'An edge change calls `bump_version` → `INCR` on `version_key(tenant)`. The starter has no counter at all, so nothing distinguishes a stale entry from a fresh one.',
       match: {
         python: {all: [/def bump_version\(/, /\.incr\(/, /version_key\(/]},
         typescript: {all: [/function bumpVersion\(/, /\.incr\(/, /versionKey\(/]},
@@ -80,7 +80,7 @@ window, and the counter is the single point of truth about which entry is curren
       id: 'no-delete',
       title: 'Invalidates by version, never by deleting the key',
       detail:
-        'No `delete`/`del` of the adjacency key anywhere: invalidation is the version bump, so a concurrent read cannot refill a deleted key with a pre-change list. The draft deletes after the write.',
+        'No `delete`/`del` of the adjacency key anywhere: invalidation is the version bump, so a concurrent read cannot refill a deleted key with a pre-change list. The starter deletes after the write.',
       match: {
         python: {all: [/bump_version\(/], none: [/\bdelete\(/]},
         typescript: {all: [/bumpVersion\(/], none: [/\.del\(/]},
@@ -93,7 +93,7 @@ window, and the counter is the single point of truth about which entry is curren
       id: 'ttl',
       title: 'Writes entries with a 5-minute TTL',
       detail:
-        'A refilled entry gets `TTL_S = 300` / `EX 300`. The draft writes with no expiry, so a hot entity is pinned in memory forever.',
+        'A refilled entry gets `TTL_S = 300` / `EX 300`. The starter writes with no expiry, so a hot entity is pinned in memory forever.',
       match: {
         python: {all: [/TTL_S\s*=\s*300/, /ex=TTL_S/]},
         typescript: {all: [/TTL_S\s*=\s*300/, /'EX',\s*TTL_S/]},
@@ -106,7 +106,7 @@ window, and the counter is the single point of truth about which entry is curren
       id: 'read-through',
       title: 'Reads through with an explicit version check',
       detail:
-        '`read_neighbors` reads the current version first, compares it with the version stamped on the cached entry, and refills only on a mismatch or miss. The draft returns whatever is cached, stale or not.',
+        '`read_neighbors` reads the current version first, compares it with the version stamped on the cached entry, and refills only on a mismatch or miss. The starter returns whatever is cached, stale or not.',
       match: {
         python: {all: [/def read_neighbors\(/, /\["version"\]/, /adj_key\(/]},
         typescript: {all: [/function readNeighbors\(/, /\.version/, /adjKey\(/]},
@@ -137,9 +137,9 @@ store = GraphStore()
 
 
 async def read_neighbors(tenant: str, entity: str) -> list[str]:
-    # TODO: this draft keys without the tenant, caches without a TTL, and invalidates by deleting
+    # TODO: this starter keys without the tenant, caches without a TTL, and invalidates by deleting
     # the entry after the write — so a concurrent read refills a stale list that no later deletion
-    # cleans. Review all three.
+    # cleans. Fix all three.
     key = f"neighbors:{entity}"
     raw = await cache.get(key)
     if raw is not None:
@@ -218,7 +218,7 @@ async def apply_edge(tenant: str, src: str, dst: str) -> None:
 `,
     },
     typescript: {
-      starter: `/** Adjacency cache: a model-generated draft that deletes after the write. */
+      starter: `/** Adjacency cache: flawed code that deletes after the write. */
 import {Redis} from 'ioredis';
 
 import {graph} from './graph';
@@ -226,7 +226,7 @@ import {graph} from './graph';
 const cache = new Redis(process.env.REDIS_URL ?? 'redis://127.0.0.1:6379');
 
 export async function readNeighbors(tenant: string, entity: string): Promise<string[]> {
-  // TODO: this draft keys without the tenant, caches without a TTL, and invalidates by deleting the
+  // TODO: this starter keys without the tenant, caches without a TTL, and invalidates by deleting the
   // entry after the write — so a concurrent read refills a stale list that no later deletion cleans.
   const key = 'neighbors:' + entity;
   const raw = await cache.get(key);
@@ -308,7 +308,7 @@ import (
 var ctx = context.Background()
 
 func readNeighbors(cache *redis.Client, tenant, entity string) ([]string, error) {
-	// TODO: this draft keys without the tenant, caches without a TTL, and invalidates by deleting
+	// TODO: this starter keys without the tenant, caches without a TTL, and invalidates by deleting
 	// the entry after the write — so a concurrent read refills a stale list that no later deletion
 	// cleans.
 	key := "neighbors:" + entity
@@ -410,7 +410,7 @@ object AdjacencyCache {
   private val log = Logger("graph")
 
   def readNeighbors(jedis: Jedis, tenant: String, entity: String): List[String] = {
-    // TODO: this draft keys without the tenant, caches without a TTL, and invalidates by deleting
+    // TODO: this starter keys without the tenant, caches without a TTL, and invalidates by deleting
     // the entry after the write — so a concurrent read refills a stale list that no later deletion
     // cleans.
     val key = s"neighbors:$entity"
@@ -495,7 +495,7 @@ void addEdge(const std::string& tenant, const std::string& src, const std::strin
 
 std::vector<std::string> readNeighbors(sw::redis::Redis& cache, const std::string& tenant,
                                        const std::string& entity) {
-  // TODO: this draft keys without the tenant, caches without a TTL, and invalidates by deleting the
+  // TODO: this starter keys without the tenant, caches without a TTL, and invalidates by deleting the
   // entry after the write — so a concurrent read refills a stale list that no later deletion cleans.
   const std::string key = "neighbors:" + entity;
   auto raw = cache.get(key);
@@ -575,5 +575,5 @@ void applyEdge(sw::redis::Redis& cache, const std::string& tenant, const std::st
     'Delete-after-write cannot be made safe by moving the delete earlier: any window where the key is absent lets a reader refill from a graph read that predates the change. Replace the delete with `INCR adjver:tenant` and stamp each cache entry with the version it was built from.',
     'Order matters in the reader: read the counter, then the entry, then refill. If you stamp the entry with a version read *after* loading the neighbours you can label fresh data stale — harmless — but doing it the other way round lets a bump to V+1 coexist with a list built at V, which is the race you were hired to remove.',
   ],
-  debrief: `The interviewer is testing whether you can invalidate a cache without a delete. The draft deletes after the write, which is the classic race: the delete can land on an entry a concurrent read just refilled, or on an entry that no longer describes the state, and either way the stale list survives. Version counters turn invalidation into a comparison: entries are written with the version they were built from, the writer only ever increments, and a reader that finds a mismatch refills — no window exists in which a delete and a refill can cancel each other out. Keying by \`(tenant, entity)\` is the second failure: without it two tenants share one list. The TTL bounds memory for entities that stop being read. Real systems add a Redis script to apply the edge and the increment atomically, per-entity locks for the write path, and a metric on the refill rate so a version churn that defeats the cache is visible.`,
+  debrief: `The interviewer is testing whether you can invalidate a cache without a delete. The starter deletes after the write, which is the classic race: the delete can land on an entry a concurrent read just refilled, or on an entry that no longer describes the state, and either way the stale list survives. Version counters turn invalidation into a comparison: entries are written with the version they were built from, the writer only ever increments, and a reader that finds a mismatch refills — no window exists in which a delete and a refill can cancel each other out. Keying by \`(tenant, entity)\` is the second failure: without it two tenants share one list. The TTL bounds memory for entities that stop being read. Real systems add a Redis script to apply the edge and the increment atomically, per-entity locks for the write path, and a metric on the refill rate so a version churn that defeats the cache is visible.`,
 };

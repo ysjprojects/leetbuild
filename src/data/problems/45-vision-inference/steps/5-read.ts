@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it looks the row up by id and
+**Starting point.** The starter is working code: it looks the row up by id and
 returns it. It is also a cross-tenant data leak, an unbounded result store and a lie about work in
 flight. Find the three flaws, fix them, and prove the fix.
 
@@ -27,7 +27,7 @@ Implement \`GET /v1/inferences/{id}\`:
   answers **202 Accepted** with the pending status, so a client cannot mistake a half-written row for
   a prediction.
 
-**Failure mode the checks target.** The draft serves any row to any caller, so one tenant can read
+**Failure mode the checks target.** The starter serves any row to any caller, so one tenant can read
 another's predictions by guessing an id; it never expires anything; and it returns a partial record
 with a 200, which downstream caching layers then treat as the finished answer.`,
   sequence: {
@@ -58,7 +58,7 @@ with a 200, which downstream caching layers then treat as the finished answer.`,
       id: 'tenant-scope',
       title: "A foreign id is 404, not someone else's result",
       detail:
-        "The record's tenant is compared with the authenticated caller and a mismatch is **404**, indistinguishable from a missing id. The draft returns whichever row the id names.",
+        "The record's tenant is compared with the authenticated caller and a mismatch is **404**, indistinguishable from a missing id. The starter returns whichever row the id names.",
       match: {
         python: {all: [/status_code\s*=\s*404/, /tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /tenant/]},
@@ -71,7 +71,7 @@ with a 200, which downstream caching layers then treat as the finished answer.`,
       id: 'result-ttl',
       title: 'Expires results at 30 days and keeps metadata longer',
       detail:
-        '`RESULT_TTL_DAYS = 30` bounds the prediction and `METADATA_TTL_DAYS` is the separate, longer budget for the audit metadata. The draft keeps every row forever.',
+        '`RESULT_TTL_DAYS = 30` bounds the prediction and `METADATA_TTL_DAYS` is the separate, longer budget for the audit metadata. The starter keeps every row forever.',
       match: {
         python: {all: [/RESULT_TTL_DAYS\s*=\s*30/, /METADATA_TTL_DAYS/]},
         typescript: {all: [/RESULT_TTL_DAYS\s*=\s*30/, /METADATA_TTL_DAYS/]},
@@ -84,7 +84,7 @@ with a 200, which downstream caching layers then treat as the finished answer.`,
       id: 'expired-gone',
       title: 'An expired result is 410 with its metadata',
       detail:
-        'A result older than the result TTL answers **410 Gone** and still returns the metadata that proves a decision was made (id, digest, created-at, the metadata TTL). The draft never expires anything.',
+        'A result older than the result TTL answers **410 Gone** and still returns the metadata that proves a decision was made (id, digest, created-at, the metadata TTL). The starter never expires anything.',
       match: {
         python: {all: [/status_code\s*=\s*410/, /metadata/]},
         typescript: {all: [/code\(\s*410\s*\)/, /metadata/]},
@@ -97,7 +97,7 @@ with a 200, which downstream caching layers then treat as the finished answer.`,
       id: 'terminal',
       title: 'A pending inference never masquerades as final',
       detail:
-        'An inference the worker has not finished answers **202 Accepted** with the pending status instead of a 200 that looks like a prediction. The draft returns the half-written row as final.',
+        'An inference the worker has not finished answers **202 Accepted** with the pending status instead of a 200 that looks like a prediction. The starter returns the half-written row as final.',
       match: {
         python: {all: [/PENDING/, /status_code\s*=\s*202/]},
         typescript: {all: [/PENDING/, /code\(\s*202\s*\)/]},
@@ -109,7 +109,7 @@ with a 200, which downstream caching layers then treat as the finished answer.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/inferences/{id}: a model-generated draft that serves any id it finds."""
+      starter: `"""GET /v1/inferences/{id}: flawed code that serves any id it finds."""
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -127,8 +127,8 @@ store = InferenceStore()
 
 @app.get("/v1/inferences/{inference_id}")
 def read_inference(inference_id: str) -> JSONResponse:
-    # TODO: this draft serves any inference id to any caller, keeps every result forever, and
-    # returns a half-written row as final. Review all three.
+    # TODO: this starter serves any inference id to any caller, keeps every result forever, and
+    # returns a half-written row as final. Fix all three.
     record = store.get(inference_id) or {"id": inference_id, "status": "complete", "label": None}
     return JSONResponse(record, status_code=200)
 `,
@@ -212,7 +212,7 @@ def read_inference(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/inferences/:id: a model-generated draft that serves any id it finds. */
+      starter: `/** GET /v1/inferences/:id: flawed code that serves any id it finds. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -225,8 +225,8 @@ interface StoredRow {
 }
 
 app.get('/v1/inferences/:id', async (request, reply) => {
-  // TODO: this draft serves any inference id to any caller, keeps every result forever, and
-  // returns a half-written row as final. Review all three.
+  // TODO: this starter serves any inference id to any caller, keeps every result forever, and
+  // returns a half-written row as final. Fix all three.
   const {id} = request.params as {id: string};
   const record: StoredRow | null = await store.get(id);
   return reply.code(200).send(record ?? {id, status: 'complete', label: null});
@@ -296,8 +296,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readInference(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves any inference id to any caller, keeps every result forever, and
-	// returns a half-written row as final. Review all three.
+	// TODO: this starter serves any inference id to any caller, keeps every result forever, and
+	// returns a half-written row as final. Fix all three.
 	record, _ := store.Get(r.PathValue("id"))
 	if record == nil {
 		writeJSON(rw, http.StatusOK, map[string]any{"id": r.PathValue("id"), "status": "complete"})
@@ -411,8 +411,8 @@ object ReadApi {
   val route: Route =
     path("v1" / "inferences" / Segment) { inferenceId =>
       get {
-        // TODO: this draft serves any inference id to any caller, keeps every result forever, and
-        // returns a half-written row as final. Review all three.
+        // TODO: this starter serves any inference id to any caller, keeps every result forever, and
+        // returns a half-written row as final. Fix all three.
         store.get(inferenceId) match {
           case Some(record) => complete(StatusCodes.OK, record.payload)
           case None => complete(StatusCodes.OK, s"""{"id":"$inferenceId","status":"complete"}""")
@@ -519,8 +519,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/inferences/:id", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves any inference id to any caller, keeps every result forever, and
-    // returns a half-written row as final. Review all three.
+    // TODO: this starter serves any inference id to any caller, keeps every result forever, and
+    // returns a half-written row as final. Fix all three.
     const auto record = store.get(req.path_params.at("id"));
     res.status = 200;
     res.set_content(record ? record->payload.dump() : json{{"id", req.path_params.at("id")}}.dump(),
@@ -613,7 +613,7 @@ int main() {
     'A record the worker is still writing is not a result: check the status before you build the response and answer 202 with the pending status. Otherwise a cache in front of you stores a half-written row as the final answer, and the client never asks again.',
   ],
   debrief: `The interviewer is testing the read path, which is where retention and isolation live. Three defects
-are being checked: tenant scope on a primary-key lookup (the draft turns a guessed id into another
+are being checked: tenant scope on a primary-key lookup (the starter turns a guessed id into another
 tenant's data), the retention split between the result and its audit metadata (keeping predictions
 forever quietly builds a training set of tenant data), and the terminal-status contract (a pending row
 served as final is indistinguishable from a real prediction downstream). The status choice matters in

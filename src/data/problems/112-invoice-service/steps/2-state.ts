@@ -13,7 +13,7 @@ the tenant's next number, marks the invoice finalized, and only then is the numb
 tenant's books. Numbers are **gapless per tenant** — a number that has been handed out is carried by
 an invoice, and two invoices of one tenant may never share one.
 
-The starter is a plausible model-generated draft: the happy path finalizes and returns a number, so
+**Starting point.** The starter is working code: the happy path finalizes and returns a number, so
 the demo passes. It reads the tenant's last number with \`GET\`, adds one **in the handler** and
 writes it back with \`SET\`; and it takes that number **before** it validates the totals, so every
 rejected finalize burns a number.
@@ -108,7 +108,7 @@ store with no constraint keeps both duplicates without a word.`,
       id: 'no-burn',
       title: 'Validation runs before the claim',
       detail:
-        "The handler validates the totals (`validate_totals`) **before** it calls the claim, so a rejected finalize consumes no number and leaves no gap in the tenant's sequence. The draft claims first and validates afterwards: every 422 burns a number that no invoice will ever carry, and the sequence is no longer gapless.",
+        "The handler validates the totals (`validate_totals`) **before** it calls the claim, so a rejected finalize consumes no number and leaves no gap in the tenant's sequence. The starter claims first and validates afterwards: every 422 burns a number that no invoice will ever carry, and the sequence is no longer gapless.",
       match: {
         python: {order: [/validate_totals\(invoice\)/, /claim_number\(tenant, invoice_id\)/]},
         typescript: {order: [/validateTotals\(invoice\)/, /claimNumber\(tenant, id\)/]},
@@ -356,7 +356,7 @@ async def finalize(invoice_id: str, tenant: str = Header(alias="X-Tenant-Id")) -
 `,
     },
     typescript: {
-      starter: `/** POST /v1/invoices/:id/finalize: a model-generated draft that counts numbers in the handler. */
+      starter: `/** POST /v1/invoices/:id/finalize: flawed code that counts numbers in the handler. */
 import Database from 'better-sqlite3';
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';

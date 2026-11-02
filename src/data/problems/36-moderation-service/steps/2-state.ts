@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'console'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a moderator asks for work and gets an item, so the
+**Starting point.** The starter is working code: a moderator asks for work and gets an item, so the
 demo passes. The claim hides a race, a stranded item and two counters that move apart. Find them,
 fix them, and prove the fix.
 
@@ -25,7 +25,7 @@ Implement the queue that hands reported items to moderators:
   deadline and re-\`EXPIRE\`s the session key, and it **refuses** when another moderator owns the
   item.
 - \`pending\` and \`in_review\` are two fields of one counters hash, moved by \`HINCRBY\` **inside the
-  same script**. The draft moves them with two separate client calls, so a crash between them
+  same script**. The starter moves them with two separate client calls, so a crash between them
   leaves the queue length wrong forever.
 - \`requeue_expired(now)\` scans the leases sorted set for deadlines in the past and puts those items
   back in the pending set, clearing the owner — an abandoned claim returns to the queue instead of
@@ -33,7 +33,7 @@ Implement the queue that hands reported items to moderators:
 
 **Failure mode the checks target.** Claim without a lease strands an item when the reviewer
 disappears; two counters updated apart drift from reality; and a pop outside a script is a race, not
-a claim. The draft fails all three because the demo never crashes and never has two moderators.`,
+a claim. The starter fails all three because the demo never crashes and never has two moderators.`,
   sequence: {
     participants: ['Moderator console', 'Redis', 'Moderation API'],
     messages: [
@@ -63,7 +63,7 @@ a claim. The draft fails all three because the demo never crashes and never has 
       id: 'lease-expiry',
       title: 'A claim carries a lease that can expire',
       detail:
-        'The claim writes a **600-second** lease deadline and an `EXPIRE` on the holder’s session key, so an abandoned claim is reclaimable. The draft marks the item in-review with no lease at all, so a crashed moderator strands it forever.',
+        'The claim writes a **600-second** lease deadline and an `EXPIRE` on the holder’s session key, so an abandoned claim is reclaimable. The starter marks the item in-review with no lease at all, so a crashed moderator strands it forever.',
       match: {
         python: {all: [/LEASE_S/, /EXPIRE/]},
         typescript: {all: [/LEASE_S/, /EXPIRE/]},
@@ -89,7 +89,7 @@ a claim. The draft fails all three because the demo never crashes and never has 
       id: 'counters-atomic',
       title: 'Moves pending and in-review in one script',
       detail:
-        '`pending` and `in_review` are fields of one counters hash updated by `HINCRBY` inside the claim script. The draft decrements one counter and increments the other in two separate calls, so a crash between them corrupts the queue metrics.',
+        '`pending` and `in_review` are fields of one counters hash updated by `HINCRBY` inside the claim script. The starter decrements one counter and increments the other in two separate calls, so a crash between them corrupts the queue metrics.',
       match: {
         python: {all: [/HINCRBY/, /pending/, /in_review/]},
         typescript: {all: [/HINCRBY/, /pending/, /in_review/]},
@@ -126,7 +126,7 @@ COUNTERS = "moderation:counters"
 
 
 def claim(moderator: str) -> str | None:
-    # TODO: this draft pops an item and marks it in-review with no lease, so a crashed moderator
+    # TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
     # strands it forever, and it moves the pending and in-review counters in two separate calls.
     popped = r.zpopmin(QUEUE, 1)
     if not popped:
@@ -210,7 +210,7 @@ def requeue_expired(now: int | None = None) -> int:
 `,
     },
     typescript: {
-      starter: `/** Moderation queue: a model-generated draft that claims without a lease. */
+      starter: `/** Moderation queue: flawed code that claims without a lease. */
 import {Redis} from 'ioredis';
 
 export const r = new Redis('redis://redis:6379');
@@ -220,7 +220,7 @@ const ACTIVE = 'moderation:active';
 const COUNTERS = 'moderation:counters';
 
 export async function claim(moderator: string): Promise<string | null> {
-  // TODO: this draft pops an item and marks it in-review with no lease, so a crashed moderator
+  // TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
   // strands it forever, and it moves the pending and in-review counters in two separate calls.
   const popped = await r.zpopmin(QUEUE, 1);
   if (popped.length === 0) return null;
@@ -314,7 +314,7 @@ const (
 )
 
 func claim(ctx context.Context, rdb *redis.Client, moderator string) (string, error) {
-	// TODO: this draft pops an item and marks it in-review with no lease, so a crashed moderator
+	// TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
 	// strands it forever, and it moves the pending and in-review counters in two separate calls.
 	popped, err := rdb.ZPopMin(ctx, queueKey, 1).Result()
 	if err != nil || len(popped) == 0 {
@@ -418,7 +418,7 @@ object ModerationQueue {
   val redis = new Jedis("redis", 6379)
 
   def claim(moderator: String): Option[String] = {
-    // TODO: this draft pops an item and marks it in-review with no lease, so a crashed moderator
+    // TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
     // strands it forever, and it moves the pending and in-review counters in two separate calls.
     val popped = redis.zpopmin(QueueKey)
     if (popped == null) None
@@ -527,7 +527,7 @@ const std::string kActiveKey = "moderation:active";
 const std::string kCountersKey = "moderation:counters";
 
 std::optional<std::string> claim(sw::redis::Redis& redis, const std::string& moderator) {
-  // TODO: this draft pops an item and marks it in-review with no lease, so a crashed moderator
+  // TODO: this starter pops an item and marks it in-review with no lease, so a crashed moderator
   // strands it forever, and it moves the pending and in-review counters in two separate calls.
   auto popped = redis.zpopmin(kQueueKey);
   if (!popped) return std::nullopt;
@@ -617,5 +617,5 @@ long long requeueExpired(sw::redis::Redis& redis, long long now) {
     'A lease is two things: a deadline in a sorted set (so a reaper can find expired claims) and a session key with `EXPIRE` (so the holder record dies with the lease). Renewing re-`ZADD`s a later deadline and re-`EXPIRE`s the session, and it checks `HGET owners == moderator` first so it cannot steal someone else’s item.',
     'Atomicity applies to the counters too. `pending` and `in_review` are two fields of one hash: move them with `HINCRBY` inside the same script, so the queue never reports one item as both pending and in-review, or as neither.',
   ],
-  debrief: `The interviewer is testing whether you can review a queue that is claimed, not just read. The draft looks fine because in the demo one moderator claims one item and finishes. Three defects are being checked: the claim must be one atomic script (a pop followed by a write is a race, and the "lost" item lives in neither the queue nor any moderator's hands), a claim needs a lease so an abandoned item returns to the queue rather than being stranded, and the two counters must move together so the queue's own metrics stay consistent. Real queues add a heartbeat thread that renews the lease, a reaper on a schedule, a per-moderator in-flight cap, and a WATCH-free design because Lua already gives them the atomicity they would otherwise build with optimistic locking.`,
+  debrief: `The interviewer is testing whether you can debug a queue that is claimed, not just read. The starter looks fine because in the demo one moderator claims one item and finishes. Three defects are being checked: the claim must be one atomic script (a pop followed by a write is a race, and the "lost" item lives in neither the queue nor any moderator's hands), a claim needs a lease so an abandoned item returns to the queue rather than being stranded, and the two counters must move together so the queue's own metrics stay consistent. Real queues add a heartbeat thread that renews the lease, a reaper on a schedule, a per-moderator in-flight cap, and a WATCH-free design because Lua already gives them the atomicity they would otherwise build with optimistic locking.`,
 };

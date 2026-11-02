@@ -8,10 +8,10 @@ export const endpointStep: Step = {
   focus: ['device', 'ingest', 'registry'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the batch and acknowledges it, so a device sending well-formed samples sees a pipeline that works.
 It compiles, it serves the demo, and it hides three production flaws — one of which poisoned a whole
-fleet's dashboard. Review it like the service owner, fix it, and prove the fix with the checks below.
+fleet's dashboard. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/telemetry\` with body
 \`{"batch_id": "…", "device_id": "…", "samples": [{"metric": "temp_c", "value": 21.5}, …]}\`.
@@ -31,7 +31,7 @@ Implement \`POST /v1/telemetry\` with body
   promise the pipeline cannot keep: the batch is already in the client's send buffer as delivered,
   and the rejection that follows has nowhere to go.
 
-**Failure mode the checks target.** The draft acknowledges each batch before validating a reading and
+**Failure mode the checks target.** The starter acknowledges each batch before validating a reading and
 does the work in the background, so unknown devices and wild values are absorbed into aggregates that
 then look plausible; and it resolves a device with \`lookup(...) or register_device(...)\`, which
 silently turns any invented id into a device the pipeline will track forever.`,
@@ -63,7 +63,7 @@ silently turns any invented id into a device the pipeline will track forever.`,
   },
   hints: [
     'Write the guard clauses in cost order: batch shape, sample count, registry lookup, then the per-sample range checks. Every one of them returns before the acknowledgment, so the client learns about a bad batch instead of assuming the samples landed.',
-    '`registry.lookup(device_id)` is the only device resolution allowed here. The draft’s `lookup(...) or register_device(...)` is the quiet bug: it turns ingest into a device-registration API, and no amount of downstream validation can undo a fleet that now contains an id nobody provisioned.',
+    '`registry.lookup(device_id)` is the only device resolution allowed here. The starter’s `lookup(...) or register_device(...)` is the quiet bug: it turns ingest into a device-registration API, and no amount of downstream validation can undo a fleet that now contains an id nobody provisioned.',
     'The metric error must carry the metric name and, for a range failure, the declared `[low, high]`. "invalid sample" tells the device firmware nothing and turns one bad metric into a fleet-wide support ticket; naming it lets the sending device drop exactly the offending reading.',
   ],
   checks: [
@@ -83,7 +83,7 @@ silently turns any invented id into a device the pipeline will track forever.`,
       id: 'device-known',
       title: 'Requires a registry device and invents no registry state',
       detail:
-        'The device comes from `registry.lookup(device_id)` and an unknown id is **404**. The draft resolves it with `lookup(...) or register_device(...)`, which creates a registry row for any id a caller sends — the one write an ingest path must never do.',
+        'The device comes from `registry.lookup(device_id)` and an unknown id is **404**. The starter resolves it with `lookup(...) or register_device(...)`, which creates a registry row for any id a caller sends — the one write an ingest path must never do.',
       match: {
         python: {all: [/registry\.lookup\(/, /status_code\s*=\s*404/], none: [/register_device\(/]},
         typescript: {all: [/registry\.lookup\(/, /code\(\s*404\s*\)/], none: [/registerDevice\(/]},
@@ -96,7 +96,7 @@ silently turns any invented id into a device the pipeline will track forever.`,
       id: 'metric-known',
       title: 'Rejects an undeclared metric and names it',
       detail:
-        'A metric that is not declared for the device is **400** with the metric named in the response; the declared ranges come from the registry row (`metrics`/`Metrics`). The draft accepts any metric name it is given.',
+        'A metric that is not declared for the device is **400** with the metric named in the response; the declared ranges come from the registry row (`metrics`/`Metrics`). The starter accepts any metric name it is given.',
       match: {
         python: {all: [/unknown metric/, /limits\.get\(/]},
         typescript: {all: [/unknown metric/, /device\.metrics\[/]},
@@ -109,7 +109,7 @@ silently turns any invented id into a device the pipeline will track forever.`,
       id: 'value-range',
       title: 'Rejects an out-of-range value with the metric and its range',
       detail:
-        'A value outside the metric’s declared `[low, high]` is **422** and the response names the metric and the declared bounds. The draft writes the value through, so one overflow reading rescales every aggregate built on it.',
+        'A value outside the metric’s declared `[low, high]` is **422** and the response names the metric and the declared bounds. The starter writes the value through, so one overflow reading rescales every aggregate built on it.',
       match: {
         python: {all: [/out of range/, /status_code\s*=\s*422/, /low\s*<=\s*sample\.value\s*<=\s*high/]},
         typescript: {all: [/out of range/, /code\(\s*422\s*\)/, /sample\.value >= low/]},
@@ -122,7 +122,7 @@ silently turns any invented id into a device the pipeline will track forever.`,
       id: 'validate-first',
       title: 'Validates before acknowledging the batch',
       detail:
-        'The registry lookup happens before the batch is acknowledged (`202`/`StatusAccepted`). The draft answers first and persists in the background, so a rejected batch has already been acknowledged to the device.',
+        'The registry lookup happens before the batch is acknowledged (`202`/`StatusAccepted`). The starter answers first and persists in the background, so a rejected batch has already been acknowledged to the device.',
       match: {
         python: {order: [/registry\.lookup\(/, /status_code\s*=\s*202/]},
         typescript: {order: [/registry\.lookup\(/, /code\(\s*202\s*\)/]},
@@ -170,7 +170,7 @@ registry = DeviceRegistry()
 
 @app.post("/v1/telemetry")
 def ingest(batch: TelemetryBatch, background: BackgroundTasks) -> JSONResponse:
-    # TODO: this draft acknowledges the batch before it validates a single reading, invents a
+    # TODO: this starter acknowledges the batch before it validates a single reading, invents a
     # registry row for a device id it has never seen, and accepts any value, so one 64-bit
     # overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
     background.add_task(persist, batch)
@@ -249,7 +249,7 @@ def ingest(batch: TelemetryBatch) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/telemetry: a model-generated draft that acks the batch and validates nothing. */
+      starter: `/** POST /v1/telemetry: flawed code that acks the batch and validates nothing. */
 import Fastify from 'fastify';
 
 import {registry, store} from './deps';
@@ -268,7 +268,7 @@ interface TelemetryBatch {
 }
 
 app.post('/v1/telemetry', async (request, reply) => {
-  // TODO: this draft acknowledges the batch before it validates a single reading, invents a
+  // TODO: this starter acknowledges the batch before it validates a single reading, invents a
   // registry row for a device id it has never seen, and accepts any value, so one 64-bit
   // overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
   const batch = request.body as TelemetryBatch;
@@ -380,7 +380,7 @@ func ingest(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft acknowledges the batch before it validates a single reading, invents a
+	// TODO: this starter acknowledges the batch before it validates a single reading, invents a
 	// registry row for a device id it has never seen, and accepts any value, so one 64-bit
 	// overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
 	go persistBatch(batch)
@@ -525,7 +525,7 @@ object IngestApi {
     path("v1" / "telemetry") {
       post {
         entity(as[TelemetryBatch]) { batch =>
-          // TODO: this draft acknowledges the batch before it validates a single reading, invents
+          // TODO: this starter acknowledges the batch before it validates a single reading, invents
           // a registry row for a device id it has never seen, and accepts any value, so one
           // 64-bit overflow reading is absorbed into the aggregates.
           system.dispatcher.execute(() => persist(batch))
@@ -653,7 +653,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft acknowledges the batch before it validates a single reading, invents a
+    // TODO: this starter acknowledges the batch before it validates a single reading, invents a
     // registry row for a device id it has never seen, and accepts any value, so one 64-bit
     // overflow reading is absorbed into the aggregates and rescales a whole fleet's graph.
     res.status = 202;
@@ -766,5 +766,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a data pipeline. The draft reads fine because the demo sends one well-formed batch from one known device. Three separate defects are being checked: the device must come from the registry (an ingest path that registers devices is a public write API with no auth model), every reading must be inside the range the metric declares (the overflow value that scaled a graph to zero arrived exactly here), and the acknowledgment must follow validation rather than lead it. That last one is the order bug interviewers love: an early 202 is a promise that the client will not retry, so the rejection that follows is invisible to the device and the batch is lost without a trace. Real edges add batch-level idempotency, per-metric cardinality limits, and a device clock skew check, but the validation funnel and the ack position are what make the pipeline's numbers defensible.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a data pipeline. The starter reads fine because the demo sends one well-formed batch from one known device. Three separate defects are being checked: the device must come from the registry (an ingest path that registers devices is a public write API with no auth model), every reading must be inside the range the metric declares (the overflow value that scaled a graph to zero arrived exactly here), and the acknowledgment must follow validation rather than lead it. That last one is the order bug interviewers love: an early 202 is a promise that the client will not retry, so the rejection that follows is invisible to the device and the batch is lost without a trace. Real edges add batch-level idempotency, per-metric cardinality limits, and a device clock skew check, but the validation funnel and the ack position are what make the pipeline's numbers defensible.`,
 };

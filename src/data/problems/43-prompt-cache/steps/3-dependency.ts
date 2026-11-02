@@ -8,9 +8,9 @@ export const cacheDependencyStep: Step = {
   focus: ['cache', 'model'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: on a miss it calls the model,
+**Starting point.** The starter is working code: on a miss it calls the model,
 catches the error, retries, and stores whatever comes back. It hides three flaws that all look like
-"resilience" and all end in one poisoned cache entry. Review the miss path, fix it, and prove the fix.
+"resilience" and all end in one poisoned cache entry. Debug the miss path, fix it, and prove the fix.
 
 Implement the model call the fill path makes on a miss.
 
@@ -20,21 +20,21 @@ Implement the model call the fill path makes on a miss.
 - **Only a deterministic completion is cacheable.** The rule is \`temperature == 0\` **and** the reply
   finished normally (\`finish_reason == "stop"\`). A sampled answer (\`temperature > 0\`) is different on
   every call, so caching one sample hands that particular sample to every later caller for the whole
-  version lifetime. The draft stores every reply it gets.
+  version lifetime. The starter stores every reply it gets.
 - **A transport error is returned uncached.** When the call fails — \`UNAVAILABLE\`,
-  \`DEADLINE_EXCEEDED\`, whatever it is — the miss path returns nothing to store. The draft writes
+  \`DEADLINE_EXCEEDED\`, whatever it is — the miss path returns nothing to store. The starter writes
   \`"upstream error"\` into the entry, so one provider blip becomes everyone's completion for six
   hours, and no later request ever retries because the cache keeps answering.
 - **A content-policy refusal is terminal for that request.** Answer it with
   \`{"status": "refused"}\` and store nothing: the refusal belongs to this prompt and this version, and
-  retrying it hammers the provider for an answer that policy already declined. The draft loops three
+  retrying it hammers the provider for an answer that policy already declined. The starter loops three
   times over a \`content_filter\` reply.
 - **A cached answer is stored through the same conditional fill as any other**. Use the fill from the
   state step (\`fill_if_absent\`), never a direct \`SET\`: the miss path must not be a second writer that
   can clobber a newer value.
 
 **Failure mode the checks target.** All three flaws are the same mistake in different clothes: the
-draft caches *a response* where it must cache *the completion the request asked for*. A sampled
+starter caches *a response* where it must cache *the completion the request asked for*. A sampled
 response, an error string and a refusal are all "a response", and all three are permanently wrong once
 they are stored under a key whose whole contract is "this exact prefix at this exact version".`,
   sequence: {
@@ -78,7 +78,7 @@ they are stored under a key whose whole contract is "this exact prefix at this e
       id: 'deadline',
       title: 'The model call carries a 3-second deadline',
       detail:
-        'The RPC is bounded to three seconds per call (`timeout=3.0`, a `deadline` of `Date.now() + 3000`, `WithTimeout(ctx, 3*time.Second)`, `withDeadlineAfter(3, SECONDS)`, `set_deadline(now + 3s)`). The draft calls the model without any bound, so a slow provider holds the request open.',
+        'The RPC is bounded to three seconds per call (`timeout=3.0`, a `deadline` of `Date.now() + 3000`, `WithTimeout(ctx, 3*time.Second)`, `withDeadlineAfter(3, SECONDS)`, `set_deadline(now + 3s)`). The starter calls the model without any bound, so a slow provider holds the request open.',
       match: {
         python: {all: [/timeout=3\.0/, /\.Complete\(/]},
         typescript: {all: [/Date\.now\(\) \+ 3000/, /\.Complete\(/]},
@@ -93,7 +93,7 @@ they are stored under a key whose whole contract is "this exact prefix at this e
       id: 'temperature-gate',
       title: 'Only temperature 0 is cacheable',
       detail:
-        'The cacheability rule tests `temperature == 0`, so a sampled answer is returned to its own caller and stored for nobody. The draft stores every reply, so the first caller’s sample becomes the answer for the whole prompt version.',
+        'The cacheability rule tests `temperature == 0`, so a sampled answer is returned to its own caller and stored for nobody. The starter stores every reply, so the first caller’s sample becomes the answer for the whole prompt version.',
       match: {
         python: {all: [/temperature == 0/]},
         typescript: {all: [/temperature === 0/]},
@@ -106,7 +106,7 @@ they are stored under a key whose whole contract is "this exact prefix at this e
       id: 'stop-only',
       title: 'Only a normally finished reply is stored',
       detail:
-        'The reply must finish with `finish_reason == "stop"` before it is cached — a truncated answer is a property of that call, not of the prefix. The draft checks nothing about how the reply ended.',
+        'The reply must finish with `finish_reason == "stop"` before it is cached — a truncated answer is a property of that call, not of the prefix. The starter checks nothing about how the reply ended.',
       match: {
         python: {all: [/finish_reason == "stop"/]},
         typescript: {all: [/finish_reason === 'stop'/]},
@@ -119,7 +119,7 @@ they are stored under a key whose whole contract is "this exact prefix at this e
       id: 'no-cache-on-error',
       title: 'A transport error returns nothing and writes nothing',
       detail:
-        'The error branch answers "no result" — `return None`, `null`, `nil`, `std::nullopt` — and never reaches the fill. The draft stores an error string, so a transient failure is served to every caller for the version’s lifetime.',
+        'The error branch answers "no result" — `return None`, `null`, `nil`, `std::nullopt` — and never reaches the fill. The starter stores an error string, so a transient failure is served to every caller for the version’s lifetime.',
       match: {
         python: {all: [/except grpc\.RpcError as error/, /return None/]},
         typescript: {all: [/catch \(error\)/, /return null/]},
@@ -132,7 +132,7 @@ they are stored under a key whose whole contract is "this exact prefix at this e
       id: 'refusal-terminal',
       title: 'A content-policy refusal is terminal and uncached',
       detail:
-        'A `content_filter` reply is answered as `refused` and never stored, and there is no retry loop around the call. The draft retries the refusal up to three times and then caches the reply anyway, spending a provider call per attempt on an answer policy already declined.',
+        'A `content_filter` reply is answered as `refused` and never stored, and there is no retry loop around the call. The starter retries the refusal up to three times and then caches the reply anyway, spending a provider call per attempt on an answer policy already declined.',
       match: {
         python: {all: [/"refused"/, /"content_filter"/], none: [/for attempt/, /max_attempts/]},
         typescript: {all: [/'refused'/, /'content_filter'/], none: [/for \(let attempt/, /maxAttempts/]},
@@ -151,7 +151,7 @@ log = logging.getLogger("prompt-cache")
 
 
 async def complete_and_cache(stub, key: str, tenant: str, version: int, prefix: str, temperature: float) -> dict:
-    # TODO: the draft retries a content-policy refusal, calls the model with no deadline, and stores
+    # TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
     # every reply it gets — a sampled answer, a truncated answer and even the error path, so one
     # provider blip is served to everyone for the rest of the version's lifetime.
     for attempt in range(3):
@@ -194,7 +194,7 @@ async def complete_or_none(
 `,
     },
     typescript: {
-      starter: `/** A model-generated miss path that retries refusals and caches every reply. */
+      starter: `/** A miss path that retries refusals and caches every reply. */
 export async function completeAndCache(
   client: CompletionClient,
   key: string,
@@ -203,7 +203,7 @@ export async function completeAndCache(
   prefix: string,
   temperature: number,
 ): Promise<{status: string; completion: string | null}> {
-  // TODO: the draft retries a content-policy refusal, calls the model with no deadline, and stores
+  // TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
   // every reply it gets — a sampled answer, a truncated answer and even the error path, so one
   // provider blip is served to everyone for the rest of the version's lifetime.
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -258,7 +258,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// TODO: the draft retries a content-policy refusal, calls the model with no deadline, and stores
+// TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
 // every reply it gets — a sampled answer, a truncated answer and even the error path, so one
 // provider blip is served to everyone for the rest of the version's lifetime.
 func completeAndCache(ctx context.Context, stub CompletionClient, key, tenant string, version int, prefix string, temperature float64) (*Result, error) {
@@ -322,7 +322,7 @@ func completeOrNone(ctx context.Context, stub CompletionClient, key, tenant stri
 import scala.concurrent.{ExecutionContext, Future}
 
 object MissPath {
-  // TODO: the draft retries a content-policy refusal, calls the model with no deadline, and stores
+  // TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
   // every reply it gets — a sampled answer, a truncated answer and even the error path, so one
   // provider blip is served to everyone for the rest of the version's lifetime.
   def completeAndCache(stub: CompletionServiceGrpc.CompletionServiceStub, jedis: Jedis, key: String, tenant: String,
@@ -375,7 +375,7 @@ object MissPath {
 #include <iostream>
 #include <string>
 
-// TODO: the draft retries a content-policy refusal, calls the model with no deadline, and stores
+// TODO: the starter retries a content-policy refusal, calls the model with no deadline, and stores
 // every reply it gets — a sampled answer, a truncated answer and even the error path, so one
 // provider blip is served to everyone for the rest of the version's lifetime.
 Result complete_and_cache(Completion::StubInterface* stub, sw::redis::Redis& cache, const std::string& key,
@@ -428,5 +428,5 @@ std::optional<Result> complete_or_none(Completion::StubInterface* stub, sw::redi
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can tell "a response arrived" from "an answer is cacheable". The draft conflates them, and all three of its flaws are the same conflation: a sampled completion is one instance of a distribution, a truncated completion is one instance of a stream, and an error string is not a completion at all — yet each of them would be stored under a key that promises "this exact prefix, at this exact version, has this answer". The deadline is the other half of the same discipline: without it, a slow provider turns a cache miss into an unbounded wait, and the retry loop the draft writes makes it worse because a refusal is deterministic and will be refused again. What a real service adds is the observability that makes the policy visible — log the failure with the key and the gRPC code, expose a cacheable/uncached/refused counter beside the hit ratio — so on-call can tell a provider problem from a policy problem without reading a single completion.`,
+  debrief: `The interviewer is testing whether you can tell "a response arrived" from "an answer is cacheable". The starter conflates them, and all three of its flaws are the same conflation: a sampled completion is one instance of a distribution, a truncated completion is one instance of a stream, and an error string is not a completion at all — yet each of them would be stored under a key that promises "this exact prefix, at this exact version, has this answer". The deadline is the other half of the same discipline: without it, a slow provider turns a cache miss into an unbounded wait, and the retry loop the starter writes makes it worse because a refusal is deterministic and will be refused again. What a real service adds is the observability that makes the policy visible — log the failure with the key and the gRPC code, expose a cacheable/uncached/refused counter beside the hit ratio — so on-call can tell a provider problem from a policy problem without reading a single completion.`,
 };

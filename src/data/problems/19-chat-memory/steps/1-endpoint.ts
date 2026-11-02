@@ -8,7 +8,7 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a turn lands in Redis, so the demo passes. The
+The starter is working code: a turn lands in Redis, so the demo passes. The
 handler trusts three things it must not — the session id in the path, the size of the body and the
 role string. Find the flaws, fix them, and prove the fix.
 
@@ -18,17 +18,17 @@ Implement the turn-append endpoint used by every chat client:
   (\`X-Tenant-Id\`), never from the path or the body. The session id in the path is a claim, not a
   proof: look up the session's owner and answer **404** when it belongs to another tenant, so a
   cross-tenant write can never create or read another tenant's buffer.
-- The role must be \`user\` or \`assistant\`; anything else is a **400**. The draft folds an unknown
+- The role must be \`user\` or \`assistant\`; anything else is a **400**. The starter folds an unknown
   or missing role into \`user\`, silently storing a system prompt as a user turn.
 - \`content\` is capped at **32 KiB**, measured in UTF-8 bytes. Reject an oversized turn with
-  **413 before any Redis write** — the draft appends first, so a multi-megabyte paste is already in
+  **413 before any Redis write** — the starter appends first, so a multi-megabyte paste is already in
   the list by the time anyone looks at its size.
 - The optional \`Idempotency-Key\` makes the append replay-safe: the first successful append stores
   its response under \`idem:{tenant}:{key}\`, and a replay returns that stored turn with **200**
   instead of appending a duplicate.
 
 **Failure mode the checks target.** A caller from tenant B posts to tenant A's session id and the
-draft writes into A's buffer; a 4 MB paste is accepted and stored; \`role: "system"\` becomes a
+starter writes into A's buffer; a 4 MB paste is accepted and stored; \`role: "system"\` becomes a
 \`user\` turn; and a client that retries after a timeout doubles the conversation.
 
 ## What to keep
@@ -76,7 +76,7 @@ dedupe — all before the first write.`,
       id: 'tenant-ownership',
       title: 'Authorizes the session against the authenticated tenant',
       detail:
-        'The session owner is loaded and compared with the tenant from the request context; a foreign session id answers `404`. The draft writes into whatever session id the path contains.',
+        'The session owner is loaded and compared with the tenant from the request context; a foreign session id answers `404`. The starter writes into whatever session id the path contains.',
       match: {
         python: {all: [/assert_tenant_owns/, /404/]},
         typescript: {all: [/assertTenantOwns/, /404/]},
@@ -89,7 +89,7 @@ dedupe — all before the first write.`,
       id: 'content-cap',
       title: 'Caps content at 32 KiB before the Redis write',
       detail:
-        'The UTF-8 byte length is measured against a 32 KiB constant and an oversized turn is rejected with `413` before the append. The draft stores first and never checks.',
+        'The UTF-8 byte length is measured against a 32 KiB constant and an oversized turn is rejected with `413` before the append. The starter stores first and never checks.',
       match: {
         python: {all: [/MAX_CONTENT_BYTES/, /413/], order: [/MAX_CONTENT_BYTES/, /lpush\(/]},
         typescript: {all: [/MAX_CONTENT_BYTES/, /413/], order: [/MAX_CONTENT_BYTES/, /lpush\(/]},
@@ -102,7 +102,7 @@ dedupe — all before the first write.`,
       id: 'role-validation',
       title: 'Rejects a role that is neither user nor assistant',
       detail:
-        'The role is checked against an explicit set and an unknown value answers `400`. The draft turns any unknown role into `user`.',
+        'The role is checked against an explicit set and an unknown value answers `400`. The starter turns any unknown role into `user`.',
       match: {
         python: {all: [/VALID_ROLES/, /400/]},
         typescript: {all: [/VALID_ROLES/, /400/]},
@@ -115,7 +115,7 @@ dedupe — all before the first write.`,
       id: 'idempotency-replay',
       title: 'Replays an Idempotency-Key instead of appending twice',
       detail:
-        'The append stores its response under `idem:{tenant}:{key}` and a replay returns the stored turn with `200` before the append. The draft ignores the header entirely.',
+        'The append stores its response under `idem:{tenant}:{key}` and a replay returns the stored turn with `200` before the append. The starter ignores the header entirely.',
       match: {
         python: {all: [/idem:/, /Idempotency-Key/], order: [/idem:/, /lpush\(/]},
         typescript: {all: [/idem:/, /idempotency[_-]key/i], order: [/idem:/, /lpush\(/]},
@@ -212,7 +212,7 @@ def append_turn(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/turns: a model-generated draft that trusts the path and the body. */
+      starter: `/** POST /v1/sessions/:id/turns: flawed code that trusts the path and the body. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {randomUUID} from 'node:crypto';
@@ -659,7 +659,7 @@ int main() {
 the caller controls — the path, the body, the role, the idempotency key — is a claim, and the
 service has to turn each claim into a fact it can prove: who owns the session, how many bytes
 arrived, whether the role is one the schema allows, and whether this exact append already happened.
-The draft passes the demo because the happy path is one tenant, one small turn, one attempt; it
+The starter passes the demo because the happy path is one tenant, one small turn, one attempt; it
 fails exactly when a second tenant, a large paste or a retrying client shows up. Two details
 interviewers listen for: measuring bytes rather than characters, and rejecting before the first
 write so a bad request never leaves a trace in Redis. The replay-safe response is the third: a

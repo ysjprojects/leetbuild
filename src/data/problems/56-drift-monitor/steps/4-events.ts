@@ -8,15 +8,15 @@ export const driftEventsStep: Step = {
   focus: ['monitor', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every evaluation produces a
-\`drift.evaluated\` event and the topic looks healthy in the console. It hides three flaws, and the first
-one is the reason an audit cannot answer "when did this monitor last fire?". Review it, fix it, and
-prove the fix.
+**Starting point.** The starter is working code: every evaluation produces a \`drift.evaluated\`
+event and the topic looks healthy in the console. It hides three flaws, and the first one is the
+reason an audit cannot answer "when did this monitor last fire?". Debug it, fix it, and prove the
+fix.
 
 Every evaluation can publish to \`drift.evaluated\`:
 
 - **Keyed by monitor id.** The key decides the partition, so all events for one monitor keep their
-  order relative to each other. The draft keys by model version, so two monitors watching the same
+  order relative to each other. The starter keys by model version, so two monitors watching the same
   version interleave and one monitor's history is split across partitions.
 - **Routine evaluations are summarized, not published one by one.** Only a threshold crossing (or a
   state change) publishes an event; no-drift ticks are counted and rolled into one summary every
@@ -64,7 +64,7 @@ when the broker is already sick — the moment you most need the record.`,
       id: 'monitor-key',
       title: 'Keys drift.evaluated by monitor id',
       detail:
-        'The record key is the monitor id, so every event for one monitor lands in one partition and keeps its order. The draft keys by model version, which interleaves monitors and scatters a single monitor’s history.',
+        'The record key is the monitor id, so every event for one monitor lands in one partition and keeps its order. The starter keys by model version, which interleaves monitors and scatters a single monitor’s history.',
       match: {
         python: {all: [/key=monitor\["monitor_id"\]/, /drift\.evaluated/]},
         typescript: {all: [/key:\s*monitor\.monitor_id/, /drift\.evaluated/]},
@@ -77,7 +77,7 @@ when the broker is already sick — the moment you most need the record.`,
       id: 'threshold-only',
       title: 'Publishes crossings, summarizes routine ticks',
       detail:
-        'A crossing publishes immediately; quiet ticks are counted and rolled into one summary every `SUMMARY_EVERY = 60` evaluations instead of one event per tick. The draft publishes every evaluation at full volume.',
+        'A crossing publishes immediately; quiet ticks are counted and rolled into one summary every `SUMMARY_EVERY = 60` evaluations instead of one event per tick. The starter publishes every evaluation at full volume.',
       match: {
         python: {all: [/crossed/, /SUMMARY_EVERY/]},
         typescript: {all: [/crossed/, /SUMMARY_EVERY/]},
@@ -90,7 +90,7 @@ when the broker is already sick — the moment you most need the record.`,
       id: 'payload-evidence',
       title: 'Carries the metric, threshold, distance and boundaries',
       detail:
-        'The event contains the metric, the threshold, the distance and both window boundaries. The draft sends no boundaries, so a consumer cannot tell which window an event describes or join it to a report.',
+        'The event contains the metric, the threshold, the distance and both window boundaries. The starter sends no boundaries, so a consumer cannot tell which window an event describes or join it to a report.',
       match: {
         python: {all: [/metric/, /distance/, /threshold/, /window_start/, /window_end/]},
         typescript: {all: [/metric/, /distance/, /threshold/, /window_start/, /window_end/]},
@@ -116,7 +116,7 @@ when the broker is already sick — the moment you most need the record.`,
       id: 'outbox-fallback',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce calls `insert_outbox` inside the error branch instead of dropping the event. The draft ignores the broker result, so an outage silently erases the alert from history.',
+        'A rejected produce calls `insert_outbox` inside the error branch instead of dropping the event. The starter ignores the broker result, so an outage silently erases the alert from history.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -139,9 +139,9 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_evaluation(monitor: dict, window: int, distance: float, over_threshold: bool) -> None:
-    # TODO: this draft keys by model version, publishes every evaluation including no-drift ticks at
+    # TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
     # full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-    # rejected produce. Review all five.
+    # rejected produce. Fix all five.
     event = {
         "monitor_id": monitor["monitor_id"],
         "metric": monitor["metric"],
@@ -210,7 +210,7 @@ def publish_evaluation(
 `,
     },
     typescript: {
-      starter: `/** drift.evaluated: a model-generated draft that publishes every evaluation. */
+      starter: `/** drift.evaluated: flawed code that publishes every evaluation. */
 import {Kafka, logLevel} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'drift-monitor', brokers: ['kafka:9092'], logLevel: logLevel.WARN});
@@ -230,9 +230,9 @@ export async function publishEvaluation(
   distance: number,
   overThreshold: boolean,
 ): Promise<void> {
-  // TODO: this draft keys by model version, publishes every evaluation including no-drift ticks at
+  // TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
   // full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-  // rejected produce. Review all five.
+  // rejected produce. Fix all five.
   const event = {
     monitor_id: monitor.monitor_id,
     metric: monitor.metric,
@@ -329,9 +329,9 @@ type Monitor struct {
 }
 
 func publishEvaluation(ctx context.Context, monitor Monitor, window int64, distance float64, overThreshold bool) error {
-	// TODO: this draft keys by model version, publishes every evaluation including no-drift ticks at
+	// TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
 	// full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-	// rejected produce. Review all five.
+	// rejected produce. Fix all five.
 	event := map[string]any{
 		"monitor_id": monitor.MonitorID,
 		"metric":     monitor.Metric,
@@ -451,9 +451,9 @@ object DriftEvents {
   val producer = new KafkaProducer[String, String](props)
 
   def publishEvaluation(monitor: Monitor, window: Long, distance: Double, overThreshold: Boolean): Unit = {
-    // TODO: this draft keys by model version, publishes every evaluation including no-drift ticks at
+    // TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
     // full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-    // rejected produce. Review all five.
+    // rejected produce. Fix all five.
     val payload =
       "{\\"monitor_id\\":\\"" + monitor.monitorId + "\\",\\"metric\\":\\"" + monitor.metric +
         "\\",\\"distance\\":" + distance + ",\\"threshold\\":" + monitor.threshold + "}"
@@ -552,9 +552,9 @@ struct Monitor {
 RdKafka::Producer* producer = nullptr;
 
 void publishEvaluation(const Monitor& monitor, long window, double distance, bool overThreshold) {
-  // TODO: this draft keys by model version, publishes every evaluation including no-drift ticks at
+  // TODO: this starter keys by model version, publishes every evaluation including no-drift ticks at
   // full volume, carries no window boundaries, configures no idempotence, and has no outbox for a
-  // rejected produce. Review all five.
+  // rejected produce. Fix all five.
   const std::string payload = "{\\"monitor_id\\":\\"" + monitor.monitor_id() + "\\",\\"metric\\":\\"" +
                               monitor.metric() + "\\",\\"distance\\":" + std::to_string(distance) +
                               ",\\"threshold\\":" + std::to_string(monitor.threshold()) + "}";

@@ -8,9 +8,9 @@ export const checkpointEndpointStep: Step = {
   focus: ['client', 'api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, decodes
+**Starting point.** The starter is working code: it registers the route, decodes
 the chunk and answers \`200\`. It compiles, it serves a single well-behaved uploader, and it hides
-three production flaws. Review it like the service owner, fix it, and prove the fix with the checks
+three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`POST /v1/checkpoints\` with body \`{"index": 0, "data": "…"}\` (\`data\` is base64).
@@ -52,7 +52,7 @@ complete, which is the state a resume trusts most.`,
       id: 'chunk-order',
       title: 'Accepts a chunk only at its expected index',
       detail:
-        'The next expected index comes from the chunks already stored for the upload; a chunk before its predecessor is **409**. The draft applies chunks in arrival order, so a redelivered or reordered chunk silently reorders the weights.',
+        'The next expected index comes from the chunks already stored for the upload; a chunk before its predecessor is **409**. The starter applies chunks in arrival order, so a redelivered or reordered chunk silently reorders the weights.',
       match: {
         python: {all: [/CHUNK_BYTES/, /status_code\s*=\s*409/]},
         typescript: {all: [/CHUNK_BYTES/, /code\(\s*409\s*\)/]},
@@ -65,7 +65,7 @@ complete, which is the state a resume trusts most.`,
       id: 'chunk-cap',
       title: 'Rejects a chunk over 8 MiB',
       detail:
-        'The decoded payload may not exceed `1 << 23` bytes — an over-sized chunk is **413** before anything is stored. The draft has no size cap, so one request can push an unbounded body into the checkpoint.',
+        'The decoded payload may not exceed `1 << 23` bytes — an over-sized chunk is **413** before anything is stored. The starter has no size cap, so one request can push an unbounded body into the checkpoint.',
       match: {
         python: {all: [/CHUNK_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/CHUNK_BYTES/, /code\(\s*413\s*\)/]},
@@ -78,7 +78,7 @@ complete, which is the state a resume trusts most.`,
       id: 'chunk-position',
       title: 'Stores the chunk at its index instead of appending',
       detail:
-        'Chunks live in a hash field per index under `chunks:{upload_id}`, so a replay overwrites its own position. The draft pushes each chunk onto a list, so a redelivered chunk is appended a second time and the chunk count no longer matches the upload.',
+        'Chunks live in a hash field per index under `chunks:{upload_id}`, so a replay overwrites its own position. The starter pushes each chunk onto a list, so a redelivered chunk is appended a second time and the chunk count no longer matches the upload.',
       match: {
         python: {all: [/chunks:\{upload_id\}/, /hset\(/], none: [/rpush\(/]},
         typescript: {all: [/chunks:\$\{uploadId\}/, /\.hset\(/], none: [/\.rpush\(/]},
@@ -91,7 +91,7 @@ complete, which is the state a resume trusts most.`,
       id: 'chunk-digest',
       title: 'Digests every chunk and keeps the digest with it',
       detail:
-        'Each chunk is digested with **sha256** and the digest is persisted under `digests:{upload_id}`, so a replay can be compared byte-for-byte and an index rewritten with different bytes is refused. The draft stores no digest at all.',
+        'Each chunk is digested with **sha256** and the digest is persisted under `digests:{upload_id}`, so a replay can be compared byte-for-byte and an index rewritten with different bytes is refused. The starter stores no digest at all.',
       match: {
         python: {all: [/sha256\(/, /digests:\{upload_id\}/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /digests:\$\{uploadId\}/]},
@@ -104,7 +104,7 @@ complete, which is the state a resume trusts most.`,
       id: 'stored-set-completeness',
       title: 'Never completes an upload from a caller-declared size',
       detail:
-        'Completeness is read from the stored chunk set (`HLEN`), never from a `total_bytes` the caller declares. The draft trusts that number, so an upload missing its last chunk still reports itself complete.',
+        'Completeness is read from the stored chunk set (`HLEN`), never from a `total_bytes` the caller declares. The starter trusts that number, so an upload missing its last chunk still reports itself complete.',
       match: {
         python: {all: [/hlen\(/], none: [/total_bytes/]},
         typescript: {all: [/\.hlen\(/], none: [/total_bytes/]},
@@ -138,7 +138,7 @@ def put_chunk(
     tenant: str = Header(alias="X-Tenant-Id"),
     upload_id: str = Header(alias="X-Upload-Id"),
 ) -> dict:
-    # TODO: this draft concatenates chunks in arrival order, appends a redelivered chunk a second
+    # TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
     # time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
     # the expected index, store it at that index with its digest, and derive completeness from the
     # stored chunk set.
@@ -203,7 +203,7 @@ def put_chunk(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/checkpoints: a model-generated draft that applies chunks as they arrive. */
+      starter: `/** POST /v1/checkpoints: flawed code that applies chunks as they arrive. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -217,7 +217,7 @@ interface ChunkBody {
 }
 
 app.post('/v1/checkpoints', async (request, reply) => {
-  // TODO: this draft concatenates chunks in arrival order, appends a redelivered chunk a second
+  // TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
   // time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
   // the expected index, store it at that index with its digest, and derive completeness from the
   // stored chunk set.
@@ -314,7 +314,7 @@ func putChunk(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft concatenates chunks in arrival order, appends a redelivered chunk a second
+	// TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
 	// time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
 	// the expected index, store it at that index with its digest, and derive completeness from the
 	// stored chunk set.
@@ -461,7 +461,7 @@ object Api {
         headerValueByName("X-Tenant-Id") { tenant =>
           headerValueByName("X-Upload-Id") { uploadId =>
             entity(as[ChunkRequest]) { body =>
-              // TODO: this draft concatenates chunks in arrival order, appends a redelivered chunk a
+              // TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a
               // second time, and reports the upload complete from the caller's totalBytes. Accept a
               // chunk only at the expected index, store it at that index with its digest, and derive
               // completeness from the stored chunk set.
@@ -590,7 +590,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft concatenates chunks in arrival order, appends a redelivered chunk a second
+    // TODO: this starter concatenates chunks in arrival order, appends a redelivered chunk a second
     // time, and reports the upload complete from the caller's total_bytes. Accept a chunk only at
     // the expected index, store it at that index with its digest, and derive completeness from the
     // stored chunk set.
@@ -703,5 +703,5 @@ int main() {
     'Store each chunk as its own hash field keyed by the index (`HSET chunks:{upload_id} {index} payload`), the way the object store will read it back. Appending to a list is what turns a redelivered chunk into a duplicated slice of the weights.',
     'The digest is what makes a replay safe: compute `sha256` of the decoded bytes, keep it next to the chunk, and compare it when the index already exists. Same bytes → 200 and nothing written; different bytes → 409, because a chunk rewriting an index is corruption rather than a retry. And completeness comes from `HLEN`, never from the size the caller declares.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated upload handler at the point where a distributed write becomes a durable object. The draft looks fine because one well-behaved client sends chunks in order exactly once. What it breaks is the retry contract: chunk indexes are the only thing that ties a stream of requests to one checkpoint, a replay has to be idempotent by construction (store at the index, compare the digest), and completeness must be a property of the stored set rather than of a number the caller sent. Real stores add per-chunk checksums returned by the object store, a manifest written last, resumable upload negotiation, and a chunk-level rate limit per upload so one client cannot saturate the store.`,
+  debrief: `The interviewer is testing whether you can debug an upload handler at the point where a distributed write becomes a durable object. The starter looks fine because one well-behaved client sends chunks in order exactly once. What it breaks is the retry contract: chunk indexes are the only thing that ties a stream of requests to one checkpoint, a replay has to be idempotent by construction (store at the index, compare the digest), and completeness must be a property of the stored set rather than of a number the caller sent. Real stores add per-chunk checksums returned by the object store, a manifest written last, resumable upload negotiation, and a chunk-level rate limit per upload so one client cannot saturate the store.`,
 };

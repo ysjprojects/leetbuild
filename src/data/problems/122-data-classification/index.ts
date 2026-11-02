@@ -20,10 +20,10 @@ export const dataClassificationProblem: Problem = {
   id: 'data-classification',
   title: 'Data Classification',
   tagline:
-    "Grab's LLM column tagging for data governance: schema events to jobs, taxonomy-bound classification in batches, a daily budget, owner verification and a tiered publish — reviewed like production.",
+    "Grab's LLM column tagging for data governance: schema events to jobs, taxonomy-bound classification in batches, a daily budget, owner verification and a tiered publish.",
   difficulty: 'medium',
   concepts: ['kafka', 'grpc', 'redis', 'http'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 60,
   company: GRAB,
   sources: [
@@ -105,12 +105,12 @@ One service, **metasense**, with five pieces:
    idempotent producer with \`acks=all\`, an outbox row when the broker refuses, and a consumer that
    upserts the metadata store before it commits.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real data
-governance feature: read the draft against the failure modes, name the subtle one, fix it, and prove
-the fix with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real data governance feature:
+debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -19,10 +19,10 @@ export const promptDefenceProblem: Problem = {
   id: 'prompt-defence',
   title: 'Prompt Injection Defence',
   tagline:
-    "Dropbox's prompt-injection research as a service: token caps, control-character stripping, repeated-token detection, a canaried template, an output guard and attack signatures — reviewed like production.",
+    "Dropbox's prompt-injection research as a service: token caps, control-character stripping, repeated-token detection, a canaried template, an output guard and attack signatures.",
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 75,
   company: DROPBOX,
   sources: [
@@ -107,12 +107,13 @@ One service, **promptguard**, with five pieces:
    \`acks=all\`, never carrying text; a consumer that counts signatures per hour in Redis and
    commits only after the write.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it answers the demo
-question, and it sounds confident. Your job in every step is the job you will have on a real AI
-feature: read the draft against the failure modes the source documents, name the subtle one, fix
-it, and prove the fix with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it answers the demo
+question, and it looks right. Your job in every step is the job you will have on a real AI
+feature: debug it against the failure modes the source documents, name the subtle one, fix it,
+optimize what is wasteful, and prove the fix with checks that fail on the starter and pass on your
+version.
 
 ## Left out on purpose
 

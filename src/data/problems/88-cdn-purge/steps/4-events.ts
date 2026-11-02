@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['purge', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter loops over the outcomes and produces one message per path. It
+**Starting point.** The starter loops over the outcomes and produces one message per path. It
 works against a healthy broker, and it gets three things wrong that only matter later: in the
-partition assignment, in the meaning of the event, and on the day the broker is down. Review it
-like the owner of the topic, fix it, and prove the fix with the checks below.
+partition assignment, in the meaning of the event, and on the day the broker is down. Debug it like
+the owner of the topic, fix it, and prove the fix with the checks below.
 
 Publish the provider's outcomes to \`cdn.purged\`:
 
@@ -61,7 +61,7 @@ provider says so, and nothing durable records it.`,
       id: 'domain-key',
       title: 'The message key is the domain',
       detail:
-        'Every produce passes the domain as the key (`key=domain`, `Key: []byte(domain)`, `ProducerRecord(topic, domain, …)`), so one domain’s purge history stays ordered. The draft keys by the requester.',
+        'Every produce passes the domain as the key (`key=domain`, `Key: []byte(domain)`, `ProducerRecord(topic, domain, …)`), so one domain’s purge history stays ordered. The starter keys by the requester.',
       match: {
         python: {all: [/cdn\.purged/, /key=body\.domain/]},
         typescript: {all: [/cdn\.purged/, /key: body\.domain/]},
@@ -74,7 +74,7 @@ provider says so, and nothing durable records it.`,
       id: 'confirmed-only',
       title: 'Publishes the confirmed outcome, never the request',
       detail:
-        'The event state is `confirmed`, so consumers and the status endpoint learn what propagated rather than what was asked for. The draft publishes `state: "requested"`, which makes the topic a log of intentions.',
+        'The event state is `confirmed`, so consumers and the status endpoint learn what propagated rather than what was asked for. The starter publishes `state: "requested"`, which makes the topic a log of intentions.',
       match: {
         python: {all: [/STATE_CONFIRMED/], none: [/["']requested["']/]},
         typescript: {all: [/STATE_CONFIRMED/], none: [/['"]requested['"]/]},
@@ -87,7 +87,7 @@ provider says so, and nothing durable records it.`,
       id: 'path-digest',
       title: 'Carries a per-path digest instead of the URL',
       detail:
-        'Each event identifies its path by `path_digest` — a `sha256` digest — so the topic never carries customer URLs while consumers can still match a purge to an edge log line. The draft publishes the raw path.',
+        'Each event identifies its path by `path_digest` — a `sha256` digest — so the topic never carries customer URLs while consumers can still match a purge to an edge log line. The starter publishes the raw path.',
       match: {
         python: {all: [/hashlib\.sha256/, /path_digest\(/]},
         typescript: {all: [/createHash\('sha256'\)/, /pathDigest\(/]},
@@ -100,7 +100,7 @@ provider says so, and nothing durable records it.`,
       id: 'dedupe-per-path',
       title: 'One event per path per purge, from an idempotent producer',
       detail:
-        'A `(purge_id, digest)` id is published once — the `published` set collapses repeats — and the producer is configured for idempotence with `acks=all` so its own retries cannot duplicate the record. The draft produces whatever it is handed, with no dedupe key and no delivery guarantee.',
+        'A `(purge_id, digest)` id is published once — the `published` set collapses repeats — and the producer is configured for idempotence with `acks=all` so its own retries cannot duplicate the record. The starter produces whatever it is handed, with no dedupe key and no delivery guarantee.',
       match: {
         python: {all: [/enable\.idempotence/, /acks/, /published/]},
         typescript: {all: [/idempotent: true/, /acks: -1/, /published/]},
@@ -113,7 +113,7 @@ provider says so, and nothing durable records it.`,
       id: 'outbox',
       title: 'A refused produce is recorded in the outbox',
       detail:
-        'A broker rejection writes the event through `insert_outbox` so a relay republishes it: a purge record must survive an outage. The draft ignores produce errors entirely, so the purge exists only on the CDN.',
+        'A broker rejection writes the event through `insert_outbox` so a relay republishes it: a purge record must survive an outage. The starter ignores produce errors entirely, so the purge exists only on the CDN.',
       match: {
         python: {all: [/store\.insert_outbox\(/, /KafkaException/]},
         typescript: {all: [/store\.insertOutbox\(/, /catch/]},
@@ -155,8 +155,8 @@ store = OutboxStore()
 
 @app.post("/v1/purges/{purge_id}/outcomes")
 def publish(purge_id: str, body: PurgeOutcomes, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft keys by the requester instead of the domain, publishes the request rather
-    # than the confirmed outcome, carries the raw path, and ignores produce failures. Review all
+    # TODO: this starter keys by the requester instead of the domain, publishes the request rather
+    # than the confirmed outcome, carries the raw path, and ignores produce failures. Fix all
     # four: key = domain, state = confirmed, a per-path digest, and an outbox row when the broker
     # refuses the produce.
     for path, outcome in body.outcomes.items():
@@ -256,7 +256,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** cdn.purged: a model-generated draft that keys by requester and publishes requests. */
+      starter: `/** cdn.purged: flawed code that keys by requester and publishes requests. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -281,8 +281,8 @@ const store = {
 };
 
 app.post('/v1/purges/:purgeId/outcomes', async (request, reply) => {
-  // TODO: this draft keys by the requester instead of the domain, publishes the request rather
-  // than the confirmed outcome, carries the raw path, and ignores produce failures. Review all
+  // TODO: this starter keys by the requester instead of the domain, publishes the request rather
+  // than the confirmed outcome, carries the raw path, and ignores produce failures. Fix all
   // four: key = domain, state = confirmed, a per-path digest, and an outbox row when the broker
   // refuses the produce.
   // Fastify types route params as a generic record; this route declares :purgeId.
@@ -410,8 +410,8 @@ var store = &OutboxStore{}
 var purgeWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: purgeTopic, Async: false}
 
 func publish(ctx context.Context, purgeID string, body OutcomesRequest) error {
-	// TODO: this draft keys by the requester instead of the domain, publishes the request rather
-	// than the confirmed outcome, carries the raw path, and ignores produce failures. Review all
+	// TODO: this starter keys by the requester instead of the domain, publishes the request rather
+	// than the confirmed outcome, carries the raw path, and ignores produce failures. Fix all
 	// four: key = domain, state = confirmed, a per-path digest, and an outbox row when the broker
 	// refuses the produce.
 	for path, outcome := range body.Outcomes {
@@ -538,8 +538,8 @@ object PurgeEvents {
 
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: this draft keys by the requester instead of the domain, publishes the request rather than
-  // the confirmed outcome, carries the raw path, and ignores produce failures. Review all four:
+  // TODO: this starter keys by the requester instead of the domain, publishes the request rather than
+  // the confirmed outcome, carries the raw path, and ignores produce failures. Fix all four:
   // key = domain, state = confirmed, a per-path digest, and an outbox row when the broker refuses
   // the produce.
   def publish(purgeId: String, domain: String, requester: String, outcomes: Map[String, String]): Int = {
@@ -655,8 +655,8 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: this draft keys by the requester instead of the domain, publishes the request rather than
-// the confirmed outcome, carries the raw path, and ignores produce failures. Review all four:
+// TODO: this starter keys by the requester instead of the domain, publishes the request rather than
+// the confirmed outcome, carries the raw path, and ignores produce failures. Fix all four:
 // key = domain, state = confirmed, a per-path digest, and an outbox row when the broker refuses the
 // produce.
 int publish(
@@ -778,5 +778,5 @@ void consume(const std::string& group) {
     'Publish the fact, not the intent: the event goes out after the provider confirms propagation, with `state = confirmed`. A `requested` event is a promise the topic then has to be trusted not to break.',
     'Digest the path (`sha256`) and use `(purge_id, digest)` as the dedupe id, keep one event per id, and wrap the produce in a try/catch that writes an outbox row: the topic is retained and replicated, so it should not carry URLs, and a broker outage should not be able to erase the record that a purge happened.',
   ],
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by domain and every purge of one domain is applied in the order it happened; key by the requester and they are not. Second, an event has to state what happened, not what was asked: \`confirmed\` is the outcome the status endpoint and the projector both need, and a topic full of requests is a log nobody can act on. Third, a broker is not a database: when the produce fails, the durable path is an outbox row a relay republishes, so the outage delays the record instead of losing it. The digest is the quiet one — topics are retained and replicated, and a customer’s URLs do not belong in one when a hash answers every question the consumer has. Real platforms add a schema registry so a future producer cannot smuggle new fields in, a dead-letter topic for events no consumer can decode, and a metric on outbox depth so a stuck relay is visible.`,
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partition by domain and every purge of one domain is applied in the order it happened; key by the requester and they are not. Second, an event has to state what happened, not what was asked: \`confirmed\` is the outcome the status endpoint and the projector both need, and a topic full of requests is a log nobody can act on. Third, a broker is not a database: when the produce fails, the durable path is an outbox row a relay republishes, so the outage delays the record instead of losing it. The digest is the quiet one — topics are retained and replicated, and a customer’s URLs do not belong in one when a hash answers every question the consumer has. Real platforms add a schema registry so a future producer cannot smuggle new fields in, a dead-letter topic for events no consumer can decode, and a metric on outbox depth so a stuck relay is visible.`,
 };

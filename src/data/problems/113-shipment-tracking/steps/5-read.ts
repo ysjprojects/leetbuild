@@ -8,10 +8,10 @@ export const readStep: Step = {
   focus: ['client', 'ops', 'api', 'redis', 'projection'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the tracking page fetches a
+**Starting point.** The starter is working code: the tracking page fetches a
 shipment and renders a status and an ETA, so the demo looks finished. It serves any shipment to any
 caller, it hands internal flags and the carrier's error payload to customers, and it trusts a stored
-\`status\` field that is written when the label is created. Review it, fix it, and prove the fix with
+\`status\` field that is written when the label is created. Debug it, fix it, and prove the fix with
 the checks below.
 
 Implement \`GET /v1/shipments/{shipment_id}\`, the read the tracking page and the operations console
@@ -66,7 +66,7 @@ make the console useful make the customer API a liability.`,
       id: 'read-route',
       title: 'Serves GET /v1/shipments/{id} with the timeline and an ETA',
       detail:
-        'The read is registered on `GET /v1/shipments/{id}` (the language’s path-parameter route) and its response carries the status and `estimated_delivery` for that shipment. The draft already answers this route, so this check passes on it — the four below are where it fails.',
+        'The read is registered on `GET /v1/shipments/{id}` (the language’s path-parameter route) and its response carries the status and `estimated_delivery` for that shipment. The starter already answers this route, so this check passes on it — the four below are where it fails.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/shipments\/\{shipment_id\}["']/, /"status"/, /"estimated_delivery"/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/shipments\/:shipmentId['"]/, /status/, /estimated_delivery/]},
@@ -79,7 +79,7 @@ make the console useful make the customer API a liability.`,
       id: 'delivered-scan',
       title: 'Derives delivered from a delivered scan',
       detail:
-        'The status comes from `status_from_scans()`, which walks the shipment’s scans, so `delivered` requires a delivered scan and a fresh label reads `label`. The draft returns the stored status field, which reports delivered when only the label was created.',
+        'The status comes from `status_from_scans()`, which walks the shipment’s scans, so `delivered` requires a delivered scan and a fresh label reads `label`. The starter returns the stored status field, which reports delivered when only the label was created.',
       match: {
         python: {all: [/def status_from_scans\(/, /DELIVERED/]},
         typescript: {all: [/function statusFromScans\(/, /DELIVERED/]},
@@ -92,7 +92,7 @@ make the console useful make the customer API a liability.`,
       id: 'tenant-scope',
       title: 'Answers 404 for a shipment of another tenant',
       detail:
-        '`load_shipment(shipment_id, tenant)` returns **404** when the shipment is missing or its `tenant_id` is not the caller’s — the same refusal in both cases, so a foreign id cannot be probed. The draft serves any shipment to any caller.',
+        '`load_shipment(shipment_id, tenant)` returns **404** when the shipment is missing or its `tenant_id` is not the caller’s — the same refusal in both cases, so a foreign id cannot be probed. The starter serves any shipment to any caller.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /def load_shipment\(/, /tenant_id/]},
         typescript: {all: [/\b404\b/, /function loadShipment\(/, /tenant_id/]},
@@ -105,7 +105,7 @@ make the console useful make the customer API a liability.`,
       id: 'ops-view',
       title: 'Adds poll health and reconciliation only for operations',
       detail:
-        'A caller presenting `X-Ops-Token` equal to `OPS_TOKEN` gets `operations_view()`, which adds the poll health and the reconciliation flag. The draft exposes nothing to operators and everything to customers.',
+        'A caller presenting `X-Ops-Token` equal to `OPS_TOKEN` gets `operations_view()`, which adds the poll health and the reconciliation flag. The starter exposes nothing to operators and everything to customers.',
       match: {
         python: {all: [/X-Ops-Token/, /OPS_TOKEN/, /def operations_view\(/]},
         typescript: {all: [/x-ops-token/, /OPS_TOKEN/, /function operationsView\(/]},
@@ -118,7 +118,7 @@ make the console useful make the customer API a liability.`,
       id: 'no-error-leak',
       title: 'Never hands carrier errors or reconciliation flags to customers',
       detail:
-        'The carrier’s error payload and the internal reconciliation flag are built in `operations_view()`; `customer_view()` never touches them, so a customer response cannot contain them. The draft returns both to every caller.',
+        'The carrier’s error payload and the internal reconciliation flag are built in `operations_view()`; `customer_view()` never touches them, so a customer response cannot contain them. The starter returns both to every caller.',
       match: {
         python: {all: [/operations_view\(/, /carrier_error/], none: [/customer_view\([\s\S]{0,200}?carrier_error/]},
         typescript: {all: [/operationsView\(/, /carrier_error/], none: [/customerView\([\s\S]{0,200}?carrier_error/]},
@@ -150,7 +150,7 @@ store = ShipmentRead()
 
 @app.get("/v1/shipments/{shipment_id}")
 def read_shipment(shipment_id: str) -> JSONResponse:
-    # TODO: this draft serves any shipment to any caller, hands the internal reconciliation flag and
+    # TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag and
     # the carrier's error payload to customers, and reports the stored status as delivered when only
     # a label was created. Scope the read to the tenant with a 404, derive the status from the scans,
     # and keep poll health, the reconciliation flag and carrier errors in the operations view.
@@ -258,7 +258,7 @@ def read_shipment(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/shipments/:shipmentId: a model-generated draft that leaks the internals. */
+      starter: `/** GET /v1/shipments/:shipmentId: flawed code that leaks the internals. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -280,7 +280,7 @@ class ShipmentRead {
 const store = new ShipmentRead();
 
 app.get('/v1/shipments/:shipmentId', async (request, reply) => {
-  // TODO: this draft serves any shipment to any caller, hands the internal reconciliation flag and
+  // TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag and
   // the carrier's error payload to customers, and reports the stored status as delivered when only
   // a label was created. Scope the read to the tenant with a 404, derive the status from the scans,
   // and keep poll health, the reconciliation flag and carrier errors in the operations view.
@@ -430,7 +430,7 @@ func (s *shipmentRead) Get(ctx context.Context, shipmentID string) (*StoredShipm
 var store = &shipmentRead{}
 
 func readShipment(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves any shipment to any caller, hands the internal reconciliation flag and
+	// TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag and
 	// the carrier's error payload to customers, and reports the stored status as delivered when only
 	// a label was created. Scope the read to the tenant with a 404, derive the status from the scans,
 	// and keep poll health, the reconciliation flag and carrier errors in the operations view.
@@ -618,7 +618,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "shipments" / Segment) { shipmentId =>
       get {
-        // TODO: this draft serves any shipment to any caller, hands the internal reconciliation
+        // TODO: this starter serves any shipment to any caller, hands the internal reconciliation
         // flag and the carrier's error payload to customers, and reports the stored status as
         // delivered when only a label was created. Scope the read to the tenant with a 404, derive
         // the status from the scans, and keep poll health, the reconciliation flag and carrier
@@ -755,7 +755,7 @@ int main() {
 
   svr.Get(R"(/v1/shipments/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
     const auto shipmentId = req.matches[1].str();
-    // TODO: this draft serves any shipment to any caller, hands the internal reconciliation flag
+    // TODO: this starter serves any shipment to any caller, hands the internal reconciliation flag
     // and the carrier's error payload to customers, and reports the stored status as delivered when
     // only a label was created. Scope the read to the tenant with a 404, derive the status from the
     // scans, and keep poll health, the reconciliation flag and carrier errors in the operations

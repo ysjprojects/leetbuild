@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['crawler', 'fetcher', 'hosts'],
   task: `## Task
 
-The starter is a plausible model-generated draft: against a healthy host it fetches pages and stores
+**Starting point.** The starter is working code: against a healthy host it fetches pages and stores
 them, so the demo crawls. Every failure path is wrong. Find them, fix them, and prove the fix.
 
 Implement \`fetch_one(job_id, host, queue, records)\` — one URL of one host, fetched through the
@@ -19,11 +19,11 @@ Implement \`fetch_one(job_id, host, queue, records)\` — one URL of one host, f
 - At most **3 attempts per URL**, and only transport failures that are worth retrying are retried:
   \`UNAVAILABLE\` (5xx) and \`DEADLINE_EXCEEDED\` (timeout). Everything else is handled once.
 - **403 and 404 are never retried.** A 403 is recorded as **permanently refused**
-  (\`mark_refused(url, "robots")\`) and a 404 as **gone**; the draft treats a 403 as “the page must
+  (\`mark_refused(url, "robots")\`) and a 404 as **gone**; the starter treats a 403 as “the page must
   exist” and spins on it forever.
 - A **429** reschedules the whole host: call \`records.throttle(job_id, host, reply.retry_after_s, attempt)\`
   so the host's next fetch waits out \`Retry-After\` with exponential backoff, and put the URL back
-  without counting the 429 as an attempt against it. The draft ignores \`Retry-After\` entirely.
+  without counting the 429 as an attempt against it. The starter ignores \`Retry-After\` entirely.
 - The URL **leaves the queue before the fetch** (\`queue.take(...)\`) and is only returned to the
   tail through \`queue.requeue(..., attempts)\` when a retry is still allowed. Peeking at the head
   and fetching it in place means one dead host holds the shard's head forever.
@@ -82,7 +82,7 @@ ignoring \`Retry-After\` means the crawler answers a polite 429 by knocking hard
       id: 'retry-policy',
       title: 'At most three attempts, only the retryable failures',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; there is no unbounded loop. The draft retries everything — including the 403 it can never satisfy.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; there is no unbounded loop. The starter retries everything — including the 403 it can never satisfy.',
       match: {
         python: {
           all: [
@@ -120,7 +120,7 @@ ignoring \`Retry-After\` means the crawler answers a polite 429 by knocking hard
       id: 'refused-terminal',
       title: '403 and 404 are terminal, never retried',
       detail:
-        'A 403 is recorded as permanently refused and a 404 as gone; neither re-enters the retry loop. The draft treats a 403 as transient and replays it forever.',
+        'A 403 is recorded as permanently refused and a 404 as gone; neither re-enters the retry loop. The starter treats a 403 as transient and replays it forever.',
       match: {
         python: {all: [/mark_refused\(/, /reply\.status\s*==\s*403/, /reply\.status\s*==\s*404/]},
         typescript: {all: [/markRefused\(/, /reply\.status\s*===\s*403/, /reply\.status\s*===\s*404/]},
@@ -133,7 +133,7 @@ ignoring \`Retry-After\` means the crawler answers a polite 429 by knocking hard
       id: 'no-head-block',
       title: 'The URL leaves the queue before the fetch',
       detail:
-        'Work is taken with `queue.take(...)` before the RPC and handed back with `requeue(..., attempts)` — never inspected at the head. The draft peeks at the head, so one dead host blocks the shard.',
+        'Work is taken with `queue.take(...)` before the RPC and handed back with `requeue(..., attempts)` — never inspected at the head. The starter peeks at the head, so one dead host blocks the shard.',
       match: {
         python: {all: [/queue\.take\(/, /requeue\(/], none: [/queue\.head\(/]},
         typescript: {all: [/queue\.take\(/, /requeue\(/], none: [/queue\.head\(/]},
@@ -146,7 +146,7 @@ ignoring \`Retry-After\` means the crawler answers a polite 429 by knocking hard
       id: 'retry-after',
       title: 'A 429 throttles the host by Retry-After',
       detail:
-        'A 429 calls `records.throttle(job_id, host, reply.retry_after_s, attempt)` so the host waits out `Retry-After` with exponential backoff, and the URL is given back so it is crawled later. The draft ignores the header.',
+        'A 429 calls `records.throttle(job_id, host, reply.retry_after_s, attempt)` so the host waits out `Retry-After` with exponential backoff, and the URL is given back so it is crawled later. The starter ignores the header.',
       match: {
         python: {all: [/reply\.status\s*==\s*429/, /retry_after/, /throttle\(/]},
         typescript: {all: [/reply\.status\s*===\s*429/, /retry_after/, /throttle\(/]},
@@ -231,7 +231,7 @@ def fetch_one(job_id: str, host: str, queue, records) -> str | None:
 `,
     },
     typescript: {
-      starter: `/** Fetcher calls: a model-generated draft that retries a 403 forever. */
+      starter: `/** Fetcher calls: flawed code that retries a 403 forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -669,5 +669,5 @@ std::optional<std::string> fetchOne(const std::string& jobId, const std::string&
 `,
     },
   },
-  debrief: `The interviewer is testing the failure policy of a remote call, which is where crawlers die in production. The draft looks fine against a healthy host: it fetches, it stores, it moves on. Four defects are being checked: the missing deadline (one stuck host pins a worker), the unbounded retry loop (a permission error becomes a hot loop), the head-of-queue fetch (one dead host blocks every other host in the shard), and the ignored \`Retry-After\` (a polite 429 is answered with another request). Real crawlers add a per-host concurrency cap, a global request-rate governor across workers, and a dead-letter record so an operator can see what was dropped after the attempt budget ran out.`,
+  debrief: `The interviewer is testing the failure policy of a remote call, which is where crawlers die in production. The starter looks fine against a healthy host: it fetches, it stores, it moves on. Four defects are being checked: the missing deadline (one stuck host pins a worker), the unbounded retry loop (a permission error becomes a hot loop), the head-of-queue fetch (one dead host blocks every other host in the shard), and the ignored \`Retry-After\` (a polite 429 is answered with another request). Real crawlers add a per-host concurrency cap, a global request-rate governor across workers, and a dead-letter record so an operator can see what was dropped after the attempt budget ran out.`,
 };

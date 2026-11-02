@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'policy'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, stores
+**Starting point.** The starter is working code: it registers the route, stores
 a request and answers with a request id, so the demo approves a spend request end to end. It also
-lets the requester choose who signs off on them. Review it like the workflow owner, fix it, and
+lets the requester choose who signs off on them. Debug it like the workflow owner, fix it, and
 prove the fix with the checks below.
 
 Implement \`POST /v1/requests\` with body
@@ -90,7 +90,7 @@ with a second chain, so one spend is approved twice by two different sets of peo
       id: 'self-approval',
       title: 'Rejects a chain the requester appears in',
       detail:
-        'When the requester is one of the resolved approvers, the submit is **409** with reason `requester_cannot_approve` and nothing is stored. The draft accepts whatever list it is given.',
+        'When the requester is one of the resolved approvers, the submit is **409** with reason `requester_cannot_approve` and nothing is stored. The starter accepts whatever list it is given.',
       match: {
         python: {all: [/requester_cannot_approve/, /status_code\s*=\s*409/]},
         typescript: {all: [/requester_cannot_approve/, /code\(\s*409\s*\)/]},
@@ -103,7 +103,7 @@ with a second chain, so one spend is approved twice by two different sets of peo
       id: 'why-cap',
       title: 'Caps the why field at 4 KiB',
       detail:
-        '`why` is measured in bytes against a 4 KiB (`1 << 12`) cap and answered with **413** when it is larger. The draft stores whatever length arrives.',
+        '`why` is measured in bytes against a 4 KiB (`1 << 12`) cap and answered with **413** when it is larger. The starter stores whatever length arrives.',
       match: {
         python: {all: [/MAX_WHY_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_WHY_BYTES/, /code\(\s*413\s*\)/]},
@@ -116,7 +116,7 @@ with a second chain, so one spend is approved twice by two different sets of peo
       id: 'idempotency',
       title: 'Replays return the original request id',
       detail:
-        '`Idempotency-Key` is required and the request is looked up under `(tenant, key)` before resolution; a replay answers with the stored `request_id` and `"replayed": true`. The draft ignores the header and mints a new request per call.',
+        '`Idempotency-Key` is required and the request is looked up under `(tenant, key)` before resolution; a replay answers with the stored `request_id` and `"replayed": true`. The starter ignores the header and mints a new request per call.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /replayed/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /replayed/]},
@@ -170,9 +170,9 @@ def submit(
     tenant: str = Header(alias="X-Tenant-Id"),
     requester: str = Header(alias="X-User-Id"),
 ) -> JSONResponse:
-    # TODO: this draft takes the approvers from the request body, never resolves the chain from
+    # TODO: this starter takes the approvers from the request body, never resolves the chain from
     # policy, never rejects a chain the requester appears in, ignores Idempotency-Key, and never
-    # caps the why field. Review all four.
+    # caps the why field. Fix all four.
     request_id = str(uuid.uuid4())
     request = {
         "request_id": request_id,
@@ -275,7 +275,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/requests: a model-generated draft that takes the approvers from the body. */
+      starter: `/** POST /v1/requests: flawed code that takes the approvers from the body. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -318,9 +318,9 @@ export const store = {
 };
 
 app.post('/v1/requests', async (request, reply) => {
-  // TODO: this draft takes the approvers from the request body, never resolves the chain from
+  // TODO: this starter takes the approvers from the request body, never resolves the chain from
   // policy, never rejects a chain the requester appears in, ignores Idempotency-Key, and never
-  // caps the why field. Review all four.
+  // caps the why field. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const requester = request.headers['x-user-id'] as string;
   const body = request.body as SubmitBody;
@@ -476,9 +476,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func submit(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft takes the approvers from the request body, never resolves the chain from
+	// TODO: this starter takes the approvers from the request body, never resolves the chain from
 	// policy, never rejects a chain the requester appears in, ignores Idempotency-Key, and never
-	// caps the why field. Review all four.
+	// caps the why field. Fix all four.
 	tenant := r.Header.Get("X-Tenant-Id")
 	requester := r.Header.Get("X-User-Id")
 	var body SubmitRequest
@@ -688,9 +688,9 @@ object Api {
         headerValueByName("X-Tenant-Id") { tenant =>
           headerValueByName("X-User-Id") { requester =>
             entity(as[SubmitRequest]) { body =>
-              // TODO: this draft takes the approvers from the request body, never resolves the chain
+              // TODO: this starter takes the approvers from the request body, never resolves the chain
               // from policy, never rejects a chain the requester appears in, ignores
-              // Idempotency-Key, and never caps the why field. Review all four.
+              // Idempotency-Key, and never caps the why field. Fix all four.
               val request = StoredRequest(UUID.randomUUID().toString, tenant, requester, body.chain_id, body.approvers)
               store.put(tenant, request.request_id, request)
               complete(StatusCodes.Created, request)
@@ -836,9 +836,9 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/requests", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft takes the approvers from the request body, never resolves the chain from
+    // TODO: this starter takes the approvers from the request body, never resolves the chain from
     // policy, never rejects a chain the requester appears in, ignores Idempotency-Key, and never
-    // caps the why field. Review all four.
+    // caps the why field. Fix all four.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto requester = req.get_header_value("X-User-Id");
     const json body = json::parse(req.body, nullptr, false);
@@ -971,5 +971,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing the trust boundary of a submit endpoint: what the caller may influence and what only the system may decide. The draft reads fine because the demo posts its own approvers and nobody retries. Four defects are being checked: the approver list comes from the pinned chain policy, never the body (a requester who names their own approver, or themselves, is the whole incident); self-approval is rejected at resolution time, before anything is stored; the audit \`why\` field is bounded to 4 KiB so it cannot be used as a payload; and the submit is idempotent under \`(tenant, Idempotency-Key)\` so a client retry returns the original request id instead of a second chain. Real workflows add the pinned version's hash to the event trail, expire unused idempotency keys, and resolve approvers by role with a directory lookup rather than an actor id list.`,
+  debrief: `The interviewer is testing the trust boundary of a submit endpoint: what the caller may influence and what only the system may decide. The starter reads fine because the demo posts its own approvers and nobody retries. Four defects are being checked: the approver list comes from the pinned chain policy, never the body (a requester who names their own approver, or themselves, is the whole incident); self-approval is rejected at resolution time, before anything is stored; the audit \`why\` field is bounded to 4 KiB so it cannot be used as a payload; and the submit is idempotent under \`(tenant, Idempotency-Key)\` so a client retry returns the original request id instead of a second chain. Real workflows add the pinned version's hash to the event trail, expire unused idempotency keys, and resolve approvers by role with a directory lookup rather than an actor id list.`,
 };

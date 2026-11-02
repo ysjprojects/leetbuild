@@ -8,14 +8,14 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: the version comes back with its template and a
+The starter is working code: the version comes back with its template and a
 rendered string, so the preview screen works. It renders with a raw string replace and it hands the
 reader whatever eval record it finds for the name. Find the flaws, fix them, and prove the fix.
 
 Implement \`GET /v1/prompts/{name}/versions/{v}\`:
 
 - The version is looked up for the **authenticated tenant**; a version that does not exist, or
-  belongs to another tenant, answers **404**. The draft serves any version it is handed, which is
+  belongs to another tenant, answers **404**. The starter serves any version it is handed, which is
   how one tenant reads another tenant’s eval history.
 - The response carries \`name\`, \`version\`, \`content_hash\`, \`template\`, \`variables\` and the
   \`eval_record\` **of that exact version hash** — \`store.get_eval(tenant, name, content_hash)\`.
@@ -68,7 +68,7 @@ requested version with the reader’s tenant.`,
       id: 'tenant-scope',
       title: 'Scopes the version to the authenticated tenant',
       detail:
-        'The version is authorized against the request tenant before anything is read, and a foreign or missing version answers **404**. The draft serves any version in the path and leaks another tenant’s eval record.',
+        'The version is authorized against the request tenant before anything is read, and a foreign or missing version answers **404**. The starter serves any version in the path and leaks another tenant’s eval record.',
       match: {
         python: {all: [/assert_tenant_owns/, /\b404\b/]},
         typescript: {all: [/assertTenantOwns/, /\b404\b/]},
@@ -81,7 +81,7 @@ requested version with the reader’s tenant.`,
       id: 'render-delimiter',
       title: 'Escapes values so a delimiter cannot break the template',
       detail:
-        'Values are escaped (`escape_value`/`escapeValue`) and substituted by a replacement function in one pass, so a value containing the delimiter is inert. The draft re-scans the caller’s text with a raw `replace`.',
+        'Values are escaped (`escape_value`/`escapeValue`) and substituted by a replacement function in one pass, so a value containing the delimiter is inert. The starter re-scans the caller’s text with a raw `replace`.',
       match: {
         python: {all: [/escape_value\(/, /PLACEHOLDER_RE/]},
         typescript: {all: [/escapeValue\(/, /PLACEHOLDER_RE/]},
@@ -94,7 +94,7 @@ requested version with the reader’s tenant.`,
       id: 'value-limits',
       title: 'Requires a value for every placeholder and caps each at 1 KiB',
       detail:
-        'Render mode validates the supplied values: every declared placeholder needs one, nothing undeclared is accepted, and each value is capped at `MAX_VALUE_BYTES`. Violations answer **422**. The draft validates nothing.',
+        'Render mode validates the supplied values: every declared placeholder needs one, nothing undeclared is accepted, and each value is capped at `MAX_VALUE_BYTES`. Violations answer **422**. The starter validates nothing.',
       match: {
         python: {all: [/MAX_VALUE_BYTES/, /status_code\s*=\s*422/]},
         typescript: {all: [/MAX_VALUE_BYTES/, /fail\(\s*422\s*,/]},
@@ -107,7 +107,7 @@ requested version with the reader’s tenant.`,
       id: 'eval-by-hash',
       title: 'Attaches the eval of the exact version hash',
       detail:
-        'The eval record is read for the requested version’s `content_hash`, not for the name: `store.get_eval(tenant, name, content_hash)`. The draft serves the name’s latest eval, which belongs to different bytes.',
+        'The eval record is read for the requested version’s `content_hash`, not for the name: `store.get_eval(tenant, name, content_hash)`. The starter serves the name’s latest eval, which belongs to different bytes.',
       match: {
         python: {all: [/get_eval\(tenant,\s*name,\s*content_hash\)/]},
         typescript: {all: [/getEval\(tenant,\s*name,\s*contentHash\)/]},
@@ -141,7 +141,7 @@ store = VersionStore()
 
 
 def render(template: str, values: dict) -> str:
-    # TODO: this draft substitutes with a raw string replace, so a caller value carrying the
+    # TODO: this starter substitutes with a raw string replace, so a caller value carrying the
     # delimiter or a quote can rewrite the template, it validates nothing about the values, and it
     # serves the name's latest eval record instead of the one for the version asked for.
     rendered = template
@@ -250,7 +250,7 @@ def read_version(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/prompts/:name/versions/:v: a model-generated draft with a raw substitution. */
+      starter: `/** GET /v1/prompts/:name/versions/:v: flawed code with a raw substitution. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -258,7 +258,7 @@ import {store} from './store';
 export const app = Fastify();
 
 function render(bodyTemplate: string, values: Record<string, string>): string {
-  // TODO: this draft substitutes with a raw string replace, so a caller value carrying the
+  // TODO: this starter substitutes with a raw string replace, so a caller value carrying the
   // delimiter or a quote can rewrite the template, it validates nothing about the values, and it
   // serves the name's latest eval record instead of the one for the version asked for.
   let rendered = bodyTemplate;
@@ -373,7 +373,7 @@ import (
 var store *VersionStore
 
 func render(bodyTemplate string, values map[string]string) string {
-	// TODO: this draft substitutes with a raw string replace, so a caller value carrying the
+	// TODO: this starter substitutes with a raw string replace, so a caller value carrying the
 	// delimiter or a quote can rewrite the template, it validates nothing about the values, and it
 	// serves the name's latest eval record instead of the one for the version asked for.
 	rendered := bodyTemplate
@@ -520,7 +520,7 @@ object ReadApi {
   implicit val system: ActorSystem = ActorSystem("prompt-registry")
 
   def render(bodyTemplate: String, values: Map[String, String]): String = {
-    // TODO: this draft substitutes with a raw string replace, so a caller value carrying the
+    // TODO: this starter substitutes with a raw string replace, so a caller value carrying the
     // delimiter or a quote can rewrite the template, it validates nothing about the values, and it
     // serves the name's latest eval record instead of the one for the version asked for.
     values.foldLeft(bodyTemplate) { case (rendered, (key, value)) =>
@@ -654,7 +654,7 @@ object ReadApi {
 using json = nlohmann::json;
 
 std::string render(const std::string& bodyTemplate, const json& values) {
-  // TODO: this draft substitutes with a raw string replace, so a caller value carrying the
+  // TODO: this starter substitutes with a raw string replace, so a caller value carrying the
   // delimiter or a quote can rewrite the template, it validates nothing about the values, and it
   // serves the name's latest eval record instead of the one for the version asked for.
   std::string rendered = bodyTemplate;

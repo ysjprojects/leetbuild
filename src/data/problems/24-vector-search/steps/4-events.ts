@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['search', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an event on the
+**Starting point.** The starter is working code: it produces an event on the
 happy path and the analytics job lights up, so the demo shows numbers moving. Four contracts are
 broken. Find them, fix them, and prove the fix with the checks below.
 
@@ -17,7 +17,7 @@ per-tenant counters.
 
 - The message **key is the tenant** (\`key=event.tenant\`, \`key: event.tenant\`, \`Key: []byte(tenant)\`,
   \`ProducerRecord(Topic, event.tenant, payload)\`). Partitioning by tenant keeps each tenant's
-  events in order; the draft keys by \`request_id\`, so one tenant's events scatter across partitions.
+  events in order; the starter keys by \`request_id\`, so one tenant's events scatter across partitions.
 - The payload carries **\`request_id\`, \`latency_ms\`, \`k\`, \`index_version\` and a \`fingerprint\`** —
   a stable digest of the query vector. It never carries the query text or the vector: a query is
   tenant content, and the topic is retained for days and replicated, so anything written there
@@ -57,7 +57,7 @@ looks exactly-once.`,
       id: 'tenant-key',
       title: 'Keyed by tenant, payload carries the fingerprint',
       detail:
-        'The message key is the tenant, and the payload carries ids, latency, `k`, index version and a query fingerprint. The draft keys by request id, so one tenant’s events scatter across partitions.',
+        'The message key is the tenant, and the payload carries ids, latency, `k`, index version and a query fingerprint. The starter keys by request id, so one tenant’s events scatter across partitions.',
       match: {
         python: {all: [/search\.query/, /key=event\.tenant/, /fingerprint/, /latency_ms/, /index_version/]},
         typescript: {all: [/search\.query/, /key:\s*event\.tenant/, /fingerprint/, /latency_ms/, /index_version/]},
@@ -78,7 +78,7 @@ looks exactly-once.`,
       id: 'no-query-text',
       title: 'No query text or vector in the event or the logs',
       detail:
-        'Neither the payload nor a log line carries the query text or the query vector — only the fingerprint. The draft copies the raw query into a retained, replicated topic.',
+        'Neither the payload nor a log line carries the query text or the query vector — only the fingerprint. The starter copies the raw query into a retained, replicated topic.',
       match: {
         python: {none: [/\bvector\b/i, /"query"/, /\bquery=/]},
         typescript: {none: [/\bvector\b/i, /"query"/, /event\.query/, /query\s*:\s*string/]},
@@ -104,7 +104,7 @@ looks exactly-once.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`outbox.insert(...)`) inside the error branch instead of dropping the event. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`outbox.insert(...)`) inside the error branch instead of dropping the event. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/outbox\.insert\(/, /except\s*\((KafkaException|BufferError)/]},
         typescript: {all: [/outbox\.insert\(/, /catch\s*\(/]},
@@ -117,7 +117,7 @@ looks exactly-once.`,
       id: 'counters-before-commit',
       title: 'Updates counters before committing the offset',
       detail:
-        'The consumer runs `HINCRBY` on the per-tenant counters before committing the offset; committing first makes a crash lose the counter update forever. The draft commits first.',
+        'The consumer runs `HINCRBY` on the per-tenant counters before committing the offset; committing first makes a crash lose the counter update forever. The starter commits first.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -151,9 +151,9 @@ class SearchEvent(BaseModel):
 
 
 def publish_search_event(event: SearchEvent) -> None:
-    # TODO: this draft keys by the request id so one tenant's events scatter, copies the raw query
+    # TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
     # into a retained topic, configures no idempotence and no acks, and drops the event when the
-    # broker rejects the produce. Review all four before this topic ships.
+    # broker rejects the produce. Fix all four before this topic ships.
     payload = json.dumps({"query": event.query, "latency_ms": event.latency_ms})
     producer.produce(TOPIC, key=event.request_id, value=payload)
     logger.info("search event tenant=%s query=%s", event.tenant, event.query)
@@ -247,7 +247,7 @@ def consume_search_events() -> None:
 `,
     },
     typescript: {
-      starter: `/** search.query: a model-generated draft that copies the query into the topic. */
+      starter: `/** search.query: flawed code that copies the query into the topic. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 
@@ -265,9 +265,9 @@ export interface SearchEvent {
 }
 
 export async function publishSearchEvent(event: SearchEvent): Promise<void> {
-  // TODO: this draft keys by the request id so one tenant's events scatter, copies the raw query
+  // TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
   // into a retained topic, configures no idempotence and no acks, and drops the event when the
-  // broker rejects the produce. Review all four before this topic ships.
+  // broker rejects the produce. Fix all four before this topic ships.
   await producer.send({
     topic: TOPIC,
     messages: [{key: event.request_id, value: JSON.stringify({query: event.query, latency_ms: event.latency_ms})}],
@@ -384,9 +384,9 @@ type SearchEvent struct {
 }
 
 func publishSearchEvent(ctx context.Context, event SearchEvent) error {
-	// TODO: this draft keys by the request id so one tenant's events scatter, copies the raw query
+	// TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
 	// into a retained topic, configures no idempotence and no acks, and drops the event when the
-	// broker rejects the produce. Review all four before this topic ships.
+	// broker rejects the produce. Fix all four before this topic ships.
 	payload, _ := json.Marshal(map[string]any{"query": event.Query, "latency_ms": event.LatencyMs})
 	message := kafka.Message{Key: []byte(event.RequestID), Value: payload}
 	return writer.WriteMessages(ctx, message)
@@ -517,9 +517,9 @@ object SearchEvents {
   val cache = new Jedis("redis", 6379)
 
   def publish(event: SearchEvent): Unit = {
-    // TODO: this draft keys by the request id so one tenant's events scatter, copies the raw query
+    // TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
     // into a retained topic, configures no idempotence and no acks, and drops the event when the
-    // broker rejects the produce. Review all four before this topic ships.
+    // broker rejects the produce. Fix all four before this topic ships.
     val payload = s"""{"query":"\${event.query}","latency_ms":\${event.latencyMs}}"""
     producer.send(new ProducerRecord[String, String](Topic, event.requestId, payload))
     System.out.println(s"search event \${event.tenant} \${event.query}")
@@ -637,9 +637,9 @@ std::unique_ptr<RdKafka::Producer> searchProducer() {
 }
 
 void publishSearchEvent(const SearchEvent& event) {
-  // TODO: this draft keys by the request id so one tenant's events scatter, copies the raw query
+  // TODO: this starter keys by the request id so one tenant's events scatter, copies the raw query
   // into a retained topic, configures no idempotence and no acks, and drops the event when the
-  // broker rejects the produce. Review all four before this topic ships.
+  // broker rejects the produce. Fix all four before this topic ships.
   const std::string payload = json{{"query", event.query}, {"latency_ms", event.latencyMs}}.dump();
   const std::string key = event.requestId;
   auto producer = searchProducer();
@@ -750,8 +750,8 @@ void consumeSearchEvents() {
 `,
     },
   },
-  debrief: `The event is where a search service decides what it is willing to remember. The draft is
-generated around the analytics use case — publish the query so the dashboard can show it — and that is
+  debrief: `The event is where a search service decides what it is willing to remember. The starter is
+built around the analytics use case — publish the query so the dashboard can show it — and that is
 precisely the mistake: the topic is retained and replicated, so the query text outlives the request,
 the session and the retention policy of whatever pipeline wrote it. The fix is a fingerprint:
 enough to group identical queries and spot a bad ranking cohort, useless as content. The other three

@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'meter', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it accepts a usage report,
+**Starting point.** The starter is working code: it accepts a usage report,
 parses the body and answers **202**. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/usage\` with body \`{"model": "…", "input_tokens": 1200, "output_tokens": 300}\`.
 
@@ -23,13 +23,13 @@ Implement \`POST /v1/usage\` with body \`{"model": "…", "input_tokens": 1200, 
   \`(tenant, key)\`: a replay returns the stored row with **200** and must not write a second one,
   so a client retry is never billed twice.
 - The write is **durable before the response leaves**: the row is put in the store, and only then
-  does the handler answer **202** with the stored row. A draft that answers first and writes in a
+  does the handler answer **202** with the stored row. A version that answers first and writes in a
   background task loses the whole report when the process dies in between — the tenant spent tokens
   the meter never recorded.
 - Log the decision with tenant, model and the usage id — this endpoint is on the hot path of every
   completion, so its write ordering and its key are the two things on-call will ask about.
 
-**Failure mode the checks target.** The draft records usage *after* sending the response, so a crash
+**Failure mode the checks target.** The starter records usage *after* sending the response, so a crash
 between the two silently drops a billable event; it accepts negative token counts, so a malformed
 client can erase spend; and it has no idempotency at all, so an ordinary retry — every HTTP client
 library retries a 202 that times out — bills the same request twice. The ordering flaw is the quiet
@@ -64,7 +64,7 @@ exactly like a fast happy path.`,
       id: 'token-range',
       title: 'Rejects negative and over-cap token counts',
       detail:
-        'Both counts are integers in `0..MAX_TOKENS_PER_REPORT`, and anything else is **400**. The draft takes whatever the body says, so a negative report erases spend the tenant already made and an unbounded one inflates the ledger.',
+        'Both counts are integers in `0..MAX_TOKENS_PER_REPORT`, and anything else is **400**. The starter takes whatever the body says, so a negative report erases spend the tenant already made and an unbounded one inflates the ledger.',
       match: {
         python: {all: [/MAX_TOKENS_PER_REPORT/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_TOKENS_PER_REPORT/, /code\(\s*400\s*\)/]},
@@ -77,7 +77,7 @@ exactly like a fast happy path.`,
       id: 'idempotency',
       title: 'Keys the write by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the row is stored under `(tenant, key)`, so a replay answers **200** with the stored row instead of writing a second one. The draft ignores the header entirely and bills the retry.',
+        '`Idempotency-Key` is required and the row is stored under `(tenant, key)`, so a replay answers **200** with the stored row instead of writing a second one. The starter ignores the header entirely and bills the retry.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -90,7 +90,7 @@ exactly like a fast happy path.`,
       id: 'durable-before-response',
       title: 'Writes the usage row before the response',
       detail:
-        'The store write happens before the handler answers: **202** is the last thing that happens. The draft responds first and records afterwards — a crash in between accepts tokens the meter never bills. This is an `order` check: the write must precede the response.',
+        'The store write happens before the handler answers: **202** is the last thing that happens. The starter responds first and records afterwards — a crash in between accepts tokens the meter never bills. This is an `order` check: the write must precede the response.',
       match: {
         python: {order: [/store\.put\(/, /JSONResponse\(/]},
         typescript: {order: [/store\.put\(/, /reply\.code\(\s*202\s*\)/]},
@@ -103,7 +103,7 @@ exactly like a fast happy path.`,
       id: 'tenant-required',
       title: 'Authenticates the tenant',
       detail:
-        'The tenant is required — **401** when `X-Tenant-Id` is absent — and it is part of the key the row is stored under. The draft reads the header and trusts whatever it finds, so a missing tenant bills an empty string.',
+        'The tenant is required — **401** when `X-Tenant-Id` is absent — and it is part of the key the row is stored under. The starter reads the header and trusts whatever it finds, so a missing tenant bills an empty string.',
       match: {
         python: {all: [/X-Tenant-Id/, /417|401/]},
         typescript: {all: [/x-tenant-id/, /401/]},
@@ -146,7 +146,7 @@ def report_usage(
     background: BackgroundTasks,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft records the usage after the response is sent, accepts negative token counts,
+    # TODO: this starter records the usage after the response is sent, accepts negative token counts,
     # and ignores Idempotency-Key so a client retry bills the same request twice.
     background.add_task(store.insert, tenant, body.model, body.input_tokens, body.output_tokens)
     logger.info("usage tenant=%s model=%s", tenant, body.model)
@@ -221,7 +221,7 @@ def report_usage(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/usage: a model-generated draft that records the usage after the response. */
+      starter: `/** POST /v1/usage: flawed code that records the usage after the response. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -237,7 +237,7 @@ async function insertUsage(tenant: string, body: UsageReport): Promise<void> {
 }
 
 app.post('/v1/usage', async (request, reply) => {
-  // TODO: this draft records the usage after the response has left the process, accepts negative
+  // TODO: this starter records the usage after the response has left the process, accepts negative
   // token counts, and ignores Idempotency-Key so a client retry bills the same request twice.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as UsageReport;
@@ -350,7 +350,7 @@ func reportUsage(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft records the usage after the response has left, accepts negative token
+	// TODO: this starter records the usage after the response has left, accepts negative token
 	// counts, and ignores Idempotency-Key so a client retry bills the same request twice.
 	writeJSON(rw, http.StatusAccepted, map[string]any{
 		"accepted": true,
@@ -488,7 +488,7 @@ object UsageApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[UsageReport]) { body =>
-            // TODO: this draft records the usage after the response is committed, accepts negative
+            // TODO: this starter records the usage after the response is committed, accepts negative
             // token counts, and ignores Idempotency-Key so a client retry bills the same request twice.
             val respond = complete(
               StatusCodes.Accepted,
@@ -599,7 +599,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft records the usage after the response has left, accepts negative token
+    // TODO: this starter records the usage after the response has left, accepts negative token
     // counts, and ignores Idempotency-Key so a client retry bills the same request twice.
     const auto model = body.value("model", std::string());
     const int inputTokens = body.value("input_tokens", 0);
@@ -695,5 +695,5 @@ int main() {
     'The idempotency lookup and the write share one key, `(tenant, idem_key)`, and the lookup happens before the write. Store the whole row — a replay then answers 200 with the same `usage_id` instead of minting a second one.',
     'The response is the last statement of the handler. If you need the write to look fast, make the *store* fast (or batch it) — never move it behind the response, because a crash in that window accepts tokens nothing will ever bill.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated write path on the money path. The draft reads fine because the demo posts well-formed reports and never retries. Three defects are being checked, in increasing subtlety: the token range (a negative count erases spend; an uncapped one corrupts the ledger), idempotency keyed by tenant (every HTTP client retries, and without the key the retry bills twice), and write-then-respond ordering (the row must be durable before the caller is told it was accepted). The ordering one is what separates candidates: \`send()\` then \`await put()\` is a two-line difference from the correct version and a silent revenue leak under a rolling deploy. Real meters add a monotonic usage id from the store for exactly-once reconciliation, a per-tenant cap on reports per minute, and a reconcile job that compares stored rows against the provider's own usage export.`,
+  debrief: `The interviewer is testing whether you can debug a write path on the money path. The starter reads fine because the demo posts well-formed reports and never retries. Three defects are being checked, in increasing subtlety: the token range (a negative count erases spend; an uncapped one corrupts the ledger), idempotency keyed by tenant (every HTTP client retries, and without the key the retry bills twice), and write-then-respond ordering (the row must be durable before the caller is told it was accepted). The ordering one is what separates candidates: \`send()\` then \`await put()\` is a two-line difference from the correct version and a silent revenue leak under a rolling deploy. Real meters add a monotonic usage id from the store for exactly-once reconciliation, a per-tenant cap on reports per minute, and a reconcile job that compares stored rows against the provider's own usage export.`,
 };

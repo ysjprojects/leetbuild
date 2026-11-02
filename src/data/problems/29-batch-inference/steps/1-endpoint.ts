@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'batchd', 'db', 'worker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and starts a job, so the demo submits a batch and shards appear in the work set. It hides
-three production flaws. Review it like the service owner, fix it, and prove the fix with the checks
+three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`POST /v1/batches\` with body \`{"manifest_uri": "s3://…"}\`.
@@ -19,10 +19,10 @@ Implement \`POST /v1/batches\` with body \`{"manifest_uri": "s3://…"}\`.
 - The input manifest is an object whose metadata carries \`record_count\` and \`records\`. Read that
   metadata with a **\`HEAD\`** *before* anything is stored: while the object is not readable the submit
   is a **409**, and when \`record_count\` is over **1 000 000** the submit is a **400** with no job
-  written. The draft reads ten million records into memory and seeds shards before the manifest
+  written. The starter reads ten million records into memory and seeds shards before the manifest
   exists, so the first worker races a half-written input.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the stored job instead of minting a new one — the draft creates a job on every submit.
+  returns the stored job instead of minting a new one — the starter creates a job on every submit.
 - Only after the manifest is durably readable and the count passes: create the job, write the
   manifest pointer, then enqueue one work-set entry per shard (\`ceil(record_count / 1000)\`).
 - Answer **202 Accepted** with \`{job_id, status, shards}\`.
@@ -59,7 +59,7 @@ reason that has nothing to do with the model.
       id: 'auth-tenant',
       title: 'Rejects a submit with no tenant',
       detail:
-        'The tenant comes from `X-Tenant-Id` and a missing tenant is **401**. The draft starts a job for whoever calls.',
+        'The tenant comes from `X-Tenant-Id` and a missing tenant is **401**. The starter starts a job for whoever calls.',
       match: {
         python: {all: [/X-Tenant-Id/, /401/]},
         typescript: {all: [/x-tenant-id/i, /401/]},
@@ -72,7 +72,7 @@ reason that has nothing to do with the model.
       id: 'idempotent-replay',
       title: 'A replayed submit returns the same job',
       detail:
-        'The submit looks up `(tenant, Idempotency-Key)` before it creates a job and returns the stored job on a hit. The draft mints a new job on every submit, so a client retry runs the batch twice.',
+        'The submit looks up `(tenant, Idempotency-Key)` before it creates a job and returns the stored job on a hit. The starter mints a new job on every submit, so a client retry runs the batch twice.',
       match: {
         python: {order: [/find_by_key\(/, /\.create\(/]},
         typescript: {order: [/findByKey\(/, /\.create\(/]},
@@ -85,7 +85,7 @@ reason that has nothing to do with the model.
       id: 'record-cap',
       title: 'Rejects a manifest over one million records',
       detail:
-        'The manifest record count is checked against `MAX_RECORDS` (1 000 000) and an oversized manifest is **400** before any job is written. The draft accepts an unbounded manifest.',
+        'The manifest record count is checked against `MAX_RECORDS` (1 000 000) and an oversized manifest is **400** before any job is written. The starter accepts an unbounded manifest.',
       match: {
         python: {all: [/MAX_RECORDS/, /1_000_000/, /400/]},
         typescript: {all: [/MAX_RECORDS/, /1_000_000/, /400/]},
@@ -98,7 +98,7 @@ reason that has nothing to do with the model.
       id: 'durable-manifest',
       title: 'Starts only after the manifest is durably readable',
       detail:
-        'The manifest object is confirmed readable (a `HEAD`/metadata read) before any shard is enqueued. The draft enqueues first and races the half-written input.',
+        'The manifest object is confirmed readable (a `HEAD`/metadata read) before any shard is enqueued. The starter enqueues first and races the half-written input.',
       match: {
         python: {order: [/\.head\(/, /enqueue_shards\(/]},
         typescript: {order: [/\.head\(/, /enqueueShards\(/]},
@@ -111,7 +111,7 @@ reason that has nothing to do with the model.
       id: 'accepted-job',
       title: 'Answers 202 with the job id and shard count',
       detail:
-        'A fresh submit answers **202 Accepted** with the job id and the shard count; the draft answers 200 with only a fresh id.',
+        'A fresh submit answers **202 Accepted** with the job id and the shard count; the starter answers 200 with only a fresh id.',
       match: {
         python: {all: [/202/, /job_id/]},
         typescript: {all: [/202/, /job_id/]},
@@ -157,8 +157,8 @@ def enqueue_shards(batch_id: str, shard_count: int) -> None:
 
 @app.post("/v1/batches")
 def submit(body: BatchRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft reads the manifest into memory unbounded, mints a new job on every submit,
-    # and seeds shards before the manifest is readable. Review all three.
+    # TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
+    # and seeds shards before the manifest is readable. Fix all three.
     records = [f"record-{i}" for i in range(10_000_000)]
     job = store.create(tenant, body.manifest_uri, body.shard_count)
     enqueue_shards(job["job_id"], body.shard_count)
@@ -240,7 +240,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/batches: a model-generated draft that starts before the manifest exists. */
+      starter: `/** POST /v1/batches: flawed code that starts before the manifest exists. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -271,8 +271,8 @@ async function enqueueShards(batchID: string, shardCount: number): Promise<void>
 }
 
 app.post('/v1/batches', async (request, reply) => {
-  // TODO: this draft reads the manifest into memory unbounded, mints a new job on every submit,
-  // and seeds shards before the manifest is readable. Review all three.
+  // TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
+  // and seeds shards before the manifest is readable. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as BatchBody;
   const records = Array.from({length: 10_000_000}, (_, i) => 'record-' + i);
@@ -411,8 +411,8 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft reads the manifest into memory unbounded, mints a new job on every submit,
-	// and seeds shards before the manifest is readable. Review all three.
+	// TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
+	// and seeds shards before the manifest is readable. Fix all three.
 	records := make([]string, 10_000_000)
 	job, _ := store.Create(r.Context(), tenant, body.ManifestURI, body.ShardCount)
 	batchID := job["job_id"].(string)
@@ -561,8 +561,8 @@ object BatchApi {
     path("v1" / "batches") {
       post {
         entity(as[BatchRequest]) { body =>
-          // TODO: this draft reads the manifest into memory unbounded, mints a new job on every
-          // submit, and seeds shards before the manifest is readable. Review all three.
+          // TODO: this starter reads the manifest into memory unbounded, mints a new job on every
+          // submit, and seeds shards before the manifest is readable. Fix all three.
           val records = (0 until 10_000_000).map(i => s"record-$i").toList
           val job = store.create(body.manifest_uri, body.shard_count)
           enqueueShards(job.job_id, body.shard_count)
@@ -673,8 +673,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft reads the manifest into memory unbounded, mints a new job on every submit,
-    // and seeds shards before the manifest is readable. Review all three.
+    // TODO: this starter reads the manifest into memory unbounded, mints a new job on every submit,
+    // and seeds shards before the manifest is readable. Fix all three.
     const std::vector<std::string> records(10000000, "record");
     const auto manifestURI = body.value("manifest_uri", std::string());
     const int shardCount = body.value("shard_count", 1000);
@@ -776,10 +776,10 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is reviewing an endpoint that starts expensive work, and every defect is about the
+  debrief: `The interviewer is testing an endpoint that starts expensive work, and every defect is about the
 order of operations. Authentication first, then the idempotency lookup, then the manifest gate, then
-the job write, then the shards. The draft reverses the last two: it starts processing before the
-input is durably readable, so the first shard is a race, not a model failure. Two more drafts hide
+the job write, then the shards. The starter reverses the last two: it starts processing before the
+input is durably readable, so the first shard is a race, not a model failure. Two more flaws hide
 behind the happy path: an unbounded manifest that trusts the caller for ten million records, and a
 minted job id that makes every client retry run the batch twice. The contract is that a submit is a
 single, idempotent, bounded promise — a \`HEAD\` on the manifest before anything is stored is what

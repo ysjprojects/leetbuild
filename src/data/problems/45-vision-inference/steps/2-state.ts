@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'state', 'worker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a tenant with room left gets a
+**Starting point.** The starter is working code: a tenant with room left gets a
 token and the happy path works. Two failures hide under it — an admission race and a leak — and
 neither shows up in a serial demo. Find them, fix them, and prove the fix.
 
@@ -48,7 +48,7 @@ leaks one slot per crashed worker until the pool is permanently empty.`,
       id: 'atomic',
       title: 'Admits with one atomic Lua script',
       detail:
-        'The read, the rejection and the decrement happen inside a single `EVAL`/`NewScript` call. The draft reads the counter with `GET` and decrements it afterwards, so two concurrent admissions both observe the same room and the pool over-admits.',
+        'The read, the rejection and the decrement happen inside a single `EVAL`/`NewScript` call. The starter reads the counter with `GET` and decrements it afterwards, so two concurrent admissions both observe the same room and the pool over-admits.',
       match: {
         python: {all: [/ADMIT_LUA/, /\.eval\(/, /DECR/, /GET/]},
         typescript: {all: [/ADMIT_LUA/, /\.eval\(/, /DECR/, /GET/]},
@@ -61,7 +61,7 @@ leaks one slot per crashed worker until the pool is permanently empty.`,
       id: 'ttl',
       title: 'Sets the token TTL at first write',
       detail:
-        'The script creates the counter with `SET … EX TOKEN_TTL_S`, so the tokens a crashed worker never released expire back into the pool. The draft never sets an expiry, so one crashed worker removes a slot until Redis restarts.',
+        'The script creates the counter with `SET … EX TOKEN_TTL_S`, so the tokens a crashed worker never released expire back into the pool. The starter never sets an expiry, so one crashed worker removes a slot until Redis restarts.',
       match: {
         python: {all: [/TOKEN_TTL_S/, /'EX'/]},
         typescript: {all: [/TOKEN_TTL_S/, /'EX'/]},
@@ -74,7 +74,7 @@ leaks one slot per crashed worker until the pool is permanently empty.`,
       id: 'release',
       title: 'Releases only for the worker holding the ticket',
       detail:
-        'Release runs through a second script that removes the ticket with `HDEL` and increments the counter only when the caller still held it. The draft never releases at all, and an unguarded `INCR` would hand a token to whoever replays a stale lock id.',
+        'Release runs through a second script that removes the ticket with `HDEL` and increments the counter only when the caller still held it. The starter never releases at all, and an unguarded `INCR` would hand a token to whoever replays a stale lock id.',
       match: {
         python: {all: [/RELEASE_LUA/, /HDEL/, /lock_id/]},
         typescript: {all: [/RELEASE_LUA/, /HDEL/, /lockId/]},
@@ -87,7 +87,7 @@ leaks one slot per crashed worker until the pool is permanently empty.`,
       id: 'guard',
       title: 'Refuses to hand out a token that is not there',
       detail:
-        'The script returns a rejection tuple when the counter has run out instead of decrementing below zero. The draft checks in Python and then decrements, so the counter can go negative and the pool admits more than the GPU can take.',
+        'The script returns a rejection tuple when the counter has run out instead of decrementing below zero. The starter checks in Python and then decrements, so the counter can go negative and the pool admits more than the GPU can take.',
       match: {
         python: {all: [/left\s*<=\s*0/, /return\s*\{\s*0/]},
         typescript: {all: [/left\s*<=\s*0/, /return\s*\{\s*0/]},
@@ -112,7 +112,7 @@ leaks one slot per crashed worker until the pool is permanently empty.`,
   ],
   code: {
     python: {
-      starter: `"""GPU admission tokens: a model-generated draft that checks and then decrements."""
+      starter: `"""GPU admission tokens: flawed code that checks and then decrements."""
 import redis
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -130,9 +130,9 @@ class InferenceRequest(BaseModel):
 
 
 def admit(tenant: str) -> bool:
-    # TODO: this draft reads the counter and decrements it in two round trips, so a burst
+    # TODO: this starter reads the counter and decrements it in two round trips, so a burst
     # over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-    # restarts. Move both into scripts. Review all of it.
+    # restarts. Move both into scripts. Fix all of it.
     left = int(r.get(f"gpu:tokens:{tenant}") or GPU_TOKENS_PER_TENANT)
     if left <= 0:
         return False
@@ -232,7 +232,7 @@ def create_inference(body: InferenceRequest, tenant: str = Header(alias="X-Tenan
 `,
     },
     typescript: {
-      starter: `/** GPU admission tokens: a model-generated draft that checks and then decrements. */
+      starter: `/** GPU admission tokens: flawed code that checks and then decrements. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -242,9 +242,9 @@ const redis = new Redis({host: 'redis', port: 6379});
 const GPU_TOKENS_PER_TENANT = 10;
 
 async function admit(tenant: string): Promise<boolean> {
-  // TODO: this draft reads the counter and decrements it in two round trips, so a burst
+  // TODO: this starter reads the counter and decrements it in two round trips, so a burst
   // over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-  // restarts. Move both into scripts. Review all of it.
+  // restarts. Move both into scripts. Fix all of it.
   const raw = await redis.get(\`gpu:tokens:\${tenant}\`);
   const left = raw === null ? GPU_TOKENS_PER_TENANT : Number(raw);
   if (left <= 0) return false;
@@ -361,9 +361,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func admit(ctx context.Context, tenant string) bool {
-	// TODO: this draft reads the counter and decrements it in two round trips, so a burst
+	// TODO: this starter reads the counter and decrements it in two round trips, so a burst
 	// over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-	// restarts. Move both into scripts. Review all of it.
+	// restarts. Move both into scripts. Fix all of it.
 	key := "gpu:tokens:" + tenant
 	left, err := rdb.Get(ctx, key).Int()
 	if err == redis.Nil {
@@ -489,9 +489,9 @@ object Admission {
   val GpuTokensPerTenant = 10
   val jedis = new JedisPooled("redis", 6379)
 
-  // TODO: this draft reads the counter and decrements it in two round trips, so a burst
+  // TODO: this starter reads the counter and decrements it in two round trips, so a burst
   // over-admits, and it never releases a token when a worker dies — the pool leaks until Redis
-  // restarts. Move both into scripts. Review all of it.
+  // restarts. Move both into scripts. Fix all of it.
   def admit(tenant: String): Boolean = {
     val key = s"gpu:tokens:$tenant"
     val left = Option(jedis.get(key)).map(_.toLong).getOrElse(GpuTokensPerTenant.toLong)
@@ -631,9 +631,9 @@ sw::redis::Redis redis("tcp://redis:6379");
 
 constexpr int kGpuTokensPerTenant = 10;
 
-// TODO: this draft reads the counter and decrements it in two round trips, so a burst over-admits,
+// TODO: this starter reads the counter and decrements it in two round trips, so a burst over-admits,
 // and it never releases a token when a worker dies — the pool leaks until Redis restarts. Move both
-// into scripts. Review all of it.
+// into scripts. Fix all of it.
 bool admit(const std::string& tenant) {
   const auto key = "gpu:tokens:" + tenant;
   const auto raw = redis.get(key);
@@ -758,7 +758,7 @@ int main() {
     "The TTL is what makes a crash self-healing. Set it with the first write (`SET key capacity EX TOKEN_TTL_S`) rather than in a follow-up `EXPIRE` that a failed request can skip — and never refresh it on release, or a busy tenant's counter would never expire.",
     'Release is not a bare `INCR`: it must prove the caller still holds the ticket (`HDEL` on the holder hash, increment only when it removed something). Otherwise a retried worker that already lost its ticket to the TTL hands the pool an eleventh token.',
   ],
-  debrief: `The interviewer is testing whether you can review a quota that looks right in a serial test. Two
+  debrief: `The interviewer is testing whether you can debug a quota that looks right in a serial test. Two
 defects are being checked and both are invisible to a demo: a check-then-decrement windows (two
 requests read the same free slot), and a token that is never returned when a worker dies. The fix is
 the same shape as every well-built limiter — one atomic server-side decision, an expiry so a crash is

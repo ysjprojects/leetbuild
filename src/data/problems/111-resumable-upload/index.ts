@@ -7,9 +7,9 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Resumable upload on the AI-era track: the course is not "accept a multipart body", it is the
- * review you owe a model-generated upload pipeline before a mobile client loses a multi-gigabyte
- * file to one failed part. Declared-parts initiation with bounded part counts → an atomic Redis
+ * Resumable upload: the course is not "accept a multipart body", it is the debugging you owe an
+ * upload pipeline before a mobile client loses a multi-gigabyte file to one failed part.
+ * Declared-parts initiation with bounded part counts → an atomic Redis
  * manifest that registers each part exactly once → gRPC part writes that verify the store's
  * checksum before marking stored → upload events keyed by upload id and published after the object
  * commits → a status read that names the exact missing and corrupt parts.
@@ -20,7 +20,6 @@ export const resumableUploadProblem: Problem = {
   tagline: 'Large uploads that resume from the exact missing part, verified per part.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Resumable Upload
 
@@ -60,12 +59,12 @@ One service, **uploadd**, with five pieces:
 5. \`GET /v1/uploads/{upload_id}\`: stored, missing and corrupt parts with their checksums, a \`resume\`
    list, and a 404 for a foreign tenant's upload.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

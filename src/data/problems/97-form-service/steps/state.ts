@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: the happy path — a captcha token the client just
+**Starting point.** The starter is working code: the happy path — a captcha token the client just
 received, one submission from one address — always works. The limiter and the captcha hide three
 races and a leak. Find them, fix them, and prove the fix.
 
@@ -30,7 +30,7 @@ Implement the abuse controls every public form submission runs through:
   \`X-RateLimit-Remaining\`; when the captcha token is missing or already used answer **409** naming
   the replay. Neither answer may reach the storage write.
 
-**Failure mode the checks target.** The draft's \`GET\`/\`DEL\` pair lets two concurrent replays both
+**Failure mode the checks target.** The starter's \`GET\`/\`DEL\` pair lets two concurrent replays both
 consume one token; its IP-only key lets a distributed sweep pass while one shared address is blocked
 and gives no per-form ceiling; and without a window bucket the first busy minute locks the key
 forever.`,
@@ -65,7 +65,7 @@ forever.`,
       id: 'captcha-atomic',
       title: 'Consumes the captcha token in one atomic compare-and-delete',
       detail:
-        'The token is removed and read in a single server-side operation (a Lua script or `GETDEL`). The draft does a client-side `GET` then `DEL`, so two parallel replays both see the token and both pass.',
+        'The token is removed and read in a single server-side operation (a Lua script or `GETDEL`). The starter does a client-side `GET` then `DEL`, so two parallel replays both see the token and both pass.',
       match: {
         python: {all: [/CONSUME_LUA/, /\.eval\(/], none: [/\.delete\(/]},
         typescript: {all: [/CONSUME_LUA/, /\.eval\(/], none: [/\.del\(/]},
@@ -91,7 +91,7 @@ forever.`,
       id: 'limit-dimensions',
       title: 'Limits the form and the IP, not just one',
       detail:
-        'The limiter keys both the form (`limit:form:…`) and the submitter IP (`limit:ip:…`), so a distributed sweep cannot pass while one address is throttled. The draft keys the IP only.',
+        'The limiter keys both the form (`limit:form:…`) and the submitter IP (`limit:ip:…`), so a distributed sweep cannot pass while one address is throttled. The starter keys the IP only.',
       match: {
         python: {all: [/limit:form:/, /limit:ip:/]},
         typescript: {all: [/limit:form:/, /limit:ip:/]},
@@ -104,7 +104,7 @@ forever.`,
       id: 'window-bucket',
       title: 'Keys expire with their window bucket',
       detail:
-        'Keys include the 60-second window bucket so the counters reset each window instead of living forever. The draft has no window, so the first busy minute locks the key permanently.',
+        'Keys include the 60-second window bucket so the counters reset each window instead of living forever. The starter has no window, so the first busy minute locks the key permanently.',
       match: {
         python: {all: [/WINDOW_S/, /window\(\)/]},
         typescript: {all: [/WINDOW_S/, /windowBucket/]},
@@ -143,7 +143,7 @@ submissions = {}
 
 
 def consume_captcha(token: str) -> bool:
-    # TODO: this draft consumes the captcha token with GET-then-DELETE (two round trips, so two
+    # TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
     # parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
     # one office IP stays blocked), and omits the window bucket so the counter never resets.
     value = r.get(f"captcha:{token}")
@@ -243,7 +243,7 @@ def submit(form_id: str, body: dict, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** Abuse controls for public form submissions — a model-generated draft. */
+      starter: `/** Abuse controls for public form submissions — flawed code. */
 import {Redis} from 'ioredis';
 import Fastify from 'fastify';
 
@@ -254,7 +254,7 @@ const LIMIT_PER_WINDOW = 5;
 const submissions: Record<string, unknown> = {};
 
 async function consumeCaptcha(token: string): Promise<boolean> {
-  // TODO: this draft consumes the captcha token with GET-then-DELETE (two round trips, so two
+  // TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
   // parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
   // one office IP stays blocked), and omits the window bucket so the counter never resets.
   const value = await r.get('captcha:' + token);
@@ -359,7 +359,7 @@ const limitPerWindow = 5
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func consumeCaptcha(ctx context.Context, token string) bool {
-	// TODO: this draft consumes the captcha token with GET-then-DELETE (two round trips, so two
+	// TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
 	// parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
 	// one office IP stays blocked), and omits the window bucket so the counter never resets.
 	value, err := rdb.Get(ctx, "captcha:"+token).Result()
@@ -483,7 +483,7 @@ object State {
   val jedis = new Jedis("redis", 6379)
 
   def consumeCaptcha(token: String): Boolean = {
-    // TODO: this draft consumes the captcha token with GET-then-DELETE (two round trips, so two
+    // TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
     // parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
     // one office IP stays blocked), and omits the window bucket so the counter never resets.
     val value = jedis.get("captcha:" + token)
@@ -599,7 +599,7 @@ void RegisterRoutes(httplib::Server& svr, Redis& redis) {
   const int limitPerWindow = 5;
 
   auto consumeCaptcha = [&](const std::string& token) {
-    // TODO: this draft consumes the captcha token with GET-then-DELETE (two round trips, so two
+    // TODO: this starter consumes the captcha token with GET-then-DELETE (two round trips, so two
     // parallel replays both pass), keys the limit on the IP only (a botnet sweeps the form while
     // one office IP stays blocked), and omits the window bucket so the counter never resets.
     auto value = redis.get("captcha:" + token);

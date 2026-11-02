@@ -8,11 +8,11 @@ export const endpointStep: Step = {
   focus: ['ops', 'api', 'vault', 'db', 'audit'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the create endpoint: it
-registers the route, parses the body and answers 201. It compiles, it serves the demo, and it hides
-three production flaws — the material it hands back, the material it writes to the audit line, and
-the rotation interval it never stores. Review it like the service owner, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter is working code for the create endpoint: it registers the route,
+parses the body and answers 201. It compiles, it serves the demo, and it hides three production
+flaws — the material it hands back, the material it writes to the audit line, and the rotation
+interval it never stores. Debug it like the service owner, fix it, and prove the fix with the
+checks below.
 
 Implement \`POST /v1/secrets\` with body
 \`{"name": "db-password", "material": "…", "rotation_seconds": 2592000}\`.
@@ -67,7 +67,7 @@ can tell that it is overdue.`,
       id: 'material-sealed',
       title: 'The 201 body never carries material',
       detail:
-        'The response is built by a `publicVersion`/`public_version` projection carrying `version_id`, `fingerprint`, `rotate_at` and `health` — never the material. The draft returns `material` in the create response, so the plaintext leaves the vault on the first call.',
+        'The response is built by a `publicVersion`/`public_version` projection carrying `version_id`, `fingerprint`, `rotate_at` and `health` — never the material. The starter returns `material` in the create response, so the plaintext leaves the vault on the first call.',
       match: {
         python: {
           all: [/def public_version\(/, /fingerprint\(/, /status_code\s*=\s*201/],
@@ -95,7 +95,7 @@ can tell that it is overdue.`,
       id: 'audit-ids-only',
       title: 'The audit line carries ids, not the material',
       detail:
-        'The create is logged with operator, name, version id and fingerprint. The draft logs the material itself, shipping tenant secrets into a pipeline whose retention outlives them.',
+        'The create is logged with operator, name, version id and fingerprint. The starter logs the material itself, shipping tenant secrets into a pipeline whose retention outlives them.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*material/]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*material/]},
@@ -108,7 +108,7 @@ can tell that it is overdue.`,
       id: 'rotation-policy',
       title: 'Every secret carries a bounded rotation interval',
       detail:
-        'The interval defaults to 30 days and is rejected outside 300..7 776 000 seconds (**400**). The draft accepts no interval at all, so secrets are created with no rotation policy and live for years.',
+        'The interval defaults to 30 days and is rejected outside 300..7 776 000 seconds (**400**). The starter accepts no interval at all, so secrets are created with no rotation policy and live for years.',
       match: {
         python: {
           all: [/DEFAULT_ROTATION_SECONDS/, /MIN_ROTATION_SECONDS/, /MAX_ROTATION_SECONDS/, /status_code\s*=\s*400/],
@@ -127,7 +127,7 @@ can tell that it is overdue.`,
       id: 'health-overdue',
       title: 'An elapsed interval raises the health state',
       detail:
-        'Health is derived from the interval — `healthOf(rotate_at, now)` answers `"overdue"` once the interval has elapsed — and the create response reports it. The draft reports no health at all, so an unrotated secret looks exactly like a fresh one.',
+        'Health is derived from the interval — `healthOf(rotate_at, now)` answers `"overdue"` once the interval has elapsed — and the create response reports it. The starter reports no health at all, so an unrotated secret looks exactly like a fresh one.',
       match: {
         python: {all: [/def health_of\(/, /"overdue"/]},
         typescript: {all: [/function healthOf\(/, /'overdue'/]},
@@ -167,8 +167,8 @@ store = VersionStore()
 
 @app.post("/v1/secrets")
 def create_secret(body: CreateSecret, operator: str = Header(default="", alias="X-Operator-Id")) -> JSONResponse:
-    # TODO: this draft returns the material "for convenience caching", logs it in the audit line,
-    # and stores no rotation interval. Review all three, then check the response, the log and the policy.
+    # TODO: this starter returns the material "for convenience caching", logs it in the audit line,
+    # and stores no rotation interval. Fix all three, then check the response, the log and the policy.
     version_id = str(uuid.uuid4())
     logger.info("secret.created operator=%s name=%s version=%s material=%r", operator, body.name, version_id, body.material)
     store.put(body.name, version_id, body.material, "", 0.0)
@@ -266,7 +266,7 @@ def create_secret(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/secrets: a model-generated draft that hands the material back to the caller. */
+      starter: `/** POST /v1/secrets: flawed code that hands the material back to the caller. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -282,8 +282,8 @@ interface CreateBody {
 app.post('/v1/secrets', async (request, reply) => {
   const operator = request.headers['x-operator-id'];
   const body = request.body as CreateBody;
-  // TODO: this draft returns the material "for convenience caching", logs it in the audit line,
-  // and stores no rotation interval. Review all three.
+  // TODO: this starter returns the material "for convenience caching", logs it in the audit line,
+  // and stores no rotation interval. Fix all three.
   const versionId = randomUUID();
   request.log.info({operator, name: body.name, version: versionId, material: body.material}, 'secret.created');
   return reply.code(201).send({name: body.name, version_id: versionId, material: body.material});
@@ -408,8 +408,8 @@ func createSecret(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft returns the material "for convenience caching", logs it in the audit line,
-	// and stores no rotation interval. Review all three.
+	// TODO: this starter returns the material "for convenience caching", logs it in the audit line,
+	// and stores no rotation interval. Fix all three.
 	versionID := newVersionID()
 	log.Printf("secret.created operator=%s name=%s version=%s material=%q", operator, body.Name, versionID, body.Material)
 	writeJSON(rw, http.StatusCreated, map[string]any{
@@ -573,8 +573,8 @@ object SecretApi {
       post {
         optionalHeaderValueByName("X-Operator-Id") { operatorOpt =>
           entity(as[CreateSecret]) { body =>
-            // TODO: this draft returns the material "for convenience caching", logs it in the audit
-            // line, and stores no rotation interval. Review all three.
+            // TODO: this starter returns the material "for convenience caching", logs it in the audit
+            // line, and stores no rotation interval. Fix all three.
             val versionId = UUID.randomUUID().toString
             val createdAt = Instant.now().getEpochSecond
             system.log.info(s"secret.created operator=\${operatorOpt.getOrElse("")} name=\${body.name} version=$versionId material=\${body.material}")
@@ -705,8 +705,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft returns the material "for convenience caching", logs it in the audit line,
-    // and stores no rotation interval. Review all three.
+    // TODO: this starter returns the material "for convenience caching", logs it in the audit line,
+    // and stores no rotation interval. Fix all three.
     const auto name = body.value("name", std::string());
     const auto material = body.value("material", std::string());
     const auto versionId = newVersionId();
@@ -826,5 +826,5 @@ int main() {
     'The interval is not decoration: default it (30 days), bound it (300 s .. 90 days), and derive `health` from `rotate_at` versus now. A version with no interval can never be overdue, which is how a secret ends up live for years without anyone noticing.',
     'The audit line is a contract with the log pipeline: operator, name, version id, fingerprint. If you need the material for debugging, you need a fingerprint — the SHA-256 identifies the version and leaks nothing, and the vault is the only place the bytes live.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the one boundary that matters for secrets: what leaves the service. Three defects are being checked, and only the first is obvious in the diff. The create response must carry a projection — version id, fingerprint, rotate_at, health — because a response body is copied into proxies, client caches and error reports; the material must be written once and read never. The audit line is the second: a log line is retained, replicated and shipped to a provider, so it may carry ids but never the bytes. The third is the one candidates skip entirely — the rotation interval. A secret with no interval is a secret with an infinite lifetime, and health that cannot become overdue cannot page anyone. Real secret stores add per-version TTLs enforced by a scheduler, a re-wrap path for the material at rest, and a fingerprint index so consumers can prove which version they hold.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the one boundary that matters for secrets: what leaves the service. Three defects are being checked, and only the first is obvious in the diff. The create response must carry a projection — version id, fingerprint, rotate_at, health — because a response body is copied into proxies, client caches and error reports; the material must be written once and read never. The audit line is the second: a log line is retained, replicated and shipped to a provider, so it may carry ids but never the bytes. The third is the one candidates skip entirely — the rotation interval. A secret with no interval is a secret with an infinite lifetime, and health that cannot become overdue cannot page anyone. Real secret stores add per-version TTLs enforced by a scheduler, a re-wrap path for the material at rest, and a fingerprint index so consumers can prove which version they hold.`,
 };

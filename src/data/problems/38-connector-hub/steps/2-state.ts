@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['hub', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a page finishes, the cursor moves and the next run
+**Starting point.** The starter is working code: a page finishes, the cursor moves and the next run
 resumes from the right place. It survives exactly one demo. Find the flaws, fix them, and prove the
 fix.
 
@@ -23,12 +23,12 @@ processed** — and \`load_cursor\`, the read the next run starts from:
   \`page:{connector_id}:{page_token}\`. A re-fetch of a page — after a crash, a retry or a rebalance —
   must not apply it twice.
 - The claim and the cursor move happen in **one atomic Lua \`EVAL\`**: \`SET … NX\` on the page key
-  first, and the \`SET\` of the new cursor only when the claim actually succeeded. The draft writes
+  first, and the \`SET\` of the new cursor only when the claim actually succeeded. The starter writes
   the cursor **before** it claims the page, so a crash between the fetch and the write skips a page
   and the bare \`SET\` race loses a cursor move under concurrency.
 - Return \`{applied, cursor}\`: \`applied\` is false for a page that was already committed, and
   \`cursor\` is the checkpoint the caller can log. A worker that decides "already seen" from a
-  client-side read is exactly the race the draft has.
+  client-side read is exactly the race the starter has.
 
 **Failure mode the checks target.** The TTL is the silent one: \`EX\` 86 400 looks like hygiene, and
 it means a quiet connector silently restarts from the beginning of history tomorrow, re-fetching and
@@ -63,7 +63,7 @@ re-fetch because nothing will ever notice.`,
       id: 'atomic-advance',
       title: 'Claims the page and moves the cursor in one atomic script',
       detail:
-        'A single `EVAL`/`NewScript` does both the page claim and the cursor `SET`. The draft issues two independent client calls, so a crash between them leaves the cursor ahead of the last processed page.',
+        'A single `EVAL`/`NewScript` does both the page claim and the cursor `SET`. The starter issues two independent client calls, so a crash between them leaves the cursor ahead of the last processed page.',
       match: {
         python: {all: [/CURSOR_LUA/, /\.eval\(/]},
         typescript: {all: [/CURSOR_LUA/, /\.eval\(/]},
@@ -76,7 +76,7 @@ re-fetch because nothing will ever notice.`,
       id: 'durable-cursor',
       title: 'Never expires the cursor',
       detail:
-        'The cursor key is written without a TTL — no `ex=`, no `EX`, no `setex`, no `time.Hour`, no `chrono::hours`. The draft gives it 24 hours, so a connector that syncs less often than daily silently restarts from the beginning of its history.',
+        'The cursor key is written without a TTL — no `ex=`, no `EX`, no `setex`, no `time.Hour`, no `chrono::hours`. The starter gives it 24 hours, so a connector that syncs less often than daily silently restarts from the beginning of its history.',
       match: {
         python: {all: [/SET/], none: [/\bex\s*=/, /EXPIRE/]},
         typescript: {all: [/SET/], none: [/['"]EX['"]/, /expire\(/]},
@@ -89,7 +89,7 @@ re-fetch because nothing will ever notice.`,
       id: 'page-dedupe',
       title: 'Claims each page under its own key',
       detail:
-        'The page claim key is `page:{connector_id}:{page_token}` and is taken with `SET … NX`, so re-fetching a page after a crash changes nothing. The draft has no per-page key at all.',
+        'The page claim key is `page:{connector_id}:{page_token}` and is taken with `SET … NX`, so re-fetching a page after a crash changes nothing. The starter has no per-page key at all.',
       match: {
         python: {all: [/page:/, /'NX'/]},
         typescript: {all: [/page:/, /'NX'/]},
@@ -136,7 +136,7 @@ def load_cursor(connector_id: str) -> str | None:
 
 
 def commit_page(commit: PageCommit) -> dict:
-    # TODO: the draft stores the cursor with a 24-hour TTL and moves it before the page is
+    # TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is
     # committed, so a quiet connector restarts from the beginning of history and an interrupted run
     # skips a page. Claim the page and move the cursor in one atomic script, with no TTL.
     r.set(f"connector:{commit.connector_id}:cursor", commit.next_cursor, ex=CURSOR_TTL_S)
@@ -194,7 +194,7 @@ def commit_page(commit: PageCommit) -> dict:
 `,
     },
     typescript: {
-      starter: `/** commitPage: a model-generated draft that expires the cursor and moves it too early. */
+      starter: `/** commitPage: flawed code that expires the cursor and moves it too early. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -216,7 +216,7 @@ export async function loadCursor(connectorId: string): Promise<string | null> {
 }
 
 export async function commitPage(commit: PageCommit): Promise<CommitResult> {
-  // TODO: the draft stores the cursor with a 24-hour TTL and moves it before the page is committed,
+  // TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is committed,
   // so a quiet connector restarts from the beginning of history and an interrupted run skips a
   // page. Claim the page and move the cursor in one atomic script, with no TTL.
   await r.set(\`connector:\${commit.connector_id}:cursor\`, commit.next_cursor, 'EX', CURSOR_TTL_S);
@@ -296,7 +296,7 @@ func loadCursor(ctx context.Context, connectorID string) (string, error) {
 }
 
 func commitPage(ctx context.Context, commit PageCommit) (CommitResult, error) {
-	// TODO: the draft stores the cursor with a 24-hour TTL and moves it before the page is
+	// TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is
 	// committed, so a quiet connector restarts from the beginning of history and an interrupted run
 	// skips a page. Claim the page and move the cursor in one atomic script, with no TTL.
 	key := fmt.Sprintf("connector:%s:cursor", commit.ConnectorID)
@@ -370,7 +370,7 @@ object CursorStore {
   def loadCursor(connectorId: String): Option[String] = Option(r.get(s"connector:$connectorId:cursor"))
 
   def commitPage(commit: PageCommit): CommitResult = {
-    // TODO: the draft stores the cursor with a 24-hour TTL and moves it before the page is
+    // TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is
     // committed, so a quiet connector restarts from the beginning of history and an interrupted run
     // skips a page. Claim the page and move the cursor in one atomic script, with no TTL.
     r.setex(s"connector:\${commit.connector_id}:cursor", CursorTtlS, commit.next_cursor)
@@ -438,7 +438,7 @@ std::string loadCursor(sw::redis::Redis& redis, const std::string& connectorId) 
 }
 
 CommitResult commitPage(sw::redis::Redis& redis, const PageCommit& commit) {
-  // TODO: the draft stores the cursor with a 24-hour TTL and moves it before the page is committed,
+  // TODO: the starter stores the cursor with a 24-hour TTL and moves it before the page is committed,
   // so a quiet connector restarts from the beginning of history and an interrupted run skips a
   // page. Claim the page and move the cursor in one atomic script, with no TTL.
   redis.set(cursorKey(commit.connector_id), commit.next_cursor, std::chrono::hours(24));

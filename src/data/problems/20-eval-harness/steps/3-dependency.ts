@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['harness', 'judge', 'fallback'],
   task: `## Task
 
-The starter is a plausible model-generated draft: while the judge is healthy every sample gets a
+The starter is working code: while the judge is healthy every sample gets a
 score and the dashboard moves. Every failure path is wrong. Find them, fix them, and prove the fix.
 
 Implement \`score_sample(sample)\`, the judge call the workers make for one golden sample:
@@ -26,7 +26,7 @@ Implement \`score_sample(sample)\`, the judge call the workers make for one gold
 - The fallback result is marked as such in the run record, so a report built mostly from fallbacks
   can be rejected later.
 
-**Failure mode the checks target.** The draft catches every error and loops forever: a permanent
+**Failure mode the checks target.** The starter catches every error and loops forever: a permanent
 \`INVALID_ARGUMENT\` spins the worker, a judge deployment gone bad becomes a hot loop against the
 service that is already down, and there is no fallback at all, so every sample of the run fails with
 it. Each of those is silent in a demo and loud during a release eval.`,
@@ -48,7 +48,7 @@ it. Each of those is silent in a demo and loud during a release eval.`,
     ],
   },
   hints: [
-    'The deadline belongs on the call itself — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline` — not around it. Bound the attempts with a constant and a counted loop; the draft’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
+    'The deadline belongs on the call itself — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline` — not around it. Bound the attempts with a constant and a counted loop; the starter’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
     'Retryability is a property of the status, not of “it threw”: capture the error, compare its code, and return anything outside `UNAVAILABLE` / `DEADLINE_EXCEEDED` at once. A malformed sample will never succeed on the third try, so those two retries are pure spend.',
     'The breaker is a failure counter per dependency: record only retryable failures, check `allow()` before each attempt, and open it for 30 s after five. When it is open — or the attempts run out — call the deterministic metric, so the run finishes with a real, reproducible number instead of an outage.',
   ],
@@ -70,7 +70,7 @@ it. Each of those is silent in a demo and loud during a release eval.`,
       id: 'retry-policy',
       title: 'At most three attempts, only the two retryable codes',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The draft retries every error forever.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The starter retries every error forever.',
       match: {
         python: {
           all: [
@@ -108,7 +108,7 @@ it. Each of those is silent in a demo and loud during a release eval.`,
       id: 'fallback-metric',
       title: 'Falls back to the deterministic string metric',
       detail:
-        'When the judge stays down the sample is scored by `fallbackExactMatch` (label equality), so the run finishes with a reproducible number instead of an outage. The draft has no fallback and lets the whole run fail.',
+        'When the judge stays down the sample is scored by `fallbackExactMatch` (label equality), so the run finishes with a reproducible number instead of an outage. The starter has no fallback and lets the whole run fail.',
       match: {
         python: {all: [/fallback_exact_match\(/, /exact_match/]},
         typescript: {all: [/fallbackExactMatch\(/, /ExactMatch/]},
@@ -134,7 +134,7 @@ it. Each of those is silent in a demo and loud during a release eval.`,
       id: 'invalid-argument',
       title: 'Never retries a malformed sample',
       detail:
-        '`INVALID_ARGUMENT` is recognized and returned immediately, and there is no catch-all that swallows every failure and loops. The draft’s blanket handler turns one malformed golden sample into an infinite retry loop.',
+        '`INVALID_ARGUMENT` is recognized and returned immediately, and there is no catch-all that swallows every failure and loops. The starter’s blanket handler turns one malformed golden sample into an infinite retry loop.',
       match: {
         python: {all: [/INVALID_ARGUMENT/], none: [/except\s+Exception\s*:/]},
         typescript: {all: [/INVALID_ARGUMENT/], none: [/catch\s*\{\s*continue/]},
@@ -247,7 +247,7 @@ def score_sample(sample: dict) -> float:
 `,
     },
     typescript: {
-      starter: `/** scoreSample: a model-generated draft that retries every failure forever. */
+      starter: `/** scoreSample: flawed code that retries every failure forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -716,5 +716,5 @@ double scoreSample(const Sample& sample) {
 `,
     },
   },
-  debrief: `The interview question is failure policy on a dependency you do not control. The draft passes every serial test with a healthy judge and fails exactly when a release eval runs but the judge is being redeployed: an unbounded retry loop turns a bad deploy into a hot loop, one malformed sample burns the whole budget, and there is no fallback, so an outage silently invalidates every sample instead of scoring them cheaply. The fixes are the four contracts every outbound call needs — a deadline, bounded attempts over a status whitelist, a deterministic degradation path, and a breaker so the dependency gets room to recover. Real harnesses add a judge-version pin so the fallback and the judge are comparable, a per-run fallback share that fails the gate when too many samples degraded, and hedged requests for the long tail.`,
+  debrief: `The interview question is failure policy on a dependency you do not control. The starter passes every serial test with a healthy judge and fails exactly when a release eval runs but the judge is being redeployed: an unbounded retry loop turns a bad deploy into a hot loop, one malformed sample burns the whole budget, and there is no fallback, so an outage silently invalidates every sample instead of scoring them cheaply. The fixes are the four contracts every outbound call needs — a deadline, bounded attempts over a status whitelist, a deterministic degradation path, and a breaker so the dependency gets room to recover. Real harnesses add a judge-version pin so the fallback and the judge are comparable, a per-run fallback share that fails the gate when too many samples degraded, and hedged requests for the long tail.`,
 };

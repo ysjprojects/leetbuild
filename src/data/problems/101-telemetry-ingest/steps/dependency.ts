@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['ingest', 'tsdb'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the store is healthy the
+**Starting point.** The starter is working code: when the store is healthy the
 batch lands and the caller gets a result, so the demo shows points arriving. Every failure path is
 wrong, and the wrong one that hurts is invisible until a fleet's totals double. Find them, fix them,
 and prove the fix with the checks below.
@@ -18,7 +18,7 @@ Implement \`write_batch(client, batch)\` for the ingest path's time-series clien
 - Each attempt carries a **4-second deadline** (\`timeout=\`/\`deadline:\`/\`WithTimeout\`/
   \`withDeadlineAfter\`/\`set_deadline\`). A call without one lets a stuck store pin the ingest
   worker until the client disconnects.
-- At most **3 attempts**, and there is no unbounded loop: the draft's \`while True\` has no exit at
+- At most **3 attempts**, and there is no unbounded loop: the starter's \`while True\` has no exit at
   all when the store keeps answering with failures.
 - The reply is **partial**: it names the **accepted** and the **failed** sub-batches. Only the
   **failed** ones go into the next request. Re-sending the whole batch is the bug that doubled a
@@ -31,7 +31,7 @@ Implement \`write_batch(client, batch)\` for the ingest path's time-series clien
   sub-batch. Reporting done while any sub-batch is still missing is how a partial write becomes an
   acknowledged, permanently incomplete batch.
 
-**Failure mode the checks target.** The draft retries the whole batch on any failure, so the points
+**Failure mode the checks target.** The starter retries the whole batch on any failure, so the points
 that already landed land again; it marks the batch done as soon as *any* sub-batch succeeds, so the
 caller stops caring about the rest; and it sends no batch id, so the store has nothing to dedupe on
 even if it wanted to.`,
@@ -89,7 +89,7 @@ even if it wanted to.`,
       id: 'bounded-attempts',
       title: 'At most three attempts, never an unbounded loop',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and the loop counts. The draft loops forever while the store keeps failing, so an outage turns every ingest worker into a hot loop against a store that is already down.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and the loop counts. The starter loops forever while the store keeps failing, so an outage turns every ingest worker into a hot loop against a store that is already down.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3/, /range\(MAX_ATTEMPTS\)/], none: [/while\s+True/]},
         typescript: {
@@ -108,7 +108,7 @@ even if it wanted to.`,
       id: 'failed-only',
       title: 'Retries only the sub-batches the store rejected',
       detail:
-        'The next request is built from the reply’s failed list — the pending set is replaced by its intersection with `failed`/`Failed` — so an accepted sub-batch is never sent twice. The draft re-sends the whole batch on every failure, which doubles the points the store already stored.',
+        'The next request is built from the reply’s failed list — the pending set is replaced by its intersection with `failed`/`Failed` — so an accepted sub-batch is never sent twice. The starter re-sends the whole batch on every failure, which doubles the points the store already stored.',
       match: {
         python: {all: [/reply\.failed/, /pending = \[sub for sub in pending if sub\["id"\] in rejected\]/]},
         typescript: {all: [/reply\.failed/, /pending = pending\.filter\(sub => rejected\.has\(sub\.id\)\)/]},
@@ -121,7 +121,7 @@ even if it wanted to.`,
       id: 'done-all',
       title: 'Done only when every sub-batch is stored',
       detail:
-        'The batch is reported complete only when the reply names no failed sub-batches. The draft returns complete as soon as any sub-batch was accepted, so the caller believes a partial write is a finished batch.',
+        'The batch is reported complete only when the reply names no failed sub-batches. The starter returns complete as soon as any sub-batch was accepted, so the caller believes a partial write is a finished batch.',
       match: {
         python: {all: [/if not reply\.failed/, /"complete": True/], none: [/if len\(reply\.accepted\)/]},
         typescript: {
@@ -140,7 +140,7 @@ even if it wanted to.`,
       id: 'batch-id',
       title: 'Every attempt carries the same batch id',
       detail:
-        'Each request carries the caller’s `batch_id` (the store’s dedupe key) and the accepted sub-batches are appended to the result rather than re-queued. The draft sends no batch id, so a re-sent sub-batch has nothing to dedupe against.',
+        'Each request carries the caller’s `batch_id` (the store’s dedupe key) and the accepted sub-batches are appended to the result rather than re-queued. The starter sends no batch id, so a re-sent sub-batch has nothing to dedupe against.',
       match: {
         python: {all: [/batch_id=batch\["batch_id"\]/, /accepted\.extend\(reply\.accepted\)/]},
         typescript: {all: [/batch_id: batch\.batch_id/, /accepted\.push\(\.\.\.reply\.accepted\)/]},
@@ -165,7 +165,7 @@ import series_pb2_grpc
 
 def write_batch(stub: series_pb2_grpc.SeriesStub, batch: dict) -> dict:
     """Write a batch of sub-batches to the time-series store."""
-    # TODO: the draft re-sends every sub-batch on any failure, so points the store already accepted
+    # TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
     # are stored twice because the store does not dedupe by batch id, and it calls the batch done as
     # soon as any sub-batch succeeds.
     while True:
@@ -221,7 +221,7 @@ def write_batch(stub: series_pb2_grpc.SeriesStub, batch: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Time-series writes: a model-generated draft that re-sends the whole batch on failure. */
+      starter: `/** Time-series writes: flawed code that re-sends the whole batch on failure. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -262,7 +262,7 @@ interface SeriesClient {
 }
 
 export async function writeBatch(batch: Batch): Promise<WriteResult> {
-  // TODO: the draft re-sends every sub-batch on any failure, so points the store already accepted
+  // TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
   // are stored twice because the store does not dedupe by batch id, and it calls the batch done as
   // soon as any sub-batch succeeds. It also calls the store without a deadline.
   for (;;) {
@@ -375,7 +375,7 @@ type WriteResult struct {
 }
 
 func writeBatch(ctx context.Context, client pb.SeriesClient, batch Batch) (*WriteResult, error) {
-	// TODO: the draft re-sends every sub-batch on any failure, so points the store already accepted
+	// TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
 	// are stored twice because the store does not dedupe by batch id, and it calls the batch done as
 	// soon as any sub-batch succeeds.
 	for {
@@ -472,7 +472,7 @@ func writeBatch(ctx context.Context, client pb.SeriesClient, batch Batch) (*Writ
     scala: {
       starter: `object TimeSeriesClient {
   def writeBatch(client: SeriesClient.SeriesBlockingStub, batch: Batch): WriteResult = {
-    // TODO: the draft re-sends every sub-batch on any failure, so points the store already accepted
+    // TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
     // are stored twice because the store does not dedupe by batch id, and it calls the batch done as
     // soon as any sub-batch succeeds.
     var done = false
@@ -545,7 +545,7 @@ struct WriteResult {
 };
 
 WriteResult writeBatch(Series::Stub* stub, const Batch& batch) {
-  // TODO: the draft re-sends every sub-batch on any failure, so points the store already accepted
+  // TODO: the starter re-sends every sub-batch on any failure, so points the store already accepted
   // are stored twice because the store does not dedupe by batch id, and it calls the batch done as
   // soon as any sub-batch succeeds.
   while (true) {

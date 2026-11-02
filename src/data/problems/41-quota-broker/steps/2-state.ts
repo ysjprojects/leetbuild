@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['broker', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads the window hash,
+**Starting point.** The starter is working code: it reads the window hash,
 decides there is room, increments the counter, and the demo shows a reservation. It compiles, it
-passes every serial test, and it oversells the window the moment two reserves overlap. Review it,
+passes every serial test, and it oversells the window the moment two reserves overlap. Debug it,
 fix it, and prove the fix.
 
 Implement the reservation ledger behind the reserve endpoint:
@@ -20,7 +20,7 @@ Implement the reservation ledger behind the reserve endpoint:
   \`reservation:{team}:{reservation_id}\` holding its \`window\`, \`resource_class\` and \`amount\`.
   The window belongs in the key — the cap is per window, and reservations from one window must never
   be counted against the next.
-- **Take, release and expiry setup happen in one Lua script.** The draft calls \`HGET\` and then
+- **Take, release and expiry setup happen in one Lua script.** The starter calls \`HGET\` and then
   \`HINCRBY\` from the client, so two callers both read \`reserved = 4\` against a limit of 8 and
   both increment: the window oversells by exactly the concurrency. \`EVAL\` reads the counter,
   compares and increments as a single step, so the loser sees the winner’s write.
@@ -59,7 +59,7 @@ atomicity, the key scope and the expiry.`,
       id: 'window-key',
       title: 'Scopes the ledger to (team, window)',
       detail:
-        'The counter hash is keyed by the team **and** the window, so one team’s windows never share capacity. The draft keys by team alone, so a stale window keeps consuming the next one’s quota.',
+        'The counter hash is keyed by the team **and** the window, so one team’s windows never share capacity. The starter keys by team alone, so a stale window keeps consuming the next one’s quota.',
       match: {
         python: {all: [/quota:\{team\}:\{window\}/]},
         typescript: {all: [/quota:\$\{team\}:\$\{window\}/]},
@@ -72,7 +72,7 @@ atomicity, the key scope and the expiry.`,
       id: 'atomic-take',
       title: 'Takes and checks the counter in one atomic script',
       detail:
-        'A single Lua `EVAL` reads `reserved`, compares it with the limit and increments as one step. The draft issues `HGET` and then `HINCRBY` from the client, so two concurrent reserves both observe the same free capacity and both take it.',
+        'A single Lua `EVAL` reads `reserved`, compares it with the limit and increments as one step. The starter issues `HGET` and then `HINCRBY` from the client, so two concurrent reserves both observe the same free capacity and both take it.',
       match: {
         python: {all: [/RESERVE_LUA/, /\.eval\(/]},
         typescript: {all: [/RESERVE_LUA/, /\.eval\(/]},
@@ -85,7 +85,7 @@ atomicity, the key scope and the expiry.`,
       id: 'expire-window',
       title: 'Expires the window key at the first write',
       detail:
-        'The script sets `EXPIRE` with a named TTL, so the window’s ledger disappears when the window closes instead of counting forever. The draft never expires anything.',
+        'The script sets `EXPIRE` with a named TTL, so the window’s ledger disappears when the window closes instead of counting forever. The starter never expires anything.',
       match: {
         python: {all: [/EXPIRE/, /TTL_S/]},
         typescript: {all: [/EXPIRE/, /TTL_S/]},
@@ -98,7 +98,7 @@ atomicity, the key scope and the expiry.`,
       id: 'release-refund',
       title: 'Refunds capacity in the same script as the release',
       detail:
-        'Releasing decrements the window’s `reserved` counter and deletes the reservation key atomically, so the next caller can reserve immediately. The draft has no release path at all, so a cancelled job holds its GPUs until the window closes.',
+        'Releasing decrements the window’s `reserved` counter and deletes the reservation key atomically, so the next caller can reserve immediately. The starter has no release path at all, so a cancelled job holds its GPUs until the window closes.',
       match: {
         python: {all: [/RELEASE_LUA/, /def release\(/]},
         typescript: {all: [/RELEASE_LUA/, /async function release\(/]},
@@ -111,7 +111,7 @@ atomicity, the key scope and the expiry.`,
       id: 'window-guard',
       title: 'Refunds only the window the reservation recorded',
       detail:
-        'The reservation key stores its window and the release script refuses a release that names a different one, so a reservation from an expired window cannot decrement the next window’s counter. The draft keeps no per-reservation record, so there is nothing to guard.',
+        'The reservation key stores its window and the release script refuses a release that names a different one, so a reservation from an expired window cannot decrement the next window’s counter. The starter keeps no per-reservation record, so there is nothing to guard.',
       match: {
         python: {all: [/WINDOW_MISMATCH/, /reservation:\{team\}:\{reservation_id\}/]},
         typescript: {all: [/WINDOW_MISMATCH/, /reservation:\$\{team\}:\$\{reservationId\}/]},
@@ -123,7 +123,7 @@ atomicity, the key scope and the expiry.`,
   ],
   code: {
     python: {
-      starter: `"""Reservation ledger: a model-generated draft that reads and increments from the client."""
+      starter: `"""Reservation ledger: flawed code that reads and increments from the client."""
 import uuid
 
 import redis
@@ -144,7 +144,7 @@ class ReserveRequest(BaseModel):
 
 @app.post("/v1/quotas/{team}/reserve")
 def reserve(team: str, body: ReserveRequest) -> dict:
-    # TODO: this draft reads the counter and increments it in two separate commands, so two
+    # TODO: this starter reads the counter and increments it in two separate commands, so two
     # concurrent reserves both see the same free capacity; and it keys by team alone, so a
     # reservation from an expired window still counts against the next one. Move the take, the
     # check and the expiry into one Lua script and read (release) the reservation back out of it.
@@ -251,7 +251,7 @@ def reserve_endpoint(team: str, body: ReserveRequest, caller: str = Header(alias
 `,
     },
     typescript: {
-      starter: `/** Reservation ledger: a model-generated draft that reads and increments from the client. */
+      starter: `/** Reservation ledger: flawed code that reads and increments from the client. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {randomUUID} from 'node:crypto';
@@ -270,7 +270,7 @@ interface ReserveBody {
 app.post('/v1/quotas/:team/reserve', async (request, reply) => {
   const {team} = request.params as {team: string};
   const body = request.body as ReserveBody;
-  // TODO: this draft reads the counter and increments it in two separate commands, so two
+  // TODO: this starter reads the counter and increments it in two separate commands, so two
   // concurrent reserves both see the same free capacity; and it keys by team alone, so a
   // reservation from an expired window still counts against the next one. Move the take, the
   // check and the expiry into one Lua script and read (release) the reservation back out of it.
@@ -408,7 +408,7 @@ func reserve(rw http.ResponseWriter, r *http.Request) {
 	team := r.PathValue("team")
 	var body reserveRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this draft reads the counter and increments it in two separate commands, so two
+	// TODO: this starter reads the counter and increments it in two separate commands, so two
 	// concurrent reserves both see the same free capacity; and it keys by team alone, so a
 	// reservation from an expired window still counts against the next one. Move the take, the
 	// check and the expiry into one Lua script and read (release) the reservation back out of it.
@@ -590,7 +590,7 @@ object StateApi {
     path("v1" / "quotas" / Segment / "reserve") { team =>
       post {
         entity(as[ReserveRequest]) { body =>
-          // TODO: this draft reads the counter and increments it in two separate commands, so two
+          // TODO: this starter reads the counter and increments it in two separate commands, so two
           // concurrent reserves both see the same free capacity; and it keys by team alone, so a
           // reservation from an expired window still counts against the next one. Move the take,
           // the check and the expiry into one Lua script and read (release) the reservation back.
@@ -739,7 +739,7 @@ int main() {
     const auto team = req.path_params.at("team");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this draft reads the counter and increments it in two separate commands, so two
+    // TODO: this starter reads the counter and increments it in two separate commands, so two
     // concurrent reserves both see the same free capacity; and it keys by team alone, so a
     // reservation from an expired window still counts against the next one. Move the take, the
     // check and the expiry into one Lua script and read (release) the reservation back out of it.

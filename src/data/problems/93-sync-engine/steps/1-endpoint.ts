@@ -8,9 +8,9 @@ export const pushEndpointStep: Step = {
   focus: ['device', 'sync', 'revisions'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the push route,
+**Starting point.** The starter is working code: it registers the push route,
 parses the body and returns an applied count. It compiles, it syncs the demo laptop, and it hides
-three production flaws. Review it like the service owner, fix it, and prove the fix with the checks
+three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`POST /v1/sync/push\` with body
@@ -30,7 +30,7 @@ Implement \`POST /v1/sync/push\` with body
   (\`store.record_revision\`) and answer with \`applied\`, the \`conflicts\` the apply produced, and the
   newly issued \`revision\`.
 
-**Failure mode the checks target.** The draft applies every change blindly, so a device that was
+**Failure mode the checks target.** The starter applies every change blindly, so a device that was
 offline overwrites a month of edits from another device and nobody is told. It accepts a change list
 of unbounded size, so one push can hold a worker for minutes while it applies a million documents.
 And it never looks at a content hash, so a truncated or corrupted change reaches storage as if it
@@ -63,7 +63,7 @@ were the device's edit.`,
       id: 'base-revision',
       title: 'Checks the base revision against the revisions the server issued',
       detail:
-        'The base revision is verified with `store.issued(...)` before anything is applied: a base the server never issued is stale. The draft ignores `base_revision` and applies the batch anyway.',
+        'The base revision is verified with `store.issued(...)` before anything is applied: a base the server never issued is stale. The starter ignores `base_revision` and applies the batch anyway.',
       match: {
         python: {all: [/store\.issued\(/, /body\.base_revision/]},
         typescript: {all: [/store\.issued\(/, /body\.base_revision/]},
@@ -76,7 +76,7 @@ were the device's edit.`,
       id: 'changes-cap',
       title: 'Bounds the change list at 500 entries',
       detail:
-        'A push with more than `MAX_CHANGES` (500) changes is rejected with **413** before any apply. The draft accepts a change list of unbounded size and applies all of it.',
+        'A push with more than `MAX_CHANGES` (500) changes is rejected with **413** before any apply. The starter accepts a change list of unbounded size and applies all of it.',
       match: {
         python: {all: [/MAX_CHANGES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_CHANGES/, /code\(\s*413\s*\)/]},
@@ -89,7 +89,7 @@ were the device's edit.`,
       id: 'hash-validation',
       title: 'Rejects a malformed content hash before any apply',
       detail:
-        'Every change’s `content_hash` is matched against the 64-hex-character shape and a bad one is **400**, in the validation pass that runs before the apply. The draft never inspects the hash.',
+        'Every change’s `content_hash` is matched against the 64-hex-character shape and a bad one is **400**, in the validation pass that runs before the apply. The starter never inspects the hash.',
       match: {
         python: {all: [/HASH_RE/, /status_code\s*=\s*400/], order: [/HASH_RE\.match\(/, /store\.apply_batch\(/]},
         typescript: {
@@ -111,7 +111,7 @@ were the device's edit.`,
       id: 'per-document-conflicts',
       title: 'A stale base yields per-document conflicts, not silent overwrites',
       detail:
-        'A stale base is answered with **409** and one entry per change in `conflicts`; nothing is applied blindly (no `applyAll`-style path). The draft’s only outcome is a blind apply.',
+        'A stale base is answered with **409** and one entry per change in `conflicts`; nothing is applied blindly (no `applyAll`-style path). The starter’s only outcome is a blind apply.',
       match: {
         python: {all: [/conflicts/, /"applied"/], none: [/store\.apply_all\(/]},
         typescript: {all: [/conflicts/, /applied:/], none: [/store\.applyAll\(/]},
@@ -156,8 +156,8 @@ store = RevisionStore()
 
 @app.post("/v1/sync/push")
 def push(body: PushRequest, device: str = Header(alias="X-Device-Id")) -> JSONResponse:
-    # TODO: this draft ignores base_revision and applies every change blindly, accepts a change
-    # list of unbounded size, and never validates a change's content hash. Review all three.
+    # TODO: this starter ignores base_revision and applies every change blindly, accepts a change
+    # list of unbounded size, and never validates a change's content hash. Fix all three.
     outcome = store.apply_all(device, [change.model_dump() for change in body.changes])
     return JSONResponse({"applied": outcome["applied"], "revision": outcome["revision"]}, status_code=200)
 `,
@@ -237,7 +237,7 @@ def push(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sync/push: a model-generated draft that applies every change it is given. */
+      starter: `/** POST /v1/sync/push: flawed code that applies every change it is given. */
 import Fastify from 'fastify';
 
 import {store} from './revisions';
@@ -256,8 +256,8 @@ interface PushBody {
 }
 
 app.post('/v1/sync/push', async (request, reply) => {
-  // TODO: this draft ignores base_revision and applies every change blindly, accepts a change
-  // list of unbounded size, and never validates a change's content hash. Review all three.
+  // TODO: this starter ignores base_revision and applies every change blindly, accepts a change
+  // list of unbounded size, and never validates a change's content hash. Fix all three.
   const device = request.headers['x-device-id'] as string;
   const body = request.body as PushBody;
   const outcome = await store.applyAll(device, body.changes);
@@ -362,8 +362,8 @@ func push(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft ignores base_revision and applies every change blindly, accepts a change
-	// list of unbounded size, and never validates a change's content hash. Review all three.
+	// TODO: this starter ignores base_revision and applies every change blindly, accepts a change
+	// list of unbounded size, and never validates a change's content hash. Fix all three.
 	outcome, _ := store.ApplyAll(r.Context(), device, body.Changes)
 	log.Printf("push device=%s changes=%d", device, len(body.Changes))
 	writeJSON(rw, http.StatusOK, map[string]any{"applied": outcome["applied"], "revision": outcome["revision"]})
@@ -511,7 +511,7 @@ object SyncApi {
       post {
         headerValueByName("X-Device-Id") { device =>
           entity(as[PushRequest]) { body =>
-            // TODO: this draft ignores base_revision and applies every change blindly, accepts a
+            // TODO: this starter ignores base_revision and applies every change blindly, accepts a
             // change list of unbounded size, and never validates a change's content hash.
             val outcome = store.applyAll(device, body.changes)
             system.log.info(s"push device=$device changes=\${body.changes.size}")
@@ -616,8 +616,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft ignores base_revision and applies every change blindly, accepts a change
-    // list of unbounded size, and never validates a change's content hash. Review all three.
+    // TODO: this starter ignores base_revision and applies every change blindly, accepts a change
+    // list of unbounded size, and never validates a change's content hash. Fix all three.
     const auto outcome = store.applyAll(device, body.value("changes", json::array()));
     std::cerr << "push device=" << device << " changes=" << body.value("changes", json::array()).size() << "\\n";
     res.status = 200;
@@ -714,5 +714,5 @@ int main() {
     'The base revision is the whole point of the endpoint. `store.issued(base_revision)` answers whether the server really handed that revision to a device; when it did not, the device has been away and its base is behind the head. The answer is 409, not a warning in the log line — the client has to see which documents conflicted so it can fetch and merge them.',
     "The conflict list is per document, built from the changes in this push: `[change.doc_id for change in body.changes]`. An empty `applied` list and a populated `conflicts` list is the honest answer for a stale base — the device's work is kept, nothing is overwritten, and the client knows exactly what to re-merge.",
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a sync protocol. The draft reads fine because the demo pushes from one device with a fresh base and never sends a large batch. Three defects are being checked. The base revision: applying a change without proving the base is a revision the server issued is how a returning laptop destroys a month of another device's edits — the fix is not to reject the device, but to surface per-document conflicts. The cap: a change list is attacker-controlled and unbounded, so the limit belongs in validation, before any write. The hash: the content hash is the device's claim about what it is uploading, and a malformed one means the change is not what the client thinks it is, so it is 400 in the same validation pass. Real sync layers add a snapshot path for devices whose base is so far behind that conflict-per-document is useless, a per-device rate limit, and a server-side revision per document rather than per batch.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a sync protocol. The starter passes the demo because it pushes from one device with a fresh base and never sends a large batch. Three defects are being checked. The base revision: applying a change without proving the base is a revision the server issued is how a returning laptop destroys a month of another device's edits — the fix is not to reject the device, but to surface per-document conflicts. The cap: a change list is attacker-controlled and unbounded, so the limit belongs in validation, before any write. The hash: the content hash is the device's claim about what it is uploading, and a malformed one means the change is not what the client thinks it is, so it is 400 in the same validation pass. Real sync layers add a snapshot path for devices whose base is so far behind that conflict-per-document is useless, a per-device rate limit, and a server-side revision per document rather than per batch.`,
 };

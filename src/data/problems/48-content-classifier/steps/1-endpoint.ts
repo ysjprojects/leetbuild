@@ -8,9 +8,8 @@ export const endpointStep: Step = {
   focus: ['client', 'classifier', 'taxonomy'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body and answers with labels, so the demo passes. It hides four production flaws. Review it like
-the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses
+the body and answers with labels, so the demo passes. It hides four production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/classify\` with body \`{"text": "…", "taxonomy_id": "…", "taxonomy_version": "…"}\`.
 
@@ -75,7 +74,7 @@ expensive model call.`,
       id: 'size-and-empty',
       title: 'Normalizes then enforces the 64 KiB cap and the empty rejection',
       detail:
-        'Text is normalized first; empty after normalization is **400** and more than `1 << 16` bytes of UTF-8 is **413**. The draft checks neither, so an empty or unbounded document reaches the model.',
+        'Text is normalized first; empty after normalization is **400** and more than `1 << 16` bytes of UTF-8 is **413**. The starter checks neither, so an empty or unbounded document reaches the model.',
       match: {
         python: {all: [/MAX_TEXT_BYTES/, /normalize_text/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /normalizeText/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -90,7 +89,7 @@ expensive model call.`,
       id: 'taxonomy-binding',
       title: 'Binds labels to the taxonomy version, invented labels to review',
       detail:
-        'Only labels present in the taxonomy version are returned; the rest are reported as unknown and the response carries the review bucket. The draft returns the model’s label strings unchecked.',
+        'Only labels present in the taxonomy version are returned; the rest are reported as unknown and the response carries the review bucket. The starter returns the model’s label strings unchecked.',
       match: {
         python: {all: [/REVIEW_LABEL/, /bind_labels\(/, /unknown_labels/]},
         typescript: {all: [/REVIEW_LABEL/, /bindLabels\(/, /unknown/]},
@@ -103,7 +102,7 @@ expensive model call.`,
       id: 'tenant-scope',
       title: 'Resolves the taxonomy for this tenant, foreign is 404',
       detail:
-        'The taxonomy is loaded with the authenticated tenant, so a taxonomy the tenant does not own is **404**. The draft looks it up by id alone and treats any tenant’s taxonomy as local.',
+        'The taxonomy is loaded with the authenticated tenant, so a taxonomy the tenant does not own is **404**. The starter looks it up by id alone and treats any tenant’s taxonomy as local.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /load\(tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /load\(tenant/]},
@@ -116,7 +115,7 @@ expensive model call.`,
       id: 'content-type',
       title: 'Rejects non-text content with 415',
       detail:
-        'Anything that is not `text/*` is **415** and never classified. The draft pushes the raw bytes of an upload to the model and returns whatever labels come back.',
+        'Anything that is not `text/*` is **415** and never classified. The starter pushes the raw bytes of an upload to the model and returns whatever labels come back.',
       match: {
         python: {all: [/status_code\s*=\s*415/, /text\//, /Content-Type/]},
         typescript: {all: [/code\(\s*415\s*\)/, /text\//, /content-type/]},
@@ -156,10 +155,10 @@ model = None
 
 @app.post("/v1/classify")
 def classify(body: ClassifyRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft returns whichever labels the model produces, looks the taxonomy up by id
+    # TODO: this starter returns whichever labels the model produces, looks the taxonomy up by id
     # alone so any tenant can classify against another tenant's taxonomy, classifies raw upload
     # bytes with no Content-Type check, and skips the 64 KiB cap and the empty-after-normalize
-    # rejection. Review all four.
+    # rejection. Fix all four.
     taxonomy = taxonomy_store.get(body.taxonomy_id)
     labels = model.classify(body.text, taxonomy_id=taxonomy["version"])
     logger.info("classify tenant=%s taxonomy=%s labels=%s", tenant, body.taxonomy_id, labels)
@@ -256,7 +255,7 @@ def classify(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/classify: a model-generated draft that returns whatever the model invents. */
+      starter: `/** POST /v1/classify: flawed code that returns whatever the model invents. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -268,7 +267,7 @@ interface ClassifyBody {
 }
 
 app.post('/v1/classify', async (request, reply) => {
-  // TODO: this draft returns the model's labels unchecked, looks the taxonomy up by id alone so
+  // TODO: this starter returns the model's labels unchecked, looks the taxonomy up by id alone so
   // tenants can classify against each other's taxonomies, classifies raw upload bytes with no
   // Content-Type check, and skips the 64 KiB cap and the empty-after-normalize rejection.
   const tenant = request.headers['x-tenant-id'] as string;
@@ -374,7 +373,7 @@ func classify(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft returns the model's labels unchecked, looks the taxonomy up by id alone so
+	// TODO: this starter returns the model's labels unchecked, looks the taxonomy up by id alone so
 	// tenants can classify against each other's taxonomies, classifies raw upload bytes with no
 	// Content-Type check, and skips the 64 KiB cap and the empty-after-normalize rejection.
 	taxonomy, _ := taxonomyStore.Get(body.TaxonomyID, body.TaxonomyVersion)
@@ -519,7 +518,7 @@ object ClassifyApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ClassifyRequest]) { body =>
-            // TODO: this draft returns the model's labels unchecked, looks the taxonomy up by id
+            // TODO: this starter returns the model's labels unchecked, looks the taxonomy up by id
             // alone so tenants can classify against each other's taxonomies, classifies raw upload
             // bytes with no Content-Type check, and skips the 64 KiB cap and the empty rejection.
             val taxonomy = TaxonomyStore.get(body.taxonomy_id, body.taxonomy_version)
@@ -654,7 +653,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft returns the model's labels unchecked, looks the taxonomy up by id alone so
+    // TODO: this starter returns the model's labels unchecked, looks the taxonomy up by id alone so
     // tenants can classify against each other's taxonomies, classifies raw upload bytes with no
     // Content-Type check, and skips the 64 KiB cap and the empty-after-normalize rejection.
     const auto taxonomyId = body.value("taxonomy_id", std::string());
@@ -785,5 +784,5 @@ int main() {
     'The taxonomy stays anchored to the tenant: `taxonomy_store.load(tenant, id, version)` returns nothing for a taxonomy the tenant does not own, which the handler answers with 404. Looking it up by id alone is what lets a tenant classify against another tenant’s categories.',
     'Binding is one intersection plus one failure path: keep the labels the version contains, collect the rest as unknowns, and when nothing valid survives (or an unknown appeared) put the result in the review bucket instead of returning an invented label downstream.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary between a model and a taxonomy. The draft reads fine because the demo feeds it clean text from one tenant against one taxonomy and the model returns labels that happen to exist. Four defects are being checked: content negotiation (an upload is not text), input discipline (normalize, then reject empty or oversized input before paying for a call), tenant scoping (a taxonomy is a tenant's data, not a global id), and label binding (a model's string is a suggestion, and the taxonomy version is the authority). The last one is the quiet one: downstream routing trusts labels, so an invented label is a routing bug that only shows up as content silently dropped into a category nobody defined. Real classifiers add a confidence threshold above which unknowns auto-route to review, a per-tenant alias table that maps common model drift back to real labels, and a metric on the invented-label rate so taxonomy maintenance is driven by evidence.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary between a model and a taxonomy. The starter reads fine because the demo feeds it clean text from one tenant against one taxonomy and the model returns labels that happen to exist. Four defects are being checked: content negotiation (an upload is not text), input discipline (normalize, then reject empty or oversized input before paying for a call), tenant scoping (a taxonomy is a tenant's data, not a global id), and label binding (a model's string is a suggestion, and the taxonomy version is the authority). The last one is the quiet one: downstream routing trusts labels, so an invented label is a routing bug that only shows up as content silently dropped into a category nobody defined. Real classifiers add a confidence threshold above which unknowns auto-route to review, a per-tenant alias table that maps common model drift back to real labels, and a metric on the invented-label rate so taxonomy maintenance is driven by evidence.`,
 };

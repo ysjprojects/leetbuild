@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'registry', 'db', 'reviewer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the tenant, unpacks the body and stores the definition under whatever version the caller sent. It
-compiles, it serves the demo, and it hides three production flaws. Review it like the platform
+compiles, it serves the demo, and it hides three production flaws. Debug it like the platform
 owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/tools\` with body
@@ -35,7 +35,7 @@ Implement \`POST /v1/tools\` with body
   writes the audit row (actor, action, version). Log the registration with name, version and actor —
   never the schema.
 
-**Failure mode the checks target.** The draft trusts three things it must not. It treats an
+**Failure mode the checks target.** The starter trusts three things it must not. It treats an
 authenticated caller as an entitled one, so any service account can mint a tool and then resolve it;
 it accepts any JSON object as a schema, so the failure surfaces much later, in the agent that cannot
 build arguments for the tool; and it takes the version from the request body, so a later registration
@@ -69,7 +69,7 @@ of the same tool and version quietly replaces the definition an agent is running
       id: 'role',
       title: 'Only the platform reviewer role may register',
       detail:
-        'The role claim is checked against `platform-reviewer` and anything else is **403**, before any lookup or write. The draft authenticates the caller and stops there, so every service account can mint tools.',
+        'The role claim is checked against `platform-reviewer` and anything else is **403**, before any lookup or write. The starter authenticates the caller and stops there, so every service account can mint tools.',
       match: {
         python: {all: [/PLATFORM_REVIEWER_ROLE/, /status_code\s*=\s*403/]},
         typescript: {all: [/PLATFORM_REVIEWER_ROLE/, /code\(\s*403\s*\)/]},
@@ -82,7 +82,7 @@ of the same tool and version quietly replaces the definition an agent is running
       id: 'side-effect',
       title: 'Requires a declared side-effect class',
       detail:
-        '`side_effect` is checked against the closed set `read` / `write` / `irreversible` and an unknown class is **400**. The draft stores whatever string arrives, so a tool can be registered with a class nobody can reason about.',
+        '`side_effect` is checked against the closed set `read` / `write` / `irreversible` and an unknown class is **400**. The starter stores whatever string arrives, so a tool can be registered with a class nobody can reason about.',
       match: {
         python: {all: [/SIDE_EFFECT_CLASSES/, /status_code\s*=\s*400/]},
         typescript: {all: [/SIDE_EFFECT_CLASSES/, /code\(\s*400\s*\)/]},
@@ -95,7 +95,7 @@ of the same tool and version quietly replaces the definition an agent is running
       id: 'schema',
       title: 'Validates the schema and names the failing pointer',
       detail:
-        'The schema is validated before the write and an invalid one is **422** carrying the failing JSON pointer (`pointer`). The draft accepts any object as a schema, so the breakage lands in the agent that cannot build arguments.',
+        'The schema is validated before the write and an invalid one is **422** carrying the failing JSON pointer (`pointer`). The starter accepts any object as a schema, so the breakage lands in the agent that cannot build arguments.',
       match: {
         python: {all: [/validate_schema\(/, /status_code\s*=\s*422/, /pointer/]},
         typescript: {all: [/validateSchema\(/, /code\(\s*422\s*\)/, /pointer/]},
@@ -108,7 +108,7 @@ of the same tool and version quietly replaces the definition an agent is running
       id: 'version',
       title: 'Mints an immutable version and refuses to overwrite it',
       detail:
-        'The version is derived from the definition content (`mintVersion` over a digest) and an existing version answers **409**. The draft takes the version from the request and upserts, so a re-registration silently replaces the definition agents are calling.',
+        'The version is derived from the definition content (`mintVersion` over a digest) and an existing version answers **409**. The starter takes the version from the request and upserts, so a re-registration silently replaces the definition agents are calling.',
       match: {
         python: {all: [/def mint_version\(/, /hashlib\.sha256/, /status_code\s*=\s*409/]},
         typescript: {all: [/function mintVersion\(/, /createHash\(\s*['"]sha256['"]/, /code\(\s*409\s*\)/]},
@@ -143,9 +143,9 @@ def register(
     body: dict = Body(...),
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft treats any authenticated caller as entitled to register, accepts whatever
+    # TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
     # JSON object arrives as the schema, and takes the version from the request body so a later
-    # registration overwrites the same version. Review all three.
+    # registration overwrites the same version. Fix all three.
     logger.info("register tool=%s schema=%s", body["name"], body["schema"])
     row = {"name": body["name"], "version": body["version"], "side_effect": body["side_effect"]}
     store.put(body["name"], body["version"], row)
@@ -266,7 +266,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/tools: a model-generated draft that believes the caller. */
+      starter: `/** POST /v1/tools: flawed code that believes the caller. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -282,9 +282,9 @@ interface RegistrationBody {
 }
 
 app.post('/v1/tools', async (request, reply) => {
-  // TODO: this draft treats any authenticated caller as entitled to register, accepts whatever
+  // TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
   // JSON object arrives as the schema, and takes the version from the request body so a later
-  // registration overwrites the same version. Review all three.
+  // registration overwrites the same version. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RegistrationBody;
   request.log.info({name: body.name, schema: body.schema}, 'register');
@@ -424,9 +424,9 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft treats any authenticated caller as entitled to register, accepts whatever
+	// TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
 	// JSON object arrives as the schema, and takes the version from the request body so a later
-	// registration overwrites the same version. Review all three.
+	// registration overwrites the same version. Fix all three.
 	log.Printf("register tool=%s schema=%v", body.Name, body.Schema)
 	row := map[string]any{
 		"name":        body.Name,
@@ -626,9 +626,9 @@ object ToolApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[String]) { raw =>
-            // TODO: this draft treats any authenticated caller as entitled to register, accepts
+            // TODO: this starter treats any authenticated caller as entitled to register, accepts
             // whatever JSON object arrives as the schema, and takes the version from the request
-            // body so a later registration overwrites the same version. Review all three.
+            // body so a later registration overwrites the same version. Fix all three.
             val fields = raw.parseJson.asJsObject.fields
             val name = fields("name").convertTo[String]
             val version = fields("version").convertTo[String]
@@ -797,9 +797,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft treats any authenticated caller as entitled to register, accepts whatever
+    // TODO: this starter treats any authenticated caller as entitled to register, accepts whatever
     // JSON object arrives as the schema, and takes the version from the request body so a later
-    // registration overwrites the same version. Review all three.
+    // registration overwrites the same version. Fix all three.
     std::cerr << "register tool=" << body["name"] << " schema=" << body.value("schema", json()) << "\\n";
     const auto name = body["name"].get<std::string>();
     const auto version = body.value("version", std::string());
@@ -945,5 +945,5 @@ int main() {
     'The version is a function of the definition, not an input: hash `(name, schema, side_effect, owner)` canonically (sorted keys) and take a short prefix. That makes re-registration of the same content idempotent-by-conflict (409) and makes a changed definition a different version instead of a silent overwrite.',
     'A JSON Schema check that only says "invalid" is not reviewable. Return the JSON pointer of the first bad node — `/type`, `/properties/amount/type`, `/required/currency` — because the tool author, not the registrar, has to fix it.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the boundary where a *change* is introduced. The draft reads fine because the demo registers one tool from an admin token. Three defects are being checked: entitlement (authenticating is not authorising — the platform reviewer role is a separate claim), validation with a location (a schema that is not JSON Schema must never be stored, and the rejection has to name the failing pointer), and immutability (a version is content-addressed, so a re-registration is a 409 rather than an overwrite that changes what running agents call). The habit to name out loud is that the registry is a release process, not a CRUD table: privileged write, validated artefact, immutable version, audited actor. Real registries add schema diff review, deprecation windows, and signed provenance of the definition itself.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the boundary where a *change* is introduced. The starter reads fine because the demo registers one tool from an admin token. Three defects are being checked: entitlement (authenticating is not authorising — the platform reviewer role is a separate claim), validation with a location (a schema that is not JSON Schema must never be stored, and the rejection has to name the failing pointer), and immutability (a version is content-addressed, so a re-registration is a 409 rather than an overwrite that changes what running agents call). The habit to name out loud is that the registry is a release process, not a CRUD table: privileged write, validated artefact, immutable version, audited actor. Real registries add schema diff review, deprecation windows, and signed provenance of the definition itself.`,
 };

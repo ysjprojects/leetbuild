@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'ledger', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: every reservation change publishes a movement, the
+The starter is working code: every reservation change publishes a movement, the
 topic and the flush are there, and the demo's ledger fills up. Four production contracts are broken.
 Find them, fix them, and prove the fix.
 
@@ -17,7 +17,7 @@ rebuilds per-sku availability from that stream.
 
 - The **record key is the sku** (\`key=sku\`, \`key: sku\`, \`Key: []byte(sku)\`,
   \`ProducerRecord(topic, sku, …)\`), so one sku's movements land in one partition and stay ordered.
-  The draft keys by the order id, so one sku's movements interleave across orders and a consumer
+  The starter keys by the order id, so one sku's movements interleave across orders and a consumer
   folding deltas can apply them out of order.
 - The payload carries \`{event_id, sku, delta, reservation_id, reason, available}\` with \`reason\`
   in \`reserved\` / \`confirmed\` / \`released\`: the signed delta and the reservation id travel
@@ -27,7 +27,7 @@ rebuilds per-sku availability from that stream.
   kafka-go). An ack must mean the record is replicated, and a retried produce must not duplicate a
   movement.
 - On the **release path** the Redis hold is cleared **first** and the \`released\` event is produced
-  **after** it. The draft produces first, so a consumer can see a release for stock the store still
+  **after** it. The starter produces first, so a consumer can see a release for stock the store still
   holds.
 - When the broker rejects the produce — an exception, an error code, a flush that leaves the record
   pending — insert the event into an **outbox** store declared in the file (an in-memory stub is
@@ -55,7 +55,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'sku-key',
       title: 'The record key is the sku',
       detail:
-        'The Kafka record key is the sku (`key=sku` / `key: sku` / `Key: []byte(sku)`), so one sku’s movements land in one partition and stay ordered. The draft keys by the order id, so one sku’s movements interleave across orders.',
+        'The Kafka record key is the sku (`key=sku` / `key: sku` / `Key: []byte(sku)`), so one sku’s movements land in one partition and stay ordered. The starter keys by the order id, so one sku’s movements interleave across orders.',
       match: {
         python: {all: [/producer\.produce\([^)]*key=sku/]},
         typescript: {all: [/key:\s*sku\b/]},
@@ -68,7 +68,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'event-fields',
       title: 'The event carries delta, reservation_id and reason',
       detail:
-        'Each event payload carries the signed `delta`, the `reservation_id` and a `reason` in reserved / confirmed / released. The draft ships a quantity and an order id instead, so a consumer cannot attribute a movement to the reservation that caused it.',
+        'Each event payload carries the signed `delta`, the `reservation_id` and a `reason` in reserved / confirmed / released. The starter ships a quantity and an order id instead, so a consumer cannot attribute a movement to the reservation that caused it.',
       match: {
         python: {all: [/["']delta["']\s*:/, /["']reservation_id["']\s*:/, /["']reason["']\s*:/]},
         typescript: {all: [/\bdelta\b/, /\breservation_id\b/, /\breason\b/]},
@@ -81,7 +81,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'publish-after-hold',
       title: 'Release clears the hold before publishing',
       detail:
-        'On the release path the Redis hold is deleted first and the `released` event is produced after it, so no consumer can observe a release for stock the store still holds. The draft produces first.',
+        'On the release path the Redis hold is deleted first and the `released` event is produced after it, so no consumer can observe a release for stock the store still holds. The starter produces first.',
       match: {
         python: {order: [/\.delete\(/, /publish_event\(/]},
         typescript: {order: [/\.del\(/, /publishEvent\(/]},
@@ -94,7 +94,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'outbox',
       title: 'A rejected produce falls back to the outbox',
       detail:
-        'When the produce fails — exception, error code or a flush that leaves the record pending — the event is inserted into the outbox store declared in the file, so a relay can republish it after the broker recovers. The draft has no outbox: an outage truncates the ledger.',
+        'When the produce fails — exception, error code or a flush that leaves the record pending — the event is inserted into the outbox store declared in the file, so a relay can republish it after the broker recovers. The starter has no outbox: an outage truncates the ledger.',
       match: {
         python: {all: [/class OutboxStore/, /insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/class OutboxStore/, /insertOutbox\(/, /catch\s*\(/]},
@@ -107,7 +107,7 @@ ledger drifts from the counter it is supposed to explain.`,
       id: 'durable-producer',
       title: 'Durable producer on inventory.event',
       detail:
-        'The publisher targets `inventory.event` with required acks `all` (`acks: -1`, `RequireAll`) and idempotence where the stack provides it, so an ack means the record is replicated and a retry cannot duplicate a movement. The draft leaves the producer on defaults.',
+        'The publisher targets `inventory.event` with required acks `all` (`acks: -1`, `RequireAll`) and idempotence where the stack provides it, so an ack means the record is replicated and a retry cannot duplicate a movement. The starter leaves the producer on defaults.',
       match: {
         python: {all: [/inventory\.event/, /enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/inventory\.event/, /idempotent:\s*true/, /acks:\s*-1/]},
@@ -227,7 +227,7 @@ def release(body: ReleaseRequest) -> None:
 `,
     },
     typescript: {
-      starter: `/** inventory.event: a model-generated first draft keyed by the order id. */
+      starter: `/** inventory.event: flawed code keyed by the order id. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -646,7 +646,7 @@ void release(const std::string& reservationId, const std::string& sku, int quant
     'Durability is producer configuration, not application logic: `enable.idempotence` with `acks=all`, KafkaJS’s `idempotent: true` plus `acks: -1` on the record, kafka-go’s `RequiredAcks: kafka.RequireAll` with `&kafka.Hash{}`, or librdkafka’s `enable.idempotence` / `acks` properties. While you are in the payload, add `delta` and `reservation_id` next to the reason.',
     'The outbox is the durability half: wrap the produce and, on the failure branch (exception, non-zero error code, pending flush), insert the row. Declare the store as a class/struct with an insert method — a relay reads that table when the broker recovers, so a produce failure must never lose the movement.',
   ],
-  debrief: `A stock ledger is an ordered log per sku, and the partition key is what makes it ordered: key by sku and every movement of that sku is appended to one partition in order, so a consumer folding deltas sees them in the order they happened. Key by anything else — the order id in the draft — and two orders touching the same sku interleave. The key is therefore a correctness decision, not a routing detail, which is why the checks pin the key argument of the produce call rather than the topic name.
+  debrief: `A stock ledger is an ordered log per sku, and the partition key is what makes it ordered: key by sku and every movement of that sku is appended to one partition in order, so a consumer folding deltas sees them in the order they happened. Key by anything else — the order id in the starter — and two orders touching the same sku interleave. The key is therefore a correctness decision, not a routing detail, which is why the checks pin the key argument of the produce call rather than the topic name.
 
 The release path is the second contract: the hold is what stops the store from selling the unit again, so the movement may only become visible after the hold is gone. Producing first leaves a window in which the ledger says released while the store still holds the unit — a double-sell that only a replay exposes. The outbox closes the third gap: Redis state and the broker cannot commit together, so a rejected produce writes the event where a relay can find it, and the ledger stays rebuildable after an outage. Idempotence plus acks=all make the retry safe; without them a retry duplicates a movement and the rebuilt counter drifts from the one the API serves. Real systems add a relay that claims rows with \`FOR UPDATE SKIP LOCKED\`, consumer-side dedupe on \`event_id\`, a schema registry for the payload, and a reconciliation job between the ledger and the counter.`,
 };

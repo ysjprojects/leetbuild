@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds a position event,
+**Starting point.** The starter is working code: it builds a position event,
 sends it to \`fleet.position\` and then updates the vehicle's latest state. It compiles, it serves
-the demo, and it hides three production flaws. Review it like the service owner, fix it, and prove
+the demo, and it hides three production flaws. Debug it like the service owner, fix it, and prove
 the fix with the checks below.
 
 Implement the position-event publish.
@@ -26,7 +26,7 @@ Implement the position-event publish.
   event whose state write has not landed.
 - The producer uses \`acks=all\` (or the client's equivalent durable-ack setting).
 
-**Failure mode the checks target.** The draft keys by fleet instead of vehicle, so one vehicle's
+**Failure mode the checks target.** The starter keys by fleet instead of vehicle, so one vehicle's
 track interleaves with every other vehicle in the fleet; it embeds the driver id and exact
 coordinates; and it publishes before the state write, so a consumer can see a position the map has
 not accepted. The checks verify the vehicle key, the coarse payload, the absent driver identity and
@@ -46,7 +46,7 @@ coordinates, and the publish-after-write order.`,
       id: 'topic-and-key',
       title: 'Publishes to fleet.position keyed by vehicle id',
       detail:
-        'The event goes to `fleet.position` with the vehicle id as the message key, so a vehicle track stays ordered on one partition. The draft keys by fleet.',
+        'The event goes to `fleet.position` with the vehicle id as the message key, so a vehicle track stays ordered on one partition. The starter keys by fleet.',
       match: {
         python: {all: [/fleet\.position/, /key\s*=\s*vehicle_id/]},
         typescript: {all: [/fleet\.position/, /key:\s*vehicleId/]},
@@ -59,7 +59,7 @@ coordinates, and the publish-after-write order.`,
       id: 'coarse-heading',
       title: 'Carries timestamp, sequence and a coarse heading',
       detail:
-        'The payload carries the device timestamp, the sequence and a heading rounded to the nearest 10 degrees. The draft ships exact coordinates instead of a coarse heading.',
+        'The payload carries the device timestamp, the sequence and a heading rounded to the nearest 10 degrees. The starter ships exact coordinates instead of a coarse heading.',
       match: {
         python: {all: [/heading_deg/, /round/, /sequence/]},
         typescript: {all: [/heading_deg/, /Math\.round/, /sequence/]},
@@ -72,7 +72,7 @@ coordinates, and the publish-after-write order.`,
       id: 'no-driver-id',
       title: 'No driver identity in the payload',
       detail:
-        'The event never carries a driver identifier, hashed or raw, so a retained, replicated topic cannot be joined back to a person. The draft embeds `driver_id`.',
+        'The event never carries a driver identifier, hashed or raw, so a retained, replicated topic cannot be joined back to a person. The starter embeds `driver_id`.',
       match: {
         python: {none: [/driver_id/]},
         typescript: {none: [/driver_id/]},
@@ -85,7 +85,7 @@ coordinates, and the publish-after-write order.`,
       id: 'publish-after-write',
       title: 'Publishes after the latest-position write',
       detail:
-        'The Redis write happens first and the produce second, so no consumer observes an event the state does not have. The draft sends before it writes.',
+        'The Redis write happens first and the produce second, so no consumer observes an event the state does not have. The starter sends before it writes.',
       match: {
         python: {order: [/write_latest\(/, /producer\.send\(/]},
         typescript: {order: [/writeLatest\(/, /producer\.send\(/]},
@@ -98,7 +98,7 @@ coordinates, and the publish-after-write order.`,
       id: 'no-exact-coordinates',
       title: 'No exact home coordinates in the payload',
       detail:
-        'The event carries a coarse heading, never the exact `lat`/`lon`, so a retained topic cannot reconstruct a doorstep. The draft ships both coordinates.',
+        'The event carries a coarse heading, never the exact `lat`/`lon`, so a retained topic cannot reconstruct a doorstep. The starter ships both coordinates.',
       match: {
         python: {none: [/["'](lat|lon)["']/]},
         typescript: {none: [/\.lat\b|\.lon\b/]},
@@ -114,8 +114,8 @@ coordinates, and the publish-after-write order.`,
 
 
 def publish_position(producer, fleet_id: str, vehicle_id: str, position: dict, redis) -> None:
-    # TODO: this draft keys by fleet, embeds the driver id and exact coordinates, and publishes
-    # before the state write. Review the key, the payload and the ordering.
+    # TODO: this starter keys by fleet, embeds the driver id and exact coordinates, and publishes
+    # before the state write. Check the key, the payload and the ordering.
     event = {
         "driver_id": position["driver_id"],
         "lat": position["lat"],
@@ -154,7 +154,7 @@ def publish_position(producer, vehicle_id: str, position: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** Position event publisher: a model-generated draft with three leaks. */
+      starter: `/** Position event publisher: flawed code with three leaks. */
 import type {Producer} from 'kafkajs';
 
 export interface Position {
@@ -174,8 +174,8 @@ export async function publishPosition(
   vehicleId: string,
   position: Position,
 ): Promise<void> {
-  // TODO: this draft keys by fleet, embeds the driver id and exact coordinates, and publishes
-  // before the state write. Review the key, the payload and the ordering.
+  // TODO: this starter keys by fleet, embeds the driver id and exact coordinates, and publishes
+  // before the state write. Check the key, the payload and the ordering.
   const event = {
     driver_id: position.driver_id,
     lat: position.lat,
@@ -254,8 +254,8 @@ func PublishPosition(
 	vehicleID string,
 	pos Position,
 ) error {
-	// TODO: this draft keys by fleet, embeds the driver id and exact coordinates, and publishes
-	// before the state write. Review the key, the payload and the ordering.
+	// TODO: this starter keys by fleet, embeds the driver id and exact coordinates, and publishes
+	// before the state write. Check the key, the payload and the ordering.
 	event := map[string]any{
 		"driver_id":           pos.DriverID,
 		"lat":                 pos.Lat,
@@ -345,8 +345,8 @@ object PositionEvents {
       vehicleId: String,
       position: Position,
   ): Unit = {
-    // TODO: this draft keys by fleet, embeds the driver id and exact coordinates, and publishes
-    // before the state write. Review the key, the payload and the ordering.
+    // TODO: this starter keys by fleet, embeds the driver id and exact coordinates, and publishes
+    // before the state write. Check the key, the payload and the ordering.
     val event: JsObject = Json.obj(
       "driver_id" -> position.driverId,
       "lat" -> position.lat,
@@ -399,8 +399,8 @@ void publishPosition(Producer* producer,
                      const std::string& fleetId,
                      const std::string& vehicleId,
                      const json& position) {
-  // TODO: this draft keys by fleet, embeds the driver id and exact coordinates, and publishes
-  // before the state write. Review the key, the payload and the ordering.
+  // TODO: this starter keys by fleet, embeds the driver id and exact coordinates, and publishes
+  // before the state write. Check the key, the payload and the ordering.
   json event = {
       {"driver_id", position.value("driver_id", std::string())},
       {"lat", position.value("lat", 0.0)},
@@ -444,5 +444,5 @@ void publishPosition(Producer* producer, const std::string& vehicleId, const jso
     'The payload is `{vehicle_id, device_timestamp_ms, sequence, heading_deg}` where `heading_deg` is the heading rounded to the nearest 10 degrees. No `driver_id`, no `lat`, no `lon`.',
     'Order matters: call `write_latest`/`writeLatest` **before** `producer.send`/`WriteMessages`/`produce`. A consumer that reads the topic must never see a position the state store has not accepted.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated event publisher against three separate contracts: partitioning (vehicle key keeps a track ordered), privacy (no driver identity, no exact home coordinates in a retained, replicated topic), and causality (publish after the state write). The draft passes the demo because one vehicle and one tenant are active and the consumer is a local print. The hash-the-driver-id idea appears in the title because the naive fix is to hash the id rather than drop it; either is acceptable only if the hash is not reversible and not the primary key of another dataset. Real platforms add a schema registry, tombstoning for GDPR deletes, and a separate coarse geohash topic for map rendering.`,
+  debrief: `The interviewer is testing whether you can debug an event publisher against three separate contracts: partitioning (vehicle key keeps a track ordered), privacy (no driver identity, no exact home coordinates in a retained, replicated topic), and causality (publish after the state write). The starter passes the demo because one vehicle and one tenant are active and the consumer is a local print. The hash-the-driver-id idea appears in the title because the naive fix is to hash the id rather than drop it; either is acceptable only if the hash is not reversible and not the primary key of another dataset. Real platforms add a schema registry, tombstoning for GDPR deletes, and a separate coarse geohash topic for map rendering.`,
 };

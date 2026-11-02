@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['api', 'store', 'kafka'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the event publisher: it
+**Starting point.** The starter is working code for the event publisher: it
 serialises an event and produces it to \`file.event\`. It compiles, the happy path works, and it hides
-three production flaws. Review it, fix it, and prove the fix with the checks below.
+three production flaws. Debug it, fix it, and prove the fix with the checks below.
 
 Implement the \`file.event\` publisher:
 
@@ -51,7 +51,7 @@ into a retained, replicated topic — the extension alone tells an attacker what
       id: 'key-by-file',
       title: 'Events are keyed by file id',
       detail:
-        'The produced key is derived from the file id, so one file’s lifecycle stays in one partition. The draft keys by tenant, so a file’s events scatter across partitions.',
+        'The produced key is derived from the file id, so one file’s lifecycle stays in one partition. The starter keys by tenant, so a file’s events scatter across partitions.',
       match: {
         python: {all: [/file_event_key\(/, /produce\(/]},
         typescript: {all: [/fileEventKey\(/, /\.send\(/]},
@@ -64,7 +64,7 @@ into a retained, replicated topic — the extension alone tells an attacker what
       id: 'publish-after-commit',
       title: 'Finalize publishes only after the store commits',
       detail:
-        '`CommitMultipart` is called before the event is produced. The draft publishes first, so a consumer can act on a file whose bytes the store has not committed.',
+        '`CommitMultipart` is called before the event is produced. The starter publishes first, so a consumer can act on a file whose bytes the store has not committed.',
       match: {
         python: {order: [/\.commit_multipart\(/, /publish\(/]},
         typescript: {order: [/commitMultipart\(/, /publish\(/]},
@@ -77,7 +77,7 @@ into a retained, replicated topic — the extension alone tells an attacker what
       id: 'no-filename',
       title: 'The payload never carries the original filename',
       detail:
-        'The original filename is user text and stays out of the event. The draft includes it so downstream consumers can label attachments.',
+        'The original filename is user text and stays out of the event. The starter includes it so downstream consumers can label attachments.',
       match: {
         python: {none: [/filename/]},
         typescript: {none: [/filename/]},
@@ -90,7 +90,7 @@ into a retained, replicated topic — the extension alone tells an attacker what
       id: 'opaque-payload',
       title: 'The payload carries digest, sniffed type and size',
       detail:
-        'The event carries the object’s digest, its sniffed mime and its size instead of content. The draft sends the filename and the size with neither digest nor sniffed type.',
+        'The event carries the object’s digest, its sniffed mime and its size instead of content. The starter sends the filename and the size with neither digest nor sniffed type.',
       match: {
         python: {all: [/digest/, /sniffed_mime/, /size/]},
         typescript: {all: [/digest/, /sniffedMime/, /size/]},
@@ -103,7 +103,7 @@ into a retained, replicated topic — the extension alone tells an attacker what
       id: 'acks-idempotent',
       title: 'The producer is idempotent with acks=all',
       detail:
-        'The producer is configured `acks=all` with idempotence enabled. The draft uses the client defaults, so a retry can duplicate an event.',
+        'The producer is configured `acks=all` with idempotence enabled. The starter uses the client defaults, so a retry can duplicate an event.',
       match: {
         python: {all: [/acks/, /idempotence/]},
         typescript: {all: [/acks/, /idempotent/]},
@@ -127,7 +127,7 @@ def tenant_event_key(event):
 
 
 def publish_file_event(kind, event):
-    # TODO: this draft keys by tenant, publishes before the store commits, and ships the original
+    # TODO: this starter keys by tenant, publishes before the store commits, and ships the original
     # filename in the payload so consumers can label attachments.
     payload = json.dumps(
         {
@@ -222,7 +222,7 @@ function tenantEventKey(event: FileEvent): string {
 }
 
 export async function publishFileEvent(kind: string, event: FileEvent): Promise<void> {
-  // TODO: this draft keys by tenant, publishes before the store commits, and ships the original
+  // TODO: this starter keys by tenant, publishes before the store commits, and ships the original
   // filename in the payload so consumers can label attachments.
   await producer.send({
     topic: 'file.event',
@@ -312,7 +312,7 @@ func tenantEventKey(event FileEvent) []byte {
 }
 
 func publishFileEvent(ctx context.Context, kind string, event FileEvent) error {
-	// TODO: this draft keys by tenant, publishes before the store commits, and ships the original
+	// TODO: this starter keys by tenant, publishes before the store commits, and ships the original
 	// filename in the payload so consumers can label attachments.
 	body, _ := json.Marshal(map[string]any{
 		"kind":     kind,
@@ -398,7 +398,7 @@ object FileEvents {
   def tenantEventKey(event: FileEvent): String = event.tenant
 
   def publishFileEvent(kind: String, event: FileEvent): Unit =
-    // TODO: this draft keys by tenant, publishes before the store commits, and ships the original
+    // TODO: this starter keys by tenant, publishes before the store commits, and ships the original
     // filename in the payload so consumers can label attachments.
     producer.send(
       new ProducerRecord[String, String](
@@ -464,7 +464,7 @@ object FileEvents {
 std::string tenantEventKey(const FileEvent& event) { return event.tenant; }
 
 bool publishFileEvent(const std::string& kind, const FileEvent& event) {
-  // TODO: this draft keys by tenant, publishes before the store commits, and ships the original
+  // TODO: this starter keys by tenant, publishes before the store commits, and ships the original
   // filename in the payload so consumers can label attachments.
   nlohmann::json body = {{"kind", kind}, {"filename", event.filename}, {"size", event.size}};
   const std::string text = body.dump();
@@ -538,5 +538,5 @@ void deleteFile(const std::string& file_id, const std::string& tenant, const std
     'Publish after the commit, not before. A consumer that reacts to "finalized" reads the object; if the event left the producer first, the consumer can race the commit and read a half-written object.',
     'Treat the topic as a public, retained surface. Digests, sniffed types and sizes are safe to keep; the original filename is user text whose extension alone leaks what the tenant is storing.',
   ],
-  debrief: `The interviewer is testing whether you treat an event topic as part of the storage contract. The draft looks harmless because one tenant and one file never collide in a demo; under load the tenant key reorders a file's lifecycle and the pre-commit publish lets an index mark a file readable before the bytes exist. The fixes are ordering and content: key by the thing whose order matters, and keep user text out of the payload. Real systems add an outbox row so a broker outage cannot lose the event with the commit, a schema registry so a future producer cannot smuggle a filename back in, and a consumer that updates its index idempotently because \`acks=all\` gives you at-least-once, not exactly-once.`,
+  debrief: `The interviewer is testing whether you treat an event topic as part of the storage contract. The starter looks harmless because one tenant and one file never collide in a demo; under load the tenant key reorders a file's lifecycle and the pre-commit publish lets an index mark a file readable before the bytes exist. The fixes are ordering and content: key by the thing whose order matters, and keep user text out of the payload. Real systems add an outbox row so a broker outage cannot lose the event with the commit, a schema registry so a future producer cannot smuggle a filename back in, and a consumer that updates its index idempotently because \`acks=all\` gives you at-least-once, not exactly-once.`,
 };

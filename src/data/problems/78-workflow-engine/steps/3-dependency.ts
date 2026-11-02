@@ -8,11 +8,11 @@ export const dependencyStep: Step = {
   focus: ['worker', 'effects', 'ledger'],
   task: `## Task
 
-**Review premise.** Step 1 published and pinned the definition; this is the half of \`workflowd\` that
-executes it. The starter is a plausible model-generated draft: it marks the step done, calls
+**Starting point.** Step 1 published and pinned the definition; this is the half of \`workflowd\` that
+executes it. The starter is working code: it marks the step done, calls
 \`SendWelcome\`, and when the call deadlines it calls again, so the demo's welcome email goes out. It
 hides the flaw that decides whether a run may be replayed at all — the side effect is guarded by
-nothing. Review it like the on-call engineer who owns the customer's inbox, fix it, and prove the fix
+nothing. Debug it like the on-call engineer who owns the customer's inbox, fix it, and prove the fix
 with the checks below.
 
 Implement \`run_step(run_id, step, payload, stub)\`: one step's side effect over gRPC, exactly once.
@@ -27,7 +27,7 @@ Implement \`run_step(run_id, step, payload, stub)\`: one step's side effect over
   \`withDeadlineAfter\`, \`set_deadline\`): a call without one pins the worker for as long as the
   target cares to take.
 - Write in this order: \`ledger.record(key, outcome)\` **first** and
-  \`runs.mark_done(run_id, step)\` **after**. The draft has it the other way round, so a crash
+  \`runs.mark_done(run_id, step)\` **after**. The starter has it the other way round, so a crash
   between the two loses the effect forever: the checkpoint says the step is done and the email was
   never sent.
 - A \`DEADLINE_EXCEEDED\` is **ambiguous**, not a failure — the request may have arrived and only
@@ -72,7 +72,7 @@ must come before the checkpoint and a deadline must be reconciled instead of res
       id: 'effect-id',
       title: 'Derives a deterministic effect id from run and step',
       detail:
-        'The ledger key is a function of the run and the step — `f"{run_id}:{step}"` — so a replay of the same step computes the same id. The draft has no id at all, and a random one per attempt would make the ledger unable to recognise its own record.',
+        'The ledger key is a function of the run and the step — `f"{run_id}:{step}"` — so a replay of the same step computes the same id. The starter has no id at all, and a random one per attempt would make the ledger unable to recognise its own record.',
       match: {
         python: {all: [/def effect_id\(/, /\{run_id\}:\{step\}/]},
         typescript: {all: [/function effectId\(/, /\$\{runId\}:\$\{step\}/]},
@@ -85,7 +85,7 @@ must come before the checkpoint and a deadline must be reconciled instead of res
       id: 'replay-skip',
       title: 'A replay returns the recorded outcome instead of calling',
       detail:
-        '`done = ledger.done(key)` is read before the call and a recorded outcome is returned as it stands, keeping the value in `done`. The draft has no ledger, so every replay of a resumed step sends the welcome email again.',
+        '`done = ledger.done(key)` is read before the call and a recorded outcome is returned as it stands, keeping the value in `done`. The starter has no ledger, so every replay of a resumed step sends the welcome email again.',
       match: {
         python: {order: [/ledger\.done\(/, /return done/]},
         typescript: {order: [/ledger\.done\(/, /return done/]},
@@ -98,7 +98,7 @@ must come before the checkpoint and a deadline must be reconciled instead of res
       id: 'record-then-done',
       title: 'The ledger records the effect before the step is marked done',
       detail:
-        '`ledger.record(key, outcome)` completes before `runs.mark_done(run_id, step)`, so a crash after the email still leaves a record that the replay returns. The draft marks the step done first, which is the order that loses the effect.',
+        '`ledger.record(key, outcome)` completes before `runs.mark_done(run_id, step)`, so a crash after the email still leaves a record that the replay returns. The starter marks the step done first, which is the order that loses the effect.',
       match: {
         python: {order: [/ledger\.record\(/, /runs\.mark_done\(/]},
         typescript: {order: [/ledger\.record\(/, /runs\.markDone\(/]},
@@ -124,7 +124,7 @@ must come before the checkpoint and a deadline must be reconciled instead of res
       id: 'timeout-reconcile',
       title: 'A deadline is reconciled against the ledger before any retry',
       detail:
-        'After `DEADLINE_EXCEEDED` the code reads `ledger.done(key)` a second time: a hit returns the recorded outcome, a miss fails loudly. The draft retries the call on the spot, so a timeout that already sent the email sends it twice.',
+        'After `DEADLINE_EXCEEDED` the code reads `ledger.done(key)` a second time: a hit returns the recorded outcome, a miss fails loudly. The starter retries the call on the spot, so a timeout that already sent the email sends it twice.',
       match: {
         python: {order: [/DEADLINE_EXCEEDED/, /ledger\.done\(/]},
         typescript: {order: [/DEADLINE_EXCEEDED/, /ledger\.done\(/]},
@@ -136,7 +136,7 @@ must come before the checkpoint and a deadline must be reconciled instead of res
   ],
   code: {
     python: {
-      starter: `"""One step's side effect over gRPC: a model-generated draft with no effect ledger."""
+      starter: `"""One step's side effect over gRPC: flawed code with no effect ledger."""
 import logging
 
 import grpc
@@ -159,7 +159,7 @@ runs = RunStore()
 
 
 def run_step(run_id: str, step: str, payload: dict, stub: welcome_pb2_grpc.WelcomeStub) -> dict:
-    # TODO: this draft marks the step done before the effect runs, so a crash in between skips the
+    # TODO: this starter marks the step done before the effect runs, so a crash in between skips the
     # welcome email forever, and it retries a deadline blindly — a timeout that already sent the
     # email sends it twice. There is no effect ledger at all: no deterministic effect id, no read
     # before the call, and no record before the step is marked done.
@@ -237,7 +237,7 @@ def run_step(run_id: str, step: str, payload: dict, stub: welcome_pb2_grpc.Welco
 `,
     },
     typescript: {
-      starter: `/** One step's side effect over gRPC: a model-generated draft with no effect ledger. */
+      starter: `/** One step's side effect over gRPC: flawed code with no effect ledger. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -281,7 +281,7 @@ export async function runStep(
   payload: WelcomeRequest,
   stub: WelcomeClient,
 ): Promise<Outcome> {
-  // TODO: this draft marks the step done before the effect runs, so a crash in between skips the
+  // TODO: this starter marks the step done before the effect runs, so a crash in between skips the
   // welcome email forever, and it retries a deadline blindly — a timeout that already sent the
   // email sends it twice. There is no effect ledger at all: no deterministic effect id, no read
   // before the call, and no record before the step is marked done.
@@ -407,7 +407,7 @@ func (s *RunStore) MarkDone(ctx context.Context, runID, step string) error { ret
 
 var runs = &RunStore{}
 
-// TODO: this draft marks the step done before the effect runs, so a crash in between skips the
+// TODO: this starter marks the step done before the effect runs, so a crash in between skips the
 // welcome email forever, and it retries a deadline blindly — a timeout that already sent the email
 // sends it twice. There is no effect ledger at all: no deterministic effect id, no read before the
 // call, and no record before the step is marked done.
@@ -519,7 +519,7 @@ object Effects {
     def markDone(runId: String, step: String): Unit = ()
   }
 
-  // TODO: this draft marks the step done before the effect runs, so a crash in between skips the
+  // TODO: this starter marks the step done before the effect runs, so a crash in between skips the
   // welcome email forever, and it retries a deadline blindly — a timeout that already sent the
   // email sends it twice. There is no effect ledger at all: no deterministic effect id, no read
   // before the call, and no record before the step is marked done.
@@ -606,7 +606,7 @@ struct RunStore {
 
 RunStore runs;
 
-// TODO: this draft marks the step done before the effect runs, so a crash in between skips the
+// TODO: this starter marks the step done before the effect runs, so a crash in between skips the
 // welcome email forever, and it retries a deadline blindly — a timeout that already sent the email
 // sends it twice. There is no effect ledger at all: no deterministic effect id, no read before the
 // call, and no record before the step is marked done.
@@ -694,5 +694,5 @@ Outcome runStep(const std::string& runId, const std::string& step, const Welcome
     'Read before you call: `done = ledger.done(key)`, return `done` when it is not `None`, and only then `stub.SendWelcome(...)`. After the call — never before it — `ledger.record(key, outcome)` and then `runs.mark_done(run_id, step)`: the record has to survive a crash that kills the process before the checkpoint is written.',
     'A deadline is an unknown, not a failure. Catch it, then call `ledger.done(key)` a second time: a record means the email went out and you return it, no record means it did not and you raise instead of resending, because a second `SendWelcome` is a second email to the customer.',
   ],
-  debrief: `The interviewer is asking one question: what happens if this step runs twice? A workflow step is executed by a worker that can crash between any two lines and be replaced, and the caller of \`SendWelcome\` cannot tell a lost request from a lost response. The deterministic effect id is what makes the ledger able to answer at all — a uuid minted per attempt records an effect nobody will ever look up again. Reading the ledger before the call turns a replay into a lookup, and recording the outcome before the checkpoint means a crash after the email still leaves the run knowing the email happened; the draft's order says the step is done while the email may never have been sent, which is the one failure no one notices until a customer complains. The second read after a deadline is the same idea applied to an ambiguous failure: a timeout means "unknown", and the ledger is the only thing that can resolve it, so a miss is a loud failure rather than a resend. Production adds a TTL and a status column on the ledger row so a long-dead attempt can be retried, an expiry after which an effect is considered abandoned, and a provider-side idempotency key so even the first send is safe.`,
+  debrief: `The interviewer is asking one question: what happens if this step runs twice? A workflow step is executed by a worker that can crash between any two lines and be replaced, and the caller of \`SendWelcome\` cannot tell a lost request from a lost response. The deterministic effect id is what makes the ledger able to answer at all — a uuid minted per attempt records an effect nobody will ever look up again. Reading the ledger before the call turns a replay into a lookup, and recording the outcome before the checkpoint means a crash after the email still leaves the run knowing the email happened; the starter's order says the step is done while the email may never have been sent, which is the one failure no one notices until a customer complains. The second read after a deadline is the same idea applied to an ambiguous failure: a timeout means "unknown", and the ledger is the only thing that can resolve it, so a miss is a loud failure rather than a resend. Production adds a TTL and a status column on the ledger row so a long-dead attempt can be retried, an expiry after which an effect is considered abandoned, and a provider-side idempotency key so even the first send is safe.`,
 };

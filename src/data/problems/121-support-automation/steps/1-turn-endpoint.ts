@@ -8,9 +8,9 @@ export const turnEndpointStep: Step = {
   focus: ['client', 'api', 'db', 'workflow'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body, runs the workflow and returns an answer. It compiles, it serves the demo, and it hides
-four production flaws. Review it like the platform owner, fix it, and prove the fix with the checks
+four production flaws. Debug it like the platform owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`POST /v1/conversations/{conversation}/messages\` with body \`{"text": "…"}\`. A message
@@ -65,7 +65,7 @@ timeout, not the platform, decide when a turn ends.`,
       id: 'principal',
       title: 'Takes the role from the verified principal, 401 without one',
       detail:
-        'The bearer token is verified with `auth.verify`; no principal is **401**, and the turn carries the principal’s role. The draft takes `role` from the request body, so a customer can claim to be an agent.',
+        'The bearer token is verified with `auth.verify`; no principal is **401**, and the turn carries the principal’s role. The starter takes `role` from the request body, so a customer can claim to be an agent.',
       match: {
         python: {all: [/auth\.verify\(/, /status_code\s*=\s*401/], none: [/body\.role/]},
         typescript: {all: [/auth\.verify\(/, /code\(\s*401\s*\)/], none: [/body\.role/]},
@@ -78,7 +78,7 @@ timeout, not the platform, decide when a turn ends.`,
       id: 'caps',
       title: 'Rejects empty text with 400 and text over 8 KiB with 413',
       detail:
-        'A `MAX_TEXT_BYTES` cap of `8 << 10` bytes answers **413**, an empty `text` answers **400**. The draft forwards whatever arrives to the workflow, where every reasoning iteration re-sends it to the model.',
+        'A `MAX_TEXT_BYTES` cap of `8 << 10` bytes answers **413**, an empty `text` answers **400**. The starter forwards whatever arrives to the workflow, where every reasoning iteration re-sends it to the model.',
       match: {
         python: {all: [/MAX_TEXT_BYTES/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -91,7 +91,7 @@ timeout, not the platform, decide when a turn ends.`,
       id: 'idempotency',
       title: 'Keys retries by (conversation, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the turn is stored under `(conversation, key)`; a replay returns the stored turn instead of enqueuing a second one. The draft ignores the header and starts a new turn per request.',
+        '`Idempotency-Key` is required and the turn is stored under `(conversation, key)`; a replay returns the stored turn instead of enqueuing a second one. The starter ignores the header and starts a new turn per request.',
       match: {
         python: {all: [/Idempotency-Key/, /turns\.get\(/, /turns\.put\(/]},
         typescript: {all: [/idempotency-key/, /turns\.get\(/, /turns\.put\(/]},
@@ -104,7 +104,7 @@ timeout, not the platform, decide when a turn ends.`,
       id: 'accepted',
       title: 'Enqueues the turn and answers 202',
       detail:
-        'The turn is handed to the workflow with `enqueue` and the handler answers **202** with the turn id. The draft runs the whole reasoning loop inside the request and answers 200 with the text.',
+        'The turn is handed to the workflow with `enqueue` and the handler answers **202** with the turn id. The starter runs the whole reasoning loop inside the request and answers 200 with the text.',
       match: {
         python: {all: [/workflow\.enqueue\(/, /status_code\s*=\s*202/], none: [/workflow\.run\(/]},
         typescript: {all: [/workflow\.enqueue\(/, /code\(\s*202\s*\)/], none: [/workflow\.run\(/]},
@@ -175,7 +175,7 @@ def post_message(
     body: MessageRequest,
     authorization: str | None = Header(default=None),
 ) -> JSONResponse:
-    # TODO: this draft takes the role from the body, never rejects a missing principal, caps
+    # TODO: this starter takes the role from the body, never rejects a missing principal, caps
     # nothing, ignores Idempotency-Key, and runs the whole reasoning loop inside the request.
     principal = auth.verify(authorization)
     actor = principal.actor_id if principal is not None else "anonymous"
@@ -281,7 +281,7 @@ def post_message(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/conversations/:conversation/messages: a model-generated draft that trusts the body's role. */
+      starter: `/** POST /v1/conversations/:conversation/messages: flawed code that trusts the body's role. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -296,7 +296,7 @@ interface MessageBody {
 }
 
 app.post('/v1/conversations/:conversation/messages', async (request, reply) => {
-  // TODO: this draft takes the role from the body, never rejects a missing principal, caps
+  // TODO: this starter takes the role from the body, never rejects a missing principal, caps
   // nothing, ignores Idempotency-Key, and runs the whole reasoning loop inside the request.
   const {conversation} = request.params as {conversation: string};
   const body = request.body as MessageBody;
@@ -429,7 +429,7 @@ func postMessage(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft takes the role from the body, never rejects a missing principal, caps
+	// TODO: this starter takes the role from the body, never rejects a missing principal, caps
 	// nothing, ignores Idempotency-Key, and runs the whole reasoning loop inside the request.
 	principal := auth.Verify(r.Header.Get("Authorization"))
 	actor := "anonymous"
@@ -631,7 +631,7 @@ object TurnApi {
       post {
         optionalHeaderValueByName("Authorization") { authorization =>
           entity(as[MessageRequest]) { body =>
-            // TODO: this draft takes the role from the body, never rejects a missing principal,
+            // TODO: this starter takes the role from the body, never rejects a missing principal,
             // caps nothing, ignores Idempotency-Key, and runs the reasoning loop inside the request.
             val actor = Auth.verify(authorization).map(_.actorId).getOrElse("anonymous")
             val turn = Turn(UUID.randomUUID().toString, conversation, actor, body.role.getOrElse("customer"), body.text)
@@ -789,7 +789,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft takes the role from the body, never rejects a missing principal, caps
+    // TODO: this starter takes the role from the body, never rejects a missing principal, caps
     // nothing, ignores Idempotency-Key, and runs the whole reasoning loop inside the request.
     const auto principal = auth.verify(req.get_header_value("Authorization"));
     const std::string actor = principal ? principal->actorId : "anonymous";
@@ -916,5 +916,5 @@ int main() {
     'The role is an output of `auth.verify`, not an input from the client: delete the body field and copy `principal.role` into the turn. The idempotency lookup is keyed by `(conversation, key)` and runs before the enqueue; a hit returns the stored `{turn_id}` with 202.',
     'The handler’s job ends at `workflow.enqueue(turn)`: store `{turn_id}`, enqueue, log conversation/turn/role, answer 202. The answer arrives through the conversation later; a 200 with the text means the reasoning loop ran inside the request and will run again on every retry.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of an LLM platform. The draft reads fine because the demo sends one well-formed message from one customer and never retries. Four separate defects are being checked: authentication (no principal, no turn), the role as a property of the verified principal rather than a body field (the role decides which tools the reasoning loop may call, so a self-declared role is a privilege escalation), input caps (every byte of text is re-sent to the model on every iteration of the loop), and idempotency keyed by conversation so a client retry cannot start a second turn — which, downstream, would mean a second answer and a second execution of whatever write tool the model picked. The 202 is the shape that makes the rest honest: the loop takes several model calls and seconds, so it runs in the workflow engine and the client polls or subscribes for the answer. Real platforms add per-actor rate limits, a conversation ownership check (this actor may post to this conversation), and request-scoped trace ids that step 5 carries into every event.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of an LLM platform. The starter reads fine because the demo sends one well-formed message from one customer and never retries. Four separate defects are being checked: authentication (no principal, no turn), the role as a property of the verified principal rather than a body field (the role decides which tools the reasoning loop may call, so a self-declared role is a privilege escalation), input caps (every byte of text is re-sent to the model on every iteration of the loop), and idempotency keyed by conversation so a client retry cannot start a second turn — which, downstream, would mean a second answer and a second execution of whatever write tool the model picked. The 202 is the shape that makes the rest honest: the loop takes several model calls and seconds, so it runs in the workflow engine and the client polls or subscribes for the answer. Real platforms add per-actor rate limits, a conversation ownership check (this actor may post to this conversation), and request-scoped trace ids that step 5 carries into every event.`,
 };

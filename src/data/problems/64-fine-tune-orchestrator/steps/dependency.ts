@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['trainer', 'checkpoints'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated gRPC client: it starts a trainer and
+**Starting point.** The starter is working code for the gRPC client: it starts a trainer and
 watches its heartbeat. It compiles, it drives the happy path, and it discards hours of progress the
-first time the trainer goes quiet. Review it like the on-call owner, fix it, and prove the fix with
+first time the trainer goes quiet. Debug it like the on-call owner, fix it, and prove the fix with
 the checks below.
 
 The orchestrator drives a long-running trainer over gRPC with a \`Heartbeat\` call and a
@@ -51,7 +51,7 @@ infinite restart loop that keeps burning budget and never surfaces a failure.`,
       id: 'heartbeat-deadline',
       title: 'Runs the heartbeat under a 60-second deadline',
       detail:
-        'Each `Heartbeat` carries a **60-second** deadline. The draft uses a short 30-second timeout, so a trainer that is merely slow looks dead and gets restarted.',
+        'Each `Heartbeat` carries a **60-second** deadline. The starter uses a short 30-second timeout, so a trainer that is merely slow looks dead and gets restarted.',
       match: {
         python: {all: [/HEARTBEAT_DEADLINE_S/, /60\.0/]},
         typescript: {all: [/HEARTBEAT_DEADLINE_MS/, /60_000/]},
@@ -64,7 +64,7 @@ infinite restart loop that keeps burning budget and never surfaces a failure.`,
       id: 'checkpoint-first',
       title: 'Requests a checkpoint before restarting',
       detail:
-        'On a missed heartbeat the client asks for a checkpoint **before** any restart, so a restart has a checkpoint id to resume from. The draft restarts first and never asks.',
+        'On a missed heartbeat the client asks for a checkpoint **before** any restart, so a restart has a checkpoint id to resume from. The starter restarts first and never asks.',
       match: {
         python: {all: [/RequestCheckpoint/, /checkpoint_id/], order: [/RequestCheckpoint/, /restart_job/]},
         typescript: {all: [/requestCheckpoint/, /checkpointId/], order: [/requestCheckpoint/, /restartJob/]},
@@ -77,7 +77,7 @@ infinite restart loop that keeps burning budget and never surfaces a failure.`,
       id: 'resume-from',
       title: 'A restart names the checkpoint it resumed from',
       detail:
-        'The restart carries `resume_from` / `resumeFrom` with the checkpoint id, and the job records it. The draft restarts with no checkpoint, so the progress is silently discarded.',
+        'The restart carries `resume_from` / `resumeFrom` with the checkpoint id, and the job records it. The starter restarts with no checkpoint, so the progress is silently discarded.',
       match: {
         python: {all: [/resume_from/, /checkpoint_id/]},
         typescript: {all: [/resumeFrom/, /checkpointId/]},
@@ -90,7 +90,7 @@ infinite restart loop that keeps burning budget and never surfaces a failure.`,
       id: 'explicit-failure',
       title: 'Fails a trainer that cannot checkpoint',
       detail:
-        'When `RequestCheckpoint` fails, the job is failed explicitly with a reason instead of being restarted blind. The draft has no failure path at all.',
+        'When `RequestCheckpoint` fails, the job is failed explicitly with a reason instead of being restarted blind. The starter has no failure path at all.',
       match: {
         python: {all: [/fail_job\(/, /cannot checkpoint/]},
         typescript: {all: [/failJob\(/, /cannot checkpoint/]},
@@ -103,7 +103,7 @@ infinite restart loop that keeps burning budget and never surfaces a failure.`,
       id: 'stop-on-repeated',
       title: 'Stops the job after repeated heartbeat failures',
       detail:
-        'A failure counter is compared with a maximum (**3**) and the job is failed when it is reached, so a broken heartbeat cannot become an infinite restart loop. The draft loops forever.',
+        'A failure counter is compared with a maximum (**3**) and the job is failed when it is reached, so a broken heartbeat cannot become an infinite restart loop. The starter loops forever.',
       match: {
         python: {all: [/MAX_HEARTBEAT_FAILURES/, /failures \+= 1/]},
         typescript: {all: [/MAX_HEARTBEAT_FAILURES/, /failures \+= 1/]},
@@ -115,7 +115,7 @@ infinite restart loop that keeps burning budget and never surfaces a failure.`,
   ],
   code: {
     python: {
-      starter: `"""gRPC client that drives the trainer (model-generated draft)."""
+      starter: `"""gRPC client that drives the trainer: flawed code that restarts without a checkpoint."""
 import logging
 
 import grpc
@@ -206,7 +206,7 @@ class TrainerClient:
 `,
     },
     typescript: {
-      starter: `/** gRPC client that drives the trainer (model-generated draft). */
+      starter: `/** gRPC client that drives the trainer: flawed code that restarts without a checkpoint. */
 import * as grpc from '@grpc/grpc-js';
 
 class Trainer {
@@ -282,7 +282,7 @@ class Trainer {
 `,
     },
     go: {
-      starter: `// Package client drives the trainer over gRPC (model-generated draft).
+      starter: `// Package client drives the trainer over gRPC: flawed code that restarts without a checkpoint.
 package client
 
 import (
@@ -445,7 +445,7 @@ object Client {
 `,
     },
     cpp: {
-      starter: `// gRPC client that drives the trainer (model-generated draft).
+      starter: `// gRPC client that drives the trainer: flawed code that restarts without a checkpoint.
 #include <grpcpp/grpcpp.h>
 
 #include "trainer.grpc.pb.h"
@@ -547,5 +547,5 @@ class TrainerClient {
     'Ask for a checkpoint before you restart. A restart that names the checkpoint it resumes from keeps the hours already trained; a restart from scratch throws them away silently.',
     'When the trainer cannot checkpoint, fail the job explicitly; and stop after repeated heartbeat failures so a broken heartbeat cannot become an infinite restart loop.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated long-running client against partial failure. The draft reads fine because the trainer usually answers. Four separate defects are being checked: the heartbeat deadline (60 s, not a twitchy 30 s), the checkpoint request that must precede any restart, the checkpoint id the restart resumes from and the job records, and the honest failure path plus the failure cap that stops the loop. The subtle one is the resume id: without it, a restart looks successful but the lineage cannot be reproduced, and nobody can tell that the progress was discarded. Real systems also keep the checkpoint id on the job record and expose the lineage on the read path.`,
+  debrief: `The interviewer is testing whether you can debug a long-running client against partial failure. The starter reads fine because the trainer usually answers. Four separate defects are being checked: the heartbeat deadline (60 s, not a twitchy 30 s), the checkpoint request that must precede any restart, the checkpoint id the restart resumes from and the job records, and the honest failure path plus the failure cap that stops the loop. The subtle one is the resume id: without it, a restart looks successful but the lineage cannot be reproduced, and nobody can tell that the progress was discarded. Real systems also keep the checkpoint id on the job record and expose the lineage on the read path.`,
 };

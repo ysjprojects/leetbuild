@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['hub', 'broker', 'audit', 'outbox'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a command is accepted, an event lands in
+**Starting point.** The starter is working code: a command is accepted, an event lands in
 \`iot.command\`, and the audit consumer writes a history row, so the demo looks right. Three
 production contracts are broken — the message key, what the event is allowed to contain, and what
-happens when the broker refuses the produce — and the draft records only the first of a command's
+happens when the broker refuses the produce — and the starter records only the first of a command's
 four transitions.
 
 \`POST /v1/devices/{id}/commands\` accepts a command from an operator. Everything the hub does to that
@@ -57,7 +57,7 @@ altogether.`,
     ],
   },
   hints: [
-    'The message key is the partition key: `key=device` (or `key: device`, `Key: []byte(device)`, `ProducerRecord("iot.command", device, …)`, the key argument of `produce`). The draft keys by fleet, so two devices that share a fleet interleave their transitions in one partition.',
+    'The message key is the partition key: `key=device` (or `key: device`, `Key: []byte(device)`, `ProducerRecord("iot.command", device, …)`, the key argument of `produce`). The starter keys by fleet, so two devices that share a fleet interleave their transitions in one partition.',
     'The event needs the command id and the outcome — nothing the device sent. A door code is payload: it must not go into the event or into a log line, because the topic retains and replicates whatever you write into it.',
     'Idempotence is producer configuration plus a stable key (`enable.idempotence=true` with `acks=all`, `idempotent: true`, `RequireAll` with a hash balancer), and durability is the outbox: wrap the produce and insert an outbox row when the broker rejects it. Emit the four transitions from wherever they happen, expiry sweeper included.',
   ],
@@ -66,7 +66,7 @@ altogether.`,
       id: 'device-key',
       title: 'Keyed by device id, carrying the command id',
       detail:
-        'The message key is the device id — `key=device`, `key: device`, `Key: []byte(device)`, `ProducerRecord("iot.command", device, …)`, the key argument of `produce` — and the event carries the command id. The draft keys by the fleet, so every device in a fleet interleaves in one partition and a device’s history is no longer the order it happened.',
+        'The message key is the device id — `key=device`, `key: device`, `Key: []byte(device)`, `ProducerRecord("iot.command", device, …)`, the key argument of `produce` — and the event carries the command id. The starter keys by the fleet, so every device in a fleet interleaves in one partition and a device’s history is no longer the order it happened.',
       match: {
         python: {all: [/key=device/, /command_id/]},
         typescript: {all: [/key:\s*device\b/, /commandId|command_id/]},
@@ -79,7 +79,7 @@ altogether.`,
       id: 'no-secrets',
       title: 'No door codes or payload fields in the events or the logs',
       detail:
-        'Neither the event nor a log line carries the command payload: no door code, no `payload` field, nothing secret. The draft copies the door code into the event and logs it. `message->payload()` — librdkafka’s accessor for the record bytes — is not a leak.',
+        'Neither the event nor a log line carries the command payload: no door code, no `payload` field, nothing secret. The starter copies the door code into the event and logs it. `message->payload()` — librdkafka’s accessor for the record bytes — is not a leak.',
       match: {
         python: {none: [/\bdoor_?codes?\b|\bsecrets?\b|\bpayloads?\b(?!\s*\()/i]},
         typescript: {none: [/\bdoor_?codes?\b|\bsecrets?\b|\bpayloads?\b(?!\s*\()/i]},
@@ -105,7 +105,7 @@ altogether.`,
       id: 'outbox-on-failure',
       title: 'Writes an outbox row when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox`) inside the error branch instead of dropping the event; a relay republishes the row when the broker recovers. The draft has no outbox at all, so a refused produce silently removes the command from the history.',
+        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox`) inside the error branch instead of dropping the event; a relay republishes the row when the broker recovers. The starter has no outbox at all, so a refused produce silently removes the command from the history.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -118,7 +118,7 @@ altogether.`,
       id: 'event-outcomes',
       title: 'Every transition is published with its outcome',
       detail:
-        'All four transitions of a command — `accepted`, `delivered`, `acknowledged`, `expired` — are published, so the audit shows what happened after accept. The draft publishes `accepted` and nothing else, so a delivered or expired command vanishes from the history.',
+        'All four transitions of a command — `accepted`, `delivered`, `acknowledged`, `expired` — are published, so the audit shows what happened after accept. The starter publishes `accepted` and nothing else, so a delivered or expired command vanishes from the history.',
       match: {
         python: {all: [/["']accepted["']/, /["']delivered["']/, /["']acknowledged["']/, /["']expired["']/]},
         typescript: {all: [/["']accepted["']/, /["']delivered["']/, /["']acknowledged["']/, /["']expired["']/]},
@@ -271,7 +271,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** iot.command: a model-generated draft that keys by fleet and copies the door code into the event. */
+      starter: `/** iot.command: flawed code that keys by fleet and copies the door code into the event. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -823,7 +823,7 @@ void consumeHistory(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking four things a generated Kafka snippet gets wrong. First, the
+  debrief: `The interviewer is checking four things a Kafka snippet like this gets wrong. First, the
 message key is an ordering contract: partition by device and one device's history arrives in the
 order it happened, key by fleet and every device under that fleet interleaves in one partition.
 Second, the event is a public artifact: ids and outcomes are all the fleet audit needs, and a door

@@ -7,11 +7,11 @@ import {trainingEventsStep} from './steps/4-events';
 import {trainingReadStep} from './steps/5-read';
 
 /**
- * Training scheduler on the AI-era track: the course is not "accept a training job", it is the
- * review you owe a model-generated scheduler before it owns a shared GPU fleet. Admitted and
- * clamped submissions whose retries replay instead of double-starting → one Redis queue position
- * per run behind a start lease → preemption that waits for a checkpoint id → run-keyed lifecycle
- * events with an outbox → a status endpoint reconciled against the cluster.
+ * Training scheduler: the course is not "accept a training job", it is the debugging you owe a
+ * scheduler before it owns a shared GPU fleet. Admitted and clamped submissions whose retries
+ * replay instead of double-starting → one Redis queue position per run behind a start lease →
+ * preemption that waits for a checkpoint id → run-keyed lifecycle events with an outbox → a status
+ * endpoint reconciled against the cluster.
  */
 export const trainingSchedulerProblem: Problem = {
   id: 'training-scheduler',
@@ -19,7 +19,7 @@ export const trainingSchedulerProblem: Problem = {
   tagline: 'Enqueue training runs against shared capacity without starvation or double-start.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Training Scheduler
 
@@ -60,12 +60,12 @@ One service, **trainsched**, with five pieces:
    checkpoint reconciled against the cluster's view, orphaned runs surfaced as failed with a
    reason, and another tenant's run invisible.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

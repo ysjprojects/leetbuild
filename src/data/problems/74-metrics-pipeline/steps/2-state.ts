@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: batches arrive, the window
+**Starting point.** The starter is working code: batches arrive, the window
 counters move, and the dashboard shows series totals. It hides a crash that leaves half a batch
-applied, an expiry that lags its window by hours, and a redelivery that counts twice. Review it, fix
+applied, an expiry that lags its window by hours, and a redelivery that counts twice. Debug it, fix
 it, and prove the fix with the checks below.
 
 Implement \`merge_batch(tenant, batch)\`, the call the API makes once a batch of per-series deltas has
@@ -24,16 +24,16 @@ been accepted:
   \`window_key\` from the tenant, the series and the boundary — a key that drops the series mixes
   unrelated counters, and a key that drops the boundary never rolls over.
 - The **whole batch merges in one atomic Lua \`EVAL\`**: every delta is incremented server-side in a
-  single script, so a crash leaves the batch applied or absent, never half of it. The draft sends
+  single script, so a crash leaves the batch applied or absent, never half of it. The starter sends
   one \`INCRBY\` per sample from the client, and a crash between two of them leaves a partial batch
   that downstream rollups cannot distinguish from real data.
 - The window key **expires exactly at its boundary**: the script sets \`EXPIRE\` to
   \`window_start + WINDOW_SECONDS - now\` on the first write (\`TTL\` < 0 means the key just opened).
-  The draft never expires at write time — a cleanup job sweeps hours later — so a closed window
+  The starter never expires at write time — a cleanup job sweeps hours later — so a closed window
   stays readable next to live ones.
 - A **redelivered batch is a no-op**: claim the batch id with \`SET NX\` (\`nx=True\`, \`'NX'\`,
   \`SetNX\`, \`nx()\`, \`UpdateType::NOT_EXIST\`) on \`metrics:batch:{batch_id}\`, with a \`WINDOW_TTL\`
-  lifetime, before merging, and skip the merge when the claim is refused. The draft keeps no batch
+  lifetime, before merging, and skip the merge when the claim is refused. The starter keeps no batch
   id, so an at-least-once redelivery adds the same samples twice.
 
 **Failure mode the checks target.** One \`INCRBY\` per sample is a partial batch waiting for a crash;
@@ -77,7 +77,7 @@ id silently doubles the series when the broker redelivers.`,
       id: 'atomic-merge',
       title: 'Merges the whole batch in one atomic script',
       detail:
-        'Every delta of the batch is applied inside one `EVAL`/`NewScript` call, so a crash leaves the batch applied or absent, never half of it. The draft sends one client-side `INCRBY` per sample, and a crash between two of them leaves a partial batch that downstream rollups cannot distinguish from real data.',
+        'Every delta of the batch is applied inside one `EVAL`/`NewScript` call, so a crash leaves the batch applied or absent, never half of it. The starter sends one client-side `INCRBY` per sample, and a crash between two of them leaves a partial batch that downstream rollups cannot distinguish from real data.',
       match: {
         python: {all: [/MERGE_LUA/, /\.eval\(/, /INCRBY/]},
         typescript: {all: [/MERGE_LUA/, /\.eval\(/, /INCRBY/]},
@@ -90,7 +90,7 @@ id silently doubles the series when the broker redelivers.`,
       id: 'window-expiry',
       title: 'Expires the key at its window boundary',
       detail:
-        'Inside the merge script the key gets `EXPIRE` when `TTL` is negative, set to `window_start + WINDOW_SECONDS - now`, so a key lives exactly until the end of the window it counts. The draft expires nothing at write time — a cleanup job sweeps hours later — so a closed window is still there long past its boundary.',
+        'Inside the merge script the key gets `EXPIRE` when `TTL` is negative, set to `window_start + WINDOW_SECONDS - now`, so a key lives exactly until the end of the window it counts. The starter expires nothing at write time — a cleanup job sweeps hours later — so a closed window is still there long past its boundary.',
       match: {
         python: {all: [/WINDOW_SECONDS/, /redis\.call\('EXPIRE'/, /redis\.call\('TTL'/]},
         typescript: {all: [/WINDOW_SECONDS/, /redis\.call\('EXPIRE'/, /redis\.call\('TTL'/]},
@@ -103,7 +103,7 @@ id silently doubles the series when the broker redelivers.`,
       id: 'dedupe-batch-id',
       title: 'Claims the batch id before merging',
       detail:
-        'The batch id is recorded with a write-once set (`nx=True`, `NX`, `SetNX`, `SetParams…nx()`, `UpdateType::NOT_EXIST`) on `metrics:batch:{batch_id}` before the merge runs, so a redelivered batch is claimed once and applied once. The draft has no batch-id key, so the same batch counts twice.',
+        'The batch id is recorded with a write-once set (`nx=True`, `NX`, `SetNX`, `SetParams…nx()`, `UpdateType::NOT_EXIST`) on `metrics:batch:{batch_id}` before the merge runs, so a redelivered batch is claimed once and applied once. The starter has no batch-id key, so the same batch counts twice.',
       match: {
         python: {all: [/metrics:batch:/, /batch_id/, /nx=True/], order: [/nx=True/, /\.eval\(/]},
         typescript: {all: [/metrics:batch:/, /batchId/, /['"]NX['"]/], order: [/['"]NX['"]/, /\.eval\(/]},
@@ -131,7 +131,7 @@ id silently doubles the series when the broker redelivers.`,
   ],
   code: {
     python: {
-      starter: `"""merge_batch: a model-generated draft that sends one INCRBY per sample."""
+      starter: `"""merge_batch: flawed code that sends one INCRBY per sample."""
 from dataclasses import dataclass
 
 import redis
@@ -164,9 +164,9 @@ def window_key(tenant: str, series: str, start: int) -> str:
 
 
 def merge_batch(tenant: str, batch: Batch) -> dict:
-    # TODO: this draft sends one INCRBY per sample from the client, so a crash mid-batch leaves a
+    # TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
     # partial merge; it never expires a window at write time (only a sweeper that runs hours later
-    # does); and it has no batch-id claim, so a redelivered batch is applied twice. Review all three.
+    # does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
     start = window_start(batch.recorded_at)
     applied = 0
     for sample in batch.samples:
@@ -250,7 +250,7 @@ def merge_batch(tenant: str, batch: Batch) -> dict:
 `,
     },
     typescript: {
-      starter: `/** mergeBatch: a model-generated draft that sends one INCRBY per sample. */
+      starter: `/** mergeBatch: flawed code that sends one INCRBY per sample. */
 import {Redis} from 'ioredis';
 
 const r = new Redis({host: 'redis', port: 6379});
@@ -278,9 +278,9 @@ export function windowKey(tenant: string, series: string, start: number): string
 }
 
 export async function mergeBatch(tenant: string, batch: Batch): Promise<{applied: number; window_start: number}> {
-  // TODO: this draft sends one INCRBY per sample from the client, so a crash mid-batch leaves a
+  // TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
   // partial merge; it never expires a window at write time (only a sweeper that runs hours later
-  // does); and it has no batch-id claim, so a redelivered batch is applied twice. Review all three.
+  // does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
   const start = windowStart(batch.recordedAt);
   let applied = 0;
   for (const sample of batch.samples) {
@@ -401,9 +401,9 @@ func windowKey(tenant, series string, start int64) string {
 }
 
 func mergeBatch(ctx context.Context, tenant string, batch Batch) (int, error) {
-	// TODO: this draft sends one INCRBY per sample from the client, so a crash mid-batch leaves a
+	// TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
 	// partial merge; it never expires a window at write time (only a sweeper that runs hours later
-	// does); and it has no batch-id claim, so a redelivered batch is applied twice. Review all three.
+	// does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
 	start := windowStart(batch.RecordedAt)
 	for _, sample := range batch.Samples {
 		if err := rdb.IncrBy(ctx, windowKey(tenant, sample.Series, start), sample.Delta).Err(); err != nil {
@@ -528,9 +528,9 @@ object MetricsStore {
   def windowKey(tenant: String, series: String, start: Long): String = s"metrics:$tenant:$series:$start"
 
   def mergeBatch(tenant: String, batch: Batch): Map[String, Long] = {
-    // TODO: this draft sends one INCRBY per sample from the client, so a crash mid-batch leaves a
+    // TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
     // partial merge; it never expires a window at write time (only a sweeper that runs hours later
-    // does); and it has no batch-id claim, so a redelivered batch is applied twice. Review all three.
+    // does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
     val start = windowStart(batch.recordedAt)
     batch.samples.foreach { sample =>
       jedis.incrBy(windowKey(tenant, sample.series, start), sample.delta)
@@ -638,9 +638,9 @@ std::string window_key(const std::string& tenant, const std::string& series, lon
 }
 
 int merge_batch(const std::string& tenant, const Batch& batch) {
-  // TODO: this draft sends one INCRBY per sample from the client, so a crash mid-batch leaves a
+  // TODO: this starter sends one INCRBY per sample from the client, so a crash mid-batch leaves a
   // partial merge; it never expires a window at write time (only a sweeper that runs hours later
-  // does); and it has no batch-id claim, so a redelivered batch is applied twice. Review all three.
+  // does); and it has no batch-id claim, so a redelivered batch is applied twice. Fix all three.
   const auto start = window_start(batch.recorded_at);
   for (const auto& sample : batch.samples) {
     redis.incrby(window_key(tenant, sample.series, start), sample.delta);

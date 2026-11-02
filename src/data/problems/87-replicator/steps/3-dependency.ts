@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['api', 'target', 'source'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the target is healthy it
+**Starting point.** The starter is working code: when the target is healthy it
 applies every change correctly, so the demo converges. Both failure paths are wrong. Find them, fix
 them, and prove the fix.
 
@@ -24,7 +24,7 @@ the target-side handler that dedupes by change id.
 - **Every attempt carries the change id.** A timeout does not mean the target did not apply the
   change: the call may have been applied and the response lost. The retry therefore has to look
   exactly like the original attempt, so the target can recognise the id and drop the duplicate.
-  Dropping the id on the retry path is the quiet defect in this draft — the retry lands as a new
+  Dropping the id on the retry path is the quiet defect in this starter — the retry lands as a new
   change and inserts a second row.
 - A **schema mismatch** (\`FAILED_PRECONDITION\`) is terminal: halt the shard with the target's
   **named diff** instead of retrying. Retrying a schema mismatch is a hot loop against a target that
@@ -33,9 +33,9 @@ the target-side handler that dedupes by change id.
 - \`target_apply(request)\` is the target's handler: it **dedupes by change id**, so applying the
   same change twice changes nothing — the second call is a no-op and no second row is inserted.
 
-**Failure mode the checks target.** The draft retries forever with no deadline, builds its retry
+**Failure mode the checks target.** The starter retries forever with no deadline, builds its retry
 request without the change id, and treats a schema mismatch like any other error. The result is the
-incident this course reviews: a call that timed out after it was applied is applied again, and
+incident this course debugs: a call that timed out after it was applied is applied again, and
 because the id is gone the target has no way to tell that the second call is the same change.`,
   sequence: {
     participants: ['Replication controller', 'Target region', 'Shard halter'],
@@ -62,7 +62,7 @@ because the id is gone the target has no way to tell that the second call is the
       id: 'deadline',
       title: 'Every attempt carries a 3-second deadline',
       detail:
-        'The call is bounded by a 3 s deadline — `timeout=APPLY_DEADLINE_S`, `deadline: Date.now() + APPLY_DEADLINE_MS`, a context with timeout, `withDeadlineAfter`, or `set_deadline`. The draft calls the target with no deadline at all.',
+        'The call is bounded by a 3 s deadline — `timeout=APPLY_DEADLINE_S`, `deadline: Date.now() + APPLY_DEADLINE_MS`, a context with timeout, `withDeadlineAfter`, or `set_deadline`. The starter calls the target with no deadline at all.',
       match: {
         python: {all: [/APPLY_DEADLINE_S\s*=\s*3\.0/, /timeout=APPLY_DEADLINE_S/]},
         typescript: {all: [/APPLY_DEADLINE_MS\s*=\s*3000/, /deadline: Date\.now\(\) \+ APPLY_DEADLINE_MS/]},
@@ -85,7 +85,7 @@ because the id is gone the target has no way to tell that the second call is the
       id: 'change-id',
       title: 'Every attempt carries the change id',
       detail:
-        'The request is built once, with `change_id`, before the retry loop, so the retry of a call that timed out is recognisable as the same change. The draft drops the id on every retry path, and the target inserts a second row.',
+        'The request is built once, with `change_id`, before the retry loop, so the retry of a call that timed out is recognisable as the same change. The starter drops the id on every retry path, and the target inserts a second row.',
       match: {
         python: {
           all: [/change_id=change\.change_id/],
@@ -113,7 +113,7 @@ because the id is gone the target has no way to tell that the second call is the
       id: 'schema-mismatch',
       title: 'A schema mismatch halts the shard with a named diff',
       detail:
-        '`FAILED_PRECONDITION` is terminal: it raises the schema-mismatch error carrying `named_diff` instead of being retried. The draft retries it like any other failure, forever.',
+        '`FAILED_PRECONDITION` is terminal: it raises the schema-mismatch error carrying `named_diff` instead of being retried. The starter retries it like any other failure, forever.',
       match: {
         python: {all: [/SchemaMismatch/, /StatusCode\.FAILED_PRECONDITION/, /named_diff/]},
         typescript: {all: [/SchemaMismatchError/, /grpc\.status\.FAILED_PRECONDITION/, /namedDiff/]},
@@ -126,7 +126,7 @@ because the id is gone the target has no way to tell that the second call is the
       id: 'idempotent-apply',
       title: 'The target dedupes by change id, so a second apply changes nothing',
       detail:
-        'The target handler checks the applied set for the change id and returns before inserting anything, so a re-applied change is a no-op. The draft inserts on every call.',
+        'The target handler checks the applied set for the change id and returns before inserting anything, so a re-applied change is a no-op. The starter inserts on every call.',
       match: {
         python: {all: [/APPLIED_CHANGES/, /if request\.change_id in APPLIED_CHANGES/]},
         typescript: {all: [/appliedChanges/, /appliedChanges\.has\(request\.change_id\)/]},
@@ -139,7 +139,7 @@ because the id is gone the target has no way to tell that the second call is the
       id: 'bounded-attempts',
       title: 'At most three attempts, then the error is surfaced',
       detail:
-        'The retry loop is bounded by `3` attempts and raises the last retryable failure when they are exhausted. The draft loops forever.',
+        'The retry loop is bounded by `3` attempts and raises the last retryable failure when they are exhausted. The starter loops forever.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3/, /for attempt in range\(MAX_ATTEMPTS\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3/, /attempt < MAX_ATTEMPTS/]},
@@ -157,7 +157,7 @@ import apply_pb2
 import apply_pb2_grpc
 
 
-# TODO: this draft retries every error forever with no deadline, drops the change id on the retry
+# TODO: this starter retries every error forever with no deadline, drops the change id on the retry
 # path so a call that timed out after it was applied is applied a second time and inserts a
 # duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
 def apply_change(stub, change) -> None:
@@ -252,7 +252,7 @@ interface ApplyRequest {
   payload: Buffer;
 }
 
-// TODO: this draft retries every error forever with no deadline, drops the change id on the retry
+// TODO: this starter retries every error forever with no deadline, drops the change id on the retry
 // path so a call that timed out after it was applied is applied a second time and inserts a
 // duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
 export async function applyChange(client: ApplyClient, change: Change): Promise<void> {
@@ -363,7 +363,7 @@ type Change struct {
 	Payload  []byte
 }
 
-// TODO: this draft retries every error forever with no deadline, drops the change id on the retry
+// TODO: this starter retries every error forever with no deadline, drops the change id on the retry
 // path so a call that timed out after it was applied is applied a second time and inserts a
 // duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
 func applyChange(ctx context.Context, client ApplyServiceClient, change Change) error {
@@ -461,7 +461,7 @@ final case class Change(change_id: String, shard: Int, payload: Array[Byte])
 final case class ApplyRequest(change_id: Option[String], shard: Int, payload: Array[Byte])
 
 object ApplyClient {
-  // TODO: this draft retries every error forever with no deadline, drops the change id on the retry
+  // TODO: this starter retries every error forever with no deadline, drops the change id on the retry
   // path so a call that timed out after it was applied is applied a second time and inserts a
   // duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
   def applyChange(stub: ApplyServiceGrpc.ApplyServiceBlockingStub, change: Change): Unit = {
@@ -539,7 +539,7 @@ object ApplyClient {
 
 #include <string>
 
-// TODO: this draft retries every error forever with no deadline, drops the change id on the retry
+// TODO: this starter retries every error forever with no deadline, drops the change id on the retry
 // path so a call that timed out after it was applied is applied a second time and inserts a
 // duplicate row, and retries a schema mismatch instead of halting the shard with the diff.
 void applyChange(apply::ApplyService::Stub& stub, const Change& change) {
@@ -629,5 +629,5 @@ void targetApply(const apply::ApplyRequest& request) {
     'Bound the loop with a constant and check the status code, not the fact that an error was thrown: retry `UNAVAILABLE` / `DEADLINE_EXCEEDED` / `RESOURCE_EXHAUSTED`, return anything else immediately, and raise the last retryable error when the attempts run out.',
     'Treat `FAILED_PRECONDITION` as terminal and carry the target’s description with it as the named diff: a schema mismatch is not a transient failure, and retrying it turns one bad change into an infinite loop while hiding the diff that would have explained it in seconds.',
   ],
-  debrief: `The interviewer is testing whether you can review generated retry logic for the difference between "the call failed" and "the change did not happen". A timeout is not a negative acknowledgement: the target may have applied the change and lost the response, so the retry has to be recognisable — same change id, so the target dedupes — or the replica silently grows duplicate rows. The second half is the failure classification: a schema mismatch is terminal, and retrying it is both useless and expensive. Real replicators add a per-shard fencing token so two controllers cannot apply the same shard concurrently, apply in the target's transaction with the dedupe row inside it, and record the diff on the shard's state so an operator sees which change halted it.`,
+  debrief: `The interviewer is testing whether you can debug retry logic for the difference between "the call failed" and "the change did not happen". A timeout is not a negative acknowledgement: the target may have applied the change and lost the response, so the retry has to be recognisable — same change id, so the target dedupes — or the replica silently grows duplicate rows. The second half is the failure classification: a schema mismatch is terminal, and retrying it is both useless and expensive. Real replicators add a per-shard fencing token so two controllers cannot apply the same shard concurrently, apply in the target's transaction with the dedupe row inside it, and record the diff on the shard's state so an operator sees which change halted it.`,
 };

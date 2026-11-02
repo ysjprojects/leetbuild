@@ -8,23 +8,23 @@ export const auditEventsStep: Step = {
   focus: ['redactor', 'kafka', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every redaction produces a
+**Starting point.** The starter is working code: every redaction produces a
 \`privacy.redacted\` event and the topic looks healthy in the console. It hides three flaws, and the
-first one is the worst kind — the audit log becomes a copy of what redaction removed. Review it, fix
+first one is the worst kind — the audit log becomes a copy of what redaction removed. Debug it, fix
 it, and prove the fix.
 
 Every redaction publishes one audit event to \`privacy.redacted\`:
 
 - **Keyed by document id.** The key decides the partition, so all events for one document keep their
-  order. The draft keys by entity type, which scatters one document's events across partitions and
+  order. The starter keys by entity type, which scatters one document's events across partitions and
   puts unrelated documents in the same partition.
 - **Content-free payload.** \`{"document_id", "tenant", "spans": [{start, end, entity}],
   "entity_counts", "pattern_version"}\` — offsets, counts and the version, and **never** the original
-  text, the redacted text, or a sample of any removed value. The draft publishes \`"sample"\` of each
+  text, the redacted text, or a sample of any removed value. The starter publishes \`"sample"\` of each
   removed value "so detection can be spot-checked": that writes the exact data redaction exists to
   protect into a retained, replicated log.
 - **An outbox row on rejection.** If the producer rejects the record, \`INSERT INTO outbox (id, topic,
-  key, payload)\` so the audit fact survives the broker. The draft has no outbox, so a rejected
+  key, payload)\` so the audit fact survives the broker. The starter has no outbox, so a rejected
   produce silently erases the audit trail.
 - **A durable producer.** \`acks=all\` and the idempotent producer: an audit event must survive a
   broker failover and the producer's own retries must not duplicate it.
@@ -59,7 +59,7 @@ an audit trail: the outbox is what makes "the event exists iff the redaction exi
       id: 'document-key',
       title: 'Keys by document id, not by entity type',
       detail:
-        'The record key is the **document id**, so one document’s events share a partition and keep their order. The draft keys by entity type, which scatters a document across partitions and mixes unrelated documents together.',
+        'The record key is the **document id**, so one document’s events share a partition and keep their order. The starter keys by entity type, which scatters a document across partitions and mixes unrelated documents together.',
       match: {
         python: {all: [/key=document_id/], none: [/key\s*=\s*[\w.]*entity/]},
         typescript: {all: [/key:\s*document_id|key:\s*documentId/], none: [/key:\s*[\w.]*entity/]},
@@ -75,7 +75,7 @@ an audit trail: the outbox is what makes "the event exists iff the redaction exi
       id: 'content-free',
       title: 'The payload carries offsets and counts, never removed values',
       detail:
-        '`spans` with `(start, end, entity)`, `entity_counts` and `pattern_version` are in; `samples`, `values`, `text`, `original` and `redacted_text` are out. The draft ships `a sample of each removed value` into a retained topic.',
+        '`spans` with `(start, end, entity)`, `entity_counts` and `pattern_version` are in; `samples`, `values`, `text`, `original` and `redacted_text` are out. The starter ships `a sample of each removed value` into a retained topic.',
       match: {
         python: {
           all: [/"spans"/, /entity_counts/, /pattern_version/],
@@ -103,7 +103,7 @@ an audit trail: the outbox is what makes "the event exists iff the redaction exi
       id: 'outbox',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce becomes an `INSERT INTO outbox (id, topic, key, payload)` row so the audit fact survives the broker. The draft drops it silently and the redaction has no audit record at all.',
+        'A rejected produce becomes an `INSERT INTO outbox (id, topic, key, payload)` row so the audit fact survives the broker. The starter drops it silently and the redaction has no audit record at all.',
       match: {
         python: {all: [/INSERT INTO outbox \(id, topic, key, payload\)/, /except|try:/]},
         typescript: {all: [/INSERT INTO outbox \(id, topic, key, payload\)/, /catch/]},
@@ -116,7 +116,7 @@ an audit trail: the outbox is what makes "the event exists iff the redaction exi
       id: 'durable-producer',
       title: 'Producer waits for all replicas and is idempotent',
       detail:
-        '`acks=all` means a leader failover cannot lose an acknowledged record, and the idempotent producer keeps its own retries from duplicating one. The draft uses a bare producer with default acks and no idempotence.',
+        '`acks=all` means a leader failover cannot lose an acknowledged record, and the idempotent producer keeps its own retries from duplicating one. The starter uses a bare producer with default acks and no idempotence.',
       match: {
         python: {all: [/acks/, /enable\.idempotence/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -140,7 +140,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_redaction(cur, tenant: str, document_id: str, spans: list, pattern_version: int) -> None:
-    # TODO: the draft publishes one sample of every removed value so detection can be spot-checked,
+    # TODO: the starter publishes one sample of every removed value so detection can be spot-checked,
     # keys by entity type instead of the document, and has no outbox for a rejected produce.
     for span in spans:
         producer.produce(
@@ -203,7 +203,7 @@ def publish_redaction(cur, tenant: str, document_id: str, spans: list, pattern_v
 `,
     },
     typescript: {
-      starter: `/** A model-generated audit publisher that ships removed values into the topic. */
+      starter: `/** A audit publisher that ships removed values into the topic. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'redactor-events', brokers: ['kafka:9092']});
@@ -219,7 +219,7 @@ export async function publishRedaction(
   pattern_version: number,
 ): Promise<void> {
   await producer.connect();
-  // TODO: the draft publishes one sample of every removed value so detection can be spot-checked,
+  // TODO: the starter publishes one sample of every removed value so detection can be spot-checked,
   // keys by entity type instead of the document, and has no outbox for a rejected produce.
   for (const span of spans) {
     await producer.send({
@@ -296,7 +296,7 @@ const topic = "privacy.redacted"
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
 func publishRedaction(ctx context.Context, cur *sql.DB, tenant, documentID string, spans []Span, patternVersion int) error {
-	// TODO: the draft publishes one sample of every removed value so detection can be spot-checked,
+	// TODO: the starter publishes one sample of every removed value so detection can be spot-checked,
 	// keys by entity type instead of the document, and has no outbox for a rejected produce.
 	for _, span := range spans {
 		payload, _ := json.Marshal(map[string]any{
@@ -377,7 +377,7 @@ object AuditEvents {
   props.put("bootstrap.servers", "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: the draft publishes one sample of every removed value so detection can be spot-checked,
+  // TODO: the starter publishes one sample of every removed value so detection can be spot-checked,
   // keys by entity type instead of the document, and has no outbox for a rejected produce.
   def publishRedaction(conn: java.sql.Connection, tenant: String, documentId: String, spans: List[Span], patternVersion: Int): Unit =
     spans.foreach { span =>
@@ -454,7 +454,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 
 auto producer = make_producer();
 
-// TODO: the draft publishes one sample of every removed value so detection can be spot-checked,
+// TODO: the starter publishes one sample of every removed value so detection can be spot-checked,
 // keys by entity type instead of the document, and has no outbox for a rejected produce.
 void publish_redaction(pqxx::work& tx, const std::string& tenant, const std::string& document_id, const std::vector<Span>& spans) {
   for (const auto& span : spans) {
@@ -523,5 +523,5 @@ void publish_redaction(pqxx::work& tx, const std::string& tenant, const std::str
     'The key is the ordering contract. Keying by `document_id` keeps one document’s events on one partition in produce order; keying by entity type scatters them and buys nothing. The document id is also the natural outbox row id, which keeps the retry path idempotent.',
     'A rejected produce must not be a lost audit event. Wrap the `produce`/`send`/`WriteMessages` call and, on failure, `INSERT INTO outbox (id, topic, key, payload)`; the relay that ships outbox rows is the same one you already have for step 2 of the payments course. Configure `acks=all` and `enable.idempotence=true` so a leader failover and the producer’s own retries are both safe.',
   ],
-  debrief: `The interviewer is testing whether you can design an audit payload that is useful precisely because it does not contain the thing it audits. The draft’s "sample for spot-checking" is the trap candidates fall into: it feels like observability, but a topic is retained, replicated and read by people who were never supposed to see a customer’s data — the audit log becomes a second copy of the leak. Offsets plus counts plus \`pattern_version\` give you everything an auditor legitimately needs: coverage, location, and which rule set produced the answer. The two smaller defects are the same theme: a key that scatters ordering, and a produce whose failure erases the record — which the transactional outbox pattern fixes by making the audit row commit next to the redaction it describes.`,
+  debrief: `The interviewer is testing whether you can design an audit payload that is useful precisely because it does not contain the thing it audits. The starter’s "sample for spot-checking" is the trap candidates fall into: it feels like observability, but a topic is retained, replicated and read by people who were never supposed to see a customer’s data — the audit log becomes a second copy of the leak. Offsets plus counts plus \`pattern_version\` give you everything an auditor legitimately needs: coverage, location, and which rule set produced the answer. The two smaller defects are the same theme: a key that scatters ordering, and a produce whose failure erases the record — which the transactional outbox pattern fixes by making the audit row commit next to the redaction it describes.`,
 };

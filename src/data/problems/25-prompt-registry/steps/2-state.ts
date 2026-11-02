@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['registry', 'redis', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a promotion moves the pointer, the demo reader
+The starter is working code: a promotion moves the pointer, the demo reader
 picks it up, and the audit list grows. It swaps in pieces, caches for an hour, and keeps no
 revision. Find the three flaws, fix them, and prove the fix.
 
@@ -48,7 +48,7 @@ first one is already live.`,
       id: 'atomic-swap',
       title: 'Promotes with one atomic Lua script',
       detail:
-        'The pointer is read and written inside one `EVAL`/`NewScript` call that returns the previous version, so two racing promotions cannot interleave. The draft sets the pointer and the pins as separate commands.',
+        'The pointer is read and written inside one `EVAL`/`NewScript` call that returns the previous version, so two racing promotions cannot interleave. The starter sets the pointer and the pins as separate commands.',
       match: {
         python: {all: [/PROMOTE_LUA/, /\.eval\(/, /GET/, /SET/]},
         typescript: {all: [/PROMOTE_LUA/, /\.eval\(/, /GET/, /SET/]},
@@ -61,7 +61,7 @@ first one is already live.`,
       id: 'audit-in-script',
       title: 'Writes the audit row and bumps the revision in the same script',
       detail:
-        'The audit entry (`audit:{name}`) and the revision bump happen inside the same script as the swap: `RPUSH` and `INCR` are Lua calls, not a second client round trip. The draft pushes the audit row after the pointer is already live.',
+        'The audit entry (`audit:{name}`) and the revision bump happen inside the same script as the swap: `RPUSH` and `INCR` are Lua calls, not a second client round trip. The starter pushes the audit row after the pointer is already live.',
       match: {
         python: {all: [/RPUSH/, /INCR/, /audit:/]},
         typescript: {all: [/RPUSH/, /INCR/, /audit:/]},
@@ -74,7 +74,7 @@ first one is already live.`,
       id: 'pin-first',
       title: 'Reads the tenant pin before the global pointer',
       detail:
-        'A reader looks up `pin:{tenant}:{name}` first and only falls back to `pointer:{name}`, so a pinned tenant keeps its version while the global pointer moves. The draft reads the global pointer for everyone.',
+        'A reader looks up `pin:{tenant}:{name}` first and only falls back to `pointer:{name}`, so a pinned tenant keeps its version while the global pointer moves. The starter reads the global pointer for everyone.',
       match: {
         python: {all: [/pin:/, /pointer:/], order: [/r\.get\(pin_key\(/, /r\.get\(pointer_key\(/]},
         typescript: {all: [/pin:/, /pointer:/], order: [/r\.get\(pinKey\(/, /r\.get\(pointerKey\(/]},
@@ -87,7 +87,7 @@ first one is already live.`,
       id: 'revision-cache',
       title: 'Cache key carries the revision, with a short TTL',
       detail:
-        'The read cache is `pointer_cache:{tenant}:{name}:{revision}` and expires in `CACHE_TTL_S` seconds: the key changes the moment the revision does, so a rollback is visible on the next read. The draft caches by name for an hour.',
+        'The read cache is `pointer_cache:{tenant}:{name}:{revision}` and expires in `CACHE_TTL_S` seconds: the key changes the moment the revision does, so a rollback is visible on the next read. The starter caches by name for an hour.',
       match: {
         python: {all: [/revision:/, /cache_key\(/], none: [/3600/]},
         typescript: {all: [/revision:/, /cacheKey\(/], none: [/3600/]},
@@ -100,7 +100,7 @@ first one is already live.`,
       id: 'rollback-path',
       title: 'Rolls back through the same atomic path',
       detail:
-        '`rollback` exists beside `promote` and reuses the same script with the actor recorded, so a rollback is as atomic and as auditable as a promotion. The draft has no rollback at all — an operator edits the pointer by hand.',
+        '`rollback` exists beside `promote` and reuses the same script with the actor recorded, so a rollback is as atomic and as auditable as a promotion. The starter has no rollback at all — an operator edits the pointer by hand.',
       match: {
         python: {all: [/def rollback\(/, /actor/, /PROMOTE_LUA/]},
         typescript: {all: [/function rollback\(/, /actor/, /PROMOTE_LUA/]},
@@ -209,7 +209,7 @@ def active_version(tenant: str, name: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** Version state: a model-generated draft that swaps in pieces and caches for an hour. */
+      starter: `/** Version state: flawed code that swaps in pieces and caches for an hour. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

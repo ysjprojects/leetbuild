@@ -8,10 +8,10 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'catalog', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body, writes an assignment and answers \`200\`. It compiles, it serves the demo, and it hides
-three production flaws — an escalation hole, an unvalidated scope, and a missing idempotency key.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body, writes
+an assignment and answers \`200\`. It compiles, it serves the demo, and it hides three production
+flaws — an escalation hole, an unvalidated scope, and a missing idempotency key. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/roles/assignments\` with body \`{"subject": "user:ada", "role": "team_admin",
 "scope": "team:eng"}\` and the authenticated \`X-Assigner-Id\` header.
@@ -81,7 +81,7 @@ audit ends up with duplicate grants nobody can explain.`,
       id: 'catalog',
       title: 'Validates role and scope against the catalog with 422',
       detail:
-        '`role` must exist in the role catalog and `scope` must have a kind the catalog allows for it, else **422**. The draft never opens the catalog, so it accepts `scope: "*"` — a scope no policy defines.',
+        '`role` must exist in the role catalog and `scope` must have a kind the catalog allows for it, else **422**. The starter never opens the catalog, so it accepts `scope: "*"` — a scope no policy defines.',
       match: {
         python: {all: [/ROLE_CATALOG/, /status_code\s*=\s*422/]},
         typescript: {all: [/ROLE_CATALOG/, /code\(\s*422\s*\)/]},
@@ -94,7 +94,7 @@ audit ends up with duplicate grants nobody can explain.`,
       id: 'no-escalation',
       title: 'Refuses a grant that exceeds the assigner, naming the permission',
       detail:
-        'Every permission the role confers must already be held by the assigner at a covering scope; the first one that is not is **403** and named as `missing_permission` in the body. The draft only checks that the assigner is an admin somewhere, so a team admin can grant `org_admin` at `org`.',
+        'Every permission the role confers must already be held by the assigner at a covering scope; the first one that is not is **403** and named as `missing_permission` in the body. The starter only checks that the assigner is an admin somewhere, so a team admin can grant `org_admin` at `org`.',
       match: {
         python: {all: [/status_code\s*=\s*403/, /missing_permission/]},
         typescript: {all: [/code\(\s*403\s*\)/, /missing_permission/]},
@@ -107,7 +107,7 @@ audit ends up with duplicate grants nobody can explain.`,
       id: 'scope-containment',
       title: 'Compares scopes by containment, not by string equality',
       detail:
-        'A holding covers the target scope only when it is the same scope, `org`, or a broader kind; a holding at a narrow scope never authorizes a wider grant. The draft compares nothing. Both a `scope_covers`/`scopeCovers` helper and the rank table must be present.',
+        'A holding covers the target scope only when it is the same scope, `org`, or a broader kind; a holding at a narrow scope never authorizes a wider grant. The starter compares nothing. Both a `scope_covers`/`scopeCovers` helper and the rank table must be present.',
       match: {
         python: {all: [/def scope_covers\(/, /SCOPE_RANK/]},
         typescript: {all: [/function scopeCovers\(/, /SCOPE_RANK/]},
@@ -120,7 +120,7 @@ audit ends up with duplicate grants nobody can explain.`,
       id: 'idempotent',
       title: 'Replays an assignment instead of granting twice',
       detail:
-        '`Idempotency-Key` is required and the assignment is stored under `(key, subject, role, scope)`; a replay returns the stored assignment instead of writing again. The draft ignores the header entirely.',
+        '`Idempotency-Key` is required and the assignment is stored under `(key, subject, role, scope)`; a replay returns the stored assignment instead of writing again. The starter ignores the header entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.assignment\(/, /store\.put\(/]},
         typescript: {all: [/Idempotency-Key/, /store\.assignment\(/, /store\.put\(/]},
@@ -132,7 +132,7 @@ audit ends up with duplicate grants nobody can explain.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/roles/assignments: a model-generated draft that trusts any admin to grant anything."""
+      starter: `"""POST /v1/roles/assignments: flawed code that trusts any admin to grant anything."""
 import logging
 
 from fastapi import FastAPI, Header
@@ -164,7 +164,7 @@ store = GrantStore()
 
 @app.post("/v1/roles/assignments")
 def assign(body: Assignment, assigner: str = Header(alias="X-Assigner-Id")) -> JSONResponse:
-    # TODO: this draft only checks that the assigner is an admin somewhere, never consults the
+    # TODO: this starter only checks that the assigner is an admin somewhere, never consults the
     # role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
     roles = store.admin_roles(assigner)
     if "org_admin" not in roles and "team_admin" not in roles:
@@ -294,7 +294,7 @@ def assign(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/roles/assignments: a model-generated draft that trusts any admin to grant anything. */
+      starter: `/** POST /v1/roles/assignments: flawed code that trusts any admin to grant anything. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -320,7 +320,7 @@ export const store: GrantStore = {
 };
 
 app.post('/v1/roles/assignments', async (request, reply) => {
-  // TODO: this draft only checks that the assigner is an admin somewhere, never consults the role
+  // TODO: this starter only checks that the assigner is an admin somewhere, never consults the role
   // catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
   const assigner = request.headers['x-assigner-id'] as string;
   const body = request.body as AssignmentBody;
@@ -487,7 +487,7 @@ func assign(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft only checks that the assigner is an admin somewhere, never consults the
+	// TODO: this starter only checks that the assigner is an admin somewhere, never consults the
 	// role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
 	roles, _ := store.AdminRoles(r.Context(), assigner)
 	admin := false
@@ -705,7 +705,7 @@ object AssignmentApi {
       post {
         headerValueByName("X-Assigner-Id") { assigner =>
           entity(as[AssignmentRequest]) { body =>
-            // TODO: this draft only checks that the assigner is an admin somewhere, never consults
+            // TODO: this starter only checks that the assigner is an admin somewhere, never consults
             // the role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
             val roles = store.adminRoles(assigner)
             if (!roles.contains("org_admin") && !roles.contains("team_admin")) {
@@ -855,7 +855,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft only checks that the assigner is an admin somewhere, never consults the
+    // TODO: this starter only checks that the assigner is an admin somewhere, never consults the
     // role catalog, accepts any scope string (a wildcard included), and has no Idempotency-Key.
     bool admin = false;
     for (const auto& role : store.adminRoles(assigner)) {
@@ -1010,5 +1010,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the *delegation* boundary, not just the authentication one. The draft reads fine because the demo has one assigner who is an organization admin and one role that happens to be grantable — so the escalation hole never fires. What is really being checked is that authorization and assignment are the same question: to hand out a permission you must hold it, at a scope that covers the one you are writing to. Three defects follow from that single idea: the set comparison (not an "is admin" flag), scope containment (so a team grant cannot reach \`org\`), and the catalog as the only source of valid scopes (so \`*\` is a 422 instead of a super-grant). Idempotency is the fourth: without a key, every client retry writes another grant, and the audit trail of "who could grant what" stops being readable. Real systems add approval workflows for privileged roles, a separate grant id per assignment, and an append-only audit log of the assigner, the role and the scope.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the *delegation* boundary, not just the authentication one. The starter reads fine because the demo has one assigner who is an organization admin and one role that happens to be grantable — so the escalation hole never fires. What is really being checked is that authorization and assignment are the same question: to hand out a permission you must hold it, at a scope that covers the one you are writing to. Three defects follow from that single idea: the set comparison (not an "is admin" flag), scope containment (so a team grant cannot reach \`org\`), and the catalog as the only source of valid scopes (so \`*\` is a 422 instead of a super-grant). Idempotency is the fourth: without a key, every client retry writes another grant, and the audit trail of "who could grant what" stops being readable. Real systems add approval workflows for privileged roles, a separate grant id per assignment, and an append-only audit log of the assigner, the role and the scope.`,
 };

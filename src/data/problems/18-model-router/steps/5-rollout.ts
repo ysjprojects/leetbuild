@@ -8,7 +8,7 @@ export const rolloutStep: Step = {
   focus: ['router', 'db', 'eval'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it takes the rollout request and applies it, so
+The starter is working code: it takes the rollout request and applies it, so
 the demo shows the canary percentage change. It trusts the caller, skips the gate that is the whole
 point of a rollout, and cannot roll back. Fix it and prove the fix.
 
@@ -23,7 +23,7 @@ Implement \`POST /v1/policies/{policy}/rollout\` with body
 - A rollback (\`rollback: true\`) pins the **calling tenant** to the version it is currently being
   served (key \`pin:{tenant}:{policy}\`) before traffic drops to 0, so no tenant flips mid-session.
 - The response is the caller’s **active assignment** — its pinned version if there is one, else the
-  policy’s canary. The draft echoes the request body instead.
+  policy’s canary. The starter echoes the request body instead.
 
 **Failure mode the checks target.** Trusting the request body means any service with network access
 can point 100% of a tenant’s traffic at an unvalidated version; without the eval gate a regression
@@ -63,7 +63,7 @@ one of those is invisible until the day it matters.`,
       id: 'validate',
       title: 'Validates policy name, version and percentage',
       detail:
-        'An invalid policy name, `version < 1` or a percentage outside 0..100 is **400**, and a missing tenant is **401**. The draft applies whatever the body says.',
+        'An invalid policy name, `version < 1` or a percentage outside 0..100 is **400**, and a missing tenant is **401**. The starter applies whatever the body says.',
       match: {
         python: {
           all: [
@@ -126,7 +126,7 @@ one of those is invisible until the day it matters.`,
       id: 'pin-rollback',
       title: 'Pins the tenant’s version during a rollback',
       detail:
-        'A rollback writes `pin:{tenant}:{policy}` for the calling tenant before traffic drops, so no tenant flips mid-session. The draft has no rollback path and no pins.',
+        'A rollback writes `pin:{tenant}:{policy}` for the calling tenant before traffic drops, so no tenant flips mid-session. The starter has no rollback path and no pins.',
       match: {
         python: {all: [/if body\.rollback:/, /store\.pin\(/, /pin:\{tenant\}:\{policy\}/]},
         typescript: {all: [/if \(body\.rollback\s*===?\s*true\)/, /store\.pin\(/, /pin:\$\{tenant\}:\$\{policy\}/]},
@@ -139,7 +139,7 @@ one of those is invisible until the day it matters.`,
       id: 'assignment',
       title: 'Answers with the caller’s active assignment',
       detail:
-        'The response is the caller’s active assignment — its pinned version if present, else the policy’s canary. The draft echoes the request body.',
+        'The response is the caller’s active assignment — its pinned version if present, else the policy’s canary. The starter echoes the request body.',
       match: {
         python: {all: [/store\.assignment\(/, /"assignment"/]},
         typescript: {all: [/store\.assignment\(/, /assignment:/]},
@@ -262,7 +262,7 @@ def rollout(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/policies/:policy/rollout: a model-generated draft that trusts the request body. */
+      starter: `/** POST /v1/policies/:policy/rollout: flawed code that trusts the request body. */
 import Fastify from 'fastify';
 
 import {store} from './rollout_store';
@@ -769,5 +769,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is asking whether you can review a control-plane endpoint like a data-plane one. Three contracts are being checked. Validation: a rollout endpoint that trusts its body lets anything on the network move a tenant’s traffic. The eval gate: raising exposure must be earned by a passing eval for the exact target version — the gate is the difference between shipping a prompt and gambling a tenant’s experience. Pins and rollback: a percentage is a fleet-wide knob, and without a per-tenant pin a rollback flips a tenant mid-session between two model versions. The response shape matters too: an operator needs the assignment that actually applies to the caller, not a restatement of the request. Real platforms add eval windows (minimum sample sizes before a pass counts), staged percentages with automatic promotion, and an audit log of who changed which policy when.`,
+  debrief: `The interviewer is asking whether you can debug a control-plane endpoint like a data-plane one. Three contracts are being checked. Validation: a rollout endpoint that trusts its body lets anything on the network move a tenant’s traffic. The eval gate: raising exposure must be earned by a passing eval for the exact target version — the gate is the difference between shipping a prompt and gambling a tenant’s experience. Pins and rollback: a percentage is a fleet-wide knob, and without a per-tenant pin a rollback flips a tenant mid-session between two model versions. The response shape matters too: an operator needs the assignment that actually applies to the caller, not a restatement of the request. Real platforms add eval windows (minimum sample sizes before a pass counts), staged percentages with automatic promotion, and an audit log of who changed which policy when.`,
 };

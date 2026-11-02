@@ -8,9 +8,9 @@ export const classifierTiersStep: Step = {
   focus: ['guard', 'classifier', 'judge'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the classifier and
+**Starting point.** The starter is working code: it calls the classifier and
 the judge and returns a verdict, so the demo refuses the obvious queries. It hides four production
-flaws, and one of them is a legal exposure, not a bug. Review it, fix it, and prove the fix.
+flaws, and one of them is a legal exposure, not a bug. Debug it, fix it, and prove the fix.
 
 Implement \`decide(text, policy)\` — the decision every guard request runs — as three tiers in the
 order the Zillow post deploys them:
@@ -32,7 +32,7 @@ order the Zillow post deploys them:
   \`guard_unavailable\` (\`FAIL_CLOSED_REASON\`). A guard that is down must not look like a guard
   that approved.
 
-**Failure mode the checks target.** The draft catches every exception and allows: when the
+**Failure mode the checks target.** The starter catches every exception and allows: when the
 classifier is overloaded, every steering query passes, silently. Its single 0.5 threshold trades
 recall for precision — the opposite of what the domain requires. It calls the judge on every
 request, so the fast tier buys nothing and the LLM bill scales with traffic. And it has no stop
@@ -60,7 +60,7 @@ the time — does not exist.`,
       id: 'stoplist-first',
       title: 'Runs the stop list before any RPC',
       detail:
-        'The policy’s `stop_phrases` are scanned first and a hit returns tier `stoplist` without calling the classifier. The draft has no deterministic tier at all.',
+        'The policy’s `stop_phrases` are scanned first and a hit returns tier `stoplist` without calling the classifier. The starter has no deterministic tier at all.',
       match: {
         python: {all: [/stop_phrases/, /"stoplist"/], order: [/stop_phrases/, /\.Classify\(/]},
         typescript: {all: [/stopPhrases/, /'stoplist'/], order: [/stopPhrases/, /\.Classify\(/]},
@@ -73,7 +73,7 @@ the time — does not exist.`,
       id: 'deadline',
       title: 'Classifies under a 250 ms deadline',
       detail:
-        'Every `Classify` call carries a 250 ms deadline — a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + DEADLINE_MS`. The draft calls without one and a slow classifier pins the conversation.',
+        'Every `Classify` call carries a 250 ms deadline — a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + DEADLINE_MS`. The starter calls without one and a slow classifier pins the conversation.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.25/, /timeout=DEADLINE_S/, /\.Classify\(/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*250/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.Classify\(/]},
@@ -99,7 +99,7 @@ the time — does not exist.`,
       id: 'judge-band',
       title: 'Calls the judge only for the uncertain band, under 2 s',
       detail:
-        'The LLM judge is called with a 2 s deadline, and only after the classifier left the score in `[REVIEW_LOW, BLOCK_THRESHOLD)`. The draft calls the judge on every request with no deadline.',
+        'The LLM judge is called with a 2 s deadline, and only after the classifier left the score in `[REVIEW_LOW, BLOCK_THRESHOLD)`. The starter calls the judge on every request with no deadline.',
       match: {
         python: {
           all: [/JUDGE_DEADLINE_S\s*=\s*2/, /timeout=JUDGE_DEADLINE_S/, /\.Judge\(/],
@@ -127,7 +127,7 @@ the time — does not exist.`,
       id: 'fail-closed',
       title: 'Fails closed on any tier error',
       detail:
-        'A gRPC error or deadline at the classifier or the judge returns a blocked decision with `FAIL_CLOSED_REASON` (`guard_unavailable`). The draft catches everything and allows — an outage becomes an approval.',
+        'A gRPC error or deadline at the classifier or the judge returns a blocked decision with `FAIL_CLOSED_REASON` (`guard_unavailable`). The starter catches everything and allows — an outage becomes an approval.',
       match: {
         python: {
           all: [/FAIL_CLOSED_REASON\s*=\s*"guard_unavailable"/, /except grpc\.RpcError/],
@@ -261,7 +261,7 @@ def decide(text: str, policy: Policy) -> Decision:
 `,
     },
     typescript: {
-      starter: `/** Guard tiers: a model-generated draft with one threshold that allows on error. */
+      starter: `/** Guard tiers: flawed code with one threshold that allows on error. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -740,5 +740,5 @@ Decision decide(Classifier::Stub* classifier, Judge::Stub* judge, const std::str
 `,
     },
   },
-  debrief: `The interviewer is probing whether you understand that a guardrail's failure policy is a legal decision, not an availability one. The draft looks fine because a healthy classifier never enters the error path, and 0.5 "feels" neutral. Four separate defects are being checked: the deterministic stop-list tier (the post's "right action 100% of the time" for the worst phrases, and the one layer that works when every model is down); the per-call deadline on a tier that sits inside conversation latency; two thresholds that encode the post's precision/recall argument in code — block early, allow only when confident, and send the band to a slower reader; and fail-closed, because an outage that returns \`allowed\` is indistinguishable from approval in the audit. The judge gating is the cost half: the fast tier only pays for itself if the LLM never sees traffic it already decided. Real systems add a breaker around the judge so a long outage degrades to "band → blocked" without 2 s of waiting per request, per-tier latency histograms, and a shadow-scoring path that feeds sampled decisions to human review — the feedback loop the post describes.`,
+  debrief: `The interviewer is probing whether you understand that a guardrail's failure policy is a legal decision, not an availability one. The starter looks fine because a healthy classifier never enters the error path, and 0.5 "feels" neutral. Four separate defects are being checked: the deterministic stop-list tier (the post's "right action 100% of the time" for the worst phrases, and the one layer that works when every model is down); the per-call deadline on a tier that sits inside conversation latency; two thresholds that encode the post's precision/recall argument in code — block early, allow only when confident, and send the band to a slower reader; and fail-closed, because an outage that returns \`allowed\` is indistinguishable from approval in the audit. The judge gating is the cost half: the fast tier only pays for itself if the LLM never sees traffic it already decided. Real systems add a breaker around the judge so a long outage degrades to "band → blocked" without 2 s of waiting per request, per-tier latency histograms, and a shadow-scoring path that feeds sampled decisions to human review — the feedback loop the post describes.`,
 };

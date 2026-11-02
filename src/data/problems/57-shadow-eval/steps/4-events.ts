@@ -8,10 +8,9 @@ export const shadowEventsStep: Step = {
   focus: ['shadow', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes a comparison event
-on the happy path, so the analytics team sees data arriving. It compiles and the demo works. The
-contract it breaks is the one that makes the topic safe and the comparison correct. Review it, fix
-it, and prove the fix.
+**Starting point.** The starter is working code: it publishes a comparison event on the happy path,
+so the analytics team sees data arriving. It compiles and the demo works. The contract it breaks is
+the one that makes the topic safe and the comparison correct. Debug it, fix it, and prove the fix.
 
 Implement the path that publishes one **paired evaluation** per shadowed request.
 
@@ -28,7 +27,7 @@ Implement the path that publishes one **paired evaluation** per shadowed request
   instead of dropping the sample or failing the request; a relay republishes outbox rows when the
   broker recovers.
 
-**Failure mode the checks target.** The draft publishes the **full prompt and both completions** so
+**Failure mode the checks target.** The starter publishes the **full prompt and both completions** so
 analysts can review by hand — a data leak with a long tail into a retained topic; it keys by **user**,
 so one config's samples scatter across partitions and lose their pairing order; and it has **no
 outbox**, so a broker hiccup silently loses the comparisons the experiment depends on.`,
@@ -60,7 +59,7 @@ outbox**, so a broker hiccup silently loses the comparisons the experiment depen
       id: 'config-key',
       title: 'Keys every sample by the config id',
       detail:
-        'The message key is the config id (`key=config_id`, `key: configId`, `Key: []byte(configID)`, a `ProducerRecord` keyed by config). The draft keys by user, so one config’s samples scatter across partitions and lose pairing order.',
+        'The message key is the config id (`key=config_id`, `key: configId`, `Key: []byte(configID)`, a `ProducerRecord` keyed by config). The starter keys by user, so one config’s samples scatter across partitions and lose pairing order.',
       match: {
         python: {all: [/key=config_id/]},
         typescript: {all: [/key:\s*configId/]},
@@ -73,7 +72,7 @@ outbox**, so a broker hiccup silently loses the comparisons the experiment depen
       id: 'no-content',
       title: 'No prompt or completion text in the payload',
       detail:
-        'The payload carries both versions, both scores and a request fingerprint — never the prompt or a completion. The draft copies the prompt and both completions into a retained, replicated topic.',
+        'The payload carries both versions, both scores and a request fingerprint — never the prompt or a completion. The starter copies the prompt and both completions into a retained, replicated topic.',
       match: {
         python: {none: [/\bprompt\b/i, /\bcompletion/i], all: [/fingerprint/i]},
         typescript: {none: [/\bprompt\b/i, /\bcompletion/i], all: [/fingerprint/i]},
@@ -86,7 +85,7 @@ outbox**, so a broker hiccup silently loses the comparisons the experiment depen
       id: 'outbox',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insertOutbox`) inside the error branch instead of dropping the sample. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insertOutbox`) inside the error branch instead of dropping the sample. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -124,7 +123,7 @@ class ShadowPublisher:
         self.producer = producer
 
     def publish(self, config_id: str, pair: dict) -> None:
-        # TODO: the draft keys by user so one config's samples scatter, publishes the prompt and
+        # TODO: the starter keys by user so one config's samples scatter, publishes the prompt and
         # both completions so analysts can review, and has no outbox for a rejected produce.
         payload = json.dumps(
             {
@@ -183,7 +182,7 @@ class ShadowPublisher:
 `,
     },
     typescript: {
-      starter: `/** shadow.sample: a model-generated draft that ships user content downstream. */
+      starter: `/** shadow.sample: flawed code that ships user content downstream. */
 import type {Producer} from 'kafkajs';
 
 export const SHADOW_TOPIC = 'shadow.sample';
@@ -192,7 +191,7 @@ export class ShadowPublisher {
   constructor(private readonly producer: Producer) {}
 
   async publish(configId: string, pair: Record<string, unknown>): Promise<void> {
-    // TODO: the draft keys by user so one config's samples scatter, publishes the prompt and both
+    // TODO: the starter keys by user so one config's samples scatter, publishes the prompt and both
     // completions so analysts can review, and has no outbox for a rejected produce.
     const payload = JSON.stringify({
       config_id: configId,
@@ -280,7 +279,7 @@ func NewShadowPublisher(brokers []string) *ShadowPublisher {
 }
 
 func (p *ShadowPublisher) Publish(ctx context.Context, configID string, pair map[string]any) error {
-	// TODO: the draft keys by user so one config's samples scatter, publishes the prompt and both
+	// TODO: the starter keys by user so one config's samples scatter, publishes the prompt and both
 	// completions so analysts can review, and has no outbox for a rejected produce.
 	payload, _ := json.Marshal(map[string]any{
 		"user_id":               pair["user_id"],
@@ -366,7 +365,7 @@ final class ShadowPublisher(producer: KafkaProducer[String, String]) {
   import ShadowPublisher._
 
   def publish(configId: String, pair: Map[String, String]): Unit = {
-    // TODO: the draft keys by user so one config's samples scatter, publishes the prompt and both
+    // TODO: the starter keys by user so one config's samples scatter, publishes the prompt and both
     // completions so analysts can review, and has no outbox for a rejected produce.
     val payload =
       "user=" + pair("user_id") + " prompt=" + pair("prompt") + " completion=" + pair("completion")
@@ -432,7 +431,7 @@ class ShadowPublisher {
 
   void publish(const std::string& configId, const std::string& userId, const std::string& prompt,
                const std::string& completion) {
-    // TODO: the draft keys by user so one config's samples scatter, publishes the prompt and the
+    // TODO: the starter keys by user so one config's samples scatter, publishes the prompt and the
     // completion so analysts can review, and has no outbox for a rejected produce.
     const std::string payload =
         "{\\"user_id\\":\\"" + userId + "\\",\\"prompt\\":\\"" + prompt + "\\",\\"completion\\":\\"" + completion + "\\"}";

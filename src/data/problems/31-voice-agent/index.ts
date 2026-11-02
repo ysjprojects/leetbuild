@@ -7,12 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Voice agent on the AI-era track: the course is not "play audio over a socket", it is the review
- * you owe a model-generated realtime speech loop before a caller hears it. A codec and duration
- * contract at the door with a resumable session → atomic turn state in Redis so barge-in never
- * races the TTS offset → cancellable ASR/TTS streams that resume instead of replaying → turn
- * events keyed by session with a redacted transcript reference → a bounded, tenant-scoped
- * transcript read with cursor pagination.
+ * Voice agent: the course is not "play audio over a socket", it is the debugging you owe a realtime
+ * speech loop before a caller hears it. A codec and duration contract at the door with a resumable
+ * session → atomic turn state in Redis so barge-in never races the TTS offset → cancellable ASR/TTS
+ * streams that resume instead of replaying → turn events keyed by session with a redacted
+ * transcript reference → a bounded, tenant-scoped transcript read with cursor pagination.
  */
 export const voiceAgentProblem: Problem = {
   id: 'voice-agent',
@@ -20,7 +19,7 @@ export const voiceAgentProblem: Problem = {
   tagline: 'Realtime speech sessions with barge-in, bounded retries and transcript-safe events.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Voice Agent
 
@@ -68,12 +67,12 @@ One service, **voice-gateway**, with five pieces:
    capped at 500 turns with cursor pagination, scoped to the tenant, and never exposing an audio
    storage path.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it plays the demo
-call, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw: it compiles, it plays the demo call, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

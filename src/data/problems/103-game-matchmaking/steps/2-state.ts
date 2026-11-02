@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['matchmaker', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it takes a candidate roster
-from the pool and claims the tickets in a loop. It compiles, it passes the single-threaded demo, and
-it hides the flaw that produces the worst bug in matchmaking. Review it, fix it, and prove the fix.
+**Starting point.** The starter is working code: it takes a candidate roster from the pool and
+claims the tickets in a loop. It compiles, it passes the single-threaded demo, and it hides the flaw
+that produces the worst bug in matchmaking. Debug it, fix it, and prove the fix.
 
 Implement the pool module the matchmaker uses when it forms a match:
 
@@ -18,17 +18,17 @@ Implement the pool module the matchmaker uses when it forms a match:
   atomic Lua \`EVAL\`**: first test whether any ticket is already claimed, then, only if the whole
   roster is free, remove every ticket from the bucket and mark it claimed with the match id. If any
   ticket is already claimed the script returns **0** without touching the pool and the caller gets
-  \`false\`. The draft tests and claims one ticket at a time, so two matchmakers racing over an
+  \`false\`. The starter tests and claims one ticket at a time, so two matchmakers racing over an
   overlapping pool both pass the "already claimed" test and put one player in two rosters.
 - A claimed ticket must be **invisible to other matchmakers**: the script \`ZREM\`s the ticket from its
   bucket in the same step that marks it claimed. A ticket left in the bucket is still handed out by
   the next pool scan.
 - The **depth counter** \`{DEPTH_KEY}:{bucket}\` must match the set of waiting tickets after both a
   claim and a cancellation: the claim script \`HINCRBY\`s the depth down by the number of tickets it
-  removes, and \`cancel_ticket\` \`HINCRBY\`s it back up when a ticket returns to the pool. The draft's
+  removes, and \`cancel_ticket\` \`HINCRBY\`s it back up when a ticket returns to the pool. The starter's
   client-side loop leaves the counter behind as soon as a claim is partially refused.
 - \`cancel_ticket(ticket_id, bucket, skill)\` must **return the ticket to its bucket**: \`ZADD\` it back
-  at its skill, restore the depth counter, and clear the claimed marker. The draft deletes the
+  at its skill, restore the depth counter, and clear the claimed marker. The starter deletes the
   open-ticket pointer only, so the ticket ends up neither in the pool nor in a match — a ghost.
 - Nothing may mark a ticket claimed before the whole roster is known to be free: the marker is what
   the next matchmaker's script tests.
@@ -64,7 +64,7 @@ pool and out of the claimed set, so neither a match nor a cancel can ever clear 
       id: 'atomic-claim',
       title: 'Claims the whole roster in one atomic script',
       detail:
-        'Every participant ticket is claimed by one `EVAL`/`NewScript` run. The draft checks and claims one ticket at a time, so a concurrent matchmaker can claim an overlapping ticket between two of its commands.',
+        'Every participant ticket is claimed by one `EVAL`/`NewScript` run. The starter checks and claims one ticket at a time, so a concurrent matchmaker can claim an overlapping ticket between two of its commands.',
       match: {
         python: {all: [/CLAIM_LUA/, /\.eval\(/]},
         typescript: {all: [/CLAIM_LUA/, /\.eval\(/]},
@@ -77,7 +77,7 @@ pool and out of the claimed set, so neither a match nor a cancel can ever clear 
       id: 'all-or-nothing',
       title: 'Claims every participant or none',
       detail:
-        'The script tests the claimed markers first and returns **0** without touching the pool when any ticket is already claimed, so a half-claimed roster is impossible. The draft returns after removing some tickets, leaving those tickets claimed by a match that will never form.',
+        'The script tests the claimed markers first and returns **0** without touching the pool when any ticket is already claimed, so a half-claimed roster is impossible. The starter returns after removing some tickets, leaving those tickets claimed by a match that will never form.',
       match: {
         python: {all: [/CLAIMED_PREFIX/, /return 0/]},
         typescript: {all: [/CLAIMED_PREFIX/, /return 0/]},
@@ -90,7 +90,7 @@ pool and out of the claimed set, so neither a match nor a cancel can ever clear 
       id: 'invisible-claim',
       title: 'Claimed tickets leave the pool',
       detail:
-        'The script `ZREM`s each ticket from its bucket as it marks it claimed, so another matchmaker scanning the bucket can never see a ticket that is already in a match. The draft leaves claimed tickets in the bucket.',
+        'The script `ZREM`s each ticket from its bucket as it marks it claimed, so another matchmaker scanning the bucket can never see a ticket that is already in a match. The starter leaves claimed tickets in the bucket.',
       match: {
         python: {all: [/ZREM/]},
         typescript: {all: [/ZREM/]},
@@ -103,7 +103,7 @@ pool and out of the claimed set, so neither a match nor a cancel can ever clear 
       id: 'depth-counters',
       title: 'Pool depth counters track the ticket set',
       detail:
-        'The same script moves the depth counter `HINCRBY depth -N` when it removes tickets, and the cancel path moves it back, so `{DEPTH_KEY}:{bucket}` always equals the tickets still waiting. The draft updates the counter outside the claim, so a refused or cancelled ticket leaves it wrong.',
+        'The same script moves the depth counter `HINCRBY depth -N` when it removes tickets, and the cancel path moves it back, so `{DEPTH_KEY}:{bucket}` always equals the tickets still waiting. The starter updates the counter outside the claim, so a refused or cancelled ticket leaves it wrong.',
       match: {
         python: {all: [/HINCRBY/, /depth/]},
         typescript: {all: [/HINCRBY/, /depth/]},
@@ -116,7 +116,7 @@ pool and out of the claimed set, so neither a match nor a cancel can ever clear 
       id: 'cancel-releases',
       title: 'Cancellation returns the ticket to the pool',
       detail:
-        '`cancel_ticket` `ZADD`s the ticket back into its bucket at its skill, restores the depth counter and clears the claimed marker — so the ticket can be matched again. The draft deletes the open-ticket pointer only and leaves a ghost.',
+        '`cancel_ticket` `ZADD`s the ticket back into its bucket at its skill, restores the depth counter and clears the claimed marker — so the ticket can be matched again. The starter deletes the open-ticket pointer only and leaves a ghost.',
       match: {
         python: {all: [/CANCEL_LUA/, /ZADD/]},
         typescript: {all: [/CANCEL_LUA/, /ZADD/]},
@@ -148,7 +148,7 @@ def claimed_key(ticket_id: str) -> str:
 
 
 def claim_participants(r: redis_lib.Redis, match_id: str, bucket: int, ticket_ids: list[str]) -> bool:
-    # TODO: this draft claims the tickets one at a time, so two matchmakers racing over an
+    # TODO: this starter claims the tickets one at a time, so two matchmakers racing over an
     # overlapping pool can both pass the "already claimed" test and put one player in two rosters.
     # Claim every participant in one atomic script, keep claimed tickets out of the bucket, keep the
     # depth counter honest, and put the ticket back in its bucket on cancel.
@@ -224,7 +224,7 @@ def cancel_ticket(r: redis_lib.Redis, ticket_id: str, bucket: int, skill: float)
 `,
     },
     typescript: {
-      starter: `/** Pool state: a model-generated draft that claims tickets one at a time. */
+      starter: `/** Pool state: flawed code that claims tickets one at a time. */
 import {Redis} from 'ioredis';
 
 export const r = new Redis('redis://redis:6379');
@@ -246,7 +246,7 @@ export async function claimParticipants(
   bucket: number,
   ticketIds: string[],
 ): Promise<boolean> {
-  // TODO: this draft claims the tickets one at a time, so two matchmakers racing over an
+  // TODO: this starter claims the tickets one at a time, so two matchmakers racing over an
   // overlapping pool can both pass the "already claimed" test and put one player in two rosters.
   // Claim every participant in one atomic script, keep claimed tickets out of the bucket, keep the
   // depth counter honest, and put the ticket back in its bucket on cancel.
@@ -365,7 +365,7 @@ func depthKeyFor(bucket int) string {
 }
 
 func ClaimParticipants(ctx context.Context, matchID string, bucket int, ticketIDs []string) (bool, error) {
-	// TODO: this draft claims the tickets one at a time, so two matchmakers racing over an
+	// TODO: this starter claims the tickets one at a time, so two matchmakers racing over an
 	// overlapping pool can both pass the "already claimed" test and put one player in two rosters.
 	// Claim every participant in one atomic script, keep claimed tickets out of the bucket, keep the
 	// depth counter honest, and put the ticket back in its bucket on cancel.
@@ -483,7 +483,7 @@ object PoolState {
   def depthKeyFor(bucket: Int): String = DepthKey + ":" + bucket
 
   def claimParticipants(matchId: String, bucket: Int, ticketIds: List[String]): Boolean = {
-    // TODO: this draft claims the tickets one at a time, so two matchmakers racing over an
+    // TODO: this starter claims the tickets one at a time, so two matchmakers racing over an
     // overlapping pool can both pass the "already claimed" test and put one player in two rosters.
     // Claim every participant in one atomic script, keep claimed tickets out of the bucket, keep the
     // depth counter honest, and put the ticket back in its bucket on cancel.
@@ -581,7 +581,7 @@ std::string bucketKey(int bucket) { return kBucketPrefix + ":" + std::to_string(
 std::string depthKeyFor(int bucket) { return kDepthKey + ":" + std::to_string(bucket); }
 
 bool claimParticipants(const std::string& matchId, int bucket, const std::vector<std::string>& ticketIds) {
-  // TODO: this draft claims the tickets one at a time, so two matchmakers racing over an overlapping
+  // TODO: this starter claims the tickets one at a time, so two matchmakers racing over an overlapping
   // pool can both pass the "already claimed" test and put one player in two rosters. Claim every
   // participant in one atomic script, keep claimed tickets out of the bucket, keep the depth counter
   // honest, and put the ticket back in its bucket on cancel.
@@ -671,5 +671,5 @@ void cancelTicket(const std::string& ticketId, int bucket, double skill) {
     'The marker is what the next matchmaker tests, so never set one before the whole roster is known to be free: test all participants first, `return 0` on the first claimed one, and only then remove and mark. That is what makes the claim all-or-nothing instead of "mostly".',
     'The depth counter is a cache of "how many tickets are waiting here", so every path that moves a ticket has to move it too: down by `N` in the claim script, up by one in `cancel_ticket`. If cancel only deletes the open-ticket pointer, the ticket is neither waiting nor claimed — a ghost that will never be matched and never be released.',
   ],
-  debrief: `The interviewer is testing whether you know what the pool is *for*: it is the shared structure every matchmaker instance reads and writes, so every operation on it is a race until proven otherwise. The draft fails on three levels. First, the claim is not atomic — checking and claiming ticket by ticket means two matchmakers can both see the same free ticket, and the loser's roster still gets formed with a player who is already in a game. Second, a partially-refused claim leaves markers set on tickets that were removed from the pool and will never be released, so those players wait in a queue position that no longer exists. Third, the depth counter is moved outside the atomic unit, so the number the scheduler reads drifts away from the tickets that are actually waiting. The right shape is one Lua script that tests every marker, refuses as a whole, and then removes and marks as a whole — and a cancel path that is the exact inverse: put the ticket back, restore the depth, clear the marker. Real pools add ticket TTLs so a crashed process cannot strand a ticket, per-bucket depth keys so a hot bucket does not contend with a cold one, and a "candidate" phase where the matchmaker claims with a short lease before it commits the roster — which is what the next step builds on when the allocation fails.`,
+  debrief: `The interviewer is testing whether you know what the pool is *for*: it is the shared structure every matchmaker instance reads and writes, so every operation on it is a race until proven otherwise. The starter fails on three levels. First, the claim is not atomic — checking and claiming ticket by ticket means two matchmakers can both see the same free ticket, and the loser's roster still gets formed with a player who is already in a game. Second, a partially-refused claim leaves markers set on tickets that were removed from the pool and will never be released, so those players wait in a queue position that no longer exists. Third, the depth counter is moved outside the atomic unit, so the number the scheduler reads drifts away from the tickets that are actually waiting. The right shape is one Lua script that tests every marker, refuses as a whole, and then removes and marks as a whole — and a cancel path that is the exact inverse: put the ticket back, restore the depth, clear the marker. Real pools add ticket TTLs so a crashed process cannot strand a ticket, per-bucket depth keys so a hot bucket does not contend with a cold one, and a "candidate" phase where the matchmaker claims with a short lease before it commits the roster — which is what the next step builds on when the allocation fails.`,
 };

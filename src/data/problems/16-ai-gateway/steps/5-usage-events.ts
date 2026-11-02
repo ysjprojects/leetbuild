@@ -8,8 +8,8 @@ export const usageEventsStep: Step = {
   focus: ['gateway', 'usage', 'billing'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it produces a usage event on the happy path and
-the billing consumer increments Redis, so the numbers look right in a demo. The review finds the
+The starter is working code: it produces a usage event on the happy path and
+the billing consumer increments Redis, so the numbers look right in a demo. Debugging finds the
 three bugs that only show up on a bad day. Find them, fix them, and prove the fix.
 
 Implement the gateway’s usage pipeline:
@@ -843,5 +843,5 @@ export async function start(): Promise<void> {
 `,
     },
   },
-  debrief: `The interview signal is **delivery semantics under failure**: can you say what is guaranteed by a key, by acks, by an idempotent producer, and by the order of the consumer’s write and commit? The draft passes the demo because no broker fails and no consumer restarts; the review is about the day one does. Keying by tenant is an ordering decision; \`acks=all\` plus idempotence is a durability decision; the outbox is an availability decision; and \`HINCRBY\` before commit is an at-least-once accounting decision. The remaining real-system gap is consumer idempotence: if the increment succeeds and the commit fails, the redelivered event increments again, so production billing stores the request id in a dedupe set or makes the counter update conditional on it.`,
+  debrief: `The interview signal is **delivery semantics under failure**: can you say what is guaranteed by a key, by acks, by an idempotent producer, and by the order of the consumer’s write and commit? The starter passes the demo because no broker fails and no consumer restarts; the debugging is about the day one does. Keying by tenant is an ordering decision; \`acks=all\` plus idempotence is a durability decision; the outbox is an availability decision; and \`HINCRBY\` before commit is an at-least-once accounting decision. The remaining real-system gap is consumer idempotence: if the increment succeeds and the commit fails, the redelivered event increments again, so production billing stores the request id in a dedupe set or makes the counter update conditional on it.`,
 };

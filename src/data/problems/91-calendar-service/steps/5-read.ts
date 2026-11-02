@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'api', 'expander', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the range route,
+**Starting point.** The starter is working code: it registers the range route,
 reads the window, expands each event's rule and answers with the instances. It compiles, it serves
-the week view in the demo, and it hides four production flaws. Review it like the service owner,
+the week view in the demo, and it hides four production flaws. Debug it like the service owner,
 fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/calendars/{id}/events?from=<iso>&to=<iso>\`.
@@ -82,7 +82,7 @@ authenticated caller.`,
       id: 'range-cap',
       title: 'Rejects a window over 90 days with 400',
       detail:
-        'Both bounds are required, `to` must be after `from`, and the window may span at most **90 days** (`MAX_RANGE_DAYS`); every violation answers **400** before the expansion runs. The draft defaults to a year, swaps inverted bounds and clamps anything wider instead of failing the request.',
+        'Both bounds are required, `to` must be after `from`, and the window may span at most **90 days** (`MAX_RANGE_DAYS`); every violation answers **400** before the expansion runs. The starter defaults to a year, swaps inverted bounds and clamps anything wider instead of failing the request.',
       match: {
         python: {all: [/MAX_RANGE_DAYS/, /timedelta\(\s*days\s*=\s*MAX_RANGE_DAYS\s*\)/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_RANGE_DAYS/, /MAX_RANGE_MS/, /code\(\s*400\s*\)/]},
@@ -95,7 +95,7 @@ authenticated caller.`,
       id: 'occurrence-ids',
       title: 'Expands server-side with a per-occurrence id and revision',
       detail:
-        'The read path expands the rules itself and memoises the slice under `(calendar, window, generation)`; every occurrence carries `occurrence_id` (`event_id:start`) plus the `revision` it was expanded from, so a client can dedupe across refreshes. The draft returns the raw RRULE and no per-occurrence id.',
+        'The read path expands the rules itself and memoises the slice under `(calendar, window, generation)`; every occurrence carries `occurrence_id` (`event_id:start`) plus the `revision` it was expanded from, so a client can dedupe across refreshes. The starter returns the raw RRULE and no per-occurrence id.',
       match: {
         python: {
           all: [
@@ -138,7 +138,7 @@ authenticated caller.`,
       id: 'instance-once',
       title: 'Emits an overridden instance once, in place',
       detail:
-        'An occurrence the override table already covers is skipped by the expansion — keyed by `occurrence_id`, the same key the store uses — and the override is appended instead, with its own revision. The draft lists the original and the override side by side, so the slot is booked twice.',
+        'An occurrence the override table already covers is skipped by the expansion — keyed by `occurrence_id`, the same key the store uses — and the override is appended instead, with its own revision. The starter lists the original and the override side by side, so the slot is booked twice.',
       match: {
         python: {
           all: [/overrides\.get\(/, /overrides\.items\(\)/, /override\["revision"\]/],
@@ -166,7 +166,7 @@ authenticated caller.`,
       id: 'private-calendars',
       title: 'Refuses non-members on private calendars with 403',
       detail:
-        'An unknown calendar is **404** and a `private` calendar is **403** for a caller whose tenant is not a member — both before any expansion or cache work. The draft serves private calendars to every caller that gets past the 404.',
+        'An unknown calendar is **404** and a `private` calendar is **403** for a caller whose tenant is not a member — both before any expansion or cache work. The starter serves private calendars to every caller that gets past the 404.',
       match: {
         python: {
           all: [/PRIVATE/, /store\.is_member\(/, /status_code\s*=\s*403/, /status_code\s*=\s*404/],
@@ -258,9 +258,9 @@ def read_events(
     from_: str | None = Query(default=None, alias="from"),
     to_: str | None = Query(default=None, alias="to"),
 ) -> JSONResponse:
-    # TODO: this draft expands a year when the range is missing and silently clamps a wider one,
+    # TODO: this starter expands a year when the range is missing and silently clamps a wider one,
     # returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-    # replace, and never asks whether the caller may read this calendar. Review all four.
+    # replace, and never asks whether the caller may read this calendar. Fix all four.
     calendar = store.get_calendar(id)
     if calendar is None:
         raise HTTPException(status_code=404, detail="unknown calendar")
@@ -395,7 +395,7 @@ def read_events(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/calendars/:id/events: a model-generated draft that expands a year by default. */
+      starter: `/** GET /v1/calendars/:id/events: flawed code that expands a year by default. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -445,9 +445,9 @@ declare const cache: ExpansionCache;
 declare function expand(event: EventRow, fromMs: number, toMs: number): string[];
 
 app.get('/v1/calendars/:id/events', async (request, reply) => {
-  // TODO: this draft expands a year when the range is missing and silently clamps a wider one,
+  // TODO: this starter expands a year when the range is missing and silently clamps a wider one,
   // returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-  // replace, and never asks whether the caller may read this calendar. Review all four.
+  // replace, and never asks whether the caller may read this calendar. Fix all four.
   const calendar = await store.getCalendar(request.params.id);
   if (calendar === null) return reply.code(404).send({error: 'unknown calendar'});
 
@@ -650,9 +650,9 @@ func expand(event Event, from, to time.Time) []string {
 }
 
 func readEvents(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft expands a year when the range is missing and silently clamps a wider one,
+	// TODO: this starter expands a year when the range is missing and silently clamps a wider one,
 	// returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-	// replace, and never asks whether the caller may read this calendar. Review all four.
+	// replace, and never asks whether the caller may read this calendar. Fix all four.
 	id := r.PathValue("id")
 	calendar, err := store.GetCalendar(r.Context(), id)
 	if err != nil {
@@ -963,9 +963,9 @@ object ReadApi {
   }
 
   def readEvents(id: String, fromRaw: Option[String], toRaw: Option[String]): (StatusCode, String) = {
-    // TODO: this draft expands a year when the range is missing and silently clamps a wider one,
+    // TODO: this starter expands a year when the range is missing and silently clamps a wider one,
     // returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-    // replace, and never asks whether the caller may read this calendar. Review all four.
+    // replace, and never asks whether the caller may read this calendar. Fix all four.
     store.getCalendar(id) match {
       case None => (StatusCodes.NotFound, """{"error":"unknown calendar"}""")
       case Some(_) =>
@@ -1186,9 +1186,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/calendars/([^/]+)/events)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft expands a year when the range is missing and silently clamps a wider one,
+    // TODO: this starter expands a year when the range is missing and silently clamps a wider one,
     // returns the raw RRULE with no per-occurrence id, lists overrides beside the instances they
-    // replace, and never asks whether the caller may read this calendar. Review all four.
+    // replace, and never asks whether the caller may read this calendar. Fix all four.
     const std::string id = req.matches[1];
     const auto calendar = store.getCalendar(id);
     if (!calendar) {
@@ -1373,5 +1373,5 @@ int main() {
     'The occurrence id is the dedupe key, and it must be built from the expanded start, not from the event\'s DTSTART: `"<event_id>:<start_iso>"`. The store keys its overrides by that same string, so the table can filter the expansion and supply the replacement.',
     "Apply the overrides in place, after the expansion: skip any instance whose occurrence id is in the table and append the override once with its own revision — never both. The cached slice stays the raw expansion, stamped with the calendar's `generation`, so an override bump replaces the slice instead of being overlaid on a stale one.",
   ],
-  debrief: `The interviewer is asking about the read path, which is also the most expensive path in a calendar service. The draft looks calm because the demo asks for one week from a public calendar. Four contracts are being checked: the window cap (a range is a budget, and the draft's "default to a year and clamp the rest" spends it silently on an infinite rule), server-side expansion with stable occurrence ids (a client cannot dedupe what the server never names, so every refresh re-books the same slot), the overlay (an override listed beside its original shows the meeting twice), and membership (a private calendar is not a URL secret; the 404 alone is not an authorization check). Real calendars go further: per-calendar expansion budgets, ETag/If-None-Match on the range so an unchanged week is a 304, windows that page the expansion, and a background worker that precomputes popular ranges so the read path usually answers straight from the cache.`,
+  debrief: `The interviewer is asking about the read path, which is also the most expensive path in a calendar service. The starter looks calm because the demo asks for one week from a public calendar. Four contracts are being checked: the window cap (a range is a budget, and the starter's "default to a year and clamp the rest" spends it silently on an infinite rule), server-side expansion with stable occurrence ids (a client cannot dedupe what the server never names, so every refresh re-books the same slot), the overlay (an override listed beside its original shows the meeting twice), and membership (a private calendar is not a URL secret; the 404 alone is not an authorization check). Real calendars go further: per-calendar expansion budgets, ETag/If-None-Match on the range so an unchanged week is a 304, windows that page the expansion, and a background worker that precomputes popular ranges so the read path usually answers straight from the cache.`,
 };

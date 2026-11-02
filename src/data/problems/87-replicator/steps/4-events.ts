@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes a
+**Starting point.** The starter is working code: it publishes a
 \`replication.applied\` event per batch and the consumer group sees traffic, so the demo shows
 progress. Three production contracts are broken. Find them, fix them, and prove the fix.
 
@@ -18,7 +18,7 @@ Implement the progress path: a function that walks one shard's batch
 
 - Publish **exactly one** \`replication.applied\` event per **confirmed** batch, with the **shard**
   as the message key — partition by shard keeps one shard's stream in order, which is what lets a
-  lag consumer compare offsets without gaps. The draft keys by the ordered region pair, so every
+  lag consumer compare offsets without gaps. The starter keys by the ordered region pair, so every
   shard of a replication shares a key and the stream order means nothing.
 - The payload carries the offsets and the change counts: \`replication_id\`, \`shard\`, \`offset\`
   (the confirmed applied offset), \`applied\` (changes applied in the batch) and \`rejected\`
@@ -33,7 +33,7 @@ Implement the progress path: a function that walks one shard's batch
 - When the broker rejects the produce, write the event to the **outbox** instead of swallowing the
   error; a relay republishes outbox rows when the broker recovers.
 
-**Failure mode the checks target.** The draft publishes on read rather than on confirmation, keys
+**Failure mode the checks target.** The starter publishes on read rather than on confirmation, keys
 the event by region pair so a shard's stream is unordered, drops the rejected count so a divergent
 shard looks healthy, configures no acks or idempotence, and swallows broker errors — which is how a
 replica loses progress silently while every dashboard stays green.`,
@@ -56,7 +56,7 @@ replica loses progress silently while every dashboard stays green.`,
       id: 'shard-key',
       title: 'The message key is the shard',
       detail:
-        'The produce is keyed by `shard_key(replication_id, shard)`, so one shard’s events share a partition and stay ordered. The draft keys by the region pair, which interleaves every shard of the replication.',
+        'The produce is keyed by `shard_key(replication_id, shard)`, so one shard’s events share a partition and stay ordered. The starter keys by the region pair, which interleaves every shard of the replication.',
       match: {
         python: {all: [/def shard_key\(/, /key=shard_key\(replication_id, shard\)/]},
         typescript: {all: [/function shardKey\(/, /key: shardKey\(replicationId, shard\)/]},
@@ -69,7 +69,7 @@ replica loses progress silently while every dashboard stays green.`,
       id: 'counts',
       title: 'The event carries offsets and the rejected count',
       detail:
-        'The event payload has the confirmed `offset` and both `applied` and `rejected` change counts, so a shard that refuses changes is visible in the stream. The draft publishes only the applied count.',
+        'The event payload has the confirmed `offset` and both `applied` and `rejected` change counts, so a shard that refuses changes is visible in the stream. The starter publishes only the applied count.',
       match: {
         python: {all: [/"offset"/, /"applied"/, /"rejected"/]},
         typescript: {all: [/offset: batch\.offset/, /applied: batch\.applied/, /rejected: batch\.rejected/]},
@@ -82,7 +82,7 @@ replica loses progress silently while every dashboard stays green.`,
       id: 'publish-after-confirm',
       title: 'Published only after the target confirmed the batch',
       detail:
-        'The publish receives the batch the target confirmed (`confirmed_batch = apply_to_target(...)`), so the event describes applied work. The draft publishes while reading changes.',
+        'The publish receives the batch the target confirmed (`confirmed_batch = apply_to_target(...)`), so the event describes applied work. The starter publishes while reading changes.',
       match: {
         python: {
           all: [/confirmed_batch = apply_to_target\(/, /publish_applied\(replication_id, shard, confirmed_batch\)/],
@@ -114,7 +114,7 @@ replica loses progress silently while every dashboard stays green.`,
       id: 'outbox',
       title: 'A rejected produce becomes an outbox row',
       detail:
-        'When the broker rejects the produce, the event is written to the outbox (and the error is not swallowed). The draft drops it.',
+        'When the broker rejects the produce, the event is written to the outbox (and the error is not swallowed). The starter drops it.',
       match: {
         python: {all: [/outbox\.insert\(replication_id, event\)/, /except KafkaException/]},
         typescript: {all: [/outbox\.insert\(replicationId, event\)/]},
@@ -148,7 +148,7 @@ TOPIC = "replication.applied"
 producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
-# TODO: the draft keys every event by the region pair instead of the shard, so one shard's stream
+# TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
 # loses its order; it publishes while reading the changes instead of after the target confirms
 # them; it drops the rejected count so a shard refusing every change looks current; configures no
 # idempotence or acks; and swallows a broker error instead of writing an outbox row.
@@ -248,7 +248,7 @@ interface Change {
   payload: Buffer;
 }
 
-// TODO: the draft keys every event by the region pair instead of the shard, so one shard's stream
+// TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
 // loses its order; it publishes while reading the changes instead of after the target confirms
 // them; it drops the rejected count so a shard refusing every change looks current; configures no
 // idempotence or acks; and swallows a broker error instead of writing an outbox row.
@@ -358,7 +358,7 @@ type Change struct {
 	Payload  []byte
 }
 
-// TODO: the draft keys every event by the region pair instead of the shard, so one shard's stream
+// TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
 // loses its order; it publishes while reading the changes instead of after the target confirms
 // them; it drops the rejected count so a shard refusing every change looks current; configures no
 // idempotence or acks; and swallows a broker error instead of writing an outbox row.
@@ -468,7 +468,7 @@ object AppliedEvents {
   props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
   private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
 
-  // TODO: the draft keys every event by the region pair instead of the shard, so one shard's stream
+  // TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
   // loses its order; it publishes while reading the changes instead of after the target confirms
   // them; it drops the rejected count so a shard refusing every change looks current; configures no
   // idempotence or acks; and swallows a broker error instead of writing an outbox row.
@@ -543,7 +543,7 @@ const std::string kAppliedTopic = "replication.applied";
 
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: the draft keys every event by the region pair instead of the shard, so one shard's stream
+// TODO: the starter keys every event by the region pair instead of the shard, so one shard's stream
 // loses its order; it publishes while reading the changes instead of after the target confirms
 // them; it drops the rejected count so a shard refusing every change looks current; configures no
 // idempotence or acks; and swallows a broker error instead of writing an outbox row.
@@ -627,5 +627,5 @@ Batch applyToTarget(const std::string& replicationId, int shard, const std::vect
     'Write the loop as apply → confirm → publish, and hand the publish the confirmed batch: the event is a claim about what the target holds. Add every count you have (`offset`, `applied`, `rejected`) — an event that omits the rejections makes a broken shard look caught up.',
     'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` plus a hashed balancer. It only helps if the key is stable, which is the same fix as keying by shard. Wrap the produce and write an outbox row when the broker rejects it.',
   ],
-  debrief: `The interviewer is testing whether you can review generated event publishing for what the stream claims. Keyed by region pair, the stream no longer says anything about a shard’s order; published on read, it announces progress that was never confirmed; and without the rejected count it hides exactly the shard an operator needs to see. The outbox is the durability half: a produce that fails must leave a row behind, or the replica loses progress while every dashboard stays green. Real platforms add a schema registry so the topic cannot silently change shape, a relay that republishes outbox rows with the same key, and a consumer that compares the event’s offset with Redis before it commits.`,
+  debrief: `The interviewer is testing whether you can debug event publishing for what the stream claims. Keyed by region pair, the stream no longer says anything about a shard’s order; published on read, it announces progress that was never confirmed; and without the rejected count it hides exactly the shard an operator needs to see. The outbox is the durability half: a produce that fails must leave a row behind, or the replica loses progress while every dashboard stays green. Real platforms add a schema registry so the topic cannot silently change shape, a relay that republishes outbox rows with the same key, and a consumer that compares the event’s offset with Redis before it commits.`,
 };

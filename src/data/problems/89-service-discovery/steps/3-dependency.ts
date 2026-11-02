@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['discovery', 'instances', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads the registry and
+**Starting point.** The starter is working code: it reads the registry and
 returns what it finds. It hides the flaw that turns a crash into minutes of errors — registered is
 treated as healthy, so the routing set is a list of what *was* true when the last heartbeat arrived.
 
@@ -22,7 +22,7 @@ internal route \`GET /v1/routable/{service}\` that exposes it as
   the probe rather than hold a request for as long as it takes to time out at the client.
 - A candidate that fails its probe is **excluded from the routing set** and stays registered: the
   registry entry is untouched, and the exclusion is recorded with a reason so the read API can
-  explain it. The draft's alternative — routing to it and discovering the failure when a request
+  explain it. The starter's alternative — routing to it and discovering the failure when a request
   fails — puts the error on a user and takes an interval to notice.
 - Probe verdicts are **shared, not per-caller**. Cache the verdict in Redis under
   \`sd:probe:{service}:{instance_id}\` (\`SERVING\` / \`NOT_SERVING\`) with a **5-second TTL**: ten
@@ -79,7 +79,7 @@ same verdict.`,
       id: 'probe-deadline',
       title: 'The probe carries a 200 ms deadline',
       detail:
-        'The gRPC `Health/Check` is issued with a **200 ms** deadline (`timeout`, `withDeadlineAfter`, `context.WithTimeout`, `set_deadline`). The draft issues no probe at all, so a hung instance holds routing decisions for as long as the client waits.',
+        'The gRPC `Health/Check` is issued with a **200 ms** deadline (`timeout`, `withDeadlineAfter`, `context.WithTimeout`, `set_deadline`). The starter issues no probe at all, so a hung instance holds routing decisions for as long as the client waits.',
       match: {
         python: {all: [/PROBE_DEADLINE_MS/, /timeout=/, /200/]},
         typescript: {all: [/PROBE_DEADLINE_MS/, /deadline/, /200/]},
@@ -92,7 +92,7 @@ same verdict.`,
       id: 'probe-before-return',
       title: 'Instances are probed before they are returned',
       detail:
-        'The candidate loop consults the shared probe state (`sd:probe:`) and splits the result into `instances` and `excluded`. The draft returns what the registry holds, so failures are discovered by the caller.',
+        'The candidate loop consults the shared probe state (`sd:probe:`) and splits the result into `instances` and `excluded`. The starter returns what the registry holds, so failures are discovered by the caller.',
       match: {
         python: {all: [/sd:probe:/, /for instance in/, /excluded/]},
         typescript: {all: [/sd:probe:/, /for \(const instance/, /excluded/]},
@@ -118,7 +118,7 @@ same verdict.`,
       id: 'excluded-stays-registered',
       title: 'A failing instance is excluded, not deregistered',
       detail:
-        'A failed probe writes the instance into `sd:excluded:{service}` with a `reason` and leaves the registry entry alone, so the instance can be probed again. The draft never records why routing skipped a backend.',
+        'A failed probe writes the instance into `sd:excluded:{service}` with a `reason` and leaves the registry entry alone, so the instance can be probed again. The starter never records why routing skipped a backend.',
       match: {
         python: {all: [/sd:excluded:/, /reason/, /SERVING/]},
         typescript: {all: [/sd:excluded:/, /reason/, /SERVING/]},
@@ -131,7 +131,7 @@ same verdict.`,
       id: 'recovery-readmit',
       title: 'A passing probe readmits the instance',
       detail:
-        'A `SERVING` verdict removes the exclusion (`HDEL`) and writes the fresh verdict, so a recovered instance returns to routing without an operator. The draft only re-probes after a client complains.',
+        'A `SERVING` verdict removes the exclusion (`HDEL`) and writes the fresh verdict, so a recovered instance returns to routing without an operator. The starter only re-probes after a client complains.',
       match: {
         python: {all: [/hdel/, /sd:excluded:/, /SERVING/]},
         typescript: {all: [/hdel/, /sd:excluded:/, /SERVING/]},
@@ -166,16 +166,16 @@ registry = Registry()
 
 @app.get("/v1/routable/{service}")
 def routable(service: str) -> JSONResponse:
-    # TODO: this draft returns instances as soon as they are registered — no gRPC health probe
+    # TODO: this starter returns instances as soon as they are registered — no gRPC health probe
     # before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-    # how it feels after a client complains. Review it.
+    # how it feels after a client complains. Fix it.
     instances = registry.candidates(service)
     logger.info("routable service=%s instances=%d", service, len(instances))
     return JSONResponse({"service": service, "instances": instances}, status_code=200)
 
 
 def note_complaint(service: str, instance_id: str) -> None:
-    """The draft's only health signal: a client told us a request failed."""
+    """The starter's only health signal: a client told us a request failed."""
     logger.warning("complaint service=%s instance=%s", service, instance_id)
 `,
       solution: `import json
@@ -257,7 +257,7 @@ def routable(service: str) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/routable/{service}: a model-generated draft that trusts the registry. */
+      starter: `/** GET /v1/routable/{service}: flawed code that trusts the registry. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -279,9 +279,9 @@ interface InstanceRecord {
 }
 
 app.get('/v1/routable/:service', async (request, reply) => {
-  // TODO: this draft returns instances as soon as they are registered — no gRPC health probe
+  // TODO: this starter returns instances as soon as they are registered — no gRPC health probe
   // before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-  // how it feels after a client complains. Review it.
+  // how it feels after a client complains. Fix it.
   const {service} = request.params as {service: string};
   const instances = await registry.candidates(service);
   request.log.info({service, instances: instances.length}, 'routable');
@@ -422,9 +422,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func routable(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft returns instances as soon as they are registered — no gRPC health probe
+	// TODO: this starter returns instances as soon as they are registered — no gRPC health probe
 	// before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-	// how it feels after a client complains. Review it.
+	// how it feels after a client complains. Fix it.
 	service := r.PathValue("service")
 	instances, err := registry.Candidates(r.Context(), service)
 	if err != nil {
@@ -590,16 +590,16 @@ object Client {
   val route: Route =
     path("v1" / "routable" / Segment) { service =>
       get {
-        // TODO: this draft returns instances as soon as they are registered — no gRPC health probe
+        // TODO: this starter returns instances as soon as they are registered — no gRPC health probe
         // before routing, no 200 ms deadline and no shared verdict cache — and it only asks an
-        // instance how it feels after a client complains. Review it.
+        // instance how it feels after a client complains. Fix it.
         val instances = registry.candidates(service)
         system.log.info(s"routable service=$service instances=\${instances.size}")
         complete(StatusCodes.OK, instances)
       }
     }
 
-  /** The draft's only health signal: a client told us a request failed. */
+  /** The starter's only health signal: a client told us a request failed. */
   def noteComplaint(service: String, instanceId: String): Unit =
     system.log.warning(s"complaint service=$service instance=$instanceId")
 
@@ -738,9 +738,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/routable/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft returns instances as soon as they are registered — no gRPC health probe
+    // TODO: this starter returns instances as soon as they are registered — no gRPC health probe
     // before routing, no 200 ms deadline and no shared verdict cache — and it only asks an instance
-    // how it feels after a client complains. Review it.
+    // how it feels after a client complains. Fix it.
     const auto service = req.matches[1].str();
     const auto candidates = registry.candidates(service);
     json instances = json::array();
@@ -861,5 +861,5 @@ int main() {
     'The deadline is why the probe is a gRPC call and not a TCP connect: `timeout=0.2`, `withDeadlineAfter(200, MILLISECONDS)`, `context.WithTimeout(ctx, 200*time.Millisecond)`, `set_deadline`. A connect that hangs is a failure, not a slow success.',
     'Write the verdict to Redis with a short TTL and read it back before probing — the registry cannot tell “new” from “dead”, but a shared observation can. Keep the failing instance registered and record *why* it was skipped, so a later probe can readmit it without an operator.',
   ],
-  debrief: `The interviewer is testing whether you separate registration from readiness. Registration is a claim made by a process; health is an observation made by the platform, and only the observation is allowed to influence routing. A draft that returns registered instances looks correct because the demo never kills a process, and it fails in the one way users feel most: a backend that is in the routing set but cannot serve, for a full heartbeat interval, while the platform reports it as up. The second half of the answer is about where the observation lives. Probing per caller duplicates work and makes two routers disagree about the same instance; caching the verdict in Redis with a short TTL gives every caller the same answer and bounds the probe rate. The exclusion hash is what keeps failure and registration separate: the instance stays in the registry for its recovery probe, and the read API can explain the exclusion instead of silently dropping a backend. Real systems add jittered probe schedules, per-instance circuit breakers, drain states that make an instance fail its probe on purpose, and probe attribution so the traffic to a struggling instance is visible.`,
+  debrief: `The interviewer is testing whether you separate registration from readiness. Registration is a claim made by a process; health is an observation made by the platform, and only the observation is allowed to influence routing. A router that returns registered instances looks correct because the demo never kills a process, and it fails in the one way users feel most: a backend that is in the routing set but cannot serve, for a full heartbeat interval, while the platform reports it as up. The second half of the answer is about where the observation lives. Probing per caller duplicates work and makes two routers disagree about the same instance; caching the verdict in Redis with a short TTL gives every caller the same answer and bounds the probe rate. The exclusion hash is what keeps failure and registration separate: the instance stays in the registry for its recovery probe, and the read API can explain the exclusion instead of silently dropping a backend. Real systems add jittered probe schedules, per-instance circuit breakers, drain states that make an instance fail its probe on purpose, and probe attribution so the traffic to a struggling instance is visible.`,
 };

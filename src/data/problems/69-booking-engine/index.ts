@@ -7,11 +7,11 @@ import {bookingEventsStep} from './steps/4-events';
 import {bookingReadStep} from './steps/5-read';
 
 /**
- * Booking engine on the AI-era track: the course is not "create a booking row", it is the review you
- * owe a model-generated booking path before two people are sold the same hour. A validated range
- * that is real and future → one atomic Redis hold with a payment-window TTL → a calendar sync that
- * confirms idempotently under a deadline → resource-keyed booking events published after the commit
- * with an outbox → an availability read that resolves timezones honestly against the same hold map.
+ * Booking engine: the course is not "create a booking row", it is the debugging you owe a booking
+ * path before two people are sold the same hour. A validated range that is real and future → one
+ * atomic Redis hold with a payment-window TTL → a calendar sync that confirms idempotently under a
+ * deadline → resource-keyed booking events published after the commit with an outbox → an
+ * availability read that resolves timezones honestly against the same hold map.
  */
 export const bookingEngineProblem: Problem = {
   id: 'booking-engine',
@@ -19,7 +19,6 @@ export const bookingEngineProblem: Problem = {
   tagline: 'Time-slot bookings that cannot double-book and survive confirmation retries.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Booking Engine
 
@@ -66,12 +65,12 @@ One service, **bookd**, with five pieces:
    the live slot map — live holds and confirmed bookings excluded — and a response that names the
    timezone it resolved.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real booking feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

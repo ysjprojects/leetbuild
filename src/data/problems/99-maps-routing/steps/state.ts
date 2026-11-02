@@ -13,10 +13,10 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'engine'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads the cache, misses,
+**Starting point.** The starter is working code: it reads the cache, misses,
 computes and serves, so the demo works. It hides two production flaws that only show up later —
 a key that essentially never hits, and an entry that may be served long after the traffic state it
-was computed under has changed. Review it, fix it, and prove the fix with the checks below.
+was computed under has changed. Debug it, fix it, and prove the fix with the checks below.
 
 Implement the route cache that fronts the routing engine:
 
@@ -64,7 +64,7 @@ forever.`,
       id: 'cell-key',
       title: 'Keys by rounded coordinate cells',
       detail:
-        'Coordinates are rounded onto a ~0.001° grid (`CELL_DEGREES`) before they enter the key, so near-identical requests share one entry. The draft keys raw floats, so a 6th decimal of GPS noise makes every request a miss.',
+        'Coordinates are rounded onto a ~0.001° grid (`CELL_DEGREES`) before they enter the key, so near-identical requests share one entry. The starter keys raw floats, so a 6th decimal of GPS noise makes every request a miss.',
       match: {
         python: {all: [/CELL_DEGREES/, /def cell\(/, /\bround\(/]},
         typescript: {all: [/CELL_DEGREES/, /function cell\(/, /Math\.round\(/]},
@@ -90,7 +90,7 @@ forever.`,
       id: 'stale-epoch',
       title: 'An entry from another epoch is not served',
       detail:
-        'The stored entry records the epoch it was computed under and a read compares that with the current epoch; a mismatch is a miss, not a hit — the route is recomputed and overwritten under the current key. The draft serves whatever the key returns.',
+        'The stored entry records the epoch it was computed under and a read compares that with the current epoch; a mismatch is a miss, not a hit — the route is recomputed and overwritten under the current key. The starter serves whatever the key returns.',
       match: {
         python: {all: [/get\("epoch"\)|\["epoch"\]/, /[!=]=\s*epoch/]},
         typescript: {all: [/entry\.epoch/, /[!=]=\s*epoch/]},
@@ -103,7 +103,7 @@ forever.`,
       id: 'epoch-response',
       title: 'The response reports epoch and hit',
       detail:
-        'The response carries the `epoch` the geometry belongs to and a `cached` marker saying whether it came from Redis or the engine. The draft returns geometry with no provenance, so a caller cannot tell a 6 a.m. route from a fresh one.',
+        'The response carries the `epoch` the geometry belongs to and a `cached` marker saying whether it came from Redis or the engine. The starter returns geometry with no provenance, so a caller cannot tell a 6 a.m. route from a fresh one.',
       match: {
         python: {all: [/"epoch":\s*epoch/, /"cached":/]},
         typescript: {all: [/\bepoch\b/, /cached:\s*(true|false)/]},
@@ -116,7 +116,7 @@ forever.`,
       id: 'ttl',
       title: 'Cache entries expire',
       detail:
-        'The write sets an expiry of `TTL_S = EPOCH_S * 2`, so a superseded epoch’s entries leave Redis on their own. The draft writes without an expiry, so every cell ever requested stays in the keyspace forever.',
+        'The write sets an expiry of `TTL_S = EPOCH_S * 2`, so a superseded epoch’s entries leave Redis on their own. The starter writes without an expiry, so every cell ever requested stays in the keyspace forever.',
       match: {
         python: {all: [/TTL_S\s*=\s*EPOCH_S\s*\*\s*2/, /ex\s*=\s*TTL_S/]},
         typescript: {all: [/TTL_S\s*=\s*EPOCH_S\s*\*\s*2/, /'EX',\s*TTL_S/]},
@@ -128,7 +128,7 @@ forever.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/routes: a model-generated draft that caches on raw coordinates and never expires."""
+      starter: `"""POST /v1/routes: flawed code that caches on raw coordinates and never expires."""
 import json
 
 import redis
@@ -163,10 +163,10 @@ engine = RoutingEngine()
 
 @app.post("/v1/routes")
 def compute_route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft keys the cache by raw float coordinates, so no two requests ever share an
+    # TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
     # entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush
     # hour is served at midnight; and the response never says which traffic state it belongs to.
-    # Review all of it.
+    # Fix all of it.
     key = (
         f"route:{body.origin.lat}:{body.origin.lng}"
         f":{body.destination.lat}:{body.destination.lng}:{body.mode}"
@@ -262,7 +262,7 @@ def compute_route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id"))
 `,
     },
     typescript: {
-      starter: `/** POST /v1/routes: a model-generated draft that caches on raw coordinates and never expires. */
+      starter: `/** POST /v1/routes: flawed code that caches on raw coordinates and never expires. */
 import {Redis} from 'ioredis';
 
 import {engine} from './engine';
@@ -282,10 +282,10 @@ interface RouteBody {
 }
 
 export async function routeWithCache(body: RouteBody): Promise<{route: string}> {
-  // TODO: this draft keys the cache by raw float coordinates, so no two requests ever share an
+  // TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
   // entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush hour
   // is served at midnight; and the response never says which traffic state it belongs to.
-  // Review all of it.
+  // Fix all of it.
   const key = \`route:\${body.origin.lat}:\${body.origin.lng}:\${body.destination.lat}:\${body.destination.lng}:\${body.mode}\`;
   const raw = await r.get(key);
   if (raw !== null) return {route: JSON.parse(raw) as string};
@@ -408,10 +408,10 @@ func handleRoute(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft keys the cache by raw float coordinates, so no two requests ever share an
+	// TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
 	// entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush
 	// hour is served at midnight; and the response never says which traffic state it belongs to.
-	// Review all of it.
+	// Fix all of it.
 	key := fmt.Sprintf("route:%v:%v:%v:%v:%s", body.Origin.Lat, body.Origin.Lng, body.Destination.Lat, body.Destination.Lng, body.Mode)
 	if raw, err := rdb.Get(r.Context(), key).Bytes(); err == nil {
 		writeJSON(rw, http.StatusOK, map[string]any{"route": string(raw)})
@@ -568,10 +568,10 @@ object StateApi {
       post {
         headerValueByName("X-Tenant-Id") { _ =>
           entity(as[RouteRequest]) { body =>
-            // TODO: this draft keys the cache by raw float coordinates, so no two requests ever
+            // TODO: this starter keys the cache by raw float coordinates, so no two requests ever
             // share an entry; it stores routes with no traffic epoch and no expiry, so a route
             // computed at rush hour is served at midnight; and the response never says which
-            // traffic state it belongs to. Review all of it.
+            // traffic state it belongs to. Fix all of it.
             val key = s"route:\${body.origin.lat}:\${body.origin.lng}:\${body.destination.lat}:\${body.destination.lng}:\${body.mode}"
             Option(jedis.get(key)) match {
               case Some(payload) =>
@@ -698,10 +698,10 @@ int main() {
   svr.Post("/v1/routes", [&redis](const httplib::Request& req, httplib::Response& res) {
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this draft keys the cache by raw float coordinates, so no two requests ever share an
+    // TODO: this starter keys the cache by raw float coordinates, so no two requests ever share an
     // entry; it stores routes with no traffic epoch and no expiry, so a route computed at rush
     // hour is served at midnight; and the response never says which traffic state it belongs to.
-    // Review all of it.
+    // Fix all of it.
     const std::string key = "route:" + std::to_string(body["origin"].value("lat", 0.0)) + ":" +
                             std::to_string(body["origin"].value("lng", 0.0)) + ":" +
                             std::to_string(body["destination"].value("lat", 0.0)) + ":" +

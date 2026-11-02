@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db', 'source'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body, mints a job id and returns \`201\`. It compiles, it serves the demo, and it hides three
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body, mints a
+job id and returns \`201\`. It compiles, it serves the demo, and it hides three production flaws.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/transcodes\` with body
 \`{"source": {"uri": "s3://raw/movie.mp4", "sha256": "…", "duration_s": 5400}, "preset": "h264-720p", "output": {"bucket": "renditions", "prefix": "movies/42"}}\`.
@@ -31,7 +31,7 @@ Implement \`POST /v1/transcodes\` with body
 - A preset id that is malformed (not \`^[a-z0-9][a-z0-9._-]{0,63}$\`) or not in the definitions is
   **404** — the preset is a resource, an unknown one does not exist.
 
-**Failure mode the checks target.** The draft has no dedupe at all, so a client retry (or two
+**Failure mode the checks target.** The starter has no dedupe at all, so a client retry (or two
 workers picking up the same upload) encodes the same source twice and pays for it twice; it hands
 \`body.args\` straight to the encoder, so any caller picks the filters, the codec and the
 arguments; and it never looks the preset up, so a typo produces a job that fails minutes later in a
@@ -66,7 +66,7 @@ worker instead of a \`404\` at submit time.`,
       id: 'dedupe',
       title: 'Keys the job by (source sha256, preset)',
       detail:
-        'The job store is queried with `(source sha256, preset id)` before anything is created; a hit returns the existing job (200, `deduped: true`) instead of starting a second encode. The draft mints a fresh job id on every submit.',
+        'The job store is queried with `(source sha256, preset id)` before anything is created; a hit returns the existing job (200, `deduped: true`) instead of starting a second encode. The starter mints a fresh job id on every submit.',
       match: {
         python: {all: [/jobs\.find\(/, /sha256/, /existing/, /status_code\s*=\s*200/]},
         typescript: {all: [/jobs\.find\(/, /sha256/, /existing/, /code\(\s*200\s*\)/]},
@@ -79,7 +79,7 @@ worker instead of a \`404\` at submit time.`,
       id: 'preset-args',
       title: 'Resolves the preset definition, never the caller arguments',
       detail:
-        'The encoder arguments come from the server-side preset definitions; the request’s `args` field is never read. The draft forwards `body.args` to the encoder, so a caller chooses the filters and the codec.',
+        'The encoder arguments come from the server-side preset definitions; the request’s `args` field is never read. The starter forwards `body.args` to the encoder, so a caller chooses the filters and the codec.',
       match: {
         python: {all: [/PRESETS\s*=\s*\{/, /args\s*=\s*PRESETS\[/], none: [/body\.args/]},
         typescript: {all: [/const PRESETS/, /args = PRESETS\[/], none: [/body\.args/]},
@@ -92,7 +92,7 @@ worker instead of a \`404\` at submit time.`,
       id: 'preset-404',
       title: 'Unknown or malformed preset id is 404',
       detail:
-        'The preset id is checked against the id pattern and the definitions; a miss answers `404` before a job exists. The draft accepts any string and lets a worker fail later.',
+        'The preset id is checked against the id pattern and the definitions; a miss answers `404` before a job exists. The starter accepts any string and lets a worker fail later.',
       match: {
         python: {all: [/PRESET_RE/, /status_code\s*=\s*404/]},
         typescript: {all: [/PRESET_RE/, /code\(\s*404\s*\)/]},
@@ -148,9 +148,9 @@ class SubmitRequest(BaseModel):
 
 @app.post("/v1/transcodes")
 def submit(body: SubmitRequest) -> JSONResponse:
-    # TODO: this draft never dedupes on (source sha256, preset), hands the caller's ffmpeg
+    # TODO: this starter never dedupes on (source sha256, preset), hands the caller's ffmpeg
     # arguments straight to the encoder, and checks neither the hash nor the preset id.
-    # Review all three before this reaches a worker.
+    # Fix all three before this reaches a worker.
     job_id = str(uuid.uuid4())
     logger.info("transcode job=%s preset=%s args=%s", job_id, body.preset, body.args)
     return JSONResponse({"job_id": job_id, "state": "queued", "args": body.args}, status_code=201)
@@ -240,7 +240,7 @@ def submit(body: SubmitRequest) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcodes: a model-generated draft that trusts the caller's arguments. */
+      starter: `/** POST /v1/transcodes: flawed code that trusts the caller's arguments. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -255,9 +255,9 @@ interface SubmitBody {
 }
 
 app.post('/v1/transcodes', async (request, reply) => {
-  // TODO: this draft never dedupes on (source sha256, preset), hands the caller's ffmpeg
+  // TODO: this starter never dedupes on (source sha256, preset), hands the caller's ffmpeg
   // arguments straight to the encoder, and checks neither the hash nor the preset id.
-  // Review all three before this reaches a worker.
+  // Fix all three before this reaches a worker.
   const body = request.body as SubmitBody;
   const jobId = randomUUID();
   request.log.info({job_id: jobId, preset: body.preset, args: body.args}, 'transcode queued');
@@ -366,9 +366,9 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft never dedupes on (source sha256, preset), hands the caller's ffmpeg
+	// TODO: this starter never dedupes on (source sha256, preset), hands the caller's ffmpeg
 	// arguments straight to the encoder, and checks neither the hash nor the preset id.
-	// Review all three before this reaches a worker.
+	// Fix all three before this reaches a worker.
 	jobID := uuid.NewString()
 	log.Printf("transcode job=%s preset=%s args=%v", jobID, body.Preset, body.Args)
 	writeJSON(rw, http.StatusCreated, map[string]any{"job_id": jobID, "state": "queued", "args": body.Args})
@@ -534,9 +534,9 @@ object Api {
   val route: Route = path("v1" / "transcodes") {
     post {
       entity(as[SubmitRequest]) { body =>
-        // TODO: this draft never dedupes on (source sha256, preset), hands the caller's ffmpeg
+        // TODO: this starter never dedupes on (source sha256, preset), hands the caller's ffmpeg
         // arguments straight to the encoder, and checks neither the hash nor the preset id.
-        // Review all three before this reaches a worker.
+        // Fix all three before this reaches a worker.
         val jobId = UUID.randomUUID().toString
         log.info("transcode job={} preset={} args={}", jobId, body.preset, body.args)
         complete(StatusCodes.Created, s"""{"job_id":"$jobId","state":"queued"}""")
@@ -656,9 +656,9 @@ int main() {
 
   svr.Post("/v1/transcodes", [](const httplib::Request& req, httplib::Response& res) {
     const json body = json::parse(req.body, nullptr, false);
-    // TODO: this draft never dedupes on (source sha256, preset), hands the caller's ffmpeg
+    // TODO: this starter never dedupes on (source sha256, preset), hands the caller's ffmpeg
     // arguments straight to the encoder, and checks neither the hash nor the preset id.
-    // Review all three before this reaches a worker.
+    // Fix all three before this reaches a worker.
     const std::string jobId = newJobId();
     const std::string preset = body.value("preset", "");
     const std::vector<std::string> args = body.value("args", std::vector<std::string>{});
@@ -798,5 +798,5 @@ int main() {
     'The dedupe key is the pair, not the request: `find(source.sha256, preset)` returns the job that is already encoding that content at that preset, and the replay answers 200 with `deduped: true`. Keying on the upload id or on a fresh UUID is what lets the same source be encoded twice.',
     'The encoder command is a server-side fact. Keep `PRESETS` as the only source of container, codec and `args`, accept a caller `args` list for compatibility and never read it — otherwise a caller chooses the filter graph, the codec and the arguments that run on your workers.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a media pipeline. The draft reads fine because the demo uploads one file once and hands the encoder exactly the arguments the example used. Three defects are being checked: dedupe on the content key (a retry or a second pickup must return the existing job instead of paying for the file twice), server-side preset resolution (the caller names a preset, never an encoder command — passing caller arguments into an encoder is a shell injection surface), and preset validation (an unknown or malformed preset is a 404 at submit time, not a worker failure minutes later). The hash check is the quieter one: a dedupe key built from an unvalidated string is how two different files end up sharing one job. Real pipelines add a signed upload URL per source, a per-tenant concurrency cap and an idempotency key for callers that do not know the content hash yet.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a media pipeline. The starter reads fine because the demo uploads one file once and hands the encoder exactly the arguments the example used. Three defects are being checked: dedupe on the content key (a retry or a second pickup must return the existing job instead of paying for the file twice), server-side preset resolution (the caller names a preset, never an encoder command — passing caller arguments into an encoder is a shell injection surface), and preset validation (an unknown or malformed preset is a 404 at submit time, not a worker failure minutes later). The hash check is the quieter one: a dedupe key built from an unvalidated string is how two different files end up sharing one job. Real pipelines add a signed upload URL per source, a per-tenant concurrency cap and an idempotency key for callers that do not know the content hash yet.`,
 };

@@ -8,9 +8,9 @@ export const transcriptionEndpointStep: Step = {
   focus: ['client', 'api', 'db', 'storage'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the body and creates a job. It compiles, it serves the demo, and it hides three production flaws.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/transcriptions\` with body
 \`{"audio_ref": "s3://bucket/talk.wav", "duration_seconds": 7200, "language": "en"}\`.
@@ -29,7 +29,7 @@ Implement \`POST /v1/transcriptions\` with body
 - The response reports the job id, a \`queued\` status and the total chunk count derived from the
   duration at 30 seconds per chunk.
 
-**Failure mode the checks target.** A model-generated handler downloads first and validates second,
+**Failure mode the checks target.** A handler downloads first and validates second,
 so every bad request has already paid for the bytes; it accepts any duration, so a five-hour file
 starts a job; and it keys nothing, so every client retry starts a second transcription. The fix is
 an ordering contract: authenticate, validate the metadata, look up the audio hash, and only then
@@ -79,7 +79,7 @@ touch the audio store.`,
       id: 'duration-cap',
       title: 'Rejects a file over four hours from metadata alone',
       detail:
-        '`duration_seconds` outside 1..14400 is **400**, decided before any audio is fetched. The draft accepts unbounded duration, so a five-hour file starts a job and pays for the download.',
+        '`duration_seconds` outside 1..14400 is **400**, decided before any audio is fetched. The starter accepts unbounded duration, so a five-hour file starts a job and pays for the download.',
       match: {
         python: {all: [/MAX_DURATION_SECONDS/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_DURATION_SECONDS/, /code\(\s*400\s*\)/]},
@@ -92,7 +92,7 @@ touch the audio store.`,
       id: 'language-allowlist',
       title: 'Accepts only the allowlisted language hints',
       detail:
-        '`language` is checked against an allowlist and anything else is **400**. The draft never looks at the hint, so a request with an unsupported language reaches the provider and is billed before it fails.',
+        '`language` is checked against an allowlist and anything else is **400**. The starter never looks at the hint, so a request with an unsupported language reaches the provider and is billed before it fails.',
       match: {
         python: {all: [/ALLOWED_LANGUAGES/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_LANGUAGES/, /code\(\s*400\s*\)/]},
@@ -105,7 +105,7 @@ touch the audio store.`,
       id: 'idempotent-by-hash',
       title: 'Keys the job by the audio hash so a retry resumes',
       detail:
-        'The job is stored under `(tenant, sha256(audio_ref))`; a replay returns the stored running job instead of creating a second one. The draft creates a fresh job on every submit, so a client retry bills the same file twice.',
+        'The job is stored under `(tenant, sha256(audio_ref))`; a replay returns the stored running job instead of creating a second one. The starter creates a fresh job on every submit, so a client retry bills the same file twice.',
       match: {
         python: {all: [/audio_hash/, /sha256/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/audioHash/, /createHash\(\s*['"]sha256['"]\)/, /store\.get\(/, /store\.put\(/]},
@@ -118,7 +118,7 @@ touch the audio store.`,
       id: 'validate-before-fetch',
       title: 'Never downloads a byte before the metadata validates',
       detail:
-        'The duration check runs before the audio is fetched: the `fetch_audio` call comes *after* the validation, so a rejected request never pays for the file. The draft downloads first, so every 400 has already downloaded two hours of audio.',
+        'The duration check runs before the audio is fetched: the `fetch_audio` call comes *after* the validation, so a rejected request never pays for the file. The starter downloads first, so every 400 has already downloaded two hours of audio.',
       match: {
         python: {order: [/MAX_DURATION_SECONDS/, /fetch_audio\(body\.audio_ref\)/]},
         typescript: {order: [/MAX_DURATION_SECONDS/, /fetchAudio\(body\.audio_ref\)/]},
@@ -165,8 +165,8 @@ def fetch_audio(audio_ref: str) -> bytes:
 
 @app.post("/v1/transcriptions")
 def create_transcription(body: TranscribeRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft accepts any duration, downloads the audio before validating it, starts a new
-    # job on every submit, and never checks the language hint. Review all four.
+    # TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
+    # job on every submit, and never checks the language hint. Fix all four.
     audio = fetch_audio(body.audio_ref)
     job = {"job_id": str(uuid.uuid4()), "bytes": len(audio)}
     return JSONResponse(job, status_code=201)
@@ -249,7 +249,7 @@ def create_transcription(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcriptions: a model-generated draft that downloads first and never dedupes. */
+      starter: `/** POST /v1/transcriptions: flawed code that downloads first and never dedupes. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -265,8 +265,8 @@ interface TranscribeBody {
 const fetchAudio = async (_audioRef: string): Promise<Buffer> => Buffer.alloc(0);
 
 app.post('/v1/transcriptions', async (request, reply) => {
-  // TODO: this draft accepts any duration, downloads the audio before validating it, starts a new
-  // job on every submit, and never checks the language hint. Review all four.
+  // TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
+  // job on every submit, and never checks the language hint. Fix all four.
   const body = request.body as TranscribeBody;
   const audio = await fetchAudio(body.audio_ref);
   return reply.code(201).send({job_id: randomUUID(), bytes: audio.byteLength});
@@ -378,8 +378,8 @@ func createTranscription(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts any duration, downloads the audio before validating it, starts a new
-	// job on every submit, and never checks the language hint. Review all four.
+	// TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
+	// job on every submit, and never checks the language hint. Fix all four.
 	audio := fetchAudio(body.AudioRef)
 	log.Printf("transcription ref=%s bytes=%d", body.AudioRef, len(audio))
 	writeJSON(rw, http.StatusCreated, map[string]any{"job_id": uuid.NewString(), "bytes": len(audio)})
@@ -537,8 +537,8 @@ object TranscriptionApi {
     path("v1" / "transcriptions") {
       post {
         entity(as[TranscribeRequest]) { body =>
-          // TODO: this draft accepts any duration, downloads the audio before validating it, starts
-          // a new job on every submit, and never checks the language hint. Review all four.
+          // TODO: this starter accepts any duration, downloads the audio before validating it, starts
+          // a new job on every submit, and never checks the language hint. Fix all four.
           val audio = fetchAudio(body.audio_ref)
           val jobId = UUID.randomUUID().toString
           complete(StatusCodes.Created, s"""{"job_id":"$jobId","bytes":\${audio.length}}""")
@@ -648,8 +648,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts any duration, downloads the audio before validating it, starts a new
-    // job on every submit, and never checks the language hint. Review all four.
+    // TODO: this starter accepts any duration, downloads the audio before validating it, starts a new
+    // job on every submit, and never checks the language hint. Fix all four.
     const auto audioRef = body.value("audio_ref", std::string());
     const auto audio = fetchAudio(audioRef);
     std::cerr << "transcription ref=" << audioRef << " bytes=" << audio.size() << "\\n";
@@ -755,5 +755,5 @@ int main() {
     'Key idempotency on the audio, not the request: `sha256(audio_ref)` is stable across retries, and a hit returns the stored running job instead of creating a second one.',
     'The order of the handler is the contract: validate the metadata, look up the audio hash, and only then call `fetch_audio`. If the download appears before the duration check, every rejection has already paid for the audio.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary before it spends money. The draft reads fine because the demo sends one well-formed, in-range request and never retries. Three defects are being checked: the missing metadata cap (a five-hour file must be a 400 decided before any download), the missing idempotency key (keyed by the audio hash so a retry resumes the same job instead of starting a second), and the ordering flaw that is the quiet one — the draft downloads the audio first and validates second, so every rejected request has already paid for bytes it will never use. Real pipelines validate the reference and its duration from an index or a manifest, never by pulling the object, and they keep the idempotency record in the same transaction that creates the job.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary before it spends money. The starter reads fine because the demo sends one well-formed, in-range request and never retries. Three defects are being checked: the missing metadata cap (a five-hour file must be a 400 decided before any download), the missing idempotency key (keyed by the audio hash so a retry resumes the same job instead of starting a second), and the ordering flaw that is the quiet one — the starter downloads the audio first and validates second, so every rejected request has already paid for bytes it will never use. Real pipelines validate the reference and its duration from an index or a manifest, never by pulling the object, and they keep the idempotency record in the same transaction that creates the job.`,
 };

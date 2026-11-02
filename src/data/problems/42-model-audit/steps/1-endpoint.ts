@@ -8,10 +8,10 @@ export const endpointStep: Step = {
   focus: ['client', 'auditd', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and inserts a row. It compiles, it serves the demo, and it hides three production flaws —
 one that turns the trail into a copy of tenant content, one that offers corrections, and one that
-lets the caller choose when history happened. Review it, fix it, and prove the fix.
+lets the caller choose when history happened. Debug it, fix it, and prove the fix.
 
 Implement \`POST /v1/audit/decisions\` with body
 \`{"model_version": "…", "policy_id": "…", "input_digest": "…", "decision_digest": "…"}\`.
@@ -22,15 +22,15 @@ Implement \`POST /v1/audit/decisions\` with body
   **400**.
 - **Prompts never enter the store.** The record holds the model version, the policy id and the two
   digests; the caller's inputs and the decision itself are never read from the body, never logged
-  and never persisted. The draft stores \`body["prompt"]\` "for replayability", which makes the audit
+  and never persisted. The starter stores \`body["prompt"]\` "for replayability", which makes the audit
   trail a second, less-guarded copy of exactly the content this system exists to avoid keeping.
 - **The record is immutable.** There is no update route and no delete route; an update attempt on an
-  existing record is answered **405** by design, never \`200\`. The draft registers a \`PATCH\` route
+  existing record is answered **405** by design, never \`200\`. The starter registers a \`PATCH\` route
   that runs \`UPDATE audit_decisions …\`, because "corrections" sounds reasonable until an auditor
   asks who edited the evidence.
 - **Timestamps are server-set and monotonic per tenant.** The timestamp field is \`recorded_at\`,
   written from the server clock as \`max(now_ms, last_recorded_at + 1)\`, and the caller's own
-  timestamp is never read. The draft trusts \`body["timestamp"]\`, so a client can backdate or reorder
+  timestamp is never read. The starter trusts \`body["timestamp"]\`, so a client can backdate or reorder
   history.
 - Answer **201** with the stored record: \`id\`, \`tenant\`, \`model_version\`, \`policy_id\`,
   \`input_digest\`, \`decision_digest\` and \`recorded_at\`.
@@ -79,7 +79,7 @@ absence of an edit route is a feature you have to prove, not a route you forgot 
       id: 'no-prompt',
       title: 'Prompts never enter the store',
       detail:
-        'The handler reads and persists the two digests only; the word `prompt` appears nowhere in the code path. The draft stores the full prompt "for replayability", which is exactly the content an audit trail must be able to prove it never kept.',
+        'The handler reads and persists the two digests only; the word `prompt` appears nowhere in the code path. The starter stores the full prompt "for replayability", which is exactly the content an audit trail must be able to prove it never kept.',
       match: {
         python: {all: [/input_digest/, /decision_digest/], none: [/prompt/]},
         typescript: {all: [/input_digest/, /decision_digest/], none: [/prompt/]},
@@ -92,7 +92,7 @@ absence of an edit route is a feature you have to prove, not a route you forgot 
       id: 'immutable',
       title: 'No update route; an edit attempt is 405',
       detail:
-        'There is no `UPDATE audit_decisions` in the code path and an update attempt answers **405**. The draft registers a `PATCH` route that runs `UPDATE audit_decisions … SET …`, so history is editable.',
+        'There is no `UPDATE audit_decisions` in the code path and an update attempt answers **405**. The starter registers a `PATCH` route that runs `UPDATE audit_decisions … SET …`, so history is editable.',
       match: {
         python: {all: [/\b405\b/], none: [/UPDATE audit_decisions/]},
         typescript: {all: [/\b405\b/], none: [/UPDATE audit_decisions/]},
@@ -105,7 +105,7 @@ absence of an edit route is a feature you have to prove, not a route you forgot 
       id: 'server-timestamp',
       title: 'The timestamp is server-set and monotonic per tenant',
       detail:
-        'The stored field is `recorded_at`, taken from the server clock and advanced past the tenant’s last record; the caller’s `timestamp` is never read. The draft writes whatever the body sends, so a client can backdate history.',
+        'The stored field is `recorded_at`, taken from the server clock and advanced past the tenant’s last record; the caller’s `timestamp` is never read. The starter writes whatever the body sends, so a client can backdate history.',
       match: {
         python: {all: [/\btime\.time\(\)|now_ms\(\)/, /recorded_at/], none: [/\btimestamp\b/]},
         typescript: {all: [/Date\.now\(\)/, /recorded_at/], none: [/\btimestamp\b/]},
@@ -118,7 +118,7 @@ absence of an edit route is a feature you have to prove, not a route you forgot 
       id: 'validate',
       title: 'Tenant and digest validation before the insert',
       detail:
-        'A missing tenant is **401**; an empty field or a digest that is not 64 lowercase hex characters is **400**. The draft validates nothing, so a malformed record is accepted and becomes evidence.',
+        'A missing tenant is **401**; an empty field or a digest that is not 64 lowercase hex characters is **400**. The starter validates nothing, so a malformed record is accepted and becomes evidence.',
       match: {
         python: {all: [/\b401\b/, /\b400\b/, /64/]},
         typescript: {all: [/code\(401\)/, /code\(400\)/, /64/]},
@@ -144,7 +144,7 @@ def now_ms() -> int:
 
 @app.post("/v1/audit/decisions")
 def append_decision(body: dict, cur=None) -> JSONResponse:
-    # TODO: the draft keeps the whole prompt "for replayability", trusts the caller's timestamp and
+    # TODO: the starter keeps the whole prompt "for replayability", trusts the caller's timestamp and
     # registers a PATCH route for corrections. Store the digests only, timestamp from the server
     # clock, and answer an edit attempt with 405 instead of offering one.
     record = {
@@ -238,13 +238,13 @@ def immutability(record_id: str) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** A model-generated audit endpoint that keeps the prompt and offers corrections. */
+      starter: `/** A audit endpoint that keeps the prompt and offers corrections. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
 
 app.post('/v1/audit/decisions', async (request, reply) => {
-  // TODO: the draft stores the whole prompt "for replayability", trusts the caller's timestamp and
+  // TODO: the starter stores the whole prompt "for replayability", trusts the caller's timestamp and
   // registers a PATCH route for corrections. Keep the digests only, timestamp on the server, and
   // answer an edit attempt with 405.
   const body = request.body as Record<string, unknown>;
@@ -334,7 +334,7 @@ type appendRequest struct {
 }
 
 func appendDecision(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft stores the whole prompt "for replayability", trusts the caller's timestamp and
+	// TODO: the starter stores the whole prompt "for replayability", trusts the caller's timestamp and
 	// registers a PATCH route for corrections. Keep the digests only, timestamp on the server, and
 	// answer an edit attempt with 405.
 	var in appendRequest
@@ -482,7 +482,7 @@ object AuditApi {
     path("v1" / "audit" / "decisions") {
       post {
         entity(as[AppendRequest]) { request =>
-          // TODO: the draft stores the whole prompt "for replayability" and trusts the caller's
+          // TODO: the starter stores the whole prompt "for replayability" and trusts the caller's
           // timestamp. Keep the digests only, timestamp on the server, and answer an edit with 405.
           val recordedAt = request.timestamp
           val id = db.insert(tenant, request.model_version, request.prompt, recordedAt)
@@ -594,7 +594,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post(R"(/v1/audit/decisions)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft stores the whole prompt "for replayability", trusts the caller's timestamp
+    // TODO: the starter stores the whole prompt "for replayability", trusts the caller's timestamp
     // and registers a PATCH route for corrections. Keep the digests only, timestamp on the server,
     // and answer an edit attempt with 405.
     const auto body = json::parse(req.body);
@@ -700,9 +700,9 @@ int main() {
     },
   },
   hints: [
-    'Digests are the whole point: `input_digest` and `decision_digest` let an auditor prove *what* was decided without the trail ever holding the content. If the draft reads `body["prompt"]`, delete the read — the safest record is the one whose content was never parsed.',
+    'Digests are the whole point: `input_digest` and `decision_digest` let an auditor prove *what* was decided without the trail ever holding the content. If the starter reads `body["prompt"]`, delete the read — the safest record is the one whose content was never parsed.',
     'Immutability is a route table decision. Register only `POST` on the collection and let every other method fall through to a `405` handler: `@app.api_route(..., methods=["PUT","PATCH","DELETE"])`, `app.route({method: ["PUT","PATCH","DELETE"]})`, or the `put | patch | delete` alternative in Pekko HTTP. Never delete a row either.',
     'The clock belongs to the server. Write `recorded_at`, compute it as `max(now, last_recorded_at + 1)` inside the tenant, and stop reading the caller’s field entirely — monotonicity is what lets the verifier order entries later, and a caller-supplied timestamp is what lets them be reordered.',
   ],
-  debrief: `The interviewer is testing whether you can review a handler at the evidence boundary. Two flaws are about trust: the record must not contain the content it audits, and it must not carry a clock the caller controls. The third is subtler and often missed: an audit API’s correctness includes the routes it *does not* have. A \`PATCH\` for "corrections" looks like good citizenship until you ask who edited the evidence — which is why the fix registers a 405 handler rather than a route, and why the storage layer has no \`UPDATE\` at all. Real audit services add a per-record signature or Merkle proof over the append batch, a policy id that resolves to an immutable policy version, and a hash-only index so an auditor can look a decision up by its input digest without the service ever holding the input.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the evidence boundary. Two flaws are about trust: the record must not contain the content it audits, and it must not carry a clock the caller controls. The third is subtler and often missed: an audit API’s correctness includes the routes it *does not* have. A \`PATCH\` for "corrections" looks like good citizenship until you ask who edited the evidence — which is why the fix registers a 405 handler rather than a route, and why the storage layer has no \`UPDATE\` at all. Real audit services add a per-record signature or Merkle proof over the append batch, a policy id that resolves to an immutable policy version, and a hash-only index so an auditor can look a decision up by its input digest without the service ever holding the input.`,
 };

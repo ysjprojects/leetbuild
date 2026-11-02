@@ -7,12 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Eval harness on the AI-era track: the course is not "compare two strings", it is the review you
- * owe a model-generated scoring pipeline before a release rides on its numbers. Validated,
- * idempotent runs → one atomic Redis progress script with per-sample dedupe → a deadline-bounded
- * judge call with a deterministic fallback and a breaker → run-keyed sample events with an outbox
- * and counters before the offset commit → a read gate that only opens on a complete, current
- * record.
+ * Eval harness: the course is not "compare two strings", it is the debugging you owe a scoring
+ * pipeline before a release rides on its numbers. Validated, idempotent runs → one atomic Redis
+ * progress script with per-sample dedupe → a deadline-bounded judge call with a deterministic
+ * fallback and a breaker → run-keyed sample events with an outbox and counters before the offset
+ * commit → a read gate that only opens on a complete, current record.
  */
 export const evalHarnessProblem: Problem = {
   id: 'eval-harness',
@@ -20,7 +19,7 @@ export const evalHarnessProblem: Problem = {
   tagline: 'Score model outputs against golden labels, sample by sample, before anything ships.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Eval Harness
 
@@ -61,12 +60,12 @@ One service, **evald**, with five pieces:
 5. \`GET /v1/evals/runs/{id}\`: tenant-scoped, a 200-sample floor, a release threshold from server
    config, and a cache that changes the moment the scored count does.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path,
+and it looks right. Your job in every step is the job you will have on a real feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

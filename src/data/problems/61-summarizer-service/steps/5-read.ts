@@ -8,10 +8,10 @@ export const summarizerReadStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the read route,
-loads the summary and returns it. It looks like a repository method, and it is a way to serve text
-that no longer matches the document it claims to describe — to the wrong tenant. Review it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the read route, loads the summary and
+returns it. It looks like a repository method, and it is a way to serve text that no longer matches
+the document it claims to describe — to the wrong tenant. Debug it like the service owner, fix it,
+and prove the fix with the checks below.
 
 Implement \`GET /v1/summaries/{summary_id}\`:
 
@@ -30,7 +30,7 @@ Implement \`GET /v1/summaries/{summary_id}\`:
   \`chunk_index\`es in \`stale_chunks\`. A stale summary must never be served as if it still described
   the current text.
 
-**Failure mode the checks target.** The draft returns the stored summary with no citations at all, so
+**Failure mode the checks target.** The starter returns the stored summary with no citations at all, so
 a reader has no way to check a claim against the document. It never compares hashes, so after an edit
 it serves a summary — and would serve citations — of text that no longer exists. And it loads by id
 alone, so any caller with a guessed or leaked summary id reads another tenant's document.`,
@@ -62,7 +62,7 @@ alone, so any caller with a guessed or leaked summary id reads another tenant's 
       id: 'citations',
       title: 'Returns sentence-level citations into source chunks',
       detail:
-        'The response carries `citations` built from the summary’s sentences, each with `chunk_index`, `char_start` and `char_end` so a reader can open the exact text a sentence came from. The draft returns the summary with no pointers.',
+        'The response carries `citations` built from the summary’s sentences, each with `chunk_index`, `char_start` and `char_end` so a reader can open the exact text a sentence came from. The starter returns the summary with no pointers.',
       match: {
         python: {all: [/citations/, /chunk_index/, /char_start/, /char_end/]},
         typescript: {all: [/citations/, /chunk_index/, /char_start/, /char_end/]},
@@ -75,7 +75,7 @@ alone, so any caller with a guessed or leaked summary id reads another tenant's 
       id: 'stale-marking',
       title: 'A source edit marks citations into changed chunks stale',
       detail:
-        'The stored `source_hash` (and each citation’s `chunk_hash`) is compared with the current hashes, and the changed chunks are reported: `stale` plus `stale_chunks`. The draft never compares hashes, so it serves a summary of text that no longer exists.',
+        'The stored `source_hash` (and each citation’s `chunk_hash`) is compared with the current hashes, and the changed chunks are reported: `stale` plus `stale_chunks`. The starter never compares hashes, so it serves a summary of text that no longer exists.',
       match: {
         python: {all: [/stale/, /source_hash/, /stale_chunks/]},
         typescript: {all: [/stale/, /source_hash/, /stale_chunks/]},
@@ -88,7 +88,7 @@ alone, so any caller with a guessed or leaked summary id reads another tenant's 
       id: 'tenant-scoped-404',
       title: 'Another tenant’s id is 404',
       detail:
-        'The tenant header is required and the lookup is scoped to it, so a foreign or unknown id answers **404** — not another tenant’s summary and not a **403** that confirms the id exists. The draft loads the summary by id alone.',
+        'The tenant header is required and the lookup is scoped to it, so a foreign or unknown id answers **404** — not another tenant’s summary and not a **403** that confirms the id exists. The starter loads the summary by id alone.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*404/]},
         typescript: {all: [/X-Tenant-Id/, /code\(\s*404\s*\)/]},
@@ -101,7 +101,7 @@ alone, so any caller with a guessed or leaked summary id reads another tenant's 
       id: 'sentence-pointers',
       title: 'Every pointer names the source hash it resolves into',
       detail:
-        'Each citation carries its `sentence` index and the `source_hash` it was written against, and `resolve_citation` refuses a pointer whose hash does not match the summary’s, so a citation that no longer resolves is never returned as one. The draft has no resolver.',
+        'Each citation carries its `sentence` index and the `source_hash` it was written against, and `resolve_citation` refuses a pointer whose hash does not match the summary’s, so a citation that no longer resolves is never returned as one. The starter has no resolver.',
       match: {
         python: {all: [/resolve_citation\(/, /sentence/, /source_hash/]},
         typescript: {all: [/resolveCitation\(/, /sentence/, /source_hash/]},
@@ -133,8 +133,8 @@ store = SummaryStore()
 
 @app.get("/v1/summaries/{summary_id}")
 def read_summary(summary_id: str) -> JSONResponse:
-    # TODO: this draft returns the summary with no citations, serves it unchanged after the source
-    # was edited (it never compares hashes), and looks the id up without the tenant. Review all three.
+    # TODO: this starter returns the summary with no citations, serves it unchanged after the source
+    # was edited (it never compares hashes), and looks the id up without the tenant. Fix all three.
     summary = store.get(summary_id)
     if summary is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -229,7 +229,7 @@ def read_summary(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/summaries/{id}: a model-generated draft that returns whatever it loads. */
+      starter: `/** GET /v1/summaries/{id}: flawed code that returns whatever it loads. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -250,8 +250,8 @@ const store = {
 };
 
 app.get('/v1/summaries/:summary_id', async (request, reply) => {
-  // TODO: this draft returns the summary with no citations, serves it unchanged after the source
-  // was edited (it never compares hashes), and looks the id up without the tenant. Review all three.
+  // TODO: this starter returns the summary with no citations, serves it unchanged after the source
+  // was edited (it never compares hashes), and looks the id up without the tenant. Fix all three.
   const {summary_id: summaryId} = request.params as {summary_id: string};
   const summary = await store.get(summaryId);
   if (summary === null) return reply.code(404).send({error: 'not found'});
@@ -361,9 +361,9 @@ func (unimplementedStore) Get(summaryID string) *Summary { panic("summary store 
 
 func handleReadSummary(store SummaryStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// TODO: this draft returns the summary with no citations, serves it unchanged after the
+		// TODO: this starter returns the summary with no citations, serves it unchanged after the
 		// source was edited (it never compares hashes), and looks the id up without the tenant.
-		// Review all three.
+		// Fix all three.
 		summary := store.Get(r.PathValue("summary_id"))
 		if summary == nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
@@ -498,9 +498,9 @@ object SummaryReadApi extends DefaultJsonProtocol {
     val route =
       path("v1" / "summaries" / Segment) { summaryId =>
         get {
-          // TODO: this draft returns the summary with no citations, serves it unchanged after the
+          // TODO: this starter returns the summary with no citations, serves it unchanged after the
           // source was edited (it never compares hashes), and looks the id up without the tenant.
-          // Review all three.
+          // Fix all three.
           store.get(summaryId) match {
             case None        => complete(StatusCodes.NotFound, "not found")
             case Some(value) => complete(StatusCodes.OK, value.toJson.compactPrint)
@@ -621,8 +621,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/summaries/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft returns the summary with no citations, serves it unchanged after the source
-    // was edited (it never compares hashes), and looks the id up without the tenant. Review all three.
+    // TODO: this starter returns the summary with no citations, serves it unchanged after the source
+    // was edited (it never compares hashes), and looks the id up without the tenant. Fix all three.
     static SummaryStore& store = *static_cast<SummaryStore*>(nullptr);
     const json summary = store.get(req.matches[1]);
     if (summary.is_null()) {
@@ -751,7 +751,7 @@ int main() {
     'A citation is a claim about a specific text: `sentence`, `chunk_index`, `char_start`, `char_end` and the `source_hash` it was written against. Return the pointers, and let `resolve_citation` decide whether a pointer still points anywhere.',
     'Staleness is a hash comparison, not a timestamp: compare the stored `source_hash` and each citation’s `chunk_hash` with the current ones, mark the changed chunks, and report `stale` plus `stale_chunks` so a reader knows exactly which claims moved.',
   ],
-  debrief: `The interview question behind this step is whether a summary is a statement you can check. The draft
+  debrief: `The interview question behind this step is whether a summary is a statement you can check. The starter
 answers no: it returns text with no way to find the sentences it compressed and no way to notice that
 the document changed underneath it. Citations are what make a summary auditable — sentence to chunk,
 with character offsets and the source hash the pointer was written against — and the hash is what

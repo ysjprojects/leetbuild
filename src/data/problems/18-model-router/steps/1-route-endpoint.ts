@@ -8,9 +8,9 @@ export const routeEndpointStep: Step = {
   focus: ['client', 'router', 'db', 'provider'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and returns a routing decision. It compiles, it serves the demo, and it hides four
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/route\` with body \`{"prompt": "…", "max_tokens": 256, "policy": "auto"}\`.
 
@@ -60,7 +60,7 @@ the retention policy.`,
       id: 'validate',
       title: 'Enforces the 256 KiB prompt cap and the max_tokens range',
       detail:
-        'A prompt over `1 << 18` bytes is **413**; `max_tokens` outside 1..4096 is **400**. The draft skips both caps, so one request can blow the provider budget and a non-integer `max_tokens` reaches the call.',
+        'A prompt over `1 << 18` bytes is **413**; `max_tokens` outside 1..4096 is **400**. The starter skips both caps, so one request can blow the provider budget and a non-integer `max_tokens` reaches the call.',
       match: {
         python: {all: [/MAX_PROMPT_BYTES/, /MAX_OUTPUT_TOKENS/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_PROMPT_BYTES/, /MAX_OUTPUT_TOKENS/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -75,7 +75,7 @@ the retention policy.`,
       id: 'tenant-policy',
       title: 'Authenticates the tenant and picks the model server-side',
       detail:
-        'The tenant is required — **401** when absent — and `policy` is checked against `auto`/`small`/`large`; the model is derived from the policy and the estimate (auto → small at ≤ 2048 tokens, large above). The draft returns the caller’s `policy` string as the model name.',
+        'The tenant is required — **401** when absent — and `policy` is checked against `auto`/`small`/`large`; the model is derived from the policy and the estimate (auto → small at ≤ 2048 tokens, large above). The starter returns the caller’s `policy` string as the model name.',
       match: {
         python: {all: [/ALLOWED_POLICIES/, /status_code\s*=\s*401/, /SMALL_MODEL/, /AUTO_SMALL_MAX_TOKENS/]},
         typescript: {all: [/ALLOWED_POLICIES/, /code\(\s*401\s*\)/, /SMALL_MODEL/, /AUTO_SMALL_MAX_TOKENS/]},
@@ -88,7 +88,7 @@ the retention policy.`,
       id: 'idempotency-key',
       title: 'Keys retries by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the decision is stored under `(tenant, key)`; a replay returns the stored decision instead of routing twice. The draft ignores the header entirely.',
+        '`Idempotency-Key` is required and the decision is stored under `(tenant, key)`; a replay returns the stored decision instead of routing twice. The starter ignores the header entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -101,7 +101,7 @@ the retention policy.`,
       id: 'no-prompt-log',
       title: 'Logs the decision, never the prompt',
       detail:
-        'The routing decision is logged with tenant, model and estimate; the prompt text never reaches a log line. The draft logs `prompt` on every request.',
+        'The routing decision is logged with tenant, model and estimate; the prompt text never reaches a log line. The starter logs `prompt` on every request.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*prompt/]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*prompt/]},
@@ -144,8 +144,8 @@ store = RouteStore()
 
 @app.post("/v1/route")
 def route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft treats the caller's policy as the model name, checks neither the prompt
-    # size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Review all four.
+    # TODO: this starter treats the caller's policy as the model name, checks neither the prompt
+    # size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
     estimate = len(body.prompt) // 4 + body.max_tokens
     logger.info("route tenant=%s prompt=%r", tenant, body.prompt)
     return JSONResponse({"model": body.policy, "estimated_tokens": estimate}, status_code=200)
@@ -231,7 +231,7 @@ def route(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/route: a model-generated draft that echoes the caller's policy. */
+      starter: `/** POST /v1/route: flawed code that echoes the caller's policy. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -243,8 +243,8 @@ interface RouteBody {
 }
 
 app.post('/v1/route', async (request, reply) => {
-  // TODO: this draft returns the caller's policy as the model name, checks neither the prompt
-  // size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Review all four.
+  // TODO: this starter returns the caller's policy as the model name, checks neither the prompt
+  // size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RouteBody;
   const estimate = Math.floor(body.prompt.length / 4) + (body.max_tokens ?? 256);
@@ -353,8 +353,8 @@ func route(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft returns the caller's policy as the model name, checks neither the prompt
-	// size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Review all four.
+	// TODO: this starter returns the caller's policy as the model name, checks neither the prompt
+	// size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
 	estimate := len([]byte(body.Prompt))/4 + body.MaxTokens
 	log.Printf("route tenant=%s prompt=%q", tenant, body.Prompt)
 	writeJSON(rw, http.StatusOK, map[string]any{"model": body.Policy, "estimated_tokens": estimate})
@@ -520,7 +520,7 @@ object RouteApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RouteRequest]) { body =>
-            // TODO: this draft returns the caller's policy as the model name, checks neither the
+            // TODO: this starter returns the caller's policy as the model name, checks neither the
             // prompt size nor max_tokens, ignores Idempotency-Key, and logs the prompt.
             val estimate = body.prompt.getBytes("UTF-8").length / 4 + body.max_tokens
             system.log.info(s"route tenant=$tenant prompt=\${body.prompt}")
@@ -642,8 +642,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft returns the caller's policy as the model name, checks neither the prompt
-    // size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Review all four.
+    // TODO: this starter returns the caller's policy as the model name, checks neither the prompt
+    // size nor max_tokens, ignores Idempotency-Key, and logs the prompt. Fix all four.
     const auto prompt = body.value("prompt", std::string());
     const int maxTokens = body.value("max_tokens", 256);
     const int estimate = static_cast<int>(prompt.size()) / 4 + maxTokens;
@@ -762,5 +762,5 @@ int main() {
     'The idempotency lookup is keyed by `(tenant, key)` and happens before routing; a hit returns the stored decision with 200. Storing the decision — not just the request hash — is what lets a replay answer without re-estimating or re-routing.',
     'The log line is a contract: tenant, model, policy, estimate. The prompt belongs to the caller; if you need it for debugging, hash it or keep only its length. `logger.info(..., body.prompt)` leaks tenant content into every log sink.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends well-formed requests from one tenant and never retries. Four separate defects are being checked: authentication (the tenant is never optional), input caps (cheap rejections before expensive work), server-side policy resolution (the caller names a policy, never a model), and idempotency keyed by tenant so a retry cannot double-route. The log line is the fourth one that candidates miss in interviews: the prompt has to be assumed sensitive, so it may never be logged verbatim. Real routers add per-tenant policy overrides from config, request-scoped trace ids, and a hashed prompt fingerprint for dedupe and debugging.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one tenant and never retries. Four separate defects are being checked: authentication (the tenant is never optional), input caps (cheap rejections before expensive work), server-side policy resolution (the caller names a policy, never a model), and idempotency keyed by tenant so a retry cannot double-route. The log line is the fourth one that candidates miss in interviews: the prompt has to be assumed sensitive, so it may never be logged verbatim. Real routers add per-tenant policy overrides from config, request-scoped trace ids, and a hashed prompt fingerprint for dedupe and debugging.`,
 };

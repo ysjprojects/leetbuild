@@ -8,8 +8,8 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'cdn'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it returns a product and the
-page renders, so the demo passes. Three production flaws are hidden in three lines. Review it, fix
+**Starting point.** The starter is working code: it returns a product and the
+page renders, so the demo passes. Three production flaws are hidden in three lines. Debug it, fix
 it, and prove the fix.
 
 Implement the storefront read, \`GET /v1/products/{id}\`.
@@ -26,7 +26,7 @@ Implement the storefront read, \`GET /v1/products/{id}\`.
   serving a rolled-back product long after the rollback.
 - A missing published version is **404**, and preview responses are never publicly cacheable.
 
-**Failure mode the checks target.** The draft serves \`latest_row(...)\` regardless of publish state,
+**Failure mode the checks target.** The starter serves \`latest_row(...)\` regardless of publish state,
 so a draft (or a held-back version) is public; it exposes that draft to ordinary storefront callers
 because there is no preview scope at all; and its weak, version-less cache header lets a CDN mix two
 versions across a swap and survive a rollback.`,
@@ -60,7 +60,7 @@ versions across a swap and survive a rollback.`,
       id: 'published-only',
       title: 'Storefront reads resolve the published version',
       detail:
-        'The default read goes through the published snapshot (`published_view`/`publishedView`) and the draft is read through a separate `draft_view`/`draftView`. The draft serves the latest row whatever its publish state.',
+        'The default read goes through the published snapshot (`published_view`/`publishedView`) and the draft is read through a separate `draft_view`/`draftView`. The starter serves the latest row whatever its publish state.',
       match: {
         python: {all: [/published_view\(/, /draft_view\(/]},
         typescript: {all: [/publishedView\(/, /draftView\(/]},
@@ -73,7 +73,7 @@ versions across a swap and survive a rollback.`,
       id: 'cache-version',
       title: 'Cache headers carry the published version',
       detail:
-        'The response carries `Cache-Control`, an `ETag` built from the version and an `X-Catalog-Version` header naming it, so a CDN cannot hold a version the catalog has replaced. The draft returns a weak, version-less header.',
+        'The response carries `Cache-Control`, an `ETag` built from the version and an `X-Catalog-Version` header naming it, so a CDN cannot hold a version the catalog has replaced. The starter returns a weak, version-less header.',
       match: {
         python: {all: [/Cache-Control/, /ETag/, /X-Catalog-Version/]},
         typescript: {all: [/Cache-Control/, /ETag/, /X-Catalog-Version/]},
@@ -86,7 +86,7 @@ versions across a swap and survive a rollback.`,
       id: 'preview-scope',
       title: 'Drafts only through the preview scope',
       detail:
-        'A draft is served only when the caller asks for the preview scope (`PREVIEW_SCOPE`), and the preview response is not publicly cacheable. The draft exposes drafts to ordinary storefront callers.',
+        'A draft is served only when the caller asks for the preview scope (`PREVIEW_SCOPE`), and the preview response is not publicly cacheable. The starter exposes drafts to ordinary storefront callers.',
       match: {
         python: {all: [/PREVIEW_SCOPE/, /scope/]},
         typescript: {all: [/PREVIEW_SCOPE/, /scope/]},
@@ -99,7 +99,7 @@ versions across a swap and survive a rollback.`,
       id: 'max-age',
       title: 'Short max-age so a rollback becomes visible',
       detail:
-        'Storefront reads use `MAX_AGE_S` (30 s) in `Cache-Control: max-age=…`, so a rollback reaches shoppers within the max-age. The draft hardcodes a ten-minute public max-age.',
+        'Storefront reads use `MAX_AGE_S` (30 s) in `Cache-Control: max-age=…`, so a rollback reaches shoppers within the max-age. The starter hardcodes a ten-minute public max-age.',
       match: {
         python: {all: [/MAX_AGE_S\s*=\s*30/, /max-age=/]},
         typescript: {all: [/MAX_AGE_S\s*=\s*30/, /max-age=/]},
@@ -123,8 +123,8 @@ def read_product(
     product_id: str,
     channel: str = Header(default="storefront", alias="X-Channel"),
 ) -> JSONResponse:
-    # TODO: this draft serves the latest row whatever its publish state, exposes drafts to
-    # storefront callers, and returns a weak cache header without the version. Review all three.
+    # TODO: this starter serves the latest row whatever its publish state, exposes drafts to
+    # storefront callers, and returns a weak cache header without the version. Fix all three.
     row = latest_row(product_id)
     return JSONResponse(
         row,
@@ -162,7 +162,7 @@ def read_product(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/products/{id}: a model-generated draft that serves the latest row. */
+      starter: `/** GET /v1/products/{id}: flawed code that serves the latest row. */
 import Fastify from 'fastify';
 
 import {latestRow} from './catalog-store';
@@ -170,8 +170,8 @@ import {latestRow} from './catalog-store';
 export const app = Fastify();
 
 app.get('/v1/products/:productId', async (request, reply) => {
-  // TODO: this draft serves the latest row whatever its publish state, exposes drafts to
-  // storefront callers, and returns a weak cache header without the version. Review all three.
+  // TODO: this starter serves the latest row whatever its publish state, exposes drafts to
+  // storefront callers, and returns a weak cache header without the version. Fix all three.
   const {productId} = request.params as {productId: string};
   const row = await latestRow(productId);
   return reply
@@ -227,8 +227,8 @@ func latestRow(productID string) map[string]any {
 }
 
 func readProduct(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves the latest row whatever its publish state, exposes drafts to
-	// storefront callers, and returns a weak cache header without the version. Review all three.
+	// TODO: this starter serves the latest row whatever its publish state, exposes drafts to
+	// storefront callers, and returns a weak cache header without the version. Fix all three.
 	row := latestRow(r.PathValue("productID"))
 	rw.Header().Set("Cache-Control", "public, max-age=600")
 	rw.Header().Set("ETag", \`W/"catalog"\`)
@@ -329,8 +329,8 @@ object ReadApi {
     path("v1" / "products" / Segment) { productId =>
       get {
         optionalHeaderValueByName("X-Channel") { _ =>
-          // TODO: this draft serves the latest row whatever its publish state, exposes drafts to
-          // storefront callers, and returns a weak cache header without the version. Review all three.
+          // TODO: this starter serves the latest row whatever its publish state, exposes drafts to
+          // storefront callers, and returns a weak cache header without the version. Fix all three.
           complete(
             HttpResponse(
               StatusCodes.OK,
@@ -425,8 +425,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/products/([^/]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves the latest row whatever its publish state, exposes drafts to
-    // storefront callers, and returns a weak cache header without the version. Review all three.
+    // TODO: this starter serves the latest row whatever its publish state, exposes drafts to
+    // storefront callers, and returns a weak cache header without the version. Fix all three.
     res.set_header("Cache-Control", "public, max-age=600");
     res.set_header("ETag", "W/\\"catalog\\"");
     res.status = 200;

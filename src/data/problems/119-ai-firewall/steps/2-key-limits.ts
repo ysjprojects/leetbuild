@@ -8,7 +8,7 @@ export const keyLimitsStep: Step = {
   focus: ['aifw', 'redis', 'guard'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a key with requests left gets
+**Starting point.** The starter is working code: a key with requests left gets
 through, so the demo passes. It hides a race, a leak, a bare refusal and a wrong order of
 operations. Find them, fix them, and prove the fix.
 
@@ -25,7 +25,7 @@ API key may send in a window, so one caller cannot consume the model's capacity 
 - Over the limit, answer **429** with \`Retry-After\` (seconds, the TTL the script returned) and do
   not touch the detector or the application.
 - The limit runs **before** the detector: a request that will be refused must not pay for a
-  detection call. The draft scores first and limits second.
+  detection call. The starter scores first and limits second.
 
 **Failure mode the checks target.** Under load, \`GET\` then \`INCR\` admits more than 120 requests
 in the window — exactly the burst the limit exists for; a key without an expiry locks a busy caller
@@ -51,7 +51,7 @@ before limiting means every refused request has already cost a detector call.`,
       id: 'atomic',
       title: 'Counts with one atomic Lua script',
       detail:
-        'The counter is incremented and checked inside one `EVAL`/`NewScript` call that runs `INCR` on the server. The draft does a client-side `GET` and a separate `INCR`, so concurrent requests all pass the same check.',
+        'The counter is incremented and checked inside one `EVAL`/`NewScript` call that runs `INCR` on the server. The starter does a client-side `GET` and a separate `INCR`, so concurrent requests all pass the same check.',
       match: {
         python: {all: [/LIMIT_LUA/, /\.eval\(/, /INCR/]},
         typescript: {all: [/LIMIT_LUA/, /\.eval\(/, /INCR/]},
@@ -77,7 +77,7 @@ before limiting means every refused request has already cost a detector call.`,
       id: 'retry-after',
       title: 'Answers 429 with Retry-After from the TTL',
       detail:
-        'Over the limit, the response is `429 Too Many Requests` with a `Retry-After` header built from the TTL the script returned. The draft sends a bare 429.',
+        'Over the limit, the response is `429 Too Many Requests` with a `Retry-After` header built from the TTL the script returned. The starter sends a bare 429.',
       match: {
         python: {all: [/Retry-After/, /status_code\s*=\s*429/]},
         typescript: {all: [/Retry-After/, /\.code\(\s*429\s*\)/]},
@@ -90,7 +90,7 @@ before limiting means every refused request has already cost a detector call.`,
       id: 'limit-first',
       title: 'Limits before the detector is called',
       detail:
-        'The limit check runs before `decide(`; a refused request never costs a detection call. The draft scores the prompt first and checks the limit afterwards.',
+        'The limit check runs before `decide(`; a refused request never costs a detection call. The starter scores the prompt first and checks the limit afterwards.',
       match: {
         python: {order: [/=\s*check_limit\(/, /=\s*await\s+decide\(/]},
         typescript: {order: [/=\s*await\s+checkLimit\(/, /=\s*await\s+decide\(/]},
@@ -189,7 +189,7 @@ async def chat(request: Request, api_key: str = Header(alias="X-Api-Key")) -> JS
 `,
     },
     typescript: {
-      starter: `/** Per-key limit: a model-generated draft that reads, then increments, and never expires. */
+      starter: `/** Per-key limit: flawed code that reads, then increments, and never expires. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

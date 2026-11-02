@@ -8,10 +8,10 @@ export const guardrailsStep: Step = {
   focus: ['workflow', 'guardrails', 'human'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the gate between the
-reasoning loop's result and the customer: it asks the Guardrail Framework whether the draft answer
-is relevant and returns the answer. When the guardrail service is healthy and the answer is fine,
-the demo passes. It hides four production flaws. Review it like the owner of the guardrails, fix
+**Starting point.** The starter is working code for the gate between the
+reasoning loop's result and the customer: it asks the Guardrail Framework whether the model's answer
+is relevant and returns it. When the guardrail service is healthy and the answer is fine,
+the demo passes. It hides four production flaws. Debug it like the owner of the guardrails, fix
 it, and prove the fix.
 
 Implement \`gate(turn, draft, context)\`, run once per turn after the loop produces a result and
@@ -28,10 +28,11 @@ before anything reaches the customer:
   The gate **fails closed**: an unverified answer is an unverified answer.
 - Any verdict other than \`PASS\` **blocks the answer** and hands the conversation to a human
   agent: \`handoff.escalate(conversation, turn_id, verdicts)\`; the turn's status is \`escalated\`
-  and the draft is never returned. Only when every verdict is \`PASS\` is the status \`answered\`.
+  and the model's answer is never returned. Only when every verdict is \`PASS\` is the status
+  \`answered\`.
 - The verdicts are returned with the turn either way, so step 5 can record them.
 
-**Failure mode the checks target.** The draft runs one guardrail, waits for it with no deadline,
+**Failure mode the checks target.** The starter runs one guardrail, waits for it with no deadline,
 treats an exception as "nothing to see", and on an explicit \`FAIL\` logs a warning and returns the
 answer anyway. In production the guardrail service's slow day becomes the assistant's slow day,
 and its outage becomes the day every hallucinated refund policy reached a guest.`,
@@ -54,14 +55,14 @@ and its outage becomes the day every hallucinated refund policy reached a guest.
   hints: [
     'Make the guardrail list data, not code: a tuple of names and one loop that builds a `CheckRequest` per name. Start all the calls before waiting on any of them — `.future()` on the stub, `Promise.all`, goroutines with a `WaitGroup`, `Future.sequence`, `std::async` — and give each the same 2 s deadline.',
     'Collect verdicts into a map keyed by guardrail name. An RPC error — including `DEADLINE_EXCEEDED` — writes `"ERROR"` into the map instead of being swallowed; the decision afterwards is simply "is every value `PASS`?".',
-    'When any verdict is not `PASS`, call `handoff.escalate(conversation, turn_id, verdicts)` and return `{status: "escalated", verdicts}` without the draft. The log line in the starter is where the draft leaks: a warning is not a block.',
+    'When any verdict is not `PASS`, call `handoff.escalate(conversation, turn_id, verdicts)` and return `{status: "escalated", verdicts}` without the answer. The log line in the starter is where the answer leaks: a warning is not a block.',
   ],
   checks: [
     {
       id: 'all-guardrails',
       title: 'Runs every configured guardrail',
       detail:
-        '`GUARDRAILS` lists `relevance`, `groundedness` and `pii`, and the gate iterates the list to build one `Check` per guardrail. The draft hardcodes a single relevance check.',
+        '`GUARDRAILS` lists `relevance`, `groundedness` and `pii`, and the gate iterates the list to build one `Check` per guardrail. The starter hardcodes a single relevance check.',
       match: {
         python: {all: [/GUARDRAILS\s*=/, /"groundedness"/, /"pii"/, /in GUARDRAILS/]},
         typescript: {all: [/GUARDRAILS\s*=/, /'groundedness'/, /'pii'/, /GUARDRAILS\.map\(/]},
@@ -87,7 +88,7 @@ and its outage becomes the day every hallucinated refund policy reached a guest.
       id: 'one-deadline',
       title: 'Every check carries the 2 s deadline',
       detail:
-        '`GUARDRAIL_DEADLINE_S = 2` is set on each `Check` call — the same deadline for all of them, so the gate as a whole is bounded. The draft waits for the guardrail service indefinitely.',
+        '`GUARDRAIL_DEADLINE_S = 2` is set on each `Check` call — the same deadline for all of them, so the gate as a whole is bounded. The starter waits for the guardrail service indefinitely.',
       match: {
         python: {all: [/GUARDRAIL_DEADLINE_S\s*=\s*2/, /timeout=GUARDRAIL_DEADLINE_S/]},
         typescript: {
@@ -102,7 +103,7 @@ and its outage becomes the day every hallucinated refund policy reached a guest.
       id: 'fail-closed',
       title: 'A timeout or RPC error is a failed verdict',
       detail:
-        'An RPC failure — `DEADLINE_EXCEEDED` included — records the verdict `ERROR` for that guardrail; nothing is swallowed. The draft catches the exception and continues as if the guardrail had passed.',
+        'An RPC failure — `DEADLINE_EXCEEDED` included — records the verdict `ERROR` for that guardrail; nothing is swallowed. The starter catches the exception and continues as if the guardrail had passed.',
       match: {
         python: {all: [/except grpc\.RpcError/, /"ERROR"/], none: [/except[^\n]*:\s*\n\s*pass\b/]},
         typescript: {all: [/catch/, /'ERROR'/], none: [/catch\s*(\([^)]*\))?\s*\{\s*\}/]},
@@ -115,7 +116,7 @@ and its outage becomes the day every hallucinated refund policy reached a guest.
       id: 'escalate',
       title: 'Blocks the answer and escalates on any non-PASS verdict',
       detail:
-        'Any verdict other than `PASS` calls `handoff.escalate(conversation, turn_id, verdicts)` and returns an `escalated` turn without the draft. The draft logs a warning and returns the answer anyway.',
+        'Any verdict other than `PASS` calls `handoff.escalate(conversation, turn_id, verdicts)` and returns an `escalated` turn without the answer. The starter logs a warning and returns the answer anyway.',
       match: {
         python: {all: [/handoff\.escalate\(/, /"escalated"/]},
         typescript: {all: [/handoff\.escalate\(/, /'escalated'/]},
@@ -215,7 +216,7 @@ def gate(turn: dict, draft: str, context: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Guardrail gate: a model-generated draft that checks relevance and returns the answer regardless. */
+      starter: `/** Guardrail gate: flawed code that checks relevance and returns the answer regardless. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -647,5 +648,5 @@ json gate(const std::string& conversation, const std::string& turnId, const std:
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat a safety check as a gate or as telemetry. The draft treats it as telemetry: one check, a warning, the answer goes out. The post's framework is a gate — reusable guardrails that engineers from different teams write once, executed in parallel against the model's output, LLM-backed where the question is semantic (content moderation, groundedness) and rule-backed where it is structural (a tool call with an invalid listing setup). Four properties make it a gate: every configured guardrail runs, they run together under one deadline so the gate costs one check's latency rather than three, a check that could not run is a check that failed, and a failed check ends in a human, not in a hedge. The fail-closed rule is the one candidates argue about, and the argument is the interview: a guardrail outage that passes everything is indistinguishable from no guardrail at all. Real frameworks add a severity per guardrail (block vs annotate), regeneration once before escalation, tool guardrails that run before \`Invoke\` rather than after the result, and a verdict stream — step 5 — so the gate's own precision can be measured.`,
+  debrief: `The interviewer is testing whether you treat a safety check as a gate or as telemetry. The starter treats it as telemetry: one check, a warning, the answer goes out. The post's framework is a gate — reusable guardrails that engineers from different teams write once, executed in parallel against the model's output, LLM-backed where the question is semantic (content moderation, groundedness) and rule-backed where it is structural (a tool call with an invalid listing setup). Four properties make it a gate: every configured guardrail runs, they run together under one deadline so the gate costs one check's latency rather than three, a check that could not run is a check that failed, and a failed check ends in a human, not in a hedge. The fail-closed rule is the one candidates argue about, and the argument is the interview: a guardrail outage that passes everything is indistinguishable from no guardrail at all. Real frameworks add a severity per guardrail (block vs annotate), regeneration once before escalation, tool guardrails that run before \`Invoke\` rather than after the result, and a verdict stream — step 5 — so the gate's own precision can be measured.`,
 };

@@ -8,28 +8,28 @@ export const transcriptionEventsStep: Step = {
   focus: ['worker', 'redactor', 'kafka', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every chunk worker publishes a
+**Starting point.** The starter is working code: every chunk worker publishes a
 \`transcript.segment\` record and the topic looks healthy in the console. It hides four flaws, and two
 of them are the kind that never show in a demo — segments of one job come out shuffled, and the raw
-text of a customer's audio lands in a retained topic. Review it, fix it, and prove the fix.
+text of a customer's audio lands in a retained topic. Debug it, fix it, and prove the fix.
 
 Each finished chunk publishes one \`transcript.segment\` record:
 
 - **Keyed by job id.** The key decides the partition, so every segment of one job lands on one
-  partition in produce order and the consumer reassembles the transcript without sorting. The draft
+  partition in produce order and the consumer reassembles the transcript without sorting. The starter
   keys by \`chunk_index\`, so segments from concurrent jobs interleave on the same partition and one
   job's segments scatter across many.
 - **Redaction runs before the produce.** The worker sends the segment to the redactor and only the
-  *redacted* text goes into the record. The draft produces first and calls the redactor afterwards,
+  *redacted* text goes into the record. The starter produces first and calls the redactor afterwards,
   so a topic that is retained and replicated long outlives the buffer TTL holding a copy of the raw
   transcript. Order is the whole point: redact, then produce.
 - **The payload carries timestamps and the speaker label.**
   \`{"job_id", "chunk_index", "text", "start_s", "end_s", "speaker_label"}\` — the offsets let the read
-  path assemble a transcript with timings and attribute each line to a speaker. The draft ships
+  path assemble a transcript with timings and attribute each line to a speaker. The starter ships
   \`text\` and timestamps but drops \`speaker_label\`, so every diarized line loses its speaker.
 - **An outbox row on rejection.** If the producer rejects the record — broker down, acks not met —
   \`INSERT INTO outbox (id, topic, key, payload)\` so the segment survives and the relay publishes it
-  later. The draft logs the failure and drops the event: the chunk is marked complete in Redis and
+  later. The starter logs the failure and drops the event: the chunk is marked complete in Redis and
   the transcript silently loses a minute.
 - **A durable producer.** \`acks=all\` and the idempotent producer: a segment must survive a broker
   failover, and the producer's own retries must not publish the same segment twice.
@@ -70,7 +70,7 @@ into storage that no buffer TTL will ever reclaim.`,
       id: 'key-by-job',
       title: 'Keys the record by job id, not by chunk index',
       detail:
-        'The record key is the **job id**, so every segment of one job hashes to the same partition and keeps its produce order. The draft keys by `chunk_index`, which interleaves segments from concurrent jobs and scatters one job across partitions.',
+        'The record key is the **job id**, so every segment of one job hashes to the same partition and keeps its produce order. The starter keys by `chunk_index`, which interleaves segments from concurrent jobs and scatters one job across partitions.',
       match: {
         python: {all: [/key=job_id/], none: [/key=str\(chunk_index\)|key=chunk_index/]},
         typescript: {
@@ -95,7 +95,7 @@ into storage that no buffer TTL will ever reclaim.`,
       id: 'redact-before-publish',
       title: 'Redacts the segment before the produce, not after',
       detail:
-        'The redactor runs first and only the redacted text goes into the record: `redact` appears before `produce`/`send`/`WriteMessages`. The draft produces the raw text and calls the redactor afterwards, so the retained topic holds a copy the redaction pass never touched.',
+        'The redactor runs first and only the redacted text goes into the record: `redact` appears before `produce`/`send`/`WriteMessages`. The starter produces the raw text and calls the redactor afterwards, so the retained topic holds a copy the redaction pass never touched.',
       match: {
         python: {all: [/redactor\.redact\(/], order: [/redact\(/, /producer\.produce\(/]},
         typescript: {all: [/redact\(/], order: [/redact\(/, /producer\.send\(/]},
@@ -108,7 +108,7 @@ into storage that no buffer TTL will ever reclaim.`,
       id: 'segment-payload',
       title: 'The payload carries timestamps and the speaker label',
       detail:
-        '`start_s`, `end_s` and `speaker_label` travel with the redacted `text`, so the read path can assemble a transcript with timings and attribute each line. The draft ships the timestamps but drops the speaker label.',
+        '`start_s`, `end_s` and `speaker_label` travel with the redacted `text`, so the read path can assemble a transcript with timings and attribute each line. The starter ships the timestamps but drops the speaker label.',
       match: {
         python: {all: [/"start_s"/, /"end_s"/, /speaker_label/]},
         typescript: {all: [/\bstart_s\b/, /\bend_s\b/, /\bspeaker_label\b/]},
@@ -121,7 +121,7 @@ into storage that no buffer TTL will ever reclaim.`,
       id: 'outbox-on-reject',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce becomes an `INSERT INTO outbox (id, topic, key, payload)` row so the segment survives the broker and the relay can publish it later. The draft catches the failure and drops the event: the chunk counts as complete while its segment is gone.',
+        'A rejected produce becomes an `INSERT INTO outbox (id, topic, key, payload)` row so the segment survives the broker and the relay can publish it later. The starter catches the failure and drops the event: the chunk counts as complete while its segment is gone.',
       match: {
         python: {all: [/INSERT INTO outbox \(id, topic, key, payload\)/, /except/]},
         typescript: {all: [/INSERT INTO outbox \(id, topic, key, payload\)/, /catch/]},
@@ -134,7 +134,7 @@ into storage that no buffer TTL will ever reclaim.`,
       id: 'producer-acks',
       title: 'Producer waits for all replicas and is idempotent',
       detail:
-        '`acks=all` means a leader failover cannot lose an acknowledged segment, and the idempotent producer keeps its own retries from publishing one segment twice. The draft uses a bare producer with default acks and no idempotence.',
+        '`acks=all` means a leader failover cannot lose an acknowledged segment, and the idempotent producer keeps its own retries from publishing one segment twice. The starter uses a bare producer with default acks and no idempotence.',
       match: {
         python: {all: [/acks/, /enable\.idempotence/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -158,7 +158,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_segment(job_id: str, chunk_index: int, text: str, start_s: float, end_s: float) -> None:
-    # TODO: the draft keys by chunk index instead of the job, publishes the raw text before the
+    # TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
     # redaction pass runs, drops the event when the broker rejects the produce, and leaves the
     # speaker label out of the payload.
     payload = json.dumps(
@@ -224,7 +224,7 @@ def publish_segment(
 `,
     },
     typescript: {
-      starter: `/** A model-generated segment publisher: raw text out, keyed by chunk index. */
+      starter: `/** A segment publisher: raw text out, keyed by chunk index. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'transcription-events', brokers: ['kafka:9092']});
@@ -241,7 +241,7 @@ export async function publishSegment(
   end_s: number,
 ): Promise<void> {
   await producer.connect();
-  // TODO: the draft keys by chunk index instead of the job, publishes the raw text before the
+  // TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
   // redaction pass runs, drops the event when the broker rejects the produce, and leaves the
   // speaker label out of the payload.
   await producer.send({
@@ -305,7 +305,7 @@ const topic = "transcript.segment"
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
 func publishSegment(ctx context.Context, cur *sql.DB, jobID string, chunkIndex int, text string, startS, endS float64) error {
-	// TODO: the draft keys by chunk index instead of the job, publishes the raw text before the
+	// TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
 	// redaction pass runs, drops the event when the broker rejects the produce, and leaves the
 	// speaker label out of the payload.
 	payload, _ := json.Marshal(map[string]any{
@@ -380,7 +380,7 @@ object TranscriptEvents {
   props.put("bootstrap.servers", "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: the draft keys by chunk index instead of the job, publishes the raw text before the
+  // TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
   // redaction pass runs, drops the event when the broker rejects the produce, and leaves the
   // speaker label out of the payload.
   def publishSegment(jobId: String, chunkIndex: Int, text: String, startS: Double, endS: Double): Unit = {
@@ -441,7 +441,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 
 auto producer = make_producer();
 
-// TODO: the draft keys by chunk index instead of the job, publishes the raw text before the
+// TODO: the starter keys by chunk index instead of the job, publishes the raw text before the
 // redaction pass runs, drops the event when the broker rejects the produce, and leaves the
 // speaker label out of the payload.
 void publish_segment(pqxx::work& tx, const std::string& job_id, int chunk_index, const std::string& text, double start_s, double end_s) {

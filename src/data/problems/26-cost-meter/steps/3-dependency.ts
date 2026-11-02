@@ -8,13 +8,13 @@ export const dependencyStep: Step = {
   focus: ['meter', 'pricing', 'cache'],
   task: `## Task
 
-The starter is a plausible model-generated draft: while the pricing service is healthy every report
+The starter is working code: while the pricing service is healthy every report
 gets a rate and the dashboard has a number. Every failure path is wrong. Find them, fix them, and
 prove the fix.
 
 Implement \`price_for(model)\`, the lookup the meter makes before it turns tokens into money:
 
-- Each call carries a **200 ms** deadline (\`PRICE_DEADLINE_S = 0.2\`). The draft calls with no
+- Each call carries a **200 ms** deadline (\`PRICE_DEADLINE_S = 0.2\`). The starter calls with no
   deadline, so one slow pricing replica holds a metering worker — and the request it is serving —
   open for as long as the replica takes.
 - Rates come back as a **table** with the pricing **version** in it. A successful reply replaces
@@ -24,9 +24,9 @@ Implement \`price_for(model)\`, the lookup the meter makes before it turns token
   usable while it is no older than \`PRICE_MAX_AGE_S = 3600\`. A table older than that is reported as
   **uncosted**; a price from last week is a wrong number with no way to tell.
 - A model that is missing from the served table is **uncosted** — \`priced: false\`, \`source:
-  "uncosted"\` — never a hardcoded rate. The draft's \`FALLBACK_RATE\` silently misprices every model
-  the pricing team added after the draft was written, and nothing in the ledger says so.
-- A **failure is never cached**. The draft writes its fallback rate into the per-model cache inside
+  "uncosted"\` — never a hardcoded rate. The starter's \`FALLBACK_RATE\` silently misprices every model
+  the pricing team added after the starter was written, and nothing in the ledger says so.
+- A **failure is never cached**. The starter writes its fallback rate into the per-model cache inside
   the \`except\` block, so one bad minute on the pricing service pins a wrong rate on that model for
   as long as the process lives.
 
@@ -77,7 +77,7 @@ the only thing that would have made it visible on the invoice.`,
       id: 'cache-fallback',
       title: 'Falls back to the cached versioned table',
       detail:
-        'A failed or timed-out call serves the cached table marked `source: "cache"` instead of a hardcoded rate. The draft has no table at all: it invents a rate and reports the lookup as priced.',
+        'A failed or timed-out call serves the cached table marked `source: "cache"` instead of a hardcoded rate. The starter has no table at all: it invents a rate and reports the lookup as priced.',
       match: {
         python: {all: [/PRICE_TABLE/, /except grpc\.RpcError/, /"cache"/]},
         typescript: {all: [/priceTable/, /catch\s*\{/, /'cache'/]},
@@ -103,7 +103,7 @@ the only thing that would have made it visible on the invoice.`,
       id: 'uncosted-model',
       title: 'Reports an unknown model as uncosted',
       detail:
-        'A model that is not in the served table comes back `uncosted` (`priced: false`) rather than at a hardcoded rate. The draft’s `FALLBACK_RATE` misprices every model it does not know and hides the fact from the ledger.',
+        'A model that is not in the served table comes back `uncosted` (`priced: false`) rather than at a hardcoded rate. The starter’s `FALLBACK_RATE` misprices every model it does not know and hides the fact from the ledger.',
       match: {
         python: {all: [/"uncosted"/], none: [/FALLBACK_RATE/]},
         typescript: {all: [/'uncosted'/], none: [/FALLBACK_RATE/]},
@@ -116,7 +116,7 @@ the only thing that would have made it visible on the invoice.`,
       id: 'versioned-table',
       title: 'Versions the served rates and never caches a failure',
       detail:
-        'Every reply carries the pricing version it was priced under, and the cache is written only after a successful call. Caching the failure path — as the draft does — pins a wrong rate for the life of the process and makes the misprice unauditable.',
+        'Every reply carries the pricing version it was priced under, and the cache is written only after a successful call. Caching the failure path — as the starter does — pins a wrong rate for the life of the process and makes the misprice unauditable.',
       match: {
         python: {all: [/"version"/, /PRICE_TABLE/], none: [/PRICE_CACHE/]},
         typescript: {all: [/version/, /priceTable/], none: [/priceCache/]},
@@ -214,7 +214,7 @@ def price_for(model: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** priceFor: a model-generated draft with no deadline and a hardcoded rate. */
+      starter: `/** priceFor: flawed code with no deadline and a hardcoded rate. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

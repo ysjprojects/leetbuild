@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'classifier', 'taxonomy'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it returns the taxonomy and the demo shows labels,
+The starter is working code: it returns the taxonomy and the demo shows labels,
 so it passes. It hides three production flaws. Find them, fix them, and prove the fix.
 
 Implement \`GET /v1/taxonomies/{taxonomy_id}\` — the read side of the taxonomy, and the contract the
@@ -21,7 +21,7 @@ classifier depends on to explain a past result.
   given — the **changelog** between that version and the requested one, so a reader can see what
   changed without diffing two snapshots by hand.
 - Versions are **immutable**: publishing an edit writes a *new* version row and never rewrites the
-  labels of an existing version. The draft's in-place update is what makes an old classification
+  labels of an existing version. The starter's in-place update is what makes an old classification
   unexplainable — the labels it was produced from no longer exist anywhere.
 - Every classification records the **exact taxonomy version** it used, so a result can always be
   reproduced against the rules that were live when it was produced.
@@ -66,7 +66,7 @@ history; and resolving the taxonomy by id alone exposes one tenant's edits to an
       id: 'immutable-versions',
       title: 'Edits publish a new version, nothing is rewritten',
       detail:
-        'An edit calls `put_version`/`putVersion`/`PutVersion` and never rewrites an existing version’s labels. The draft calls `update_labels`, which mutates the version old classifications were produced from.',
+        'An edit calls `put_version`/`putVersion`/`PutVersion` and never rewrites an existing version’s labels. The starter calls `update_labels`, which mutates the version old classifications were produced from.',
       match: {
         python: {all: [/put_version\(/], none: [/update_labels\(/]},
         typescript: {all: [/putVersion\(/], none: [/updateLabels\(/]},
@@ -79,7 +79,7 @@ history; and resolving the taxonomy by id alone exposes one tenant's edits to an
       id: 'tenant-scoped-404',
       title: 'Reads are tenant-scoped, another tenant is 404',
       detail:
-        'The taxonomy is loaded with the authenticated tenant, so a taxonomy the tenant does not own answers **404**. The draft resolves it by id alone and returns another tenant’s taxonomy.',
+        'The taxonomy is loaded with the authenticated tenant, so a taxonomy the tenant does not own answers **404**. The starter resolves it by id alone and returns another tenant’s taxonomy.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /load\(tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /load\(tenant/]},
@@ -92,7 +92,7 @@ history; and resolving the taxonomy by id alone exposes one tenant's edits to an
       id: 'changelog',
       title: 'Publishing versions and serving the changelog',
       detail:
-        'The read returns the changelog between versions when `since` is supplied, and publishing a version is the only way labels change. The draft has no version write path and no changelog.',
+        'The read returns the changelog between versions when `since` is supplied, and publishing a version is the only way labels change. The starter has no version write path and no changelog.',
       match: {
         python: {all: [/def publish_version\(/, /\.changelog\(/, /since/]},
         typescript: {all: [/function publishVersion\(/, /\.changelog\(/, /since/]},
@@ -105,7 +105,7 @@ history; and resolving the taxonomy by id alone exposes one tenant's edits to an
       id: 'version-named',
       title: 'A classification names the exact version it used',
       detail:
-        'Classifying records the taxonomy version that produced the labels, so a past result stays explainable after the taxonomy moves on. The draft records nothing.',
+        'Classifying records the taxonomy version that produced the labels, so a past result stays explainable after the taxonomy moves on. The starter records nothing.',
       match: {
         python: {all: [/record_classification\(/, /taxonomy_version/]},
         typescript: {all: [/recordClassification\(/, /taxonomyVersion/]},
@@ -128,9 +128,9 @@ def read_taxonomy(
     taxonomy_id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft answers with the mutable latest and no version, resolves the taxonomy by id
+    # TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
     # alone so another tenant's edits are visible, and rewrites labels in place so an old
-    # classification can no longer be explained. Review all three.
+    # classification can no longer be explained. Fix all three.
     taxonomy = taxonomy_store.load(taxonomy_id)
     return JSONResponse(
         {"taxonomy_id": taxonomy_id, "labels": taxonomy.latest.labels},
@@ -188,15 +188,15 @@ def record_classification(tenant: str, taxonomy_id: str, taxonomy_version: str, 
 `,
     },
     typescript: {
-      starter: `/** GET /v1/taxonomies/{id}: a model-generated draft that serves the mutable latest. */
+      starter: `/** GET /v1/taxonomies/{id}: flawed code that serves the mutable latest. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
 
 app.get('/v1/taxonomies/:taxonomyId', async (request, reply) => {
-  // TODO: this draft answers with the mutable latest and no version, resolves the taxonomy by id
+  // TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
   // alone so another tenant's edits are visible, and rewrites labels in place so an old
-  // classification can no longer be explained. Review all three.
+  // classification can no longer be explained. Fix all three.
   const {taxonomyId} = request.params as {taxonomyId: string};
   const taxonomy = await taxonomyStore.load(taxonomyId);
   return reply.code(200).send({taxonomy_id: taxonomyId, labels: taxonomy.latest.labels});
@@ -267,9 +267,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 func readTaxonomy(rw http.ResponseWriter, r *http.Request) {
 	taxonomyID := r.PathValue("taxonomy_id")
-	// TODO: this draft answers with the mutable latest and no version, resolves the taxonomy by id
+	// TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
 	// alone so another tenant's edits are visible, and rewrites labels in place so an old
-	// classification can no longer be explained. Review all three.
+	// classification can no longer be explained. Fix all three.
 	taxonomy, _ := taxonomyStore.Load(taxonomyID)
 	writeJSON(rw, http.StatusOK, map[string]any{"taxonomy_id": taxonomyID, "labels": taxonomy.Latest().Labels})
 }
@@ -359,9 +359,9 @@ object TaxonomyApi {
   val route: Route =
     path("v1" / "taxonomies" / Segment) { taxonomyId =>
       get {
-        // TODO: this draft answers with the mutable latest and no version, resolves the taxonomy by
+        // TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by
         // id alone so another tenant's edits are visible, and rewrites labels in place so an old
-        // classification can no longer be explained. Review all three.
+        // classification can no longer be explained. Fix all three.
         val taxonomy = TaxonomyStore.load(taxonomyId)
         val labels = taxonomy.latest.labels.mkString("[", ",", "]")
         complete(StatusCodes.OK, s"""{"taxonomy_id":"$taxonomyId","labels":$labels}""")
@@ -457,9 +457,9 @@ int main() {
 
   svr.Get(R"(/v1/taxonomies/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
     const auto taxonomyId = req.matches[1];
-    // TODO: this draft answers with the mutable latest and no version, resolves the taxonomy by id
+    // TODO: this starter answers with the mutable latest and no version, resolves the taxonomy by id
     // alone so another tenant's edits are visible, and rewrites labels in place so an old
-    // classification can no longer be explained. Review all three.
+    // classification can no longer be explained. Fix all three.
     const auto taxonomy = taxonomyStore.load(taxonomyId);
     res.status = 200;
     res.set_content(json{{"taxonomy_id", taxonomyId}, {"labels", taxonomy.latest().labels}}.dump(),
@@ -542,5 +542,5 @@ void recordClassification(const std::string& tenant, const std::string& taxonomy
     'Immutability is a write rule: an edit calls `putVersion`/`put_version` and creates a new row. An in-place `updateLabels` rewrites the labels that old classifications were produced from, which is how a result becomes unexplainable without anyone deleting anything.',
     'Tenant scoping is the same rule as the classify path: `load(tenant, taxonomy_id)` and 404 for anything else. Returning 403 leaks the existence of another tenant’s taxonomy, and returning a filtered view hides an authorization bug instead of failing the request.',
   ],
-  debrief: `The interviewer is testing whether you can review the read side of a generated service, where correctness is about history rather than the current request. Three defects are being checked: version identity (a read without a version cannot support an explanation of the past), immutability (an edit is a new version, never a mutation of an old one, so old results stay reproducible), and tenant scoping (the same boundary as the write path, enforced on every read). The classification record naming its version is the fourth idea: provenance is only useful if the version it names still exists and can be read back. Real taxonomy services add signed version manifests, a deprecation window before a version is retired, and an index from classification id to version so a reviewer can pull up the exact label set behind any historical result.`,
+  debrief: `The interviewer is testing whether you can debug the read side of a service, where correctness is about history rather than the current request. Three defects are being checked: version identity (a read without a version cannot support an explanation of the past), immutability (an edit is a new version, never a mutation of an old one, so old results stay reproducible), and tenant scoping (the same boundary as the write path, enforced on every read). The classification record naming its version is the fourth idea: provenance is only useful if the version it names still exists and can be read back. Real taxonomy services add signed version manifests, a deprecation window before a version is retired, and an index from classification id to version so a reviewer can pull up the exact label set behind any historical result.`,
 };

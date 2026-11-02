@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'engine', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers both routes,
+**Starting point.** The starter is working code: it registers both routes,
 parses the bodies and answers with the run it just created. It compiles, it serves the demo, and it
-hides three production flaws. Review it like the engine owner, fix it, and prove the fix with the
+hides three production flaws. Debug it like the engine owner, fix it, and prove the fix with the
 checks below.
 
 Implement the run API as two routes.
@@ -31,7 +31,7 @@ Implement the run API as two routes.
 - The response carries \`run_id\`, \`workflow\`, \`definition_version\`, \`pinned_steps\` and
   \`max_steps\`.
 
-**Failure mode the checks target.** The draft resolves the *latest* definition on every advance, so
+**Failure mode the checks target.** The starter resolves the *latest* definition on every advance, so
 publishing version 4 during a version-3 run silently changes the steps that run executes — sometimes
 between two steps, always irreproducibly. It also accepts inputs of any size, so one request can pin
 a gigabyte into the checkpoint, and it publishes cyclic definitions, so the only thing that ever
@@ -65,7 +65,7 @@ checks look for.`,
       id: 'routes',
       title: 'Publishes a definition and starts a run',
       detail:
-        '`POST /v1/workflows` publishes a definition version and `POST /v1/runs` starts a run against one. The draft already registers both, so this check is the floor the other four build on.',
+        '`POST /v1/workflows` publishes a definition version and `POST /v1/runs` starts a run against one. The starter already registers both, so this check is the floor the other four build on.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/workflows["']/, /@app\.post\(\s*["']\/v1\/runs["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/workflows['"]/, /app\.post\(\s*['"]\/v1\/runs['"]/]},
@@ -78,7 +78,7 @@ checks look for.`,
       id: 'cycle',
       title: 'Refuses a cyclic definition at publish time',
       detail:
-        'A definition whose step graph contains a cycle is rejected with **422** when it is published, so a run can never spin whatever its cap is. The draft publishes it and only ever stops it when the run exhausts the cap.',
+        'A definition whose step graph contains a cycle is rejected with **422** when it is published, so a run can never spin whatever its cap is. The starter publishes it and only ever stops it when the run exhausts the cap.',
       match: {
         python: {all: [/has_cycle\(/, /status_code\s*=\s*422/]},
         typescript: {all: [/hasCycle\(/, /code\(\s*422\s*\)/]},
@@ -91,7 +91,7 @@ checks look for.`,
       id: 'pin',
       title: 'Pins the definition version for the life of the run',
       detail:
-        'A run stores the version it started on and the step list of that version, resolved once at start and reported as `definition_version` and `pinned_steps`. The draft stores no version and re-reads the newest definition, so a publish mid-flight silently changes what the run does.',
+        'A run stores the version it started on and the step list of that version, resolved once at start and reported as `definition_version` and `pinned_steps`. The starter stores no version and re-reads the newest definition, so a publish mid-flight silently changes what the run does.',
       match: {
         python: {all: [/definition_version/, /pinned_steps/, /store\.get\(/]},
         typescript: {all: [/definition_version/, /pinned_steps/, /store\.get\(/]},
@@ -104,7 +104,7 @@ checks look for.`,
       id: 'bounds',
       title: 'Caps the input document and the step budget',
       detail:
-        'An input document over `1 << 16` bytes is **413** and `max_steps` outside 1..500 is **400**. The draft accepts inputs of any size and any step budget, so one request can pin a gigabyte of input and a run is only bounded by the worker.',
+        'An input document over `1 << 16` bytes is **413** and `max_steps` outside 1..500 is **400**. The starter accepts inputs of any size and any step budget, so one request can pin a gigabyte of input and a run is only bounded by the worker.',
       match: {
         python: {all: [/MAX_INPUT_BYTES/, /MAX_STEPS/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_INPUT_BYTES/, /MAX_STEPS/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -117,7 +117,7 @@ checks look for.`,
       id: 'immutable',
       title: 'Keeps a published version immutable',
       detail:
-        'A version that already exists is checked before the write and publishing it again is **409**. The draft upserts, so a deploy that re-publishes version 3 changes a definition that running runs are pinned to.',
+        'A version that already exists is checked before the write and publishing it again is **409**. The starter upserts, so a deploy that re-publishes version 3 changes a definition that running runs are pinned to.',
       match: {
         python: {all: [/store\.exists\(/, /status_code\s*=\s*409/]},
         typescript: {all: [/store\.exists\(/, /code\(\s*409\s*\)/]},
@@ -167,7 +167,7 @@ store = DefinitionStore()
 
 @app.post("/v1/workflows")
 def publish(body: PublishRequest) -> JSONResponse:
-    # TODO: this draft publishes any definition, cycle or not, and overwrites an existing
+    # TODO: this starter publishes any definition, cycle or not, and overwrites an existing
     # (name, version) instead of refusing to mutate a published one.
     store.put(body.name, body.version, body.steps)
     return JSONResponse({"name": body.name, "version": body.version}, status_code=201)
@@ -175,7 +175,7 @@ def publish(body: PublishRequest) -> JSONResponse:
 
 @app.post("/v1/runs")
 def start_run(body: RunRequest) -> JSONResponse:
-    # TODO: this draft resolves the newest definition instead of pinning the version the run
+    # TODO: this starter resolves the newest definition instead of pinning the version the run
     # started on, and validates neither the size of the input document nor max_steps.
     definition = store.latest(body.workflow)
     run = {
@@ -290,7 +290,7 @@ def start_run(body: RunRequest) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/workflows and POST /v1/runs: a model-generated draft that floats a run to the newest definition. */
+      starter: `/** POST /v1/workflows and POST /v1/runs: flawed code that floats a run to the newest definition. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -318,7 +318,7 @@ export const store = {
 };
 
 app.post('/v1/workflows', async (request, reply) => {
-  // TODO: this draft publishes any definition, cycle or not, and overwrites an existing
+  // TODO: this starter publishes any definition, cycle or not, and overwrites an existing
   // (name, version) instead of refusing to mutate a published one.
   const body = request.body as PublishBody;
   await store.put(body.name, body.version, body.steps);
@@ -326,7 +326,7 @@ app.post('/v1/workflows', async (request, reply) => {
 });
 
 app.post('/v1/runs', async (request, reply) => {
-  // TODO: this draft resolves the newest definition instead of pinning the version the run
+  // TODO: this starter resolves the newest definition instead of pinning the version the run
   // started on, and validates neither the size of the input document nor max_steps.
   const body = request.body as RunBody;
   const definition = await store.latest(body.workflow);
@@ -475,7 +475,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func publish(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft publishes any definition, cycle or not, and overwrites an existing
+	// TODO: this starter publishes any definition, cycle or not, and overwrites an existing
 	// (name, version) instead of refusing to mutate a published one.
 	var body PublishRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -487,7 +487,7 @@ func publish(rw http.ResponseWriter, r *http.Request) {
 }
 
 func startRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft resolves the newest definition instead of pinning the version the run
+	// TODO: this starter resolves the newest definition instead of pinning the version the run
 	// started on, and validates neither the size of the input document nor max_steps.
 	var body RunRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -728,7 +728,7 @@ object WorkflowApi {
     path("v1" / "workflows") {
       post {
         entity(as[PublishRequest]) { body =>
-          // TODO: this draft publishes any definition, cycle or not, and overwrites an existing
+          // TODO: this starter publishes any definition, cycle or not, and overwrites an existing
           // (name, version) instead of refusing to mutate a published one.
           store.put(body.name, body.version, body.steps)
           complete(StatusCodes.Created, s"""{"name":"\${body.name}","version":\${body.version}}""")
@@ -738,7 +738,7 @@ object WorkflowApi {
       path("v1" / "runs") {
         post {
           entity(as[RunRequest]) { body =>
-            // TODO: this draft resolves the newest definition instead of pinning the version the
+            // TODO: this starter resolves the newest definition instead of pinning the version the
             // run started on, and validates neither the input size nor max_steps.
             val definition = store.latest(body.workflow)
             val steps = definition.map(_.steps).getOrElse(Nil)
@@ -886,7 +886,7 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/workflows", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft publishes any definition, cycle or not, and overwrites an existing
+    // TODO: this starter publishes any definition, cycle or not, and overwrites an existing
     // (name, version) instead of refusing to mutate a published one.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
@@ -902,7 +902,7 @@ int main() {
   });
 
   svr.Post("/v1/runs", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft resolves the newest definition instead of pinning the version the run
+    // TODO: this starter resolves the newest definition instead of pinning the version the run
     // started on, and validates neither the size of the input document nor max_steps.
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
@@ -1063,5 +1063,5 @@ int main() {
     'The run path pins, it does not look up. Store the version and the step list in the run record at start (`definition_version`, `pinned_steps`) and read the definition exactly once, with the version the caller named — never `latest`, which is a different run’s definition the moment someone publishes again.',
     'Size the input the way the engine will store it: serialize the document and compare its byte length against `1 << 16`, and range-check `max_steps` from 1 to 500. Both rejections happen before the run record is written, so a rejected request leaves nothing behind.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the boundary where a definition becomes a run. The draft reads fine because the demo publishes once, starts one run and never deploys in between. Three defects are being checked, and each one is a class of production incident: a run that follows the newest definition turns every mid-flight deploy into an irreproducible run; an uncapped input document lets one request pin an unbounded amount of data into the checkpoint; and a published cyclic definition has no end other than the step cap, which is exactly the sort of run that pages someone at 03:00. The immutability check is the one that is easy to miss: an upsert on \`(name, version)\` looks harmless until a redeploy re-publishes a version that runs are pinned to, and then the pinned version is no longer what it was. In a real engine the pin also carries the definition's own hash, so the store can refuse a re-publish that changes any byte, and starting a run returns a \`202\` with the run id rather than the whole definition.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the boundary where a definition becomes a run. The starter reads fine because the demo publishes once, starts one run and never deploys in between. Three defects are being checked, and each one is a class of production incident: a run that follows the newest definition turns every mid-flight deploy into an irreproducible run; an uncapped input document lets one request pin an unbounded amount of data into the checkpoint; and a published cyclic definition has no end other than the step cap, which is exactly the sort of run that pages someone at 03:00. The immutability check is the one that is easy to miss: an upsert on \`(name, version)\` looks harmless until a redeploy re-publishes a version that runs are pinned to, and then the pinned version is no longer what it was. In a real engine the pin also carries the definition's own hash, so the store can refuse a re-publish that changes any byte, and starting a run returns a \`202\` with the run id rather than the whole definition.`,
 };

@@ -8,21 +8,21 @@ export const detectorClientStep: Step = {
   focus: ['redactor', 'detector', 'regex'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the model answers, the demo
+**Starting point.** The starter is working code: the model answers, the demo
 redacts, and when the model is down the service still answers — with a warning header. That last
-part is the bug: the fallback returns what it was given. Review it, fix it, and prove the fix.
+part is the bug: the fallback returns what it was given. Debug it, fix it, and prove the fix.
 
 Detection runs over **gRPC**. The model is the primary path; the fallback must be a **deterministic
 regex pass over the declared entity types**, never a pass-through.
 
 - Every attempt carries a **600 ms** deadline, so one slow model cannot pin a worker.
 - At most **two attempts** per request, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
-  retryable. The draft retries a timeout four times while the model is down: that is an amplifier,
+  retryable. The starter retries a timeout four times while the model is down: that is an amplifier,
   not a retry policy — the outage gets four times the load exactly when it can least take it.
 - On failure — including a deadline — redact with the regex pass and return the spans marked
   \`degraded: true\` and \`source: "regex"\`. Degraded must mean "redacted by a weaker detector", not
   "returned unchanged".
-- The regex pass runs for **every** text size. The draft skips it above 10 KiB \`(10 * 1024)\`, so the
+- The regex pass runs for **every** text size. The starter skips it above 10 KiB \`(10 * 1024)\`, so the
   large documents — the ones most likely to contain a leak — are exactly the ones left unredacted.
 
 **Failure mode the checks target.** A fallback that returns the input is not a fallback, it is the
@@ -59,7 +59,7 @@ denial of service. Notice the two failure modes are in tension: the fix is a *bo
       id: 'bounded-retry',
       title: 'Two attempts, retrying only UNAVAILABLE and DEADLINE_EXCEEDED',
       detail:
-        'The attempt budget is **2** and the retryable set is exactly `UNAVAILABLE`/`DEADLINE_EXCEEDED`. The draft retries a timeout four times and retries anything, so an outage is amplified 4×.',
+        'The attempt budget is **2** and the retryable set is exactly `UNAVAILABLE`/`DEADLINE_EXCEEDED`. The starter retries a timeout four times and retries anything, so an outage is amplified 4×.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*2/, /StatusCode\.UNAVAILABLE/, /StatusCode\.DEADLINE_EXCEEDED/, /RETRYABLE/],
@@ -74,7 +74,7 @@ denial of service. Notice the two failure modes are in tension: the fix is a *bo
       id: 'regex-fallback',
       title: 'Falls back to a deterministic regex pass, not a pass-through',
       detail:
-        'A named table of compiled patterns over the declared entity types is scanned when the model fails. The draft has no such pass: it returns a warning header and lets the caller ship the raw text.',
+        'A named table of compiled patterns over the declared entity types is scanned when the model fails. The starter has no such pass: it returns a warning header and lets the caller ship the raw text.',
       match: {
         python: {all: [/ENTITY_PATTERNS/, /re\.compile/, /fallback_spans/]},
         typescript: {all: [/ENTITY_PATTERNS/, /new RegExp\(/, /fallbackSpans/]},
@@ -87,7 +87,7 @@ denial of service. Notice the two failure modes are in tension: the fix is a *bo
       id: 'degraded-marker',
       title: 'Marks the degraded result with its source',
       detail:
-        'A fallback answer says so: `source: "regex"` and `degraded: true`. The draft emits a warning header while returning the input, so callers cannot distinguish "redacted by regex" from "not redacted at all".',
+        'A fallback answer says so: `source: "regex"` and `degraded: true`. The starter emits a warning header while returning the input, so callers cannot distinguish "redacted by regex" from "not redacted at all".',
       match: {
         python: {all: [/FALLBACK_SOURCE\s*=\s*"regex"/, /"source":\s*source/, /"degraded":/]},
         typescript: {all: [/FALLBACK_SOURCE\s*=\s*'regex'/, /degraded:/, /source\b/]},
@@ -221,7 +221,7 @@ def detection_result(tenant: str, text: str, entities: list[str], stub) -> dict:
 `,
     },
     typescript: {
-      starter: `/** A model-generated detector client that retries forever and returns the input when down. */
+      starter: `/** A detector client that retries forever and returns the input when down. */
 import * as grpc from '@grpc/grpc-js';
 
 const MAX_RETRIES = 4;
@@ -654,7 +654,7 @@ std::string detection_result(const std::string& tenant, const std::string& text,
   hints: [
     'Bounded retries under one budget: `for attempt in range(MAX_ATTEMPTS)` with the deadline set per attempt, and `if error.code() not in RETRYABLE: break`. Retrying an unretryable code is a bug; retrying a retryable one more than once while the dependency is down is an outage amplifier.',
     'The fallback table is data: `ENTITY_PATTERNS = {"EMAIL": re.compile(…), "PHONE": …}` and a loop that runs every declared type over the whole text. Deterministic means the same input yields the same spans — a property the model path cannot offer, which is exactly why the response must say `source: "regex"`.',
-    'There is no size guard. The draft’s `len(text) > 10 * 1024: return []` skips redaction for the largest documents; if the regex pass is too slow for a 256 KiB text, make the pass cheaper, not the coverage smaller.',
+    'There is no size guard. The starter’s `len(text) > 10 * 1024: return []` skips redaction for the largest documents; if the regex pass is too slow for a 256 KiB text, make the pass cheaper, not the coverage smaller.',
   ],
-  debrief: `The interviewer is testing failure policy for a model dependency: a deadline, a bounded retry, and a fallback that is genuinely safer than the primary path’s absence. The draft fails on all three counts — four retries with no deadline amplifies a model outage, and the "fallback" returns the caller's text behind a warning header, which is not a degraded mode but an exfiltration mode. The interesting sentence is the one about size: gating the regex pass at 10 KiB means the redactor’s coverage silently drops on exactly the documents that matter most, and nothing in the response says so. In production you would also cap concurrent model calls, keep the regex table versioned beside the pattern version reported in step 2, and alert on the degraded rate rather than the error rate.`,
+  debrief: `The interviewer is testing failure policy for a model dependency: a deadline, a bounded retry, and a fallback that is genuinely safer than the primary path’s absence. The starter fails on all three counts — four retries with no deadline amplifies a model outage, and the "fallback" returns the caller's text behind a warning header, which is not a degraded mode but an exfiltration mode. The interesting sentence is the one about size: gating the regex pass at 10 KiB means the redactor’s coverage silently drops on exactly the documents that matter most, and nothing in the response says so. In production you would also cap concurrent model calls, keep the regex table versioned beside the pattern version reported in step 2, and alert on the degraded rate rather than the error rate.`,
 };

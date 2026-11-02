@@ -8,9 +8,9 @@ export const shadowClientStep: Step = {
   focus: ['shadow', 'candidate', 'prodmodel'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the candidate and
-handles failures. It compiles and the demo returns. What it does to the production request when the
-candidate is slow, or retries without limit, is the flaw. Review it, fix it, and prove the fix.
+**Starting point.** The starter is working code: it calls the candidate and handles failures. It
+compiles and the demo returns. What it does to the production request when the candidate is slow,
+or retries without limit, is the flaw. Debug it, fix it, and prove the fix.
 
 Implement the client that the request path uses to run a shadow beside production.
 
@@ -27,7 +27,7 @@ Implement the client that the request path uses to run a shadow beside productio
   goroutine, a \`Future\`, a detached thread). The production response is written without waiting for
   the candidate, so an unresponsive candidate adds **zero** latency to it.
 
-**Failure mode the checks target.** The draft runs the candidate call inline on the request thread
+**Failure mode the checks target.** The starter runs the candidate call inline on the request thread
 with **no deadline**, so an unresponsive candidate doubles production latency; it has no concurrency
 cap, so a burst of shadow traffic amplifies the outage; it has no dropped counter, so the overload is
 invisible; and it **retries** every failure, multiplying the load exactly when the candidate is
@@ -48,7 +48,7 @@ already down.`,
       id: 'deadline',
       title: 'Calls the candidate with a 300 ms deadline',
       detail:
-        'Every candidate call carries a 300 ms deadline. The draft calls the candidate with no deadline, so one unresponsive candidate blocks the production request until gRPC gives up on its own.',
+        'Every candidate call carries a 300 ms deadline. The starter calls the candidate with no deadline, so one unresponsive candidate blocks the production request until gRPC gives up on its own.',
       match: {
         python: {all: [/SHADOW_DEADLINE_MS\s*=\s*300/, /timeout=/]},
         typescript: {all: [/SHADOW_DEADLINE_MS\s*=\s*300/, /\bdeadline\b/]},
@@ -61,7 +61,7 @@ already down.`,
       id: 'inflight',
       title: 'Hard per-instance concurrency cap, admitted without blocking',
       detail:
-        'At most `MAX_SHADOW_INFLIGHT` candidate calls run at once, and a full cap drops the shadow instead of waiting. The draft has no cap, so a burst of shadow traffic multiplies the load on a struggling candidate.',
+        'At most `MAX_SHADOW_INFLIGHT` candidate calls run at once, and a full cap drops the shadow instead of waiting. The starter has no cap, so a burst of shadow traffic multiplies the load on a struggling candidate.',
       match: {
         python: {all: [/MAX_SHADOW_INFLIGHT/, /self\.inflight\s*>=/]},
         typescript: {all: [/MAX_SHADOW_INFLIGHT/, /inflight\s*>=/]},
@@ -74,7 +74,7 @@ already down.`,
       id: 'dropped',
       title: 'Counts dropped shadows',
       detail:
-        'An overloaded or timed-out shadow increments the `shadow.dropped` counter, so the overload is observable. The draft drops nothing and counts nothing, so the failure is silent.',
+        'An overloaded or timed-out shadow increments the `shadow.dropped` counter, so the overload is observable. The starter drops nothing and counts nothing, so the failure is silent.',
       match: {
         python: {all: [/DROPPED_METRIC/, /shadow\.dropped/]},
         typescript: {all: [/DROPPED_METRIC/, /shadow\.dropped/]},
@@ -87,7 +87,7 @@ already down.`,
       id: 'off-path',
       title: 'Runs the shadow off the request path',
       detail:
-        'The shadow is dispatched so the production response never waits for the candidate (`asyncio.create_task`, `setImmediate`, a goroutine, a `Future`, a detached thread). The draft awaits the candidate inline.',
+        'The shadow is dispatched so the production response never waits for the candidate (`asyncio.create_task`, `setImmediate`, a goroutine, a `Future`, a detached thread). The starter awaits the candidate inline.',
       match: {
         python: {all: [/asyncio\.create_task\(/]},
         typescript: {all: [/setImmediate\(/]},
@@ -100,7 +100,7 @@ already down.`,
       id: 'no-retry',
       title: 'Disables retries on the shadow path',
       detail:
-        'A shadow is attempted exactly once (`SHADOW_MAX_ATTEMPTS = 1`). The draft retries every failure, so a candidate outage multiplies the load against the candidate exactly when it can least take it.',
+        'A shadow is attempted exactly once (`SHADOW_MAX_ATTEMPTS = 1`). The starter retries every failure, so a candidate outage multiplies the load against the candidate exactly when it can least take it.',
       match: {
         python: {all: [/SHADOW_MAX_ATTEMPTS\s*=\s*1/]},
         typescript: {all: [/SHADOW_MAX_ATTEMPTS\s*=\s*1/]},
@@ -124,9 +124,9 @@ class ShadowClient:
         self.channel = channel
 
     async def observe(self, config_id: str, request) -> None:
-        # TODO: the draft calls the candidate inline on the request thread, with no deadline, no
+        # TODO: the starter calls the candidate inline on the request thread, with no deadline, no
         # concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-        # doubles production latency. Review all four.
+        # doubles production latency. Fix all four.
         for _ in range(CANDIDATE_RETRIES):
             try:
                 await self.channel.Complete(request)
@@ -184,7 +184,7 @@ def schedule_shadow(client: ShadowClient, config_id: str, request) -> None:
 `,
     },
     typescript: {
-      starter: `/** Candidate calls: a model-generated draft that awaits the candidate inline. */
+      starter: `/** Candidate calls: flawed code that awaits the candidate inline. */
 import * as grpc from '@grpc/grpc-js';
 
 const CANDIDATE_RETRIES = 3;
@@ -197,9 +197,9 @@ export class ShadowClient {
   constructor(private readonly client: CandidateStub) {}
 
   async observe(configId: string, request: unknown): Promise<void> {
-    // TODO: the draft calls the candidate inline on the request thread, with no deadline, no
+    // TODO: the starter calls the candidate inline on the request thread, with no deadline, no
     // concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-    // doubles production latency. Review all four.
+    // doubles production latency. Fix all four.
     for (let attempt = 0; attempt < CANDIDATE_RETRIES; attempt += 1) {
       try {
         await this.call(configId, request);
@@ -299,9 +299,9 @@ func NewShadowClient(client pb.CandidateClient) *ShadowClient {
 }
 
 func (s *ShadowClient) observe(configID string, request *pb.Request) {
-	// TODO: the draft calls the candidate inline on the request thread, with no deadline, no
+	// TODO: the starter calls the candidate inline on the request thread, with no deadline, no
 	// concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-	// doubles production latency. Review all four.
+	// doubles production latency. Fix all four.
 	for attempt := 0; attempt < candidateRetries; attempt++ {
 		if _, err := s.client.Complete(context.Background(), request); err == nil {
 			return
@@ -376,9 +376,9 @@ func (s *ShadowClient) scheduleShadow(configID string, request *pb.Request) {
   private val candidateRetries = 3
 
   def observe(configId: String, request: Request): Unit = {
-    // TODO: the draft calls the candidate inline on the request thread, with no deadline, no
+    // TODO: the starter calls the candidate inline on the request thread, with no deadline, no
     // concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-    // doubles production latency. Review all four.
+    // doubles production latency. Fix all four.
     var attempt = 0
     while (attempt < candidateRetries) {
       try {
@@ -452,9 +452,9 @@ class ShadowClient {
       : stub_(Candidate::NewStub(channel)) {}
 
   void observe(const std::string& configId, const Request& request) {
-    // TODO: the draft calls the candidate inline on the request thread, with no deadline, no
+    // TODO: the starter calls the candidate inline on the request thread, with no deadline, no
     // concurrency cap and no dropped counter, and it retries every failure. A stuck candidate
-    // doubles production latency. Review all four.
+    // doubles production latency. Fix all four.
     for (int attempt = 0; attempt < kCandidateRetries; ++attempt) {
       grpc::ClientContext context;
       Response response;

@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Metrics pipeline on the AI-era track: the course is not "accept a datapoint from an endpoint", it
- * is the review you owe a model-generated ingest path before a dashboard trusts it. Validated
- * batches with cardinality guards and honest acks → one atomic, deduped Redis window merge →
- * per-shard gRPC flushes with a deadline and resumable partials → series-keyed rollup events with an
- * outbox → a series query bounded in time, cardinality, resolution and tenant.
+ * Metrics pipeline: the course is not "accept a datapoint from an endpoint", it is the debugging
+ * you owe an ingest path before a dashboard trusts it. Validated batches with cardinality guards
+ * and honest acks → one atomic, deduped Redis window merge → per-shard gRPC flushes with a deadline
+ * and resumable partials → series-keyed rollup events with an outbox → a series query bounded in
+ * time, cardinality, resolution and tenant.
  */
 export const metricsPipelineProblem: Problem = {
   id: 'metrics-pipeline',
@@ -19,7 +19,6 @@ export const metricsPipelineProblem: Problem = {
   tagline: 'Ingest metrics at scale with cardinality guards, honest acks and bounded queries.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Metrics Pipeline
 
@@ -64,12 +63,12 @@ One service, **metricsd**, with five pieces:
    per **10 seconds** with the downsampling method named, cursor paging, and a **404** for a series
    that belongs to another tenant.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real ingest path:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real ingest path: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'harness', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the body and answers \`202\` with a fresh run id. It compiles, it serves the demo, and it starts
-scoring a dataset this service has never seen, with whatever budget the caller felt like. Review it
+scoring a dataset this service has never seen, with whatever budget the caller felt like. Debug it
 like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/evals/runs\` with body
@@ -20,7 +20,7 @@ Implement \`POST /v1/evals/runs\` with body
 - \`model_version\` is a required non-empty string (**400** otherwise). A run without a version
   cannot be compared with the previous release, which is the only thing the numbers are for.
 - \`sample_budget\` is a required integer from **1** to **5000**; a missing budget or anything above
-  5000 is **400**. The draft caps nothing, so one request can queue an unbounded eval.
+  5000 is **400**. The starter caps nothing, so one request can queue an unbounded eval.
 - \`dataset_id\` must name a dataset the service owns: look it up in the dataset registry before
   anything is queued and answer **404** for an unknown id. Scoring against a dataset that does not
   exist produces a green report with no samples behind it.
@@ -30,7 +30,7 @@ Implement \`POST /v1/evals/runs\` with body
 - Validate everything **before** the run is enqueued: a rejected request must leave no run behind.
 - Log the decision with tenant, run id and dataset — never the sample or prompt data.
 
-**Failure mode the checks target.** The draft trusts the caller for the dataset id, so a typo
+**Failure mode the checks target.** The starter trusts the caller for the dataset id, so a typo
 produces an eval that measures nothing; it caps no budget, so a typo'd budget can queue a million
 judge calls; and it ignores \`Idempotency-Key\`, so the CI retry that every client does starts a
 second run against the same dataset and the release gate later reads two half-populated records.`,
@@ -69,7 +69,7 @@ second run against the same dataset and the release gate later reads two half-po
       id: 'dataset-404',
       title: 'Rejects a dataset the service does not own',
       detail:
-        'The dataset id is looked up in the registry and an unknown one answers **404** before anything is queued. The draft never consults the registry, so a typo starts a run against a dataset that does not exist.',
+        'The dataset id is looked up in the registry and an unknown one answers **404** before anything is queued. The starter never consults the registry, so a typo starts a run against a dataset that does not exist.',
       match: {
         python: {all: [/datasets\.exists\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/datasets\.exists\(/, /code\(\s*404\s*\)/]},
@@ -82,7 +82,7 @@ second run against the same dataset and the release gate later reads two half-po
       id: 'budget-cap',
       title: 'Requires a sample budget inside 1..5000',
       detail:
-        '`sample_budget` is required and bounded by `MAX_SAMPLES = 5000`; a missing or oversized budget is **400**. The draft caps nothing, so one request can queue an unbounded number of judge calls.',
+        '`sample_budget` is required and bounded by `MAX_SAMPLES = 5000`; a missing or oversized budget is **400**. The starter caps nothing, so one request can queue an unbounded number of judge calls.',
       match: {
         python: {all: [/MAX_SAMPLES\s*=\s*5000/, /sample_budget/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_SAMPLES\s*=\s*5000/, /sample_budget/, /code\(\s*400\s*\)/]},
@@ -95,7 +95,7 @@ second run against the same dataset and the release gate later reads two half-po
       id: 'idempotency-key',
       title: 'Replays return the stored run keyed by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`; a replay returns the stored run instead of queueing a second one. The draft ignores the header, so the retry every client does starts a competing run.',
+        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`; a replay returns the stored run instead of queueing a second one. The starter ignores the header, so the retry every client does starts a competing run.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
@@ -108,7 +108,7 @@ second run against the same dataset and the release gate later reads two half-po
       id: 'tenant-required',
       title: 'Requires the authenticated tenant',
       detail:
-        'A missing `X-Tenant-Id` is **401** and the run is keyed by that tenant, so one team cannot read or start another team’s eval. The draft reads the header as an optional label and never rejects its absence.',
+        'A missing `X-Tenant-Id` is **401** and the run is keyed by that tenant, so one team cannot read or start another team’s eval. The starter reads the header as an optional label and never rejects its absence.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/]},
         typescript: {all: [/X-Tenant-Id/, /code\(\s*401\s*\)/]},
@@ -141,7 +141,7 @@ def enqueue(run_id: str, dataset_id: str, model_version: str) -> None:
 
 @app.post("/v1/evals/runs")
 def start_run(body: RunRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft accepts whatever dataset id the caller sends, caps nothing, queues before it
+    # TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
     # validates, and ignores Idempotency-Key, so a retry starts a second competing run.
     run_id = str(uuid.uuid4())
     enqueue(run_id, body.dataset_id, body.model_version)
@@ -224,7 +224,7 @@ def start_run(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/evals/runs: a model-generated draft that queues whatever the caller sends. */
+      starter: `/** POST /v1/evals/runs: flawed code that queues whatever the caller sends. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -244,7 +244,7 @@ async function enqueue(runId: string, datasetId: string, modelVersion: string): 
 }
 
 app.post('/v1/evals/runs', async (request, reply) => {
-  // TODO: this draft accepts whatever dataset id the caller sends, caps nothing, queues before it
+  // TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
   // validates, and ignores Idempotency-Key, so a retry starts a second competing run.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RunBody;
@@ -347,7 +347,7 @@ func startRun(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts whatever dataset id the caller sends, caps nothing, queues before it
+	// TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
 	// validates, and ignores Idempotency-Key, so a retry starts a second competing run.
 	runID := uuid.NewString()
 	enqueue(runID, body.DatasetID, body.ModelVersion)
@@ -494,7 +494,7 @@ object EvalApi {
       post {
         headerValueByName("X-Tenant-Id") { _ =>
           entity(as[RunRequest]) { body =>
-            // TODO: this draft accepts whatever dataset id the caller sends, caps nothing, queues
+            // TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues
             // before it validates, and ignores Idempotency-Key, so a retry starts a second run.
             val runId = UUID.randomUUID().toString
             enqueue(runId, body.dataset_id, body.model_version)
@@ -612,7 +612,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts whatever dataset id the caller sends, caps nothing, queues before it
+    // TODO: this starter accepts whatever dataset id the caller sends, caps nothing, queues before it
     // validates, and ignores Idempotency-Key, so a retry starts a second competing run.
     const auto runId = uuidString();
     enqueue(runId, body.value("dataset_id", std::string()), body.value("model_version", std::string()));
@@ -723,5 +723,5 @@ int main() {
     'The registry lookup is the check that keeps the numbers honest: `datasets.exists(dataset_id)` before `store.put`. Without it, a typo in the CI job starts a run that scores nothing and reports `pending` forever — or worse, a green report over zero samples.',
     'The idempotency lookup is keyed by `(tenant, key)` and happens before the new run is written; a hit returns the stored run with `200`. Storing the run object — not just a request hash — is what lets the replay answer with the same `run_id` the first call returned.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary, where a wrong acceptance is expensive rather than slow. The draft reads fine because the demo posts a known dataset, a sane budget and never retries. Four defects are being checked: authentication (the tenant is never optional), existence (a dataset id is a claim until the registry confirms it), caps (cheap rejections before expensive work), and idempotency keyed by tenant so the retry loop every CI client runs cannot start a competing run. Real harnesses add per-tenant dataset grants, a run state machine (\`queued\` → \`running\` → \`passed\`/\`failed\`), and a hashed request fingerprint so two different bodies under one key are rejected instead of silently replaying the first.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, where a wrong acceptance is expensive rather than slow. The starter reads fine because the demo posts a known dataset, a sane budget and never retries. Four defects are being checked: authentication (the tenant is never optional), existence (a dataset id is a claim until the registry confirms it), caps (cheap rejections before expensive work), and idempotency keyed by tenant so the retry loop every CI client runs cannot start a competing run. Real harnesses add per-tenant dataset grants, a run state machine (\`queued\` → \`running\` → \`passed\`/\`failed\`), and a hashed request fingerprint so two different bodies under one key are rejected instead of silently replaying the first.`,
 };

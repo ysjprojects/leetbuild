@@ -8,23 +8,23 @@ import {guardrailsStep} from './steps/4-guardrails';
 import {traceEventsStep} from './steps/5-trace-events';
 
 /**
- * Airbnb's Automation Platform v2 on the AI-era track: the platform a support assistant runs on,
- * not the assistant. A turn endpoint that takes the role from the verified principal and accepts
- * work idempotently → per-conversation context in Redis with declared static context, cached
- * dynamic retrievers, a size budget and a TTL → the Chain of Thought reasoning loop with a
- * deadline per LLM call, a bounded iteration count, a tool registry and keyed write tools → the
- * guardrails framework running every configured guardrail in parallel under one deadline and
- * handing failures to a human → one trace event per LLM/tool call keyed by conversation, with an
- * outbox and metrics written before the offset commit.
+ * Airbnb's Automation Platform v2: the platform a support assistant runs on, not the assistant. A
+ * turn endpoint that takes the role from the verified principal and accepts work idempotently →
+ * per-conversation context in Redis with declared static context, cached dynamic retrievers, a
+ * size budget and a TTL → the Chain of Thought reasoning loop with a deadline per LLM call, a
+ * bounded iteration count, a tool registry and keyed write tools → the guardrails framework
+ * running every configured guardrail in parallel under one deadline and handing failures to a
+ * human → one trace event per LLM/tool call keyed by conversation, with an outbox and metrics
+ * written before the offset commit.
  */
 export const supportAutomationProblem: Problem = {
   id: 'support-automation',
   title: 'Support Automation Platform',
   tagline:
-    "Airbnb's Automation Platform v2: a Chain of Thought reasoning loop with a tool registry, declared context in Redis, parallel guardrails that escalate to a human, and a trace per model call — reviewed like production.",
+    "Airbnb's Automation Platform v2: a Chain of Thought reasoning loop with a tool registry, declared context in Redis, parallel guardrails that escalate to a human, and a trace per model call.",
   difficulty: 'medium',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 60,
   company: AIRBNB,
   sources: [
@@ -104,12 +104,12 @@ One service, **apv2**, with five pieces:
    text; an idempotent producer with \`acks=all\`; an outbox row when the broker rejects; a consumer
    that updates the Redis metrics before it commits.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['runner', 'redis', 'container'],
   task: `## Task
 
-The starter is a plausible model-generated draft: the happy-path job runs to completion and its
+The starter is working code: the happy-path job runs to completion and its
 result appears, so the demo works. Its clock lives in the wrong place. Find the flaws, fix them, and
 prove the fix.
 
@@ -54,7 +54,7 @@ invisible until the process is restarted or a job misbehaves.`,
       id: 'lease-ttl',
       title: 'Holds the hard runtime as the lease TTL',
       detail:
-        'The lease key is written atomically with the hard maximum runtime as its expiry (`EX MAX_RUNTIME_S` / `SetNX` with a duration / `setex` / `ex = MAX_RUNTIME_S`). The draft keeps the timeout in a local constant and never writes a lease, so nothing in Redis expires the job.',
+        'The lease key is written atomically with the hard maximum runtime as its expiry (`EX MAX_RUNTIME_S` / `SetNX` with a duration / `setex` / `ex = MAX_RUNTIME_S`). The starter keeps the timeout in a local constant and never writes a lease, so nothing in Redis expires the job.',
       match: {
         python: {all: [/LEASE_PREFIX/, /MAX_RUNTIME_S/, /set\([^;\n]*ex\s*=\s*MAX_RUNTIME_S/]},
         typescript: {all: [/LEASE_PREFIX/, /MAX_RUNTIME_S/, /set\([^;\n]*['"]EX['"]/]},
@@ -67,7 +67,7 @@ invisible until the process is restarted or a job misbehaves.`,
       id: 'redis-authority',
       title: 'Reads the deadline from Redis, not from process memory',
       detail:
-        'Every check asks Redis for the remaining `TTL`, and no monotonic or wall-clock arithmetic in the runner decides the deadline. The draft measures `time.monotonic() - started`, which a restart forgets.',
+        'Every check asks Redis for the remaining `TTL`, and no monotonic or wall-clock arithmetic in the runner decides the deadline. The starter measures `time.monotonic() - started`, which a restart forgets.',
       match: {
         python: {all: [/LEASE_PREFIX/, /\.ttl\(/], none: [/monotonic\(/]},
         typescript: {all: [/LEASE_PREFIX/, /\.ttl\(/], none: [/Date\.now\(\)\s*-/, /performance\.now\(/]},
@@ -80,7 +80,7 @@ invisible until the process is restarted or a job misbehaves.`,
       id: 'kill-at-deadline',
       title: 'Kills the container when the lease lapses',
       detail:
-        'When `lease_ttl(job_id)` reaches zero the runner kills the container; the kill is guarded by the lease check, not by a local timer. The draft never calls `Kill`, so an over-running container survives until the node does not.',
+        'When `lease_ttl(job_id)` reaches zero the runner kills the container; the kill is guarded by the lease check, not by a local timer. The starter never calls `Kill`, so an over-running container survives until the node does not.',
       match: {
         python: {all: [/lease_ttl\(/, /containers\.Kill\(/], order: [/lease_ttl\(job_id\)/, /containers\.Kill\(/]},
         typescript: {all: [/leaseTtl\(/, /containers\.Kill\(/], order: [/leaseTtl\(jobId\)/, /containers\.Kill\(/]},
@@ -93,7 +93,7 @@ invisible until the process is restarted or a job misbehaves.`,
       id: 'late-writes',
       title: 'Discards a result written after the lease lapsed',
       detail:
-        '`finish` re-reads the lease and returns without writing when it is gone, so a late write can never appear as the job’s result. The draft writes the result unconditionally, which is how a killed job shows up as successful.',
+        '`finish` re-reads the lease and returns without writing when it is gone, so a late write can never appear as the job’s result. The starter writes the result unconditionally, which is how a killed job shows up as successful.',
       match: {
         python: {all: [/def finish/, /store\.put_result\(/], order: [/lease_ttl\(job_id\)/, /store\.put_result\(/]},
         typescript: {
@@ -109,7 +109,7 @@ invisible until the process is restarted or a job misbehaves.`,
       id: 'restart-safe',
       title: 'Recovers its jobs from Redis on start-up',
       detail:
-        '`recover_leases` scans the `lease:` keys, kills the ones whose lease already lapsed and resumes the rest — the runner’s state lives in Redis, so a restart cannot forget a running job. The draft keeps `jobs` in a process-local dictionary.',
+        '`recover_leases` scans the `lease:` keys, kills the ones whose lease already lapsed and resumes the rest — the runner’s state lives in Redis, so a restart cannot forget a running job. The starter keeps `jobs` in a process-local dictionary.',
       match: {
         python: {all: [/def recover_leases/, /LEASE_PREFIX/, /scan_iter\(/]},
         typescript: {all: [/async function recoverLeases/, /LEASE_PREFIX/, /r\.scan\(/]},
@@ -224,7 +224,7 @@ def finish(job_id: str, result: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** The runner loop: a model-generated draft whose clock lives in the process. */
+      starter: `/** The runner loop: flawed code whose clock lives in the process. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

@@ -8,14 +8,14 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, embeds
+**Starting point.** The starter is working code: it registers the route, embeds
 the batch and writes the vectors. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/embeddings\` with body \`{"inputs": ["…", "…"]}\`.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- A batch holds **1..256** inputs; a 257th input is **400** (\`MAX_BATCH_INPUTS\`). The draft
+- A batch holds **1..256** inputs; a 257th input is **400** (\`MAX_BATCH_INPUTS\`). The starter
   embeds however many the caller sends, so one request can pin a worker and the model server for
   minutes.
 - Each input is at most **8 KiB** (\`MAX_INPUT_BYTES = 8192\`) of UTF-8; a longer one is **413**.
@@ -24,7 +24,7 @@ Implement \`POST /v1/embeddings\` with body \`{"inputs": ["…", "…"]}\`.
   previous model's vectors. A replay returns the **stored vectors** instead of embedding again.
 - Log the decision with tenant, model version and batch size — never the input text.
 
-**Failure mode the checks target.** The draft hashes the input text alone, so after a model upgrade
+**Failure mode the checks target.** The starter hashes the input text alone, so after a model upgrade
 every lookup is a hit and the service serves stale vectors forever; it caps neither the batch nor the
 input, so one request pays for an unbounded amount of model work; and it ignores \`Idempotency-Key\`,
 so the client retry every SDK performs is embedded — and billed — twice.`,
@@ -67,7 +67,7 @@ so the client retry every SDK performs is embedded — and billed — twice.`,
       id: 'batch-cap',
       title: 'Caps the batch at 256 inputs',
       detail:
-        'More than `MAX_BATCH_INPUTS = 256` inputs is **400**. The draft embeds any batch size, so one request can pin a worker and the model server for minutes.',
+        'More than `MAX_BATCH_INPUTS = 256` inputs is **400**. The starter embeds any batch size, so one request can pin a worker and the model server for minutes.',
       match: {
         python: {all: [/MAX_BATCH_INPUTS/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_BATCH_INPUTS/, /code\(\s*400\s*\)/]},
@@ -80,7 +80,7 @@ so the client retry every SDK performs is embedded — and billed — twice.`,
       id: 'input-cap',
       title: 'Caps every input at 8 KiB',
       detail:
-        'An input over `MAX_INPUT_BYTES = 8192` UTF-8 bytes is **413**. The draft measures nothing, so a megabyte input reaches the model server.',
+        'An input over `MAX_INPUT_BYTES = 8192` UTF-8 bytes is **413**. The starter measures nothing, so a megabyte input reaches the model server.',
       match: {
         python: {all: [/MAX_INPUT_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_INPUT_BYTES/, /code\(\s*413\s*\)/]},
@@ -93,7 +93,7 @@ so the client retry every SDK performs is embedded — and billed — twice.`,
       id: 'version-hash',
       title: 'Digests tenant, model version and input together',
       detail:
-        "The digest is `sha256(tenant, model version, input)`, so a model upgrade changes every key. The draft hashes the input text alone, so the new model keeps reading the old model's vectors.",
+        "The digest is `sha256(tenant, model version, input)`, so a model upgrade changes every key. The starter hashes the input text alone, so the new model keeps reading the old model's vectors.",
       match: {
         python: {all: [/def content_hash\(/, /MODEL_VERSION/]},
         typescript: {all: [/function contentHash\(/, /MODEL_VERSION/]},
@@ -106,7 +106,7 @@ so the client retry every SDK performs is embedded — and billed — twice.`,
       id: 'replay',
       title: 'Replays return the stored vectors',
       detail:
-        '`Idempotency-Key` is required and the stored response is returned on a replay instead of embedding again. The draft ignores the header, so every client retry is billed twice.',
+        '`Idempotency-Key` is required and the stored response is returned on a replay instead of embedding again. The starter ignores the header, so every client retry is billed twice.',
       match: {
         python: {all: [/Idempotency-Key/, /def replay_key\(/, /store\.get\(/]},
         typescript: {all: [/idempotency-key/, /function replayKey\(/, /store\.get\(/]},
@@ -143,7 +143,7 @@ def embed(inputs: list[str], model_version: str) -> list[list[float]]:
 
 @app.post("/v1/embeddings")
 def embeddings(body: EmbedRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft embeds any batch size with no per-input cap, hashes only the input text (so a
+    # TODO: this starter embeds any batch size with no per-input cap, hashes only the input text (so a
     # model upgrade keeps serving the previous model's vectors) and ignores Idempotency-Key.
     digest = hashlib.sha256(body.inputs[0].encode("utf-8")).hexdigest()
     vectors = embed(body.inputs, MODEL_VERSION)
@@ -254,7 +254,7 @@ interface EmbedBody {
 declare function embed(inputs: string[], modelVersion: string): Promise<number[][]>;
 
 app.post('/v1/embeddings', async (request, reply) => {
-  // TODO: this draft embeds any batch size with no per-input cap, hashes only the input text (so a
+  // TODO: this starter embeds any batch size with no per-input cap, hashes only the input text (so a
   // model upgrade keeps serving the previous model's vectors) and ignores Idempotency-Key.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as EmbedBody;
@@ -364,7 +364,7 @@ func embed(inputs []string, modelVersion string) ([][]float32, error) {
 }
 
 func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft embeds any batch size with no per-input cap, hashes only the input text (so
+	// TODO: this starter embeds any batch size with no per-input cap, hashes only the input text (so
 	// a model upgrade keeps serving the previous model's vectors) and ignores Idempotency-Key.
 	var body embedRequest
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -544,7 +544,7 @@ object Endpoint {
   val route =
     path("v1" / "embeddings") {
       post {
-        // TODO: this draft embeds any batch size with no per-input cap, hashes only the input text
+        // TODO: this starter embeds any batch size with no per-input cap, hashes only the input text
         // (so a model upgrade keeps serving the previous model's vectors) and ignores Idempotency-Key.
         entity(as[EmbedRequest]) { body =>
           val digest = MessageDigest
@@ -669,7 +669,7 @@ std::string sha256Hex(const std::string& text) {
 int main() {
   httplib::Server svr;
   svr.Post("/v1/embeddings", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft embeds any batch size with no per-input cap, hashes only the input text (so
+    // TODO: this starter embeds any batch size with no per-input cap, hashes only the input text (so
     // a model upgrade keeps serving the previous model's vectors) and ignores Idempotency-Key.
     auto body = nlohmann::json::parse(req.body);
     const std::string digest = sha256Hex(body["inputs"][0].get<std::string>());

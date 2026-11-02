@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'handlers', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: every handler answers on the first attempt in the
-demo, so the submission looks delivered. The retry path hides two flaws that only appear when a
-handler is slow or down. Review it, fix it, and prove the fix.
+**Starting point.** The starter is working code: every handler answers on the first attempt in
+the demo, so the submission looks delivered. The retry path hides two flaws that only appear when a
+handler is slow or down. Debug it, fix it, and prove the fix.
 
 Implement the delivery fan-out that runs after a submission is accepted. Each accepted submission is
 handed to three downstream handlers — \`webhook\`, \`crm\`, \`queue\` — over gRPC:
@@ -21,7 +21,7 @@ handed to three downstream handlers — \`webhook\`, \`crm\`, \`queue\` — over
 - Every call runs under a **3-second deadline**. A handler that hangs must not hold the request
   open; the deadline ends the attempt and the outcome is recorded as failed.
 - The response records **per-handler outcomes** — which handler succeeded and which failed — rather
-  than one aggregate flag. The draft sets \`delivered\` as soon as the first handler succeeds, so a
+  than one aggregate flag. The starter sets \`delivered\` as soon as the first handler succeeds, so a
   submission where two of three handlers failed still reads as delivered.
 - The submission is **partial** when some handlers failed and all of them succeeded otherwise. A
   partially delivered submission must be **replayable per handler**: re-running the failed handlers
@@ -65,7 +65,7 @@ gives up on the ones that failed.`,
       id: 'stable-key',
       title: 'Invokes each handler under one stable idempotency key',
       detail:
-        'The key for a `(submission, handler)` pair is derived from the submission id and reused on every retry. The draft mints a fresh key per attempt, so downstream systems create duplicate records.',
+        'The key for a `(submission, handler)` pair is derived from the submission id and reused on every retry. The starter mints a fresh key per attempt, so downstream systems create duplicate records.',
       match: {
         python: {all: [/"idempotency-key"/, /submission_id/], none: [/uuid/]},
         typescript: {all: [/'idempotency-key'/, /submissionId/], none: [/randomUUID/]},
@@ -78,7 +78,7 @@ gives up on the ones that failed.`,
       id: 'per-handler-outcomes',
       title: 'Records an outcome per handler',
       detail:
-        'The response carries one outcome per handler (`HandlerOutcome`), not a single delivered flag. The draft reports delivered as soon as the first handler succeeds.',
+        'The response carries one outcome per handler (`HandlerOutcome`), not a single delivered flag. The starter reports delivered as soon as the first handler succeeds.',
       match: {
         python: {all: [/HandlerOutcome/, /outcomes/]},
         typescript: {all: [/HandlerOutcome/, /outcomes/]},
@@ -91,7 +91,7 @@ gives up on the ones that failed.`,
       id: 'partial-status',
       title: 'Marks a submission partial when a handler failed',
       detail:
-        'A submission where some handlers failed is reported as `partial`; only an all-succeeded fan-out is `delivered`. The draft always reports delivered.',
+        'A submission where some handlers failed is reported as `partial`; only an all-succeeded fan-out is `delivered`. The starter always reports delivered.',
       match: {
         python: {all: [/"partial"/]},
         typescript: {all: [/'partial'/]},
@@ -104,7 +104,7 @@ gives up on the ones that failed.`,
       id: 'deadline',
       title: 'Runs every handler call under a 3-second deadline',
       detail:
-        'Each gRPC call carries a 3-second deadline, so a hung handler cannot hold the request open. The draft calls with no deadline at all.',
+        'Each gRPC call carries a 3-second deadline, so a hung handler cannot hold the request open. The starter calls with no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S/]},
         typescript: {all: [/DEADLINE_S/]},
@@ -153,7 +153,7 @@ class Submission(BaseModel):
 
 
 def deliver(submission_id: str, handler: str) -> bool:
-    # TODO: this draft retries each handler with a fresh idempotency key, so a CRM that retries
+    # TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries
     # gets two leads, and it marks the submission delivered as soon as the first handler succeeds
     # even when the others failed — there is no per-handler outcome and no replay of just the
     # failed ones.
@@ -240,7 +240,7 @@ def deliver_all(submission_id: str, tenant: str = Header(alias="X-Tenant-Id")) -
 `,
     },
     typescript: {
-      starter: `/** Delivery fan-out to downstream handlers — a model-generated draft. */
+      starter: `/** Delivery fan-out to downstream handlers — flawed code. */
 import {randomUUID} from 'node:crypto';
 import {promisify} from 'node:util';
 import * as grpc from '@grpc/grpc-js';
@@ -261,7 +261,7 @@ const deliverCall = promisify(client.deliver.bind(client)) as (
 const submissions: Record<string, string> = {};
 
 async function deliver(submissionId: string, handler: string): Promise<boolean> {
-  // TODO: this draft retries each handler with a fresh idempotency key, so a CRM that retries gets
+  // TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
   // two leads, and it marks the submission delivered as soon as the first handler succeeds even
   // when the others failed — there is no per-handler outcome and no replay of just the failed ones.
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -355,7 +355,7 @@ import (
 var handlers = []string{"webhook", "crm", "queue"}
 
 func deliver(ctx context.Context, conn *grpc.ClientConn, submissionID, handler string) bool {
-	// TODO: this draft retries each handler with a fresh idempotency key, so a CRM that retries gets
+	// TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
 	// two leads, and it marks the submission delivered as soon as the first handler succeeds even
 	// when the others failed — there is no per-handler outcome and no replay of just the failed ones.
 	client := handlerspb.NewHandlerClient(conn)
@@ -471,7 +471,7 @@ object Client {
   val Handlers = Seq("webhook", "crm", "queue")
 
   def deliver(submissionId: String, handler: String): Future[Boolean] = {
-    // TODO: this draft retries each handler with a fresh idempotency key, so a CRM that retries gets
+    // TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
     // two leads, and it marks the submission delivered as soon as the first handler succeeds even
     // when the others failed — there is no per-handler outcome and no replay of just the failed ones.
     val key = UUID.randomUUID().toString
@@ -539,7 +539,7 @@ std::string FreshIdempotencyKey() {
 }
 
 bool DeliverOne(HandlerClient& client, const std::string& submissionId, const std::string& handler) {
-  // TODO: this draft retries each handler with a fresh idempotency key, so a CRM that retries gets
+  // TODO: this starter retries each handler with a fresh idempotency key, so a CRM that retries gets
   // two leads, and it marks the submission delivered as soon as the first handler succeeds even
   // when the others failed — there is no per-handler outcome and no replay of just the failed ones.
   for (int attempt = 0; attempt < 3; ++attempt) {

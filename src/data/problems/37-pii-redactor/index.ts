@@ -7,11 +7,11 @@ import {auditEventsStep} from './steps/4-events';
 import {readRedactionStep} from './steps/5-read';
 
 /**
- * PII redactor on the AI-era track: the course is not "call an NER model and replace some
- * strings", it is the review you owe a model-generated redaction service before it is trusted with
- * customer text. Fail-closed HTTP → tenant-scoped Redis patterns and an atomic budget → a gRPC
- * detector with a bounded retry and a deterministic regex fallback → content-free audit events
- * with an outbox → an audit read that returns spans, never text.
+ * PII redactor: the course is not "call an NER model and replace some strings", it is the
+ * debugging you owe a redaction service before it is trusted with customer text. Fail-closed HTTP →
+ * tenant-scoped Redis patterns and an atomic budget → a gRPC detector with a bounded retry and a
+ * deterministic regex fallback → content-free audit events with an outbox → an audit read that
+ * returns spans, never text.
  */
 export const piiRedactorProblem: Problem = {
   id: 'pii-redactor',
@@ -19,7 +19,7 @@ export const piiRedactorProblem: Problem = {
   tagline: 'Redaction that fails closed, proves its spans, and never stores what it removed.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# PII Redactor
 
@@ -61,12 +61,12 @@ One service, the redactor, with five pieces:
    the owning tenant only — no text field of any kind, and a **404** for a missing or foreign
    document rather than a 403.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
+failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

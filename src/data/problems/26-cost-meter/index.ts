@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * AI cost meter on the AI-era track: the course is not "count tokens", it is the review you owe a
- * model-generated metering path before finance bills anyone from it. Idempotent usage writes that
- * land before the response → one atomic Redis counter per (tenant, hour) that expires with its
- * window → a pricing lookup with a deadline and a versioned, freshness-bounded fallback → usage
- * events keyed by tenant with the idempotency key embedded and an outbox behind a rejected produce
- * → a spend read reconstructed from the same counters the limiter enforces.
+ * AI cost meter: the course is not "count tokens", it is the debugging you owe a metering path
+ * before finance bills anyone from it. Idempotent usage writes that land before the response →
+ * one atomic Redis counter per (tenant, hour) that expires with its window → a pricing lookup
+ * with a deadline and a versioned, freshness-bounded fallback → usage events keyed by tenant with
+ * the idempotency key embedded and an outbox behind a rejected produce → a spend read
+ * reconstructed from the same counters the limiter enforces.
  */
 export const costMeterProblem: Problem = {
   id: 'cost-meter',
@@ -20,7 +20,7 @@ export const costMeterProblem: Problem = {
   tagline: 'Meter tokens per tenant per window atomically so spend is enforceable before it happens.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# AI Cost Meter
 
@@ -67,12 +67,12 @@ One service, **meterd**, with five pieces:
    spend and remaining budget read from the limiter's own counters, integer micro-dollars per
    request, and rounding applied once at statement level.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path,
+and it looks right. Your job in every step is the job you will have on a real feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

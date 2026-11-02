@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['shards', 'kafka'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the flush publishes a
+**Starting point.** The starter is working code: the flush publishes a
 \`metrics.rolled\` event per window and a consumer sees records arrive, so the demo shows the rollup
 stream filling. It compiles, and it hides four production flaws — a stream keyed by shard, a publish
-that races the shard confirmation, no outbox, and no window boundaries. Review it like the pipeline
+that races the shard confirmation, no outbox, and no window boundaries. Debug it like the pipeline
 owner, fix it, and prove the fix with the checks below.
 
 The flush that moves aggregated windows to the shard writers is also the source of the
@@ -20,16 +20,16 @@ The flush that moves aggregated windows to the shard writers is also the source 
 
 - Publish one \`metrics.rolled\` event per **confirmed** series window, keyed by the **series id**.
   The key is the partition key: one series' windows then land on one partition and keep their order,
-  so a consumer can fold a series' stream without sorting it. The draft keys by the shard, and a
+  so a consumer can fold a series' stream without sorting it. The starter keys by the shard, and a
   shard carries many series — every consumer must resort the interleaving, and no key can order it
   back afterwards.
 - Publish **only after the shard writer confirms the window**. The flush returns the windows the
   shards accepted; a window they rejected must not appear on the topic, or the consumer's stream
-  announces a rollup the store never committed and the two copies disagree forever. The draft
+  announces a rollup the store never committed and the two copies disagree forever. The starter
   produces before the confirmation.
 - The payload carries the **window boundaries and the count**: \`window_start\`, \`window_end\` and
   the \`count\` of samples the window aggregated. A consumer told only that a rollup happened cannot
-  place it on a graph; the draft's payload has neither boundary.
+  place it on a graph; the starter's payload has neither boundary.
 - The producer must be **idempotent with \`acks=all\`** (or the stack's equivalent: required acks
   \`all\` plus hashed, stable keys), so a retried produce cannot duplicate a rollup and an ack means
   the broker has the record.
@@ -84,7 +84,7 @@ spare them.`,
       id: 'key-by-series',
       title: 'Keys every rollup event by the series',
       detail:
-        'The message key is the series id, so one series’ windows stay on one partition and in order and a consumer can fold them without sorting. The draft keys by the shard, which carries many series and scatters every series’ stream.',
+        'The message key is the series id, so one series’ windows stay on one partition and in order and a consumer can fold them without sorting. The starter keys by the shard, which carries many series and scatters every series’ stream.',
       match: {
         python: {all: [/metrics\.rolled/, /key=series_id/], none: [/key=shard/]},
         typescript: {all: [/metrics\.rolled/, /key:\s*seriesId\b/], none: [/key:\s*shardId\b/]},
@@ -100,7 +100,7 @@ spare them.`,
       id: 'publish-after-confirm',
       title: 'Publishes only after the shard confirms the window',
       detail:
-        'The events go out only after the shard-writer flush returns the windows the shards accepted; publishing first announces a rollup the store may never commit. The draft produces before the confirmation.',
+        'The events go out only after the shard-writer flush returns the windows the shards accepted; publishing first announces a rollup the store may never commit. The starter produces before the confirmation.',
       match: {
         python: {order: [/accepted\s*=\s*flush_windows\(/, /producer\.produce\(/]},
         typescript: {order: [/accepted\s*=\s*await\s+flushWindows\(/, /producer\.send\(/]},
@@ -113,7 +113,7 @@ spare them.`,
       id: 'outbox-on-rejection',
       title: 'Writes a rollup_outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce writes a row into `rollup_outbox` instead of dropping the event; a relay republishes it when the broker returns. The draft ignores the broker result, so one outage erases the rollup.',
+        'A rejected produce writes a row into `rollup_outbox` instead of dropping the event; a relay republishes it when the broker returns. The starter ignores the broker result, so one outage erases the rollup.',
       match: {
         python: {all: [/rollup_outbox/, /insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/rollup_outbox/, /insertOutbox\(/, /catch\s*\(/]},
@@ -126,7 +126,7 @@ spare them.`,
       id: 'window-boundaries',
       title: 'Carries window_start, window_end and the count',
       detail:
-        'Each event carries the window start, the window end and the count of samples the window aggregated, so a consumer knows exactly which window it is folding. The draft’s payload has neither boundary.',
+        'Each event carries the window start, the window end and the count of samples the window aggregated, so a consumer knows exactly which window it is folding. The starter’s payload has neither boundary.',
       match: {
         python: {all: [/window_start/, /window_end/, /\bcount\b/]},
         typescript: {all: [/window_start/, /window_end/, /\bcount\b/]},
@@ -139,7 +139,7 @@ spare them.`,
       id: 'idempotent-producer',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` with `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer — so a retried produce cannot duplicate a rollup and an ack means the broker has the record. The draft publishes fire-and-forget from a default producer.',
+        'The producer is configured for idempotence and `acks=all` — `enable.idempotence` with `acks`, KafkaJS’s `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer — so a retried produce cannot duplicate a rollup and an ack means the broker has the record. The starter publishes fire-and-forget from a default producer.',
       match: {
         python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -161,7 +161,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_rollup(windows: list[dict]) -> None:
-    # TODO: this draft keys every event by the shard, publishes before the shard confirms the
+    # TODO: this starter keys every event by the shard, publishes before the shard confirms the
     # windows, skips the outbox on a broker rejection and omits the window boundaries. Key by the
     # series, publish only the windows the shards accepted, carry window_start/window_end/count in
     # the event and insert a rollup_outbox row when the produce is rejected.
@@ -226,7 +226,7 @@ def flush_windows(windows: list[dict]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** metrics.rolled: a model-generated draft that keys by shard and publishes before the shard confirms. */
+      starter: `/** metrics.rolled: flawed code that keys by shard and publishes before the shard confirms. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'metrics-pipeline', brokers: ['kafka:9092']});
@@ -245,7 +245,7 @@ interface Window {
 declare function flushWindows(windows: Window[]): Promise<Window[]>;
 
 export async function publishRollup(windows: Window[]): Promise<void> {
-  // TODO: this draft keys every event by the shard, publishes before the shard confirms the
+  // TODO: this starter keys every event by the shard, publishes before the shard confirms the
   // windows, skips the outbox on a broker rejection and omits the window boundaries. Key by the
   // series, publish only the accepted windows, carry window_start/window_end/count in the event
   // and insert a rollup_outbox row when the produce is rejected.
@@ -327,7 +327,7 @@ type Window struct {
 	Count    int    \`json:"count"\`
 }
 
-// TODO: this draft keys every event by the shard, publishes before the shard confirms the windows,
+// TODO: this starter keys every event by the shard, publishes before the shard confirms the windows,
 // skips the outbox on a broker rejection and omits the window boundaries. Key by the series,
 // publish only the windows the shards accepted, carry window_start/window_end/count in the event
 // and insert a rollup_outbox row when the produce is rejected.
@@ -426,7 +426,7 @@ case class Window(seriesId: String, shardId: String, count: Long)
 object RollupPublisher {
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: this draft keys every event by the shard, publishes before the shard confirms the
+  // TODO: this starter keys every event by the shard, publishes before the shard confirms the
   // windows, skips the outbox on a broker rejection and omits the window boundaries. Key by the
   // series, publish only the accepted windows, carry window_start/window_end/count in the event
   // and insert a rollup_outbox row when the produce is rejected.
@@ -523,7 +523,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: this draft keys every event by the shard, produces before the shard confirms the windows,
+// TODO: this starter keys every event by the shard, produces before the shard confirms the windows,
 // skips the outbox on a broker rejection and omits the window boundaries. Key by the series,
 // produce only the windows the shards accepted, carry window_start/window_end/count in the event
 // and insert a rollup_outbox row when the produce is rejected.
@@ -618,5 +618,5 @@ void publishRollup(const std::vector<Window>& windows) {
     'The shard flush already knows what was accepted: publish from its result, never straight from the input list. Producing first announces a rollup before the store commits it; wrap the produce, flush or await it so a rejection is real, and insert a `rollup_outbox` row when the broker refuses. The event carries `window_start`, `window_end` and the `count` so a consumer can fold it without asking the store.',
     'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS’s `idempotent: true` plus `acks: -1`, or required acks `all` with a hash balancer. Then a retried produce cannot duplicate a rollup and an acknowledged produce means the broker has the record.',
   ],
-  debrief: `The interviewer is checking whether you can review an event-publishing path whose failure modes are ordering, currency and durability rather than syntax. The draft is convincing because the demo shows a well-shaped record arriving; nothing in it survives a broker rejection, an out-of-order stream or a consumer that cannot place a window on a graph. Three contracts are under review. The key is an ordering contract: partition by series and one series’ rollup stream arrives in window order, which is the assumption every consumer of that stream is built on; key by shard and every consumer inherits the resorting, and no later stage can restore order that the partition never guaranteed. The flush result is a currency contract: only the windows the shards accepted are real, so the produce follows the confirmation — an event published first announces a rollup the store may never commit, and the topic and the store disagree forever. The outbox is the durability contract: an idempotent producer with acks=all makes a retry harmless and an ack meaningful, and a rejected produce parks the event in rollup_outbox for a relay, so a broker outage delays a rollup instead of erasing one the dashboard will never see. Real platforms add a schema registry so consumers can trust the payload shape, topic compaction or retention sized to the rollup cadence, per-tenant produce quotas, and outbox-lag alarms — and they treat the rollup stream as replayable: a consumer rebuilds a series’ total by folding the windows it reads, which only works because the key and the boundaries are on every event.`,
+  debrief: `The interviewer is checking whether you can debug an event-publishing path whose failure modes are ordering, currency and durability rather than syntax. The starter looks right because the demo shows a well-shaped record arriving; nothing in it survives a broker rejection, an out-of-order stream or a consumer that cannot place a window on a graph. Three contracts are being checked. The key is an ordering contract: partition by series and one series’ rollup stream arrives in window order, which is the assumption every consumer of that stream is built on; key by shard and every consumer inherits the resorting, and no later stage can restore order that the partition never guaranteed. The flush result is a currency contract: only the windows the shards accepted are real, so the produce follows the confirmation — an event published first announces a rollup the store may never commit, and the topic and the store disagree forever. The outbox is the durability contract: an idempotent producer with acks=all makes a retry harmless and an ack meaningful, and a rejected produce parks the event in rollup_outbox for a relay, so a broker outage delays a rollup instead of erasing one the dashboard will never see. Real platforms add a schema registry so consumers can trust the payload shape, topic compaction or retention sized to the rollup cadence, per-tenant produce quotas, and outbox-lag alarms — and they treat the rollup stream as replayable: a consumer rebuilds a series’ total by folding the windows it reads, which only works because the key and the boundaries are on every event.`,
 };

@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['api', 'model', 'fallback'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: while the model server is up
+**Starting point.** The starter is working code: while the model server is up
 every input gets a vector. Every failure path is wrong. Find them, fix them, and prove the fix.
 
 Implement \`embed(text, model_version)\`, the one call the write path makes:
@@ -23,7 +23,7 @@ Implement \`embed(text, model_version)\`, the one call the write path makes:
 - The returned vector's dimension is checked against the namespace it would be cached under: a
   wrong-dimension fallback must raise instead of being returned as a primary vector.
 
-**Failure mode the checks target.** The draft retries every status forever, so a bad deployment
+**Failure mode the checks target.** The starter retries every status forever, so a bad deployment
 becomes a hot loop against the service that is already down. It caches by content hash alone, so the
 fallback's 384-dimension vector overwrites the primary's 1024-dimension one. And it returns the
 fallback vector silently, so a shape mismatch only surfaces when retrieval ranks garbage.`,
@@ -66,7 +66,7 @@ fallback vector silently, so a shape mismatch only surfaces when retrieval ranks
       id: 'bounded-attempts',
       title: 'At most two attempts, only UNAVAILABLE retried',
       detail:
-        'Attempts are bounded (`MAX_ATTEMPTS = 2`) and only `UNAVAILABLE` is retryable; `INVALID_ARGUMENT` is returned immediately. The draft retries every error forever.',
+        'Attempts are bounded (`MAX_ATTEMPTS = 2`) and only `UNAVAILABLE` is retryable; `INVALID_ARGUMENT` is returned immediately. The starter retries every error forever.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /RETRYABLE/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /RETRYABLE/, /UNAVAILABLE/]},
@@ -79,7 +79,7 @@ fallback vector silently, so a shape mismatch only surfaces when retrieval ranks
       id: 'namespace',
       title: 'Switches the cache namespace for the fallback',
       detail:
-        "The cache namespace is a function of the model version and whether the fallback was used, so the fallback's vectors never land under the primary version. The draft caches both under one namespace.",
+        "The cache namespace is a function of the model version and whether the fallback was used, so the fallback's vectors never land under the primary version. The starter caches both under one namespace.",
       match: {
         python: {all: [/def cache_namespace\(/, /used_fallback/]},
         typescript: {all: [/function cacheNamespace\(/, /usedFallback/]},
@@ -92,7 +92,7 @@ fallback vector silently, so a shape mismatch only surfaces when retrieval ranks
       id: 'dimension-guard',
       title: 'Refuses a wrong-dimension vector',
       detail:
-        "The vector length is compared with the dimension of the namespace it would be cached under. The draft returns the fallback's 384-dimension vector as if it were a primary 1024-dimension one.",
+        "The vector length is compared with the dimension of the namespace it would be cached under. The starter returns the fallback's 384-dimension vector as if it were a primary 1024-dimension one.",
       match: {
         python: {all: [/PRIMARY_DIMENSION\s*=\s*1024/, /len\(vector\)\s*!=\s*expected/]},
         typescript: {all: [/PRIMARY_DIMENSION\s*=\s*1024/, /vector\.length\s*!==\s*expected/]},
@@ -105,7 +105,7 @@ fallback vector silently, so a shape mismatch only surfaces when retrieval ranks
       id: 'fallback',
       title: 'Fails over to the fallback model',
       detail:
-        "When the primary's attempts are exhausted the input is embedded by the fallback model instead of failing the batch. The draft has no fallback path with its own namespace.",
+        "When the primary's attempts are exhausted the input is embedded by the fallback model instead of failing the batch. The starter has no fallback path with its own namespace.",
       match: {
         python: {all: [/FALLBACK_MODEL/, /fallback_stub\.Embed\(/]},
         typescript: {all: [/FALLBACK_MODEL/, /fallbackClient\.Embed\(/]},

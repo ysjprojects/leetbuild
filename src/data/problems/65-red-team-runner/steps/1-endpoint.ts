@@ -8,10 +8,10 @@ export const endpointStep: Step = {
   focus: ['client', 'runner', 'db', 'sandbox'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body and starts a run. It compiles, it serves the demo against the one sandbox host the author
-had running, and it hides three production flaws. Review it like the service owner, fix it, and
-prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body and starts
+a run. It compiles, it serves the demo against the one sandbox host the author had running, and it
+hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the
+checks below.
 
 Implement \`POST /v1/redteam/runs\` with body
 \`{"target": "checkout-shadow", "probe_set": "prompt-injection"}\`.
@@ -29,7 +29,7 @@ Implement \`POST /v1/redteam/runs\` with body
 - Only after both checks have passed does the run get an id and its probe set dispatched to the
   sandbox endpoint that hosts the target (**201**).
 
-**Failure mode the checks target.** The draft treats \`target\` as whatever the caller typed and
+**Failure mode the checks target.** The starter treats \`target\` as whatever the caller typed and
 dispatches at it directly, so a typo — or a deliberate value — points the whole probe set at
 production, and no registry entry can stop it. The quiet one is the replay: a completed probe set is
 re-run on every retry because the handler ignores \`Idempotency-Key\`, so one flaky client doubles
@@ -69,7 +69,7 @@ control.`,
       id: 'resolve-registered-target',
       title: 'Resolves the target through the registry',
       detail:
-        '`target` is looked up in `TARGET_REGISTRY` and an unknown name is **400** before anything is dispatched. The draft sends the caller’s string straight at the network, so no unregistered host is ever rejected.',
+        '`target` is looked up in `TARGET_REGISTRY` and an unknown name is **400** before anything is dispatched. The starter sends the caller’s string straight at the network, so no unregistered host is ever rejected.',
       match: {
         python: {all: [/TARGET_REGISTRY/, /resolve_target\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/TARGET_REGISTRY/, /resolveTarget\(/, /code\(\s*400\s*\)/]},
@@ -82,7 +82,7 @@ control.`,
       id: 'refuse-production',
       title: 'Refuses a production target',
       detail:
-        'A target whose environment is in `PRODUCTION_ENVIRONMENTS` is **403** and is never dispatched. The draft has no notion of an environment at all, which is how a red-team run reaches production.',
+        'A target whose environment is in `PRODUCTION_ENVIRONMENTS` is **403** and is never dispatched. The starter has no notion of an environment at all, which is how a red-team run reaches production.',
       match: {
         python: {all: [/PRODUCTION_ENVIRONMENTS/, /status_code\s*=\s*403/]},
         typescript: {all: [/PRODUCTION_ENVIRONMENTS/, /code\(\s*403\s*\)/]},
@@ -108,7 +108,7 @@ control.`,
       id: 'idempotent-replay',
       title: 'Keys retries by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`; a replay returns the existing run instead of dispatching the probe set a second time. The draft ignores the header entirely.',
+        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`; a replay returns the existing run instead of dispatching the probe set a second time. The starter ignores the header entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /run_store\.get\(/, /run_store\.put\(/]},
         typescript: {all: [/idempotency-key/, /runStore\.get\(/, /runStore\.put\(/]},
@@ -155,7 +155,7 @@ def create_run(
     tenant: str = Header(alias="X-Tenant-Id"),
     idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JSONResponse:
-    # TODO: this draft dispatches at whatever the caller put in "target" (no registry, so no way to
+    # TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way to
     # refuse production), checks nothing about the environment, and starts a fresh run on every
     # retry. Resolve the target, refuse production, and answer a replay with the existing run.
     probes = PROBE_SETS.get(body.probe_set, 4)
@@ -248,7 +248,7 @@ def create_run(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/redteam/runs: a model-generated draft that probes whatever it is handed. */
+      starter: `/** POST /v1/redteam/runs: flawed code that probes whatever it is handed. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -263,7 +263,7 @@ interface RunBody {
 }
 
 app.post('/v1/redteam/runs', async (request, reply) => {
-  // TODO: this draft dispatches at whatever the caller put in "target" (no registry, so no way to
+  // TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way to
   // refuse production), checks nothing about the environment, and starts a fresh run on every
   // retry. Resolve the target, refuse production, and answer a replay with the existing run.
   const tenant = request.headers['x-tenant-id'] as string;
@@ -384,7 +384,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft dispatches at whatever the caller put in "target" (no registry, so no way to
+	// TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way to
 	// refuse production), checks nothing about the environment, and starts a fresh run on every
 	// retry. Resolve the target, refuse production, and answer a replay with the existing run.
 	tenant := r.Header.Get("X-Tenant-Id")
@@ -554,7 +554,7 @@ object Api {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RunRequest]) { body =>
-            // TODO: this draft dispatches at whatever the caller put in "target" (no registry, so
+            // TODO: this starter dispatches at whatever the caller put in "target" (no registry, so
             // no way to refuse production), checks nothing about the environment, and starts a
             // fresh run on every retry. Resolve the target, refuse production, and answer a replay
             // with the existing run.
@@ -688,7 +688,7 @@ int main() {
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) body = json::object();
-    // TODO: this draft dispatches at whatever the caller put in "target" (no registry, so no way
+    // TODO: this starter dispatches at whatever the caller put in "target" (no registry, so no way
     // to refuse production), checks nothing about the environment, and starts a fresh run on every
     // retry. Resolve the target, refuse production, and answer a replay with the existing run.
     const auto target = body.value("target", std::string());
@@ -810,5 +810,5 @@ int main() {
     'The environment check belongs next to the lookup, not in the probe runner: by the time a probe is dispatched the decision has already been made. One `PRODUCTION_ENVIRONMENTS` membership test is the difference between a sandbox run and an incident.',
     'Idempotency here is about blast radius, not about tidy bookkeeping: the second submission of the same probe set is more adversarial traffic at the target. Look the key up before you validate anything expensive, return the stored run with 200, and let the client believe it started a run.',
   ],
-  debrief: `The interviewer is testing whether you can review a run-creation endpoint that aims a hostile workload at a host. The draft reads fine because a demo passes one sandbox hostname and never retries. Three defects are being checked. First, the target is a registry key, not a URL: the service refuses what it does not know, so a typo cannot become an attack. Second, the environment filter: production is out of scope for adversarial probing, and the refusal happens before any probe is dispatched, which is what makes it a control rather than a log line. Third, idempotency keyed by tenant so a retry cannot re-launch a completed probe set. Real platforms add per-target approval records, probe sets pinned to a target version, a hard egress allowlist at the sandbox and a short-lived token the runner uses to prove it is allowed to probe.`,
+  debrief: `The interviewer is testing whether you can debug a run-creation endpoint that aims a hostile workload at a host. The starter reads fine because a demo passes one sandbox hostname and never retries. Three defects are being checked. First, the target is a registry key, not a URL: the service refuses what it does not know, so a typo cannot become an attack. Second, the environment filter: production is out of scope for adversarial probing, and the refusal happens before any probe is dispatched, which is what makes it a control rather than a log line. Third, idempotency keyed by tenant so a retry cannot re-launch a completed probe set. Real platforms add per-target approval records, probe sets pinned to a target version, a hard egress allowlist at the sandbox and a short-lived token the runner uses to prove it is allowed to probe.`,
 };

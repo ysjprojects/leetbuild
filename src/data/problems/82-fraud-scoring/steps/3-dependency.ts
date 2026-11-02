@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['scorer', 'model', 'rules'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the model is healthy the
+**Starting point.** The starter is working code: when the model is healthy the
 scoring service answers, so the demo passes. Every failure path is wrong, and two of them are the
 kind of bug that only shows up during an incident — when nobody is watching the code. Find them, fix
 them, and prove the fix with the checks below.
@@ -31,7 +31,7 @@ Implement \`score_transaction(features)\`, the fraud scorer's model layer.
   at best land in the review band, so the approval rate during an outage can never exceed the band
   someone signed off on.
 
-**Failure mode the checks target.** The draft has no deadline, catches every error, retries three
+**Failure mode the checks target.** The starter has no deadline, catches every error, retries three
 times whatever the status is, and after the loop returns \`{"score": 0.0, "band": "approve"}\` — which
 means a model outage is scored as a fleet of perfectly safe transactions. The malformed-request retry
 is the quieter half: three identical round trips for a vector that will be rejected identically every
@@ -67,7 +67,7 @@ time, with a reviewer later reading a latency spike that never had a cause.`,
       id: 'retryable-codes',
       title: 'Only UNAVAILABLE and DEADLINE_EXCEEDED are retried',
       detail:
-        'The bounded loop retries a status only when it is in the retryable set (`RETRYABLE_CODES`, `retryableCodes`, `RetryableCodes`, `kRetryableCodes`). The draft retries whatever throws, so a permanent rejection is retried like a blip.',
+        'The bounded loop retries a status only when it is in the retryable set (`RETRYABLE_CODES`, `retryableCodes`, `RetryableCodes`, `kRetryableCodes`). The starter retries whatever throws, so a permanent rejection is retried like a blip.',
       match: {
         python: {all: [/RETRYABLE_CODES/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS/]},
         typescript: {all: [/RETRYABLE_CODES/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS/]},
@@ -80,7 +80,7 @@ time, with a reviewer later reading a latency spike that never had a cause.`,
       id: 'terminal-invalid',
       title: 'A malformed feature vector is terminal',
       detail:
-        '`INVALID_ARGUMENT` is not retried: the terminal statuses are declared (`TERMINAL_CODES`, `terminalCodes`, `TerminalCodes`, `kTerminalCodes`) and the retry predicate returns false for them. The draft loops over every exception, so a malformed vector costs three round trips and a confusing latency spike.',
+        '`INVALID_ARGUMENT` is not retried: the terminal statuses are declared (`TERMINAL_CODES`, `terminalCodes`, `TerminalCodes`, `kTerminalCodes`) and the retry predicate returns false for them. The starter loops over every exception, so a malformed vector costs three round trips and a confusing latency spike.',
       match: {
         python: {all: [/INVALID_ARGUMENT/, /TERMINAL_CODES/]},
         typescript: {all: [/INVALID_ARGUMENT/, /TERMINAL_CODES/]},
@@ -93,7 +93,7 @@ time, with a reviewer later reading a latency spike that never had a cause.`,
       id: 'rules-fallback',
       title: 'A failure returns a rules verdict marked as a fallback, never a zero',
       detail:
-        'The exhausted path returns `rules_score(features)` with `fallback: true` and the rules model version. The draft returns `{"score": 0.0, "band": "approve"}` — during a model outage that approves everything, which is how an availability incident becomes a fraud incident.',
+        'The exhausted path returns `rules_score(features)` with `fallback: true` and the rules model version. The starter returns `{"score": 0.0, "band": "approve"}` — during a model outage that approves everything, which is how an availability incident becomes a fraud incident.',
       match: {
         python: {all: [/def rules_score\(/, /["']fallback["']:\s*True/], none: [/["']score["']\s*:\s*0(\.0)?\s*[,}]/]},
         typescript: {all: [/function rulesScore\(/, /fallback:\s*true/], none: [/score:\s*0(\.0)?\s*[,}]/]},
@@ -139,9 +139,9 @@ def band_for(score: float) -> str:
 
 
 def score_transaction(stub, features: dict) -> dict:
-    # TODO: the draft has no deadline, retries every status three times - including a malformed
+    # TODO: the starter has no deadline, retries every status three times - including a malformed
     # feature vector - and maps an unreachable model to risk zero, which approves the outage.
-    # Review all three.
+    # Fix all three.
     for _ in range(3):
         try:
             response = stub.Score(ScoreRequest(features=features))
@@ -247,7 +247,7 @@ def score_transaction(stub, features: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** The scorer's model layer — a model-generated draft. */
+      starter: `/** The scorer's model layer — flawed code. */
 import * as grpc from '@grpc/grpc-js';
 
 import {client} from './stubs';
@@ -265,9 +265,9 @@ function bandFor(score: number): string {
 }
 
 export async function scoreTransaction(features: Record<string, unknown>): Promise<Verdict> {
-  // TODO: the draft has no deadline, retries every status three times - including a malformed
+  // TODO: the starter has no deadline, retries every status three times - including a malformed
   // feature vector - and maps an unreachable model to risk zero, which approves the outage.
-  // Review all three.
+  // Fix all three.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const response = await client.score({features});
@@ -412,9 +412,9 @@ func bandFor(score float64) string {
 }
 
 func scoreTransaction(ctx context.Context, client ModelClient, features FeatureVector) (Verdict, error) {
-	// TODO: the draft has no deadline, retries every status three times - including a malformed
+	// TODO: the starter has no deadline, retries every status three times - including a malformed
 	// feature vector - and maps an unreachable model to risk zero, which approves the outage.
-	// Review all three.
+	// Fix all three.
 	for attempt := 0; attempt < 3; attempt++ {
 		response, err := client.Score(ctx, &pb.ScoreRequest{FeatureVersion: features.Version, TxRef: features.TxRef})
 		if err != nil {
@@ -589,9 +589,9 @@ object ModelClient {
   def bandFor(score: Double): String =
     if (score <= 0.30) "approve" else if (score <= 0.70) "review" else "decline"
 
-  // TODO: the draft has no deadline, retries every status three times - including a malformed
+  // TODO: the starter has no deadline, retries every status three times - including a malformed
   // feature vector - and maps an unreachable model to risk zero, which approves the outage.
-  // Review all three.
+  // Fix all three.
   def scoreTransaction(model: ModelStub, features: Map[String, Any]): Verdict = {
     var attempt = 0
     while (attempt < 3) {
@@ -681,7 +681,7 @@ object ModelClient {
 `,
     },
     cpp: {
-      starter: `// The scorer's model layer — a model-generated draft.
+      starter: `// The scorer's model layer — flawed code.
 #include <string>
 
 #include <grpcpp/grpcpp.h>
@@ -698,9 +698,9 @@ static std::string bandFor(double score) {
 }
 
 static json scoreTransaction(Model::Stub* stub, const json& features) {
-  // TODO: the draft has no deadline, retries every status three times - including a malformed
+  // TODO: the starter has no deadline, retries every status three times - including a malformed
   // feature vector - and maps an unreachable model to risk zero, which approves the outage.
-  // Review all three.
+  // Fix all three.
   for (int attempt = 0; attempt < 3; ++attempt) {
     grpc::ClientContext ctx;
     ScoreReply reply;
@@ -806,7 +806,7 @@ static json scoreTransaction(Model::Stub* stub, const json& features) {
     },
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), not a wrapper around it. Bound the loop with `MAX_ATTEMPTS`; the draft’s `for _ in range(3)` is bounded but blind — it retries a rejection exactly like a blip.',
+    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), not a wrapper around it. Bound the loop with `MAX_ATTEMPTS`; the starter’s `for _ in range(3)` is bounded but blind — it retries a rejection exactly like a blip.',
     'Retryability is a property of the status: capture the error, compare its code against `RETRYABLE_CODES`, and treat `TERMINAL_CODES` (starting with `INVALID_ARGUMENT`) as final. The terminal case should raise, not fall back: a malformed vector is a bug in the caller, and hiding it behind a rules verdict hides the bug.',
     'The fallback is where the outage is decided. `rules_score(features)` must be deterministic over the feature vector, clamped by `clamp_rules_score` to `RULES_MAX_SCORE`, and returned with `fallback: true` plus the rules version. A `0.0` here is not `no risk`, it is `no model` written as the lowest possible risk.',
   ],

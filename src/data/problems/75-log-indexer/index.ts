@@ -7,13 +7,13 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Log indexer on the AI-era track: the course is not "write logs to a queue", it is the review you
- * owe a model-generated ingestion pipeline before it silently loses a stack trace. Validated
- * records with an honest truncation marker → one atomic Redis buffer per index with real
- * back-pressure → gRPC shard writes with a deadline, a stable batch id and terminal conflicts →
- * `log.indexed` events keyed by service, published only after the shard commits, with an outbox and
- * the shed/rejected counts → a completeness read that buckets by hour, expects per tenant, and
- * refuses to answer for another tenant's service.
+ * Log indexer: the course is not "write logs to a queue", it is the debugging you owe an ingestion
+ * pipeline before it silently loses a stack trace. Validated records with an honest truncation
+ * marker → one atomic Redis buffer per index with real back-pressure → gRPC shard writes with a
+ * deadline, a stable batch id and terminal conflicts → `log.indexed` events keyed by service,
+ * published only after the shard commits, with an outbox and the shed/rejected counts → a
+ * completeness read that buckets by hour, expects per tenant, and refuses to answer for another
+ * tenant's service.
  */
 export const logIndexerProblem: Problem = {
   id: 'log-indexer',
@@ -21,7 +21,6 @@ export const logIndexerProblem: Problem = {
   tagline: 'Index logs with retention, sampling and honest completeness markers.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Log Indexer
 
@@ -69,12 +68,12 @@ One service, **logindex**, with five pieces:
    own service history, gaps flagged past a threshold, and a \`404\` for a service that is not in the
    caller's registry.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it indexes the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI platform:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw. It compiles, it indexes the happy path,
+and it looks right. Your job in every step is the job you will have on a real logging platform:
+debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and
+prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

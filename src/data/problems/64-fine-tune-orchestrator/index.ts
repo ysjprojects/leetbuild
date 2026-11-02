@@ -7,12 +7,12 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Fine-tune orchestrator on the AI-era track: the course is not "submit a fine-tune job", it is the
- * review you owe a model-generated training pipeline before it spends a week of GPUs and promotes an
- * unvalidated artifact. A reproducible, idempotent job submission → one atomic Redis reservation per
- * job released exactly once → a trainer watched over gRPC whose missed heartbeats checkpoint before
- * they restart → job-keyed events that carry hashes rather than recipes → a read path that reports a
- * run as trained but not promotable when its eval gate failed.
+ * Fine-tune orchestrator: the course is not "submit a fine-tune job", it is the debugging you owe a
+ * training pipeline before it spends a week of GPUs and promotes an unvalidated artifact. A
+ * reproducible, idempotent job submission → one atomic Redis reservation per job released exactly
+ * once → a trainer watched over gRPC whose missed heartbeats checkpoint before they restart →
+ * job-keyed events that carry hashes rather than recipes → a read path that reports a run as
+ * trained but not promotable when its eval gate failed.
  */
 export const fineTuneOrchestratorProblem: Problem = {
   id: 'fine-tune-orchestrator',
@@ -20,7 +20,7 @@ export const fineTuneOrchestratorProblem: Problem = {
   tagline: 'Fine-tuning jobs with reproducible configs, budget gates and rollback-safe promotion.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Fine-tune Orchestrator
 
@@ -69,12 +69,12 @@ One service, **finetuned**, with five pieces:
 5. \`GET /v1/finetune/jobs/{id}\`: team-scoped, with the eval gate, a \`promotable\` flag that needs
    both exit code zero and a passing eval, a reconciled budget and the checkpoint lineage.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

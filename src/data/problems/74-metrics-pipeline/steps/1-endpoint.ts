@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the ingest route,
+**Starting point.** The starter is working code: it registers the ingest route,
 parses the batch and acknowledges it. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/metrics\` with body \`{"samples": [{"metric": "…", "labels": {…}, "timestamp": 1719…, "value": 1.0}]}\`.
 
@@ -25,7 +25,7 @@ Implement \`POST /v1/metrics\` with body \`{"samples": [{"metric": "…", "label
   then silently dropped: if any sample fails, the whole batch is rejected with its reason.
 
 **Failure mode the checks target.** An unbounded label set is how one tenant's cardinality blows up
-the whole store: labels are dimensions, so the draft's "accept any label" path multiplies series
+the whole store: labels are dimensions, so the starter's "accept any label" path multiplies series
 without bound. Accepting a year-old timestamp backfills a window that has already rolled up, so the
 chart moves under a reader who has already looked. And acknowledging the batch before validating it
 means a rejected sample is reported as accepted — the sender deletes its buffer and the datapoint is
@@ -57,7 +57,7 @@ gone forever.`,
       id: 'batch-limit',
       title: 'Caps a batch at 500 samples',
       detail:
-        'A batch over **500** samples is **400**. The draft accepts any batch size, so one request can pin the ingest workers while it is parsed.',
+        'A batch over **500** samples is **400**. The starter accepts any batch size, so one request can pin the ingest workers while it is parsed.',
       match: {
         python: {all: [/MAX_BATCH_SAMPLES/, /\b400\b/]},
         typescript: {all: [/MAX_BATCH_SAMPLES/, /status:\s*400/]},
@@ -70,7 +70,7 @@ gone forever.`,
       id: 'label-allowlist',
       title: 'Enforces the tenant label allowlist and the cardinality budget',
       detail:
-        'Every label name must be on the tenant allowlist and the label set must fit the per-sample budget (**12**); a violation is **422** naming the offending label. The draft accepts unbounded label sets, so a tenant can create series without limit.',
+        'Every label name must be on the tenant allowlist and the label set must fit the per-sample budget (**12**); a violation is **422** naming the offending label. The starter accepts unbounded label sets, so a tenant can create series without limit.',
       match: {
         python: {all: [/LABEL_ALLOWLIST/, /MAX_LABELS_PER_SAMPLE/, /\b422\b/]},
         typescript: {all: [/LABEL_ALLOWLIST/, /MAX_LABELS_PER_SAMPLE/, /status:\s*422/]},
@@ -83,7 +83,7 @@ gone forever.`,
       id: 'timestamp-skew',
       title: 'Rejects timestamps outside the accepted skew',
       detail:
-        'Each sample timestamp must be within **3600** seconds of now (**400** otherwise). The draft accepts timestamps a year old, so it backfills windows that already rolled up.',
+        'Each sample timestamp must be within **3600** seconds of now (**400** otherwise). The starter accepts timestamps a year old, so it backfills windows that already rolled up.',
       match: {
         python: {all: [/MAX_SKEW_SECONDS/, /time\.time\(\)/]},
         typescript: {all: [/MAX_SKEW_SECONDS/, /Date\.now\(\)/]},
@@ -96,7 +96,7 @@ gone forever.`,
       id: 'validate-before-ack',
       title: 'Validates the batch before acknowledging it',
       detail:
-        'Every sample is validated before the response is written, so a rejected batch is never acknowledged. The draft answers **200** first and validates nothing.',
+        'Every sample is validated before the response is written, so a rejected batch is never acknowledged. The starter answers **200** first and validates nothing.',
       match: {
         python: {order: [/validate_batch\(/, /JSONResponse\(/]},
         typescript: {order: [/validateBatch\(/, /reply\.code\(/]},
@@ -128,7 +128,7 @@ class Batch(BaseModel):
 
 @app.post("/v1/metrics")
 def ingest(batch: Batch, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft acknowledges the batch before validating anything, accepts unbounded label
+    # TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
     # sets and accepts timestamps up to a year old. Validate every sample first.
     return JSONResponse({"accepted": len(batch.samples)}, status_code=200)
 `,
@@ -198,7 +198,7 @@ interface Batch {
 }
 
 app.post('/v1/metrics', async (req: FastifyRequest, reply: FastifyReply) => {
-  // TODO: this draft acknowledges the batch before validating anything, accepts unbounded label
+  // TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
   // sets and accepts timestamps up to a year old. Validate every sample first.
   const batch = req.body as Batch;
   return reply.code(200).send({accepted: batch.samples.length});
@@ -267,7 +267,7 @@ type Batch struct {
 }
 
 func ingest(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft acknowledges the batch before validating anything, accepts unbounded label
+	// TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
 	// sets and accepts timestamps up to a year old. Validate every sample first.
 	var batch Batch
 	_ = json.NewDecoder(r.Body).Decode(&batch)
@@ -369,7 +369,7 @@ object Api {
   implicit val sampleFormat = jsonFormat4(Sample)
   implicit val batchFormat = jsonFormat1(Batch)
 
-  // TODO: this draft acknowledges the batch before validating anything, accepts unbounded label
+  // TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
   // sets and accepts timestamps up to a year old. Validate every sample first.
   val routes: Route = path("v1" / "metrics") {
     post {
@@ -437,7 +437,7 @@ using json = nlohmann::json;
 
 int main() {
   httplib::Server svr;
-  // TODO: this draft acknowledges the batch before validating anything, accepts unbounded label
+  // TODO: this starter acknowledges the batch before validating anything, accepts unbounded label
   // sets and accepts timestamps up to a year old. Validate every sample first.
   svr.Post("/v1/metrics", [](const httplib::Request& req, httplib::Response& res) {
     const json batch = json::parse(req.body);
@@ -503,5 +503,5 @@ int main() {
     'The label set is an input, not a given. Check each label name against the tenant allowlist and the per-sample label budget, and name the offending label in the 422 body.',
     'Timestamps are claims too. Compare each sample timestamp to now and reject anything outside the accepted skew — a backfilled window is a chart that lies after the fact.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated ingest handler at the trust boundary. The draft reads fine because the demo sends one well-formed sample from one tenant. Three defects are being checked: cardinality (an unbounded label set is how one tenant blows up the store for everyone), freshness (an accepted year-old timestamp rewrites a window that has already rolled up), and honest acknowledgment (validating after the 200 means a rejected sample is reported as accepted and never retried). Real ingest paths add per-tenant cardinality budgets that are enforced as a running series count, a metric-name allowlist on top of the label allowlist, and a partial-success protocol only when the sender can actually retry the failed samples — never a silent drop.`,
+  debrief: `The interviewer is testing whether you can debug an ingest handler at the trust boundary. The starter reads fine because the demo sends one well-formed sample from one tenant. Three defects are being checked: cardinality (an unbounded label set is how one tenant blows up the store for everyone), freshness (an accepted year-old timestamp rewrites a window that has already rolled up), and honest acknowledgment (validating after the 200 means a rejected sample is reported as accepted and never retried). Real ingest paths add per-tenant cardinality budgets that are enforced as a running series count, a metric-name allowlist on top of the label allowlist, and a partial-success protocol only when the sender can actually retry the failed samples — never a silent drop.`,
 };

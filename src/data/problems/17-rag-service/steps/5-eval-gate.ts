@@ -8,8 +8,8 @@ export const evalGateStep: Step = {
   focus: ['events', 'eval', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it compiles and passes the
-happy path, so a quick demo makes it look done. Review it like the service owner. Find the subtle
+**Starting point.** The starter is working code: it compiles and passes the
+happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
 flaw, fix it, and prove the fix with the checks below.
 
 Consume \`answer.events\` in consumer group **\`rag-eval\`**. Each event carries answer metadata and
@@ -28,7 +28,7 @@ golden labels, never the raw question or answer text:
 - Publish \`eval.metrics\` with aggregate counts and verdicts only. No raw question, answer text,
   email or other PII.
 
-**Failure mode the checks target.** The draft gates on one event, lets auto-commit acknowledge it
+**Failure mode the checks target.** The starter gates on one event, lets auto-commit acknowledge it
 before the metrics are durable, and copies the raw question into the metrics topic. A single lucky
 answer can therefore "approve" a release, and the audit trail leaks user content.
 
@@ -165,7 +165,7 @@ answer can therefore "approve" a release, and the audit trail leaks user content
       id: 'no-raw-pii',
       title: 'Keeps raw question and answer text out of eval.metrics',
       detail:
-        'Metrics events carry ids, aggregates and verdicts only. The draft copies `question` into the payload, which puts user content in an analytics topic with different retention and access rules.',
+        'Metrics events carry ids, aggregates and verdicts only. The starter copies `question` into the payload, which puts user content in an analytics topic with different retention and access rules.',
       match: {
         python: {none: [/"question"|question_text|raw_answer|user_email|email/i]},
         typescript: {
@@ -323,12 +323,12 @@ if __name__ == "__main__":
 `,
     },
     typescript: {
-      starter: `/** answer.events consumer: a model-generated eval that treats one event as a verdict. */
+      starter: `/** answer.events consumer: a eval that treats one event as a verdict. */
 import {Kafka} from 'kafkajs';
 
 import {MetricsStore} from './metrics';
 
-const kafka = new Kafka({clientId: 'rag-eval-draft', brokers: ['kafka:9092']});
+const kafka = new Kafka({clientId: 'rag-eval', brokers: ['kafka:9092']});
 const consumer = kafka.consumer({groupId: 'rag-eval-v2'});
 const producer = kafka.producer();
 const store = new MetricsStore();
@@ -962,5 +962,5 @@ int main() {
     'Groundedness is not “the model said grounded”: require both `grounded` and `has_citation` from the joined golden record. Keep recall as the mean of `recall_at_k` over the window.',
     'Read the previous release’s groundedness before deciding. A metric at 0.96 can still be a regression if the last release was 0.99; the 1% rule catches that.',
   ],
-  debrief: `The interviewer learns whether you can turn a product claim into a release contract. The starter is the classic generated eval: it treats one event as a result, lets Kafka acknowledge before the verdict is durable, and leaks the raw question into an analytics topic. The corrected version is a windowed job with a minimum sample size, three metrics that are computed rather than asserted, a comparison against the previous release, and an evidence-before-acknowledgement commit order. Thresholds are policy, so they live as named constants and the blocked reasons are emitted with the metrics for audit. Real eval systems add stratified slices (tenant, language, document type), confidence intervals so a 200-sample window is not treated as exact, offline golden-set refresh, and a human review step before a blocked prompt is rewritten.`,
+  debrief: `The interviewer learns whether you can turn a product claim into a release contract. The starter is the classic first-pass eval: it treats one event as a result, lets Kafka acknowledge before the verdict is durable, and leaks the raw question into an analytics topic. The corrected version is a windowed job with a minimum sample size, three metrics that are computed rather than asserted, a comparison against the previous release, and an evidence-before-acknowledgement commit order. Thresholds are policy, so they live as named constants and the blocked reasons are emitted with the metrics for audit. Real eval systems add stratified slices (tenant, language, document type), confidence intervals so a 200-sample window is not treated as exact, offline golden-set refresh, and a human review step before a blocked prompt is rewritten.`,
 };

@@ -8,10 +8,10 @@ export const readCitationsStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it serves a citation, it is
-fast, and the demo always asks for the caller’s own answer. It hides three flaws — a cross-tenant
-read, a status that is guessed instead of read, and an answer whose status ignores its broken
-citations. Review it, fix it, and prove the fix.
+**Starting point.** The starter is working code: it serves a citation, it is fast, and the demo
+always asks for the caller’s own answer. It hides three flaws — a cross-tenant read, a status that
+is guessed instead of read, and an answer whose status ignores its broken citations. Debug it, fix
+it, and prove the fix.
 
 Implement the read side, two endpoints:
 
@@ -21,17 +21,17 @@ Implement the read side, two endpoints:
   **owning tenant only**: a citation that belongs to another tenant is **404**, never 403 — a 403
   confirms that the citation exists, which is itself information the caller may not have.
 - The response names the evidence in full: \`{"id", "document_id", "version", "start", "end",
-  "quote", "status", "reason"}\`. The draft returns a quote and a status but no version and no
+  "quote", "status", "reason"}\`. The starter returns a quote and a status but no version and no
   offsets, so a reviewer cannot check the span against the bytes.
 
 \`GET /v1/answers/{answer_id}/citations\`:
 
 - The list is scoped by tenant in the lookup, not filtered after the fact.
 - The answer’s **status is the worst status among its citations**: \`broken\` beats \`pending\`
-  beats \`verified\`, and an answer with any broken citation reports **\`degraded\`**. The draft
+  beats \`verified\`, and an answer with any broken citation reports **\`degraded\`**. The starter
   reports the first citation’s status, so one broken citation in the middle is invisible.
 - **Statuses come from the stored verification**, never recomputed from “the document still
-  exists”. The draft answers \`valid\` for anything whose document resolves, which erases the
+  exists”. The starter answers \`valid\` for anything whose document resolves, which erases the
   verification result this whole store exists to keep.
 
 **Failure mode the checks target.** Reading by id without the tenant predicate turns the endpoint
@@ -99,7 +99,7 @@ trustworthy while one of its spans no longer resolves.`,
       id: 'evidence-shape',
       title: 'The citation names its evidence in full',
       detail:
-        'The response carries the version, the full offset range and the quote, so a reviewer can check the span against the bytes. The draft returns a quote and a status but no version and no offsets.',
+        'The response carries the version, the full offset range and the quote, so a reviewer can check the span against the bytes. The starter returns a quote and a status but no version and no offsets.',
       match: {
         python: {all: [/"quote"/, /"version"/, /"status"/, /"start"/, /"end"/]},
         typescript: {all: [/quote:/, /version:/, /status:/, /start:/, /end:/]},
@@ -112,7 +112,7 @@ trustworthy while one of its spans no longer resolves.`,
       id: 'worst-status',
       title: 'The answer reports the worst status among its citations',
       detail:
-        'A ranked worst-of (`broken > pending > verified`) decides the answer’s status, and any broken citation makes it `degraded`. The draft echoes the first citation’s status, so a broken citation in the middle disappears.',
+        'A ranked worst-of (`broken > pending > verified`) decides the answer’s status, and any broken citation makes it `degraded`. The starter echoes the first citation’s status, so a broken citation in the middle disappears.',
       match: {
         python: {all: [/STATUS_RANK/, /answer_status\(/, /ANSWER_DEGRADED/]},
         typescript: {all: [/STATUS_RANK/, /answerStatus\(/, /ANSWER_DEGRADED/]},
@@ -125,7 +125,7 @@ trustworthy while one of its spans no longer resolves.`,
       id: 'stored-status',
       title: 'The status is the stored verification, not a guess',
       detail:
-        'The response returns the stored verification status. The draft answers `valid` whenever the document still exists, replacing the verification result with a lookup.',
+        'The response returns the stored verification status. The starter answers `valid` whenever the document still exists, replacing the verification result with a lookup.',
       match: {
         python: {all: [/"status":\s*citation\["status"\]/], none: [/documents\.exists\(/]},
         typescript: {all: [/status:\s*citation\.status/], none: [/documents\.exists\(/]},
@@ -138,7 +138,7 @@ trustworthy while one of its spans no longer resolves.`,
       id: 'tenant-404',
       title: 'A foreign citation is 404, never 403',
       detail:
-        'The citation is returned only to the tenant that owns it and anything else answers **404** — a 403 would confirm the citation exists. The draft serves any tenant the citation it asks for.',
+        'The citation is returned only to the tenant that owns it and anything else answers **404** — a 403 would confirm the citation exists. The starter serves any tenant the citation it asks for.',
       match: {
         python: {all: [/citation\["tenant"\]\s*!=\s*tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/citation\.tenant\s*!==?\s*tenant/, /code\(\s*404\s*\)/]},
@@ -158,7 +158,7 @@ app = FastAPI()
 
 @app.get("/v1/citations/{citation_id}")
 def read_citation(citation_id: str) -> JSONResponse:
-    # TODO: this draft serves any tenant, guesses the status from whether the document exists, and
+    # TODO: this starter serves any tenant, guesses the status from whether the document exists, and
     # returns no version or offsets. Return the stored verification and the full span, and answer
     # 404 for a citation that belongs to another tenant.
     citation = lookup(citation_id)
@@ -270,7 +270,7 @@ def read_answer(
 `,
     },
     typescript: {
-      starter: `/** A model-generated read that serves any tenant and guesses the citation status. */
+      starter: `/** A read that serves any tenant and guesses the citation status. */
 import Fastify from 'fastify';
 
 import {documents, db} from './store';
@@ -278,7 +278,7 @@ import {documents, db} from './store';
 export const app = Fastify();
 
 app.get('/v1/citations/:citation_id', async (request, reply) => {
-  // TODO: this draft serves any tenant, guesses the status from whether the document exists, and
+  // TODO: this starter serves any tenant, guesses the status from whether the document exists, and
   // returns no version or offsets. Return the stored verification and the full span, and answer
   // 404 for a citation that belongs to another tenant.
   const {citation_id} = request.params as {citation_id: string};
@@ -383,7 +383,7 @@ import (
 )
 
 func readCitation(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves any tenant, guesses the status from whether the document exists, and
+	// TODO: this starter serves any tenant, guesses the status from whether the document exists, and
 	// returns no version or offsets. Return the stored verification and the full span, and answer
 	// 404 for a citation that belongs to another tenant.
 	citation, _ := store.Get(r.Context(), r.PathValue("citation_id"))
@@ -547,7 +547,7 @@ object ReadApi {
     concat(
       path("v1" / "citations" / Segment) { citationId =>
         get {
-          // TODO: this draft serves any tenant, guesses the status from whether the document
+          // TODO: this starter serves any tenant, guesses the status from whether the document
           // exists, and returns no version or offsets. Return the stored verification and the full
           // span, and answer 404 for a citation that belongs to another tenant.
           val citation = store.get(citationId)
@@ -692,7 +692,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/citations/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves any tenant, guesses the status from whether the document exists, and
+    // TODO: this starter serves any tenant, guesses the status from whether the document exists, and
     // returns no version or offsets. Return the stored verification and the full span, and answer
     // 404 for a citation that belongs to another tenant.
     const std::string citationId = req.matches[1];

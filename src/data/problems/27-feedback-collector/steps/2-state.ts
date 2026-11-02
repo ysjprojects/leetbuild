@@ -38,13 +38,13 @@ export const stateStep: Step = {
   },
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. A double-clicked thumbs-up produced two
+**Starting point.** You are the AI platform engineer on call. A double-clicked thumbs-up produced two
 ratings on the same answer, a scripted client flipped a score from \`-1\` to \`1\` by posting twice, and
 a support team found that "alice" on one tenant was blocking "alice" on another because the dedupe key
-dropped the tenant. The model-generated module below checks membership and then adds in two separate
+dropped the tenant. The module below checks membership and then adds in two separate
 round trips, so two concurrent submits both read "not seen" and both write.
 
-Review \`state\` and make the ballot reservation impossible to race, then make it prove the fix.
+Debug \`state\` and make the ballot reservation impossible to race, then make it prove the fix.
 
 - The check and the add must be one atomic operation. Express it as a Lua script and run it with
   \`EVAL\` — a \`SISMEMBER\` read followed by an \`SADD\` write is the bug, not the fix.
@@ -106,7 +106,7 @@ claim result the caller can branch on.`,
     },
     {
       id: 'no-two-step',
-      title: 'The SISMEMBER-then-SADD draft is gone',
+      title: 'The SISMEMBER-then-SADD version is gone',
       detail:
         'A membership read followed by a separate add is exactly the race the fix removes; the reservation must come back from the one script instead of two commands.',
       match: {
@@ -150,7 +150,7 @@ class Dedupe:
         self.redis = redis
 
     def is_duplicate(self, tenant: str, user_id: str, request_id: str) -> bool:
-        # TODO: this draft checks membership and then adds in two round trips, so a double click
+        # TODO: this starter checks membership and then adds in two round trips, so a double click
         # lands two ratings, and the key forgets the tenant so user ids collide across tenants.
         key = f"feedback:{user_id}:{request_id}"
         if self.redis.sismember(SEEN_KEY, key):
@@ -205,7 +205,7 @@ export class Dedupe {
   constructor(private readonly redis: Redis) {}
 
   async isDuplicate(tenant: string, userId: string, requestId: string): Promise<boolean> {
-    // TODO: this draft checks membership and then adds in two round trips, so a double click
+    // TODO: this starter checks membership and then adds in two round trips, so a double click
     // lands two ratings, and the key forgets the tenant so user ids collide across tenants.
     const key = \`feedback:\${userId}:\${requestId}\`;
     if (await this.redis.sismember(SEEN_KEY, key)) return true;
@@ -267,7 +267,7 @@ func NewDedupe(client *redis.Client) *Dedupe {
 }
 
 func (d *Dedupe) isDuplicate(ctx context.Context, tenant, userID, requestID string) bool {
-	// TODO: this draft checks membership and then adds in two round trips, so a double click
+	// TODO: this starter checks membership and then adds in two round trips, so a double click
 	// lands two ratings, and the key forgets the tenant so user ids collide across tenants.
 	key := "feedback:" + userID + ":" + requestID
 	if d.redis.SIsMember(ctx, seenKey, key).Val() {
@@ -337,7 +337,7 @@ final class Dedupe(jedis: Jedis) {
 
   /** True when this (user, request) already voted. */
   def isDuplicate(tenant: String, userId: String, requestId: String): Boolean = {
-    // TODO: this draft checks membership and then adds in two round trips, so a double click
+    // TODO: this starter checks membership and then adds in two round trips, so a double click
     // lands two ratings, and the key forgets the tenant so user ids collide across tenants.
     val key = dedupeKey(userId, requestId)
     if (jedis.sismember(SeenKey, key)) {
@@ -400,7 +400,7 @@ class Dedupe {
   explicit Dedupe(redisContext* ctx) : ctx_(ctx) {}
 
   bool isDuplicate(const std::string& tenant, const std::string& userId, const std::string& requestId) {
-    // TODO: this draft checks membership and then adds in two round trips, so a double click
+    // TODO: this starter checks membership and then adds in two round trips, so a double click
     // lands two ratings, and the key forgets the tenant so user ids collide across tenants.
     const std::string key = keyFor(userId, requestId);
     auto* member = redisCommand(ctx_, "SISMEMBER %s %s", kSeenKey.c_str(), key.c_str());

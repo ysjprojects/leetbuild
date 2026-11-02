@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['gateway', 'kafka', 'transcripts', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes a turn event and the consumer moves the transcript along, so the demo shows turns arriving. Three contracts are broken. Find them, fix them, and prove the fix.
+**Starting point.** The starter is working code: it publishes a turn event and the consumer moves the transcript along, so the demo shows turns arriving. Three contracts are broken. Find them, fix them, and prove the fix.
 
 \`voice.turn\` is how the gateway reports each finished turn; a consumer groups those events into the stored transcript.
 
@@ -44,7 +44,7 @@ export const eventsStep: Step = {
       id: 'session-key',
       title: 'Keyed by session id so a transcript assembles in order',
       detail:
-        'The message key is the session id. The draft keys by user id, so two concurrent sessions of one user interleave and neither transcript can be reconstructed.',
+        'The message key is the session id. The starter keys by user id, so two concurrent sessions of one user interleave and neither transcript can be reconstructed.',
       match: {
         python: {all: [/key=session_id/]},
         typescript: {all: [/key:\s*sessionId\b/]},
@@ -57,7 +57,7 @@ export const eventsStep: Step = {
       id: 'no-raw-speech',
       title: 'References the redacted transcript, never raw speech',
       detail:
-        'The event carries `transcript_ref` and no `transcript_text` or `audio_bytes` anywhere in the file. The draft copies the raw text and the audio blob into a retained, replicated topic.',
+        'The event carries `transcript_ref` and no `transcript_text` or `audio_bytes` anywhere in the file. The starter copies the raw text and the audio blob into a retained, replicated topic.',
       match: {
         python: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
         typescript: {all: [/transcript_ref/], none: [/transcript_text/, /audio_bytes/]},
@@ -83,7 +83,7 @@ export const eventsStep: Step = {
       id: 'persist-before-commit',
       title: 'Persists the transcript before committing the offset',
       detail:
-        'The consumer runs `insert_turn` before committing the offset; committing first makes a crash lose the turn forever. The draft commits first.',
+        'The consumer runs `insert_turn` before committing the offset; committing first makes a crash lose the turn forever. The starter commits first.',
       match: {
         python: {order: [/insert_turn\(/, /consumer\.commit\(/]},
         typescript: {order: [/insert_turn\(/, /commitOffsets\(/]},
@@ -96,7 +96,7 @@ export const eventsStep: Step = {
       id: 'turn-payload',
       title: 'Carries the turn index, timings and the transcript ref',
       detail:
-        'The event carries `turn_index`, the timings (`started_at`, `ended_at`) and `transcript_ref`. The draft publishes a bare counter and the raw text, so a consumer cannot place the turn in time.',
+        'The event carries `turn_index`, the timings (`started_at`, `ended_at`) and `transcript_ref`. The starter publishes a bare counter and the raw text, so a consumer cannot place the turn in time.',
       match: {
         python: {all: [/turn_index/, /transcript_ref/]},
         typescript: {all: [/turn_index/, /transcript_ref/]},
@@ -243,7 +243,7 @@ store = TranscriptStore()
 `,
     },
     typescript: {
-      starter: `/** voice.turn: a model-generated draft that keys by user id and commits before the row lands. */
+      starter: `/** voice.turn: flawed code that keys by user id and commits before the row lands. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -797,5 +797,5 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you can review a Kafka path against the two contracts a topic never renegotiates. The partition key is the unit of ordering: Kafka only orders records within a partition, so keying every turn by the session id keeps one call's turns on one partition and lets the consumer assemble them in \`turn_index\` order, while keying by the user interleaves two concurrent calls and makes either transcript impossible to reconstruct. Retention is the second contract: a retained, replicated topic keeps whatever you write into it long after the request, the tenant and the policy that produced it are gone, so the event carries the ids, the timings and a \`transcript_ref\` into storage that redacts and expires on its own schedule — never the raw speech, never the audio. The third is the consumer's transactional boundary: \`insert_turn\` before the offset commit, with an idempotent producer configured \`acks=all\` on the other side, turns a crash into a replay instead of a lost turn. Real platforms add a schema registry that refuses any field outside the allowlist, per-session partition quotas, and a dead-letter topic for records the transcript store cannot apply.`,
+  debrief: `The interviewer is checking whether you can debug a Kafka path against the two contracts a topic never renegotiates. The partition key is the unit of ordering: Kafka only orders records within a partition, so keying every turn by the session id keeps one call's turns on one partition and lets the consumer assemble them in \`turn_index\` order, while keying by the user interleaves two concurrent calls and makes either transcript impossible to reconstruct. Retention is the second contract: a retained, replicated topic keeps whatever you write into it long after the request, the tenant and the policy that produced it are gone, so the event carries the ids, the timings and a \`transcript_ref\` into storage that redacts and expires on its own schedule — never the raw speech, never the audio. The third is the consumer's transactional boundary: \`insert_turn\` before the offset commit, with an idempotent producer configured \`acks=all\` on the other side, turns a crash into a replay instead of a lost turn. Real platforms add a schema registry that refuses any field outside the allowlist, per-session partition quotas, and a dead-letter topic for records the transcript store cannot apply.`,
 };

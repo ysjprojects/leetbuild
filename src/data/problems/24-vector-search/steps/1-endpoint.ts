@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'search', 'index'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and returns hits. It compiles, it serves the demo, and it hides four production flaws.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/search\` with body \`{"query": [0.1, …], "k": 10, "tenant": "acme", "index_version": "idx-42"}\`.
 
@@ -65,7 +65,7 @@ the shards.`,
       id: 'tenant-filter',
       title: 'Scopes the search to the authenticated tenant',
       detail:
-        'The tenant comes from `X-Tenant-Id` (**401** when missing) and a contradicting `tenant` in the body is **403**. The draft reads the tenant from the body, so any caller can search any corpus.',
+        'The tenant comes from `X-Tenant-Id` (**401** when missing) and a contradicting `tenant` in the body is **403**. The starter reads the tenant from the body, so any caller can search any corpus.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/, /status_code\s*=\s*403/, /body\.tenant/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/, /body\.tenant/]},
@@ -78,7 +78,7 @@ the shards.`,
       id: 'k-cap',
       title: 'Rejects k above the cap instead of clamping it',
       detail:
-        '`k` must be an integer in 1..100 and anything above the cap is **400**. The draft clamps `k` down to the cap and answers 200, so the caller never learns its request was rewritten.',
+        '`k` must be an integer in 1..100 and anything above the cap is **400**. The starter clamps `k` down to the cap and answers 200, so the caller never learns its request was rewritten.',
       match: {
         python: {all: [/MAX_K\s*=\s*100/, /1\s*<=\s*body\.k\s*<=\s*MAX_K/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_K\s*=\s*100/, /k\s*>\s*MAX_K/, /code\(\s*400\s*\)/]},
@@ -91,7 +91,7 @@ the shards.`,
       id: 'dimension',
       title: 'Checks the query against the active dimension',
       detail:
-        'The vector length is compared against the active index dimension (**768**) and a mismatch is **400** with the active version in the error. The draft never compares the vector, so a wrong-width query reaches the shards.',
+        'The vector length is compared against the active index dimension (**768**) and a mismatch is **400** with the active version in the error. The starter never compares the vector, so a wrong-width query reaches the shards.',
       match: {
         python: {all: [/INDEX_DIMENSIONS/, /len\(body\.query\)\s*!=\s*INDEX_DIMENSIONS/, /active_version/]},
         typescript: {all: [/INDEX_DIMENSIONS/, /vector\.length\s*!==\s*INDEX_DIMENSIONS/, /active_version/]},
@@ -104,7 +104,7 @@ the shards.`,
       id: 'active-version',
       title: 'Resolves the index version server-side',
       detail:
-        'The searched version is the active one and a body `index_version` that disagrees is **409** naming the active version. The draft searches whatever version the body names.',
+        'The searched version is the active one and a body `index_version` that disagrees is **409** naming the active version. The starter searches whatever version the body names.',
       match: {
         python: {all: [/ACTIVE_INDEX_VERSION/, /status_code\s*=\s*409/, /body\.index_version/]},
         typescript: {all: [/ACTIVE_INDEX_VERSION/, /code\(\s*409\s*\)/, /body\.index_version/]},
@@ -146,9 +146,9 @@ index = Index()
 
 @app.post("/v1/search")
 def search(body: SearchRequest) -> JSONResponse:
-    # TODO: this draft searches as whoever the body names, clamps k to the cap instead of
+    # TODO: this starter searches as whoever the body names, clamps k to the cap instead of
     # rejecting it, compares the vector against nothing and trusts the body's index version.
-    # Review all four before this endpoint is allowed to take traffic.
+    # Fix all four before this endpoint is allowed to take traffic.
     k = max(1, min(body.k, 100))
     hits = index.search(body.tenant, body.query, k, body.index_version)
     logger.info("search tenant=%s k=%d version=%s", body.tenant, k, body.index_version)
@@ -231,7 +231,7 @@ def search(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/search: a model-generated draft that searches as whoever the body names. */
+      starter: `/** POST /v1/search: flawed code that searches as whoever the body names. */
 import Fastify from 'fastify';
 
 import {index} from './index_store';
@@ -246,9 +246,9 @@ interface SearchBody {
 }
 
 app.post('/v1/search', async (request, reply) => {
-  // TODO: this draft searches as whoever the body names, clamps k to the cap instead of
+  // TODO: this starter searches as whoever the body names, clamps k to the cap instead of
   // rejecting it, compares the vector against nothing and trusts the body's index version.
-  // Review all four before this endpoint is allowed to take traffic.
+  // Fix all four before this endpoint is allowed to take traffic.
   const body = request.body as SearchBody;
   const version = body.index_version ?? 'idx-42';
   const k = Math.min(Math.max(body.k ?? 10, 1), 100);
@@ -351,9 +351,9 @@ func search(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft searches as whoever the body names, clamps k to the cap instead of
+	// TODO: this starter searches as whoever the body names, clamps k to the cap instead of
 	// rejecting it, compares the vector against nothing and trusts the body's index version.
-	// Review all four before this endpoint is allowed to take traffic.
+	// Fix all four before this endpoint is allowed to take traffic.
 	version := body.IndexVersion
 	if version == "" {
 		version = activeIndexVersion
@@ -514,9 +514,9 @@ object SearchApi {
     path("v1" / "search") {
       post {
         entity(as[SearchRequest]) { body =>
-          // TODO: this draft searches as whoever the body names, clamps k to the cap instead of
+          // TODO: this starter searches as whoever the body names, clamps k to the cap instead of
           // rejecting it, compares the vector against nothing and trusts the body's index version.
-          // Review all four before this endpoint is allowed to take traffic.
+          // Fix all four before this endpoint is allowed to take traffic.
           val version = body.index_version.getOrElse(ActiveIndexVersion)
           val k = math.max(1, math.min(body.k, 100))
           val hits = index.search(body.tenant, body.query, k, version)
@@ -630,9 +630,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft searches as whoever the body names, clamps k to the cap instead of
+    // TODO: this starter searches as whoever the body names, clamps k to the cap instead of
     // rejecting it, compares the vector against nothing and trusts the body's index version.
-    // Review all four before this endpoint is allowed to take traffic.
+    // Fix all four before this endpoint is allowed to take traffic.
     const auto tenant = body.value("tenant", std::string());
     const auto version = body.value("index_version", kActiveIndexVersion);
     const auto query = body.value("query", std::vector<double>());
@@ -722,9 +722,9 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary, and
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, and
 the search endpoint has three cross-tenant seams that a demo never trips. The body \`tenant\` is the
-first and quietest: the draft never reads the header, so the authenticated identity is decorative and
+first and quietest: the starter never reads the header, so the authenticated identity is decorative and
 any caller can ask for any corpus by name — the fix is that the authenticated tenant is the only
 tenant, and a contradicting body field is a 403 rather than a silent override. The cap is the second:
 clamping \`k\` to 100 hides the client's mistake and lets a response disagree with its request, where a

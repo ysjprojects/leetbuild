@@ -7,20 +7,20 @@ import {feedbackEventsStep} from './steps/4-feedback-events';
 import {rolloutStep} from './steps/5-rollout';
 
 /**
- * Model router on the AI-era track: the course is not "call an LLM from an endpoint", it is the
- * review you owe a model-generated routing layer before it spends a tenant's budget. Validated,
- * idempotent routing decisions → one atomic Redis reservation per tenant window → a provider call
- * with a deadline, bounded retries, a fallback and a breaker → tenant-keyed feedback events with
- * an outbox and counters before the offset commit → a canary rollout gated by evals with per-tenant
- * pins.
+ * Model router: the course is not "call an LLM from an endpoint", it is the debugging you owe a
+ * routing layer before it spends a tenant's budget. Validated, idempotent routing decisions → one
+ * atomic Redis reservation per tenant window → a provider call with a deadline, bounded retries,
+ * a fallback and a breaker → tenant-keyed feedback events with an outbox and counters before the
+ * offset commit → a canary rollout gated by evals with per-tenant pins.
  */
 export const modelRouterProblem: Problem = {
   id: 'model-router',
   title: 'Model Router',
-  tagline: 'Route requests across models with tenant limits, deadlines and gated rollouts — reviewed like production.',
+  tagline:
+    'Route requests across models with tenant limits, deadlines and gated rollouts, debugged until it is safe to ship.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Model Router
 
@@ -62,12 +62,12 @@ One service, **routerd**, with five pieces:
    traffic increases, a per-tenant pin during rollback, and a response that reports the caller's
    active assignment.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path,
+and it looks right. Your job in every step is the job you will have on a real feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

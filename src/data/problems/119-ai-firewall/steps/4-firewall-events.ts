@@ -8,7 +8,7 @@ export const firewallEventsStep: Step = {
   focus: ['aifw', 'kafka', 'app', 'client'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes one event per
+**Starting point.** The starter is working code: it publishes one event per
 decision and hands the application's answer back to the client, so the dashboard shows numbers
 moving. Four production contracts are broken. Find them, fix them, and prove the fix.
 
@@ -56,7 +56,7 @@ the model for it — the disclosure the source's SDD rules exist to catch.`,
       id: 'key-hash',
       title: 'Keyed by the API key’s SHA-256 hash',
       detail:
-        'The record key and the `key_hash` field are the first 16 hex characters of the SHA-256 of the API key. The draft keys by the request id and never hashes anything.',
+        'The record key and the `key_hash` field are the first 16 hex characters of the SHA-256 of the API key. The starter keys by the request id and never hashes anything.',
       match: {
         python: {all: [/sha256\(/, /key=key_hash/, /\[:16\]/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /key:\s*keyHash/, /slice\(0,\s*16\)/]},
@@ -88,7 +88,7 @@ the model for it — the disclosure the source's SDD rules exist to catch.`,
       id: 'no-text',
       title: 'No user or model text in the event or the logs',
       detail:
-        'Neither the event payload nor any log line carries the request’s input or the model’s answer. The draft copies the input text into the event — a leak that is retained and replicated with the topic.',
+        'Neither the event payload nor any log line carries the request’s input or the model’s answer. The starter copies the input text into the event — a leak that is retained and replicated with the topic.',
       match: {
         python: {all: [/latency_ms/], none: [/\bprompt\b/i, /["']text["']\s*:/]},
         typescript: {all: [/latency_ms/], none: [/\bprompt\b/i, /\btext:\s*responseText/]},
@@ -101,7 +101,7 @@ the model for it — the disclosure the source's SDD rules exist to catch.`,
       id: 'redact',
       title: 'Redacts card numbers and API keys before the client sees the answer',
       detail:
-        '`redact(text)` applies `CARD_PATTERN` and `API_KEY_PATTERN`, replaces hits with `[REDACTED]` and returns the count; `finish` returns the redacted text and puts the count in the event as `redactions`. The draft returns the response untouched.',
+        '`redact(text)` applies `CARD_PATTERN` and `API_KEY_PATTERN`, replaces hits with `[REDACTED]` and returns the count; `finish` returns the redacted text and puts the count in the event as `redactions`. The starter returns the response untouched.',
       match: {
         python: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /["']redactions["']/]},
         typescript: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /redactions/]},
@@ -201,7 +201,7 @@ def finish(api_key: str, request_id: str, decision: Decision, response_text: str
 `,
     },
     typescript: {
-      starter: `/** ai.firewall.events: a model-generated draft that keys by request id and returns the answer as is. */
+      starter: `/** ai.firewall.events: flawed code that keys by request id and returns the answer as is. */
 import {Kafka} from 'kafkajs';
 
 import type {Decision} from './detect';

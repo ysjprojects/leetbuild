@@ -8,28 +8,28 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a fire publishes an event and
+**Starting point.** The starter is working code: a fire publishes an event and
 the ledger consumer writes a row, so the demo shows a run. Three production contracts are broken.
-Review it like the owner of the scheduler, fix it, and prove the fix with the checks below.
+Debug it like the owner of the scheduler, fix it, and prove the fix with the checks below.
 
 Every fire attempt and its outcome publishes to \`schedule.fired\` so a run ledger and the history
 read can reconstruct what happened.
 
 - **Key by the schedule id.** The message key is the partition key: \`key=schedule_id\` (or the
-  stack's equivalent). A schedule's events then share a partition and keep their order. The draft
+  stack's equivalent). A schedule's events then share a partition and keep their order. The starter
   keys by job type, so one schedule's history is scattered across partitions and arrives
   interleaved with every other schedule that shares the job type.
 - The payload carries the ids and the decision: \`schedule_id\`, \`window\`, \`decision\`,
   \`outcome\` and \`reason\`. Never a job payload — the topic is retained for days and replicated.
 - **Publish skips and misses too.** A window the misfire policy skipped, and a window that was
-  missed while the scheduler was down, are both events with \`decision\` and \`reason\`. The draft
+  missed while the scheduler was down, are both events with \`decision\` and \`reason\`. The starter
   publishes only successful fires, so a schedule that stopped running looks like a schedule that
   had nothing to do.
 - The producer must be **idempotent with \`acks=all\`** (\`enable.idempotence\` + \`acks\`,
   KafkaJS \`idempotent: true\` + \`acks: -1\`, or required acks \`all\` with a hash balancer), so a
   retry of a produce cannot duplicate a record.
 - When the broker rejects the produce, write the event to the **outbox** (\`insert_outbox\`) instead
-  of dropping it; a relay republishes outbox rows when the broker recovers. The draft ignores the
+  of dropping it; a relay republishes outbox rows when the broker recovers. The starter ignores the
   broker result entirely.
 
 **Failure mode the checks target.** Keying by job type destroys per-schedule ordering, which is the
@@ -62,7 +62,7 @@ record of a fire that really happened.`,
       id: 'schedule-key',
       title: 'Keyed by schedule id on schedule.fired',
       detail:
-        'The event is produced to `schedule.fired` with the **schedule id** as the message key, so one schedule has one partition and an ordered history. The draft keys by job type, scattering the history of every schedule that shares it.',
+        'The event is produced to `schedule.fired` with the **schedule id** as the message key, so one schedule has one partition and an ordered history. The starter keys by job type, scattering the history of every schedule that shares it.',
       match: {
         python: {all: [/key=schedule_id/, /schedule\.fired/]},
         typescript: {all: [/key:\s*scheduleId/, /'schedule\.fired'/]},
@@ -75,7 +75,7 @@ record of a fire that really happened.`,
       id: 'skip-published',
       title: 'Skipped and missed windows are published with reasons',
       detail:
-        'A skipped window is an event: `skipped` with the `reason` that produced the decision is produced like any other outcome. The draft publishes only successful fires, so a stalled schedule looks idle.',
+        'A skipped window is an event: `skipped` with the `reason` that produced the decision is produced like any other outcome. The starter publishes only successful fires, so a stalled schedule looks idle.',
       match: {
         python: {all: [/"skipped"/, /reason/, /produce\(/]},
         typescript: {all: [/'skipped'/, /reason/, /producer\.send\(/]},
@@ -88,7 +88,7 @@ record of a fire that really happened.`,
       id: 'outbox',
       title: 'Falls back to the outbox when the produce is rejected',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The draft never looks at the broker result.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`InsertOutbox`) inside the error branch instead of dropping the event. The starter never looks at the broker result.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -114,7 +114,7 @@ record of a fire that really happened.`,
       id: 'event-shape',
       title: 'Carries schedule, window, decision and outcome',
       detail:
-        'The event payload names `schedule_id`, `window`, `decision` and `outcome` (plus the reason), so a consumer can build a ledger row without guessing. The draft sends a job type and window and leaves the decision out.',
+        'The event payload names `schedule_id`, `window`, `decision` and `outcome` (plus the reason), so a consumer can build a ledger row without guessing. The starter sends a job type and window and leaves the decision out.',
       match: {
         python: {all: [/"schedule_id"/, /"window"/, /"decision"/, /"outcome"/]},
         typescript: {all: [/schedule_id/, /window/, /decision/, /outcome/]},
@@ -139,8 +139,8 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_fire(schedule: dict, window: int, outcome: str) -> None:
-    # TODO: this draft keys by job type, publishes only successful fires so a stalled schedule
-    # looks idle, and drops the event when the broker rejects the produce. Review all three.
+    # TODO: this starter keys by job type, publishes only successful fires so a stalled schedule
+    # looks idle, and drops the event when the broker rejects the produce. Fix all three.
     event = {
         "job_type": schedule["job_ref"],
         "window": window,
@@ -230,7 +230,7 @@ def publish_missed(schedule_id: str, window: int, reason: str) -> None:
 `,
     },
     typescript: {
-      starter: `/** A model-generated draft that keys events by job type and only publishes successes. */
+      starter: `/** schedule.fired: flawed code that keys events by job type and only publishes successes. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'schedule.fired';
@@ -238,8 +238,8 @@ const TOPIC = 'schedule.fired';
 const producer = new Kafka({clientId: 'cron-scheduler', brokers: ['kafka:9092']}).producer();
 
 export async function publishFire(jobType: string, window: number, outcome: string): Promise<void> {
-  // TODO: this draft keys by job type, publishes only successful fires so a stalled schedule looks
-  // idle, and drops the event when the broker rejects the produce. Review all three.
+  // TODO: this starter keys by job type, publishes only successful fires so a stalled schedule looks
+  // idle, and drops the event when the broker rejects the produce. Fix all three.
   await producer.send({
     topic: TOPIC,
     messages: [{key: jobType, value: JSON.stringify({job_type: jobType, window, outcome})}],
@@ -315,8 +315,8 @@ const topic = "schedule.fired"
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: topic}
 
 func PublishFire(ctx context.Context, jobType string, window int64, outcome string) error {
-	// TODO: this draft keys by job type, publishes only successful fires so a stalled schedule
-	// looks idle, and drops the event when the broker rejects the produce. Review all three.
+	// TODO: this starter keys by job type, publishes only successful fires so a stalled schedule
+	// looks idle, and drops the event when the broker rejects the produce. Fix all three.
 	value, err := json.Marshal(map[string]any{"job_type": jobType, "window": window, "outcome": outcome})
 	if err != nil {
 		return err
@@ -399,8 +399,8 @@ object ScheduleEvents {
   val producer = new KafkaProducer[String, String](props)
 
   def publishFire(jobType: String, window: Long, outcome: String): Unit = {
-    // TODO: this draft keys by job type, publishes only successful fires so a stalled schedule
-    // looks idle, and drops the event when the broker rejects the produce. Review all three.
+    // TODO: this starter keys by job type, publishes only successful fires so a stalled schedule
+    // looks idle, and drops the event when the broker rejects the produce. Fix all three.
     val event = s"""{"job_type":"$jobType","window":$window,"outcome":"$outcome"}"""
     producer.send(new ProducerRecord(Topic, jobType, event))
     producer.flush()
@@ -469,8 +469,8 @@ std::string eventJson(const std::string& jobType, long window, const std::string
 }
 
 void publishFire(const std::string& jobType, long window, const std::string& outcome) {
-  // TODO: this draft keys by job type, publishes only successful fires so a stalled schedule looks
-  // idle, and drops the event when the broker rejects the produce. Review all three.
+  // TODO: this starter keys by job type, publishes only successful fires so a stalled schedule looks
+  // idle, and drops the event when the broker rejects the produce. Fix all three.
   const std::string event = eventJson(jobType, window, outcome);
   producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                     const_cast<char*>(event.c_str()), event.size(), jobType.c_str(), nullptr);
@@ -537,5 +537,5 @@ void publishMissed(const std::string& scheduleId, long window, const std::string
     'Idempotence is producer configuration, not application logic: `enable.idempotence=true` with `acks=all`, KafkaJS `idempotent: true` with `acks: -1`, or required acks `all` with a hash balancer. It needs the same key on every retry, which is the same fix as the schedule key.',
     'The outbox is the durability half: wrap the produce and, when the broker rejects it, insert the event as an outbox row for the relay. Publish the decisions you did not act on as well — `skipped` and `missed` with their reason are the rows an on-call engineer reads first.',
   ],
-  debrief: `The interviewer is testing whether the event stream can answer "what did this schedule do?" The draft passes because the demo fires successfully and the broker is up. Four defects are checked: keying by job type instead of schedule, publishing only successes, no idempotent producer, and no outbox when the broker rejects the produce. The subtle one is the omission: a history built from successful fires only is indistinguishable from a healthy idle schedule, which is exactly the state a stalled scheduler is in. Real ledgers also carry a producer sequence number so a duplicate is detectable, and reconcile the outbox against the topic before they mark a window final.`,
+  debrief: `The interviewer is testing whether the event stream can answer "what did this schedule do?" The starter passes because the demo fires successfully and the broker is up. Four defects are checked: keying by job type instead of schedule, publishing only successes, no idempotent producer, and no outbox when the broker rejects the produce. The subtle one is the omission: a history built from successful fires only is indistinguishable from a healthy idle schedule, which is exactly the state a stalled scheduler is in. Real ledgers also carry a producer sequence number so a duplicate is detectable, and reconcile the outbox against the topic before they mark a window final.`,
 };

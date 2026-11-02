@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['registry', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a version moves to promoted
+**Starting point.** The starter is working code: a version moves to promoted
 and the demo reads the new state back from the instance that did it. It compiles, and it fails on
-the two things that matter — a race and a second instance. Review it like the service owner, fix it,
+the two things that matter — a race and a second instance. Debug it like the service owner, fix it,
 and prove the fix with the checks below.
 
 Implement the stage transitions and the serving pointer:
@@ -18,10 +18,10 @@ Implement the stage transitions and the serving pointer:
 - A version record lives in a Redis hash \`version:{name}:{version}\` with a \`stage\` field among
   \`staged\`, \`canary\`, \`promoted\` and \`rolled_back\`, and the registered \`eval_id\`.
 - The active pointer for a serving pool is a Redis key **\`active:{pool}\`** holding
-  \`"{name}:{version}"\`. The draft keeps pointers in a process-local map, so two registry instances
+  \`"{name}:{version}"\`. The starter keeps pointers in a process-local map, so two registry instances
   disagree about which version a pool is serving.
 - Promotion swaps the \`stage\` field and the pool pointer in **one atomic script** (\`PROMOTE_LUA\`
-  run with \`EVAL\`). The draft writes \`HSET\` and the pointer in two separate round trips, so a
+  run with \`EVAL\`). The starter writes \`HSET\` and the pointer in two separate round trips, so a
   promotion that races a rollback can leave the stage promoted while the pointer points at the old
   version — a half-applied transition.
 - The script may only promote from \`staged\` or \`canary\`, and it must **compare the version's
@@ -35,7 +35,7 @@ Implement the stage transitions and the serving pointer:
   promotion, every instance answers the same version. A process-local cache that never expires
   cannot do that.
 
-**Failure mode the checks target.** Every serial test passes on the draft: promote, then read, and
+**Failure mode the checks target.** Every serial test passes on the starter: promote, then read, and
 the local map is right. The flaw appears only under a concurrent promotion and rollback, or on the
 second instance, which is exactly where a registry either works or silently splits a fleet.
 
@@ -64,7 +64,7 @@ trips the transition takes, and what the gate is allowed to re-open.`,
       id: 'atomic-transition',
       title: 'Swaps the stage and the pointer in one atomic script',
       detail:
-        'A single Lua `EVAL` (`PROMOTE_LUA`) writes the stage and the pool pointer together. The draft issues two separate round trips, so a promotion racing a rollback can half-apply.',
+        'A single Lua `EVAL` (`PROMOTE_LUA`) writes the stage and the pool pointer together. The starter issues two separate round trips, so a promotion racing a rollback can half-apply.',
       match: {
         python: {all: [/PROMOTE_LUA/, /\.eval\(/]},
         typescript: {all: [/PROMOTE_LUA/, /\.eval\(/]},
@@ -77,7 +77,7 @@ trips the transition takes, and what the gate is allowed to re-open.`,
       id: 'shared-pointer',
       title: 'Keeps the active pointer in Redis under active:{pool}',
       detail:
-        'The pointer every instance reads lives in Redis at `active:{pool}`. The draft keeps it in a process-local map, so only the instance that promoted the version sees the new pointer.',
+        'The pointer every instance reads lives in Redis at `active:{pool}`. The starter keeps it in a process-local map, so only the instance that promoted the version sees the new pointer.',
       match: {
         python: {all: [/active:\{pool\}/]},
         typescript: {all: [/active:\$\{pool\}/]},
@@ -90,7 +90,7 @@ trips the transition takes, and what the gate is allowed to re-open.`,
       id: 'no-process-cache',
       title: 'Resolves the active version through Redis',
       detail:
-        '`resolve_active` reads the pointer from Redis, so all instances converge within a second. The draft answers from a per-process cache that never expires, so instances disagree indefinitely.',
+        '`resolve_active` reads the pointer from Redis, so all instances converge within a second. The starter answers from a per-process cache that never expires, so instances disagree indefinitely.',
       match: {
         python: {all: [/resolve_active/, /r\.get\(/], none: [/self\._active|registry\._active/]},
         typescript: {all: [/resolveActive/, /\.get\(/], none: [/processPointers/]},
@@ -103,7 +103,7 @@ trips the transition takes, and what the gate is allowed to re-open.`,
       id: 'rollback-clears',
       title: 'Clears the pointer when a version is rolled back',
       detail:
-        'A rollback sets `stage = rolled_back` and deletes `active:{pool}` in the same script. The draft leaves the pointer behind, so a rolled-back version keeps receiving traffic.',
+        'A rollback sets `stage = rolled_back` and deletes `active:{pool}` in the same script. The starter leaves the pointer behind, so a rolled-back version keeps receiving traffic.',
       match: {
         python: {all: [/rolled_back/, /ROLLBACK_LUA/]},
         typescript: {all: [/rolled_back/, /ROLLBACK_LUA/]},
@@ -116,7 +116,7 @@ trips the transition takes, and what the gate is allowed to re-open.`,
       id: 'new-eval-gate',
       title: 'Requires a new eval record to re-promote after a rollback',
       detail:
-        'The promote script compares the version’s stored `eval_id` with the caller’s and refuses a stale one, and only promotes from `staged` or `canary`. The draft re-promotes a rolled-back version with its old eval.',
+        'The promote script compares the version’s stored `eval_id` with the caller’s and refuses a stale one, and only promotes from `staged` or `canary`. The starter re-promotes a rolled-back version with its old eval.',
       match: {
         python: {all: [/eval_id/, /canary/]},
         typescript: {all: [/eval_id/, /canary/]},
@@ -154,7 +154,7 @@ registry = Registry()
 
 @app.post("/v1/models/{name}/versions/{version}/promote")
 def promote(name: str, version: str, body: PromoteBody) -> dict:
-    # TODO: the draft updates the stage and the pointer in two separate writes, so a promotion can
+    # TODO: the starter updates the stage and the pointer in two separate writes, so a promotion can
     # half-apply against a rollback, and it keeps the pointer in this process so a second instance
     # never sees it. Move both into one Lua EVAL, key the pointer active:{pool} in Redis, and refuse
     # to re-promote a rolled-back version without a new eval record.
@@ -241,7 +241,7 @@ def active(pool: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Promote: a model-generated draft that writes state and pointer separately. */
+      starter: `/** Promote: flawed code that writes state and pointer separately. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -258,7 +258,7 @@ interface PromoteBody {
 const processPointers: Record<string, string> = {};
 
 app.post('/v1/models/:name/versions/:version/promote', async (request, reply) => {
-  // TODO: the draft updates the stage and the pointer in two separate writes, so a promotion can
+  // TODO: the starter updates the stage and the pointer in two separate writes, so a promotion can
   // half-apply against a rollback, and it keeps the pointer in this process so a second instance
   // never sees it. Move both into one Lua EVAL, key the pointer active:{pool} in Redis, and refuse
   // to re-promote a rolled-back version without a new eval record.
@@ -372,7 +372,7 @@ type PromoteBody struct {
 func promote(rw http.ResponseWriter, r *http.Request) {
 	body := PromoteBody{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: the draft updates the stage and the pointer in two separate writes, so a promotion can
+	// TODO: the starter updates the stage and the pointer in two separate writes, so a promotion can
 	// half-apply against a rollback, and it keeps the pointer in this process so a second instance
 	// never sees it. Move both into one Lua EVAL, key the pointer active:{pool} in Redis, and refuse
 	// to re-promote a rolled-back version without a new eval record.
@@ -491,7 +491,7 @@ object RegistryState {
     path("v1" / "models" / Segment / "versions" / Segment / "promote") { (name, version) =>
       post {
         entity(as[PromoteBody]) { body =>
-          // TODO: the draft updates the stage and the pointer in two separate writes, so a
+          // TODO: the starter updates the stage and the pointer in two separate writes, so a
           // promotion can half-apply against a rollback, and it keeps the pointer in this process
           // so a second instance never sees it. Move both into one Lua EVAL, key the pointer
           // active:{pool} in Redis, and refuse to re-promote a rolled-back version without a new
@@ -601,7 +601,7 @@ std::map<std::string, std::string> process_pointers;
 
 void promote(sw::redis::Redis& redis, const std::string& name, const std::string& version,
              const std::string& pool, const std::string& eval_id) {
-  // TODO: the draft updates the stage and the pointer in two separate writes, so a promotion can
+  // TODO: the starter updates the stage and the pointer in two separate writes, so a promotion can
   // half-apply against a rollback, and it keeps the pointer in this process so a second instance
   // never sees it. Move both into one Lua EVAL, key the pointer active:{pool} in Redis, and refuse
   // to re-promote a rolled-back version without a new eval record.

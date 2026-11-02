@@ -8,9 +8,9 @@ export const completionEndpointStep: Step = {
   focus: ['editor', 'api'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the editor's request and returns candidates. It compiles, it serves the demo, and it hides four
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/completions\` with body
 \`{"prefix": "…", "suffix": "…", "language": "python", "path": "db/conn.py", "token": 17, "open_tabs": [{"path": "…", "text": "…"}]}\`.
@@ -67,7 +67,7 @@ log pipeline on every keystroke, where it outlives the session and the retention
       id: 'session',
       title: 'Requires a session and answers with a request id',
       detail:
-        'A missing `X-Session-Id` is **401**, and every reply carries a fresh `request_id` next to the echoed `token`. The draft serves anyone and returns candidates the editor cannot match to a keystroke.',
+        'A missing `X-Session-Id` is **401**, and every reply carries a fresh `request_id` next to the echoed `token`. The starter serves anyone and returns candidates the editor cannot match to a keystroke.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /request_id/]},
         typescript: {all: [/code\(\s*401\s*\)/, /request_id|requestId/]},
@@ -80,7 +80,7 @@ log pipeline on every keystroke, where it outlives the session and the retention
       id: 'window',
       title: 'Fits the prompt into the 6,000-character window',
       detail:
-        'The prefix keeps its last `MAX_PREFIX_CHARS`, the suffix its first `MAX_SUFFIX_CHARS`, snippets fill the rest of `PROMPT_WINDOW_CHARS = 6000`, and a request over `MAX_BODY_BYTES` is **413**. The draft sends whole files and never checks the size.',
+        'The prefix keeps its last `MAX_PREFIX_CHARS`, the suffix its first `MAX_SUFFIX_CHARS`, snippets fill the rest of `PROMPT_WINDOW_CHARS = 6000`, and a request over `MAX_BODY_BYTES` is **413**. The starter sends whole files and never checks the size.',
       match: {
         python: {
           all: [/PROMPT_WINDOW_CHARS\s*=\s*6000/, /MAX_PREFIX_CHARS/, /MAX_SUFFIX_CHARS/, /status_code\s*=\s*413/],
@@ -104,7 +104,7 @@ log pipeline on every keystroke, where it outlives the session and the retention
       id: 'no-code-log',
       title: 'Logs ids and sizes, never the code',
       detail:
-        'The completion is logged with session, request id, language, prompt size and snippet count; the prefix, suffix and tab text never reach a log line. The draft logs the prefix and suffix on every keystroke.',
+        'The completion is logged with session, request id, language, prompt size and snippet count; the prefix, suffix and tab text never reach a log line. The starter logs the prefix and suffix on every keystroke.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*(prefix|suffix|open_tabs)/]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*(prefix|suffix|open_tabs|openTabs)/]},
@@ -147,8 +147,8 @@ def complete(prefix: str, suffix: str, snippets: list[str], language: str) -> li
 
 @app.post("/v1/completions")
 def completions(body: CompletionRequest, session: str = Header(default="", alias="X-Session-Id")) -> JSONResponse:
-    # TODO: this draft serves anyone without a session, sends whole files into the prompt, returns
-    # no request id for the editor to match replies against, and logs the code. Review all four.
+    # TODO: this starter serves anyone without a session, sends whole files into the prompt, returns
+    # no request id for the editor to match replies against, and logs the code. Fix all four.
     logger.info("complete session=%s path=%s prefix=%r suffix=%r", session, body.path, body.prefix, body.suffix)
     snippets = [tab.text for tab in body.open_tabs]
     candidates = complete(body.prefix, body.suffix, snippets, body.language)
@@ -236,7 +236,7 @@ def completions(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/completions: a model-generated draft that sends whole files and logs them. */
+      starter: `/** POST /v1/completions: flawed code that sends whole files and logs them. */
 import Fastify from 'fastify';
 
 import {complete} from './fim_call';
@@ -258,8 +258,8 @@ interface CompletionBody {
 }
 
 app.post('/v1/completions', async (request, reply) => {
-  // TODO: this draft serves anyone without a session, sends whole files into the prompt, returns
-  // no request id for the editor to match replies against, and logs the code. Review all four.
+  // TODO: this starter serves anyone without a session, sends whole files into the prompt, returns
+  // no request id for the editor to match replies against, and logs the code. Fix all four.
   const session = request.headers['x-session-id'] as string;
   const body = request.body as CompletionBody;
   request.log.info({session, path: body.path, prefix: body.prefix, suffix: body.suffix}, 'complete');
@@ -383,8 +383,8 @@ func completions(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft serves anyone without a session, sends whole files into the prompt, returns
-	// no request id for the editor to match replies against, and logs the code. Review all four.
+	// TODO: this starter serves anyone without a session, sends whole files into the prompt, returns
+	// no request id for the editor to match replies against, and logs the code. Fix all four.
 	log.Printf("complete session=%s path=%s prefix=%q suffix=%q", session, body.Path, body.Prefix, body.Suffix)
 	snippets := make([]string, 0, len(body.OpenTabs))
 	for _, tab := range body.OpenTabs {
@@ -558,7 +558,7 @@ object CompletionApi {
       post {
         optionalHeaderValueByName("X-Session-Id") { sessionOpt =>
           entity(as[CompletionRequest]) { body =>
-            // TODO: this draft serves anyone without a session, sends whole files into the prompt,
+            // TODO: this starter serves anyone without a session, sends whole files into the prompt,
             // returns no request id for the editor to match replies against, and logs the code.
             val session = sessionOpt.getOrElse("")
             system.log.info(s"complete session=$session path=\${body.path} prefix=\${body.prefix} suffix=\${body.suffix}")
@@ -687,8 +687,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft serves anyone without a session, sends whole files into the prompt, returns
-    // no request id for the editor to match replies against, and logs the code. Review all four.
+    // TODO: this starter serves anyone without a session, sends whole files into the prompt, returns
+    // no request id for the editor to match replies against, and logs the code. Fix all four.
     const auto prefix = body.value("prefix", std::string());
     const auto suffix = body.value("suffix", std::string());
     const auto language = body.value("language", std::string());
@@ -808,5 +808,5 @@ int main() {
     'The window is a budget, not a validator: slice the prefix from the end (`prefix[-MAX_PREFIX_CHARS:]`), the suffix from the start, then hand the remaining characters to the snippets in order. `PROMPT_WINDOW_CHARS - MAX_PREFIX_CHARS - MAX_SUFFIX_CHARS` is what the tabs get.',
     'The reply needs two ids: a server-made `request_id` for telemetry and the editor’s `token` echoed back so a stale reply can be dropped. The log line is a contract: session, request id, language, character count, snippet count — compute the count into a variable first so no `prefix` lands inside the logging call.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a product that sees source code on every keystroke. The draft reads fine because the demo sends small files from one session and never retries. Four defects are being checked: authentication (the session is never optional, because the open tabs in the request are one developer's code), the window budget (the model reads about 6,000 characters, so the service trims the prefix to its tail, the suffix to its head and gives the rest to snippets, instead of sending whole files or refusing them), a reply id so the editor can discard stale completions, and a log line that carries sizes and ids but never code. Real completion services add a per-session rate limit on keystrokes, a language allow-list, and a hashed prompt fingerprint for caching and debugging.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a product that sees source code on every keystroke. The starter reads fine because the demo sends small files from one session and never retries. Four defects are being checked: authentication (the session is never optional, because the open tabs in the request are one developer's code), the window budget (the model reads about 6,000 characters, so the service trims the prefix to its tail, the suffix to its head and gives the rest to snippets, instead of sending whole files or refusing them), a reply id so the editor can discard stale completions, and a log line that carries sizes and ids but never code. Real completion services add a per-session rate limit on keystrokes, a language allow-list, and a hashed prompt fingerprint for caching and debugging.`,
 };

@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['search', 'shards'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: with every shard healthy it
+**Starting point.** The starter is working code: with every shard healthy it
 returns the union of the shard replies and the demo ranks well. Three failure modes are hidden in it.
 Find them, fix them, and prove the fix with the checks below.
 
@@ -18,13 +18,13 @@ The search fans a query out to the index shards over gRPC.
   \`withDeadlineAfter\`, \`set_deadline\`). A shard that has not answered by then is a *missing*
   answer, not a slow one: the call is abandoned and the query proceeds.
 - Retries are **bounded**: at most **2 attempts** per shard and a **150 ms retry budget** measured
-  from the first attempt. The draft retries timeouts forever, which turns one stuck shard into a
+  from the first attempt. The starter retries timeouts forever, which turns one stuck shard into a
   request that never returns and a client that cancels by timing out at the edge.
 - A shard reply set must reach a **quorum** — a majority of the configured shards
   (\`shard_count // 2 + 1\`). Below quorum the search answers **503** with the answered and required
   counts and \`partial: true\`; it must never answer 200 with a silently incomplete list.
 - A failing or timing-out shard counts as a **failure** (\`failures += 1\`), never as an empty hit
-  list. The draft maps a rejected shard call to \`[]\`, so a dead shard looks exactly like a shard
+  list. The starter maps a rejected shard call to \`[]\`, so a dead shard looks exactly like a shard
   with nothing to return.
 - Above quorum, the response reports \`partial\` — \`true\` when any shard failed — alongside
   \`shards.answered\` and \`shards.required\`, so a client can tell a degraded answer from a complete
@@ -66,7 +66,7 @@ unbounded wait means a partial shard outage becomes a full outage under load.`,
       id: 'deadline',
       title: 'Gives every shard a 400 ms deadline',
       detail:
-        'Each shard call carries a 400 ms deadline, so a stuck shard is cut off and the search proceeds. The draft awaits the slowest shard with no timeout at all.',
+        'Each shard call carries a 400 ms deadline, so a stuck shard is cut off and the search proceeds. The starter awaits the slowest shard with no timeout at all.',
       match: {
         python: {all: [/SHARD_DEADLINE_MS\s*=\s*400/, /timeout=SHARD_DEADLINE_S/]},
         typescript: {all: [/SHARD_DEADLINE_MS\s*=\s*400/, /deadline:\s*Date\.now\(\)\s*\+\s*SHARD_DEADLINE_MS/]},
@@ -79,7 +79,7 @@ unbounded wait means a partial shard outage becomes a full outage under load.`,
       id: 'quorum',
       title: 'Requires a quorum of shard replies',
       detail:
-        'A majority of the configured shards must answer; below quorum the search answers **503** with the answered and required counts. The draft answers 200 with whatever came back, so a partial index looks complete.',
+        'A majority of the configured shards must answer; below quorum the search answers **503** with the answered and required counts. The starter answers 200 with whatever came back, so a partial index looks complete.',
       match: {
         python: {all: [/def quorum_size\(/, /status_code\s*=\s*503/, /answered\s*<\s*quorum/]},
         typescript: {all: [/function quorumSize\(/, /code\(\s*503\s*\)/, /answered\s*<\s*quorum/]},
@@ -92,7 +92,7 @@ unbounded wait means a partial shard outage becomes a full outage under load.`,
       id: 'failures-not-empty',
       title: 'A failed shard is a failure, not an empty result',
       detail:
-        'A rejected or timed-out shard increments a failure counter (`failures += 1`) and its hits are not merged; the draft turns the error into an empty hit list, so a dead shard is indistinguishable from an empty one.',
+        'A rejected or timed-out shard increments a failure counter (`failures += 1`) and its hits are not merged; the starter turns the error into an empty hit list, so a dead shard is indistinguishable from an empty one.',
       match: {
         python: {all: [/failures\s*\+=\s*1/, /return_exceptions=True/]},
         typescript: {all: [/failures\s*\+=\s*1/, /allSettled/]},
@@ -105,7 +105,7 @@ unbounded wait means a partial shard outage becomes a full outage under load.`,
       id: 'bounded-retries',
       title: 'Retries stop at the attempt cap and the budget',
       detail:
-        'At most 2 attempts per shard inside a 150 ms wall-clock budget; the loop exits when either bound is reached. The draft retries every timeout forever, so one stuck shard stalls the whole query.',
+        'At most 2 attempts per shard inside a 150 ms wall-clock budget; the loop exits when either bound is reached. The starter retries every timeout forever, so one stuck shard stalls the whole query.',
       match: {
         python: {all: [/RETRY_BUDGET_MS/, /MAX_ATTEMPTS/, /attempt\s*\+=\s*1/], none: [/while True/]},
         typescript: {all: [/RETRY_BUDGET_MS/, /MAX_ATTEMPTS/, /attempts\s*\+=\s*1/], none: [/while\s*\(\s*true\s*\)/]},
@@ -118,7 +118,7 @@ unbounded wait means a partial shard outage becomes a full outage under load.`,
       id: 'partial-flag',
       title: 'Reports a partial answer explicitly',
       detail:
-        'Above quorum the response carries `partial` (true when any shard failed) together with `shards.answered` and `shards.required`. The draft merges silently, so the caller cannot tell how complete the list is.',
+        'Above quorum the response carries `partial` (true when any shard failed) together with `shards.answered` and `shards.required`. The starter merges silently, so the caller cannot tell how complete the list is.',
       match: {
         python: {all: [/partial/, /quorum_size\(/]},
         typescript: {all: [/partial/, /quorumSize\(/]},
@@ -158,9 +158,9 @@ class SearchQuery(BaseModel):
 async def query_shard(target: str, tenant: str, query: list[float], k: int, version: str) -> list[dict]:
     stub = shards_pb2_grpc.IndexShardStub(channels[target])
     request = shards_pb2.SearchRequest(tenant=tenant, query=query, k=k, index_version=version)
-    # TODO: this draft has no deadline, no quorum and no retry budget. It awaits every shard
+    # TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
     # forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-    # never ends. Review all three before this fan-out takes traffic.
+    # never ends. Fix all three before this fan-out takes traffic.
     while True:
         try:
             reply = await stub.Search(request)
@@ -286,7 +286,7 @@ async def search(
 `,
     },
     typescript: {
-      starter: `/** Scatter-gather over index shards: a model-generated draft with no bounds. */
+      starter: `/** Scatter-gather over index shards: flawed code with no bounds. */
 import * as grpc from '@grpc/grpc-js';
 import Fastify from 'fastify';
 
@@ -324,9 +324,9 @@ function callShard(client: grpc.Client, request: ShardRequest): Promise<{hits?: 
 }
 
 async function queryShard(target: string, client: grpc.Client, request: ShardRequest): Promise<Hit[]> {
-  // TODO: this draft has no deadline, no quorum and no retry budget. It awaits every shard
+  // TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
   // forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-  // never ends. Review all three before this fan-out takes traffic.
+  // never ends. Fix all three before this fan-out takes traffic.
   while (true) {
     try {
       const reply = await callShard(client, request);
@@ -488,9 +488,9 @@ func shardClient(target string) shards.IndexShardClient {
 }
 
 func queryShard(ctx context.Context, target string, request *shards.SearchRequest) []Hit {
-	// TODO: this draft has no deadline, no quorum and no retry budget. It awaits every shard
+	// TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
 	// forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-	// never ends. Review all three before this fan-out takes traffic.
+	// never ends. Fix all three before this fan-out takes traffic.
 	for {
 		reply, err := shardClient(target).Search(ctx, request)
 		if err == nil {
@@ -686,9 +686,9 @@ object SearchApi {
     IndexShardGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
 
   def queryShard(stub: IndexShardGrpc.IndexShardBlockingStub, request: SearchRequest): List[Hit] = {
-    // TODO: this draft has no deadline, no quorum and no retry budget. It awaits every shard
+    // TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
     // forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-    // never ends. Review all three before this fan-out takes traffic.
+    // never ends. Fix all three before this fan-out takes traffic.
     while (true) {
       try {
         val reply = stub.search(request)
@@ -863,9 +863,9 @@ std::unique_ptr<shards::IndexShard::Stub> shardStub(const std::string& target) {
 }
 
 ShardOutcome queryShard(const std::string& target, const shards::SearchRequest& request) {
-  // TODO: this draft has no deadline, no quorum and no retry budget. It awaits every shard
+  // TODO: this starter has no deadline, no quorum and no retry budget. It awaits every shard
   // forever, turns a rejected shard into an empty hit list, and retries timeouts in a loop that
-  // never ends. Review all three before this fan-out takes traffic.
+  // never ends. Fix all three before this fan-out takes traffic.
   auto stub = shardStub(target);
   while (true) {
     grpc::ClientContext context;
@@ -1026,7 +1026,7 @@ int main() {
 `,
     },
   },
-  debrief: `A scatter-gather is where a search service's tail latency and its honesty both live. The draft's
+  debrief: `A scatter-gather is where a search service's tail latency and its honesty both live. The starter's
 three defects are the three questions an interviewer asks in order. First, is the wait bounded?
 Without a per-attempt deadline the service inherits the slowest shard's latency, so one hot shard
 becomes an outage. Second, is the answer complete? A quorum turns "some shards replied" into a

@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['api', 'registry'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the body and returns a job id. It compiles, it serves the demo, and it hides three production flaws.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the route, parses the body and returns
+a job id. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/finetune/jobs\` with body
 \`{"base_model": "…", "dataset_version": "…", "hyperparameters": {…}, "compute_budget": 1200}\`.
@@ -75,7 +75,7 @@ budget.`,
       id: 'dataset-version',
       title: 'Rejects anything that is not a registered dataset version',
       detail:
-        'The dataset is a registry version id; the handler resolves it and returns **400** for an unknown or unregistered version. The draft stores the caller-supplied `dataset_file` and never consults the registry.',
+        'The dataset is a registry version id; the handler resolves it and returns **400** for an unknown or unregistered version. The starter stores the caller-supplied `dataset_file` and never consults the registry.',
       match: {
         python: {all: [/dataset_version/, /registry\.get_dataset\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/dataset_version/, /registry\.getDataset\(/, /code\(\s*400\s*\)/]},
@@ -88,7 +88,7 @@ budget.`,
       id: 'hyperparams',
       title: 'Validates hyperparameters against the base model’s supported set',
       detail:
-        'Every key in `hyperparameters` must be one the base model supports; an unknown key is **400**. The draft accepts the block verbatim and would train on an undefined knob.',
+        'Every key in `hyperparameters` must be one the base model supports; an unknown key is **400**. The starter accepts the block verbatim and would train on an undefined knob.',
       match: {
         python: {all: [/SUPPORTED_HYPERPARAMS/, /status_code\s*=\s*400/]},
         typescript: {all: [/SUPPORTED_HYPERPARAMS/, /code\(\s*400\s*\)/]},
@@ -101,7 +101,7 @@ budget.`,
       id: 'idempotency',
       title: 'Replays the original job for a repeated key',
       detail:
-        '`Idempotency-Key` is required and the job is stored under `(team, key)`; a replay returns the stored job instead of submitting a second one. The draft ignores the header.',
+        '`Idempotency-Key` is required and the job is stored under `(team, key)`; a replay returns the stored job instead of submitting a second one. The starter ignores the header.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -114,7 +114,7 @@ budget.`,
       id: 'budget',
       title: 'Requires a positive compute budget',
       detail:
-        '`compute_budget` must be a positive integer — **400** otherwise — and is stored verbatim on the job. The draft trusts the field, so a zero or negative budget slips through.',
+        '`compute_budget` must be a positive integer — **400** otherwise — and is stored verbatim on the job. The starter trusts the field, so a zero or negative budget slips through.',
       match: {
         python: {all: [/compute_budget/, /compute_budget\s*<=\s*0/]},
         typescript: {all: [/computeBudget/, /computeBudget\s*<=\s*0/]},
@@ -126,7 +126,7 @@ budget.`,
   ],
   code: {
     python: {
-      starter: `"""Fine-tune job submission API (model-generated draft)."""
+      starter: `"""Fine-tune job submission API: flawed code that trusts the caller's dataset file."""
 import logging
 from typing import Any, Dict
 
@@ -250,7 +250,7 @@ async def create_job(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/finetune/jobs: a model-generated draft that trusts the caller's dataset file. */
+      starter: `/** POST /v1/finetune/jobs: flawed code that trusts the caller's dataset file. */
 import Fastify from 'fastify';
 import {createClient} from 'ioredis';
 
@@ -348,7 +348,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// Package api is the fine-tune job submission API (model-generated draft).
+      starter: `// Package api is the fine-tune job submission API: flawed code that trusts the caller's dataset file.
 package api
 
 import (
@@ -591,7 +591,7 @@ object Api {
 `,
     },
     cpp: {
-      starter: `// Fine-tune job submission API (model-generated draft).
+      starter: `// Fine-tune job submission API: flawed code that trusts the caller's dataset file.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -706,5 +706,5 @@ void Register(httplib::Server& svr) {
     'The base model names the hyperparameters its recipe supports; a key outside that set means "the same config" is meaningless later, so reject it with **400**.',
     'A retried submission carries the same `Idempotency-Key`; store the job under `(team, key)` and return the original instead of creating a twin.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo sends well-formed requests from one team and never retries. Three separate defects are being checked: dataset provenance (only a registered version may be trained on), recipe reproducibility (the hyperparameter block must be a subset of what the base model supports, then hashed so equal recipes are equal), and idempotency keyed by team so a retry cannot launch a twin that reserves its own budget. The subtle one is the dataset: a path looks convenient in a demo, but without the registry's hash and version nothing about the run can be reproduced. Real orchestrators also pin the tokenizer, the training image digest and the random seed, and record all of them in the config hash.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one team and never retries. Three separate defects are being checked: dataset provenance (only a registered version may be trained on), recipe reproducibility (the hyperparameter block must be a subset of what the base model supports, then hashed so equal recipes are equal), and idempotency keyed by team so a retry cannot launch a twin that reserves its own budget. The subtle one is the dataset: a path looks convenient in a demo, but without the registry's hash and version nothing about the run can be reproduced. Real orchestrators also pin the tokenizer, the training image digest and the random seed, and record all of them in the config hash.`,
 };

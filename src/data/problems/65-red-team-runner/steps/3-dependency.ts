@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['runner', 'sandbox', 'sut'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it calls the system under test, retries when the
+**Starting point.** The starter is working code: it calls the system under test, retries when the
 call fails, and stops when an operator flips a flag. In a demo it looks careful. Under a real probe
 set it hammers a target, ignores the kill switch other runners see, and reports a run as complete
 that never finished. Find the flaws, fix them, and prove the fix.
@@ -22,7 +22,7 @@ Implement \`run_probes\` and the \`execute\` call it makes:
   **every** probe, so when one runner reports unintended damage, no other runner sends its next
   probe either. A process-local boolean only stops the runner that saw the damage.
 - A probe that times out is **retried at most once** (\`MAX_ATTEMPTS = 2\`) and only on
-  \`DEADLINE_EXCEEDED\`; every other status is surfaced immediately. The draft retries forever
+  \`DEADLINE_EXCEEDED\`; every other status is surfaced immediately. The starter retries forever
   because more attempts look like more coverage.
 - When the kill switch fires, the run ends with \`status: "aborted"\` and **records where it
   stopped** (\`resume_at\` = the probe that was not sent), so an operator can resume from a known
@@ -55,7 +55,7 @@ invisible, and the next run repeats probes that already succeeded.`,
       id: 'deadline',
       title: 'Bounds every probe with a 5-second deadline',
       detail:
-        'The gRPC call carries a 5-second deadline, so a stalled target cannot hold a runner. The draft calls without any deadline at all.',
+        'The gRPC call carries a 5-second deadline, so a stalled target cannot hold a runner. The starter calls without any deadline at all.',
       match: {
         python: {all: [/PROBE_DEADLINE_S\s*=\s*5/, /timeout=PROBE_DEADLINE_S/]},
         typescript: {all: [/PROBE_DEADLINE_MS\s*=\s*5_000/, /deadline:\s*Date\.now\(\)\s*\+\s*PROBE_DEADLINE_MS/]},
@@ -70,7 +70,7 @@ invisible, and the next run repeats probes that already succeeded.`,
       id: 'kill-switch-shared',
       title: 'Reads the kill switch from shared state',
       detail:
-        'The switch is a Redis key every runner reads before it probes. The draft keeps a process-local boolean, so a runner that hits damage stops alone while its replicas keep probing.',
+        'The switch is a Redis key every runner reads before it probes. The starter keeps a process-local boolean, so a runner that hits damage stops alone while its replicas keep probing.',
       match: {
         python: {all: [/kill_switch_key\(/, /r\.get\(/, /KILL_SWITCH/], none: [/KILL_SWITCH\s*=\s*False/]},
         typescript: {all: [/killSwitchKey\(/, /\.get\(/, /KILL_SWITCH/], none: [/let\s+killSwitch\s*=\s*false/]},
@@ -96,7 +96,7 @@ invisible, and the next run repeats probes that already succeeded.`,
       id: 'single-retry',
       title: 'Retries a timed-out probe at most once',
       detail:
-        'Attempts are capped at 2 and only `DEADLINE_EXCEEDED` is retryable. The draft loops forever on every failure, which multiplies the probe set against a target that is already failing.',
+        'Attempts are capped at 2 and only `DEADLINE_EXCEEDED` is retryable. The starter loops forever on every failure, which multiplies the probe set against a target that is already failing.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2/, /DEADLINE_EXCEEDED/]},
@@ -109,7 +109,7 @@ invisible, and the next run repeats probes that already succeeded.`,
       id: 'abort-cursor',
       title: 'Records where an aborted run stopped',
       detail:
-        'An aborted run returns `status: "aborted"` with `resume_at` set to the probe that was not sent. The draft reports `complete`, so the coverage gap is invisible and the next run repeats work.',
+        'An aborted run returns `status: "aborted"` with `resume_at` set to the probe that was not sent. The starter reports `complete`, so the coverage gap is invisible and the next run repeats work.',
       match: {
         python: {all: [/resume_at/, /"aborted"/]},
         typescript: {all: [/resumeAt/, /'aborted'/]},
@@ -152,7 +152,7 @@ def execute(endpoint: str, probe_id: str) -> str:
 
 @app.post("/v1/redteam/execute")
 def run_probes(body: RunRequest) -> dict:
-    # TODO: this draft probes without any deadline, retries every failure forever because more
+    # TODO: this starter probes without any deadline, retries every failure forever because more
     # attempts look like more coverage, and reads a process-local flag that the other runners never
     # see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch
     # from Redis before each probe, and record where an aborted run stopped.
@@ -228,7 +228,7 @@ def run_probes(body: RunRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Probe execution: a model-generated draft that retries forever behind a local flag. */
+      starter: `/** Probe execution: flawed code that retries forever behind a local flag. */
 import * as grpc from '@grpc/grpc-js';
 import Fastify from 'fastify';
 
@@ -256,7 +256,7 @@ function execute(stub: grpc.Client, probeId: string, endpoint: string): Promise<
 }
 
 app.post('/v1/redteam/execute', async (request, reply) => {
-  // TODO: this draft probes without any deadline, retries every failure forever because more
+  // TODO: this starter probes without any deadline, retries every failure forever because more
   // attempts look like more coverage, and reads a process-local flag that the other runners never
   // see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch
   // from Redis before each probe, and record where an aborted run stopped.
@@ -360,7 +360,7 @@ import (
 	pb "runner/sutpb"
 )
 
-// TODO: this draft probes without any deadline, retries every failure forever because more
+// TODO: this starter probes without any deadline, retries every failure forever because more
 // attempts look like more coverage, and reads a process-local flag that the other runners never
 // see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch from
 // Redis before each probe, and record where an aborted run stopped.
@@ -473,7 +473,7 @@ object Client {
   val stub = SutGrpc.blockingStub(ManagedChannelBuilder.forAddress("sut-shadow.sandbox", 9000).usePlaintext().build())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: this draft probes without any deadline, retries every failure forever because more
+  // TODO: this starter probes without any deadline, retries every failure forever because more
   // attempts look like more coverage, and reads a process-local flag that the other runners never
   // see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch
   // from Redis before each probe, and record where an aborted run stopped.
@@ -562,7 +562,7 @@ object Client {
 #include <string>
 #include <vector>
 
-// TODO: this draft probes without any deadline, retries every failure forever because more
+// TODO: this starter probes without any deadline, retries every failure forever because more
 // attempts look like more coverage, and reads a process-local flag that the other runners never
 // see. Add the 5s deadline, cap the attempts at 2 on DEADLINE_EXCEEDED, read the kill switch from
 // Redis before each probe, and record where an aborted run stopped.

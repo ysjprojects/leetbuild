@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the exact-key index. It
-compiles, it works in a single-writer demo, and it hides three production flaws. Review it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the exact-key index. It compiles, it works in a
+single-writer demo, and it hides three production flaws. Debug it like the service owner, fix it,
+and prove the fix with the checks below.
 
 Implement the exact-key index over Redis.
 
@@ -49,7 +49,7 @@ collided in a shared set.`,
       id: 'script',
       title: 'Registers one Lua script',
       detail:
-        'The index loads a single Lua script once and calls it by name or SHA. The draft runs two separate client commands instead of one script.',
+        'The index loads a single Lua script once and calls it by name or SHA. The starter runs two separate client commands instead of one script.',
       match: {
         python: {all: [/register_script\(/]},
         typescript: {all: [/defineCommand\(/]},
@@ -62,7 +62,7 @@ collided in a shared set.`,
       id: 'atomic',
       title: 'Inserts and checks in one atomic call',
       detail:
-        'The script does the `SADD` and reports existence in the same call; the client never issues a separate `SISMEMBER`. The draft checks membership first, so two concurrent submissions both see a miss.',
+        'The script does the `SADD` and reports existence in the same call; the client never issues a separate `SISMEMBER`. The starter checks membership first, so two concurrent submissions both see a miss.',
       match: {
         python: {all: [/sadd/i], none: [/sismember/i]},
         typescript: {all: [/sadd/i], none: [/sismember/i]},
@@ -75,7 +75,7 @@ collided in a shared set.`,
       id: 'tenant-namespace',
       title: 'Namespaces the set by tenant',
       detail:
-        'The set key is built from the tenant (`t:{tenant}:exact:{key_type}`) so namespaces are disjoint. The draft names only the key type, so distinct tenants collide into a false duplicate.',
+        'The set key is built from the tenant (`t:{tenant}:exact:{key_type}`) so namespaces are disjoint. The starter names only the key type, so distinct tenants collide into a false duplicate.',
       match: {
         python: {all: [/tenant_namespace\(/]},
         typescript: {all: [/tenantNamespace\(/]},
@@ -88,7 +88,7 @@ collided in a shared set.`,
       id: 'rebuild',
       title: 'Rebuilds the sets from durable records',
       detail:
-        "A `rebuild` routine re-inserts every record's exact keys from the durable store into the right tenant namespaces. The draft has no way to reconstruct the index after a flush.",
+        "A `rebuild` routine re-inserts every record's exact keys from the durable store into the right tenant namespaces. The starter has no way to reconstruct the index after a flush.",
       match: {
         python: {all: [/rebuild\(/]},
         typescript: {all: [/rebuild\(/]},
@@ -101,7 +101,7 @@ collided in a shared set.`,
       id: 'winner',
       title: 'Reports the winner and the existing key',
       detail:
-        'The atomic call returns whether the caller won the insert (`winner`) or the key already existed (`existing`), so concurrent submissions agree on one record. The draft returns a bare boolean from two commands.',
+        'The atomic call returns whether the caller won the insert (`winner`) or the key already existed (`existing`), so concurrent submissions agree on one record. The starter returns a bare boolean from two commands.',
       match: {
         python: {all: [/winner/, /existing/]},
         typescript: {all: [/winner/, /existing/]},
@@ -125,7 +125,7 @@ class ExactKeyIndex:
         return f"exact:{key_type}"
 
     def insert_and_check(self, tenant: str, key_type: str, value: str) -> bool:
-        # TODO: this draft checks membership then inserts in two round trips, so two concurrent
+        # TODO: this starter checks membership then inserts in two round trips, so two concurrent
         # submissions both see a miss and both create records; and the key namespace omits the
         # tenant so distinct tenants collide. Add the tenant and make the check atomic.
         if self.client.sismember(self.key(key_type), value):
@@ -179,7 +179,7 @@ class ExactKeyIndex {
   }
 
   async insertAndCheck(tenant: string, keyType: string, value: string): Promise<boolean> {
-    // TODO: this draft checks membership then inserts in two round trips, so two concurrent
+    // TODO: this starter checks membership then inserts in two round trips, so two concurrent
     // submissions both see a miss and both create records; and the key namespace omits the tenant
     // so distinct tenants collide. Add the tenant and make the check atomic.
     if (await this.client.sismember(this.key(keyType), value)) return false;
@@ -252,7 +252,7 @@ func (idx *ExactKeyIndex) key(keyType string) string {
 }
 
 func (idx *ExactKeyIndex) InsertAndCheck(ctx context.Context, tenant, keyType, value string) (bool, error) {
-	// TODO: this draft checks membership then inserts in two round trips, so two concurrent
+	// TODO: this starter checks membership then inserts in two round trips, so two concurrent
 	// submissions both see a miss and both create records; and the key namespace omits the tenant
 	// so distinct tenants collide. Add the tenant and make the check atomic.
 	exists, err := idx.client.Sismember(ctx, idx.key(keyType), value).Result()
@@ -335,7 +335,7 @@ class ExactKeyIndex(jedis: Jedis) {
     "exact:" + keyType
 
   def insertAndCheck(tenant: String, keyType: String, value: String): Boolean = {
-    // TODO: this draft checks membership then inserts in two round trips, so two concurrent
+    // TODO: this starter checks membership then inserts in two round trips, so two concurrent
     // submissions both see a miss and both create records; and the key namespace omits the tenant
     // so distinct tenants collide. Add the tenant and make the check atomic.
     if (jedis.sismember(key(keyType), value)) {
@@ -397,7 +397,7 @@ class ExactKeyIndex {
 
   bool insert_and_check(const std::string& tenant, const std::string& keyType,
                         const std::string& value) {
-    // TODO: this draft checks membership then inserts in two round trips, so two concurrent
+    // TODO: this starter checks membership then inserts in two round trips, so two concurrent
     // submissions both see a miss and both create records; and the key namespace omits the tenant
     // so distinct tenants collide. Add the tenant and make the check atomic.
     if (redis_.sismember(key(keyType), value)) {

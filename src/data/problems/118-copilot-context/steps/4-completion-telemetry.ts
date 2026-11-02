@@ -8,7 +8,7 @@ export const completionTelemetryStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the editor reports what it
+**Starting point.** The starter is working code: the editor reports what it
 showed and what the developer kept, the events reach Kafka, and a consumer moves counters, so the
 acceptance dashboard shows numbers. Four production contracts are broken. Find them, fix them,
 and prove the fix.
@@ -63,7 +63,7 @@ rate silently wrong after every consumer restart.`,
       id: 'session-key',
       title: 'Keyed by session, validated event, id is the request id',
       detail:
-        'The message key is the session (partition by session), the event name is checked against `ALLOWED_EVENTS`, and the event carries the request id. The draft keys by the request id and produces to whatever topic the body names.',
+        'The message key is the session (partition by session), the event name is checked against `ALLOWED_EVENTS`, and the event carries the request id. The starter keys by the request id and produces to whatever topic the body names.',
       match: {
         python: {all: [/key\s*=\s*session/, /ALLOWED_EVENTS/, /request_id/]},
         typescript: {all: [/key:\s*session\b/, /ALLOWED_EVENTS/, /request_id|requestId/]},
@@ -89,7 +89,7 @@ rate silently wrong after every consumer restart.`,
       id: 'no-code',
       title: 'No completion text, prefix or suffix in the event or logs',
       detail:
-        'Neither the event payload nor any log line carries the completion text, the prefix or the suffix; the event reports `candidate_len`. The draft accepts a `text` field, logs it and copies it into the event.',
+        'Neither the event payload nor any log line carries the completion text, the prefix or the suffix; the event reports `candidate_len`. The starter accepts a `text` field, logs it and copies it into the event.',
       match: {
         python: {all: [/candidate_len/], none: [/\btext\b/, /\bprefix\b/, /\bsuffix\b/]},
         typescript: {all: [/candidate_len/], none: [/\btext\b/, /\bprefix\b/, /\bsuffix\b/]},
@@ -102,7 +102,7 @@ rate silently wrong after every consumer restart.`,
       id: 'counters-before-commit',
       title: 'Updates counters before committing the offset',
       detail:
-        'The consumer runs `HINCRBY` on `acceptance:{language}` before committing the offset, with auto-commit off; committing first makes a crash lose the counter update forever. The draft commits first.',
+        'The consumer runs `HINCRBY` on `acceptance:{language}` before committing the offset, with auto-commit off; committing first makes a crash lose the counter update forever. The starter commits first.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/], all: [/enable\.auto\.commit/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/], all: [/autoCommit:\s*false/]},
@@ -141,7 +141,7 @@ class TelemetryRequest(BaseModel):
 def telemetry(body: TelemetryRequest, session: str = Header(alias="X-Session-Id")) -> dict:
     # TODO: key by session instead of the request id and validate the event name, configure the
     # idempotent producer with acks=all, keep the completion text out of the event and the logs,
-    # and make the consumer update counters before it commits. Review all four.
+    # and make the consumer update counters before it commits. Fix all four.
     logger.info("telemetry session=%s event=%s text=%r", session, body.event, body.text)
     event = {
         "request_id": body.request_id,
@@ -233,7 +233,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** Completion telemetry: a model-generated draft that keys by request id and ships the code. */
+      starter: `/** Completion telemetry: flawed code that keys by request id and ships the code. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -255,7 +255,7 @@ interface TelemetryBody {
 app.post('/v1/telemetry', async (request, reply) => {
   // TODO: key by session instead of the request id and validate the event name, configure the
   // idempotent producer with acks=all, keep the completion text out of the event and the logs,
-  // and make the consumer update counters before it commits. Review all four.
+  // and make the consumer update counters before it commits. Fix all four.
   const session = request.headers['x-session-id'] as string;
   const body = request.body as TelemetryBody;
   request.log.info({session, event: body.event, text: body.text}, 'telemetry');
@@ -379,7 +379,7 @@ func telemetry(rw http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	// TODO: key by session instead of the request id and validate the event name, configure
 	// acks=all / hashed keys, keep the completion text out of the event and the logs, and make
-	// the consumer update counters before it commits. Review all four.
+	// the consumer update counters before it commits. Fix all four.
 	log.Printf("telemetry session=%s event=%s text=%q", session, body.Event, body.Text)
 	event := map[string]any{
 		"request_id": body.RequestID,
@@ -520,7 +520,7 @@ object Telemetry {
 
   // TODO: key by session instead of the request id and validate the event name, configure the
   // idempotent producer with acks=all, keep the completion text out of the event and the logs,
-  // and make the consumer update counters before it commits. Review all four.
+  // and make the consumer update counters before it commits. Fix all four.
   def publish(session: String, event: String, requestId: String, language: String, text: String): Unit = {
     log.info(s"telemetry session=$session event=$event text=$text")
     val payload = Map(
@@ -621,7 +621,7 @@ std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tc
 
 // TODO: key by session instead of the request id and validate the event name, configure the
 // idempotent producer with acks=all, keep the completion text out of the event and the logs, and
-// make the consumer update counters before it commits. Review all four.
+// make the consumer update counters before it commits. Fix all four.
 void publish(
     const std::string& session,
     const std::string& event,
@@ -734,5 +734,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you treat a telemetry topic as a product surface with the same rules as the request path. The acceptance rate is the number GitHub's post reports every improvement against — neighboring tabs +5 %, FIM +10 % — so it has to be right: the session key keeps a developer's shown/accepted pairs ordered on one partition, the idempotent producer with acks=all keeps a retry from counting an acceptance twice, and counters-before-commit keeps a consumer crash from losing one. The leak is the quiet flaw: the draft copies the accepted completion into an event that is retained and replicated, which is source code leaving the editor for a system nobody scoped for it; the event needs the length, not the text. Real pipelines add a schema registry so a \`text\` field cannot be added back by accident, a dead-letter topic for unparseable events, and a windowed aggregation instead of unbounded hash counters.`,
+  debrief: `The interviewer is checking whether you treat a telemetry topic as a product surface with the same rules as the request path. The acceptance rate is the number GitHub's post reports every improvement against — neighboring tabs +5 %, FIM +10 % — so it has to be right: the session key keeps a developer's shown/accepted pairs ordered on one partition, the idempotent producer with acks=all keeps a retry from counting an acceptance twice, and counters-before-commit keeps a consumer crash from losing one. The leak is the quiet flaw: the starter copies the accepted completion into an event that is retained and replicated, which is source code leaving the editor for a system nobody scoped for it; the event needs the length, not the text. Real pipelines add a schema registry so a \`text\` field cannot be added back by accident, a dead-letter topic for unparseable events, and a windowed aggregation instead of unbounded hash counters.`,
 };

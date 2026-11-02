@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'eligibility', 'hr'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the eligibility service
+**Starting point.** The starter is working code: when the eligibility service
 answers, the decision is recorded and the demo approves a request. Every answer that is not a clean
-yes is treated as a yes anyway. Review it, fix it, and prove the fix.
+yes is treated as a yes anyway. Debug it, fix it, and prove the fix.
 
 Implement the eligibility gate that runs **before** any decision is recorded, and the decision entry
 point that uses it: \`POST /v1/requests/{id}/decision\`, actor from \`X-User-Id\` (**401** when
@@ -34,7 +34,7 @@ missing), body \`{"step_index": 0, "decision": "approved", "reason": ""}\`.
 - The order is part of the contract: **verify first, then record**. A denied decision must leave
   the chain exactly where it was, and the response is the denial, not a chain advance.
 
-**Failure mode the checks target.** The draft asks eligibility with no deadline, loops until it
+**Failure mode the checks target.** The starter asks eligibility with no deadline, loops until it
 hears something it likes, and records the decision before it asks at all. So an approver who left
 the company decides, an ineligible approver is retried until the call happens to succeed, and a
 timeout becomes an approval because nothing checks the error. Each of those is invisible in a demo
@@ -67,7 +67,7 @@ where the dependency is healthy and every approver is valid.`,
       id: 'grpc-call',
       title: 'Verifies eligibility over gRPC before recording',
       detail:
-        'The decision path calls `CheckEligibility` on the eligibility client and only records through `state.advance` after that call returned a verified yes. The draft records first and asks afterwards.',
+        'The decision path calls `CheckEligibility` on the eligibility client and only records through `state.advance` after that call returned a verified yes. The starter records first and asks afterwards.',
       match: {
         python: {
           all: [/CheckEligibility\(/, /eligibility/],
@@ -92,7 +92,7 @@ where the dependency is healthy and every approver is valid.`,
       id: 'deadline',
       title: 'Every attempt carries a 1-second deadline',
       detail:
-        'The RPC is issued with a `1000 ms` deadline — `timeout=`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. The draft calls without one, so a hung service holds the approval open.',
+        'The RPC is issued with a `1000 ms` deadline — `timeout=`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. The starter calls without one, so a hung service holds the approval open.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1\.0/, /timeout=DEADLINE_S/, /CheckEligibility\(/]},
         typescript: {
@@ -107,7 +107,7 @@ where the dependency is healthy and every approver is valid.`,
       id: 'fail-closed',
       title: 'A timeout denies instead of allowing',
       detail:
-        'A `DEADLINE_EXCEEDED` (and any other transport error) ends in a denial with the `eligibility_timeout` / `eligibility_unverified` reason. The draft keeps looping and treats whatever eventually arrives as consent.',
+        'A `DEADLINE_EXCEEDED` (and any other transport error) ends in a denial with the `eligibility_timeout` / `eligibility_unverified` reason. The starter keeps looping and treats whatever eventually arrives as consent.',
       match: {
         python: {all: [/StatusCode\.DEADLINE_EXCEEDED/, /REASON_TIMEOUT/, /return False, REASON_TIMEOUT/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /REASON_TIMEOUT/, /allowed:\s*false, reason: REASON_TIMEOUT/]},
@@ -120,7 +120,7 @@ where the dependency is healthy and every approver is valid.`,
       id: 'departed-approver',
       title: 'A departed approver cannot decide',
       detail:
-        'The reply’s `active` flag is read and a false value denies the decision with the `approver_departed` reason. The draft never looks at it, so anybody who ever had the role keeps approving.',
+        'The reply’s `active` flag is read and a false value denies the decision with the `approver_departed` reason. The starter never looks at it, so anybody who ever had the role keeps approving.',
       match: {
         python: {all: [/not reply\.active/, /REASON_DEPARTED/]},
         typescript: {all: [/!reply\.active/, /REASON_DEPARTED/]},
@@ -133,7 +133,7 @@ where the dependency is healthy and every approver is valid.`,
       id: 'terminal-rejection',
       title: 'An ineligible answer is terminal, not retried',
       detail:
-        'A denial from eligibility returns immediately: retries are bounded by an attempt cap and the `approver_ineligible` reason is returned rather than retried. The draft loops until the dependency says yes, which converts a rejection into an approval.',
+        'A denial from eligibility returns immediately: retries are bounded by an attempt cap and the `approver_ineligible` reason is returned rather than retried. The starter loops until the dependency says yes, which converts a rejection into an approval.',
       match: {
         python: {all: [/REASON_INELIGIBLE/, /MAX_ATTEMPTS\s*=\s*2/, /range\(MAX_ATTEMPTS\)/], none: [/while\s+True/]},
         typescript: {
@@ -176,8 +176,8 @@ class DecisionRequest(BaseModel):
 
 
 def record_decision(request_id: str, body: DecisionRequest, actor: str) -> dict:
-    # TODO: the draft records the decision before it asks eligibility, calls with no deadline,
-    # loops until the reply looks acceptable, and never reads active. Review all four.
+    # TODO: the starter records the decision before it asks eligibility, calls with no deadline,
+    # loops until the reply looks acceptable, and never reads active. Fix all four.
     recorded = state.advance(request_id, body.step_index, actor, body.decision, body.reason)
     while True:
         try:
@@ -268,7 +268,7 @@ def decide(
 `,
     },
     typescript: {
-      starter: `/** Decision path: a model-generated draft that trusts the session for eligibility. */
+      starter: `/** Decision path: flawed code that trusts the session for eligibility. */
 import * as grpc from '@grpc/grpc-js';
 import Fastify from 'fastify';
 
@@ -318,8 +318,8 @@ async function recordDecision(
   body: DecisionBody,
   actor: string,
 ): Promise<Record<string, unknown>> {
-  // TODO: the draft records the decision before it asks eligibility, calls with no deadline,
-  // loops until the reply looks acceptable, and never reads active. Review all four.
+  // TODO: the starter records the decision before it asks eligibility, calls with no deadline,
+  // loops until the reply looks acceptable, and never reads active. Fix all four.
   const recorded = await state.advance(requestId, body.step_index, actor, body.decision, body.reason ?? '');
   for (;;) {
     try {
@@ -478,8 +478,8 @@ type DecisionBody struct {
 }
 
 func recordDecision(ctx context.Context, requestID string, body DecisionBody, actor string) map[string]any {
-	// TODO: the draft records the decision before it asks eligibility, calls with no deadline,
-	// loops until the reply looks acceptable, and never reads Active. Review all four.
+	// TODO: the starter records the decision before it asks eligibility, calls with no deadline,
+	// loops until the reply looks acceptable, and never reads Active. Fix all four.
 	recorded := state.Advance(ctx, requestID, body.StepIndex, actor, body.Decision, body.Reason)
 	for {
 		_, err := eligibility.CheckEligibility(ctx, &EligibilityRequest{Actor: actor, RequestID: requestID})
@@ -648,8 +648,8 @@ object Client {
   val stub = EligibilityGrpc.blockingStub(ManagedChannelBuilder.forAddress("eligibility", 9000).usePlaintext().build())
 
   def recordDecision(requestId: String, body: DecisionRequest, actor: String): String = {
-    // TODO: the draft records the decision before it asks eligibility, calls with no deadline,
-    // loops until the reply looks acceptable, and never reads active. Review all four.
+    // TODO: the starter records the decision before it asks eligibility, calls with no deadline,
+    // loops until the reply looks acceptable, and never reads active. Fix all four.
     val recorded = state.advance(requestId, body.step_index, actor, body.decision, body.reason)
     var done = false
     while (!done) {
@@ -775,8 +775,8 @@ using json = nlohmann::json;
 std::unique_ptr<Eligibility::Stub> stub;
 
 json recordDecision(const std::string& requestId, const json& body, const std::string& actor) {
-  // TODO: the draft records the decision before it asks eligibility, calls with no deadline,
-  // loops until the reply looks acceptable, and never reads active. Review all four.
+  // TODO: the starter records the decision before it asks eligibility, calls with no deadline,
+  // loops until the reply looks acceptable, and never reads active. Fix all four.
   json recorded = state::advance(requestId, body.value("step_index", 0), actor, body.value("decision", ""), body.value("reason", ""));
   while (true) {
     grpc::ClientContext ctx;
@@ -889,7 +889,7 @@ int main() {
 `,
     },
   },
-  debrief: `The question behind this step is what a workflow does when a dependency cannot answer. The draft
+  debrief: `The question behind this step is what a workflow does when a dependency cannot answer. The starter
   is the classic fail-open shape: it asks eligibility, but nothing about the answer is a condition —
   no deadline means the request waits forever, no error classification means a timeout is treated
   like silence, and the retry loop exists only to hear a yes. The fix is three lines of policy in

@@ -8,8 +8,8 @@ export const dependencyStep: Step = {
   focus: ['api', 'job'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when nothing was missed it
-calls the job and the job runs, so the demo passes. Its failure path is a storm. Review it like the
+**Starting point.** The starter is working code: when nothing was missed it
+calls the job and the job runs, so the demo passes. Its failure path is a storm. Debug it like the
 owner of the scheduler, fix it, and prove the fix with the checks below.
 
 Implement the fire path that turns **missed windows** into calls against the target job service.
@@ -32,7 +32,7 @@ Implement the fire path that turns **missed windows** into calls against the tar
   reason that produced it.
 
 **Failure mode the checks target.** After a ten-minute pause a minutely job has **200** missed
-windows. The draft loops over them and retries each one until it succeeds, which is a catch-up
+windows. The starter loops over them and retries each one until it succeeds, which is a catch-up
 burst fired as fast as the network allows — the target database gets 200 executions in seconds. The
 policy is the thing that is supposed to cap that; a retry loop that ignores it turns a scheduler
 pause into a self-inflicted DDoS.`,
@@ -66,7 +66,7 @@ pause into a self-inflicted DDoS.`,
       id: 'policy-decide',
       title: 'The misfire policy decides, with a reason',
       detail:
-        'A `decide(policy, windows)` decision maps `skip`, `fire_once_now` and `catch_up` onto the windows to fire now and the reason to record. The draft has no policy at all and treats every missed window as owed.',
+        'A `decide(policy, windows)` decision maps `skip`, `fire_once_now` and `catch_up` onto the windows to fire now and the reason to record. The starter has no policy at all and treats every missed window as owed.',
       match: {
         python: {all: [/def decide\(/, /"skip"/, /"fire_once_now"/, /"catch_up"/]},
         typescript: {all: [/function decide\(/, /'skip'/, /'fire_once_now'/, /'catch_up'/]},
@@ -79,7 +79,7 @@ pause into a self-inflicted DDoS.`,
       id: 'burst-collapse',
       title: 'fire_once_now collapses a burst into at most one fire',
       detail:
-        '`MAX_IMMEDIATE_FIRES = 1` and the fire-once decision selects only the **latest** missed window, so ten minutes of pause is one execution, not two hundred. The draft fires every missed window as fast as it can.',
+        '`MAX_IMMEDIATE_FIRES = 1` and the fire-once decision selects only the **latest** missed window, so ten minutes of pause is one execution, not two hundred. The starter fires every missed window as fast as it can.',
       match: {
         python: {all: [/MAX_IMMEDIATE_FIRES\s*=\s*1/, /windows\[-1:\]/]},
         typescript: {all: [/MAX_IMMEDIATE_FIRES\s*=\s*1/, /windows\.slice\(-1\)/]},
@@ -92,7 +92,7 @@ pause into a self-inflicted DDoS.`,
       id: 'catchup-rate',
       title: 'catch_up is rate limited to one fire per second',
       detail:
-        '`CATCH_UP_PER_SECOND = 1` sets `CATCH_UP_INTERVAL_MS = 1000`, and the replay waits between windows (`time.sleep` / `setTimeout` / `time.Sleep` / `Thread.sleep` / `sleep_for`). The draft replays as fast as the loop allows.',
+        '`CATCH_UP_PER_SECOND = 1` sets `CATCH_UP_INTERVAL_MS = 1000`, and the replay waits between windows (`time.sleep` / `setTimeout` / `time.Sleep` / `Thread.sleep` / `sleep_for`). The starter replays as fast as the loop allows.',
       match: {
         python: {all: [/CATCH_UP_PER_SECOND\s*=\s*1/, /CATCH_UP_INTERVAL_MS\s*=\s*1000/, /time\.sleep\(/]},
         typescript: {all: [/CATCH_UP_PER_SECOND\s*=\s*1/, /CATCH_UP_INTERVAL_MS\s*=\s*1000/, /setTimeout\(/]},
@@ -105,7 +105,7 @@ pause into a self-inflicted DDoS.`,
       id: 'record-decision',
       title: 'Records every misfire decision, skips included',
       detail:
-        'Each outcome is written with its reason: `record_decision(schedule_id, window, "skipped", reason)` when the policy fires nothing, and `fired` or `error` otherwise. The draft records nothing, so a paused schedule leaves no trace.',
+        'Each outcome is written with its reason: `record_decision(schedule_id, window, "skipped", reason)` when the policy fires nothing, and `fired` or `error` otherwise. The starter records nothing, so a paused schedule leaves no trace.',
       match: {
         python: {all: [/record_decision\(/, /"skipped"/, /reason/]},
         typescript: {all: [/recordDecision\(/, /'skipped'/, /reason/]},
@@ -126,9 +126,9 @@ stub = jobs_pb2_grpc.JobServiceStub(grpc.insecure_channel("jobs:9000"))
 
 
 def run_misfire(schedule: dict, windows: list[int], owner: str) -> list[int]:
-    # TODO: this draft treats every missed window as owed and retries the trigger itself until it
+    # TODO: this starter treats every missed window as owed and retries the trigger itself until it
     # succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no
-    # deadline and no decision record. Review all three.
+    # deadline and no decision record. Fix all three.
     fired = []
     for window in windows:
         while True:
@@ -220,11 +220,11 @@ def run_misfire(schedule: dict, windows: list[int], owner: str) -> list[int]:
 `,
     },
     typescript: {
-      starter: `/** A model-generated draft that treats every missed window as owed. */
+      starter: `/** Misfire handling: flawed code that treats every missed window as owed. */
 export async function runMisfire(schedule: Schedule, windows: number[]): Promise<number[]> {
-  // TODO: this draft treats every missed window as owed and retries the trigger itself until it
+  // TODO: this starter treats every missed window as owed and retries the trigger itself until it
   // succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no deadline
-  // and no decision record. Review all three.
+  // and no decision record. Fix all three.
   const fired: number[] = [];
   for (const window of windows) {
     for (;;) {
@@ -306,9 +306,9 @@ import (
 )
 
 func RunMisfire(schedule Schedule, windows []int64) []int64 {
-	// TODO: this draft treats every missed window as owed and retries the trigger itself until it
+	// TODO: this starter treats every missed window as owed and retries the trigger itself until it
 	// succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no
-	// deadline and no decision record. Review all three.
+	// deadline and no decision record. Fix all three.
 	fired := make([]int64, 0, len(windows))
 	for _, window := range windows {
 		for {
@@ -399,9 +399,9 @@ func RunMisfire(schedule Schedule, windows []int64) []int64 {
 
 object Misfire {
   def runMisfire(schedule: Schedule, windows: List[Long]): List[Long] = {
-    // TODO: this draft treats every missed window as owed and retries the trigger itself until it
+    // TODO: this starter treats every missed window as owed and retries the trigger itself until it
     // succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no
-    // deadline and no decision record. Review all three.
+    // deadline and no decision record. Fix all three.
     val fired = ListBuffer.empty[Long]
     for (window <- windows) {
       var done = false
@@ -483,9 +483,9 @@ object Misfire {
 #include <vector>
 
 std::vector<long> runMisfire(const Schedule& schedule, const std::vector<long>& windows) {
-  // TODO: this draft treats every missed window as owed and retries the trigger itself until it
+  // TODO: this starter treats every missed window as owed and retries the trigger itself until it
   // succeeds, so a scheduler pause becomes a catch-up burst; it has no misfire policy, no deadline
-  // and no decision record. Review all three.
+  // and no decision record. Fix all three.
   std::vector<long> fired;
   for (const long window : windows) {
     for (;;) {
@@ -572,5 +572,5 @@ std::vector<long> runMisfire(const Schedule& schedule, const std::vector<long>& 
     'The decision is data: `decide(policy, windows)` returns the windows to fire now plus a reason. For `fire_once_now` that is exactly the latest window (`windows[-1:]`), which is what turns ten minutes of pause into one execution instead of two hundred.',
     'Catch-up is a rate, not a loop: `CATCH_UP_PER_SECOND = 1` gives `CATCH_UP_INTERVAL_MS = 1000`, and every catch-up window after the first waits that long. Record the decision either way — a skip with a reason is the only way on-call can tell a deliberate ignore from a lost run.',
   ],
-  debrief: `The interviewer is testing whether the failure path is a policy or a retry loop. The draft passes because the demo never pauses the scheduler. Four defects are checked: a trigger with no deadline, no policy at all, a fire-once decision that does not collapse the burst, and a catch-up replay with no rate limit. The burst is the one that takes down a database: after a ten-minute pause a minutely job owes 200 executions and the draft delivers them as fast as the network allows. Real schedulers also persist a cursor per schedule so catch-up resumes after a crash, cap the catch-up window by wall-clock age rather than count, and skip anything older than the retention the target can tolerate.`,
+  debrief: `The interviewer is testing whether the failure path is a policy or a retry loop. The starter passes because the demo never pauses the scheduler. Four defects are checked: a trigger with no deadline, no policy at all, a fire-once decision that does not collapse the burst, and a catch-up replay with no rate limit. The burst is the one that takes down a database: after a ten-minute pause a minutely job owes 200 executions and the starter delivers them as fast as the network allows. Real schedulers also persist a cursor per schedule so catch-up resumes after a crash, cap the catch-up window by wall-clock age rather than count, and skip anything older than the retention the target can tolerate.`,
 };

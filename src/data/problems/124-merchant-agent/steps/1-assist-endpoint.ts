@@ -8,9 +8,9 @@ export const assistEndpointStep: Step = {
   focus: ['merchant', 'api', 'turns'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and hands the message to the agent. It compiles, it serves the demo, and it hides four
-production flaws. Review it like the owner of a merchant-facing assistant, fix it, and prove the fix
+production flaws. Debug it like the owner of a merchant-facing assistant, fix it, and prove the fix
 with the checks below.
 
 Implement \`POST /v1/assist\` with body
@@ -25,7 +25,7 @@ Implement \`POST /v1/assist\` with body
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(shop, key)\`
   returns the stored turn instead of running the agent — and its write tools — again.
 - The merchant's **permission set** is attached server-side from the permission store
-  (\`scopes_for(shop)\`) and passed to the agent. The draft takes \`scopes\` from the body, so any
+  (\`scopes_for(shop)\`) and passed to the agent. The starter takes \`scopes\` from the body, so any
   caller can grant itself \`write_products\`.
 - Log the turn with shop, page and turn id — never the message text.
 
@@ -63,7 +63,7 @@ on every client retry.`,
       id: 'shop-auth',
       title: 'Takes the shop from X-Shop-Id, never from the body',
       detail:
-        'The shop is the authenticated `X-Shop-Id` header — **401** when absent — and no `shop_id` field is read from the request. The draft trusts `shop_id` in the body, so any caller can assist as any merchant.',
+        'The shop is the authenticated `X-Shop-Id` header — **401** when absent — and no `shop_id` field is read from the request. The starter trusts `shop_id` in the body, so any caller can assist as any merchant.',
       match: {
         python: {all: [/X-Shop-Id/, /status_code\s*=\s*401/], none: [/shop_id/]},
         typescript: {all: [/x-shop-id/, /code\(\s*401\s*\)/], none: [/shop_id/]},
@@ -76,7 +76,7 @@ on every client retry.`,
       id: 'caps',
       title: 'Enforces the 8 KiB message cap and the page whitelist',
       detail:
-        'A message over `1 << 13` bytes is **413**; a `page.type` outside the whitelist is **400**. The draft forwards any size and any page string straight into the prompt.',
+        'A message over `1 << 13` bytes is **413**; a `page.type` outside the whitelist is **400**. The starter forwards any size and any page string straight into the prompt.',
       match: {
         python: {all: [/MAX_MESSAGE_BYTES/, /ALLOWED_PAGES/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_MESSAGE_BYTES/, /ALLOWED_PAGES/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -91,7 +91,7 @@ on every client retry.`,
       id: 'idempotency-key',
       title: 'Keys retries by (shop, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the turn is stored under `(shop, key)`; a replay returns the stored turn instead of running the agent again. The draft ignores the header, so a client retry fills the same product form twice.',
+        '`Idempotency-Key` is required and the turn is stored under `(shop, key)`; a replay returns the stored turn instead of running the agent again. The starter ignores the header, so a client retry fills the same product form twice.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -104,7 +104,7 @@ on every client retry.`,
       id: 'server-scopes',
       title: 'Attaches the permission set server-side',
       detail:
-        'The scopes passed to the agent come from the permission store (`scopes_for(shop)`), never from the body. The draft reads `scopes` from the request, so a caller can grant itself write access to products.',
+        'The scopes passed to the agent come from the permission store (`scopes_for(shop)`), never from the body. The starter reads `scopes` from the request, so a caller can grant itself write access to products.',
       match: {
         python: {all: [/scopes_for\(/], none: [/body\.scopes/]},
         typescript: {all: [/scopesFor\(/], none: [/body\.scopes/]},
@@ -143,8 +143,8 @@ class AssistRequest(BaseModel):
 
 @app.post("/v1/assist")
 def assist(body: AssistRequest) -> JSONResponse:
-    # TODO: this draft takes the shop and its scopes from the body, caps neither the message nor the
-    # page type, ignores Idempotency-Key, and logs the message. Review all four.
+    # TODO: this starter takes the shop and its scopes from the body, caps neither the message nor the
+    # page type, ignores Idempotency-Key, and logs the message. Fix all four.
     turn_id = str(uuid.uuid4())
     logger.info("assist shop=%s message=%r", body.shop_id, body.message)
     outcome = run_agent(shop=body.shop_id, scopes=body.scopes, message=body.message, page=body.page.type)
@@ -229,7 +229,7 @@ def assist(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/assist: a model-generated draft that trusts the body for the shop and its scopes. */
+      starter: `/** POST /v1/assist: flawed code that trusts the body for the shop and its scopes. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -246,8 +246,8 @@ interface AssistBody {
 }
 
 app.post('/v1/assist', async (request, reply) => {
-  // TODO: this draft takes the shop and its scopes from the body, caps neither the message nor the
-  // page type, ignores Idempotency-Key, and logs the message. Review all four.
+  // TODO: this starter takes the shop and its scopes from the body, caps neither the message nor the
+  // page type, ignores Idempotency-Key, and logs the message. Fix all four.
   const body = request.body as AssistBody;
   const turnId = randomUUID();
   request.log.info({shop: body.shop_id, message: body.message}, 'assist');
@@ -354,8 +354,8 @@ func assist(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft takes the shop and its scopes from the body, caps neither the message nor
-	// the page type, ignores Idempotency-Key, and logs the message. Review all four.
+	// TODO: this starter takes the shop and its scopes from the body, caps neither the message nor
+	// the page type, ignores Idempotency-Key, and logs the message. Fix all four.
 	turnID := uuid.NewString()
 	log.Printf("assist shop=%s message=%q", body.ShopID, body.Message)
 	outcome, err := agent.Run(r.Context(), body.ShopID, body.Scopes, body.Message, body.Page.Type)
@@ -523,8 +523,8 @@ object AssistApi {
     path("v1" / "assist") {
       post {
         entity(as[AssistRequest]) { body =>
-          // TODO: this draft takes the shop and its scopes from the body, caps neither the message
-          // nor the page type, ignores Idempotency-Key, and logs the message. Review all four.
+          // TODO: this starter takes the shop and its scopes from the body, caps neither the message
+          // nor the page type, ignores Idempotency-Key, and logs the message. Fix all four.
           val turnId = UUID.randomUUID().toString
           system.log.info(s"assist shop=\${body.shop_id} message=\${body.message}")
           val outcome = Agent.run(body.shop_id, body.scopes, body.message, body.page.\`type\`)
@@ -636,8 +636,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft takes the shop and its scopes from the body, caps neither the message nor
-    // the page type, ignores Idempotency-Key, and logs the message. Review all four.
+    // TODO: this starter takes the shop and its scopes from the body, caps neither the message nor
+    // the page type, ignores Idempotency-Key, and logs the message. Fix all four.
     const auto shop = body.value("shop_id", std::string());
     const auto message = body.value("message", std::string());
     const auto page = body.value("page", json::object()).value("type", std::string());
@@ -750,5 +750,5 @@ int main() {
     'Two things in the body must move to the server: the shop (the `X-Shop-Id` header the session layer sets) and the scopes (`scopes_for(shop)` from the permission store). Delete both fields from the request model so a caller cannot even send them.',
     'The idempotency lookup is keyed by `(shop, key)` and happens before the agent runs; a hit returns the stored turn. Store the finished turn — reply and tools used — so a replay never re-runs a write tool.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a multi-tenant assistant. The draft reads fine because the demo sends one shop's requests with the right scopes and never retries. Four separate defects are being checked: the shop identity (it comes from the session, never the body — a body field is a cross-merchant read), the permission set (attached server-side, because the agent will act on whatever scopes it is given), input caps (cheap rejections before an expensive agentic loop), and idempotency keyed by shop so a retry cannot run a form-filling tool twice. The log line is the one candidates forget: a merchant's message can contain customer names and order details, so it never goes to a log sink verbatim. Real assistants add a per-staff-member identity beside the shop, a page-context schema instead of a free string, and a request-scoped trace id that follows the turn through the loop.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a multi-tenant assistant. The starter reads fine because the demo sends one shop's requests with the right scopes and never retries. Four separate defects are being checked: the shop identity (it comes from the session, never the body — a body field is a cross-merchant read), the permission set (attached server-side, because the agent will act on whatever scopes it is given), input caps (cheap rejections before an expensive agentic loop), and idempotency keyed by shop so a retry cannot run a form-filling tool twice. The log line is the one candidates forget: a merchant's message can contain customer names and order details, so it never goes to a log sink verbatim. Real assistants add a per-staff-member identity beside the shop, a page-context schema instead of a free string, and a request-scoped trace id that follows the turn through the loop.`,
 };

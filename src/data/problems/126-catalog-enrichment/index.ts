@@ -8,23 +8,23 @@ import {reviewEndpointStep} from './steps/4-review-endpoint';
 import {publishEnrichedStep} from './steps/5-publish-enriched';
 
 /**
- * DoorDash's LLM-built product knowledge graph, cut down to the service that enriches one SKU on
- * the AI-era track: merchant upserts consumed and content-hashed before the offset commit → an
- * extraction call that retrieves candidate brands from the taxonomy before the model, asks for a
- * schema, validates the answer against the taxonomy and sends low-confidence SKUs to review → a
- * Redis layer with a cache keyed by taxonomy version and content hash, an atomic per-merchant daily
- * budget and review-claim leases → a review endpoint whose corrections become versioned labels →
- * `sku.enriched` events through an idempotent producer and an outbox, applied to the catalog and the
- * search index before the commit, with human attributes never overwritten by the model.
+ * DoorDash's LLM-built product knowledge graph, cut down to the service that enriches one SKU:
+ * merchant upserts consumed and content-hashed before the offset commit → an extraction call that
+ * retrieves candidate brands from the taxonomy before the model, asks for a schema, validates the
+ * answer against the taxonomy and sends low-confidence SKUs to review → a Redis layer with a cache
+ * keyed by taxonomy version and content hash, an atomic per-merchant daily budget and review-claim
+ * leases → a review endpoint whose corrections become versioned labels → `sku.enriched` events
+ * through an idempotent producer and an outbox, applied to the catalog and the search index before
+ * the commit, with human attributes never overwritten by the model.
  */
 export const catalogEnrichmentProblem: Problem = {
   id: 'catalog-enrichment',
   title: 'Catalog Enrichment',
   tagline:
-    "DoorDash's product knowledge graph: extract SKU attributes with a model constrained by the taxonomy, gate on confidence, route to human review, and feed the corrections back — reviewed like production.",
+    "DoorDash's product knowledge graph: extract SKU attributes with a model constrained by the taxonomy, gate on confidence, route to human review, and feed the corrections back.",
   difficulty: 'hard',
   concepts: ['kafka', 'grpc', 'redis', 'http'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 75,
   company: DOORDASH,
   sources: [
@@ -50,7 +50,7 @@ export const catalogEnrichmentProblem: Problem = {
       by: 'Sudeep Das',
       date: '2024-10-29',
       takes:
-        'The labelling loop: a few human "golden" annotations, many model-generated "silver" ones produced with retrieval, and a fine-tuned generalised extraction model trained on both — which is why every reviewer decision in this course is stored as a versioned labelled example rather than a one-off catalog edit.',
+        'The labelling loop: a few human "golden" annotations, many "silver" ones produced with retrieval, and a fine-tuned generalised extraction model trained on both — which is why every reviewer decision in this course is stored as a versioned labelled example rather than a one-off catalog edit.',
     },
   ],
   statement: `# Catalog Enrichment
@@ -121,12 +121,12 @@ One service, **catalogd**, with five pieces:
    in group \`catalog-index\` that updates the catalog and the search index before it commits, and
    never lets a model result overwrite a human correction.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident — exactly like the model it calls. Your job in every step is the job
-you will have on a real AI feature: read the draft against the failure modes, name the subtle one,
-fix it, and prove the fix with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,8 +8,8 @@ export const chunkEmbedStep: Step = {
   focus: ['kafka', 'worker', 'embed', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it compiles and passes the
-happy path, so a quick demo makes it look done. Review it like the service owner. Find the subtle
+**Starting point.** The starter is working code: it compiles and passes the
+happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
 flaw, fix it, and prove the fix with the checks below.
 
 Consume \`doc.ingest\` events carrying \`{doc_id, version, content}\` and write searchable chunks.
@@ -27,7 +27,7 @@ Consume \`doc.ingest\` events carrying \`{doc_id, version, content}\` and write 
 
 **Failure mode the checks target.** Random chunk ids plus retry-everything looks harmless in the
 demo: the first upload works. A redelivery then doubles the index, and a permanent \`INVALID_ARGUMENT\`
-spins the consumer forever because the draft catches every exception.
+spins the consumer forever because the starter catches every exception.
 
 :::widget deadline-retry {}
 
@@ -295,7 +295,7 @@ if __name__ == "__main__":
 `,
     },
     typescript: {
-      starter: `/** doc.ingest consumer: a model-generated draft that indexes one chunk at a time. */
+      starter: `/** doc.ingest consumer: flawed code that indexes one chunk at a time. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';
@@ -1059,5 +1059,5 @@ int main() {
     'Build the id from the document identity and the chunk geometry. The embedding is derived data; the id must be derivable from the event alone, so a replay recomputes the same key.',
     'Retry inside one batch call. Check `status.code()` / `e.code()` before sleeping; `INVALID_ARGUMENT` and `PERMISSION_DENIED` will never heal, so fail the batch immediately.',
   ],
-  debrief: `The interviewer is looking for review instincts around derived data. The draft has three independent production bugs that the first upload hides: non-overlapping chunks quietly cut sentences in half, one RPC per chunk with no deadline lets a slow embedder stall the consumer, and catch-all retries turn a permanent error into poison-message thrash. The stable id is the design signal: it makes the pipeline idempotent without a dedupe table, because replaying an event addresses the same Redis hashes. Batch size and deadline are one decision — 32 texts is a latency/size trade-off, and 2 seconds bounds the tail; max attempts and jitter bound the batch. Real pipelines add a dead-letter topic for permanent failures, metrics on retry rate, and a content hash in the id when the same document id can be re-ingested with different bytes.`,
+  debrief: `The interviewer is looking for debugging instincts around derived data. The starter has three independent production bugs that the first upload hides: non-overlapping chunks quietly cut sentences in half, one RPC per chunk with no deadline lets a slow embedder stall the consumer, and catch-all retries turn a permanent error into poison-message thrash. The stable id is the design signal: it makes the pipeline idempotent without a dedupe table, because replaying an event addresses the same Redis hashes. Batch size and deadline are one decision — 32 texts is a latency/size trade-off, and 2 seconds bounds the tail; max attempts and jitter bound the batch. Real pipelines add a dead-letter topic for permanent failures, metrics on retry rate, and a content hash in the id when the same document id can be re-ingested with different bytes.`,
 };

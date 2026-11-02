@@ -8,8 +8,8 @@ export const ingestDocumentStep: Step = {
   focus: ['client', 'api', 'db', 'kafka'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it compiles and passes the
-happy path, so a quick demo makes it look done. Review it like the service owner. Find the subtle
+**Starting point.** The starter is working code: it compiles and passes the
+happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
 flaw, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/documents\` with body
@@ -63,7 +63,7 @@ before the commit means the consumer can read a document that the database later
       id: 'validate-body',
       title: 'Validates doc id, type and 1 MiB body',
       detail:
-        'Reject an invalid `doc_id`, an unsupported `content_type` or `version < 1` with **400**, and a body over `1 << 20` bytes with **413**. The draft skips all three.',
+        'Reject an invalid `doc_id`, an unsupported `content_type` or `version < 1` with **400**, and a body over `1 << 20` bytes with **413**. The starter skips all three.',
       match: {
         python: {
           all: [/ALLOWED_TYPES/, /MAX_BODY_BYTES|1\s*<<\s*20|1048576/, /status_code\s*=\s*413|status_code\s*=\s*400/],
@@ -168,8 +168,8 @@ store = Store()
 
 @app.post("/v1/documents")
 def ingest(body: DocumentRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft looks up idempotency by doc_id only, never validates the body,
-    # and publishes before the write is durable. Review all three before trusting it.
+    # TODO: this starter looks up idempotency by doc_id only, never validates the body,
+    # and publishes before the write is durable. Fix all three before trusting it.
     existing = store.find_by_doc(tenant, body.doc_id)
     if existing is not None:
         return JSONResponse({"job_id": existing.job_id}, status_code=202)
@@ -250,7 +250,7 @@ def ingest(body: DocumentRequest, tenant: str = Header(alias="X-Tenant-Id")) -> 
 `,
     },
     typescript: {
-      starter: `/** POST /v1/documents: a model-generated draft that only exercises the first upload. */
+      starter: `/** POST /v1/documents: flawed code that only exercises the first upload. */
 import {createHash, randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -271,8 +271,8 @@ interface DocumentBody {
 }
 
 app.post('/v1/documents', async (request, reply) => {
-  // TODO: this draft looks up idempotency by doc_id only, never validates the body,
-  // and publishes before the write is durable. Review all three before trusting it.
+  // TODO: this starter looks up idempotency by doc_id only, never validates the body,
+  // and publishes before the write is durable. Fix all three before trusting it.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as DocumentBody;
 
@@ -852,5 +852,5 @@ int main() {
     'The lookup is inside the transaction and returns the stored hash. Compare hashes before comparing job ids: equal hash → 202 with the stored job id; different hash → 409.',
     'Commit the document and outbox writes as one transaction, then publish. If the produce fails, the outbox row remains for the relay; the document is still durable.',
   ],
-  debrief: `The interviewer is testing whether you can review generated code at its durability boundary. The draft reads cleanly because the happy path only exercises the first upload: no lookup, no conflict, no broker failure. Three things are being checked here — an idempotency key that includes every part of the identity (tenant, doc, version, bytes), a validation funnel that rejects cheaply before hashing, and a transaction boundary that includes the outbox. The outbox is the interview signal: it shows you know a broker is not transactional with a database, and that "publish after commit" needs a durable row rather than hope. Real systems add a relay that marks outbox rows published, content-addressed storage for the bytes, and a unique constraint on \`(tenant, doc_id, version)\` so two concurrent retries races resolve in the database, not in application code.`,
+  debrief: `The interviewer is testing whether you can debug an ingest handler at its durability boundary. The starter reads cleanly because the happy path only exercises the first upload: no lookup, no conflict, no broker failure. Three things are being checked here — an idempotency key that includes every part of the identity (tenant, doc, version, bytes), a validation funnel that rejects cheaply before hashing, and a transaction boundary that includes the outbox. The outbox is the interview signal: it shows you know a broker is not transactional with a database, and that "publish after commit" needs a durable row rather than hope. Real systems add a relay that marks outbox rows published, content-addressed storage for the bytes, and a unique constraint on \`(tenant, doc_id, version)\` so two concurrent retries races resolve in the database, not in application code.`,
 };

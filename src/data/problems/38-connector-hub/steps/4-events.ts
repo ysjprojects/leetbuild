@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['hub', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it publishes an event on the happy path and the
+**Starting point.** The starter is working code: it publishes an event on the happy path and the
 consumer moves the cursor, so a sync looks observable. Four production contracts are broken. Find
 them, fix them, and prove the fix.
 
@@ -67,7 +67,7 @@ invisible until a replay, a rebalance or a broker hiccup.`,
       id: 'connector-key',
       title: 'Keys the event by connector id',
       detail:
-        "The message key is the connector id, so one connector's run log stays in one partition and in order. The draft keys by vendor, so a replay of one connector arrives interleaved with another's.",
+        "The message key is the connector id, so one connector's run log stays in one partition and in order. The starter keys by vendor, so a replay of one connector arrives interleaved with another's.",
       match: {
         python: {all: [/connector\.sync/, /key=connector_id/]},
         typescript: {all: [/connector\.sync/, /key:\s*connectorId/]},
@@ -93,7 +93,7 @@ invisible until a replay, a rebalance or a broker hiccup.`,
       id: 'no-secrets',
       title: 'No token or record contents in the event or the logs',
       detail:
-        "Neither the payload nor a log line carries the access token or a record's contents. The draft copies both into the retained topic and logs them, so a leak outlives the connector it came from.",
+        "Neither the payload nor a log line carries the access token or a record's contents. The starter copies both into the retained topic and logs them, so a leak outlives the connector it came from.",
       match: {
         python: {all: [/connector\.sync/], none: [/access_token|payload_sample/]},
         typescript: {all: [/connector\.sync/], none: [/access_token|payload_sample/]},
@@ -106,7 +106,7 @@ invisible until a replay, a rebalance or a broker hiccup.`,
       id: 'cursor-before-commit',
       title: 'Advances the cursor before committing the offset',
       detail:
-        'The consumer writes `connector:{connector_id}:cursor` before it commits the offset, so a crash between the two replays the event instead of losing the cursor advance. The draft commits first and advances afterwards.',
+        'The consumer writes `connector:{connector_id}:cursor` before it commits the offset, so a crash between the two replays the event instead of losing the cursor advance. The starter commits first and advances afterwards.',
       match: {
         python: {order: [/connector:/, /consumer\.commit\(/]},
         typescript: {order: [/connector:/, /commitOffsets\(/]},
@@ -254,7 +254,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** publishEvent: a model-generated draft that keys by vendor and commits too early. */
+      starter: `/** publishEvent: flawed code that keys by vendor and commits too early. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';

@@ -8,10 +8,10 @@ export const readStep: Step = {
   focus: ['client', 'recsvc', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the surface row and answers \`200\` with a \`model_version\`. It compiles, it serves the demo, and it
 lets the caller name the version it is served — which makes the one read every other reader trusts
-the one read that can be pointed at a model nobody shipped. Review it like the service owner, fix
+the one read that can be pointed at a model nobody shipped. Debug it like the service owner, fix
 it, and prove the fix with the checks below.
 
 Implement \`GET /v1/surfaces/{surface}/config\`, the read every caller of the surface resolves before
@@ -40,7 +40,7 @@ it ranks, so a rollout or a rollback is one switch instead of per-reader drift.
   live.
 - Log the read with tenant, surface and version — nothing else.
 
-**Failure mode the checks target.** The draft echoes whatever \`model_version\` the query string
+**Failure mode the checks target.** The starter echoes whatever \`model_version\` the query string
 names, so whoever reaches the endpoint is served a version that was never promoted and the only
 record of what a user actually saw points at a model the team never shipped. It also caches the
 surface row for the life of the process: the operator flips the switch, ranking keeps serving the
@@ -89,7 +89,7 @@ experiment report can attribute an outcome to a version that was never served.`,
       id: 'promoted-only',
       title: 'Serves promoted versions only',
       detail:
-        'The handler consults the promotion record for `(surface, version)` and answers **404** when the version was never promoted. The draft serves any version string it is handed, so a caller can read a model the team never shipped — and the promotion table is never consulted at all.',
+        'The handler consults the promotion record for `(surface, version)` and answers **404** when the version was never promoted. The starter serves any version string it is handed, so a caller can read a model the team never shipped — and the promotion table is never consulted at all.',
       match: {
         python: {all: [/promotions\.get\(\s*surface\s*,\s*version\s*\)/, /status_code\s*=\s*404/]},
         typescript: {all: [/promotions\.get\(\s*surface\s*,\s*version\s*\)/, /code\(\s*404\s*\)/]},
@@ -102,7 +102,7 @@ experiment report can attribute an outcome to a version that was never served.`,
       id: 'no-query-version',
       title: 'Takes the version from the config, not the query string',
       detail:
-        'The served `model_version` is the one in `surface:{surface}:config`; a `model_version` on the query string is ignored. The draft reads the query parameter and answers with it, so the assignment every reader resolves becomes a caller-supplied value.',
+        'The served `model_version` is the one in `surface:{surface}:config`; a `model_version` on the query string is ignored. The starter reads the query parameter and answers with it, so the assignment every reader resolves becomes a caller-supplied value.',
       match: {
         python: {all: [/surface:\{surface\}:config/], none: [/Query\(default=None\)/, /query_params\.get\(/]},
         typescript: {all: [/surface:\$\{surface\}:config/], none: [/query[^;\n]*model_version/]},
@@ -115,7 +115,7 @@ experiment report can attribute an outcome to a version that was never served.`,
       id: 'live-config',
       title: 'Expires the config in seconds, not at the next deploy',
       detail:
-        'The config is written back with `CONFIG_TTL_S = 5`, so the switch is re-read within seconds and a rollback lands without a deploy. The draft caches the surface row in process memory for the life of the process, so a rollback only takes effect after a restart.',
+        'The config is written back with `CONFIG_TTL_S = 5`, so the switch is re-read within seconds and a rollback lands without a deploy. The starter caches the surface row in process memory for the life of the process, so a rollback only takes effect after a restart.',
       match: {
         python: {all: [/CONFIG_TTL_S\s*=\s*5/, /ex=CONFIG_TTL_S/]},
         typescript: {all: [/CONFIG_TTL_S\s*=\s*5/, /['"]EX['"]/]},
@@ -128,7 +128,7 @@ experiment report can attribute an outcome to a version that was never served.`,
       id: 'consistent-version',
       title: 'Reports the version the ranking call resolves',
       detail:
-        'The response `model_version` comes from the shared `active_model_version(surface)` accessor — the same one the ranking call resolves through — so the config read and the next ranking call cannot disagree. The draft resolves its own copy straight out of the cached row.',
+        'The response `model_version` comes from the shared `active_model_version(surface)` accessor — the same one the ranking call resolves through — so the config read and the next ranking call cannot disagree. The starter resolves its own copy straight out of the cached row.',
       match: {
         python: {all: [/version = active_model_version\(surface\)/, /"model_version": version/]},
         typescript: {all: [/const version = await activeModelVersion\(surface\)/, /model_version: version/]},
@@ -140,7 +140,7 @@ experiment report can attribute an outcome to a version that was never served.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/surfaces/{surface}/config: a model-generated draft that serves a stale switch."""
+      starter: `"""GET /v1/surfaces/{surface}/config: flawed code that serves a stale switch."""
 import json
 import logging
 
@@ -246,7 +246,7 @@ def read_surface_config(surface: str, tenant: str | None = Header(default=None, 
 `,
     },
     typescript: {
-      starter: `/** GET /v1/surfaces/:surface/config: a model-generated draft that serves a stale switch. */
+      starter: `/** GET /v1/surfaces/:surface/config: flawed code that serves a stale switch. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -835,9 +835,9 @@ int main() {
     },
   },
   hints: [
-    'Serve the version, do not accept it: the response `model_version` is the one in `surface:{surface}:config`, so delete the query parameter the draft reads and answer with the config’s own version. A caller that names the version can be served a model that was never promoted.',
+    'Serve the version, do not accept it: the response `model_version` is the one in `surface:{surface}:config`, so delete the query parameter the starter reads and answer with the config’s own version. A caller that names the version can be served a model that was never promoted.',
     'Promotion is the second gate: call `promotions.get(surface, version)` for the version you are about to serve and answer **404** when the record is missing — the same answer an unknown surface gets, so a reader cannot tell a version that never shipped from one that does not exist. A read never promotes.',
     'The TTL is the point of the endpoint: write the config back with `CONFIG_TTL_S = 5` (`setex` / `ex=CONFIG_TTL_S` / `EX` / `configTTLS*time.Second`) so a rollback lands within seconds, and have both this handler and the ranking call resolve through `active_model_version(surface)` so the two can never disagree.',
   ],
-  debrief: `The interviewer is testing whether you can review a read that other services trust. This endpoint looks like a lookup, but it is the assignment every reader resolves before it ranks: the ranking call, the offline comparison, the analytics job that stamps impressions with a version. That makes two things release-critical. First, the version must be a promoted one — an unpromoted version is a model nobody shipped, and serving it silently turns an experiment into an unexplained incident, so the read consults the promotion record and answers 404 exactly as it would for a surface that does not exist. Second, the version must be read live: a five-second TTL in Redis is the difference between a rollback that lands in seconds and a rollback that waits for the next deploy of every process that cached the row in memory. The third contract is the shared accessor. If the config read and the ranking call each resolve the version themselves, two reads of the same key can straddle a rollback and the response can carry a version the ranking never used; one accessor — \`active_model_version(surface)\` — makes that impossible and keeps the switch a single write. Real systems add an audit trail for promotions, staged percentages so a switch is not all-or-nothing, pushes (Pub/Sub or a watched key) so readers invalidate ahead of the TTL, per-tenant pins for the callers still mid-session, and an \`ETag\`/short \`Cache-Control\` on the response so well-behaved clients re-read instead of holding an assignment for hours. They also keep a last-known-good copy of the config so a Redis outage degrades to the previous assignment rather than to no answer at all.`,
+  debrief: `The interviewer is testing whether you can debug a read that other services trust. This endpoint looks like a lookup, but it is the assignment every reader resolves before it ranks: the ranking call, the offline comparison, the analytics job that stamps impressions with a version. That makes two things release-critical. First, the version must be a promoted one — an unpromoted version is a model nobody shipped, and serving it silently turns an experiment into an unexplained incident, so the read consults the promotion record and answers 404 exactly as it would for a surface that does not exist. Second, the version must be read live: a five-second TTL in Redis is the difference between a rollback that lands in seconds and a rollback that waits for the next deploy of every process that cached the row in memory. The third contract is the shared accessor. If the config read and the ranking call each resolve the version themselves, two reads of the same key can straddle a rollback and the response can carry a version the ranking never used; one accessor — \`active_model_version(surface)\` — makes that impossible and keeps the switch a single write. Real systems add an audit trail for promotions, staged percentages so a switch is not all-or-nothing, pushes (Pub/Sub or a watched key) so readers invalidate ahead of the TTL, per-tenant pins for the callers still mid-session, and an \`ETag\`/short \`Cache-Control\` on the response so well-behaved clients re-read instead of holding an assignment for hours. They also keep a last-known-good copy of the config so a Redis outage degrades to the previous assignment rather than to no answer at all.`,
 };

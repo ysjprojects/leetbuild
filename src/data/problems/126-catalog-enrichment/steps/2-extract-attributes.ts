@@ -8,10 +8,10 @@ export const extractAttributesStep: Step = {
   focus: ['catalogd', 'taxonomy', 'llm'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it sends the title to the
+**Starting point.** The starter is working code: it sends the title to the
 extractor, parses "key: value" lines out of the answer and returns the attributes. On clean titles
 the demo looks great. It hides five production flaws — the first of them is the one the source
-post is about. Review it like the owner of the catalog, fix it, and prove the fix.
+post is about. Debug it like the owner of the catalog, fix it, and prove the fix.
 
 Implement \`extract_attributes(sku)\` for a job from \`sku.extract\`
 (\`{"sku_id", "merchant", "content_hash", "title", "description", "images"}\`), calling the
@@ -35,7 +35,7 @@ where \`ExtractRequest{title, description, candidate_brands[], schema}\` and
   \`taxonomy_version\` it was produced under and \`source: "model"\`.
 
 **Failure mode the checks target.** A model asked for free text with no candidates will produce a
-brand for every title, including brands that do not exist, and the draft writes them straight into
+brand for every title, including brands that do not exist, and the starter writes them straight into
 the catalog. The missing deadline pins a worker on a slow model; the missing retry turns a broker
 blip into a failed job; the line parser silently drops every attribute the moment the model changes
 its phrasing. The confidence gate is the quiet one: without it, the human reviewers the source post
@@ -67,7 +67,7 @@ relies on never see the SKUs that need them.`,
       id: 'retrieve-first',
       title: 'Retrieves 20 candidate brands from the taxonomy before the model call',
       detail:
-        '`BRAND_CANDIDATES = 20` nearest brand names come from `taxonomy.nearest_brands` and are passed to the model as `candidate_brands`; the retrieval precedes the call. The draft sends the title alone and lets the model name any brand.',
+        '`BRAND_CANDIDATES = 20` nearest brand names come from `taxonomy.nearest_brands` and are passed to the model as `candidate_brands`; the retrieval precedes the call. The starter sends the title alone and lets the model name any brand.',
       match: {
         python: {
           all: [/BRAND_CANDIDATES\s*=\s*20/, /candidate_brands=candidates/],
@@ -95,7 +95,7 @@ relies on never see the SKUs that need them.`,
       id: 'deadline-retry',
       title: 'Every attempt has a 5 s deadline; at most two, only on UNAVAILABLE',
       detail:
-        'The call carries a 5-second deadline, attempts are bounded by `MAX_ATTEMPTS = 2`, and only `UNAVAILABLE` is retried. The draft calls once with no deadline and no retry, so a stuck model pins the worker and a broker blip fails the job.',
+        'The call carries a 5-second deadline, attempts are bounded by `MAX_ATTEMPTS = 2`, and only `UNAVAILABLE` is retried. The starter calls once with no deadline and no retry, so a stuck model pins the worker and a broker blip fails the job.',
       match: {
         python: {
           all: [
@@ -152,7 +152,7 @@ relies on never see the SKUs that need them.`,
       id: 'structured-output',
       title: 'Asks for a schema and parses the reply as JSON',
       detail:
-        'The request carries `ATTRIBUTE_SCHEMA` and `reply.output` is parsed as JSON. The draft asks for free text and splits lines on `:` — it silently loses every attribute the moment the model rephrases.',
+        'The request carries `ATTRIBUTE_SCHEMA` and `reply.output` is parsed as JSON. The starter asks for free text and splits lines on `:` — it silently loses every attribute the moment the model rephrases.',
       match: {
         python: {all: [/ATTRIBUTE_SCHEMA/, /schema=ATTRIBUTE_SCHEMA/, /json\.loads\(\s*reply\.output/]},
         typescript: {all: [/ATTRIBUTE_SCHEMA/, /schema:\s*ATTRIBUTE_SCHEMA/, /JSON\.parse\(\s*reply\.output/]},
@@ -165,7 +165,7 @@ relies on never see the SKUs that need them.`,
       id: 'taxonomy-validate',
       title: 'Validates brand, unit and category against the taxonomy',
       detail:
-        'The brand must be one of the retrieved candidates, the unit one of `ALLOWED_UNITS`, and the category known to the taxonomy (`has_category`); anything else is nulled and recorded as a problem. The draft copies whatever the model said.',
+        'The brand must be one of the retrieved candidates, the unit one of `ALLOWED_UNITS`, and the category known to the taxonomy (`has_category`); anything else is nulled and recorded as a problem. The starter copies whatever the model said.',
       match: {
         python: {all: [/ALLOWED_UNITS/, /not in candidate_names/, /taxonomy\.has_category\(/]},
         typescript: {all: [/ALLOWED_UNITS/, /candidateNames\[/, /taxonomy\.hasCategory\(/]},
@@ -178,7 +178,7 @@ relies on never see the SKUs that need them.`,
       id: 'confidence-review',
       title: 'Routes unresolved or low-confidence results to human review',
       detail:
-        'Any validation problem or a confidence below `MIN_CONFIDENCE = 0.85` sends the SKU to `review.enqueue` with the reason and marks the result `review`. The draft accepts everything the model returns.',
+        'Any validation problem or a confidence below `MIN_CONFIDENCE = 0.85` sends the SKU to `review.enqueue` with the reason and marks the result `review`. The starter accepts everything the model returns.',
       match: {
         python: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /review\.enqueue\(/, /["']review["']/, /taxonomy_version/]},
         typescript: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /review\.enqueue\(/, /['"]review['"]/, /taxonomy_version/]},
@@ -202,9 +202,9 @@ FIELDS = ("brand", "size", "unit", "organic", "category")
 
 
 def extract_attributes(sku: dict) -> dict:
-    # TODO: this draft sends the title alone and lets the model name any brand, has no deadline
+    # TODO: this starter sends the title alone and lets the model name any brand, has no deadline
     # and no retry, parses "key: value" lines, trusts every value, and never routes anything to
-    # review. Review all five.
+    # review. Fix all five.
     request = extractor_pb2.ExtractRequest(
         title=sku["title"],
         description=sku.get("description", ""),
@@ -361,7 +361,7 @@ def extract_attributes(sku: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Extract: a model-generated draft that trusts free-text output from the model. */
+      starter: `/** Extract: flawed code that trusts free-text output from the model. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -398,9 +398,9 @@ export interface SkuJob {
 }
 
 export async function extractAttributes(sku: SkuJob): Promise<Record<string, unknown>> {
-  // TODO: this draft sends the title alone and lets the model name any brand, has no deadline
+  // TODO: this starter sends the title alone and lets the model name any brand, has no deadline
   // and no retry, parses "key: value" lines, trusts every value, and never routes anything to
-  // review. Review all five.
+  // review. Fix all five.
   const reply = await new Promise<ExtractReply>((resolve, reject) => {
     client.Extract(
       {title: sku.title, description: sku.description ?? '', candidate_brands: [], schema: ''},
@@ -615,9 +615,9 @@ type Result struct {
 
 var fields = []string{"brand", "size", "unit", "organic", "category"}
 
-// TODO: this draft sends the title alone and lets the model name any brand, has no deadline and
+// TODO: this starter sends the title alone and lets the model name any brand, has no deadline and
 // no retry, parses "key: value" lines, trusts every value, and never routes anything to review.
-// Review all five.
+// Fix all five.
 func extractAttributes(ctx context.Context, sku SkuJob) (Result, error) {
 	reply, err := extractor.Extract(ctx, &pb.ExtractRequest{
 		Title:       sku.Title,
@@ -856,9 +856,9 @@ object ExtractAttributes {
 
   val Fields = List("brand", "size", "unit", "organic", "category")
 
-  // TODO: this draft sends the title alone and lets the model name any brand, has no deadline and
+  // TODO: this starter sends the title alone and lets the model name any brand, has no deadline and
   // no retry, parses "key: value" lines, trusts every value, and never routes anything to review.
-  // Review all five.
+  // Fix all five.
   def extractAttributes(sku: SkuJob): JsObject = {
     val reply = stub.extract(
       ExtractRequest(title = sku.title, description = sku.description.getOrElse(""), candidateBrands = Nil, schema = "")
@@ -1046,9 +1046,9 @@ std::string trim(const std::string& s) {
   return s.substr(begin, end - begin + 1);
 }
 
-// TODO: this draft sends the title alone and lets the model name any brand, has no deadline and
+// TODO: this starter sends the title alone and lets the model name any brand, has no deadline and
 // no retry, parses "key: value" lines, trusts every value, and never routes anything to review.
-// Review all five.
+// Fix all five.
 json extractAttributes(const json& sku) {
   grpc::ClientContext ctx;
   ExtractRequest request;
@@ -1209,5 +1209,5 @@ json extractAttributes(const json& sku) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you know what to put around a model so that its output can be trusted by a system that cannot read it. The source post's answer, which this step reproduces, is constraint from three sides: retrieval before the call (the model picks a brand from candidates that exist in the taxonomy, the way DoorDash's brand pipeline retrieves similar brands from the knowledge graph before deciding), structure in the call (a schema, parsed as JSON — the search post's structured output mapped onto taxonomy categories), and validation after the call (nothing outside the controlled vocabulary survives). The deadline and the single retry on UNAVAILABLE are the ordinary gRPC hygiene a generated client never has. The confidence gate is what makes the human reviewers useful: it is the handoff the posts describe, where SKUs the model cannot tag confidently go to a person instead of into the catalog. Real extractors add per-category attribute sets (a wine has a vintage, a beer does not), an in-house classifier in front of the model so only hard SKUs pay for an LLM call, and image inputs when the title is an abbreviation.`,
+  debrief: `The interviewer is testing whether you know what to put around a model so that its output can be trusted by a system that cannot read it. The source post's answer, which this step reproduces, is constraint from three sides: retrieval before the call (the model picks a brand from candidates that exist in the taxonomy, the way DoorDash's brand pipeline retrieves similar brands from the knowledge graph before deciding), structure in the call (a schema, parsed as JSON — the search post's structured output mapped onto taxonomy categories), and validation after the call (nothing outside the controlled vocabulary survives). The deadline and the single retry on UNAVAILABLE are the ordinary gRPC hygiene a first client never has. The confidence gate is what makes the human reviewers useful: it is the handoff the posts describe, where SKUs the model cannot tag confidently go to a person instead of into the catalog. Real extractors add per-category attribute sets (a wine has a vintage, a beer does not), an in-house classifier in front of the model so only hard SKUs pay for an LLM call, and image inputs when the title is an abbreviation.`,
 };

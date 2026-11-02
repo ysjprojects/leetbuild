@@ -8,10 +8,10 @@ export const labelEventsStep: Step = {
   focus: ['service', 'db', 'kafka'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the submit handler writes a
+**Starting point.** The starter is working code: the submit handler writes a
 label, publishes a \`label.submitted\` event, and a consumer moves agreement counters, so the demo
 shows numbers rising. It compiles, the demo never crashes, and it breaks four production contracts
-at once. Review it like the service owner, name the subtle ones, fix them, and prove the fix with
+at once. Debug it like the service owner, name the subtle ones, fix them, and prove the fix with
 the checks below.
 
 \`POST /v1/tasks/{id}/labels\` accepts one human answer for one item, and the consumer folds those
@@ -41,7 +41,7 @@ events into the per-task agreement counters the progress endpoint reads.
   only then is the **offset committed**. Counters before commit, so a crash replays the record
   instead of losing the update; the applied set makes that replay a no-op instead of a double count.
 
-**Failure mode the checks target.** The draft is wrong in four places that only show up under
+**Failure mode the checks target.** The starter is wrong in four places that only show up under
 failure. Keying by annotator scatters one task's events across partitions, so "this is the second
 label for this item" stops being a fact you can compute. Publishing before persisting inverts the
 guarantee you actually want: the event is durable and the label is not. A producer with no outbox
@@ -85,7 +85,7 @@ update *forever*, with no applied set to stop a replay from counting the same la
       id: 'key-task',
       title: 'label.submitted is keyed by the task id',
       detail:
-        'The produce keys the record by the task id on an idempotent, `acks=all` producer: partition by task keeps one task’s submissions in order, and an idempotent producer can only deduplicate a retry that repeats the same key. The draft keys by the annotator on a default producer, so one task’s labels scatter across partitions and the fold loses its ordering guarantee.',
+        'The produce keys the record by the task id on an idempotent, `acks=all` producer: partition by task keeps one task’s submissions in order, and an idempotent producer can only deduplicate a retry that repeats the same key. The starter keys by the annotator on a default producer, so one task’s labels scatter across partitions and the fold loses its ordering guarantee.',
       match: {
         python: {all: [/key=task_id\b/, /"enable\.idempotence":\s*True/]},
         typescript: {all: [/key:\s*label\.task_id,/, /acks:\s*-1/]},
@@ -98,7 +98,7 @@ update *forever*, with no applied set to stop a replay from counting the same la
       id: 'payload',
       title: 'The event carries the values, the spec version and the time spent',
       detail:
-        'The event body carries `values`, `spec_version` and `ms_spent`, beside the ids and the submit time. The draft sends the ids and the values only, so a later agreement pass cannot tell which question the answer was given under — or how fast it was given.',
+        'The event body carries `values`, `spec_version` and `ms_spent`, beside the ids and the submit time. The starter sends the ids and the values only, so a later agreement pass cannot tell which question the answer was given under — or how fast it was given.',
       match: {
         python: {
           all: [/"values":\s*body\.values/, /"spec_version":\s*body\.spec_version/, /"ms_spent":\s*body\.ms_spent/],
@@ -123,7 +123,7 @@ update *forever*, with no applied set to stop a replay from counting the same la
       id: 'persist-first',
       title: 'The label is persisted before it is published',
       detail:
-        'The first persist call (`store.persist_label(label)` and its per-language equivalent) must appear before the first produce. The draft produces and flushes and only then writes the row, so a crash between the two leaves an event in the agreement math whose label was never stored.',
+        'The first persist call (`store.persist_label(label)` and its per-language equivalent) must appear before the first produce. The starter produces and flushes and only then writes the row, so a crash between the two leaves an event in the agreement math whose label was never stored.',
       match: {
         python: {order: [/store\.persist_label\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.persistLabel\(/, /producer\.send\(/]},
@@ -136,7 +136,7 @@ update *forever*, with no applied set to stop a replay from counting the same la
       id: 'outbox',
       title: 'A rejected produce writes an outbox row',
       detail:
-        'The failure branch of the produce writes the same payload to the outbox — `store.insert_outbox(...)` inside `except KafkaException`, `store.insertOutbox(...)` in the send callback or the `catch`, `store.InsertOutbox(...)` under `if err != nil`. The draft ignores the broker result entirely, so a rejected produce loses the event while the submit still answers 202.',
+        'The failure branch of the produce writes the same payload to the outbox — `store.insert_outbox(...)` inside `except KafkaException`, `store.insertOutbox(...)` in the send callback or the `catch`, `store.InsertOutbox(...)` under `if err != nil`. The starter ignores the broker result entirely, so a rejected produce loses the event while the submit still answers 202.',
       match: {
         python: {all: [/store\.insert_outbox\(/, /except KafkaException/]},
         typescript: {all: [/store\.insertOutbox\(/, /catch\s*\(error\)/]},
@@ -155,7 +155,7 @@ update *forever*, with no applied set to stop a replay from counting the same la
       id: 'agreement-idempotent',
       title: 'Agreement counters fold idempotently before the offset commit',
       detail:
-        'In the consumer the applied-set guard (`SADD agreement:applied:{task_id}` with the label id) matches before the first counter increment (`HINCRBY`), which matches before the offset commit. The draft commits first, increments after, and keeps no applied set: a replay counts one label twice, and a crash between commit and increment loses the update for good.',
+        'In the consumer the applied-set guard (`SADD agreement:applied:{task_id}` with the label id) matches before the first counter increment (`HINCRBY`), which matches before the offset commit. The starter commits first, increments after, and keeps no applied set: a replay counts one label twice, and a crash between commit and increment loses the update for good.',
       match: {
         python: {all: [/agreement:applied/], order: [/\.sadd\(/, /\.hincrby\(/, /\.commit\(/]},
         typescript: {all: [/agreement:applied/], order: [/\.sadd\(/, /\.hincrby\(/, /commitOffsets\(/]},
@@ -332,7 +332,7 @@ def consume_submitted() -> None:
 `,
     },
     typescript: {
-      starter: `/** label.submitted: a model-generated draft that keys by annotator and publishes before persisting. */
+      starter: `/** label.submitted: flawed code that keys by annotator and publishes before persisting. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';

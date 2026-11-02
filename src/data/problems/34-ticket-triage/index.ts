@@ -7,12 +7,11 @@ import {triageEventsStep} from './steps/4-events';
 import {triageReadStep} from './steps/5-read';
 
 /**
- * Ticket triage on the AI-era track: the course is not "call a classifier from an endpoint", it is
- * the review you owe a model-generated triage service before it routes a customer's tickets.
- * Server-side routing and an idempotency key → an atomic Redis dedupe claim plus per-queue
- * admission → a classifier call with a deadline and a rule-based fallback → a tenant-keyed
- * `triage.decided` event with an outbox and a commit after the routing record → a queue summary
- * computed from routing records.
+ * Ticket triage: the course is not "call a classifier from an endpoint", it is the debugging you
+ * owe a triage service before it routes a customer's tickets. Server-side routing and an
+ * idempotency key → an atomic Redis dedupe claim plus per-queue admission → a classifier call with
+ * a deadline and a rule-based fallback → a tenant-keyed `triage.decided` event with an outbox and a
+ * commit after the routing record → a queue summary computed from routing records.
  */
 export const ticketTriageProblem: Problem = {
   id: 'ticket-triage',
@@ -20,7 +19,7 @@ export const ticketTriageProblem: Problem = {
   tagline: 'Classify, prioritize and route inbound tickets without letting the caller route itself.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Ticket Triage
 
@@ -65,12 +64,12 @@ One service, **triage-api**, with five pieces:
 5. \`GET /v1/queues/{id}/summary\`: depth, median wait and fallback share computed from routing
    records, and a 404 for a queue that belongs to another tenant.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
+failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

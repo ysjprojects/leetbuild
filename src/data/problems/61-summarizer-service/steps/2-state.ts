@@ -8,10 +8,10 @@ export const summarizerStateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it keeps a per-source record in
-Redis, folds each chunk's summary into it and bumps a counter. It works for one document that is
-written once, by one writer, that never fails. Review it like the service owner, fix it, and prove
-the fix with the checks below.
+**Starting point.** The starter is working code: it keeps a per-source record in Redis, folds each
+chunk's summary into it and bumps a counter. It works for one document that is written once, by one
+writer, that never fails. Debug it like the service owner, fix it, and prove the fix with the checks
+below.
 
 A long source is summarized chunk by chunk. Implement the per-source progress record:
 
@@ -34,7 +34,7 @@ A long source is summarized chunk by chunk. Implement the per-source progress re
   \`summary_version\` it covers, and \`line\` — \`NEW_LINE\` when this chunk opened a summary line for
   this hash, the continuation otherwise.
 
-**Failure mode the checks target.** The draft writes the summary with \`HSET\` and bumps the counter
+**Failure mode the checks target.** The starter writes the summary with \`HSET\` and bumps the counter
 with a second command, so a crash (or a timeout between the two) leaves a summary that claims
 chunks it never read — the invented quarter. It keys progress by \`source_id\` with no content hash,
 so an edited source resumes the old line and appends new text to a summary of the previous version.
@@ -61,7 +61,7 @@ instead of storing the chunk index it covered, so a redelivered chunk silently d
       id: 'hash-key',
       title: 'Keys progress by tenant and the source content hash',
       detail:
-        'The key is `summary:progress:{tenant}:{source_hash}` built by `progress_key`, and the hash identifies the source *content*, so an edited source lands on a new key. The draft keys by `source_id` alone, so an edit resumes the previous summary.',
+        'The key is `summary:progress:{tenant}:{source_hash}` built by `progress_key`, and the hash identifies the source *content*, so an edited source lands on a new key. The starter keys by `source_id` alone, so an edit resumes the previous summary.',
       match: {
         python: {all: [/progress_key\(/, /source_hash/, /summary:progress:/]},
         typescript: {all: [/progressKey\(/, /source_hash/, /summary:progress:/]},
@@ -74,7 +74,7 @@ instead of storing the chunk index it covered, so a redelivered chunk silently d
       id: 'atomic-commit',
       title: 'Commits the summary and its chunk counter in one script',
       detail:
-        'A single registered `COMMIT_LUA` script `HSET`s the rolling summary and the `chunks_done` counter it covers in one round trip. The draft writes them as two separate commands, so a crash between them leaves a summary claiming chunks it never read.',
+        'A single registered `COMMIT_LUA` script `HSET`s the rolling summary and the `chunks_done` counter it covers in one round trip. The starter writes them as two separate commands, so a crash between them leaves a summary claiming chunks it never read.',
       match: {
         python: {all: [/COMMIT_LUA/, /register_script\(/, /HSET/, /chunks_done/]},
         typescript: {all: [/COMMIT_LUA/, /\.eval\(/, /HSET/, /chunks_done/]},
@@ -87,7 +87,7 @@ instead of storing the chunk index it covered, so a redelivered chunk silently d
       id: 'ttl',
       title: 'Expires progress with a TTL set inside the same script',
       detail:
-        '`TTL_S = 3600` is applied with `EXPIRE` inside the commit script when the key has no expiry. The draft never sets a TTL, so progress for sources nobody writes again is retained forever.',
+        '`TTL_S = 3600` is applied with `EXPIRE` inside the commit script when the key has no expiry. The starter never sets a TTL, so progress for sources nobody writes again is retained forever.',
       match: {
         python: {all: [/TTL_S/, /EXPIRE/]},
         typescript: {all: [/TTL_S/, /EXPIRE/]},
@@ -100,7 +100,7 @@ instead of storing the chunk index it covered, so a redelivered chunk silently d
       id: 'idempotent-chunk',
       title: 'Re-applying a chunk is idempotent',
       detail:
-        'The script compares the incoming `chunk_index` with the stored `chunks_done` (`idx <= done`) and returns the record unchanged when the chunk is already covered, so a redelivery cannot double-count. The draft increments the counter, which counts deliveries rather than chunks.',
+        'The script compares the incoming `chunk_index` with the stored `chunks_done` (`idx <= done`) and returns the record unchanged when the chunk is already covered, so a redelivery cannot double-count. The starter increments the counter, which counts deliveries rather than chunks.',
       match: {
         python: {all: [/apply_chunk\(/, /idx <= done/, /chunks_done/]},
         typescript: {all: [/applyChunk\(/, /idx <= done/, /chunks_done/]},
@@ -113,7 +113,7 @@ instead of storing the chunk index it covered, so a redelivered chunk silently d
       id: 'new-line-on-edit',
       title: 'An edited source starts a new summary line',
       detail:
-        'The commit reports `NEW_LINE` when this chunk opened the line for its hash (the old summary is not appended to) and returns the `summary_version` it covers. The draft has no such status and no version, so a chunk from an edited source extends the previous summary.',
+        'The commit reports `NEW_LINE` when this chunk opened the line for its hash (the old summary is not appended to) and returns the `summary_version` it covers. The starter has no such status and no version, so a chunk from an edited source extends the previous summary.',
       match: {
         python: {all: [/NEW_LINE/, /summary_version/]},
         typescript: {all: [/NEW_LINE/, /summary_version/]},
@@ -148,9 +148,9 @@ def progress_key(tenant: str, source_id: str) -> str:
 
 @app.post("/v1/sources/{source_id}/chunks")
 def apply_chunk(source_id: str, body: ChunkBody, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft writes the rolling summary and then bumps the counter as two separate
+    # TODO: this starter writes the rolling summary and then bumps the counter as two separate
     # commands, keys progress by source id with no content hash, never sets a TTL, and increments
-    # the counter instead of storing the chunk it covered. Review all four.
+    # the counter instead of storing the chunk it covered. Fix all four.
     key = progress_key(tenant, source_id)
     r.hset(key, mapping={"summary": body.chunk_summary, "summary_version": str(body.chunk_index)})
     r.hincrby(key, "chunks_done", 1)
@@ -250,7 +250,7 @@ def write_chunk(
 `,
     },
     typescript: {
-      starter: `/** Per-source summary progress in Redis: a model-generated draft. */
+      starter: `/** Per-source summary progress in Redis: flawed code. */
 import {Redis} from 'ioredis';
 
 const r = new Redis({host: 'redis', port: 6379});
@@ -270,9 +270,9 @@ export async function applyChunk(
   chunkIndex: number,
   chunkSummary: string,
 ): Promise<{chunks_done: number; summary: string}> {
-  // TODO: this draft writes the rolling summary and then bumps the counter as two separate
+  // TODO: this starter writes the rolling summary and then bumps the counter as two separate
   // commands, keys progress by source id with no content hash, never sets a TTL, and increments
-  // the counter instead of storing the chunk it covered. Review all four.
+  // the counter instead of storing the chunk it covered. Fix all four.
   const key = progressKey(tenant, sourceId);
   await r.hset(key, {summary: chunkSummary, summary_version: String(chunkIndex)});
   await r.hincrby(key, 'chunks_done', 1);
@@ -373,12 +373,12 @@ func progressKey(tenant, sourceID string) string {
 	return fmt.Sprintf("summary:progress:%s:%s", tenant, sourceID)
 }
 
-// applyChunk folds one chunk into the rolling summary. The model-generated draft does it in two
+// applyChunk folds one chunk into the rolling summary. The starter does it in two
 // steps and keys by source id.
 func applyChunk(ctx context.Context, rdb *redis.Client, tenant, sourceID string, body ChunkBody) (map[string]any, error) {
-	// TODO: this draft writes the rolling summary and then bumps the counter as two separate
+	// TODO: this starter writes the rolling summary and then bumps the counter as two separate
 	// commands, keys progress by source id with no content hash, never sets a TTL, and increments
-	// the counter instead of storing the chunk it covered. Review all four.
+	// the counter instead of storing the chunk it covered. Fix all four.
 	key := progressKey(tenant, sourceID)
 	if err := rdb.HSet(ctx, key, "summary", body.ChunkSummary, "summary_version", body.ChunkIndex).Err(); err != nil {
 		return nil, err
@@ -490,11 +490,11 @@ object SourceProgress {
 
   def progressKey(tenant: String, sourceId: String): String = s"summary:progress:$tenant:$sourceId"
 
-  /** Fold one chunk into the rolling summary. The model-generated draft does it in two steps. */
+  /** Fold one chunk into the rolling summary. The starter does it in two steps. */
   def applyChunk(tenant: String, sourceId: String, chunkIndex: Int, chunkSummary: String): Map[String, String] = {
-    // TODO: this draft writes the rolling summary and then bumps the counter as two separate
+    // TODO: this starter writes the rolling summary and then bumps the counter as two separate
     // commands, keys progress by source id with no content hash, never sets a TTL, and increments
-    // the counter instead of storing the chunk it covered. Review all four.
+    // the counter instead of storing the chunk it covered. Fix all four.
     val key = progressKey(tenant, sourceId)
     Redis.hset(key, "summary", chunkSummary)
     Redis.hset(key, "summary_version", chunkIndex.toString)
@@ -576,12 +576,12 @@ static std::string progress_key(const std::string& tenant, const std::string& so
   return "summary:progress:" + tenant + ":" + source_id;
 }
 
-/** Fold one chunk into the rolling summary. The model-generated draft does it in two steps. */
+/** Fold one chunk into the rolling summary. The starter does it in two steps. */
 std::string apply_chunk(Redis& redis, const std::string& tenant, const std::string& source_id, int chunk_index,
                         const std::string& chunk_summary) {
-  // TODO: this draft writes the rolling summary and then bumps the counter as two separate
+  // TODO: this starter writes the rolling summary and then bumps the counter as two separate
   // commands, keys progress by source id with no content hash, never sets a TTL, and increments
-  // the counter instead of storing the chunk it covered. Review all four.
+  // the counter instead of storing the chunk it covered. Fix all four.
   const auto key = progress_key(tenant, source_id);
   redis.hset(key, "summary", chunk_summary);
   redis.hset(key, "summary_version", std::to_string(chunk_index));

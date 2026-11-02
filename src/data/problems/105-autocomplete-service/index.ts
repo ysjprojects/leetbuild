@@ -7,11 +7,11 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Autocomplete on the AI-era track: the course is not "return some suggestions from an endpoint",
- * it is the review you owe a model-generated typeahead before it suggests a person's name. A bounded,
- * folded prefix → a Redis cache capped per tenant with a TTL → a suggester call with a deadline and a
- * versioned fallback → tenant-keyed events carrying prefix hashes, not text → a trending read with an
- * occurrence floor and no user linkage.
+ * Autocomplete: the course is not "return some suggestions from an endpoint", it is the debugging
+ * you owe a typeahead before it suggests a person's name. A bounded, folded prefix → a Redis cache
+ * capped per tenant with a TTL → a suggester call with a deadline and a versioned fallback →
+ * tenant-keyed events carrying prefix hashes, not text → a trending read with an occurrence floor
+ * and no user linkage.
  */
 export const autocompleteServiceProblem: Problem = {
   id: 'autocomplete-service',
@@ -19,7 +19,6 @@ export const autocompleteServiceProblem: Problem = {
   tagline: 'Typeahead suggestions that are capped, tenant-safe and honest about trends.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Autocomplete
 
@@ -59,12 +58,13 @@ One service, **suggestd**, with five pieces:
 5. \`GET /v1/trending\`: aggregated popular terms with a 100-occurrence floor, a sensitive-category
    filter, and no user linkage in the response.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path — one tenant, English prefixes, a healthy suggester — and it sounds confident. Your job in every
-step is the job you will have on a real AI feature: read the draft against the failure modes, name the
-subtle one, fix it, and prove the fix with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw. It compiles, it serves the happy path — one
+tenant, English prefixes, a healthy suggester — and it looks right. Your job in every step is the
+job you will have on a real search feature: debug it against the failure modes, name the subtle
+one, fix it, optimize what is wasteful, and prove the fix with checks that fail on the starter and
+pass on your version.
 
 ## Left out on purpose
 

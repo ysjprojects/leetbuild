@@ -8,8 +8,8 @@ export const groundedAnswerStep: Step = {
   focus: ['api', 'redis', 'llm'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it compiles and passes the
-happy path, so a quick demo makes it look done. Review it like the service owner. Find the subtle
+**Starting point.** The starter is working code: it compiles and passes the
+happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
 flaw, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/answer\` with body \`{"query": "…", "k": 5}\`. Retrieval is given; the answer
@@ -28,7 +28,7 @@ path is yours.
 - Cap the context at **3000 tokens** (count words as a cheap proxy). Truncate by whole chunks, never
   mid-chunk.
 
-**Failure mode the checks target.** The draft concatenates retrieved text into the system prompt and
+**Failure mode the checks target.** The starter concatenates retrieved text into the system prompt and
 trusts the model's citation objects. One poisoned chunk can rewrite the instructions, and one
 hallucinated citation renders as a source the user believes.
 
@@ -65,7 +65,7 @@ hallucinated citation renders as a source the user believes.
       id: 'refusal-path',
       title: 'Refuses when nothing supports an answer',
       detail:
-        'An empty context or zero verified citations returns `{"answer": "I don\'t know", "citations": []}`. The draft returns whatever the model says.',
+        'An empty context or zero verified citations returns `{"answer": "I don\'t know", "citations": []}`. The starter returns whatever the model says.',
       match: {
         python: {all: [/(I don't know|do not know)/i, /(citation|Citation)/]},
         typescript: {all: [/(I don't know|do not know)/i, /(citation|Citation)/]},
@@ -187,7 +187,7 @@ def answer(body: AnswerRequest, tenant: str = Header(alias="X-Tenant-Id")):
     retrieved = retrieve(tenant, body.query, body.k)
     context = "\\n\\n".join(chunk["text"] for chunk in retrieved["chunks"])
     prompt = SYSTEM + "\\n\\n" + context + "\\n\\nQuestion: " + body.query
-    # TODO: the context is untrusted; this draft puts it in the system prompt, lets the model
+    # TODO: the context is untrusted; this starter puts it in the system prompt, lets the model
     # call tools, trusts every citation, never refuses and sends the whole context.
     response = llm.complete(prompt, tools=TOOLS)
     return {"answer": response.text, "citations": response.citations}
@@ -260,7 +260,7 @@ def answer(body: AnswerRequest, tenant: str = Header(alias="X-Tenant-Id")):
 `,
     },
     typescript: {
-      starter: `/** POST /v1/answer: a model-generated draft that trusts the model and the retrieved text. */
+      starter: `/** POST /v1/answer: flawed code that trusts the model and the retrieved text. */
 import Fastify from 'fastify';
 
 import {LLM, TOOLS} from './llm';
@@ -276,7 +276,7 @@ interface AnswerRequest {
 }
 
 app.post('/v1/answer', async (request, reply) => {
-  // TODO: the context is untrusted; this draft puts it in the system prompt, lets the model
+  // TODO: the context is untrusted; this starter puts it in the system prompt, lets the model
   // call tools, trusts every citation, never refuses and sends the whole context.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as AnswerRequest;
@@ -395,7 +395,7 @@ func answer(rw http.ResponseWriter, r *http.Request) {
 		contextText += chunk.Text + "\\n\\n"
 	}
 	prompt := systemPrompt + "\\n\\n" + contextText + "\\n\\nQuestion: " + body.Query
-	// TODO: retrieved text is untrusted; this draft puts it in the system prompt, exposes tools,
+	// TODO: retrieved text is untrusted; this starter puts it in the system prompt, exposes tools,
 	// trusts citations and never refuses.
 	request := llm.Request{Prompt: prompt, Tools: llm.AllTools()}
 	response, _ := client.Complete(r.Context(), request)
@@ -505,7 +505,7 @@ object AnswerApi {
             val chunks = Retrieve.retrieve(tenant, body.query, body.k)
             val context = chunks.map(_.text).mkString("\\n\\n")
             val prompt = SystemPrompt + "\\n\\n" + context + "\\n\\nQuestion: " + body.query
-            // TODO: retrieved text is untrusted; this draft puts it in the system prompt, passes
+            // TODO: retrieved text is untrusted; this starter puts it in the system prompt, passes
             // tools, trusts citations and never refuses.
             val response = llm.complete(prompt, tools = ToolRegistry.all)
             complete(StatusCodes.OK, s"""{"answer":"$answer","citations":$citations}""")
@@ -615,7 +615,7 @@ int main() {
     std::string context;
     for (const auto& chunk : chunks) context += chunk.text + "\\n\\n";
     const auto prompt = kSystemPrompt + "\\n\\n" + context + "\\n\\nQuestion: " + body.value("query", std::string());
-    // TODO: retrieved text is untrusted; this draft puts it in the system prompt, passes tools,
+    // TODO: retrieved text is untrusted; this starter puts it in the system prompt, passes tools,
     // trusts citations and never refuses.
     LlmRequest request;
     request.prompt = prompt;
@@ -706,5 +706,5 @@ int main() {
     'Refusal is a normal response, not an error: check for an empty context and for zero surviving citations, and return the fixed refusal object in both cases.',
     'Validate each claimed citation against the retrieved chunk: the chunk must exist, the quote must be non-empty, and `quote in chunk.text` must be true. Build the citation from the stored offsets, never from the model.',
   ],
-  debrief: `The interviewer learns whether you treat model output as a proposal rather than a fact. Three review signals are packed here: prompt-layer separation (retrieved text is data, the system turn is policy), a refusal path that is designed rather than accidental, and server-side citation verification, which is the difference between a citation UI and a source of fabricated evidence. The absence of a tool loop is deliberate: an answer endpoint that can execute tools from retrieved text turns a prompt injection into an action. Real systems add a second classifier for injection attempts, quote-normalization before substring checks, per-tenant context budgets, and citations that point at the exact character span so a reviewer can click through to the document.`,
+  debrief: `The interviewer learns whether you treat model output as a proposal rather than a fact. Three signals are packed here: prompt-layer separation (retrieved text is data, the system turn is policy), a refusal path that is designed rather than accidental, and server-side citation verification, which is the difference between a citation UI and a source of fabricated evidence. The absence of a tool loop is deliberate: an answer endpoint that can execute tools from retrieved text turns a prompt injection into an action. Real systems add a second classifier for injection attempts, quote-normalization before substring checks, per-tenant context budgets, and citations that point at the exact character span so a reader can click through to the document.`,
 };

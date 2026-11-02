@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['purge', 'redis', 'tenant'],
   task: `## Task
 
-**Review premise.** The starter dedupes with \`EXISTS\` and marks paths afterwards, keeps the
+**Starting point.** The starter dedupes with \`EXISTS\` and marks paths afterwards, keeps the
 budget counter under a key that never expires, and answers a bare \`429\`. It works in a demo
-where requests arrive one at a time. Review it like the engineer who owns the Redis keyspace, fix
+where requests arrive one at a time. Debug it like the engineer who owns the Redis keyspace, fix
 it, and prove the fix with the checks below.
 
 Every purge goes through \`reserve(tenant, domain, paths)\`, which runs **one** Lua script
@@ -39,7 +39,7 @@ The handler reserves **before** it calls the provider:
 
 :::widget token-bucket {"rate": 3, "burst": 1000}
 
-**Failure mode the checks target.** The draft checks dedupe with a client-side \`EXISTS\`, then
+**Failure mode the checks target.** The starter checks dedupe with a client-side \`EXISTS\`, then
 writes later — a double-submitted deploy purges twice and burns budget for work it did not need.
 Its budget key is \`purge:budget:{domain}\` with no window bucket and no TTL, so the counter only
 ever grows: after 1000 paths in the domain's lifetime, every purge is rejected forever, and no
@@ -61,7 +61,7 @@ budget rejects a deploy into a retry storm.`,
       id: 'atomic-reserve',
       title: 'Dedupe and budget live in one server-side script',
       detail:
-        'One `RESERVE_LUA` runs through `EVAL` and marks each path with `SET … NX EX` inside the script. The draft asks Redis `EXISTS` first and writes later, so two concurrent purges both see the path as new.',
+        'One `RESERVE_LUA` runs through `EVAL` and marks each path with `SET … NX EX` inside the script. The starter asks Redis `EXISTS` first and writes later, so two concurrent purges both see the path as new.',
       match: {
         python: {all: [/RESERVE_LUA/, /'NX'/, /\.eval\(/], none: [/\.exists\(/]},
         typescript: {all: [/RESERVE_LUA/, /'NX'/, /\.eval\(/], none: [/\.exists\(/]},
@@ -74,7 +74,7 @@ budget rejects a deploy into a retry storm.`,
       id: 'window-bucket',
       title: 'The budget key is bucketed by window and expires with it',
       detail:
-        'The budget key carries the window (`purge:budget:{domain}:{window}` via `budget_key`) and the script sets `EXPIRE WINDOW_S` on first write, so the counter resets per window. The draft uses one un-bucketed, immortal key, so the domain’s budget only ever shrinks.',
+        'The budget key carries the window (`purge:budget:{domain}:{window}` via `budget_key`) and the script sets `EXPIRE WINDOW_S` on first write, so the counter resets per window. The starter uses one un-bucketed, immortal key, so the domain’s budget only ever shrinks.',
       match: {
         python: {all: [/purge:budget/, /WINDOW_S/, /EXPIRE/, /budget_key\(/]},
         typescript: {all: [/purge:budget/, /WINDOW_S/, /EXPIRE/, /budgetKey\(/]},
@@ -87,7 +87,7 @@ budget rejects a deploy into a retry storm.`,
       id: 'dedupe-window',
       title: 'Dedupe holds for ten minutes and only new paths are purged',
       detail:
-        '`DEDUPE_TTL_S` = 600 gives each path a ten-minute window, and the reservation returns only `new_paths` to the provider while reporting the `duplicates`. The draft writes dedupe keys with no TTL at all, so a path purged once can never be purged again.',
+        '`DEDUPE_TTL_S` = 600 gives each path a ten-minute window, and the reservation returns only `new_paths` to the provider while reporting the `duplicates`. The starter writes dedupe keys with no TTL at all, so a path purged once can never be purged again.',
       match: {
         python: {all: [/DEDUPE_TTL_S/, /new_paths/, /duplicates/]},
         typescript: {all: [/DEDUPE_TTL_S/, /newPaths/, /duplicates/]},
@@ -100,7 +100,7 @@ budget rejects a deploy into a retry storm.`,
       id: 'budget-429',
       title: 'An exhausted budget answers 429 with Retry-After before the provider',
       detail:
-        '`BUDGET_MAX` paths per window; when the reservation is refused the handler answers **429** with `Retry-After` (the window’s remaining TTL) and `X-Purge-Budget-Remaining`, and never calls the provider. The draft sends a bare 429 and charges after the fact.',
+        '`BUDGET_MAX` paths per window; when the reservation is refused the handler answers **429** with `Retry-After` (the window’s remaining TTL) and `X-Purge-Budget-Remaining`, and never calls the provider. The starter sends a bare 429 and charges after the fact.',
       match: {
         python: {all: [/BUDGET_MAX/, /\b429\b/, /Retry-After/, /X-Purge-Budget-Remaining/]},
         typescript: {all: [/BUDGET_MAX/, /\b429\b/, /Retry-After/, /X-Purge-Budget-Remaining/]},
@@ -115,7 +115,7 @@ budget rejects a deploy into a retry storm.`,
       id: 'reserve-before-submit',
       title: 'The reservation settles before the provider is called',
       detail:
-        'The reserve runs first, the provider sees only the paths the reservation accepted, and the budget is never adjusted from the application. The draft charges the counter from the client after deciding, which is a second place for the budget and the truth to disagree.',
+        'The reserve runs first, the provider sees only the paths the reservation accepted, and the budget is never adjusted from the application. The starter charges the counter from the client after deciding, which is a second place for the budget and the truth to disagree.',
       match: {
         python: {
           all: [/providers\.SubmitPurge\(/],
@@ -182,9 +182,9 @@ def dedupe_key(tenant: str, domain: str, path: str) -> str:
 
 
 def reserve(tenant: str, domain: str, paths: list[str]) -> dict:
-    # TODO: this draft checks dedupe with a client-side EXISTS and writes afterwards, so a
+    # TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
     # double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-    # counter never resets; and the 429 carries no Retry-After. Review all three: one atomic EVAL
+    # counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
     # that checks and writes together, a bucketed budget key that expires with its window, and a
     # 429 that tells the client when to come back.
     seen = [path for path in paths if r.exists(dedupe_key(tenant, domain, path))]
@@ -323,7 +323,7 @@ def create_purge(body: PurgeRequest, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** Purge intake: a model-generated draft that reads before it writes and never expires its budget. */
+      starter: `/** Purge intake: flawed code that reads before it writes and never expires its budget. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -352,9 +352,9 @@ function dedupeKey(tenant: string, domain: string, path: string): string {
 }
 
 app.post('/v1/purges', async (request, reply) => {
-  // TODO: this draft checks dedupe with a client-side EXISTS and writes afterwards, so a
+  // TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
   // double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-  // counter never resets; and the 429 carries no Retry-After. Review all three: one atomic EVAL
+  // counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
   // that checks and writes together, a bucketed budget key that expires with its window, and a
   // 429 that tells the client when to come back.
   const tenant = request.headers['x-tenant-id'] as string;
@@ -541,9 +541,9 @@ type Reservation struct {
 }
 
 func reserve(ctx context.Context, tenant, domain string, paths []string) (*Reservation, error) {
-	// TODO: this draft checks dedupe with a client-side EXISTS and writes afterwards, so a
+	// TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
 	// double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-	// counter never resets; and the 429 carries no Retry-After. Review all three: one atomic EVAL
+	// counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
 	// that checks and writes together, a bucketed budget key that expires with its window, and a
 	// 429 that tells the client when to come back.
 	reservation := &Reservation{}
@@ -818,9 +818,9 @@ object PurgeState {
   def dedupeKey(tenant: String, domain: String, path: String): String =
     s"purge:seen:$tenant:$domain:$path"
 
-  // TODO: this draft checks dedupe with a client-side EXISTS and writes afterwards, so a
+  // TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
   // double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-  // counter never resets; and the 429 carries no Retry-After. Review all three: one atomic EVAL
+  // counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL
   // that checks and writes together, a bucketed budget key that expires with its window, and a
   // 429 that tells the client when to come back.
   def reserve(tenant: String, domain: String, paths: List[String]): Reservation = {
@@ -980,9 +980,9 @@ struct Reservation {
   std::vector<std::string> duplicates;
 };
 
-// TODO: this draft checks dedupe with a client-side EXISTS and writes afterwards, so a
+// TODO: this starter checks dedupe with a client-side EXISTS and writes afterwards, so a
 // double-submitted deploy purges twice; the budget key has no window bucket and no TTL, so the
-// counter never resets; and the 429 carries no Retry-After. Review all three: one atomic EVAL that
+// counter never resets; and the 429 carries no Retry-After. Fix all three: one atomic EVAL that
 // checks and writes together, a bucketed budget key that expires with its window, and a 429 that
 // tells the client when to come back.
 Reservation reserve(const std::string& tenant, const std::string& domain, const std::vector<std::string>& paths) {

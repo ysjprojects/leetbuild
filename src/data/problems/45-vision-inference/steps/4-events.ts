@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'consumer', 'outbox'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes an event per
+**Starting point.** The starter is working code: it publishes an event per
 inference and the analytics pipeline is happy for a week. The key, the payload and the failure path
 are all wrong. Find them, fix them, and prove the fix.
 
@@ -29,7 +29,7 @@ Implement the event path for completed inferences on \`vision.inference\`:
 - The consumer updates the per-version counter and **commits after** it, so a crash replays rather
   than skips.
 
-**Failure mode the checks target.** The draft keys by tenant so no one can answer "how did
+**Failure mode the checks target.** The starter keys by tenant so no one can answer "how did
 vision-large-3.1.0 behave on Tuesdays?"; it publishes the presigned URL because "the training
 pipeline needs to fetch the image"; and it skips the outbox, so every broker hiccup silently loses an
 inference from the counters.`,
@@ -54,7 +54,7 @@ inference from the counters.`,
       id: 'topic-key',
       title: 'Publishes vision.inference keyed by model version',
       detail:
-        'The topic is `vision.inference` and the record key is the model version, so per-version quality streams stay ordered. The draft keys by tenant and records no version at all.',
+        'The topic is `vision.inference` and the record key is the model version, so per-version quality streams stay ordered. The starter keys by tenant and records no version at all.',
       match: {
         python: {all: [/vision\.inference/, /model_version/], none: [/key\s*=\s*tenant/]},
         typescript: {all: [/vision\.inference/, /model_version/], none: [/key:\s*tenant/]},
@@ -80,7 +80,7 @@ inference from the counters.`,
       id: 'no-bytes-no-urls',
       title: 'Ships digests, never bytes or URLs',
       detail:
-        "The payload carries the storage key's digest and no presigned URL, no base64 blob and no image bytes. The draft publishes the presigned URL so the training pipeline can fetch it.",
+        "The payload carries the storage key's digest and no presigned URL, no base64 blob and no image bytes. The starter publishes the presigned URL so the training pipeline can fetch it.",
       match: {
         python: {all: [/digest/], none: [/presigned|base64|b64encode|image_bytes/]},
         typescript: {all: [/digest/], none: [/presigned|base64|image_bytes/]},
@@ -93,7 +93,7 @@ inference from the counters.`,
       id: 'producer-config',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured once with `acks=all` and idempotence enabled, not per request. The draft uses the default `acks=1` and no idempotence, so a retry can duplicate an event.',
+        'The producer is configured once with `acks=all` and idempotence enabled, not per request. The starter uses the default `acks=1` and no idempotence, so a retry can duplicate an event.',
       match: {
         python: {all: [/"acks":\s*"all"/, /enable\.idempotence/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -106,7 +106,7 @@ inference from the counters.`,
       id: 'outbox',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce writes an outbox row and the relay retries it — the event is never dropped, and the inference is never blocked on the broker. The draft has no outbox at all.',
+        'A rejected produce writes an outbox row and the relay retries it — the event is never dropped, and the inference is never blocked on the broker. The starter has no outbox at all.',
       match: {
         python: {all: [/outbox/, /Outbox/], order: [/producer\.produce\(/, /outbox/]},
         typescript: {all: [/outbox/, /Outbox/], order: [/\.send\(/, /outbox/]},
@@ -118,7 +118,7 @@ inference from the counters.`,
   ],
   code: {
     python: {
-      starter: `"""Inference events: a model-generated draft that publishes everything it knows."""
+      starter: `"""Inference events: flawed code that publishes everything it knows."""
 import json
 
 from confluent_kafka import Producer
@@ -135,9 +135,9 @@ def complete_inference(
     storage_key: str,
     presigned_url: str,
 ) -> None:
-    # TODO: this draft keys by tenant so per-version quality signals scatter, ships the presigned URL
+    # TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
     # of the image, configures no idempotence, and skips the outbox when the broker rejects the
-    # produce. Review all four.
+    # produce. Fix all four.
     event = {
         "tenant": tenant,
         "task": task,
@@ -215,7 +215,7 @@ def consume(consumer: Consumer, counter) -> None:
 `,
     },
     typescript: {
-      starter: `/** Inference events: a model-generated draft that publishes everything it knows. */
+      starter: `/** Inference events: flawed code that publishes everything it knows. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'vision.inference';
@@ -230,9 +230,9 @@ export async function completeInference(
   storageKey: string,
   presignedUrl: string,
 ): Promise<void> {
-  // TODO: this draft keys by tenant so per-version quality signals scatter, ships the presigned URL
+  // TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
   // of the image, configures no idempotence, and skips the outbox when the broker rejects the
-  // produce. Review all four.
+  // produce. Fix all four.
   await producer.connect();
   await producer.send({
     topic: TOPIC,
@@ -320,9 +320,9 @@ type InferenceEvent struct {
 }
 
 func completeInference(ctx context.Context, event InferenceEvent) error {
-	// TODO: this draft keys by tenant so per-version quality signals scatter, ships the presigned URL
+	// TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
 	// of the image, configures no idempotence, and skips the outbox when the broker rejects the
-	// produce. Review all four.
+	// produce. Fix all four.
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -342,7 +342,7 @@ import (
 const visionInferenceTopic = "vision.inference"
 
 // segmentio/kafka-go has no idempotence switch of its own: RequireAll plus an explicit flag is the
-// closest the client gets, and the intent is recorded here for the review.
+// closest the client gets, and the intent is recorded here for the checks.
 var idempotentProducer = true
 
 var writer = &kafka.Writer{
@@ -427,9 +427,9 @@ object InferenceEvents {
   )
 
   def completeInference(event: InferenceEvent, payload: String): Unit = {
-    // TODO: this draft keys by tenant so per-version quality signals scatter, ships the presigned URL
+    // TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
     // of the image, configures no idempotence, and skips the outbox when the broker rejects the
-    // produce. Review all four.
+    // produce. Fix all four.
     producer.send(new ProducerRecord[String, String](Topic, event.tenant, payload))
   }
 }
@@ -510,9 +510,9 @@ struct InferenceEvent {
 };
 
 void completeInference(const InferenceEvent& event, const std::string& payload) {
-  // TODO: this draft keys by tenant so per-version quality signals scatter, ships the presigned URL
+  // TODO: this starter keys by tenant so per-version quality signals scatter, ships the presigned URL
   // of the image, configures no idempotence, and skips the outbox when the broker rejects the
-  // produce. Review all four.
+  // produce. Fix all four.
   producer->produce(kVisionInferenceTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                     const_cast<char*>(payload.data()), payload.size(), event.tenant.c_str(), event.tenant.size(), 0,
                     nullptr);

@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['worker', 'model'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the model server and
+**Starting point.** The starter is working code: it calls the model server and
 returns the output, so a healthy provider makes the shard pass. One bad shard, however, takes the
 whole batch down. Find the three defects, fix them, and prove the fix with the checks below.
 
@@ -16,7 +16,7 @@ Implement the model client each shard calls.
 
 - **One deadline per attempt: 5 seconds.** A call that never returns must be abandoned, not waited
   on; a batch of a million records cannot block on one hung shard.
-- **Retry at most twice, and only \`UNAVAILABLE\`.** Timeout is not "retry harder": the draft retries
+- **Retry at most twice, and only \`UNAVAILABLE\`.** Timeout is not "retry harder": the starter retries
   \`DEADLINE_EXCEEDED\` forever, which turns a slow provider into a hot loop. The retryable set
   contains exactly \`UNAVAILABLE\`.
 - **Contain the failure to its own shard.** A shard that still fails after the retries is recorded
@@ -41,7 +41,7 @@ for a batch that dropped a shard is the bug the whole course is about.
   },
   hints: [
     'The deadline belongs on the call, not the batch: `timeout=DEADLINE_S` / `context.WithTimeout` / `withDeadlineAfter`. Without it a stuck stream pins the worker forever.',
-    'Bound the loop with `for _ in range(MAX_ATTEMPTS)` and break when `error.code() not in RETRYABLE`. Retrying `DEADLINE_EXCEEDED` is the draft’s bug: a timeout means the provider is already struggling.',
+    'Bound the loop with `for _ in range(MAX_ATTEMPTS)` and break when `error.code() not in RETRYABLE`. Retrying `DEADLINE_EXCEEDED` is the starter’s bug: a timeout means the provider is already struggling.',
     'A shard failure is data, not control flow: catch it per shard, append the id to `failed`, and let the loop continue. Never call a batch-wide cancel or re-raise past the loop.',
   ],
   checks: [
@@ -49,7 +49,7 @@ for a batch that dropped a shard is the bug the whole course is about.
       id: 'deadline',
       title: 'Every attempt carries a 5-second deadline',
       detail:
-        'Each model call is made under a **5-second** deadline. The draft has no deadline, so a hung provider blocks the worker.',
+        'Each model call is made under a **5-second** deadline. The starter has no deadline, so a hung provider blocks the worker.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:/]},
@@ -62,7 +62,7 @@ for a batch that dropped a shard is the bug the whole course is about.
       id: 'retry-unavailable',
       title: 'Retries only on UNAVAILABLE',
       detail:
-        'The retryable set is exactly `UNAVAILABLE`; a timeout is not retried. The draft retries every error, including `DEADLINE_EXCEEDED`, forever.',
+        'The retryable set is exactly `UNAVAILABLE`; a timeout is not retried. The starter retries every error, including `DEADLINE_EXCEEDED`, forever.',
       match: {
         python: {all: [/UNAVAILABLE/, /RETRYABLE/], none: [/DEADLINE_EXCEEDED/]},
         typescript: {all: [/UNAVAILABLE/, /RETRYABLE/], none: [/DEADLINE_EXCEEDED/]},
@@ -75,7 +75,7 @@ for a batch that dropped a shard is the bug the whole course is about.
       id: 'bounded-attempts',
       title: 'At most two retries',
       detail:
-        'The attempt loop is bounded by `MAX_ATTEMPTS` (initial call plus two retries). The draft loops `while true`, so a permanent failure never returns.',
+        'The attempt loop is bounded by `MAX_ATTEMPTS` (initial call plus two retries). The starter loops `while true`, so a permanent failure never returns.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /range\(MAX_ATTEMPTS\)/]},
         typescript: {all: [/MAX_ATTEMPTS/, /attempt\s*<\s*MAX_ATTEMPTS/]},
@@ -88,7 +88,7 @@ for a batch that dropped a shard is the bug the whole course is about.
       id: 'contained-failure',
       title: 'A shard failure is contained to its own shard',
       detail:
-        'A failed shard is caught and recorded per shard; it never cancels the other in-flight shards. The draft calls a batch-wide cancel from the catch block.',
+        'A failed shard is caught and recorded per shard; it never cancels the other in-flight shards. The starter calls a batch-wide cancel from the catch block.',
       match: {
         python: {all: [/except grpc\.RpcError/, /failed/], none: [/cancel_all/]},
         typescript: {all: [/catch\s*\(/, /failed/], none: [/cancelAll/]},
@@ -101,7 +101,7 @@ for a batch that dropped a shard is the bug the whole course is about.
       id: 'failed-count',
       title: 'The batch reports an explicit failed-shard count',
       detail:
-        'The batch result carries the failed shards instead of a blanket success. The draft returns `succeeded` even when a shard was dropped.',
+        'The batch result carries the failed shards instead of a blanket success. The starter returns `succeeded` even when a shard was dropped.',
       match: {
         python: {all: [/failed_shards|failed_count/, /return/]},
         typescript: {all: [/failedShards|failedCount/, /return/]},
@@ -119,7 +119,7 @@ attempts = 0
 
 
 def generate(shard_id: str) -> str:
-    # TODO: this draft retries every error forever with no deadline, and one failed shard cancels
+    # TODO: this starter retries every error forever with no deadline, and one failed shard cancels
     # every other in-flight shard instead of being contained.
     global attempts
     while True:
@@ -172,11 +172,11 @@ def run_batch(batch_id: str, shards: list[str]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Per-shard model call: a model-generated draft that retries forever and cancels siblings. */
+      starter: `/** Per-shard model call: flawed code that retries forever and cancels siblings. */
 import * as grpc from '@grpc/grpc-js';
 
 export async function generate(shardID: string): Promise<string> {
-  // TODO: this draft retries every error forever with no deadline, and one failed shard cancels
+  // TODO: this starter retries every error forever with no deadline, and one failed shard cancels
   // every other in-flight shard instead of being contained.
   for (;;) {
     try {
@@ -247,7 +247,7 @@ import (
 )
 
 func Generate(client ModelClient, shardID string) (string, error) {
-	// TODO: this draft retries every error forever with no deadline, and one failed shard cancels
+	// TODO: this starter retries every error forever with no deadline, and one failed shard cancels
 	// every other in-flight shard instead of being contained.
 	for {
 		reply, err := client.Generate(context.Background(), &ShardRequest{ShardId: shardID})
@@ -324,7 +324,7 @@ func RunBatch(client ModelClient, batchID string, shards []string) map[string]an
 
 object ShardRunner {
   def generate(stub: ModelGrpc.ModelBlockingStub, shardId: String): String = {
-    // TODO: this draft retries every error forever with no deadline, and one failed shard cancels
+    // TODO: this starter retries every error forever with no deadline, and one failed shard cancels
     // every other in-flight shard instead of being contained.
     var done = false
     var output = ""
@@ -395,7 +395,7 @@ object ShardRunner {
 #include <vector>
 
 std::string generate(Model::Stub& stub, const std::string& shardId) {
-  // TODO: this draft retries every error forever with no deadline, and one failed shard cancels
+  // TODO: this starter retries every error forever with no deadline, and one failed shard cancels
   // every other in-flight shard instead of being contained.
   bool done = false;
   std::string output;

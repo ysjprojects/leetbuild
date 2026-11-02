@@ -8,32 +8,32 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and writes a case row. It compiles, it serves the demo, and it hides four production flaws.
-Review it like the trust-and-safety owner, fix it, and prove the fix with the checks below.
+Debug it like the trust-and-safety owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/reports\` with body \`{"content_id": "…", "reason": "…", "detail": "…"}\`.
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header and the reporter from
   \`X-Reporter-Id\`; either one missing is **401**.
 - \`content_id\` must resolve to content **owned by the calling tenant** — look it up in the tenant
-  catalogue and answer **404** for a foreign or unknown id. The draft accepts any content id, so a
+  catalogue and answer **404** for a foreign or unknown id. The starter accepts any content id, so a
   tenant can file a report against another tenant's content.
 - \`reason\` must be one of \`spam\`, \`harassment\`, \`hate\`, \`self_harm\`, \`csam\`; anything else is
-  **400**. The draft falls back to an \`"other"\` bucket, so a typo silently becomes a real case.
+  **400**. The starter falls back to an \`"other"\` bucket, so a typo silently becomes a real case.
 - \`detail\` is optional (default \`""\`) and at most **4096 bytes** of UTF-8; a larger detail is
-  **413**. The draft never caps it, so one report can carry a megabyte into the case store.
+  **413**. The starter never caps it, so one report can carry a megabyte into the case store.
 - A reporter may report the same item only once: look up the reporter's open case on
   \`(tenant, content_id, reporter_id)\` and **update it** (200, \`status: "updated"\`) instead of
   minting a second case. A genuinely new report creates a case (**201**, \`status: "created"\`). The
-  draft inserts a fresh row for every duplicate, so one angry reporter can inflate the queue.
+  starter inserts a fresh row for every duplicate, so one angry reporter can inflate the queue.
 - Log the case id, the tenant and the content id — never the detail text, which is report content
   about a person.
 
 **Failure mode the checks target.** A report is a claim about someone else's content, so the
 endpoint is a trust boundary: the tenant must own the content, the reason must be a real reason,
 the detail must be bounded, and a repeat report is a signal on an existing case, not a new one. The
-draft fails all four because the demo only ever sends well-formed reports from the content owner.`,
+starter fails all four because the demo only ever sends well-formed reports from the content owner.`,
   sequence: {
     participants: ['Reporter', 'Moderation API', 'case store'],
     messages: [
@@ -62,7 +62,7 @@ draft fails all four because the demo only ever sends well-formed reports from t
       id: 'tenant-scope',
       title: 'Confines a report to content the tenant owns',
       detail:
-        'The content id is resolved against the tenant catalogue and a foreign or unknown id is **404**. The draft accepts any content id, so a tenant can report content it does not own and start a case against someone else.',
+        'The content id is resolved against the tenant catalogue and a foreign or unknown id is **404**. The starter accepts any content id, so a tenant can report content it does not own and start a case against someone else.',
       match: {
         python: {all: [/CONTENT_TENANTS/, /belongs_to\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/CONTENT_TENANTS/, /belongsTo\(/, /code\(\s*404\s*\)/]},
@@ -75,7 +75,7 @@ draft fails all four because the demo only ever sends well-formed reports from t
       id: 'reason-allowlist',
       title: 'Rejects a reason outside the allowlist',
       detail:
-        'Only `spam`, `harassment`, `hate`, `self_harm` and `csam` are accepted; anything else is **400**. The draft maps an unknown reason to `other`, so a typo becomes a real moderation case with no rule behind it.',
+        'Only `spam`, `harassment`, `hate`, `self_harm` and `csam` are accepted; anything else is **400**. The starter maps an unknown reason to `other`, so a typo becomes a real moderation case with no rule behind it.',
       match: {
         python: {all: [/ALLOWED_REASONS/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_REASONS/, /code\(\s*400\s*\)/]},
@@ -88,7 +88,7 @@ draft fails all four because the demo only ever sends well-formed reports from t
       id: 'detail-cap',
       title: 'Caps the optional detail at 4 KiB',
       detail:
-        'A `detail` longer than **4096 bytes** is **413**. The draft never measures it, so one report can push an unbounded and highly personal free-text field into the case store and every downstream record.',
+        'A `detail` longer than **4096 bytes** is **413**. The starter never measures it, so one report can push an unbounded and highly personal free-text field into the case store and every downstream record.',
       match: {
         python: {all: [/MAX_DETAIL_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_DETAIL_BYTES/, /code\(\s*413\s*\)/]},
@@ -101,7 +101,7 @@ draft fails all four because the demo only ever sends well-formed reports from t
       id: 'dedupe',
       title: 'Updates the reporter’s existing case instead of creating a second',
       detail:
-        'The lookup on `(tenant, content_id, reporter_id)` runs first; a hit updates that case and answers `status: "updated"`, a miss inserts and answers `status: "created"`. The draft always inserts, so a reporter who reports twice creates two cases for one item.',
+        'The lookup on `(tenant, content_id, reporter_id)` runs first; a hit updates that case and answers `status: "updated"`, a miss inserts and answers `status: "created"`. The starter always inserts, so a reporter who reports twice creates two cases for one item.',
       match: {
         python: {all: [/cases\.find\(/, /cases\.update\(/, /"updated"/]},
         typescript: {all: [/cases\.find\(/, /cases\.update\(/, /'updated'/]},
@@ -147,7 +147,7 @@ def create_report(
     tenant: str = Header(alias="X-Tenant-Id"),
     reporter_id: str = Header(alias="X-Reporter-Id"),
 ) -> JSONResponse:
-    # TODO: this draft accepts content ids from any tenant, lets unknown reasons through as
+    # TODO: this starter accepts content ids from any tenant, lets unknown reasons through as
     # "other", never caps the detail, and mints a new case for every duplicate report. Fix all four.
     reason = body.reason or REASON_FALLBACK
     case_id = str(uuid.uuid4())
@@ -241,7 +241,7 @@ def create_report(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/reports: a model-generated draft that trusts the body and duplicates cases. */
+      starter: `/** POST /v1/reports: flawed code that trusts the body and duplicates cases. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -265,7 +265,7 @@ export const cases: CaseStore = {
 };
 
 app.post('/v1/reports', async (request, reply) => {
-  // TODO: this draft accepts content ids from any tenant, lets unknown reasons through as
+  // TODO: this starter accepts content ids from any tenant, lets unknown reasons through as
   // "other", never caps the detail, and mints a new case for every duplicate report. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const reporterId = request.headers['x-reporter-id'] as string;
@@ -402,7 +402,7 @@ func createReport(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts content ids from any tenant, lets unknown reasons through as
+	// TODO: this starter accepts content ids from any tenant, lets unknown reasons through as
 	// "other", never caps the detail, and mints a new case for every duplicate report.
 	reason := body.Reason
 	if reason == "" {
@@ -558,7 +558,7 @@ object ReportApi {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
           optionalHeaderValueByName("X-Reporter-Id") { reporterOpt =>
             entity(as[ReportRequest]) { body =>
-              // TODO: this draft accepts content ids from any tenant, lets unknown reasons through
+              // TODO: this starter accepts content ids from any tenant, lets unknown reasons through
               // as "other", never caps the detail, and mints a new case for every duplicate report.
               val reason = if (body.reason.nonEmpty) body.reason else ReasonFallback
               val caseId = UUID.randomUUID().toString
@@ -676,7 +676,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts content ids from any tenant, lets unknown reasons through as
+    // TODO: this starter accepts content ids from any tenant, lets unknown reasons through as
     // "other", never caps the detail, and mints a new case for every duplicate report.
     auto reason = body.value("reason", std::string());
     if (reason.empty()) reason = kReasonFallback;
@@ -789,5 +789,5 @@ int main() {
     'The dedupe lookup is keyed by `(tenant, content_id, reporter_id)` and runs before the insert. A hit means this reporter already has a case on this item: update the reason and detail, bump the case, and answer `status: "updated"` instead of minting a second row.',
     'The detail is report content about a person, so it is both bounded and never logged: measure its UTF-8 bytes against 4096 and log the case id, the tenant and the content id. `logger.info(..., body.detail)` ships a private statement into every log sink.',
   ],
-  debrief: `The interviewer is testing whether you treat a report as a claim, not as trusted input. The draft reads fine because the demo reports the tenant's own content with a valid reason, once. Four defects are being checked: ownership (a tenant can only report its own content — anything else is a 404, not a 403 that confirms the content exists), a closed reason set, a byte cap on the free text, and per-reporter uniqueness that turns a repeat report into a signal on an existing case rather than queue inflation. Real systems add rate limits per reporter, a hashed content fingerprint for cross-tenant detection, and a separate store for the sensitive detail so it can be sealed and audited apart from the case metadata.`,
+  debrief: `The interviewer is testing whether you treat a report as a claim, not as trusted input. The starter reads fine because the demo reports the tenant's own content with a valid reason, once. Four defects are being checked: ownership (a tenant can only report its own content — anything else is a 404, not a 403 that confirms the content exists), a closed reason set, a byte cap on the free text, and per-reporter uniqueness that turns a repeat report into a signal on an existing case rather than queue inflation. Real systems add rate limits per reporter, a hashed content fingerprint for cross-tenant detection, and a separate store for the sensitive detail so it can be sealed and audited apart from the case metadata.`,
 };

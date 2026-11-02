@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Synthetic data on the AI-era track: the course is not "call a model and write the rows out", it is
- * the review you owe a generated dataset before anyone trains on it. Licensed, versioned seeds with
+ * Synthetic data: the course is not "call a model and write the rows out", it is the debugging
+ * you owe a generation pipeline before anyone trains on its output. Licensed, versioned seeds with
  * a service-enforced cap → per-entity diversity windows in Redis → judge calls that park a timeout
  * instead of admitting it → recipe-keyed record events carrying digests and scores → a provenance
- * report a reviewer can trace back to the seed.
+ * report a data reviewer can trace back to the seed.
  */
 export const syntheticDataProblem: Problem = {
   id: 'synthetic-data',
@@ -19,7 +19,7 @@ export const syntheticDataProblem: Problem = {
   tagline: 'Generate training data from seeds with diversity, dedupe and honest provenance.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Synthetic Data
 
@@ -65,12 +65,12 @@ One service, **synthd**, with five pieces:
    counts plus per-entity coverage and the judge version, where every admitted record resolves to a
    seed digest.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real data pipeline: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

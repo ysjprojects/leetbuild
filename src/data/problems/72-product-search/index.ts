@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Product search on the AI-era track: the course is not "call an index from an endpoint", it is the
- * review you owe a model-generated search service before it answers a tenant's catalog queries.
- * A bounded query DSL with an allowlisted filter surface → one Redis cache whose key covers every
- * input that changes results → a gRPC fan-out that cuts slow shards at a deadline and is honest
- * about partial answers → tenant-keyed telemetry that carries a query hash and updates counters
- * before the offset commit → a product read that refuses to serve a price the catalog has moved past.
+ * Product search: the course is not "call an index from an endpoint", it is the debugging you owe
+ * a search service before it answers a tenant's catalog queries. A bounded query DSL with an
+ * allowlisted filter surface → one Redis cache whose key covers every input that changes results →
+ * a gRPC fan-out that cuts slow shards at a deadline and is honest about partial answers →
+ * tenant-keyed telemetry that carries a query hash and updates counters before the offset commit →
+ * a product read that refuses to serve a price the catalog has moved past.
  */
 export const productSearchProblem: Problem = {
   id: 'product-search',
@@ -20,7 +20,6 @@ export const productSearchProblem: Problem = {
   tagline: 'Catalog search with bounded queries, scoped caches and honest partial results.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Product Search
 
@@ -65,12 +64,12 @@ One service, **searchd**, with five pieces:
    index version trails the current snapshot by more than five minutes, and \`404\` for a product id
    that is not in the caller's catalog.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the demo,
-and it sounds confident. Your job in every step is the job you will have on a real search feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real search feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

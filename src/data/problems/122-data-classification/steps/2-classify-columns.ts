@@ -8,9 +8,9 @@ export const classifyColumnsStep: Step = {
   focus: ['metasense', 'llm'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds the prompt, calls
+**Starting point.** The starter is working code: it builds the prompt, calls
 the gateway and parses the JSON the model returns, so the demo tags a ten-column table correctly.
-It hides five production flaws. Review it like the owner of the model bill and the tag library,
+It hides five production flaws. Debug it like the owner of the model bill and the tag library,
 fix it, and prove the fix.
 
 Implement \`classify_columns(entity, columns)\` for the classifier worker. The LLM gateway exposes
@@ -59,7 +59,7 @@ it looks like a classification and is not one.`,
       id: 'token-batches',
       title: 'Batches columns under a 3000-token prompt budget',
       detail:
-        'A `MAX_PROMPT_TOKENS = 3000` constant and an `estimate_tokens` helper split the columns into several prompts. The draft sends every column in one call, however wide the table.',
+        'A `MAX_PROMPT_TOKENS = 3000` constant and an `estimate_tokens` helper split the columns into several prompts. The starter sends every column in one call, however wide the table.',
       match: {
         python: {all: [/MAX_PROMPT_TOKENS\s*=\s*3000/, /estimate_tokens\(/]},
         typescript: {all: [/MAX_PROMPT_TOKENS\s*=\s*3000/, /estimateTokens\(/]},
@@ -85,7 +85,7 @@ it looks like a classification and is not one.`,
       id: 'retry-once',
       title: 'Two attempts per batch, retrying only UNAVAILABLE',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retried; every other status fails the batch. The draft makes one unguarded call, or loops on everything.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` is retried; every other status fails the batch. The starter makes one unguarded call, or loops on everything.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*2/, /range\(MAX_ATTEMPTS\)/, /StatusCode\.UNAVAILABLE/],
@@ -110,7 +110,7 @@ it looks like a classification and is not one.`,
       id: 'taxonomy',
       title: 'Rejects tags outside the taxonomy',
       detail:
-        'A `TAXONOMY` set names the five allowed tags and every model tag is checked against it; an unknown tag becomes `None` with confidence 0. The draft stores whatever string the model returned.',
+        'A `TAXONOMY` set names the five allowed tags and every model tag is checked against it; an unknown tag becomes `None` with confidence 0. The starter stores whatever string the model returned.',
       match: {
         python: {all: [/TAXONOMY\s*=/, /not in TAXONOMY/]},
         typescript: {all: [/const TAXONOMY/, /TAXONOMY\[\w+\]\s*!==\s*true/]},
@@ -123,7 +123,7 @@ it looks like a classification and is not one.`,
       id: 'defensive-parse',
       title: 'Parses the model reply defensively',
       detail:
-        'Invalid JSON fails the batch instead of crashing the worker, the array shape is checked, and the tag of each requested column is looked up with a default rather than indexed. The draft indexes the parsed array as if it were well-formed.',
+        'Invalid JSON fails the batch instead of crashing the worker, the array shape is checked, and the tag of each requested column is looked up with a default rather than indexed. The starter indexes the parsed array as if it were well-formed.',
       match: {
         python: {all: [/JSONDecodeError/, /isinstance\(\s*\w+,\s*list\s*\)/, /\.get\(\s*["']assigned_tag["']/]},
         typescript: {all: [/catch/, /Array\.isArray\(/, /\.get\(/]},
@@ -159,8 +159,8 @@ def build_prompt(entity: str, columns: list[str]) -> str:
 
 
 def classify_columns(entity: str, columns: list[str]) -> list[dict]:
-    # TODO: this draft sends every column in one prompt, calls without a deadline, never retries
-    # a flaky gateway, trusts the JSON shape and keeps any tag the model invents. Review all five.
+    # TODO: this starter sends every column in one prompt, calls without a deadline, never retries
+    # a flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
     request = classifier_pb2.ClassifyRequest(entity=entity, prompt=build_prompt(entity, columns))
     reply = classifier.Classify(request)
     data = json.loads(reply.content)
@@ -269,7 +269,7 @@ def classify_columns(entity: str, columns: list[str]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** Classify: a model-generated draft that sends one prompt and keeps whatever comes back. */
+      starter: `/** Classify: flawed code that sends one prompt and keeps whatever comes back. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -302,8 +302,8 @@ function buildPrompt(entity: string, columns: string[]): string {
 }
 
 export async function classifyColumns(entity: string, columns: string[]): Promise<ColumnTag[]> {
-  // TODO: this draft sends every column in one prompt, calls without a deadline, never retries
-  // a flaky gateway, trusts the JSON shape and keeps any tag the model invents. Review all five.
+  // TODO: this starter sends every column in one prompt, calls without a deadline, never retries
+  // a flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
   const reply = await new Promise<{content: string}>((resolve, reject) => {
     classifier.Classify({entity, prompt: buildPrompt(entity, columns)}, (error, result) =>
       error ? reject(error) : resolve(result),
@@ -478,8 +478,8 @@ func buildPrompt(entity string, columns []string) string {
 	return b.String()
 }
 
-// TODO: this draft sends every column in one prompt, calls without a deadline, never retries a
-// flaky gateway, trusts the JSON shape and keeps any tag the model invents. Review all five.
+// TODO: this starter sends every column in one prompt, calls without a deadline, never retries a
+// flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
 func classifyColumns(ctx context.Context, client pb.ClassifierClient, entity string, columns []string) ([]ColumnTag, error) {
 	reply, err := client.Classify(ctx, &pb.ClassifyRequest{Entity: entity, Prompt: buildPrompt(entity, columns)})
 	if err != nil {
@@ -670,8 +670,8 @@ object ClassifyColumns {
     s"""$PromptHeader These columns belong to the "$entity" table\\n""" + lines.mkString("\\n")
   }
 
-  // TODO: this draft sends every column in one prompt, calls without a deadline, never retries a
-  // flaky gateway, trusts the JSON shape and keeps any tag the model invents. Review all five.
+  // TODO: this starter sends every column in one prompt, calls without a deadline, never retries a
+  // flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
   def classifyColumns(entity: String, columns: List[String]): List[ColumnTag] = {
     val reply = stub.classify(ClassifyRequest(entity = entity, prompt = buildPrompt(entity, columns)))
     reply.content.parseJson.asInstanceOf[JsArray].elements.toList.map { element =>
@@ -805,8 +805,8 @@ std::string buildPrompt(const std::string& entity, const std::vector<std::string
   return prompt;
 }
 
-// TODO: this draft sends every column in one prompt, calls without a deadline, never retries a
-// flaky gateway, trusts the JSON shape and keeps any tag the model invents. Review all five.
+// TODO: this starter sends every column in one prompt, calls without a deadline, never retries a
+// flaky gateway, trusts the JSON shape and keeps any tag the model invents. Fix all five.
 std::vector<ColumnTag> classifyColumns(Classifier::Stub* stub, const std::string& entity,
                                        const std::vector<std::string>& columns) {
   grpc::ClientContext ctx;
@@ -950,5 +950,5 @@ std::vector<ColumnTag> classifyColumns(Classifier::Stub* stub, const std::string
 `,
     },
   },
-  debrief: `The interviewer is testing whether you treat a model's output as input. The draft trusts three things at once: that the prompt fits (it does not, past a few hundred columns — the source's team split tables at 150 for exactly this reason), that the reply is the JSON the prompt asked for (usually; not always), and that the string in \`assigned_tag\` is a tag (the model is told the library, not bound by it). Five separate defects are being checked: the token-budgeted batches, the per-call deadline, the bounded retry that only follows \`UNAVAILABLE\`, the closed taxonomy, and the defensive parse that maps each *requested* column to a tag instead of each returned row. The taxonomy is the one that matters most downstream: the tier rules in step 4 are written against five names, so an unknown tag is not a classification, it is a gap that looks filled. Real classifiers add the few-shot example from the source's prompt, a confidence threshold below which the owner is asked rather than told, and a second, PII-only pass with the 8-tag prompt Metasense V2 describes.`,
+  debrief: `The interviewer is testing whether you treat a model's output as input. The starter trusts three things at once: that the prompt fits (it does not, past a few hundred columns — the source's team split tables at 150 for exactly this reason), that the reply is the JSON the prompt asked for (usually; not always), and that the string in \`assigned_tag\` is a tag (the model is told the library, not bound by it). Five separate defects are being checked: the token-budgeted batches, the per-call deadline, the bounded retry that only follows \`UNAVAILABLE\`, the closed taxonomy, and the defensive parse that maps each *requested* column to a tag instead of each returned row. The taxonomy is the one that matters most downstream: the tier rules in step 4 are written against five names, so an unknown tag is not a classification, it is a gap that looks filled. Real classifiers add the few-shot example from the source's prompt, a confidence threshold below which the owner is asked rather than told, and a second, PII-only pass with the 8-tag prompt Metasense V2 describes.`,
 };

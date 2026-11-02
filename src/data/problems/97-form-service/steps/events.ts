@@ -8,14 +8,14 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'outbox'],
   task: `## Task
 
-The starter is a plausible model-generated draft: one submission produces one event, the consumer
+**Starting point.** The starter is working code: one submission produces one event, the consumer
 sees it, and the demo ends. The event itself hides three problems — the partition key, the payload
-and the failure path. Review it, fix it, and prove the fix.
+and the failure path. Debug it, fix it, and prove the fix.
 
 Every accepted submission publishes one \`form.submission\` event:
 
 - The event key is the **form id**, so every event for one form lands on one partition and a form's
-  intake stays in order. The draft keys by the submitter, so one form's events scatter across
+  intake stays in order. The starter keys by the submitter, so one form's events scatter across
   partitions and a consumer sees submission 2 before submission 1.
 - The event carries **field names and a value hash**, never raw values. A topic is retained and
   replicated, so publishing the raw fields — including email addresses — ships personal data into
@@ -24,7 +24,7 @@ Every accepted submission publishes one \`form.submission\` event:
 - The producer is configured for durable delivery (\`acks=all\`, and idempotence where the client
   supports it) so a retry does not publish the same event twice.
 - When the produce is **rejected**, the event is not dropped: an **outbox row** records the topic,
-  key and payload so a relay can publish it once the broker recovers. The draft has no outbox, so a
+  key and payload so a relay can publish it once the broker recovers. The starter has no outbox, so a
   broker outage silently loses every submission event.
 
 **Failure mode the checks target.** A submitter-keyed topic breaks per-form ordering; raw values in a
@@ -52,7 +52,7 @@ produce loses the event — the submission is stored but nothing downstream ever
       id: 'form-key',
       title: 'Keys the event by the form id',
       detail:
-        'The produce key is the form id, so all events for one form share a partition and stay ordered. The draft keys by the submitter, so one form’s events scatter and arrive out of order.',
+        'The produce key is the form id, so all events for one form share a partition and stay ordered. The starter keys by the submitter, so one form’s events scatter and arrive out of order.',
       match: {
         python: {all: [/"form\.submission"/, /key=form_id/], none: [/submitter/]},
         typescript: {all: [/'form\.submission'/, /key: formId/], none: [/submitter/]},
@@ -65,7 +65,7 @@ produce loses the event — the submission is stored but nothing downstream ever
       id: 'value-hash',
       title: 'Carries a value hash instead of the values',
       detail:
-        'The payload holds a SHA-256 `value_hash` of the canonicalised field values. The draft publishes the raw values, so a retained topic carries the submitter’s personal data.',
+        'The payload holds a SHA-256 `value_hash` of the canonicalised field values. The starter publishes the raw values, so a retained topic carries the submitter’s personal data.',
       match: {
         python: {all: [/value_hash/, /sha256/]},
         typescript: {all: [/valueHash/, /createHash/]},
@@ -78,7 +78,7 @@ produce loses the event — the submission is stored but nothing downstream ever
       id: 'no-raw-values',
       title: 'Publishes field names, never raw field values',
       detail:
-        'The event names the fields it received rather than copying their values. The draft serialises the raw field map straight into the topic.',
+        'The event names the fields it received rather than copying their values. The starter serialises the raw field map straight into the topic.',
       match: {
         python: {all: [/field_names/], none: [/raw_payload/]},
         typescript: {all: [/fieldNames/], none: [/rawPayload/]},
@@ -104,7 +104,7 @@ produce loses the event — the submission is stored but nothing downstream ever
       id: 'outbox-on-reject',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce leaves a durable outbox row so a relay can publish it later. The draft drops the event when the broker rejects it.',
+        'A rejected produce leaves a durable outbox row so a relay can publish it later. The starter drops the event when the broker rejects it.',
       match: {
         python: {all: [/outbox/]},
         typescript: {all: [/outbox/]},
@@ -134,7 +134,7 @@ def raw_payload(fields: dict) -> str:
 
 @app.post("/v1/forms/{form_id}/submissions")
 def submit(form_id: str, body: dict) -> dict:
-    # TODO: this draft keys by the submitter (so one form's intake scatters across partitions),
+    # TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
     # publishes the raw field values — including email addresses — into a retained topic, and has no
     # outbox: when the produce is rejected the event is simply lost.
     submission_id = "sub_" + str(len(submissions) + 1)
@@ -201,7 +201,7 @@ def submit(form_id: str, body: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Publishes one form.submission event per accepted submission — a model-generated draft. */
+      starter: `/** Publishes one form.submission event per accepted submission — flawed code. */
 import {Kafka} from 'kafkajs';
 import Fastify from 'fastify';
 
@@ -216,7 +216,7 @@ function rawPayload(fields: Record<string, unknown>): string {
 }
 
 app.post('/v1/forms/:id/submissions', async (req, reply) => {
-  // TODO: this draft keys by the submitter (so one form's intake scatters across partitions),
+  // TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
   // publishes the raw field values — including email addresses — into a retained topic, and has no
   // outbox: when the produce is rejected the event is simply lost.
   const {id} = req.params as {id: string};
@@ -297,7 +297,7 @@ func rawPayload(fields map[string]string) string {
 }
 
 func Submit(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft keys by the submitter (so one form's intake scatters across partitions),
+	// TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
 	// publishes the raw field values — including email addresses — into a retained topic, and has no
 	// outbox: when the produce is rejected the event is simply lost.
 	var body struct {
@@ -420,7 +420,7 @@ object Events {
   val routes: Route = path("v1" / "forms" / Segment / "submissions") { _ =>
     post {
       entity(as[String]) { _ =>
-        // TODO: this draft keys by the submitter (so one form's intake scatters across partitions),
+        // TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
         // publishes the raw field values — including email addresses — into a retained topic, and has
         // no outbox: when the produce is rejected the event is simply lost.
         val submitter = "anonymous"
@@ -504,7 +504,7 @@ std::string RawPayload(const std::map<std::string, std::string>& fields) {
 
 void RegisterRoutes(httplib::Server& svr, RdKafka::Producer& producer) {
   svr.Post("/v1/forms/([^/]+)/submissions", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft keys by the submitter (so one form's intake scatters across partitions),
+    // TODO: this starter keys by the submitter (so one form's intake scatters across partitions),
     // publishes the raw field values — including email addresses — into a retained topic, and has no
     // outbox: when the produce is rejected the event is simply lost.
     const std::string submitter = "anonymous";

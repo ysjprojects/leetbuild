@@ -43,13 +43,13 @@ export const readStep: Step = {
   },
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. A model version that shipped an hour ago
+**Starting point.** You are the AI platform engineer on call. A model version that shipped an hour ago
 already shows a healthy satisfaction score, because the endpoint aggregated all time and inherited the
-previous model's reputation. The model-generated handler below also serves a cached score that never
+previous model's reputation. The handler below also serves a cached score that never
 refreshes after a bad release, and it lets the caller pass \`?window=all\` to choose whatever sample set
 flatters the number.
 
-Review \`read\` and make the score honest.
+Debug \`read\` and make the score honest.
 
 - Route \`GET /v1/models/{version}/satisfaction\`. The window comes from a documented set — \`1h\`, \`24h\`,
   \`7d\` (default \`24h\`) — and anything else is \`400\`; a caller must not be able to shrink the sample
@@ -163,9 +163,9 @@ satisfaction = SatisfactionStore()
 
 @app.get("/v1/models/{version}/satisfaction")
 def read_satisfaction(version: str, window: str = "all") -> JSONResponse:
-    # TODO: this draft serves a cache that never expires after a bad release, aggregates over all
+    # TODO: this starter serves a cache that never expires after a bad release, aggregates over all
     # time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-    # sample set. Review all three.
+    # sample set. Fix all three.
     if version in SCORE_CACHE:
         return JSONResponse(SCORE_CACHE[version])
     counts = satisfaction.all_time_totals(version)
@@ -271,9 +271,9 @@ export class SatisfactionStore {
 export const satisfaction = new SatisfactionStore();
 
 app.get('/v1/models/:version/satisfaction', async (request, reply) => {
-  // TODO: this draft serves a cache that never expires after a bad release, aggregates over all
+  // TODO: this starter serves a cache that never expires after a bad release, aggregates over all
   // time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-  // sample set. Review all three.
+  // sample set. Fix all three.
   const {version} = request.params as {version: string};
   const window = (request.query as {window?: string}).window ?? 'all';
   const hit = SCORE_CACHE.get(version);
@@ -386,9 +386,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readSatisfaction(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves a cache that never expires after a bad release, aggregates over all
+	// TODO: this starter serves a cache that never expires after a bad release, aggregates over all
 	// time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-	// sample set. Review all three.
+	// sample set. Fix all three.
 	version := r.PathValue("version")
 	window := r.URL.Query().Get("window")
 	if window == "" {
@@ -527,9 +527,9 @@ object SatisfactionApi {
     path("v1" / "models" / Segment / "satisfaction") { version =>
       get {
         parameter("window".?) { windowOpt =>
-          // TODO: this draft serves a cache that never expires after a bad release, aggregates over
+          // TODO: this starter serves a cache that never expires after a bad release, aggregates over
           // all time so a fresh version inherits an old model's reputation, and lets ?window=
-          // shrink the sample set. Review all three.
+          // shrink the sample set. Fix all three.
           scoreCache.get(version) match {
             case Some(body) =>
               complete(StatusCodes.OK, body)
@@ -641,9 +641,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/models/([^/]+)/satisfaction)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves a cache that never expires after a bad release, aggregates over all
+    // TODO: this starter serves a cache that never expires after a bad release, aggregates over all
     // time so a fresh version inherits an old model's reputation, and lets ?window= shrink the
-    // sample set. Review all three.
+    // sample set. Fix all three.
     const std::string version = req.matches[1];
     const auto hit = scoreCache.find(version);
     if (hit != scoreCache.end()) {

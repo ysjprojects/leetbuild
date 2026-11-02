@@ -8,9 +8,9 @@ export const bookingEventsStep: Step = {
   focus: ['api', 'kafka', 'db', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds a producer, assembles
+**Starting point.** The starter is working code: it builds a producer, assembles
 a payload and publishes. Downstream calendars consume the same topic, so every mistake here becomes
-somebody else's wrong schedule. Review it like the service owner, fix it, and prove the fix with the
+somebody else's wrong schedule. Debug it like the service owner, fix it, and prove the fix with the
 checks below.
 
 Publish \`booking.event\` for the create, reschedule and cancel transitions of a booking.
@@ -33,7 +33,7 @@ Publish \`booking.event\` for the create, reschedule and cancel transitions of a
   relay publish it later. No booking may vanish from a downstream calendar because the broker was
   briefly unreachable.
 
-**Failure mode the checks target.** The draft keys by customer (one resource's schedule arrives
+**Failure mode the checks target.** The starter keys by customer (one resource's schedule arrives
 interleaved), publishes before the booking is committed (a phantom event when the commit then fails),
 drops the hold id, and neither waits for the ack nor writes an outbox row.`,
   sequence: {
@@ -53,7 +53,7 @@ drops the hold id, and neither waits for the ack nor writes an outbox row.`,
       id: 'resource-key',
       title: 'Keys booking.event by the resource id',
       detail:
-        'The record key is the resource id, so one resource’s schedule stays in one partition in order. The draft keys by customer, which interleaves every resource that customer ever books.',
+        'The record key is the resource id, so one resource’s schedule stays in one partition in order. The starter keys by customer, which interleaves every resource that customer ever books.',
       match: {
         python: {all: [/TOPIC\s*=\s*"booking\.event"/, /key=booking\["resource_id"\]/]},
         typescript: {all: [/TOPIC\s*=\s*'booking\.event'/, /key:\s*booking\.resourceId/]},
@@ -66,7 +66,7 @@ drops the hold id, and neither waits for the ack nor writes an outbox row.`,
       id: 'event-payload',
       title: 'Carries the range and the hold id',
       detail:
-        'The payload names the `hold_id` and a `range` object, so a downstream calendar can replay the event idempotently. The draft sends a flat start/end pair, no hold id, and the customer id.',
+        'The payload names the `hold_id` and a `range` object, so a downstream calendar can replay the event idempotently. The starter sends a flat start/end pair, no hold id, and the customer id.',
       match: {
         python: {all: [/hold_id/, /"range"/]},
         typescript: {all: [/hold_id/, /range:\s*\{/]},
@@ -79,7 +79,7 @@ drops the hold id, and neither waits for the ack nor writes an outbox row.`,
       id: 'publish-after-commit',
       title: 'Commits the booking before publishing its event',
       detail:
-        'The booking is committed first and the event is produced after, so there is never an event for a booking nobody can read. The draft produces first and commits later — or never.',
+        'The booking is committed first and the event is produced after, so there is never an event for a booking nobody can read. The starter produces first and commits later — or never.',
       match: {
         python: {order: [/commit_booking\(/, /producer\.send\(/]},
         typescript: {order: [/commitBooking\(/, /producer\.send\(/]},
@@ -92,7 +92,7 @@ drops the hold id, and neither waits for the ack nor writes an outbox row.`,
       id: 'acks-idempotent',
       title: 'Configures an idempotent producer with acks=all',
       detail:
-        'The producer waits for every in-sync replica and enables idempotence, so a produce retried after a timeout cannot duplicate an event. The draft sets neither.',
+        'The producer waits for every in-sync replica and enables idempotence, so a produce retried after a timeout cannot duplicate an event. The starter sets neither.',
       match: {
         python: {all: [/acks="all"/, /enable_idempotence=True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
@@ -105,7 +105,7 @@ drops the hold id, and neither waits for the ack nor writes an outbox row.`,
       id: 'outbox-on-failure',
       title: 'Waits for the broker ack and falls back to the outbox',
       detail:
-        'The produce is awaited, and a failure inserts an outbox row with the topic, the key and the payload so a relay can publish it later. The draft fires and forgets.',
+        'The produce is awaited, and a failure inserts an outbox row with the topic, the key and the payload so a relay can publish it later. The starter fires and forgets.',
       match: {
         python: {all: [/outbox\.insert\(/, /except/, /\.get\(timeout=/]},
         typescript: {all: [/outbox\.insert\(/, /catch/, /await producer\.send\(/]},
@@ -131,7 +131,7 @@ def build_producer(bootstrap):
 
 
 def publish_event(producer, booking, event_type: str) -> None:
-    # TODO: this draft keys by customer, drops the hold id, publishes before the booking is
+    # TODO: this starter keys by customer, drops the hold id, publishes before the booking is
     # committed, and never checks whether the broker accepted the produce. Key by the resource,
     # carry the range and the hold id, commit first, and write an outbox row on failure.
     payload = {
@@ -198,7 +198,7 @@ export async function publishEvent(
   booking: Booking,
   eventType: string,
 ): Promise<void> {
-  // TODO: this draft keys by customer, drops the hold id, publishes before the booking is
+  // TODO: this starter keys by customer, drops the hold id, publishes before the booking is
   // committed, and never checks whether the broker accepted the produce. Key by the resource,
   // carry the range and the hold id, commit first, and write an outbox row on failure.
   const payload = {
@@ -274,7 +274,7 @@ func buildWriter(brokers []string) *kafka.Writer {
 }
 
 func publishEvent(ctx context.Context, writer *kafka.Writer, booking Booking, eventType string) error {
-	// TODO: this draft keys by customer, drops the hold id, publishes before the booking is
+	// TODO: this starter keys by customer, drops the hold id, publishes before the booking is
 	// committed, and never checks whether the broker accepted the produce. Key by the resource,
 	// carry the range and the hold id, commit first, and write an outbox row on failure.
 	payload, err := json.Marshal(map[string]any{
@@ -362,7 +362,7 @@ object BookingEvents {
   }
 
   def publishEvent(producer: KafkaProducer[String, String], booking: Booking, eventType: String): Unit = {
-    // TODO: this draft keys by customer, drops the hold id, publishes before the booking is
+    // TODO: this starter keys by customer, drops the hold id, publishes before the booking is
     // committed, and never checks whether the broker accepted the produce. Key by the resource,
     // carry the range and the hold id, commit first, and write an outbox row on failure.
     val payload = Map(
@@ -442,7 +442,7 @@ RdKafka::Producer* buildProducer(const std::string& brokers) {
 }
 
 void publishEvent(RdKafka::Producer* producer, const Booking& booking, const std::string& eventType) {
-  // TODO: this draft keys by customer, drops the hold id, publishes before the booking is
+  // TODO: this starter keys by customer, drops the hold id, publishes before the booking is
   // committed, and never checks whether the broker accepted the produce. Key by the resource,
   // carry the range and the hold id, commit first, and write an outbox row on failure.
   const std::string payload = "{\\"type\\":\\"" + eventType + "\\",\\"booking_id\\":\\"" + booking.booking_id +

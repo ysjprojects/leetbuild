@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'hub', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a health response comes back and the dashboard
+**Starting point.** The starter is working code: a health response comes back and the dashboard
 shows a green connector. It authorizes nothing, it measures the wrong clock, and it hides the reason
 a connector is failing. Find the flaws, fix them, and prove the fix.
 
@@ -16,7 +16,7 @@ Implement \`GET /v1/connectors/{id}/health\`, the endpoint on-call alerts on:
 
 - The connector is authorized against the **authenticated tenant**: a connector that belongs to
   another tenant, or does not exist, answers **404** — the same answer for both, so ids cannot be
-  probed. The draft serves any id in the path.
+  probed. The starter serves any id in the path.
 - The read reports **last successful page time** (\`last_success_at\`), the **cursor lag**
   (\`cursor_lag_s = now − last_success_at\`), \`consecutive_failures\`, \`breaker\` state and the
   connector's \`sync_interval_s\`.
@@ -67,7 +67,7 @@ looks like a read-only status page.`,
       id: 'tenant-scope',
       title: 'Scopes the health read to the authenticated tenant',
       detail:
-        'The connector is authorized against the request tenant before its health is read, and a foreign or unknown connector answers **404**. The draft serves any connector id in the path.',
+        'The connector is authorized against the request tenant before its health is read, and a foreign or unknown connector answers **404**. The starter serves any connector id in the path.',
       match: {
         python: {all: [/owner_of\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/ownerOf\(/, /code\(\s*404\s*\)/]},
@@ -80,7 +80,7 @@ looks like a read-only status page.`,
       id: 'stale-unhealthy',
       title: 'Turns unhealthy a page-lag behind, not a run behind',
       detail:
-        'The verdict is measured from the last **successful** page against `STALE_INTERVALS = 2` sync intervals, and reports `unhealthy` when the lag exceeds it. The draft measures from `last_run_at`, which moves on every failed attempt, so a connector that syncs nothing reads healthy forever.',
+        'The verdict is measured from the last **successful** page against `STALE_INTERVALS = 2` sync intervals, and reports `unhealthy` when the lag exceeds it. The starter measures from `last_run_at`, which moves on every failed attempt, so a connector that syncs nothing reads healthy forever.',
       match: {
         python: {all: [/STALE_INTERVALS\s*=\s*2/, /last_success_at/, /unhealthy/]},
         typescript: {all: [/STALE_INTERVALS\s*=\s*2/, /lastSuccessAt/, /unhealthy/]},
@@ -93,7 +93,7 @@ looks like a read-only status page.`,
       id: 'breaker-state',
       title: 'Exposes the breaker state and the failure count',
       detail:
-        'The body carries `breaker` (`closed`/`open`) and `consecutive_failures`, so an operator can separate "waiting out a vendor outage" from "needs a human". The draft hides both.',
+        'The body carries `breaker` (`closed`/`open`) and `consecutive_failures`, so an operator can separate "waiting out a vendor outage" from "needs a human". The starter hides both.',
       match: {
         python: {all: [/consecutive_failures/, /breaker/]},
         typescript: {all: [/consecutive_failures/, /breaker/]},
@@ -106,7 +106,7 @@ looks like a read-only status page.`,
       id: 'lag-field',
       title: 'Reports the cursor lag against the sync interval',
       detail:
-        "`cursor_lag_s` is reported alongside the connector's `sync_interval_s`, so the lag means something to the person reading the alert. The draft reports only a run timestamp.",
+        "`cursor_lag_s` is reported alongside the connector's `sync_interval_s`, so the lag means something to the person reading the alert. The starter reports only a run timestamp.",
       match: {
         python: {all: [/cursor_lag_s/, /sync_interval_s/]},
         typescript: {all: [/cursor_lag_s/, /sync_interval_s/]},
@@ -134,7 +134,7 @@ class Health(BaseModel):
 
 @app.get("/v1/connectors/{id}/health")
 def health(id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft trusts the path id, judges freshness from last_run_at (which moves on every
+    # TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
     # failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
     # staleness from the last successful page against twice the sync interval, and expose the
     # breaker state.
@@ -202,7 +202,7 @@ def health(id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id
 `,
     },
     typescript: {
-      starter: `/** GET /v1/connectors/{id}/health: a model-generated draft that trusts the path id. */
+      starter: `/** GET /v1/connectors/{id}/health: flawed code that trusts the path id. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -210,7 +210,7 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/connectors/:id/health', async (request, reply) => {
-  // TODO: this draft trusts the path id, judges freshness from last_run_at (which moves on every
+  // TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
   // failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
   // staleness from the last successful page against twice the sync interval, and expose the breaker
   // state.
@@ -284,7 +284,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func health(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft trusts the path id, judges freshness from last_run_at (which moves on every
+	// TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
 	// failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
 	// staleness from the last successful page against twice the sync interval, and expose the
 	// breaker state.
@@ -426,7 +426,7 @@ object HealthApi {
     path("v1" / "connectors" / Segment / "health") {
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this draft trusts the path segment, judges freshness from last_run_at (which moves
+          // TODO: this starter trusts the path segment, judges freshness from last_run_at (which moves
           // on every failed attempt), and hides the breaker. Authorize the connector against the
           // tenant, measure staleness from the last successful page against twice the sync
           // interval, and expose the breaker state.
@@ -510,7 +510,7 @@ int main() {
   sw::redis::Redis redis("tcp://redis:6379");
 
   svr.Get("/v1/connectors/([^/]+)/health", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft trusts the path id, judges freshness from last_run_at (which moves on every
+    // TODO: this starter trusts the path id, judges freshness from last_run_at (which moves on every
     // failed attempt), and hides the breaker. Authorize the connector against the tenant, measure
     // staleness from the last successful page against twice the sync interval, and expose the
     // breaker state.
@@ -601,5 +601,5 @@ int main() {
     'Staleness is measured from the last **successful** page: `cursor_lag_s = now − last_success_at`, and the connector is `unhealthy` once that exceeds `STALE_INTERVALS × sync_interval_s`. `last_run_at` is the wrong clock — it moves on the runs that fail every page, which is exactly the connector the alert exists for.',
     'Return the shape an alert needs: `status`, `last_success_at`, `cursor_lag_s`, `consecutive_failures`, `breaker` and `sync_interval_s`. Exposing the breaker is what lets on-call tell a vendor outage (closed → open, backing off) from a connector that will never recover on its own.',
   ],
-  debrief: `The interview question is what a health endpoint is for. It is not a status page; it is the input an alert evaluates, so every field has to mean something the alert can act on. The draft fails three ways: it trusts the path so it leaks other tenants' lag, it measures freshness from the last run (a clock that a broken connector still advances), and it hides the breaker so a vendor outage and a dead connector look the same. The right verdict is lag against twice the configured interval, measured from the last page that actually landed, with the breaker state exposed beside the failure count. Real hubs add per-connector SLOs instead of a global interval, a scheduler heartbeat so a connector that is not even being attempted is unhealthy too, and a synthetic probe that syncs a sandbox vendor so the health read itself is monitored.`,
+  debrief: `The interview question is what a health endpoint is for. It is not a status page; it is the input an alert evaluates, so every field has to mean something the alert can act on. The starter fails three ways: it trusts the path so it leaks other tenants' lag, it measures freshness from the last run (a clock that a broken connector still advances), and it hides the breaker so a vendor outage and a dead connector look the same. The right verdict is lag against twice the configured interval, measured from the last page that actually landed, with the breaker state exposed beside the failure count. Real hubs add per-connector SLOs instead of a global interval, a scheduler heartbeat so a connector that is not even being attempted is unhealthy too, and a synthetic probe that syncs a sandbox vendor so the health read itself is monitored.`,
 };

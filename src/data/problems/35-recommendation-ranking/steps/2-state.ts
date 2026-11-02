@@ -8,15 +8,15 @@ export const stateStep: Step = {
   focus: ['recsvc', 'redis', 'features'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads the cached vector,
+**Starting point.** The starter is working code: it reads the cached vector,
 returns it on a hit, and on a miss asks the feature service once and writes the result back. It
-serves the demo, and it hides four production failures. Review it like the owner of the ranking
+serves the demo, and it hides four production failures. Debug it like the owner of the ranking
 path, fix it, and prove the fix with the checks below.
 
 Implement \`load_features(tenant, user)\`, the call the ranking path makes before it scores a
 request:
 
-- The vector is cached **per \`(tenant, user)\`** under \`features:{tenant}:{user}\`. The draft keys by
+- The vector is cached **per \`(tenant, user)\`** under \`features:{tenant}:{user}\`. The starter keys by
   the user id alone, so two tenants that happen to share a user id read each other's vector — a
   wrong ranking for one of them, served by both. The endpoint's **401** on a missing tenant and its
   **400** on a malformed body cannot see this: both requests are perfectly well-formed.
@@ -27,7 +27,7 @@ request:
   \`SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S\` (5 s) before calling the feature service.
   Every other caller **waits on the same published value** — sleep 50 ms, re-read
   \`features:{tenant}:{user}\`, repeat until it appears or the lock TTL passes — instead of calling
-  the feature service itself. The draft calls the service on every miss, so one slow second there
+  the feature service itself. The starter calls the service on every miss, so one slow second there
   becomes a thundering herd of identical calls.
 - Keep a **longer-lived stale copy** at \`features:stale:{tenant}:{user}\` (\`STALE_TTL_S = 86_400\`),
   written on every successful refresh. When the refresh fails, return that copy with \`stale=True\`
@@ -84,7 +84,7 @@ permanently stale key.`,
       id: 'ttl',
       title: 'Caches the vector with a 300 s TTL',
       detail:
-        'The fresh copy is written with `TTL_S = 300` (`ex=`/`EX`/`Expire`/`setex`), so a catalog change reaches the ranking within five minutes. The draft writes the vector with no expiry at all, so the first value a user ever gets is the one they keep.',
+        'The fresh copy is written with `TTL_S = 300` (`ex=`/`EX`/`Expire`/`setex`), so a catalog change reaches the ranking within five minutes. The starter writes the vector with no expiry at all, so the first value a user ever gets is the one they keep.',
       match: {
         python: {all: [/\bTTL_S = 300/, /r\.set\(key, blob, ex=TTL_S\)/]},
         typescript: {all: [/\bTTL_S = 300/, /r\.set\(key, blob, 'EX', TTL_S\)/]},
@@ -97,7 +97,7 @@ permanently stale key.`,
       id: 'tenant-key',
       title: 'Keys the cache by (tenant, user)',
       detail:
-        'The key is `features:{tenant}:{user}`: both ids are part of it. The draft keys by the user id alone, so two tenants that share a user id collide — the first writer wins and the second tenant is ranked from the first tenant’s vector.',
+        'The key is `features:{tenant}:{user}`: both ids are part of it. The starter keys by the user id alone, so two tenants that share a user id collide — the first writer wins and the second tenant is ranked from the first tenant’s vector.',
       match: {
         python: {all: [/features:\{tenant\}:\{user\}/], none: [/features:\{user\}/]},
         typescript: {all: [/features:\$\{tenant\}:\$\{user\}/], none: [/features:\$\{user\}/]},
@@ -110,7 +110,7 @@ permanently stale key.`,
       id: 'single-flight',
       title: 'Refreshes once per miss under concurrency',
       detail:
-        'The caller that wins `SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S` calls the feature service; every concurrent miss sleeps, re-reads the fresh key and waits for the value the winner publishes instead of calling the service too. The draft has no lock, so a cold key with N concurrent requests makes N identical calls.',
+        'The caller that wins `SET lock:features:{tenant}:{user} 1 NX EX LOCK_TTL_S` calls the feature service; every concurrent miss sleeps, re-reads the fresh key and waits for the value the winner publishes instead of calling the service too. The starter has no lock, so a cold key with N concurrent requests makes N identical calls.',
       match: {
         python: {
           all: [/nx=True/, /ex=LOCK_TTL_S/, /time\.sleep\(POLL_S\)/],
@@ -138,7 +138,7 @@ permanently stale key.`,
       id: 'stale-fallback',
       title: 'Serves the stale copy when the refresh fails',
       detail:
-        'A longer-lived stale copy `features:stale:{tenant}:{user}` (`STALE_TTL_S = 86_400`) is written on every successful refresh, and when the refresh fails the previous features are returned marked `stale=True` instead of empty ones. The draft has no stale copy at all and degrades to an empty vector.',
+        'A longer-lived stale copy `features:stale:{tenant}:{user}` (`STALE_TTL_S = 86_400`) is written on every successful refresh, and when the refresh fails the previous features are returned marked `stale=True` instead of empty ones. The starter has no stale copy at all and degrades to an empty vector.',
       match: {
         python: {all: [/STALE_TTL_S/, /features:stale:\{tenant\}:\{user\}/, /"stale": True/]},
         typescript: {all: [/STALE_TTL_S/, /features:stale:/, /stale: true/]},
@@ -184,9 +184,9 @@ features = FeatureService()
 
 
 def load_features(tenant: str, user: str) -> dict:
-    # TODO: this draft caches under the user id alone, writes the vector with no TTL, calls the
+    # TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
     # feature service on every miss with no single-flight lock, and degrades to empty features
-    # when the refresh fails. Review all four.
+    # when the refresh fails. Fix all four.
     key = f"features:{user}"
     cached = r.get(key)
     if cached is not None:
@@ -295,9 +295,9 @@ const featureService = {
 };
 
 export async function loadFeatures(tenant: string, user: string): Promise<{features: Features; stale: boolean}> {
-  // TODO: this draft caches under the user id alone, writes the vector with no TTL, calls the
+  // TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
   // feature service on every miss with no single-flight lock, and degrades to empty features
-  // when the refresh fails. Review all four.
+  // when the refresh fails. Fix all four.
   const key = \`features:\${user}\`;
   const cached = await r.get(key);
   if (cached !== null) return {features: JSON.parse(cached) as Features, stale: false};
@@ -415,9 +415,9 @@ var features = featureService{}
 
 // loadFeatures: the ranking path's read of the per-(tenant, user) feature vector.
 func loadFeatures(ctx context.Context, tenant, user string) (FeatureVector, bool, error) {
-	// TODO: this draft caches under the user id alone, writes the vector with no TTL, calls the
+	// TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
 	// feature service on every miss with no single-flight lock, and degrades to empty features
-	// when the refresh fails. Review all four.
+	// when the refresh fails. Fix all four.
 	key := "features:" + user
 	if blob, err := rdb.Get(ctx, key).Bytes(); err == nil {
 		var vector FeatureVector
@@ -574,9 +574,9 @@ object FeatureCache {
 
   /** The ranking path's read of the per-(tenant, user) feature vector. */
   def loadFeatures(tenant: String, user: String): FeatureResult = {
-    // TODO: this draft caches under the user id alone, writes the vector with no TTL, calls the
+    // TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
     // feature service on every miss with no single-flight lock, and degrades to empty features
-    // when the refresh fails. Review all four.
+    // when the refresh fails. Fix all four.
     val key = s"features:$user"
     Option(jedis.get(key)) match {
       case Some(blob) => FeatureResult(decode(blob), stale = false)
@@ -698,9 +698,9 @@ json fetchFeatures(const std::string& tenant, const std::string& user) {
 
 // loadFeatures: the ranking path's read of the per-(tenant, user) feature vector.
 FeatureResult loadFeatures(const std::string& tenant, const std::string& user) {
-  // TODO: this draft caches under the user id alone, writes the vector with no TTL, calls the
+  // TODO: this starter caches under the user id alone, writes the vector with no TTL, calls the
   // feature service on every miss with no single-flight lock, and degrades to empty features
-  // when the refresh fails. Review all four.
+  // when the refresh fails. Fix all four.
   const auto key = "features:" + user;
   if (const auto cached = redis.get(key)) {
     FeatureResult fresh;

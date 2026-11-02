@@ -8,9 +8,9 @@ export const graphEventsStep: Step = {
   focus: ['api', 'db', 'kafka', 'consumer', 'outbox'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the graph event path. It
+**Starting point.** The starter is working code for the graph event path. It
 publishes a change, keys the message, and its consumer applies the change. It compiles, the demo
-replays cleanly, and it hides three production flaws. Review it like the streaming owner, fix it, and
+replays cleanly, and it hides three production flaws. Debug it like the streaming owner, fix it, and
 prove the fix with the checks below.
 
 Implement publishing and consuming \`graph.changed\`:
@@ -29,7 +29,7 @@ Implement publishing and consuming \`graph.changed\`:
   commit must not double-apply, because the replay finds its own mark.
 - Commit the offset only *after* the merge is durable — never before.
 
-**Failure mode the checks target.** The draft keys by operation type, so \`edge_added\` and
+**Failure mode the checks target.** The starter keys by operation type, so \`edge_added\` and
 \`entity_merged\` events for the same entity are spread over different partitions and a consumer sees
 them out of order. It publishes *before* the graph transaction commits, so a crash loses the edge and
 leaves a permanent event describing state that never existed. Its consumer applies the merge and then
@@ -57,7 +57,7 @@ window. The outbox is missing entirely: a broker rejection drops the event.`,
       id: 'topic-key',
       title: 'Publishes graph.changed keyed by entity id',
       detail:
-        'Events go to `graph.changed` with the key set to the entity id, so one entity stays on one partition. The draft keys by operation type.',
+        'Events go to `graph.changed` with the key set to the entity id, so one entity stays on one partition. The starter keys by operation type.',
       match: {
         python: {all: [/TOPIC\s*=\s*"graph\.changed"/, /key=entity_id/]},
         typescript: {all: [/TOPIC\s*=\s*'graph\.changed'/, /key:\s*entityId/]},
@@ -70,7 +70,7 @@ window. The outbox is missing entirely: a broker rejection drops the event.`,
       id: 'payload-fields',
       title: 'Carries old label, new label and the policy version',
       detail:
-        'The event body has `old_label`, `new_label` and `policy_version` so a replay can reconstruct the transition and dedupe. The draft sends only the new value.',
+        'The event body has `old_label`, `new_label` and `policy_version` so a replay can reconstruct the transition and dedupe. The starter sends only the new value.',
       match: {
         python: {all: [/old_label/, /new_label/, /policy_version/]},
         typescript: {all: [/oldLabel/, /newLabel/, /policyVersion/]},
@@ -83,7 +83,7 @@ window. The outbox is missing entirely: a broker rejection drops the event.`,
       id: 'after-commit',
       title: 'Publishes only after the graph transaction commits',
       detail:
-        'The graph commit happens before the produce, so a consumer never sees an event whose edge is not durable. The draft produces first and commits afterwards.',
+        'The graph commit happens before the produce, so a consumer never sees an event whose edge is not durable. The starter produces first and commits afterwards.',
       match: {
         python: {order: [/\bcommit\(/, /producer\.produce\(/]},
         typescript: {order: [/commit\(/, /producer\.send\(/]},
@@ -96,7 +96,7 @@ window. The outbox is missing entirely: a broker rejection drops the event.`,
       id: 'outbox',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce is recorded via `outbox.put` into `OUTBOX_TABLE` so it can be replayed. The draft has no outbox.',
+        'A rejected produce is recorded via `outbox.put` into `OUTBOX_TABLE` so it can be replayed. The starter has no outbox.',
       match: {
         python: {all: [/outbox\.put\(/, /OUTBOX_TABLE/]},
         typescript: {all: [/outbox\.put\(/, /OUTBOX_TABLE/]},
@@ -109,7 +109,7 @@ window. The outbox is missing entirely: a broker rejection drops the event.`,
       id: 'consumer-idempotent',
       title: 'Consumer applies idempotently, then commits the offset',
       detail:
-        'The consumer checks `already_applied` first, applies the merge, and commits the offset only after. The draft applies then commits with no mark, so a replay double-applies.',
+        'The consumer checks `already_applied` first, applies the merge, and commits the offset only after. The starter applies then commits with no mark, so a replay double-applies.',
       match: {
         python: {
           all: [/def consume\(/, /already_applied\(/],
@@ -138,8 +138,8 @@ TOPIC = "graph.changed"
 
 
 def publish_change(producer: Producer, graph, tenant: str, entity_id: str, op_type: str, edge: dict) -> None:
-    # TODO: this draft keys by operation type, publishes before the graph transaction commits, and
-    # never writes an outbox row when the broker rejects the produce. Review all three.
+    # TODO: this starter keys by operation type, publishes before the graph transaction commits, and
+    # never writes an outbox row when the broker rejects the produce. Fix all three.
     payload = {"tenant": tenant, "entity_id": entity_id, "new_label": edge["new_label"]}
     producer.produce(TOPIC, key=op_type, value=json.dumps(payload))
     producer.flush()
@@ -147,7 +147,7 @@ def publish_change(producer: Producer, graph, tenant: str, entity_id: str, op_ty
 
 
 def consume(consumer, message) -> None:
-    # TODO: this draft applies the merge before committing the offset and keeps no idempotency mark,
+    # TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
     # so a replay re-applies every event in the retained window.
     event = json.loads(message.value())
     merge_entities(event["tenant"], event["entity_id"], event)
@@ -194,7 +194,7 @@ def consume(consumer, message) -> None:
 `,
     },
     typescript: {
-      starter: `/** graph.changed: a model-generated draft that publishes before the commit. */
+      starter: `/** graph.changed: flawed code that publishes before the commit. */
 import {Kafka, type Consumer, type EachMessagePayload} from 'kafkajs';
 
 import {graph} from './graph';
@@ -210,15 +210,15 @@ interface EdgeChange {
 }
 
 export async function publishChange(tenant: string, entityId: string, opType: string, edge: EdgeChange): Promise<void> {
-  // TODO: this draft keys by operation type, publishes before the graph transaction commits, and
-  // never writes an outbox row when the broker rejects the produce. Review all three.
+  // TODO: this starter keys by operation type, publishes before the graph transaction commits, and
+  // never writes an outbox row when the broker rejects the produce. Fix all three.
   const payload = {tenant, entity_id: entityId, new_label: edge.newLabel};
   await producer.send({topic: TOPIC, messages: [{key: opType, value: JSON.stringify(payload)}]});
   await graph.commit();
 }
 
 export async function consume(consumer: Consumer, payload: EachMessagePayload): Promise<void> {
-  // TODO: this draft applies the merge before committing the offset and keeps no idempotency mark,
+  // TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
   // so a replay re-applies every event in the retained window.
   const event = JSON.parse(payload.message.value?.toString() ?? '{}') as {tenant: string; entity_id: string};
   await applyMerge(event);
@@ -300,8 +300,8 @@ type EdgeChange struct {
 }
 
 func publishChange(ctx context.Context, writer *kafka.Writer, graph Graph, tenant, entityID, opType string, edge EdgeChange) error {
-	// TODO: this draft keys by operation type, publishes before the graph transaction commits, and
-	// never writes an outbox row when the broker rejects the produce. Review all three.
+	// TODO: this starter keys by operation type, publishes before the graph transaction commits, and
+	// never writes an outbox row when the broker rejects the produce. Fix all three.
 	payload, _ := json.Marshal(map[string]string{"tenant": tenant, "entity_id": entityID, "new_label": edge.NewLabel})
 	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(opType), Value: payload}); err != nil {
 		return err
@@ -310,7 +310,7 @@ func publishChange(ctx context.Context, writer *kafka.Writer, graph Graph, tenan
 }
 
 func consume(ctx context.Context, reader *kafka.Reader, consumer Consumer) error {
-	// TODO: this draft applies the merge before committing the offset and keeps no idempotency mark,
+	// TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
 	// so a replay re-applies every event in the retained window.
 	message, err := reader.ReadMessage(ctx)
 	if err != nil {
@@ -406,8 +406,8 @@ object GraphEvents {
 
   def publishChange(producer: KafkaProducer[String, String], graph: Graph, tenant: String, entityId: String,
       opType: String, edge: EdgeChange): Unit = {
-    // TODO: this draft keys by operation type, publishes before the graph transaction commits, and
-    // never writes an outbox row when the broker rejects the produce. Review all three.
+    // TODO: this starter keys by operation type, publishes before the graph transaction commits, and
+    // never writes an outbox row when the broker rejects the produce. Fix all three.
     val payload = s"""{"tenant":"$tenant","entity_id":"$entityId","new_label":"\${edge.newLabel}"}"""
     producer.send(new ProducerRecord[String, String](Topic, opType, payload))
     producer.flush()
@@ -415,7 +415,7 @@ object GraphEvents {
   }
 
   def consume(consumer: KafkaConsumer[String, String], record: ConsumerRecord[String, String]): Unit = {
-    // TODO: this draft applies the merge before committing the offset and keeps no idempotency mark,
+    // TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
     // so a replay re-applies every event in the retained window.
     val event = parse(record.value())
     applyMerge(event)
@@ -473,8 +473,8 @@ struct EdgeChange {
 
 void publishChange(rd_kafka_t* producer, Graph& graph, const std::string& tenant, const std::string& entityId,
                    const std::string& opType, const EdgeChange& edge) {
-  // TODO: this draft keys by operation type, publishes before the graph transaction commits, and
-  // never writes an outbox row when the broker rejects the produce. Review all three.
+  // TODO: this starter keys by operation type, publishes before the graph transaction commits, and
+  // never writes an outbox row when the broker rejects the produce. Fix all three.
   const json payload = {{"tenant", tenant}, {"entity_id", entityId}, {"new_label", edge.newLabel}};
   const std::string value = payload.dump();
   rd_kafka_producev(producer, RD_KAFKA_V_TOPIC(kTopic.c_str()), RD_KAFKA_V_MSGSIZE(value.size()),
@@ -484,7 +484,7 @@ void publishChange(rd_kafka_t* producer, Graph& graph, const std::string& tenant
 }
 
 void consume(rd_kafka_t* consumer, const std::string& value) {
-  // TODO: this draft applies the merge before committing the offset and keeps no idempotency mark,
+  // TODO: this starter applies the merge before committing the offset and keeps no idempotency mark,
   // so a replay re-applies every event in the retained window.
   const json event = json::parse(value);
   applyMerge(event);

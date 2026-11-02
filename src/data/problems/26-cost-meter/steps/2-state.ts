@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['meter', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a report arrives, the counters move, and the
+The starter is working code: a report arrives, the counters move, and the
 dashboard shows spend. It races under concurrency, it never rolls over, and it leaks keys forever.
 Find the flaws, fix them, and prove the fix.
 
@@ -17,7 +17,7 @@ usage report has been validated:
 
 - Spend lives in **one Redis hash per \`(tenant, hour bucket)\`**: \`meter:{tenant}:{bucket}\` with
   fields \`input_tokens\`, \`output_tokens\` and \`events\`, where \`bucket = int(now // WINDOW_S)\` and
-  \`WINDOW_S = 3600\`. The draft keys on the tenant alone, so the counter never resets and "this
+  \`WINDOW_S = 3600\`. The starter keys on the tenant alone, so the counter never resets and "this
   hour's spend" is really "all spend since the tenant first appeared".
 - Both token increments, the event count and the window expiry happen in **one atomic Lua
   \`EVAL\`**: a report is one unit of spend, so a process that dies mid-update must not leave the
@@ -53,7 +53,7 @@ week is still over it today, and no TTL can fix a key that is supposed to keep c
       id: 'atomic-script',
       title: 'Moves both counters in one atomic script',
       detail:
-        'The increments and the expiry run inside one `EVAL`, so an interrupted update can never leave the input counter moved and the output counter behind. The draft sends one client-side `HINCRBY` per field, which is exactly the half-applied hash the limiter reads.',
+        'The increments and the expiry run inside one `EVAL`, so an interrupted update can never leave the input counter moved and the output counter behind. The starter sends one client-side `HINCRBY` per field, which is exactly the half-applied hash the limiter reads.',
       match: {
         python: {all: [/METER_LUA/, /\.eval\(/, /HINCRBY/], none: [/r\.hincrby\(/]},
         typescript: {all: [/METER_LUA/, /\.eval\(/, /HINCRBY/], none: [/r\.hincrby\(/]},
@@ -66,7 +66,7 @@ week is still over it today, and no TTL can fix a key that is supposed to keep c
       id: 'window-key',
       title: 'Keys the hash by (tenant, hour bucket)',
       detail:
-        'The hash is `meter:{tenant}:{bucket}`, built from the tenant and the hour the report belongs to. The draft keys on the tenant alone, so one counter accumulates every hour the tenant ever spent and "this window" is unbounded.',
+        'The hash is `meter:{tenant}:{bucket}`, built from the tenant and the hour the report belongs to. The starter keys on the tenant alone, so one counter accumulates every hour the tenant ever spent and "this window" is unbounded.',
       match: {
         python: {all: [/meter:/, /bucket/]},
         typescript: {all: [/meter:/, /bucket/]},
@@ -79,7 +79,7 @@ week is still over it today, and no TTL can fix a key that is supposed to keep c
       id: 'window-ttl',
       title: 'Expires the window with a named TTL',
       detail:
-        'The script sets `EXPIRE` from `WINDOW_TTL_S`, so the key for a closed window is gone instead of accumulating forever. The draft sets no TTL on any key it touches.',
+        'The script sets `EXPIRE` from `WINDOW_TTL_S`, so the key for a closed window is gone instead of accumulating forever. The starter sets no TTL on any key it touches.',
       match: {
         python: {all: [/WINDOW_TTL_S/, /EXPIRE/]},
         typescript: {all: [/WINDOW_TTL_S/, /EXPIRE/]},
@@ -191,7 +191,7 @@ def record_usage(tenant: str, model: str, input_tokens: int, output_tokens: int)
 `,
     },
     typescript: {
-      starter: `/** recordUsage: a model-generated draft that moves each counter with its own command. */
+      starter: `/** recordUsage: flawed code that moves each counter with its own command. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -544,5 +544,5 @@ json recordUsage(const std::string& tenant, const std::string& model, long long 
     'The key is the contract with the limiter: `meter:{tenant}:{bucket}`, with `bucket = now // WINDOW_S`. Price this window and enforce the same window, or the platform will happily admit a request the meter has already billed for an hour ago.',
     'Only set the deadline when there is none: `TTL` returns -1 for a key with no expiry and -2 for a missing one, so `if redis.call(\'TTL\', KEYS[1]) < 0` means "this window just opened". Re-setting `EXPIRE` on every write slides the deadline forward and the key outlives its window by as long as the tenant keeps spending.',
   ],
-  debrief: `The interviewer is testing whether you know what the counter is *for*: it is the number the budget limiter reads before admitting a request and the number the spend report prints afterwards, so it has to be one atomic unit of spend that belongs to one window and disappears when that window is done. The draft fails all three: two client commands instead of one script, a key without the hour in it, and no expiry at all. The subtle part is the third one done right — setting the TTL on every write looks careful and is wrong, because an active tenant then never lets the key go; the deadline belongs to the window, not to the write. Real meters keep a second, coarser counter for the billing period, a reconciliation key that survives longer than the window, and a hash tag so all of one tenant's window keys land on the same Redis cluster slot.`,
+  debrief: `The interviewer is testing whether you know what the counter is *for*: it is the number the budget limiter reads before admitting a request and the number the spend report prints afterwards, so it has to be one atomic unit of spend that belongs to one window and disappears when that window is done. The starter fails all three: two client commands instead of one script, a key without the hour in it, and no expiry at all. The subtle part is the third one done right — setting the TTL on every write looks careful and is wrong, because an active tenant then never lets the key go; the deadline belongs to the window, not to the write. Real meters keep a second, coarser counter for the billing period, a reconciliation key that survives longer than the window, and a hash tag so all of one tenant's window keys land on the same Redis cluster slot.`,
 };

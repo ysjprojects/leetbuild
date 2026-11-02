@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'state', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it receives a position for a
+**Starting point.** The starter is working code: it receives a position for a
 vehicle and writes it to the vehicle's latest-position key. It compiles, it serves the demo, and it
-hides the flaw that makes a dispatch map wrong. Review it like the service owner, fix it, and prove
+hides the flaw that makes a dispatch map wrong. Debug it like the service owner, fix it, and prove
 the fix with the checks below.
 
 Implement the latest-position write as **one atomic Redis operation** per vehicle.
@@ -26,7 +26,7 @@ Implement the latest-position write as **one atomic Redis operation** per vehicl
 - The stored record always matches the winner of the comparison: it holds the winning timestamp,
   sequence and coordinates, never a merged or partially updated value.
 
-**Failure mode the checks target.** The draft writes whatever arrives last, so a delayed
+**Failure mode the checks target.** The starter writes whatever arrives last, so a delayed
 cell-network position overwrites a fresh one and the map shows a ghost car. The checks verify the
 atomic Lua script, the timestamp comparison, the sequence tie-break, and that the stored record is
 the winner.`,
@@ -45,7 +45,7 @@ the winner.`,
       id: 'eval',
       title: 'Writes through one atomic Lua EVAL',
       detail:
-        'The compare-and-set runs server-side in a single Lua script invoked with `EVAL`/`EVALSHA` (or the client equivalent). The draft calls plain `SET`, so two writers can interleave.',
+        'The compare-and-set runs server-side in a single Lua script invoked with `EVAL`/`EVALSHA` (or the client equivalent). The starter calls plain `SET`, so two writers can interleave.',
       match: {
         python: {all: [/\beval\w*\(/]},
         typescript: {all: [/\.eval\w*\(/]},
@@ -71,7 +71,7 @@ the winner.`,
       id: 'compare-ts',
       title: 'Compares the incoming timestamp with the stored one',
       detail:
-        'The script decodes the stored record and writes only when `incoming_ts` is newer. The draft has no comparison at all, so order of arrival decides the winner.',
+        'The script decodes the stored record and writes only when `incoming_ts` is newer. The starter has no comparison at all, so order of arrival decides the winner.',
       match: {
         python: {all: [/tonumber/, /incoming_ts/, />/]},
         typescript: {all: [/tonumber/, /incoming_ts/, />/]},
@@ -84,7 +84,7 @@ the winner.`,
       id: 'tie-sequence',
       title: 'Resolves equal timestamps by sequence',
       detail:
-        'Equal timestamps are broken deterministically by the higher `sequence`. The draft cannot distinguish two positions carrying the same timestamp.',
+        'Equal timestamps are broken deterministically by the higher `sequence`. The starter cannot distinguish two positions carrying the same timestamp.',
       match: {
         python: {all: [/incoming_seq/, /sequence/, /==/]},
         typescript: {all: [/incoming_seq/, /sequence/, /==/]},
@@ -97,7 +97,7 @@ the winner.`,
       id: 'winner-record',
       title: 'Stores the winner of the comparison, not a partial merge',
       detail:
-        'The script reads the stored record, and only the winning branch writes the payload, so the record always matches the comparison winner. The draft overwrites on every call.',
+        'The script reads the stored record, and only the winning branch writes the payload, so the record always matches the comparison winner. The starter overwrites on every call.',
       match: {
         python: {all: [/GET/, /SET/], order: [/GET/, /SET/]},
         typescript: {all: [/GET/, /SET/], order: [/GET/, /SET/]},
@@ -113,8 +113,8 @@ the winner.`,
 
 
 def update_latest(redis, vehicle_id: str, position: dict) -> None:
-    # TODO: this draft writes whatever arrives last, so a delayed position overwrites a fresh one.
-    # Review the atomic compare-by-timestamp and the sequence tie-break.
+    # TODO: this starter writes whatever arrives last, so a delayed position overwrites a fresh one.
+    # Check the atomic compare-by-timestamp and the sequence tie-break.
     key = f"vehicle:{vehicle_id}:latest"
     redis.set(key, json.dumps(position))
 `,
@@ -155,7 +155,7 @@ def update_latest(redis, vehicle_id: str, position: dict) -> int:
 `,
     },
     typescript: {
-      starter: `/** Latest-position writer: a model-generated draft that writes the last arrival. */
+      starter: `/** Latest-position writer: flawed code that writes the last arrival. */
 import type {Redis} from 'ioredis';
 
 export interface Position {
@@ -167,8 +167,8 @@ export interface Position {
 }
 
 export async function updateLatest(redis: Redis, vehicleId: string, position: Position): Promise<void> {
-  // TODO: this draft writes whatever arrives last, so a delayed position overwrites a fresh one.
-  // Review the atomic compare-by-timestamp and the sequence tie-break.
+  // TODO: this starter writes whatever arrives last, so a delayed position overwrites a fresh one.
+  // Check the atomic compare-by-timestamp and the sequence tie-break.
   await redis.set(\`vehicle:\${vehicleId}:latest\`, JSON.stringify(position));
 }
 `,
@@ -235,8 +235,8 @@ type Position struct {
 }
 
 func UpdateLatest(ctx context.Context, rdb *goredis.Client, vehicleID string, pos Position) error {
-	// TODO: this draft writes whatever arrives last, so a delayed position overwrites a fresh one.
-	// Review the atomic compare-by-timestamp and the sequence tie-break.
+	// TODO: this starter writes whatever arrives last, so a delayed position overwrites a fresh one.
+	// Check the atomic compare-by-timestamp and the sequence tie-break.
 	payload, err := json.Marshal(pos)
 	if err != nil {
 		return err
@@ -302,8 +302,8 @@ func UpdateLatest(ctx context.Context, rdb *goredis.Client, vehicleID string, po
 
 object LatestPosition {
   def updateLatest(redis: RedisClient, vehicleId: String, position: JsObject): Unit = {
-    // TODO: this draft writes whatever arrives last, so a delayed position overwrites a fresh one.
-    // Review the atomic compare-by-timestamp and the sequence tie-break.
+    // TODO: this starter writes whatever arrives last, so a delayed position overwrites a fresh one.
+    // Check the atomic compare-by-timestamp and the sequence tie-break.
     redis.set(s"vehicle:$vehicleId:latest", Json.stringify(position))
   }
 }
@@ -354,8 +354,8 @@ return 1
 using json = nlohmann::json;
 
 void updateLatest(sw::redis::Redis& redis, const std::string& vehicleId, const json& position) {
-  // TODO: this draft writes whatever arrives last, so a delayed position overwrites a fresh one.
-  // Review the atomic compare-by-timestamp and the sequence tie-break.
+  // TODO: this starter writes whatever arrives last, so a delayed position overwrites a fresh one.
+  // Check the atomic compare-by-timestamp and the sequence tie-break.
   const auto key = "vehicle:" + vehicleId + ":latest";
   redis.set(key, position.dump());
 }
@@ -405,5 +405,5 @@ long long updateLatest(sw::redis::Redis& redis, const std::string& vehicleId, co
     'The condition is `incoming_ts > current_ts or (incoming_ts == current_ts and incoming_seq > current_seq)`. The timestamp branch handles a newer position; the sequence branch makes equal-timestamp replays deterministic.',
     'Both the "no stored record" and the "newer" paths write the same payload. Never merge fields: the record must equal the winner of the comparison.',
   ],
-  debrief: `The interviewer is testing whether you can keep distributed state correct when messages arrive out of order. The draft reads fine because the demo delivers positions in order and never replays. Three defects are being checked: the atomic script (no read-modify-write race between two ingest workers), the timestamp comparison (a delayed packet cannot roll state backward), and the sequence tie-break (two positions sharing a timestamp still converge to one winner). Real systems add per-vehicle TTLs for silent devices, a separate history append, and a coarse geohash index for nearby queries.`,
+  debrief: `The interviewer is testing whether you can keep distributed state correct when messages arrive out of order. The starter reads fine because the demo delivers positions in order and never replays. Three defects are being checked: the atomic script (no read-modify-write race between two ingest workers), the timestamp comparison (a delayed packet cannot roll state backward), and the sequence tie-break (two positions sharing a timestamp still converge to one winner). Real systems add per-vehicle TTLs for silent devices, a separate history append, and a coarse geohash index for nearby queries.`,
 };

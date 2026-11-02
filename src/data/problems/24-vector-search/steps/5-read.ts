@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'search', 'index', 'cache'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the read endpoint returns
+**Starting point.** The starter is working code: the read endpoint returns
 neighbors for a document id and the response carries an index version. It compiles, the demo shows a
 plausible list, and three things are wrong with it. Find them, fix them, and prove the fix with the
 checks below.
@@ -21,11 +21,11 @@ Implement \`GET /v1/documents/{document_id}/neighbors?k=10\`.
   else's documents is a leak of its own.
 - The tenant comes from \`X-Tenant-Id\` (**401** when absent) and never from a query parameter or the
   body.
-- \`k\` is capped at **20** neighbors; \`k > 20\` is **400**, not a silent clamp. The draft caps
+- \`k\` is capped at **20** neighbors; \`k > 20\` is **400**, not a silent clamp. The starter caps
   nothing, so one caller can ask for the whole neighborhood of a document.
 - The response is labeled with **the index version the results came from**. Neighbors are often
   served from a cached snapshot, so \`index_version\` is the version on the snapshot the hits were
-  read from — never \`"the latest"\`. The draft stamps the current version onto results an older
+  read from — never \`"the latest"\`. The starter stamps the current version onto results an older
   snapshot produced, which is exactly the bug that makes a rollback look like it did nothing.
 - The document is resolved before the neighbor query, and the neighbor query is started with the
   tenant and, when the document carries one, the version the document was indexed at.
@@ -68,7 +68,7 @@ untrustworthy — you cannot reproduce, explain or roll back a ranking you canno
       id: 'tenant-lookup',
       title: 'Looks the document up as (tenant, id)',
       detail:
-        'The document is fetched with the authenticated tenant as part of the key and a missing (or foreign) document is **404**. The draft looks it up by id alone, so any tenant can read any document’s neighbors.',
+        'The document is fetched with the authenticated tenant as part of the key and a missing (or foreign) document is **404**. The starter looks it up by id alone, so any tenant can read any document’s neighbors.',
       match: {
         python: {all: [/documents\.get\(tenant, document_id\)/, /status_code\s*=\s*404/]},
         typescript: {all: [/documents\.get\(tenant, documentId\)/, /code\(\s*404\s*\)/]},
@@ -81,7 +81,7 @@ untrustworthy — you cannot reproduce, explain or roll back a ranking you canno
       id: 'cap',
       title: 'Caps the neighbor list at 20',
       detail:
-        '`k` is validated against a cap of 20 and anything above it is **400**. The draft passes any `k` through to the index, so one request can ask for an unbounded neighborhood.',
+        '`k` is validated against a cap of 20 and anything above it is **400**. The starter passes any `k` through to the index, so one request can ask for an unbounded neighborhood.',
       match: {
         python: {all: [/MAX_NEIGHBORS\s*=\s*20/, /k\s*>\s*MAX_NEIGHBORS/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_NEIGHBORS\s*=\s*20/, /k\s*>\s*MAX_NEIGHBORS/, /code\(\s*400\s*\)/]},
@@ -94,7 +94,7 @@ untrustworthy — you cannot reproduce, explain or roll back a ranking you canno
       id: 'served-version',
       title: 'Labels results with the version that produced them',
       detail:
-        'The reported `index_version` comes from the snapshot the hits were read from (`snapshot.index_version`), not from a live-version constant. The draft stamps the latest version onto results an older snapshot produced.',
+        'The reported `index_version` comes from the snapshot the hits were read from (`snapshot.index_version`), not from a live-version constant. The starter stamps the latest version onto results an older snapshot produced.',
       match: {
         python: {all: [/snapshot\.index_version/], none: [/ACTIVE_INDEX_VERSION/]},
         typescript: {all: [/snapshot\.indexVersion/], none: [/ACTIVE_INDEX_VERSION/]},
@@ -107,7 +107,7 @@ untrustworthy — you cannot reproduce, explain or roll back a ranking you canno
       id: 'resolve-then-query',
       title: 'Resolves the document before querying neighbors',
       detail:
-        'The tenant-scoped document lookup happens before the neighbor query, and the neighbor query runs with the authenticated tenant. The draft queries neighbors with a bare document id and no ownership check at all.',
+        'The tenant-scoped document lookup happens before the neighbor query, and the neighbor query runs with the authenticated tenant. The starter queries neighbors with a bare document id and no ownership check at all.',
       match: {
         python: {order: [/documents\.get\(tenant, document_id\)/, /index\.neighbors\(tenant/]},
         typescript: {order: [/documents\.get\(tenant, documentId\)/, /index\.neighbors\(tenant/]},
@@ -146,8 +146,8 @@ index = NeighborIndex()
 
 @app.get("/v1/documents/{document_id}/neighbors")
 def neighbors(document_id: str, k: int = 10) -> JSONResponse:
-    # TODO: this draft looks the document up by id alone, caps nothing, and labels the results
-    # with the latest index version even when a cached snapshot served them. Review all three.
+    # TODO: this starter looks the document up by id alone, caps nothing, and labels the results
+    # with the latest index version even when a cached snapshot served them. Fix all three.
     document = documents.get(document_id)
     if document is None:
         return JSONResponse({"error": "document not found"}, status_code=404)
@@ -235,7 +235,7 @@ def neighbors(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/documents/{id}/neighbors: a model-generated draft with no ownership check. */
+      starter: `/** GET /v1/documents/{id}/neighbors: flawed code with no ownership check. */
 import Fastify from 'fastify';
 
 import {documents} from './document_store';
@@ -246,8 +246,8 @@ export const app = Fastify();
 const LATEST_INDEX_VERSION = 'idx-42';
 
 app.get('/v1/documents/:documentId/neighbors', async (request, reply) => {
-  // TODO: this draft looks the document up by id alone, caps nothing, and labels the results with
-  // the latest index version even when a cached snapshot served them. Review all three.
+  // TODO: this starter looks the document up by id alone, caps nothing, and labels the results with
+  // the latest index version even when a cached snapshot served them. Fix all three.
   const {documentId} = request.params as {documentId?: string};
   const k = Number((request.query as {k?: string}).k ?? 10);
   const document = await documents.get(documentId ?? '');
@@ -353,8 +353,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func neighbors(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft looks the document up by id alone, caps nothing, and labels the results
-	// with the latest index version even when a cached snapshot served them. Review all three.
+	// TODO: this starter looks the document up by id alone, caps nothing, and labels the results
+	// with the latest index version even when a cached snapshot served them. Fix all three.
 	documentID := r.PathValue("documentId")
 	k, _ := strconv.Atoi(r.URL.Query().Get("k"))
 	document, err := documents.Get(r.Context(), documentID)
@@ -518,9 +518,9 @@ object ReadApi {
     path("v1" / "documents" / Segment / "neighbors") { documentId =>
       get {
         parameter("k".as[Int].withDefault(10)) { k =>
-          // TODO: this draft looks the document up by id alone, caps nothing, and labels the
+          // TODO: this starter looks the document up by id alone, caps nothing, and labels the
           // results with the latest index version even when a cached snapshot served them.
-          // Review all three.
+          // Fix all three.
           documents.get(documentId) match {
             case None =>
               complete(StatusCodes.NotFound, """{"error":"document not found"}""")
@@ -641,8 +641,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/documents/([^/]+)/neighbors", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft looks the document up by id alone, caps nothing, and labels the results
-    // with the latest index version even when a cached snapshot served them. Review all three.
+    // TODO: this starter looks the document up by id alone, caps nothing, and labels the results
+    // with the latest index version even when a cached snapshot served them. Fix all three.
     const std::string documentId = req.matches[1];
     const int k = req.has_param("k") ? std::stoi(req.get_param_value("k")) : 10;
     const auto document = documents.get(documentId);
@@ -740,7 +740,7 @@ int main() {
     },
   },
   debrief: `The read path is where a search service tells the truth about what it just served. Three
-defects, each with a different flavour. Ownership: the draft keys the document store by id, so an id
+defects, each with a different flavour. Ownership: the starter keys the document store by id, so an id
 namespace that is global becomes a cross-tenant read, and the 404-versus-403 distinction is the only
 thing that keeps the endpoint from doubling as an existence oracle. Cap: \`k\` is a cost control, not a
 formatting preference — an uncapped \`k\` on the neighbor read can walk a document's whole

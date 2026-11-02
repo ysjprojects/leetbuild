@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'coordinator', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a finished shard produces an
+**Starting point.** The starter is working code: a finished shard produces an
 event and the coordinator consumes it, so the happy path moves shards through the topic. Three
 production contracts are broken. Find them, fix them, and prove the fix with the checks below.
 
@@ -16,11 +16,11 @@ Every finished shard publishes exactly one \`batch.shard\` event, and the coordi
 events back into the batch manifest.
 
 - **Key by batch id.** The message key is the batch, so every shard of one batch lands in the same
-  partition in a stable order. The draft keys by worker, so one batch's shards scatter and the
+  partition in a stable order. The starter keys by worker, so one batch's shards scatter and the
   coordinator folds them out of order.
 - **Publish only after the output is flushed.** Write the output object first and take its
   \`checksum\`, then produce the event carrying \`shard_id\`, the record \`records\` count and that
-  \`checksum\`. The draft produces first, so the checksum can reference an object that is not readable
+  \`checksum\`. The starter produces first, so the checksum can reference an object that is not readable
   yet — or does not exist.
 - **Outbox on a rejected produce.** When the broker rejects the produce, write an outbox row inside
   the error branch instead of dropping the event, so a relay can republish it.
@@ -58,7 +58,7 @@ and committing before folding turns a crash into a permanently missing shard.`,
       id: 'batch-key',
       title: 'Produced keyed by the batch id',
       detail:
-        'The message key is the batch id, so one batch’s shards share a partition and arrive in a stable order. The draft keys by worker.',
+        'The message key is the batch id, so one batch’s shards share a partition and arrive in a stable order. The starter keys by worker.',
       match: {
         python: {all: [/key=batch_id/, /batch\.shard/]},
         typescript: {all: [/key:\s*batchId/, /batch\.shard/]},
@@ -71,7 +71,7 @@ and committing before folding turns a crash into a permanently missing shard.`,
       id: 'publish-after-flush',
       title: 'Publishes only after the output is flushed',
       detail:
-        'The output object is written (and its checksum taken) before the event is produced, so a published checksum always matches a readable object. The draft produces first.',
+        'The output object is written (and its checksum taken) before the event is produced, so a published checksum always matches a readable object. The starter produces first.',
       match: {
         python: {order: [/outputs\.put\(|flush_shard_output\(/, /producer\.produce\(/]},
         typescript: {order: [/outputs\.put\(|flushShardOutput\(/, /producer\.send\(/]},
@@ -84,7 +84,7 @@ and committing before folding turns a crash into a permanently missing shard.`,
       id: 'shard-fields',
       title: 'The event carries the shard id, counts and checksum',
       detail:
-        'The payload carries the shard id, the record count and the output checksum. The draft omits the checksum, so consumers cannot verify the object.',
+        'The payload carries the shard id, the record count and the output checksum. The starter omits the checksum, so consumers cannot verify the object.',
       match: {
         python: {all: [/shard_id/, /checksum/, /records/]},
         typescript: {all: [/shard_id|shardId/, /checksum/, /records/]},
@@ -97,7 +97,7 @@ and committing before folding turns a crash into a permanently missing shard.`,
       id: 'outbox-on-reject',
       title: 'Writes an outbox row when the produce is rejected',
       detail:
-        'A rejected produce inserts an outbox row in the error branch instead of dropping the event. The draft ignores the broker result entirely.',
+        'A rejected produce inserts an outbox row in the error branch instead of dropping the event. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except/]},
         typescript: {all: [/insertOutbox\(/, /catch/]},
@@ -110,7 +110,7 @@ and committing before folding turns a crash into a permanently missing shard.`,
       id: 'fold-before-commit',
       title: 'Folds the shard before committing the offset',
       detail:
-        'The coordinator folds the shard into the manifest and records it as folded before it commits the offset; a replayed record is skipped by the folded set. The draft commits first.',
+        'The coordinator folds the shard into the manifest and records it as folded before it commits the offset; a replayed record is skipped by the folded set. The starter commits first.',
       match: {
         python: {all: [/folded/], order: [/fold_shard\(/, /consumer\.commit\(/]},
         typescript: {all: [/folded/], order: [/foldShard\(/, /commitOffsets\(/]},
@@ -131,7 +131,7 @@ consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "coordinator
 
 
 def publish_shard(batch_id: str, worker_id: str, shard_id: str, records: list[str]) -> None:
-    # TODO: this draft keys by worker, publishes before the output is flushed, and the coordinator
+    # TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
     # commits its offset before it folds the shard into the manifest.
     event = {"batch_id": batch_id, "shard_id": shard_id, "records": len(records)}
     producer.produce("batch.shard", key=worker_id, value=json.dumps(event))
@@ -196,7 +196,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** batch.shard: a model-generated draft that keys by worker and commits before folding. */
+      starter: `/** batch.shard: flawed code that keys by worker and commits before folding. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'batchd', brokers: ['kafka:9092']});
@@ -209,7 +209,7 @@ export async function publishShard(
   shardId: string,
   records: string[],
 ): Promise<void> {
-  // TODO: this draft keys by worker, publishes before the output is flushed, and the coordinator
+  // TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
   // commits its offset before it folds the shard into the manifest.
   const event = {batch_id: batchId, shard_id: shardId, records: records.length};
   await producer.send({topic: 'batch.shard', messages: [{key: workerId, value: JSON.stringify(event)}]});
@@ -278,7 +278,7 @@ import (
 var producer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "batch.shard"}
 
 func PublishShard(ctx context.Context, batchID, workerID, shardID string, records []string) error {
-	// TODO: this draft keys by worker, publishes before the output is flushed, and the coordinator
+	// TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
 	// commits its offset before it folds the shard into the manifest.
 	event := map[string]any{"batch_id": batchID, "shard_id": shardID, "records": len(records)}
 	payload, _ := json.Marshal(event)
@@ -387,7 +387,7 @@ object ShardEvents {
   val producer = new KafkaProducer[String, String](new Properties())
 
   def publishShard(batchId: String, workerId: String, shardId: String, records: Seq[String]): Unit = {
-    // TODO: this draft keys by worker, publishes before the output is flushed, and the coordinator
+    // TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
     // commits its offset before it folds the shard into the manifest.
     val event = s"""{"batch_id":"$batchId","shard_id":"$shardId","records":\${records.size}}"""
     producer.send(new ProducerRecord("batch.shard", workerId, event))
@@ -465,7 +465,7 @@ std::unique_ptr<RdKafka::Producer> producer;
 
 void publish_shard(const std::string& batchId, const std::string& workerId, const std::string& shardId,
                    const std::vector<std::string>& records) {
-  // TODO: this draft keys by worker, publishes before the output is flushed, and the coordinator
+  // TODO: this starter keys by worker, publishes before the output is flushed, and the coordinator
   // commits its offset before it folds the shard into the manifest.
   const json event = {{"batch_id", batchId}, {"shard_id", shardId}, {"records", records.size()}};
   const auto payload = event.dump();
@@ -549,7 +549,7 @@ void consume(const std::string& group) {
 `,
     },
   },
-  debrief: `The interviewer is checking three contracts a generated Kafka snippet almost always gets wrong.
+  debrief: `The interviewer is checking three contracts a Kafka snippet almost always gets wrong.
 First, the message key is an ordering contract: partition by batch and every shard of that batch
 arrives in order; key by worker and the coordinator folds shards out of order and the manifest is
 nondeterministic. Second, an event may only describe state that already exists: publish after the

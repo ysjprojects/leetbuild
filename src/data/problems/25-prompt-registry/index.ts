@@ -7,19 +7,20 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Prompt registry on the AI-era track: the course is not "store a string in a database", it is the
- * review you owe a model-generated registry before it ships prompts into production. Immutable,
- * hashed versions behind an idempotent registration endpoint → an atomic Redis pointer swap with
- * tenant pins and an audit row → an eval-gated promotion that blocks on an unavailable evaluator →
- * name-keyed lifecycle events with an outbox → tenant-scoped, render-safe reads.
+ * Prompt registry: the course is not "store a string in a database", it is the debugging you owe
+ * a registry before it ships prompts into production. Immutable, hashed versions behind an
+ * idempotent registration endpoint → an atomic Redis pointer swap with tenant pins and an audit
+ * row → an eval-gated promotion that blocks on an unavailable evaluator → name-keyed lifecycle
+ * events with an outbox → tenant-scoped, render-safe reads.
  */
 export const promptRegistryProblem: Problem = {
   id: 'prompt-registry',
   title: 'Prompt Registry',
-  tagline: 'Versioned prompt templates with eval-gated promotion and tenant pins — reviewed like production.',
+  tagline:
+    'Versioned prompt templates with eval-gated promotion and tenant pins, debugged until they are safe to ship.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Prompt Registry
 
@@ -67,12 +68,12 @@ One service, **registryd**, with five pieces:
    validates every supplied value against the allowlist and escapes it so no value can break the
    template.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path,
+and it looks right. Your job in every step is the job you will have on a real feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

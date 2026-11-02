@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it produces to \`upload.event\`, the topic exists and
+The starter is working code: it produces to \`upload.event\`, the topic exists and
 the happy path emits events. Four defects hide in how and when it publishes. Find them, fix them, and
 prove the fix.
 
@@ -16,15 +16,15 @@ Implement the upload event publisher. Three events are published to the \`upload
 \`part.stored\`, \`session.expired\` and \`upload.completed\`.
 
 - Every event is keyed by the **upload id**, so all events for one upload land in the same partition
-  and their history stays ordered. The draft keys by client, so one upload's events scatter and a
+  and their history stays ordered. The starter keys by client, so one upload's events scatter and a
   consumer sees \`upload.completed\` before the \`part.stored\` events that precede it.
-- The \`upload.completed\` event is published **after the object commits**, not before. The draft
+- The \`upload.completed\` event is published **after the object commits**, not before. The starter
   publishes first and commits afterwards, so a consumer can react to an upload whose object does not
   exist yet — an upload that is invisible downstream is worse than a late event.
 - When the broker rejects the produce, an **outbox row** is written so the event can be replayed.
-  The draft drops the event on the floor.
+  The starter drops the event on the floor.
 - The event carries **part numbers and checksums**, never content: \`{"event":"part.stored",
-  "upload_id": …, "part_number": …, "size": …, "checksum": …}\`. The draft puts the part bytes in
+  "upload_id": …, "part_number": …, "size": …, "checksum": …}\`. The starter puts the part bytes in
   the event, so the topic retains and replicates tenant content.
 
 **Failure mode the checks target.** Keying by client scatters one upload's events across partitions, so
@@ -63,7 +63,7 @@ part bytes into the event ships tenant content into a retained, replicated log.`
       id: 'key-by-upload',
       title: 'Keys every event by the upload id',
       detail:
-        'The message key is the upload id, so one upload’s events share a partition and stay ordered. The draft keys by client, so the history scatters.',
+        'The message key is the upload id, so one upload’s events share a partition and stay ordered. The starter keys by client, so the history scatters.',
       match: {
         python: {all: [/key=upload_id/]},
         typescript: {all: [/key: uploadId/]},
@@ -76,7 +76,7 @@ part bytes into the event ships tenant content into a retained, replicated log.`
       id: 'publish-after-commit',
       title: 'Publishes completed only after the object commits',
       detail:
-        'The object commit happens before the `upload.completed` produce. The draft publishes first and commits afterwards.',
+        'The object commit happens before the `upload.completed` produce. The starter publishes first and commits afterwards.',
       match: {
         python: {order: [/commit_object\(/, /producer\.send\(/]},
         typescript: {order: [/commitObject\(/, /producer\.send\(/]},
@@ -88,7 +88,7 @@ part bytes into the event ships tenant content into a retained, replicated log.`
     {
       id: 'outbox',
       title: 'Writes an outbox row when the broker rejects',
-      detail: 'A rejected produce leaves an outbox row so the event can be replayed. The draft drops the event.',
+      detail: 'A rejected produce leaves an outbox row so the event can be replayed. The starter drops the event.',
       match: {
         python: {all: [/outbox/]},
         typescript: {all: [/[Oo]utbox/]},
@@ -101,7 +101,7 @@ part bytes into the event ships tenant content into a retained, replicated log.`
       id: 'no-content',
       title: 'Carries part numbers and checksums, never content',
       detail:
-        'The event carries `part_number` and `checksum`; the part bytes never reach the topic. The draft puts the part bytes in the event payload.',
+        'The event carries `part_number` and `checksum`; the part bytes never reach the topic. The starter puts the part bytes in the event payload.',
       match: {
         python: {all: [/part_number/, /checksum/], none: [/\bdata\b/]},
         typescript: {all: [/part_number/, /checksum/], none: [/\bdata\b/]},
@@ -123,7 +123,7 @@ producer = KafkaProducer(bootstrap_servers="kafka:9092", acks="all")
 def publish_part_stored(
     client_id: str, upload_id: str, part_number: int, checksum: str, data: bytes
 ) -> None:
-    # TODO: this draft keys by client so one upload's events scatter across partitions, publishes
+    # TODO: this starter keys by client so one upload's events scatter across partitions, publishes
     # upload.completed before the object commits, carries the part bytes in the event, and writes no
     # outbox row when the broker rejects.
     event = {
@@ -184,7 +184,7 @@ def send_event(upload_id: str, event: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** upload.event: a model-generated draft that keys by client and commits late. */
+      starter: `/** upload.event: flawed code that keys by client and commits late. */
 import {Kafka, logLevel} from 'kafkajs';
 
 const kafka = new Kafka({brokers: ['kafka:9092'], logLevel: logLevel.ERROR});
@@ -205,7 +205,7 @@ export async function publishPartStored(
   checksum: string,
   data: Buffer,
 ): Promise<void> {
-  // TODO: this draft keys by client so one upload's events scatter across partitions, publishes
+  // TODO: this starter keys by client so one upload's events scatter across partitions, publishes
   // upload.completed before the object commits, carries the part bytes in the event, and writes no
   // outbox row when the broker rejects.
   const event: PartStoredEvent = {
@@ -303,7 +303,7 @@ func PublishPartStored(
 	checksum string,
 	data []byte,
 ) error {
-	// TODO: this draft keys by client so one upload's events scatter across partitions, publishes
+	// TODO: this starter keys by client so one upload's events scatter across partitions, publishes
 	// upload.completed before the object commits, carries the part bytes in the event, and writes no
 	// outbox row when the broker rejects.
 	value, _ := json.Marshal(map[string]any{
@@ -400,7 +400,7 @@ object UploadEvents {
       checksum: String,
       data: Array[Byte],
   ): Unit = {
-    // TODO: this draft keys by client so one upload's events scatter across partitions, publishes
+    // TODO: this starter keys by client so one upload's events scatter across partitions, publishes
     // upload.completed before the object commits, carries the part bytes in the event, and writes no
     // outbox row when the broker rejects.
     val event =
@@ -467,7 +467,7 @@ void PublishPartStored(
     long long partNumber,
     const std::string& checksum,
     const std::string& data) {
-  // TODO: this draft keys by client so one upload's events scatter across partitions, publishes
+  // TODO: this starter keys by client so one upload's events scatter across partitions, publishes
   // upload.completed before the object commits, carries the part bytes in the event, and writes no
   // outbox row when the broker rejects.
   const auto event = "{\\"event\\":\\"part.stored\\",\\"upload_id\\":\\"" + uploadId +

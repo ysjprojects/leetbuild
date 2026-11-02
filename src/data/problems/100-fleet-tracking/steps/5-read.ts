@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['tenant', 'read', 'state', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it lists a fleet's vehicles
+**Starting point.** The starter is working code: it lists a fleet's vehicles
 and returns whatever latest position each one's cache happens to hold. It compiles, it serves the
-demo, and it hides three production flaws. Review it like the service owner, fix it, and prove the
+demo, and it hides three production flaws. Debug it like the service owner, fix it, and prove the
 fix with the checks below.
 
 Implement \`GET /v1/fleets/{fleet_id}/positions\`.
@@ -30,7 +30,7 @@ Implement \`GET /v1/fleets/{fleet_id}/positions\`.
 - The response includes the fleet id, the vehicle positions, a \`stale\` count and the
   \`max_vehicles\` cap.
 
-**Failure mode the checks target.** The draft composes the snapshot from per-vehicle caches
+**Failure mode the checks target.** The starter composes the snapshot from per-vehicle caches
 refreshed lazily at different times, so the map shows a fleet assembled from a five-minute window,
 and it returns vehicles that have not reported in hours as current. It also has no cap, no
 pagination and no tenant scoping. The checks verify the freshness bound and stale flag, the cap,
@@ -62,7 +62,7 @@ pagination, and tenant scope.`,
       id: 'freshness',
       title: 'Flags positions older than the freshness bound',
       detail:
-        'A single instant is captured and each position older than `FRESHNESS_BOUND_MS` is returned with `"stale": true`. The draft returns hours-old positions as current.',
+        'A single instant is captured and each position older than `FRESHNESS_BOUND_MS` is returned with `"stale": true`. The starter returns hours-old positions as current.',
       match: {
         python: {all: [/FRESHNESS_BOUND_MS/, /stale/]},
         typescript: {all: [/FRESHNESS_BOUND_MS/, /stale/]},
@@ -75,7 +75,7 @@ pagination, and tenant scope.`,
       id: 'cap',
       title: 'Caps the snapshot at 5000 vehicles',
       detail:
-        'The read is capped at 5 000 vehicles so one fleet cannot exhaust a response. The draft returns every vehicle.',
+        'The read is capped at 5 000 vehicles so one fleet cannot exhaust a response. The starter returns every vehicle.',
       match: {
         python: {all: [/MAX_VEHICLES/, /5000/]},
         typescript: {all: [/MAX_VEHICLES/, /5000/]},
@@ -88,7 +88,7 @@ pagination, and tenant scope.`,
       id: 'pagination',
       title: 'Paginates with a limit and a cursor',
       detail:
-        'The read takes `limit` (1..1000) and an opaque `cursor`, and returns the next `cursor` when a page fills. The draft returns the whole fleet at once.',
+        'The read takes `limit` (1..1000) and an opaque `cursor`, and returns the next `cursor` when a page fills. The starter returns the whole fleet at once.',
       match: {
         python: {all: [/cursor/, /limit/]},
         typescript: {all: [/cursor/, /limit/]},
@@ -101,7 +101,7 @@ pagination, and tenant scope.`,
       id: 'tenant-scope',
       title: 'Scopes the snapshot to the caller tenant',
       detail:
-        'The tenant from `X-Tenant-Id` is passed into the query, so a caller can only read their own fleet. The draft lists vehicles by fleet id alone.',
+        'The tenant from `X-Tenant-Id` is passed into the query, so a caller can only read their own fleet. The starter lists vehicles by fleet id alone.',
       match: {
         python: {all: [/X-Tenant-Id/, /fleet_vehicles\(tenant/]},
         typescript: {all: [/x-tenant-id/, /fleetVehicles\(tenant/]},
@@ -137,9 +137,9 @@ store = FleetStore()
 
 @app.get("/v1/fleets/{fleet_id}/positions")
 def snapshot(fleet_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft composes the snapshot from per-vehicle caches refreshed at different times,
+    # TODO: this starter composes the snapshot from per-vehicle caches refreshed at different times,
     # returns hours-old vehicles as current, and has no cap, pagination or tenant scoping.
-    # Review the instant, the freshness bound, the cap and the cursor.
+    # Check the instant, the freshness bound, the cap and the cursor.
     vehicles = store.list_vehicles(fleet_id)
     positions = [store.latest(vehicle_id) for vehicle_id in vehicles]
     return JSONResponse({"vehicles": positions}, status_code=200)
@@ -209,7 +209,7 @@ def snapshot(
 `,
     },
     typescript: {
-      starter: `/** Fleet snapshot: a model-generated draft that stitches lazily refreshed caches. */
+      starter: `/** Fleet snapshot: flawed code that stitches lazily refreshed caches. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -226,9 +226,9 @@ export interface FleetStore {
 declare const store: FleetStore;
 
 app.get('/v1/fleets/:fleetId/positions', async (request, reply) => {
-  // TODO: this draft composes the snapshot from per-vehicle caches refreshed at different times,
+  // TODO: this starter composes the snapshot from per-vehicle caches refreshed at different times,
   // returns hours-old vehicles as current, and has no cap, pagination or tenant scoping.
-  // Review the instant, the freshness bound, the cap and the cursor.
+  // Check the instant, the freshness bound, the cap and the cursor.
   const {fleetId} = request.params as {fleetId: string};
   const vehicles = await store.listVehicles(fleetId);
   return reply.code(200).send({vehicles});
@@ -321,9 +321,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 func Snapshot(store Store) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: this draft composes the snapshot from per-vehicle caches refreshed at different
+		// TODO: this starter composes the snapshot from per-vehicle caches refreshed at different
 		// times, returns hours-old vehicles as current, and has no cap, pagination or tenant
-		// scoping. Review the instant, the freshness bound, the cap and the cursor.
+		// scoping. Check the instant, the freshness bound, the cap and the cursor.
 		fleetID := r.PathValue("fleetID")
 		vehicles, err := store.ListVehicles(r.Context(), fleetID)
 		if err != nil {
@@ -448,9 +448,9 @@ object FleetSnapshot {
     path("v1" / "fleets" / Segment / "positions") {
       get {
         parameterMap { _ =>
-          // TODO: this draft composes the snapshot from per-vehicle caches refreshed at different
+          // TODO: this starter composes the snapshot from per-vehicle caches refreshed at different
           // times, returns hours-old vehicles as current, and has no cap, pagination or tenant
-          // scoping. Review the instant, the freshness bound, the cap and the cursor.
+          // scoping. Check the instant, the freshness bound, the cap and the cursor.
           val fleetId = "fleet"
           val vehicles = store.listVehicles(fleetId)
           complete(StatusCodes.OK, s"""{"vehicles":\${vehicles.size}}""")
@@ -544,9 +544,9 @@ FleetStore store;
 void registerFleetRoutes(httplib::Server& svr) {
   svr.Get(R"(/v1/fleets/([^/]+)/positions)",
           [](const httplib::Request& req, httplib::Response& res) {
-            // TODO: this draft composes the snapshot from per-vehicle caches refreshed at
+            // TODO: this starter composes the snapshot from per-vehicle caches refreshed at
             // different times, returns hours-old vehicles as current, and has no cap, pagination
-            // or tenant scoping. Review the instant, the freshness bound, the cap and the cursor.
+            // or tenant scoping. Check the instant, the freshness bound, the cap and the cursor.
             const auto fleetId = req.matches[1].str();
             const auto vehicles = store.listVehicles(fleetId);
             res.status = 200;
@@ -645,5 +645,5 @@ void registerFleetRoutes(httplib::Server& svr) {
     'The freshness rule is `age_ms > FRESHNESS_BOUND_MS` and the response carries `"stale": true` for those vehicles plus a total `stale` count. A vehicle that has not reported in hours is stale, not current.',
     'Scope the query by the tenant and page it: `fleet_vehicles(tenant, fleet_id, cursor, limit)` with `limit` in 1..1000, default 500, capped at 5 000 vehicles per snapshot. Return the next `cursor` whenever the page fills.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated read path for consistency, not just compilation. The draft passes the demo because one fleet has three vehicles that all reported a second ago. Three defects are being checked: the snapshot instant (a lazily refreshed per-vehicle cache produces a fleet assembled from a five-minute window), the freshness bound (hours-old vehicles must be flagged stale), and the read contract (tenant scope, a 5 000-vehicle cap, limit/cursor pagination). Real platforms add a read-through cache keyed by the snapshot instant, a separate stale-vehicle count metric, and geohash-bounded queries for viewport reads.`,
+  debrief: `The interviewer is testing whether you can debug a read path for consistency, not just compilation. The starter passes the demo because one fleet has three vehicles that all reported a second ago. Three defects are being checked: the snapshot instant (a lazily refreshed per-vehicle cache produces a fleet assembled from a five-minute window), the freshness bound (hours-old vehicles must be flagged stale), and the read contract (tenant scope, a 5 000-vehicle cap, limit/cursor pagination). Real platforms add a read-through cache keyed by the snapshot instant, a separate stale-vehicle count metric, and geohash-bounded queries for viewport reads.`,
 };

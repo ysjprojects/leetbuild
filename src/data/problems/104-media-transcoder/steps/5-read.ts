@@ -8,26 +8,26 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db', 'output'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it looks the job up, divides
-encoded seconds by a duration and returns a percentage. On a file that was encoded in one piece it
-looks right, which is why nobody questions it until a customer does. Review it, fix it, and prove
-the fix with the checks below.
+**Starting point.** The starter is working code: it looks the job up, divides encoded seconds by a
+duration and returns a percentage. On a file that was encoded in one piece it looks right, which is
+why nobody questions it until a customer does. Debug it, fix it, and prove the fix with the checks
+below.
 
 Implement \`GET /v1/transcodes/{job_id}\`:
 
 - The job is read from the store and the caller must **own** it: a job whose tenant is not the
   authenticated \`X-Tenant-Id\` is **404** (not 403 — a foreign id must not be distinguishable from a
-  missing one). The draft serves any job to any caller.
+  missing one). The starter serves any job to any caller.
 - Progress is **computed from the manifest**, never from elapsed time or a guessed total:
   \`completed_segments\` is what the manifest says is done, and the response carries
   \`segment_count\` and \`failed_segments\` (the indices that failed, sorted).
 - \`state\` is \`"done"\` **only when the manifest covers every expected segment** —
   \`expected = range(segment_count)\`, nothing missing — and there are no failures. A job with
-  failures is \`"failed"\`; anything else is \`"processing"\`. The draft calls a job done at 99 % of
+  failures is \`"failed"\`; anything else is \`"processing"\`. The starter calls a job done at 99 % of
   its segments, which is exactly how a file with a missing minute ships as finished.
 - The response lists **renditions with durations** (\`preset\`, \`duration_s\`/\`durationS\`, and a
   signed reference), so a client can render an output list without a second call.
-- The draft's guess never changes the manifest: the read may cache, but it may not invent progress.
+- The starter's guess never changes the manifest: the read may cache, but it may not invent progress.
 
 **Failure mode the checks target.** Percent-of-a-guess reports a number that no longer means
 anything once segments have different lengths; a 99 % threshold is a lie told to a customer; an
@@ -73,7 +73,7 @@ failed indices hides which segment needs re-encoding.`,
       id: 'done-manifest',
       title: 'Done only when the manifest covers every expected segment',
       detail:
-        'The state is `"done"` only when nothing is missing from `expected = range(segment_count)` (an `every`/`len(missing) == 0`/`isEmpty`/`empty()` check). The draft calls a job done at 99 % of its segments.',
+        'The state is `"done"` only when nothing is missing from `expected = range(segment_count)` (an `every`/`len(missing) == 0`/`isEmpty`/`empty()` check). The starter calls a job done at 99 % of its segments.',
       match: {
         python: {all: [/expected\s*=\s*set\(range\(job\["segment_count"\]\)\)/, /state = "done"/], none: [/0\.99/]},
         typescript: {all: [/const complete = expected\.every\(/, /'done'/], none: [/0\.99/]},
@@ -86,7 +86,7 @@ failed indices hides which segment needs re-encoding.`,
       id: 'failed-indices',
       title: 'Lists the failed segment indices',
       detail:
-        'The response carries the failed segment indices, sorted, so a caller knows which part of the file must be re-encoded. The draft lists nothing at all.',
+        'The response carries the failed segment indices, sorted, so a caller knows which part of the file must be re-encoded. The starter lists nothing at all.',
       match: {
         python: {all: [/"failed_segments"/, /failed/]},
         typescript: {all: [/failedSegments/, /failed/]},
@@ -99,7 +99,7 @@ failed indices hides which segment needs re-encoding.`,
       id: 'renditions',
       title: 'Returns renditions with durations',
       detail:
-        'The response lists the output renditions with their durations (`duration_s`/`durationS`/`DurationS`) and a signed reference, taken from the manifest. The draft returns no renditions.',
+        'The response lists the output renditions with their durations (`duration_s`/`durationS`/`DurationS`) and a signed reference, taken from the manifest. The starter returns no renditions.',
       match: {
         python: {all: [/renditions/, /duration_s/]},
         typescript: {all: [/renditions/, /durationS/]},
@@ -112,7 +112,7 @@ failed indices hides which segment needs re-encoding.`,
       id: 'owner-404',
       title: 'A foreign job is 404',
       detail:
-        'The authenticated tenant is compared with the job’s owner and a foreign job answers `404` before any field is rendered. The draft serves any job to any caller.',
+        'The authenticated tenant is compared with the job’s owner and a foreign job answers `404` before any field is rendered. The starter serves any job to any caller.',
       match: {
         python: {all: [/tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/tenant/, /code\(\s*404\s*\)/]},
@@ -146,9 +146,9 @@ jobs = JobStore()
 
 @app.get("/v1/transcodes/{job_id}")
 def read(job_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft guesses progress from encoded seconds, calls a job done at 99 percent of
+    # TODO: this starter guesses progress from encoded seconds, calls a job done at 99 percent of
     # its segments, lists no failed indices, returns no renditions and serves any tenant's job.
-    # Review all five.
+    # Fix all five.
     job = jobs.get(job_id)
     percent = job["encoded_seconds"] / GUESSED_DURATION_S
     logger.info("job read job=%s tenant=%s percent=%.2f", job_id, tenant, percent)
@@ -211,7 +211,7 @@ def read(job_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse
 `,
     },
     typescript: {
-      starter: `/** Job read: a model-generated draft that guesses a percentage and trusts the caller. */
+      starter: `/** Job read: flawed code that guesses a percentage and trusts the caller. */
 import Fastify from 'fastify';
 
 import {jobs} from './state';
@@ -221,9 +221,9 @@ export const app = Fastify();
 const GUESSED_DURATION_S = 3600;
 
 app.get('/v1/transcodes/:jobId', async (request, reply) => {
-  // TODO: this draft guesses progress from encoded seconds, calls a job done at 99 percent of
+  // TODO: this starter guesses progress from encoded seconds, calls a job done at 99 percent of
   // its segments, lists no failed indices, returns no renditions and serves any tenant's job.
-  // Review all five.
+  // Fix all five.
   const {jobId} = request.params as {jobId: string};
   const job = await jobs.get(jobId);
   const percent = job.encodedSeconds / GUESSED_DURATION_S;
@@ -310,11 +310,11 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// readJob is the draft: a percentage of a guessed duration, served to any caller.
+// readJob as it stands: a percentage of a guessed duration, served to any caller.
 func readJob(rw http.ResponseWriter, r *http.Request, jobs JobStore) {
-	// TODO: this draft guesses progress from encoded seconds, calls a job done at 99 percent of
+	// TODO: this starter guesses progress from encoded seconds, calls a job done at 99 percent of
 	// its segments, lists no failed indices, returns no renditions and serves any tenant's job.
-	// Review all five.
+	// Fix all five.
 	tenant := r.Header.Get("X-Tenant-Id")
 	job, err := jobs.Get(r.Context(), r.PathValue("job_id"))
 	if err != nil {
@@ -443,13 +443,13 @@ object ReadApi {
   val GuessedDurationS = 3600.0
   val jobs = new JobStore
 
-  // The draft: a percentage of a guessed duration, served to any caller.
+  // The starter: a percentage of a guessed duration, served to any caller.
   val route: Route = path("v1" / "transcodes" / Segment) { jobId =>
     get {
       headerValueByName("X-Tenant-Id") { tenant =>
-        // TODO: this draft guesses progress from encoded seconds, calls a job done at 99 percent
+        // TODO: this starter guesses progress from encoded seconds, calls a job done at 99 percent
         // of its segments, lists no failed indices, returns no renditions and serves any
-        // tenant's job. Review all five.
+        // tenant's job. Fix all five.
         val job = jobs.get(jobId).get
         val percent = job.encodedSeconds / GuessedDurationS
         val state = if (percent >= 0.99) "done" else "processing"
@@ -547,9 +547,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/transcodes/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft guesses progress from encoded seconds, calls a job done at 99 percent of
+    // TODO: this starter guesses progress from encoded seconds, calls a job done at 99 percent of
     // its segments, lists no failed indices, returns no renditions and serves any tenant's job.
-    // Review all five.
+    // Fix all five.
     const std::string job_id = req.matches[1];
     const std::string tenant = req.get_header_value("X-Tenant-Id");
     const auto job = jobs.get(job_id);
@@ -643,5 +643,5 @@ int main() {
     'Compute the state from sets, not from a percentage: `expected = range(segment_count)`, `done` from the manifest, `missing = expected − done`, and `done` only when `missing` is empty. A percentage is fine for a progress bar, never for a completion decision.',
     'The response is a contract with the player: completed segment count, the failing indices, and each rendition with its duration and a signed reference. Return all of it from the manifest so the read cannot disagree with the events.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated read endpoint that decides what "finished" means. The draft is convincing because a percentage is what a dashboard shows. Four defects are being checked: completion derived from a gapless manifest instead of a 99 % threshold (a file with a missing minute must never report done), the failed indices (a caller needs to know which segment to re-encode), renditions with durations from the manifest (so the output list never disagrees with the events), and ownership (a foreign job is 404, indistinguishable from a missing one). The percentage in the draft is the deeper flaw: it re-guesses the duration the pipeline already knows, and it silently hides the difference between a job that is nearly finished and one that is finished. Real reads add ETag caching on the manifest version, a streaming progress endpoint for long jobs, and a signed playback manifest per rendition.`,
+  debrief: `The interviewer is testing whether you can debug a read endpoint that decides what "finished" means. The starter is convincing because a percentage is what a dashboard shows. Four defects are being checked: completion derived from a gapless manifest instead of a 99 % threshold (a file with a missing minute must never report done), the failed indices (a caller needs to know which segment to re-encode), renditions with durations from the manifest (so the output list never disagrees with the events), and ownership (a foreign job is 404, indistinguishable from a missing one). The percentage in the starter is the deeper flaw: it re-guesses the duration the pipeline already knows, and it silently hides the difference between a job that is nearly finished and one that is finished. Real reads add ETag caching on the manifest version, a streaming progress endpoint for long jobs, and a signed playback manifest per rendition.`,
 };

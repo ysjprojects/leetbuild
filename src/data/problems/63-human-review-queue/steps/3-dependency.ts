@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['queue', 'enforcement', 'items'],
   task: `## Task
 
-**Review premise.** The starter calls the enforcement service and, when the call times out, decides
+**Starting point.** The starter calls the enforcement service and, when the call times out, decides
 the item itself. It also retries a rejection. On the demo the service always answers, so nobody
-notices — until an enforcement outage silently approves a spam wave. Review it, fix it, and prove the
+notices — until an enforcement outage silently approves a spam wave. Debug it, fix it, and prove the
 fix with the checks below.
 
 Implement \`POST /v1/review/items/{item_id}/resolve\` over the **gRPC** enforcement client:
@@ -30,7 +30,7 @@ Implement \`POST /v1/review/items/{item_id}/resolve\` over the **gRPC** enforcem
   writes an audit row tying the auto-resolve to the enforcement service's grant, so the decision can
   be explained months later. No grant, no auto-resolve.
 
-**Failure mode the checks target.** Two defects. The draft treats a timeout as approval for anything
+**Failure mode the checks target.** Two defects. The starter treats a timeout as approval for anything
 above 0.5 confidence, so an enforcement outage becomes a silent self-approval loop that clears
 exactly the items nobody could verify. And it retries \`PERMISSION_DENIED\`, so a category the policy
 has refused gets hammered three times per resolution.`,
@@ -50,7 +50,7 @@ has refused gets hammered three times per resolution.`,
       id: 'deadline',
       title: 'The enforcement call has a one-second deadline',
       detail:
-        'The RPC is issued with a deadline: a `ENFORCEMENT_DEADLINE` constant passed as `timeout`, `deadline`, or a context/context deadline. The draft issues it with no deadline.',
+        'The RPC is issued with a deadline: a `ENFORCEMENT_DEADLINE` constant passed as `timeout`, `deadline`, or a context/context deadline. The starter issues it with no deadline.',
       match: {
         python: {all: [/ENFORCEMENT_DEADLINE/, /timeout=/]},
         typescript: {all: [/ENFORCEMENT_DEADLINE_MS/, /deadline:/]},
@@ -63,7 +63,7 @@ has refused gets hammered three times per resolution.`,
       id: 'safe-class',
       title: 'Only the safe class auto-resolves',
       detail:
-        'Auto-resolve is gated on `SAFE_CATEGORIES` (`spam_duplicate`, `known_safe_false_positive`); everything else escalates to a human. The draft gates on a 0.5 confidence instead.',
+        'Auto-resolve is gated on `SAFE_CATEGORIES` (`spam_duplicate`, `known_safe_false_positive`); everything else escalates to a human. The starter gates on a 0.5 confidence instead.',
       match: {
         python: {all: [/SAFE_CATEGORIES/, /not in SAFE_CATEGORIES/]},
         typescript: {all: [/SAFE_CATEGORIES/, /SAFE_CATEGORIES\.has\(/]},
@@ -89,7 +89,7 @@ has refused gets hammered three times per resolution.`,
       id: 'timeout-escalates',
       title: 'A timeout escalates instead of resolving',
       detail:
-        '`DEADLINE_EXCEEDED` produces an **escalated** outcome for a human — never an auto-resolve. The draft resolves on timeout above 0.5 confidence.',
+        '`DEADLINE_EXCEEDED` produces an **escalated** outcome for a human — never an auto-resolve. The starter resolves on timeout above 0.5 confidence.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/, /escalate/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /escalate/]},
@@ -102,7 +102,7 @@ has refused gets hammered three times per resolution.`,
       id: 'rejection-terminal',
       title: 'A policy rejection is terminal',
       detail:
-        '`PERMISSION_DENIED` is handled as a final answer — escalated, not retried. The draft wraps the RPC in a three-attempt retry loop that hammers the rejected category.',
+        '`PERMISSION_DENIED` is handled as a final answer — escalated, not retried. The starter wraps the RPC in a three-attempt retry loop that hammers the rejected category.',
       match: {
         python: {all: [/PERMISSION_DENIED/], none: [/for attempt in range\(/]},
         typescript: {all: [/PERMISSION_DENIED/], none: [/for \(let attempt/]},
@@ -137,8 +137,8 @@ def resolve(
     body: ResolveBody,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft auto-resolves any category above 0.5 confidence when the enforcement call
-    # times out, and it retries a policy rejection, so one category gets hammered. Review both.
+    # TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
+    # times out, and it retries a policy rejection, so one category gets hammered. Fix both.
     for attempt in range(3):
         try:
             response = stub.AutoResolve(
@@ -230,7 +230,7 @@ def resolve(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items/{id}/resolve: a model-generated draft that resolves on a timeout. */
+      starter: `/** POST /v1/review/items/{id}/resolve: flawed code that resolves on a timeout. */
 import Fastify from 'fastify';
 import {status} from '@grpc/grpc-js';
 
@@ -245,8 +245,8 @@ interface ResolveBody {
 }
 
 app.post('/v1/review/items/:item_id/resolve', async (request, reply) => {
-  // TODO: this draft auto-resolves any category above 0.5 confidence when the enforcement call
-  // times out, and it retries a policy rejection, so one category gets hammered. Review both.
+  // TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
+  // times out, and it retries a policy rejection, so one category gets hammered. Fix both.
   const body = request.body as ResolveBody;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const response = await callEnforcement(body.category).catch(() => null);
@@ -356,8 +356,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func resolve(rw http.ResponseWriter, r *http.Request) {
 	var body ResolveBody
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this draft auto-resolves any category above 0.5 confidence when the enforcement call
-	// times out, and it retries a policy rejection, so one category gets hammered. Review both.
+	// TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
+	// times out, and it retries a policy rejection, so one category gets hammered. Fix both.
 	for attempt := 0; attempt < 3; attempt++ {
 		resp, err := enforcementClient.AutoResolve(context.Background(), &ResolveRequest{Category: body.Category})
 		if err == nil {
@@ -479,8 +479,8 @@ object Client {
   val ConfidenceThreshold: Double = 0.5
 
   def resolve(tenant: String, itemId: String, category: String, confidence: Double): Future[String] = {
-    // TODO: this draft auto-resolves any category above 0.5 confidence when the enforcement call
-    // times out, and it retries a policy rejection, so one category gets hammered. Review both.
+    // TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
+    // times out, and it retries a policy rejection, so one category gets hammered. Fix both.
     for (attempt <- 1 to 3) {
       try {
         val resp = enforcement.autoResolve(tenant, itemId, category)
@@ -593,8 +593,8 @@ int main() {
   httplib::Server svr;
   svr.Post("/v1/review/items/([^/]+)/resolve", [](const httplib::Request& req, httplib::Response& res) {
     auto body = json::parse(req.body);
-    // TODO: this draft auto-resolves any category above 0.5 confidence when the enforcement call
-    // times out, and it retries a policy rejection, so one category gets hammered. Review both.
+    // TODO: this starter auto-resolves any category above 0.5 confidence when the enforcement call
+    // times out, and it retries a policy rejection, so one category gets hammered. Fix both.
     for (int attempt = 0; attempt < 3; ++attempt) {
       grpc::ClientContext context;
       AutoResolveResponse response;
@@ -685,5 +685,5 @@ int main() {
     'A deadline is what stops an enforcement outage from becoming a review outage. Pass the 1-second deadline on the RPC, and treat `DEADLINE_EXCEEDED` as "escalate to a human" — a timeout is not approval.',
     'A policy rejection is an answer, not a transient error. Handle `PERMISSION_DENIED` once, escalate, and never retry it — and only auto-resolve after the enforcement service returned a grant you recorded.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated dependency call at the most dangerous seam in an AI platform: the place where the system decides an item does not need a human. Three defects are being checked. First, the class: auto-resolution must be gated on a named safe set — spam duplicates and known-safe false positives — never on a confidence threshold, because confidence measures the model's self-assessment, not whether a category is safe to clear unattended. Second, the timeout: a 1-second deadline keeps a reviewer's request bounded, and a timeout must escalate, because treating a timeout as approval turns an enforcement outage into a silent self-approval loop. Third, the rejection: PERMISSION_DENIED is terminal — retrying it hammers the policy that already said no. The subtle point candidates miss is the grant: without a recorded grant id, an auto-resolve months later cannot be explained to an auditor. Real platforms add per-tenant safe-category overrides, a circuit breaker around enforcement, and a hard cap on how many items may auto-resolve per minute.`,
+  debrief: `The interviewer is testing whether you can debug a dependency call at the most dangerous seam in an AI platform: the place where the system decides an item does not need a human. Three defects are being checked. First, the class: auto-resolution must be gated on a named safe set — spam duplicates and known-safe false positives — never on a confidence threshold, because confidence measures the model's self-assessment, not whether a category is safe to clear unattended. Second, the timeout: a 1-second deadline keeps a reviewer's request bounded, and a timeout must escalate, because treating a timeout as approval turns an enforcement outage into a silent self-approval loop. Third, the rejection: PERMISSION_DENIED is terminal — retrying it hammers the policy that already said no. The subtle point candidates miss is the grant: without a recorded grant id, an auto-resolve months later cannot be explained to an auditor. Real platforms add per-tenant safe-category overrides, a circuit breaker around enforcement, and a hard cap on how many items may auto-resolve per minute.`,
 };

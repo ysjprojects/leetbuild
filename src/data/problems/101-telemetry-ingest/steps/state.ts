@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['ingest', 'redis', 'tsdb'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a device with room in its
+**Starting point.** The starter is working code: a device with room in its
 window gets its batch through and its latest values are visible to the dashboard, so the demo looks
-right. The draft hides a race, a leak and a half-applied write. Find them, fix them, and prove the
+right. The starter hides a race, a leak and a half-applied write. Find them, fix them, and prove the
 fix with the checks below.
 
 Implement \`admit(device_id, samples)\`, the Redis decision the ingest path makes before it writes
@@ -76,7 +76,7 @@ one sample in March is still allocating keys in December.`,
       id: 'atomic-script',
       title: 'Rate counter and latest value share one Lua script',
       detail:
-        'One `EVAL`/`NewScript` call runs a script that touches both keys: the window counter (`HINCRBY`) and the latest-value hash (`HSET`). The draft increments the counter from the client after writing the values, so the two can disagree.',
+        'One `EVAL`/`NewScript` call runs a script that touches both keys: the window counter (`HINCRBY`) and the latest-value hash (`HSET`). The starter increments the counter from the client after writing the values, so the two can disagree.',
       match: {
         python: {all: [/ADMIT_LUA/, /\.eval\(/, /HINCRBY/, /HSET/]},
         typescript: {all: [/ADMIT_LUA/, /\.eval\(/, /HINCRBY/, /HSET/]},
@@ -89,7 +89,7 @@ one sample in March is still allocating keys in December.`,
       id: 'reject-before-write',
       title: 'Reads the counter before it increments or writes a value',
       detail:
-        "Inside the script the order is `HGET` → `HINCRBY` → `HSET`: the counter is read and compared first, so a batch that does not fit returns before anything is written. The draft writes the values first and moves the counter afterwards, so a refused batch still changes the device's latest value.",
+        "Inside the script the order is `HGET` → `HINCRBY` → `HSET`: the counter is read and compared first, so a batch that does not fit returns before anything is written. The starter writes the values first and moves the counter afterwards, so a refused batch still changes the device's latest value.",
       match: {
         python: {order: [/HGET/, /HINCRBY/, /HSET/]},
         typescript: {order: [/HGET/, /HINCRBY/, /HSET/]},
@@ -102,7 +102,7 @@ one sample in March is still allocating keys in December.`,
       id: 'window-ttl',
       title: 'The window key expires on first write',
       detail:
-        "The script sets the key's expiry (`EXPIRE`) when it creates it and reports the remaining `TTL`, so the per-minute budget resets and a device that sent once is not tracked forever. The draft never expires its keys.",
+        "The script sets the key's expiry (`EXPIRE`) when it creates it and reports the remaining `TTL`, so the per-minute budget resets and a device that sent once is not tracked forever. The starter never expires its keys.",
       match: {
         python: {all: [/EXPIRE/, /TTL/]},
         typescript: {all: [/EXPIRE/, /TTL/]},
@@ -115,7 +115,7 @@ one sample in March is still allocating keys in December.`,
       id: 'window-key',
       title: 'Keys the counter by device and window bucket',
       detail:
-        "The counter key is `rate:{device_id}:{window}` built from the device id and the 60-second bucket, so one window cannot spend another window's budget and the counter resets every minute. The draft's `rate:{device_id}` key never resets.",
+        "The counter key is `rate:{device_id}:{window}` built from the device id and the 60-second bucket, so one window cannot spend another window's budget and the counter resets every minute. The starter's `rate:{device_id}` key never resets.",
       match: {
         python: {all: [/rate:\{device_id\}:\{window\}/, /WINDOW_S/]},
         typescript: {all: [/rate:\$\{deviceId\}:\$\{window\}/, /WINDOW_S/]},
@@ -128,7 +128,7 @@ one sample in March is still allocating keys in December.`,
       id: 'reject-429',
       title: 'Refuses with 429, Retry-After and remaining samples',
       detail:
-        "A device over its rate gets `429 Too Many Requests` with `Retry-After` and `X-RateLimit-Remaining` built from the script's return value, not from a constant. The draft answers a bare 429 and gives the client nothing to back off with.",
+        "A device over its rate gets `429 Too Many Requests` with `Retry-After` and `X-RateLimit-Remaining` built from the script's return value, not from a constant. The starter answers a bare 429 and gives the client nothing to back off with.",
       match: {
         python: {all: [/Retry-After/, /X-RateLimit-Remaining/, /status_code\s*=\s*429/]},
         typescript: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\.code\(\s*429\s*\)/]},
@@ -171,7 +171,7 @@ def latest_key(device_id: str) -> str:
 
 
 def admit(device_id: str, samples: list[Sample]) -> tuple[bool, int, int]:
-    # TODO: this draft writes the latest values first and moves the rate counter afterwards, so a
+    # TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
     # storm of samples passes the check before any counter moves, and its keys never expire, so a
     # device that sent once is tracked forever.
     used = int(r.get(rate_key(device_id)) or 0)
@@ -261,7 +261,7 @@ def ingest(batch: TelemetryBatch) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** Per-device rate and latest-value state: a model-generated draft that writes values first. */
+      starter: `/** Per-device rate and latest-value state: flawed code that writes values first. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -282,7 +282,7 @@ interface TelemetryBatch {
 }
 
 async function admit(deviceId: string, samples: Sample[]): Promise<[boolean, number, number]> {
-  // TODO: this draft writes the latest values first and moves the rate counter afterwards, so a
+  // TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
   // storm of samples passes the check before any counter moves, and its keys never expire, so a
   // device that sent once is tracked forever.
   const used = Number((await r.get(\`rate:\${deviceId}\`)) ?? 0);
@@ -409,7 +409,7 @@ func rateKey(deviceID string) string { return "rate:" + deviceID }
 func latestKey(deviceID string) string { return "latest:" + deviceID }
 
 func admit(ctx context.Context, deviceID string, samples []Sample) (bool, int64, int64, error) {
-	// TODO: this draft writes the latest values first and moves the rate counter afterwards, so a
+	// TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
 	// storm of samples passes the check before any counter moves, and its keys never expire, so a
 	// device that sent once is tracked forever.
 	used, err := rdb.Get(ctx, rateKey(deviceID)).Int64()
@@ -592,7 +592,7 @@ object DeviceState {
 
   def latestKey(deviceId: String): String = s"latest:$deviceId"
 
-  // TODO: this draft writes the latest values first and moves the rate counter afterwards, so a
+  // TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
   // storm of samples passes the check before any counter moves, and its keys never expire, so a
   // device that sent once is tracked forever.
   def admit(deviceId: String, samples: List[Sample]): (Boolean, Long, Long) = {
@@ -739,7 +739,7 @@ std::tuple<bool, long long, long long> admit(
     sw::redis::Redis& redis,
     const std::string& deviceId,
     const std::vector<std::pair<std::string, double>>& samples) {
-  // TODO: this draft writes the latest values first and moves the rate counter afterwards, so a
+  // TODO: this starter writes the latest values first and moves the rate counter afterwards, so a
   // storm of samples passes the check before any counter moves, and its keys never expire, so a
   // device that sent once is tracked forever.
   const auto raw = redis.get(rateKey(deviceId));

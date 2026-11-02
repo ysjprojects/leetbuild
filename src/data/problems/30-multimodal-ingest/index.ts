@@ -7,13 +7,13 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Multimodal ingest on the AI-era track: the course is not "store an image and call a caption
- * model", it is the review you owe a model-generated ingest path before hundreds of tenants point
- * their uploaders at it. Metadata registered under the content hash before the bytes arrive → one
- * atomic Redis reservation for dedupe and the per-tenant quota → a vision call with a deadline
- * whose failure degrades to text-only indexing instead of a placeholder caption → per-asset events
- * that carry checksums and embedding ids and are published only after the index write confirms →
- * a read endpoint that scopes by tenant and hands out short-lived signed URLs.
+ * Multimodal ingest: the course is not "store an image and call a caption model", it is the
+ * debugging you owe an ingest path before hundreds of tenants point their uploaders at it. Metadata
+ * registered under the content hash before the bytes arrive → one atomic Redis reservation for
+ * dedupe and the per-tenant quota → a vision call with a deadline whose failure degrades to
+ * text-only indexing instead of a placeholder caption → per-asset events that carry checksums and
+ * embedding ids and are published only after the index write confirms → a read endpoint that
+ * scopes by tenant and hands out short-lived signed URLs.
  */
 export const multimodalIngestProblem: Problem = {
   id: 'multimodal-ingest',
@@ -21,7 +21,7 @@ export const multimodalIngestProblem: Problem = {
   tagline: 'Images and captions enter the index together, deduped and tenant-safe.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Multimodal Ingest
 
@@ -83,12 +83,12 @@ One service, **ingestd**, with five pieces:
 5. \`GET /v1/assets/{id}\`: tenant-scoped (foreign id → **404**) with a signed URL that expires in 15
    minutes; the API never proxies the original bytes.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
+failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

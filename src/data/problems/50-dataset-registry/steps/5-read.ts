@@ -8,21 +8,21 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'db', 'storage'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the read endpoint: it looks
+**Starting point.** The starter is working code for the read endpoint: it looks
 the version up, returns the provenance it has and a URL to the object. It compiles, it serves the
 demo, and it hides three production flaws that only matter once there are two tenants or one failed
-validation. Review it like the owner of the endpoint a training run starts from.
+validation. Debug it like the owner of the endpoint a training run starts from.
 
 Implement \`GET /v1/datasets/{dataset}/versions/{version}\`.
 
 - The caller comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
 - A version **belongs to a tenant**. A version another tenant owns is **404**, not 403 — the
-  endpoint must not confirm that a foreign version exists. The draft serves any tenant's record.
+  endpoint must not confirm that a foreign version exists. The starter serves any tenant's record.
 - The response carries the version's **provenance**: \`source\`, \`license\`, \`row_count\` and the
-  **full \`validator_report\`**, present whether validation passed or failed. The draft omits the
+  **full \`validator_report\`**, present whether validation passed or failed. The starter omits the
   report when it was negative, so a caller cannot tell a bad version from a clean one.
 - The object is reachable only through a **short-lived signed URL** (\`SIGNED_URL_TTL_S\`, 300 s)
-  scoped to the caller's tenant, returned with its expiry. The draft returns a permanent URL to the
+  scoped to the caller's tenant, returned with its expiry. The starter returns a permanent URL to the
   raw object, which anyone who sees it can replay forever.
 
 **Failure mode the checks target.** The signed URL is the one clients paste into tickets: without an
@@ -59,7 +59,7 @@ reviewer needs, and its absence reads as "nothing to report".`,
       id: 'tenant-scoped',
       title: 'A version owned by another tenant is 404',
       detail:
-        'The record carries its tenant and the handler compares it to the authenticated caller, answering **404** for a foreign version. The draft answers any tenant that asks.',
+        'The record carries its tenant and the handler compares it to the authenticated caller, answering **404** for a foreign version. The starter answers any tenant that asks.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /record\["tenant"\]\s*!=\s*tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /record\.tenant\s*!==\s*tenant/]},
@@ -72,7 +72,7 @@ reviewer needs, and its absence reads as "nothing to report".`,
       id: 'signed-url',
       title: 'Signed URLs expire',
       detail:
-        'The URL is signed over the tenant, the version and an expiry (`SIGNED_URL_TTL_S` = 300, `signed_url`/`signedUrl`/`signedURL`, an `expires_at`), so it cannot be replayed later or by another tenant. The draft hands out a permanent raw URL.',
+        'The URL is signed over the tenant, the version and an expiry (`SIGNED_URL_TTL_S` = 300, `signed_url`/`signedUrl`/`signedURL`, an `expires_at`), so it cannot be replayed later or by another tenant. The starter hands out a permanent raw URL.',
       match: {
         python: {all: [/SIGNED_URL_TTL_S\s*=\s*300/, /def signed_url\(/, /expires_at/]},
         typescript: {all: [/SIGNED_URL_TTL_S\s*=\s*300/, /function signedUrl\(/, /expiresAt/]},
@@ -85,7 +85,7 @@ reviewer needs, and its absence reads as "nothing to report".`,
       id: 'validator-report',
       title: 'The validator report is always present',
       detail:
-        'The provenance carries `validator_report` and `row_count` unconditionally, including when validation failed. The draft attaches the report only on a pass, so a failed version looks like a clean one.',
+        'The provenance carries `validator_report` and `row_count` unconditionally, including when validation failed. The starter attaches the report only on a pass, so a failed version looks like a clean one.',
       match: {
         python: {all: [/validator_report/, /row_count/]},
         typescript: {all: [/validator_report/, /row_count/]},
@@ -98,7 +98,7 @@ reviewer needs, and its absence reads as "nothing to report".`,
       id: 'no-raw-url',
       title: 'No permanent URL to the raw object',
       detail:
-        'The response exposes the signed URL and never a permanent raw object URL (`raw_url` / `rawUrl` / `RawURL`). The draft returns `raw_url` alongside the provenance.',
+        'The response exposes the signed URL and never a permanent raw object URL (`raw_url` / `rawUrl` / `RawURL`). The starter returns `raw_url` alongside the provenance.',
       match: {
         python: {all: [/signed_url\(/], none: [/raw_url/]},
         typescript: {all: [/signedUrl\(/], none: [/rawUrl/]},
@@ -131,8 +131,8 @@ store = RegistryStore()
 
 
 def permanent_url(dataset: str, version: str) -> str:
-    # TODO: this draft returns a permanent URL to the raw object, serves versions across tenants,
-    # and omits the validator report when it was negative. Review all three.
+    # TODO: this starter returns a permanent URL to the raw object, serves versions across tenants,
+    # and omits the validator report when it was negative. Fix all three.
     return f"{PERMANENT_BASE}/{dataset}/{version}"
 
 
@@ -224,7 +224,7 @@ def read_version(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/datasets/{dataset}/versions/{version}: a model-generated draft. */
+      starter: `/** GET /v1/datasets/{dataset}/versions/{version}: flawed code. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -250,8 +250,8 @@ class RegistryStore {
 const store = new RegistryStore();
 
 function permanentUrl(dataset: string, version: string): string {
-  // TODO: this draft returns a permanent URL to the raw object, serves versions across tenants,
-  // and omits the validator report when it was negative. Review all three.
+  // TODO: this starter returns a permanent URL to the raw object, serves versions across tenants,
+  // and omits the validator report when it was negative. Fix all three.
   return \`\${PERMANENT_BASE}/\${dataset}/\${version}\`;
 }
 
@@ -377,8 +377,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/datasets/{dataset}/versions/{version}", func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: this draft returns a permanent URL to the raw object, serves versions across
-		// tenants, and omits the validator report when it was negative. Review all three.
+		// TODO: this starter returns a permanent URL to the raw object, serves versions across
+		// tenants, and omits the validator report when it was negative. Fix all three.
 		dataset := r.PathValue("dataset")
 		version := r.PathValue("version")
 		record, err := store.Head(r.Context(), dataset, version)
@@ -523,8 +523,8 @@ object ReadApi {
   val route: Route =
     path("v1" / "datasets" / Segment / "versions" / Segment) { (dataset, version) =>
       get {
-        // TODO: this draft returns a permanent URL to the raw object, serves versions across
-        // tenants, and omits the validator report when it was negative. Review all three.
+        // TODO: this starter returns a permanent URL to the raw object, serves versions across
+        // tenants, and omits the validator report when it was negative. Fix all three.
         val stored = store.head(dataset, version)
         if (stored.isEmpty) {
           complete(StatusCodes.NotFound, """{"error":"unknown version"}""")
@@ -640,8 +640,8 @@ struct RegistryStore {
 RegistryStore store;
 
 static std::string permanent_url(const std::string& dataset, const std::string& version) {
-  // TODO: this draft returns a permanent URL to the raw object, serves versions across tenants,
-  // and omits the validator report when it was negative. Review all three.
+  // TODO: this starter returns a permanent URL to the raw object, serves versions across tenants,
+  // and omits the validator report when it was negative. Fix all three.
   return kObjectBase + "/" + dataset + "/" + version;
 }
 
@@ -774,5 +774,5 @@ int main() {
     'The URL is a capability, so it needs an expiry and a scope: sign `tenant/version/expires` and return the expiry with it. A permanent link to the raw object is a public link the moment it lands in a ticket.',
     'Provenance is returned as a whole: `source`, `license`, `row_count`, `validator_report` — the failed report included. Hiding a negative report is the same as reporting success.',
   ],
-  debrief: `The interviewer is testing the read path as a security boundary and a provenance surface. The draft reads correctly for the tenant that registered the dataset. Three defects are checked: cross-tenant reads (404, not a silent success), a permanent object URL instead of a scoped, expiring one, and a validator report that disappears exactly when it matters. The provenance point is the one candidates forget: a version read is how a training run records what it trained on, so the fields that say where the bytes came from, under which license and whether validation passed must be present regardless of the outcome. Real registries add per-request audit logging, range requests through the same signed scope, a URL signing key with rotation, and a check that the dataset’s license is still compatible with the tenant’s declared use.`,
+  debrief: `The interviewer is testing the read path as a security boundary and a provenance surface. The starter reads correctly for the tenant that registered the dataset. Three defects are checked: cross-tenant reads (404, not a silent success), a permanent object URL instead of a scoped, expiring one, and a validator report that disappears exactly when it matters. The provenance point is the one candidates forget: a version read is how a training run records what it trained on, so the fields that say where the bytes came from, under which license and whether validation passed must be present regardless of the outcome. Real registries add per-request audit logging, range requests through the same signed scope, a URL signing key with rotation, and a check that the dataset’s license is still compatible with the tenant’s declared use.`,
 };

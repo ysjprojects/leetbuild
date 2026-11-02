@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['reviewer', 'scorer', 'accounts', 'audit'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: an analyst opens a case, sees
+**Starting point.** The starter is working code: an analyst opens a case, sees
 the score, the signals and the velocity numbers, and everything works. It is also a card-data leak
-with a tenant-isolation hole behind it. Review it, fix it, and prove the fix with the checks below.
+with a tenant-isolation hole behind it. Debug it, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/cases/{id}\` for the review console.
 
@@ -28,7 +28,7 @@ Implement \`GET /v1/cases/{id}\` for the review console.
   it returns the PAN. A role check inside the read handler is not that tool; it is the same leak
   with a longer name.
 
-**Failure mode the checks target.** The draft returns \`record["pan"]\` and the raw feature vector in
+**Failure mode the checks target.** The starter returns \`record["pan"]\` and the raw feature vector in
 the case detail, and it looks up \`cases.get(case_id)\` with no tenant at all, so any authenticated
 caller can read any case by guessing an id. Then it gates unmasking on a role the caller sends in a
 header — \`if role == "admin"\` — which is not authorization, it is a suggestion to the client. The
@@ -74,7 +74,7 @@ they are a cross-tenant card-data extraction path.`,
       id: 'masking',
       title: 'Masking is enforced in the response',
       detail:
-        '`mask_card(pan)` returns `MASK_PREFIX` plus the last four digits and the response builder uses it for the account’s card reference. The draft returns the full card number, which turns a review screen into a card-data export.',
+        '`mask_card(pan)` returns `MASK_PREFIX` plus the last four digits and the response builder uses it for the account’s card reference. The starter returns the full card number, which turns a review screen into a card-data export.',
       match: {
         python: {all: [/def mask_card\(/, /MASK_PREFIX/]},
         typescript: {all: [/function maskCard\(/, /MASK_PREFIX/]},
@@ -87,7 +87,7 @@ they are a cross-tenant card-data extraction path.`,
       id: 'raw-pan-absent',
       title: 'No raw card data in the response, whatever the role',
       detail:
-        'The case detail never carries a full card number: the masked `card_ref` replaces it and no `card_number` field exists. The draft ships `card_number` and unmasked `pan` for anyone who claims the admin role.',
+        'The case detail never carries a full card number: the masked `card_ref` replaces it and no `card_number` field exists. The starter ships `card_number` and unmasked `pan` for anyone who claims the admin role.',
       match: {
         python: {all: [/mask_card\(/], none: [/card_number/]},
         typescript: {all: [/maskCard\(/], none: [/card_number/]},
@@ -100,7 +100,7 @@ they are a cross-tenant card-data extraction path.`,
       id: 'tenant-scope',
       title: 'A foreign case is 404',
       detail:
-        'The lookup is scoped with the caller’s tenant — `cases.get(tenant, case_id)` — and a miss is **404**, so a case id from another tenant is indistinguishable from an unknown one. The draft looks the case up by id alone, so any authenticated caller can read any case.',
+        'The lookup is scoped with the caller’s tenant — `cases.get(tenant, case_id)` — and a miss is **404**, so a case id from another tenant is indistinguishable from an unknown one. The starter looks the case up by id alone, so any authenticated caller can read any case.',
       match: {
         python: {all: [/cases\.get\(tenant/, /\b404\b/]},
         typescript: {all: [/cases\.get\(tenant/, /\b404\b/]},
@@ -113,7 +113,7 @@ they are a cross-tenant card-data extraction path.`,
       id: 'audited-tool',
       title: 'Raw card data lives behind a separately audited tool',
       detail:
-        '`audited_pan(actor, tenant, case_id)` resolves the case for that tenant, writes an audit row with a declared scope, and only then returns the PAN. The draft instead branches on a caller-supplied role inside the read handler — `if role == "admin"` — which is a client-controlled bypass, not authorization.',
+        '`audited_pan(actor, tenant, case_id)` resolves the case for that tenant, writes an audit row with a declared scope, and only then returns the PAN. The starter instead branches on a caller-supplied role inside the read handler — `if role == "admin"` — which is a client-controlled bypass, not authorization.',
       match: {
         python: {all: [/def audited_pan\(/, /audit_log\.record\(/], none: [/role\s*==\s*["']admin["']/]},
         typescript: {all: [/function auditedPan\(/, /auditLog\.record\(/], none: [/role\s*===\s*['"]admin['"]/]},
@@ -157,8 +157,8 @@ def case_view(record: dict, case_id: str) -> dict:
 
 @app.get("/v1/cases/{case_id}")
 def read_case(case_id: str, role: str = Header(default="reviewer")) -> JSONResponse:
-    # TODO: the draft serves any case id across tenants, returns the full card number and the raw
-    # feature vector, and gates unmasking on a role the caller sets itself. Review all three.
+    # TODO: the starter serves any case id across tenants, returns the full card number and the raw
+    # feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
     record = cases.get(case_id)
     if record is None:
         return JSONResponse({"error": "case not found"}, status_code=404)
@@ -238,7 +238,7 @@ def read_case(case_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONRe
 `,
     },
     typescript: {
-      starter: `/** GET /v1/cases/{id}: a model-generated draft of the review read. */
+      starter: `/** GET /v1/cases/{id}: flawed code of the review read. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -262,8 +262,8 @@ class CaseStore {
 const cases = new CaseStore();
 
 app.get('/v1/cases/:caseId', async (request, reply) => {
-  // TODO: the draft serves any case id across tenants, returns the full card number and the raw
-  // feature vector, and gates unmasking on a role the caller sets itself. Review all three.
+  // TODO: the starter serves any case id across tenants, returns the full card number and the raw
+  // feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
   const {caseId} = request.params as {caseId: string};
   const role = request.headers['x-reviewer-role'];
   const record = await cases.get(caseId);
@@ -391,8 +391,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readCase(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft serves any case id across tenants, returns the full card number and the raw
-	// feature vector, and gates unmasking on a role the caller sets itself. Review all three.
+	// TODO: the starter serves any case id across tenants, returns the full card number and the raw
+	// feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
 	caseID := r.PathValue("case_id")
 	role := r.Header.Get("X-Reviewer-Role")
 	record, err := cases.Get(r.Context(), caseID)
@@ -556,8 +556,8 @@ object CasesApi {
   private def json(status: StatusCode, body: String): Route =
     complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
 
-  // TODO: the draft serves any case id across tenants, returns the full card number and the raw
-  // feature vector, and gates unmasking on a role the caller sets itself. Review all three.
+  // TODO: the starter serves any case id across tenants, returns the full card number and the raw
+  // feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
   val route: Route =
     path("v1" / "cases" / Segment) { caseId =>
       get {
@@ -667,7 +667,7 @@ object CasesApi {
 `,
     },
     cpp: {
-      starter: `// GET /v1/cases/{id}: a model-generated draft of the review read.
+      starter: `// GET /v1/cases/{id}: flawed code of the review read.
 #include <string>
 
 #include <httplib.h>
@@ -686,8 +686,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/cases/([\\w-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft serves any case id across tenants, returns the full card number and the raw
-    // feature vector, and gates unmasking on a role the caller sets itself. Review all three.
+    // TODO: the starter serves any case id across tenants, returns the full card number and the raw
+    // feature vector, and gates unmasking on a role the caller sets itself. Fix all three.
     const std::string case_id = req.matches[1];
     const json record = cases.get(case_id);
     if (record.is_null()) {

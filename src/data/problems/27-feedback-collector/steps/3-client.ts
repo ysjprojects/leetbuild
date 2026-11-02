@@ -48,12 +48,12 @@ export const clientStep: Step = {
   },
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. After a model rollout, a week of feedback
+**Starting point.** You are the AI platform engineer on call. After a model rollout, a week of feedback
 that belonged to the previous model showed up under the new one, because the attribution client fell
 back to whatever model was active when the lookup was slow. A second bug hid in the same file: a failed
 lookup was cached for a day, so one slow request poisoned attribution for every request that followed.
 
-Review \`client\` and make a failed lookup honest instead of convenient.
+Debug \`client\` and make a failed lookup honest instead of convenient.
 
 - The lookup carries a \`200\` ms deadline. Express it as \`DEADLINE_MS = 200\` and pass it to the stub
   (\`timeout=\`, \`deadline:\`, \`withDeadlineAfter\`, \`set_deadline\` — whatever the stack calls it).
@@ -192,7 +192,7 @@ def _active_model_attribution() -> Attribution:
 
 
 def attribute(tenant: str, request_id: str) -> Attribution:
-    # TODO: this draft drops the rating when the lookup is slow, caches the failure for a day, and
+    # TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
     # falls back to whatever model is active, so a rollout rewrites last week's feedback.
     if request_id in _failure_cache and time.time() - _failure_cache[request_id] < CACHE_FAILURE_TTL:
         return _active_model_attribution()
@@ -317,7 +317,7 @@ export async function attribute(
   tenant: string,
   requestId: string,
 ): Promise<Attribution> {
-  // TODO: this draft drops the rating when the lookup is slow, caches the failure for a day, and
+  // TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
   // falls back to whatever model is active, so a rollout rewrites last week's feedback.
   const cached = failureCache.get(requestId);
   if (cached !== undefined && Date.now() / 1000 - cached < CACHE_FAILURE_TTL) {
@@ -427,7 +427,7 @@ type Attribution struct {
 var failureCache = map[string]time.Time{}
 
 func attribute(ctx context.Context, client pb.AttributionClient, tenant, requestID string) Attribution {
-	// TODO: this draft drops the rating when the lookup is slow, caches the failure for a day, and
+	// TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
 	// falls back to whatever model is active, so a rollout rewrites last week's feedback.
 	if seenAt, ok := failureCache[requestID]; ok && time.Since(seenAt) < time.Duration(cacheFailureTtl)*time.Second {
 		return Attribution{ModelVersion: activeModel, PromptVersion: "current", Route: "default"}
@@ -518,7 +518,7 @@ object AttributionLookup {
   private var failureCache: Map[String, Long] = Map.empty
 
   def attribute(tenant: String, requestId: String): Future[Attribution] = {
-    // TODO: this draft drops the rating when the lookup is slow, caches the failure for a day, and
+    // TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
     // falls back to whatever model is active, so a rollout rewrites last week's feedback.
     val now = System.currentTimeMillis()
     failureCache.get(requestId) match {
@@ -611,7 +611,7 @@ struct Attribution {
 };
 
 Attribution attribute(const std::string& tenant, const std::string& requestId) {
-  // TODO: this draft drops the rating when the lookup is slow, caches the failure for a day, and
+  // TODO: this starter drops the rating when the lookup is slow, caches the failure for a day, and
   // falls back to whatever model is active, so a rollout rewrites last week's feedback.
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kTimeoutSeconds));

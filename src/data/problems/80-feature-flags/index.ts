@@ -7,13 +7,13 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Feature flags on the AI-era track: the course is not "add a boolean to config", it is the review
- * you owe a model-generated flag service before it decides what every user sees. Validated,
- * idempotent flag creation against a schema registry → one atomic Redis versioned snapshot swapped
- * whole, with per-flag deterministic bucketing → a kill switch propagated over gRPC with a bounded
- * staleness that a stale snapshot can never overwrite → flag-keyed events carrying rule digests and
- * an outbox, published after the snapshot commits → an explain endpoint that must agree with the
- * served evaluation bit-for-bit without revealing another user's history.
+ * Feature flags: the course is not "add a boolean to config", it is the debugging you owe a flag
+ * service before it decides what every user sees. Validated, idempotent flag creation against a
+ * schema registry → one atomic Redis versioned snapshot swapped whole, with per-flag deterministic
+ * bucketing → a kill switch propagated over gRPC with a bounded staleness that a stale snapshot can
+ * never overwrite → flag-keyed events carrying rule digests and an outbox, published after the
+ * snapshot commits → an explain endpoint that must agree with the served evaluation bit-for-bit
+ * without revealing another user's history.
  */
 export const featureFlagsProblem: Problem = {
   id: 'feature-flags',
@@ -21,7 +21,6 @@ export const featureFlagsProblem: Problem = {
   tagline: 'Flags that evaluate deterministically, roll out safely and cannot be flipped by drift.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Feature Flags
 
@@ -68,12 +67,12 @@ One service, **flagd**, with five pieces:
    value, and the exact snapshot version — agreeing with the served evaluation and exposing only the
    caller's own user.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real flag feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

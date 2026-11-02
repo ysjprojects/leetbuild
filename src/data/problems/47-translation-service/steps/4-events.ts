@@ -8,10 +8,10 @@ export const localeEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated analytics path: it publishes one event
+**Starting point.** The starter is working code for the analytics path: it publishes one event
 per translated segment and updates quality counters from the consumer. It compiles, the dashboard
-fills, and it hides three production flaws. Review it, fix it, and prove the fix with the checks
-below.
+fills, and it hides three production flaws. Debug it like the owner of the metric, fix it, and prove
+the fix with the checks below.
 
 Implement the \`translation.done\` quality path.
 
@@ -46,7 +46,7 @@ dashboard looks fine until the day a consumer restarts.`,
       id: 'locale-key',
       title: 'Keys translation.done by the locale pair',
       detail:
-        'Every record goes to `translation.done` with the partition key `source->target`. The draft keys by tenant, so one locale pair is spread across partitions and per-locale ordering is lost.',
+        'Every record goes to `translation.done` with the partition key `source->target`. The starter keys by tenant, so one locale pair is spread across partitions and per-locale ordering is lost.',
       match: {
         python: {all: [/translation\.done/, /locale_pair_key/]},
         typescript: {all: [/translation\.done/, /localePairKey/]},
@@ -59,7 +59,7 @@ dashboard looks fine until the day a consumer restarts.`,
       id: 'no-text',
       title: 'Publishes text hashes, never the source or target text',
       detail:
-        'The payload carries `source_sha256` and `target_sha256` and no `source_text`/`target_text` field. The draft publishes the source text verbatim for spot checks.',
+        'The payload carries `source_sha256` and `target_sha256` and no `source_text`/`target_text` field. The starter publishes the source text verbatim for spot checks.',
       match: {
         python: {all: [/source_sha256/, /target_sha256/], none: [/source_text/, /target_text/]},
         typescript: {all: [/sourceSha256/, /targetSha256/], none: [/source_text/, /target_text/]},
@@ -72,7 +72,7 @@ dashboard looks fine until the day a consumer restarts.`,
       id: 'outbox',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A failed produce is caught and the event is inserted into the outbox for a later replay. The draft lets the exception escape and loses the segment.',
+        'A failed produce is caught and the event is inserted into the outbox for a later replay. The starter lets the exception escape and loses the segment.',
       match: {
         python: {all: [/insert_outbox/, /KafkaException/]},
         typescript: {all: [/insertOutbox/, /catch\s*\(/]},
@@ -85,7 +85,7 @@ dashboard looks fine until the day a consumer restarts.`,
       id: 'counters-before-commit',
       title: 'Updates the counters before committing the offset',
       detail:
-        'The `HINCRBY` that records the segment happens **before** the offset commit, so a crash replays the update instead of dropping it. The draft commits first.',
+        'The `HINCRBY` that records the segment happens **before** the offset commit, so a crash replays the update instead of dropping it. The starter commits first.',
       match: {
         python: {order: [/\.hincrby\(/, /\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets/]},
@@ -98,7 +98,7 @@ dashboard looks fine until the day a consumer restarts.`,
       id: 'acks',
       title: 'Configures an idempotent producer with acks=all',
       detail:
-        'Idempotence plus required acks `all` is producer configuration, not application logic: it is what makes a produce retry free of duplicates. The draft sends with the default acks and no idempotence.',
+        'Idempotence plus required acks `all` is producer configuration, not application logic: it is what makes a produce retry free of duplicates. The starter sends with the default acks and no idempotence.',
       match: {
         python: {all: [/ACKS_ALL/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*ACKS_ALL/]},
@@ -125,8 +125,8 @@ TOPIC = "translation.done"
 
 
 def publish(tenant: str, segment: dict, text: str) -> None:
-    # TODO: this draft keys by tenant so per-locale quality is unavailable, publishes the source
-    # text verbatim for spot checks, and updates its counters after committing the offset. Review
+    # TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source
+    # text verbatim for spot checks, and updates its counters after committing the offset. Fix
     # all three.
     payload = {**segment, "source_text": text}
     producer.produce(TOPIC, key=tenant, value=json.dumps(payload))
@@ -212,7 +212,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** The model-generated quality path: tenant-keyed, text in the payload, commit too early. */
+      starter: `/** The quality path: tenant-keyed, text in the payload, commit too early. */
 import {Redis} from 'ioredis';
 import {Kafka} from 'kafkajs';
 
@@ -230,8 +230,8 @@ interface Segment {
 }
 
 export async function publish(tenant: string, segment: Segment, text: string): Promise<void> {
-  // TODO: this draft keys by tenant so per-locale quality is unavailable, publishes the source text
-  // verbatim for spot checks, and updates its counters after committing the offset. Review all three.
+  // TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source text
+  // verbatim for spot checks, and updates its counters after committing the offset. Fix all three.
   const value = JSON.stringify({...segment, tenant, source_text: text});
   await producer.send({topic: TOPIC, messages: [{key: tenant, value}]});
 }
@@ -348,8 +348,8 @@ var (
 )
 
 func publish(ctx context.Context, tenant string, event SegmentEvent, text string) error {
-	// TODO: this draft keys by tenant so per-locale quality is unavailable, publishes the source text
-	// verbatim for spot checks, and updates its counters after committing the offset. Review all three.
+	// TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source text
+	// verbatim for spot checks, and updates its counters after committing the offset. Fix all three.
 	event.SourceText = text
 	payload, _ := json.Marshal(event)
 	return eventsWriter.WriteMessages(ctx, kafka.Message{Key: []byte(tenant), Value: payload})
@@ -485,8 +485,8 @@ object QualityEvents {
   val jedis = new Jedis("redis", 6379)
 
   def publish(tenant: String, segment: Map[String, String], text: String): Unit = {
-    // TODO: this draft keys by tenant so per-locale quality is unavailable, publishes the source
-    // text verbatim for spot checks, and updates its counters after committing the offset. Review
+    // TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source
+    // text verbatim for spot checks, and updates its counters after committing the offset. Fix
     // all three.
     val payload = (segment + ("source_text" -> text)).toJson.compactPrint
     producer.send(new ProducerRecord("translation.done", tenant, payload))
@@ -585,8 +585,8 @@ const std::string kDoneTopic = "translation.done";
 std::unique_ptr<RdKafka::Producer> producer;
 
 void publish(const std::string& tenant, const json& segment, const std::string& text) {
-  // TODO: this draft keys by tenant so per-locale quality is unavailable, publishes the source text
-  // verbatim for spot checks, and updates its counters after committing the offset. Review all three.
+  // TODO: this starter keys by tenant so per-locale quality is unavailable, publishes the source text
+  // verbatim for spot checks, and updates its counters after committing the offset. Fix all three.
   json event = segment;
   event["source_text"] = text;
   const auto payload = event.dump();
@@ -597,7 +597,7 @@ void publish(const std::string& tenant, const json& segment, const std::string& 
 }
 
 void consume(const std::string& topic) {
-  // TODO: counters after commit — see the review note above.
+  // TODO: counters after commit — see the note above.
   consumeLoop(topic);
 }
 `,

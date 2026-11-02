@@ -8,10 +8,9 @@ export const rerankStateStep: Step = {
   focus: ['api', 'redis', 'reranker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads a cache, computes a
-miss and writes it back. It works for one query and one model build, and it quietly serves the wrong
-answer everywhere else. Review it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter is working code: it reads a cache, computes a miss and writes it
+back. It works for one query and one model build, and it quietly serves the wrong answer everywhere
+else. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 A score is a function of **(query, passage, model version)** — change any one of the three and the
 cached number is no longer the score of this comparison. Implement the score cache:
@@ -26,7 +25,7 @@ cached number is no longer the score of this comparison. Implement the score cac
 - A model version bump must produce a different key, so the same pair gets a fresh score instead of
   the previous build's number.
 
-**Failure mode the checks target.** The draft keys by passage hash alone, so the first query to
+**Failure mode the checks target.** The starter keys by passage hash alone, so the first query to
 score a passage populates an entry every other query then receives; it never puts the model version
 in the key, so a new build silently reuses old numbers; and it writes without a TTL, so a score
 outlives the model that made it.`,
@@ -46,7 +45,7 @@ outlives the model that made it.`,
       id: 'cache-key',
       title: 'Keys scores by query fingerprint and passage hash',
       detail:
-        'The cache key names the query fingerprint and the passage hash, so a score is stored for a pair rather than for a passage. The draft keys by the passage hash alone.',
+        'The cache key names the query fingerprint and the passage hash, so a score is stored for a pair rather than for a passage. The starter keys by the passage hash alone.',
       match: {
         python: {all: [/query_fingerprint/, /passage_hash/, /score_key/]},
         typescript: {all: [/queryFingerprint/, /passageHash/, /scoreKey/]},
@@ -59,7 +58,7 @@ outlives the model that made it.`,
       id: 'version-in-key',
       title: 'Includes the model version in the key',
       detail:
-        'The key builder takes the model version, so a version bump is a different key and serves a fresh score for the same pair. The draft ignores the version.',
+        'The key builder takes the model version, so a version bump is a different key and serves a fresh score for the same pair. The starter ignores the version.',
       match: {
         python: {all: [/def score_key\([^)]*model_version/]},
         typescript: {all: [/function scoreKey\([^)]*modelVersion/]},
@@ -72,7 +71,7 @@ outlives the model that made it.`,
       id: 'ttl',
       title: 'Expires every entry after 30 minutes',
       detail:
-        'Scores are written with a `30 * 60` second TTL, so a cached number cannot outlive the model build. The draft writes with no expiry.',
+        'Scores are written with a `30 * 60` second TTL, so a cached number cannot outlive the model build. The starter writes with no expiry.',
       match: {
         python: {all: [/SCORE_TTL_S/, /ex\s*=\s*SCORE_TTL_S/]},
         typescript: {all: [/SCORE_TTL_S/, /['"]EX['"]/]},
@@ -85,7 +84,7 @@ outlives the model that made it.`,
       id: 'cache-aside',
       title: 'Reads the batch, writes only the misses',
       detail:
-        'The batch is read in one `MGET` and the recomputed values are written back with the TTL. The draft reads one key at a time and never batches.',
+        'The batch is read in one `MGET` and the recomputed values are written back with the TTL. The starter reads one key at a time and never batches.',
       match: {
         python: {all: [/mget/, /\.set\(/]},
         typescript: {all: [/mget/, /\.set\(/]},
@@ -98,7 +97,7 @@ outlives the model that made it.`,
       id: 'miss-recompute',
       title: 'Recomputes exactly the missing pair entries',
       detail:
-        'Entries whose `MGET` value is nil are collected and recomputed; cached entries are returned untouched. The draft has no concept of a partial hit.',
+        'Entries whose `MGET` value is nil are collected and recomputed; cached entries are returned untouched. The starter has no concept of a partial hit.',
       match: {
         python: {all: [/missing/, /compute_scores/]},
         typescript: {all: [/missing/, /computeScores/]},
@@ -122,7 +121,7 @@ def passage_hash(text: str) -> str:
 
 
 def score_key(text: str) -> str:
-    # TODO: this draft keys by the passage hash alone, so one query's scores are served for every
+    # TODO: this starter keys by the passage hash alone, so one query's scores are served for every
     # other query, and it never distinguishes model versions. It also writes with no TTL.
     return "rerank:score:" + passage_hash(text)
 
@@ -196,7 +195,7 @@ function passageHash(text: string): string {
 }
 
 function scoreKey(text: string): string {
-  // TODO: this draft keys by the passage hash alone, so one query's scores are served for every
+  // TODO: this starter keys by the passage hash alone, so one query's scores are served for every
   // other query, and it never distinguishes model versions. It also writes with no TTL.
   return 'rerank:score:' + passageHash(text);
 }
@@ -298,7 +297,7 @@ func passageHash(text string) string {
 }
 
 func scoreKey(text string) string {
-	// TODO: this draft keys by the passage hash alone, so one query's scores are served for every
+	// TODO: this starter keys by the passage hash alone, so one query's scores are served for every
 	// other query, and it never distinguishes model versions. It also writes with no TTL.
 	return "rerank:score:" + passageHash(text)
 }
@@ -430,7 +429,7 @@ object ScoreCache {
     MessageDigest.getInstance("SHA-256").digest(text.getBytes("UTF-8")).map("%02x".format(_)).mkString.take(32)
 
   def scoreKey(text: String): String =
-    // TODO: this draft keys by the passage hash alone, so one query's scores are served for every
+    // TODO: this starter keys by the passage hash alone, so one query's scores are served for every
     // other query, and it never distinguishes model versions. It also writes with no TTL.
     "rerank:score:" + passageHash(text)
 
@@ -519,7 +518,7 @@ std::string digest(const std::string& value) {
 std::string passageHash(const std::string& text) { return digest(text); }
 
 std::string scoreKey(const std::string& text) {
-  // TODO: this draft keys by the passage hash alone, so one query's scores are served for every
+  // TODO: this starter keys by the passage hash alone, so one query's scores are served for every
   // other query, and it never distinguishes model versions. It also writes with no TTL.
   return "rerank:score:" + passageHash(text);
 }
@@ -624,7 +623,7 @@ std::vector<double> cachedScores(const std::string& query, const std::vector<Can
     'A version bump should be invisible to the caller: the same pair under a new version simply misses and recomputes, because the version is part of the key rather than a field beside it.',
   ],
   debrief: `The interviewer is testing whether you understand that a relevance score is not a property of a
-passage. The draft reads fine because the demo reruns the same query against the same build. Three
+passage. The starter reads fine because the demo reruns the same query against the same build. Three
 defects are being checked: an incomplete pair key (query fingerprint missing), a missing model
 version (so a new build silently reuses old numbers), and no TTL (so a score outlives the build that
 made it). The batch read and the miss list are the operational half: a per-key loop issues N round

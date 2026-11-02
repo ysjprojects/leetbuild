@@ -8,9 +8,9 @@ export const trainingEndpointStep: Step = {
   focus: ['client', 'scheduler', 'store', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, mints a
+**Starting point.** The starter is working code: it registers the route, mints a
 run id and answers \`201 queued\`. It compiles, it serves the demo, and it hides four production
-flaws. Review it like the owner of the scheduler, fix it, and prove the fix with the checks below.
+flaws. Debug it like the owner of the scheduler, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/training/runs\` with body
 \`{"dataset_version": "…", "recipe_version": "…", "priority": 5}\`.
@@ -71,7 +71,7 @@ second run, so one submission trains two models and bills twice.`,
       id: 'priority-band',
       title: 'Clamps priority into the supported bands',
       detail:
-        'Priority is clamped to `0..9` and mapped to one of 3 bands before the run is queued. The draft passes the caller’s integer straight through, so `999999` outranks every band.',
+        'Priority is clamped to `0..9` and mapped to one of 3 bands before the run is queued. The starter passes the caller’s integer straight through, so `999999` outranks every band.',
       match: {
         python: {
           all: [/PRIORITY_MIN/, /PRIORITY_MAX/, /PRIORITY_BANDS/, /def clamp_priority\(/, /def priority_band\(/],
@@ -94,7 +94,7 @@ second run, so one submission trains two models and bills twice.`,
       id: 'idempotency',
       title: 'A replay of (tenant, Idempotency-Key) returns the original run',
       detail:
-        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`: a retry returns the stored run instead of queueing a second one. The draft ignores the header entirely.',
+        '`Idempotency-Key` is required and the run is stored under `(tenant, key)`: a retry returns the stored run instead of queueing a second one. The starter ignores the header entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /runs\.get\(/, /runs\.put\(/]},
         typescript: {all: [/idempotency-key/, /runs\.get\(/, /runs\.put\(/]},
@@ -107,7 +107,7 @@ second run, so one submission trains two models and bills twice.`,
       id: 'recipe-version',
       title: 'An unknown recipe version is 400 before the run is enqueued',
       detail:
-        'The recipe version is checked against the registry and rejected with **400** before any queue write. The draft never looks the recipe up, so a typo consumes a GPU slot.',
+        'The recipe version is checked against the registry and rejected with **400** before any queue write. The starter never looks the recipe up, so a typo consumes a GPU slot.',
       match: {
         python: {all: [/KNOWN_RECIPES/, /HTTPException\(status_code=400/], order: [/KNOWN_RECIPES/, /enqueue\(/]},
         typescript: {all: [/KNOWN_RECIPES/, /code\(400\)/], order: [/KNOWN_RECIPES/, /enqueue\(/]},
@@ -120,7 +120,7 @@ second run, so one submission trains two models and bills twice.`,
       id: 'durable-run',
       title: 'The scheduler issues the run id and persists the run before answering',
       detail:
-        'The run id is a scheduler-issued UUID, written to the run store under `(tenant, key)` before the response, so a restart replays the submission rather than losing it. The draft mints a counter-based id and stores nothing.',
+        'The run id is a scheduler-issued UUID, written to the run store under `(tenant, key)` before the response, so a restart replays the submission rather than losing it. The starter mints a counter-based id and stores nothing.',
       match: {
         python: {all: [/uuid\.uuid4\(\)/, /runs\.put\(/, /run_id/]},
         typescript: {all: [/randomUUID\(\)/, /runs\.put\(/, /run_id/]},
@@ -169,9 +169,9 @@ runs = RunStore()
 
 @app.post("/v1/training/runs")
 def submit(body: SubmitRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft takes the caller's priority unchanged, ignores Idempotency-Key, never
+    # TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never
     # checks the recipe version against the registry, and mints a new run id on every retry.
-    # Review all four before a run is allowed to reach a GPU.
+    # Fix all four before a run is allowed to reach a GPU.
     run_id = f"run-{next(run_counter)}"
     logger.info("run queued run_id=%s tenant=%s priority=%d", run_id, tenant, body.priority)
     return JSONResponse(
@@ -277,7 +277,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/training/runs: a model-generated draft that queues anything it is given. */
+      starter: `/** POST /v1/training/runs: flawed code that queues anything it is given. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -291,8 +291,8 @@ interface SubmitBody {
 }
 
 app.post('/v1/training/runs', async (request, reply) => {
-  // TODO: this draft takes the caller's priority unchanged, ignores Idempotency-Key, never checks
-  // the recipe version against the registry, and mints a new run id on every retry. Review all four.
+  // TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never checks
+  // the recipe version against the registry, and mints a new run id on every retry. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as SubmitBody;
   const runId = \`run-\${++runCounter}\`;
@@ -439,7 +439,7 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft takes the caller's priority unchanged, ignores Idempotency-Key, never checks
+	// TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never checks
 	// the recipe version against the registry, and mints a new run id on every retry.
 	runCounter++
 	runID := fmt.Sprintf("run-%d", runCounter)
@@ -622,7 +622,7 @@ object TrainingApi {
     path("v1" / "training" / "runs") {
       post {
         entity(as[SubmitRequest]) { body =>
-          // TODO: this draft takes the caller's priority unchanged, ignores Idempotency-Key, never
+          // TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never
           // checks the recipe version against the registry, and mints a new run id on every retry.
           runCounter += 1
           val runId = s"run-$runCounter"
@@ -771,7 +771,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft takes the caller's priority unchanged, ignores Idempotency-Key, never
+    // TODO: this starter takes the caller's priority unchanged, ignores Idempotency-Key, never
     // checks the recipe version against the registry, and mints a new run id on every retry.
     static int runCounter = 0;
     const auto runId = "run-" + std::to_string(++runCounter);
@@ -896,8 +896,8 @@ int main() {
     'Clamp, then band — never band the raw integer. `min(max(priority, PRIORITY_MIN), PRIORITY_MAX)` is what keeps a caller-provided `999999` inside the same three bands as everyone else, and the band is what the queue orders by.',
     'Idempotency is keyed by `(tenant, Idempotency-Key)` and stores the **run**, not the request: the replay has to return the original `run_id` and the original band, which is only possible if the scheduler issued and persisted the id before it answered.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the admission boundary. The
-draft reads fine because the demo submits a valid recipe from one tenant and never retries. Four
+  debrief: `The interviewer is testing whether you can debug a handler at the admission boundary. The
+starter reads fine because the demo submits a valid recipe from one tenant and never retries. Four
 defects are being checked: authentication of the tenant, the recipe-registry lookup that must happen
 before a GPU is reserved, the clamp that keeps priority inside supported bands (a starvation problem
 when it is missing, a fairness problem when it is added carelessly), and idempotency keyed by tenant

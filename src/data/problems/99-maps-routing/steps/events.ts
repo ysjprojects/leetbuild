@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it produces an event on the happy path and the
+**Starting point.** The starter is working code: it produces an event on the happy path and the
 payload names the user, so the demo shows telemetry flowing. Three production contracts are
 broken. Find them, fix them, and prove the fix.
 
@@ -68,7 +68,7 @@ it is counting; and a rejected produce with no outbox row loses the event with n
       id: 'region-key',
       title: 'Keyed by region, not the user',
       detail:
-        'The record key is the map region and the event carries it, so one region’s telemetry stays ordered inside one partition. The draft keys by the user id, which scatters a region’s events and loses the ordering guarantee.',
+        'The record key is the map region and the event carries it, so one region’s telemetry stays ordered inside one partition. The starter keys by the user id, which scatters a region’s events and loses the ordering guarantee.',
       match: {
         python: {all: [/key=route\["region"\]/, /"region"\s*:\s*route\["region"\]/]},
         typescript: {all: [/key:\s*route\.region\b/, /region:\s*route\.region\b/]},
@@ -81,7 +81,7 @@ it is counting; and a rejected produce with no outbox row loses the event with n
       id: 'cell-hash',
       title: 'Coordinate cell hash: rounded, then hashed',
       detail:
-        'Exact endpoints are rounded to a ~1 km cell (two decimals) and only the hash of that cell — `route_cell` — is published. The draft ships the raw origin and destination instead.',
+        'Exact endpoints are rounded to a ~1 km cell (two decimals) and only the hash of that cell — `route_cell` — is published. The starter ships the raw origin and destination instead.',
       match: {
         python: {all: [/def cell_hash\(/, /round\(/, /"route_cell"\s*:\s*cell_hash\(/]},
         typescript: {all: [/cellHash\(route\.origin/, /Math\.round\(/, /route_cell:\s*cell/]},
@@ -94,7 +94,7 @@ it is counting; and a rejected produce with no outbox row loses the event with n
       id: 'no-exact-points',
       title: 'No exact endpoints in the payload or the logs',
       detail:
-        'Neither the event payload nor any log line contains the exact origin or destination — only the coarse cell. The draft prints and publishes both, and the topic is retained and replicated, so those points outlive every retention policy the request pipeline has.',
+        'Neither the event payload nor any log line contains the exact origin or destination — only the coarse cell. The starter prints and publishes both, and the topic is retained and replicated, so those points outlive every retention policy the request pipeline has.',
       match: {
         python: {
           none: [
@@ -127,7 +127,7 @@ it is counting; and a rejected produce with no outbox row loses the event with n
       id: 'payload-fields',
       title: 'Latency, distance and epoch ride the event',
       detail:
-        'The event carries the route’s `latency_ms`, `distance_m` and traffic `epoch`, so consumers know what traffic state and how long a route they are counting. The draft drops the epoch and the distance.',
+        'The event carries the route’s `latency_ms`, `distance_m` and traffic `epoch`, so consumers know what traffic state and how long a route they are counting. The starter drops the epoch and the distance.',
       match: {
         python: {
           all: [
@@ -162,7 +162,7 @@ it is counting; and a rejected produce with no outbox row loses the event with n
       id: 'outbox-rejected',
       title: 'A rejected produce becomes an outbox row',
       detail:
-        'A broker rejection writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) instead of dropping the event; a relay republishes it when the broker recovers. The draft ignores the produce result entirely.',
+        'A broker rejection writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) instead of dropping the event; a relay republishes it when the broker recovers. The starter ignores the produce result entirely.',
       match: {
         python: {all: [/store\.insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/store\.insertOutbox\(/, /catch\s*[({]/]},
@@ -256,7 +256,7 @@ def publish_route(route: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** route.computed: a model-generated draft that keys by user and ships raw coordinates. */
+      starter: `/** route.computed: flawed code that keys by user and ships raw coordinates. */
 import {Kafka} from 'kafkajs';
 
 export const kafka = new Kafka({clientId: 'maps-routing', brokers: ['kafka:9092']});
@@ -661,5 +661,5 @@ void publishRoute(const Route& route) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partitioned by region, each region’s telemetry arrives in order; keyed by user, it does not. Second, a topic is retained and replicated, so anything written there — exact endpoints included — outlives the request: the payload carries a coarse cell hash and the logs carry ids, not positions. Third, a broker is not a database: a rejected produce becomes an outbox row that a relay republishes, and the event carries the epoch so consumers never mix traffic states. Real platforms add a schema registry and per-topic retention, compact telemetry to roll-ups, and run PII scanners over the pipeline.`,
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the message key is an ordering contract: partitioned by region, each region’s telemetry arrives in order; keyed by user, it does not. Second, a topic is retained and replicated, so anything written there — exact endpoints included — outlives the request: the payload carries a coarse cell hash and the logs carry ids, not positions. Third, a broker is not a database: a rejected produce becomes an outbox row that a relay republishes, and the event carries the epoch so consumers never mix traffic states. Real platforms add a schema registry and per-topic retention, compact telemetry to roll-ups, and run PII scanners over the pipeline.`,
 };

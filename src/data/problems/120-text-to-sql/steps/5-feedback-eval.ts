@@ -8,7 +8,7 @@ export const feedbackEvalStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a rating goes onto a topic
+**Starting point.** The starter is working code: a rating goes onto a topic
 and a consumer moves a counter, so the dashboard shows numbers. Four production contracts are
 broken: the event carries almost none of the signals the evaluation needs, it is keyed so that one
 user's events scatter across partitions, the producer can duplicate on retry, and the consumer
@@ -66,7 +66,7 @@ commit-before-write is the crash that quietly makes the dashboard lie.`,
       id: 'user-key',
       title: 'Keyed by user, carries the query id',
       detail:
-        'The message key is the user (one user’s events stay in one partition) and the event carries `query_id`. The draft keys by the query id, so one user’s events scatter across partitions.',
+        'The message key is the user (one user’s events stay in one partition) and the event carries `query_id`. The starter keys by the query id, so one user’s events scatter across partitions.',
       match: {
         python: {all: [/key=user/, /query_id/]},
         typescript: {all: [/key:\s*user\b/, /query_id/]},
@@ -92,7 +92,7 @@ commit-before-write is the crash that quietly makes the dashboard lie.`,
       id: 'signals',
       title: 'Carries the evaluation signals, not just a rating',
       detail:
-        'The event has `tables_proposed`, `tables_acked`, `run_ok` and `has_output` beside the rating — the signals the source’s evaluation separates. The draft sends the rating alone.',
+        'The event has `tables_proposed`, `tables_acked`, `run_ok` and `has_output` beside the rating — the signals the source’s evaluation separates. The starter sends the rating alone.',
       match: {
         python: {all: [/tables_proposed/, /tables_acked/, /run_ok/, /has_output/]},
         typescript: {all: [/tables_proposed/, /tables_acked/, /run_ok/, /has_output/]},
@@ -105,7 +105,7 @@ commit-before-write is the crash that quietly makes the dashboard lie.`,
       id: 'overlap-score',
       title: 'Computes table overlap into eval:{workspace}',
       detail:
-        '`table_overlap` scores `|proposed ∩ acked| / |acked|` and the consumer adds it as `overlap_milli` to the `eval:{workspace}` hash alongside the success counters. The draft counts ratings only.',
+        '`table_overlap` scores `|proposed ∩ acked| / |acked|` and the consumer adds it as `overlap_milli` to the `eval:{workspace}` hash alongside the success counters. The starter counts ratings only.',
       match: {
         python: {all: [/def table_overlap\(/, /overlap_milli/, /eval:\{workspace\}/]},
         typescript: {all: [/function tableOverlap\(/, /overlap_milli/, /eval:\$\{workspace\}/]},
@@ -118,7 +118,7 @@ commit-before-write is the crash that quietly makes the dashboard lie.`,
       id: 'write-before-commit',
       title: 'Writes the counters before committing the offset',
       detail:
-        'Auto-commit is off and the `HINCRBY`s run before the offset commit; committing first makes a crash lose the update forever. The draft commits first.',
+        'Auto-commit is off and the `HINCRBY`s run before the offset commit; committing first makes a crash lose the update forever. The starter commits first.',
       match: {
         python: {all: [/enable\.auto\.commit/], order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {all: [/autoCommit:\s*false/], order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -258,7 +258,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** query.feedback: a model-generated draft that ships a rating keyed by query id and commits early. */
+      starter: `/** query.feedback: flawed code that ships a rating keyed by query id and commits early. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {Kafka} from 'kafkajs';
@@ -876,5 +876,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you understand what the evaluation is *for*. QueryGPT's evaluation captures five signals per question — intent, table overlap, successful run, run-has-output, and a judged similarity — because each one isolates a different component: the intent agent, the table agent, the generator, and the generator's taste in filter values. An event that carries only a rating collapses all of them into one number nobody can act on; an event with the tables proposed and ACKed lets the consumer compute the overlap score per workspace, which is the number that tells you which workspace's curation needs work. The Kafka half is the usual three contracts a generated snippet gets wrong: the key is an ordering contract (user, not query), the producer needs idempotence and acks=all so a retry cannot double-count a success, and the consumer writes before it commits or a crash loses the update. Real pipelines add the LLM-judged similarity against a golden query for the questions that have one, the vanilla/decoupled split so the generator can be scored with the true tables instead of the inferred ones, and a dead-letter topic for events that fail to parse.`,
+  debrief: `The interviewer is checking whether you understand what the evaluation is *for*. QueryGPT's evaluation captures five signals per question — intent, table overlap, successful run, run-has-output, and a judged similarity — because each one isolates a different component: the intent agent, the table agent, the generator, and the generator's taste in filter values. An event that carries only a rating collapses all of them into one number nobody can act on; an event with the tables proposed and ACKed lets the consumer compute the overlap score per workspace, which is the number that tells you which workspace's curation needs work. The Kafka half is the usual three contracts a Kafka snippet gets wrong: the key is an ordering contract (user, not query), the producer needs idempotence and acks=all so a retry cannot double-count a success, and the consumer writes before it commits or a crash loses the update. Real pipelines add the LLM-judged similarity against a golden query for the questions that have one, the vanilla/decoupled split so the generator can be scored with the true tables instead of the inferred ones, and a dead-letter topic for events that fail to parse.`,
 };

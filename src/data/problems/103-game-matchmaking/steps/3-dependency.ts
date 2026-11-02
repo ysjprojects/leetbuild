@@ -8,10 +8,10 @@ export const dependencyStep: Step = {
   focus: ['matchmaker', 'allocator', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the allocator and
-returns a server id when the happy path works. It compiles, the demo allocates, and it hides the
-failure path — the one that decides whether a bad afternoon at the allocator becomes a stuck queue.
-Review it, fix it, and prove the fix.
+**Starting point.** The starter is working code: it calls the allocator and returns a server id when
+the happy path works. It compiles, the demo allocates, and it hides the failure path — the one that
+decides whether a bad afternoon at the allocator becomes a stuck queue. Debug it, fix it, and prove
+the fix.
 
 Implement the allocator client the matchmaker uses after it has claimed a roster:
 
@@ -21,14 +21,14 @@ Implement the allocator client the matchmaker uses after it has claimed a roster
 - When an attempt fails — deadline exceeded or the allocator returning \`FAILED\` — the client must
   **release every participant ticket back to the pool** before the next attempt: \`ZADD\` each ticket
   back into its bucket at its skill, clear its claimed marker and restore the depth counter. The
-  draft returns on the error and leaves the whole roster claimed, so those players sit in a ghost
+  starter returns on the error and leaves the whole roster claimed, so those players sit in a ghost
   queue: their tickets are neither waiting nor in a match, and nothing will ever release them.
 - The release must be **idempotent**: a retried or duplicated release must not return the same ticket
   twice. One atomic script with a \`SET … NX\` guard on \`{RELEASED_PREFIX}:{match_id}\` releases the
   roster once and answers **0** on every later call, so a second attempt cannot double-count the
   depth counter.
 - Retries must be **bounded** by \`MAX_ALLOC_ATTEMPTS\` and spaced by an exponential backoff from
-  \`BACKOFF_BASE_MS\`. The draft retries the same dead allocator forever, so one unhealthy allocator
+  \`BACKOFF_BASE_MS\`. The starter retries the same dead allocator forever, so one unhealthy allocator
   turns into an unbounded loop of doomed calls that never gives the pool its players back.
 - A failed allocation must end in one of two honest states: a server id, or a released roster. There
   is no third state in which the tickets stay claimed.
@@ -60,7 +60,7 @@ waiting tickets than there are.`,
       id: 'grpc-deadline',
       title: 'Calls the allocator with a 3-second deadline',
       detail:
-        'Each attempt carries `ALLOCATOR_DEADLINE_MS = 3000`, so a hung allocator cannot hold the matchmaker. The draft uses the deadline too — this is the one check it already satisfies — but it never gives the roster back when the deadline fires.',
+        'Each attempt carries `ALLOCATOR_DEADLINE_MS = 3000`, so a hung allocator cannot hold the matchmaker. The starter uses the deadline too — this is the one check it already satisfies — but it never gives the roster back when the deadline fires.',
       match: {
         python: {all: [/DEADLINE_MS/, /3000/]},
         typescript: {all: [/DEADLINE_MS/, /3000/]},
@@ -73,7 +73,7 @@ waiting tickets than there are.`,
       id: 'release-on-failure',
       title: 'Releases the roster when the allocation fails',
       detail:
-        'The failure branch calls `release_participants`, so every participant ticket goes back to the pool. The draft returns from the error and leaves the roster claimed — the ghost queue. This is an `order`-style contract in spirit: release must happen on the failure path, not only on the happy one.',
+        'The failure branch calls `release_participants`, so every participant ticket goes back to the pool. The starter returns from the error and leaves the roster claimed — the ghost queue. This is an `order`-style contract in spirit: release must happen on the failure path, not only on the happy one.',
       match: {
         python: {all: [/release_participants\(/, /except/]},
         typescript: {all: [/releaseParticipants\(/, /catch/]},
@@ -99,7 +99,7 @@ waiting tickets than there are.`,
       id: 'backoff-retry',
       title: 'Backs off between attempts',
       detail:
-        'Attempts are spaced by an exponential delay derived from `BACKOFF_BASE_MS`, so the retry does not hammer an allocator that is already unhealthy. The draft retries in a tight loop.',
+        'Attempts are spaced by an exponential delay derived from `BACKOFF_BASE_MS`, so the retry does not hammer an allocator that is already unhealthy. The starter retries in a tight loop.',
       match: {
         python: {all: [/BACKOFF/, /attempt/i]},
         typescript: {all: [/BACKOFF/, /attempt/i]},
@@ -112,7 +112,7 @@ waiting tickets than there are.`,
       id: 'bounded-retry',
       title: 'Bounds the attempts',
       detail:
-        'The retry loop is bounded by `MAX_ALLOC_ATTEMPTS`; there is no `while true` around the allocator. The draft retries against the same dead pool indefinitely, which is how one failed dependency becomes an unbounded loop.',
+        'The retry loop is bounded by `MAX_ALLOC_ATTEMPTS`; there is no `while true` around the allocator. The starter retries against the same dead pool indefinitely, which is how one failed dependency becomes an unbounded loop.',
       match: {
         python: {all: [/MAX_ALLOC_ATTEMPTS/]},
         typescript: {all: [/MAX_ALLOC_ATTEMPTS/]},
@@ -124,7 +124,7 @@ waiting tickets than there are.`,
   ],
   code: {
     python: {
-      starter: `"""Allocator client: a model-generated draft that never releases the roster."""
+      starter: `"""Allocator client: flawed code that never releases the roster."""
 import grpc
 
 import allocator_pb2
@@ -134,7 +134,7 @@ ALLOCATOR_DEADLINE_MS = 3000
 
 
 def allocate_match(stub: allocator_pb2_grpc.AllocatorStub, match_id: str) -> str | None:
-    # TODO: this draft leaves every participant ticket claimed forever when the allocation fails, so
+    # TODO: this starter leaves every participant ticket claimed forever when the allocation fails, so
     # the players wait in a ghost queue that nothing will ever release, and it retries the same dead
     # allocator indefinitely. Release the whole roster on failure, make the release idempotent, and
     # bound the retries with a backoff.
@@ -232,7 +232,7 @@ def allocate_match(
 `,
     },
     typescript: {
-      starter: `/** Allocator client: a model-generated draft that never releases the roster. */
+      starter: `/** Allocator client: flawed code that never releases the roster. */
 import * as grpc from '@grpc/grpc-js';
 
 import {AllocatorClient} from './allocator_grpc_pb';
@@ -241,7 +241,7 @@ import {AllocateRequest} from './allocator_pb';
 const ALLOCATOR_DEADLINE_MS = 3000;
 
 export async function allocateMatch(client: AllocatorClient, matchId: string): Promise<string | null> {
-  // TODO: this draft leaves every participant ticket claimed forever when the allocation fails, so
+  // TODO: this starter leaves every participant ticket claimed forever when the allocation fails, so
   // the players wait in a ghost queue that nothing will ever release, and it retries the same dead
   // allocator indefinitely. Release the whole roster on failure, make the release idempotent, and
   // bound the retries with a backoff.
@@ -363,7 +363,7 @@ const allocatorDeadlineMs = 3000
 var allocatorConn, _ = grpc.NewClient("allocator:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 
 func AllocateMatch(ctx context.Context, matchID string) (string, error) {
-	// TODO: this draft leaves every participant ticket claimed forever when the allocation fails, so
+	// TODO: this starter leaves every participant ticket claimed forever when the allocation fails, so
 	// the players wait in a ghost queue that nothing will ever release, and it retries the same dead
 	// allocator indefinitely. Release the whole roster on failure, make the release idempotent, and
 	// bound the retries with a backoff.
@@ -475,7 +475,7 @@ object AllocatorClient {
   val AllocatorDeadlineMs = 3000
 
   def allocateMatch(stub: AllocatorGrpc.AllocatorBlockingStub, matchId: String): Option[String] = {
-    // TODO: this draft leaves every participant ticket claimed forever when the allocation fails, so
+    // TODO: this starter leaves every participant ticket claimed forever when the allocation fails, so
     // the players wait in a ghost queue that nothing will ever release, and it retries the same dead
     // allocator indefinitely. Release the whole roster on failure, make the release idempotent, and
     // bound the retries with a backoff.
@@ -580,7 +580,7 @@ return 1
 constexpr int kAllocatorDeadlineMs = 3000;
 
 std::string allocateMatch(allocator::Allocator::Stub& stub, const std::string& matchId) {
-  // TODO: this draft leaves every participant ticket claimed forever when the allocation fails, so
+  // TODO: this starter leaves every participant ticket claimed forever when the allocation fails, so
   // the players wait in a ghost queue that nothing will ever release, and it retries the same dead
   // allocator indefinitely. Release the whole roster on failure, make the release idempotent, and
   // bound the retries with a backoff.
@@ -694,9 +694,9 @@ std::string allocateMatch(
     },
   },
   hints: [
-    'The failure path is the whole step. In the `except`/`catch` branch you have to do two things before you loop: give the roster back, and wait. Everything the draft does on the happy path is already right — the deadline, the request — so read the error branch first.',
+    'The failure path is the whole step. In the `except`/`catch` branch you have to do two things before you loop: give the roster back, and wait. Everything the starter does on the happy path is already right — the deadline, the request — so read the error branch first.',
     'Release is the inverse of the claim: `ZADD` each ticket back at its skill, `DEL` its claimed marker, `HINCRBY` the depth back up. Do it in one script so a crash cannot half-release a roster, and guard the script with `SET {RELEASED_PREFIX}:{match_id} 1 NX EX …` so a retried release is a no-op instead of a second return of the same ticket.',
     'Bound the loop and space the attempts: `MAX_ALLOC_ATTEMPTS` attempts with `BACKOFF_BASE_MS * 2 ** attempt` between them. An unbounded retry against a dead allocator is worse than failing — it holds the worker and keeps the roster claimed, so the queue never gets its players back.',
   ],
-  debrief: `The interviewer is testing the failure path of a dependency call on the hot path of matchmaking. The happy path is trivial; what matters is what happens to the roster's tickets when the allocator says no. The draft returns on the error and leaves every ticket claimed, which produces the worst state in the system: the players are neither waiting in the pool nor in a match, so nothing can match them and nothing can cancel them — the ghost queue. The fix is a release that is *certain* and *idempotent*: certain, so no failure path skips it; idempotent, because the retry loop will call it more than once and a second release must not return the same ticket twice or double-count the pool depth. The bounded retry matters for a different reason: an unbounded retry against a dead allocator does not just fail slowly, it hides the failure from the matchmaker's own metrics and keeps the roster out of the pool the whole time. Real allocators add a lease on the server, a release that is driven by the allocator's own timeout rather than by the client's memory, and a "capacity" signal so the matchmaker stops forming matches when the fleet cannot seat them.`,
+  debrief: `The interviewer is testing the failure path of a dependency call on the hot path of matchmaking. The happy path is trivial; what matters is what happens to the roster's tickets when the allocator says no. The starter returns on the error and leaves every ticket claimed, which produces the worst state in the system: the players are neither waiting in the pool nor in a match, so nothing can match them and nothing can cancel them — the ghost queue. The fix is a release that is *certain* and *idempotent*: certain, so no failure path skips it; idempotent, because the retry loop will call it more than once and a second release must not return the same ticket twice or double-count the pool depth. The bounded retry matters for a different reason: an unbounded retry against a dead allocator does not just fail slowly, it hides the failure from the matchmaker's own metrics and keeps the roster out of the pool the whole time. Real allocators add a lease on the server, a release that is driven by the allocator's own timeout rather than by the client's memory, and a "capacity" signal so the matchmaker stops forming matches when the fleet cannot seat them.`,
 };

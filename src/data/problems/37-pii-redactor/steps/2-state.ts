@@ -8,9 +8,9 @@ export const redactionStateStep: Step = {
   focus: ['redactor', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it caches patterns, it counts
+**Starting point.** The starter is working code: it caches patterns, it counts
 characters, and the demo tenant never hits a limit and never shares a pattern id with anyone else.
-It hides two multi-tenant bugs and one ordering bug. Review it, fix it, and prove the fix.
+It hides two multi-tenant bugs and one ordering bug. Debug it, fix it, and prove the fix.
 
 Custom patterns are per-tenant rules — a regex body plus an id — and detection costs money, so the
 redactor keeps both a pattern cache and a per-tenant budget in Redis.
@@ -23,7 +23,7 @@ redactor keeps both a pattern cache and a per-tenant budget in Redis.
   \`budget:{tenant}:{window}\` with \`window = floor(unix_seconds / 3600)\` — a tenant-less key shares
   one budget across every tenant, a window-less key never resets.
 - **Reserve atomically and before the detector.** One **Lua \`EVAL\`** must read the used count, reject
-  when the request does not fit, increment on success and set \`EXPIRE\` on first write. The draft does
+  when the request does not fit, increment on success and set \`EXPIRE\` on first write. The starter does
   a client-side check, calls the detector, and only then \`INCRBY\`s — so an over-budget request has
   already been paid for and two concurrent requests can both pass.
 - An exhausted tenant is **429** with \`Retry-After\` (the key's TTL in seconds) and
@@ -68,7 +68,7 @@ by charging after the expensive call.`,
       id: 'budget-key',
       title: 'Keys the budget by tenant and hourly window',
       detail:
-        'The budget key is `budget:{tenant}:{window}` with a 3 600-second window and a 2 000 000 character cap. The draft keys by tenant alone with no cap and no window, so one busy hour spends forever.',
+        'The budget key is `budget:{tenant}:{window}` with a 3 600-second window and a 2 000 000 character cap. The starter keys by tenant alone with no cap and no window, so one busy hour spends forever.',
       match: {
         python: {all: [/budget:\{tenant\}:\{window\}/, /BUDGET_PER_HOUR/, /WINDOW_S/]},
         typescript: {all: [/budget:\$\{tenant\}:\$\{window\}/, /BUDGET_PER_HOUR/, /WINDOW_S/]},
@@ -94,7 +94,7 @@ by charging after the expensive call.`,
       id: 'reserve-before-detect',
       title: 'Reserves the budget before the detector runs',
       detail:
-        'The reservation happens before `detect`; an over-budget request never reaches the detector. The draft calls the detector first and increments afterwards, so rejected work is already paid for.',
+        'The reservation happens before `detect`; an over-budget request never reaches the detector. The starter calls the detector first and increments afterwards, so rejected work is already paid for.',
       match: {
         python: {order: [/reserve_budget\(/, /detector\.detect\(/]},
         typescript: {order: [/reserveBudget\(/, /detector\.detect\(/]},
@@ -107,7 +107,7 @@ by charging after the expensive call.`,
       id: 'over-budget-429',
       title: 'Answers 429 with Retry-After and remaining characters',
       detail:
-        'An exhausted tenant gets **429** with `Retry-After` (the key TTL) and `X-RateLimit-Remaining`, built from the script result — not a hardcoded constant. The draft has no refusal path at all.',
+        'An exhausted tenant gets **429** with `Retry-After` (the key TTL) and `X-RateLimit-Remaining`, built from the script result — not a hardcoded constant. The starter has no refusal path at all.',
       match: {
         python: {all: [/status_code\s*=\s*429/, /Retry-After/, /X-RateLimit-Remaining/]},
         typescript: {all: [/\b429\b/, /Retry-After/, /X-RateLimit-Remaining/]},
@@ -773,5 +773,5 @@ void budget_exceeded(httplib::Response& res, long long retry_after) {
     'The version is a hash of the regex body, so editing a rule lands under a new key and the old body can still serve in-flight requests until its TTL ends. Cache-aside both ways: `GET`, and on `nil` `SET … EX 3600`.',
     'The reservation is one script: `HGET` the used count, compare against the cap, `HINCRBY` on success, `EXPIRE` when the window key was just created. Run it *before* the detector — the cost you are metering is the detector call you are about to make.',
   ],
-  debrief: `The interviewer is testing two production reflexes at once: tenant isolation in every key, and metering before spending. The draft looks reasonable because a single tenant with unique pattern ids works perfectly. The first bug is the classic shared-cache leak: a key without the tenant lets one tenant's rule become authoritative for another, and because the rule is a *detection* rule, the failure is silent — spans simply stop appearing. The second bug is a read-then-write race compounded by ordering: the check is client-side, so concurrent requests both see room, and the charge happens after the detector, so refused work is already paid for. Real systems add a version to the key so a rule edit is a new cache entry, a window bucket so budgets reset, and a 429 that tells the client *when* to come back via the key's TTL.`,
+  debrief: `The interviewer is testing two production reflexes at once: tenant isolation in every key, and metering before spending. The starter looks reasonable because a single tenant with unique pattern ids works perfectly. The first bug is the classic shared-cache leak: a key without the tenant lets one tenant's rule become authoritative for another, and because the rule is a *detection* rule, the failure is silent — spans simply stop appearing. The second bug is a read-then-write race compounded by ordering: the check is client-side, so concurrent requests both see room, and the charge happens after the detector, so refused work is already paid for. Real systems add a version to the key so a rule edit is a new cache entry, a window bucket so budgets reset, and a 429 that tells the client *when* to come back via the key's TTL.`,
 };

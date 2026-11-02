@@ -8,10 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis', 'storage'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the caller's documents and answers **200** with a case. It serves the demo because the demo sends a
-well-formed body, one tenant, and one attempt — and it hides three production flaws. Review it like
-the service owner, fix it, and prove the fix with the checks below.
+well-formed body, one tenant, and one attempt — and it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/verifications\` with body
 \`{"applicant": "a-123", "documents": [{"type": "passport", "ref": "documents/tenant-a/passport-9.jpg"}]}\`
@@ -30,7 +29,7 @@ and header \`X-Tenant-Id\`:
   caller input may set a status — a \`status\` field in the body is ignored, and the verdict is
   always the service's.
 
-**Failure mode the checks target.** The draft reads \`status\` from the body and persists it, so a
+**Failure mode the checks target.** The starter reads \`status\` from the body and persists it, so a
 caller opens a case that is already \`approved\`; it never counts attempts, so one applicant can
 grind the review pipeline forever; and it fetches whatever URL arrives in \`ref\`, so the API
 becomes an open proxy pointed at the tenant's own network.`,
@@ -68,7 +67,7 @@ becomes an open proxy pointed at the tenant's own network.`,
       id: 'route',
       title: 'Registers POST /v1/verifications',
       detail:
-        'The submission route is registered as `POST /v1/verifications`. The draft already has it, so this check passes before any fix — the four below are the real review.',
+        'The submission route is registered as `POST /v1/verifications`. The starter already has it, so this check passes before any fix — the four below are the real work.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/verifications["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/verifications['"]/]},
@@ -81,7 +80,7 @@ becomes an open proxy pointed at the tenant's own network.`,
       id: 'status-server-side',
       title: 'A body status never sets the case status',
       detail:
-        'The case is written `pending` by the service, and a `status` field in the request is never read or persisted. The draft takes the caller’s `status` and stores it, so a caller can open a case that is already `approved`.',
+        'The case is written `pending` by the service, and a `status` field in the request is never read or persisted. The starter takes the caller’s `status` and stores it, so a caller can open a case that is already `approved`.',
       match: {
         python: {all: [/["']pending["']/], none: [/body\.status/, /body\[["']status["']\]/]},
         typescript: {all: [/'pending'/], none: [/body\.status/, /body\[['"]status['"]\]/]},
@@ -94,7 +93,7 @@ becomes an open proxy pointed at the tenant's own network.`,
       id: 'attempt-cap',
       title: 'Bounds attempts per applicant and answers 429',
       detail:
-        'Attempts per applicant are bounded with `MAX_ATTEMPTS = 4` and reserved atomically before the case opens; the refusal is **429** with `Retry-After`. The draft never counts attempts, so one applicant can submit without limit.',
+        'Attempts per applicant are bounded with `MAX_ATTEMPTS = 4` and reserved atomically before the case opens; the refusal is **429** with `Retry-After`. The starter never counts attempts, so one applicant can submit without limit.',
       match: {
         python: {all: [/\bMAX_ATTEMPTS\b/, /status_code\s*=\s*429/]},
         typescript: {all: [/\bMAX_ATTEMPTS\b/, /code\(\s*429\s*\)/]},
@@ -107,7 +106,7 @@ becomes an open proxy pointed at the tenant's own network.`,
       id: 'document-scope',
       title: 'Refuses a non-tenant document reference before any fetch',
       detail:
-        'A `ref` outside `documents/{tenant}/` is **403**, refused before anything is fetched or signed, and the API never dereferences a caller-supplied URL. The draft fetches whatever URL arrives in `ref`.',
+        'A `ref` outside `documents/{tenant}/` is **403**, refused before anything is fetched or signed, and the API never dereferences a caller-supplied URL. The starter fetches whatever URL arrives in `ref`.',
       match: {
         python: {all: [/status_code\s*=\s*403/, /startswith\(/], none: [/urlopen\(/, /requests\.get\(/]},
         typescript: {all: [/code\(\s*403\s*\)/, /startsWith\(/], none: [/\bfetch\(/]},
@@ -120,7 +119,7 @@ becomes an open proxy pointed at the tenant's own network.`,
       id: 'document-type',
       title: 'Requires a document type from the allowlist',
       detail:
-        'Every document `type` must come from the allowlist `passport` / `drivers_license` / `national_id`; anything else is **400**. The draft trusts the caller and never checks the type.',
+        'Every document `type` must come from the allowlist `passport` / `drivers_license` / `national_id`; anything else is **400**. The starter trusts the caller and never checks the type.',
       match: {
         python: {all: [/\bALLOWED_DOCUMENT_TYPES\b/, /document_type/]},
         typescript: {all: [/\bALLOWED_DOCUMENT_TYPES\b/, /documentType/]},
@@ -154,8 +153,8 @@ class Submission(BaseModel):
 
 @app.post("/v1/verifications")
 def submit(body: Submission, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft persists a caller-supplied status, never bounds attempts per applicant, and
-    # dereferences whatever document URL the caller sends. Review all three flaws.
+    # TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
+    # dereferences whatever document URL the caller sends. Fix all three flaws.
     for document in body.documents:
         response = requests.get(document.ref)
         response.raise_for_status()
@@ -246,7 +245,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/verifications: a model-generated draft that trusts the caller. */
+      starter: `/** POST /v1/verifications: flawed code that trusts the caller. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -263,8 +262,8 @@ interface Submission {
 }
 
 app.post('/v1/verifications', async (request, reply) => {
-  // TODO: this draft persists a caller-supplied status, never bounds attempts per applicant, and
-  // dereferences whatever document URL the caller sends. Review all three flaws.
+  // TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
+  // dereferences whatever document URL the caller sends. Fix all three flaws.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as Submission;
   for (const document of body.documents) {
@@ -382,8 +381,8 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft persists a caller-supplied status, never bounds attempts per applicant, and
-	// dereferences whatever document URL the caller sends. Review all three flaws.
+	// TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
+	// dereferences whatever document URL the caller sends. Fix all three flaws.
 	for _, document := range body.Documents {
 		response, err := http.Get(document.Ref)
 		if err != nil {
@@ -554,8 +553,8 @@ object VerificationApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[Submission]) { body =>
-            // TODO: this draft persists a caller-supplied status, never bounds attempts per
-            // applicant, and dereferences whatever document URL the caller sends. Review all three.
+            // TODO: this starter persists a caller-supplied status, never bounds attempts per
+            // applicant, and dereferences whatever document URL the caller sends. Fix all three.
             body.documents.foreach { document =>
               Http().singleRequest(HttpRequest(uri = document.ref))
             }
@@ -689,8 +688,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft persists a caller-supplied status, never bounds attempts per applicant, and
-    // dereferences whatever document URL the caller sends. Review all three flaws.
+    // TODO: this starter persists a caller-supplied status, never bounds attempts per applicant, and
+    // dereferences whatever document URL the caller sends. Fix all three flaws.
     for (const auto& document : body["documents"]) {
       const auto ref = document.value("ref", std::string());
       httplib::Client client(ref);
@@ -798,7 +797,7 @@ int main() {
     'The verdict is server-side: the case is stored `pending` whatever the body says. Reserve the attempt atomically in Redis before opening the case, cap it at `MAX_ATTEMPTS = 4`, and answer the refusal with **429** plus `Retry-After`.',
   ],
   debrief: `The interviewer is testing whether you treat submission as a trust boundary. The caller supplies
-an applicant, a document type and a storage key — nothing else. The draft reads well because the
+an applicant, a document type and a storage key — nothing else. The starter reads well because the
 demo never sends a \`status\` field, never retries and never points \`ref\` at an internal address.
 Three separate defects are being checked: the verdict is the service's (the case opens \`pending\`
 and the body cannot name a status), attempts are bounded per applicant (4 reservations, atomic in

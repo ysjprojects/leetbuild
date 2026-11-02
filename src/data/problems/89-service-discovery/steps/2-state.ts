@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['discovery', 'redis', 'reaper'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a live instance renews and the
+**Starting point.** The starter is working code: a live instance renews and the
 demo never notices, because the demo never restarts an instance and never deploys. The two flaws it
 hides are the ones that produce minutes-long outages — a TTL refreshed without the metadata it is
 supposed to describe, and a replacement instance written while the old one is still there.
@@ -23,7 +23,7 @@ entry true:
   instance must register again rather than resurrect a record nobody can vouch for.
 - Everything moves in **one atomic script** (\`EVAL\` / \`NewScript\` / \`eval\`): the new address, the
   port, the new \`metadata_version\`, the \`last_heartbeat\` stamp (server clock, \`redis.call('TIME')\`)
-  and the key's expiry. A refresh that calls \`EXPIRE\` on its own is the draft's first flaw: the
+  and the key's expiry. A refresh that calls \`EXPIRE\` on its own is the starter's first flaw: the
   entry stays warm forever while its metadata stays stale, so a restarted instance with a new
   address keeps receiving traffic that the registry still points at its old one.
 - Reject an older version: an incoming \`metadata_version\` below the stored one is **409 Conflict**
@@ -36,7 +36,7 @@ entry true:
 one identity to a new address.
 
 - One identity maps to **one address at a time**. Inside a single script, remove the old record
-  (\`DEL\`) when its address differs, then write the replacement with its own TTL. The draft writes
+  (\`DEL\`) when its address differs, then write the replacement with its own TTL. The starter writes
   the replacement first and removes the old one afterwards, so during every deploy window two live
   addresses claim \`checkout-3\` and readers route to whichever they read last.
 - The replacement carries \`metadata_version\`, \`last_heartbeat\` and the TTL like a heartbeat, and
@@ -101,7 +101,7 @@ is unroutable within three intervals.`,
       id: 'version-guard',
       title: 'An older metadata version is refused',
       detail:
-        'A heartbeat carrying a `metadata_version` below the stored one answers **409 Conflict** and writes nothing, so a restarted or lagging replica cannot undo a rollout. The draft overwrites the version with whatever arrives.',
+        'A heartbeat carrying a `metadata_version` below the stored one answers **409 Conflict** and writes nothing, so a restarted or lagging replica cannot undo a rollout. The starter overwrites the version with whatever arrives.',
       match: {
         python: {all: [/metadata_version/, /409/]},
         typescript: {all: [/metadata_version/, /409/]},
@@ -114,7 +114,7 @@ is unroutable within three intervals.`,
       id: 'identity-swap',
       title: 'One identity, one address across a replace',
       detail:
-        'The replace script removes the old record (`DEL`) before it writes the replacement inside the same `EVAL`, so no reader sees two addresses for one identity during a deploy. The draft registers the replacement first and removes the original afterwards.',
+        'The replace script removes the old record (`DEL`) before it writes the replacement inside the same `EVAL`, so no reader sees two addresses for one identity during a deploy. The starter registers the replacement first and removes the original afterwards.',
       match: {
         python: {all: [/REPLACE_LUA/, /DEL/, /SET/]},
         typescript: {all: [/REPLACE_LUA/, /DEL/, /SET/]},
@@ -140,7 +140,7 @@ is unroutable within three intervals.`,
       id: 'no-bare-expire',
       title: 'No client-side EXPIRE on the renewal path',
       detail:
-        'The renewal never calls `EXPIRE` from the client: a bare expiry refresh is the draft’s signature bug, because it renews liveness without renewing the metadata that liveness is supposed to certify.',
+        'The renewal never calls `EXPIRE` from the client: a bare expiry refresh is the starter’s signature bug, because it renews liveness without renewing the metadata that liveness is supposed to certify.',
       match: {
         python: {all: [/RENEW_LUA/], none: [/\.expire\(/]},
         typescript: {all: [/RENEW_LUA/], none: [/\.expire\(/]},
@@ -180,10 +180,10 @@ def key_of(service: str, instance_id: str) -> str:
 
 @app.post("/v1/instances/{service}/{instance_id}/heartbeat")
 def heartbeat(service: str, instance_id: str, body: RenewRequest) -> dict:
-    # TODO: this draft renews the TTL with EXPIRE on its own, so a restarted instance with new
+    # TODO: this starter renews the TTL with EXPIRE on its own, so a restarted instance with new
     # metadata keeps its stale routing metadata alive forever, and the replace path below writes
     # the replacement address before the old record is removed, so two addresses claim one
-    # identity during a deploy. Review both.
+    # identity during a deploy. Fix both.
     key = key_of(service, instance_id)
     raw = r.get(key)
     if raw is None:
@@ -321,7 +321,7 @@ def replace(service: str, instance_id: str, body: RenewRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Heartbeat and replace for the Redis registry: a model-generated draft. */
+      starter: `/** Heartbeat and replace for the Redis registry: flawed code. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -350,10 +350,10 @@ interface InstanceRecord {
 }
 
 app.post('/v1/instances/:service/:instanceId/heartbeat', async (request, reply) => {
-  // TODO: this draft renews the TTL with EXPIRE on its own, so a restarted instance with new
+  // TODO: this starter renews the TTL with EXPIRE on its own, so a restarted instance with new
   // metadata keeps its stale routing metadata alive forever, and the replace path below writes the
   // replacement address before the old record is removed, so two addresses claim one identity
-  // during a deploy. Review both.
+  // during a deploy. Fix both.
   const {service, instanceId} = request.params as {service: string; instanceId: string};
   const body = request.body as RenewBody;
   const key = keyOf(service, instanceId);
@@ -553,10 +553,10 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func keyOf(service, instanceID string) string { return "sd:" + service + ":" + instanceID }
 
 func heartbeat(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft renews the TTL with EXPIRE on its own, so a restarted instance with new
+	// TODO: this starter renews the TTL with EXPIRE on its own, so a restarted instance with new
 	// metadata keeps its stale routing metadata alive forever, and the replace path below writes the
 	// replacement address before the old record is removed, so two addresses claim one identity
-	// during a deploy. Review both.
+	// during a deploy. Fix both.
 	service := r.PathValue("service")
 	instanceID := r.PathValue("instance")
 	var body RenewRequest
@@ -805,10 +805,10 @@ object State {
     path("v1" / "instances" / Segment / Segment / "heartbeat") { (service, instanceId) =>
       post {
         entity(as[RenewRequest]) { body =>
-          // TODO: this draft renews the TTL with EXPIRE on its own, so a restarted instance with new
+          // TODO: this starter renews the TTL with EXPIRE on its own, so a restarted instance with new
           // metadata keeps its stale routing metadata alive forever, and the replace path below
           // writes the replacement address before the old record is removed, so two addresses claim
-          // one identity during a deploy. Review both.
+          // one identity during a deploy. Fix both.
           val key = keyOf(service, instanceId)
           Option(jedis.get(key)) match {
             case None => complete(StatusCodes.OK, """{"status":"unregistered"}""")
@@ -990,10 +990,10 @@ int main() {
   httplib::Server svr;
 
   svr.Post(R"(/v1/instances/([^/]+)/([^/]+)/heartbeat)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft renews the TTL with EXPIRE on its own, so a restarted instance with new
+    // TODO: this starter renews the TTL with EXPIRE on its own, so a restarted instance with new
     // metadata keeps its stale routing metadata alive forever, and the replace path below writes
     // the replacement address before the old record is removed, so two addresses claim one identity
-    // during a deploy. Review both.
+    // during a deploy. Fix both.
     const auto service = req.matches[1].str();
     const auto instanceId = req.matches[2].str();
     const auto key = keyOf(service, instanceId);
@@ -1205,5 +1205,5 @@ int main() {
     '`EXPIRE` is not a renewal. It keeps the key warm while the payload freezes, which is the failure that outlives restarts: the instance is healthy, the registry is warm, and the address inside it belongs to a process that no longer exists.',
     'For the deploy path, order is the guarantee. Remove the old record before the new one is written *inside one script*, so the identity — not the address — is the unit of consistency: a reader sees the old address or the new one, never both, and never neither.',
   ],
-  debrief: `The interviewer is testing whether you can see the two writes that make a registry lie. The first is the bare \`EXPIRE\`: it is the most common generated-TTL bug in the wild because it looks like liveness — the key keeps its TTL, the instance keeps heartbeating, and the routing metadata inside is from the previous process. A model-trained draft reaches for it because the renewal request carries a version and the code never uses it. The second is the ordering of a deploy swap: writing the replacement and then cleaning up is what humans do when they think in terms of records, but a discovery registry is read by other services, so the intermediate state is observable and durable for as long as the sweep takes. Both flaws share one cure: make the transition atomic and make the version monotonic, then let the TTL, not a cleanup job, decide who is alive. Real registries add drain states, a replica-slot identity so the address can change under a fixed id, and a periodic reconcile that compares Redis against the deployments table.`,
+  debrief: `The interviewer is testing whether you can see the two writes that make a registry lie. The first is the bare \`EXPIRE\`: it is the most common renewal bug in the wild because it looks like liveness — the key keeps its TTL, the instance keeps heartbeating, and the routing metadata inside is from the previous process. A first version reaches for it because the renewal request carries a version and the code never uses it. The second is the ordering of a deploy swap: writing the replacement and then cleaning up is what humans do when they think in terms of records, but a discovery registry is read by other services, so the intermediate state is observable and durable for as long as the sweep takes. Both flaws share one cure: make the transition atomic and make the version monotonic, then let the TTL, not a cleanup job, decide who is alive. Real registries add drain states, a replica-slot identity so the address can change under a fixed id, and a periodic reconcile that compares Redis against the deployments table.`,
 };

@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Human review queue on the AI-era track: the course is not "add a review button to the model
- * output", it is the review you owe a queue that decides which model outputs reach a human, how
- * long a reviewer may hold an item, when the queue may clear an item by itself, and what the
- * lifecycle leaves behind. Validated, deduped escalations → Redis leases and monotonic SLA clocks
- * → a narrow, granted auto-resolve over gRPC with a deadline → source-keyed lifecycle events with
- * the reviewer anonymized → a queue read that reconciles depth with the item store.
+ * Human review queue: the course is not "add a review button to the model output", it is the
+ * debugging you owe a queue that decides which model outputs reach a human, how long a reviewer may
+ * hold an item, when the queue may clear an item by itself, and what the lifecycle leaves behind.
+ * Validated, deduped escalations → Redis leases and monotonic SLA clocks → a narrow, granted
+ * auto-resolve over gRPC with a deadline → source-keyed lifecycle events with the reviewer
+ * anonymized → a queue read that reconciles depth with the item store.
  */
 export const humanReviewQueueProblem: Problem = {
   id: 'human-review-queue',
@@ -20,7 +20,7 @@ export const humanReviewQueueProblem: Problem = {
   tagline: 'Route low-confidence model output to humans with SLA-aware leases and clean handoffs.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Human Review Queue
 
@@ -69,12 +69,12 @@ One service, **reviewd**, with five pieces:
    oldest item always reported, the SLA breach count and the assignment state distribution — **403**
    for another tenant's queue.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

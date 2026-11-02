@@ -8,11 +8,11 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'outbox', 'projector', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it assigns a role, publishes a
+**Starting point.** The starter is working code: it assigns a role, publishes a
 \`permission.event\` on the happy path and answers \`200\`. It compiles, it serves the demo, and it
-hides four production flaws — a role-ordered stream, a publish that races the grant, no outbox, and a
-payload with no version. Review it like the service owner, fix it, and prove the fix with the checks
-below.
+hides four production flaws — a role-ordered stream, a publish that races the grant, no outbox, and
+a payload with no version. Debug it like the service owner, fix it, and prove the fix with the
+checks below.
 
 Every grant change — \`granted\`, \`revoked\` and \`scope_changed\` alike — produces **exactly one**
 \`permission.event\` record on the \`permission.event\` topic.
@@ -79,7 +79,7 @@ version leaves the log unable to explain the counter — and the cache — it wa
       id: 'subject-key',
       title: 'Keys every event by subject id',
       detail:
-        'Granted, revoked and scope-changed events all use the subject id as the message key, so one subject’s history stays on one partition and in order. The draft keys by role, scattering a subject’s events across partitions.',
+        'Granted, revoked and scope-changed events all use the subject id as the message key, so one subject’s history stays on one partition and in order. The starter keys by role, scattering a subject’s events across partitions.',
       match: {
         python: {all: [/producer\.produce\(/, /key=subject\b/]},
         typescript: {all: [/producer\.send\(/, /key:\s*subject\b/]},
@@ -92,7 +92,7 @@ version leaves the log unable to explain the counter — and the cache — it wa
       id: 'outbox',
       title: 'Writes the event to an outbox inside the grant transaction',
       detail:
-        'The event row goes into `permission_outbox` in the same transaction as the grant, and a relay publishes pending rows. The draft has no outbox, so a broker rejection drops the event.',
+        'The event row goes into `permission_outbox` in the same transaction as the grant, and a relay publishes pending rows. The starter has no outbox, so a broker rejection drops the event.',
       match: {
         python: {all: [/permission_outbox/, /def relay\(/]},
         typescript: {all: [/permission_outbox/, /relayOutbox\(/]},
@@ -105,7 +105,7 @@ version leaves the log unable to explain the counter — and the cache — it wa
       id: 'publish-after-commit',
       title: 'Publishes after the commit and marks sent after the ack',
       detail:
-        'Rows are published only after the grant transaction commits, and marked sent only after the broker acknowledges; publishing before the commit can announce a grant that then rolls back. The draft publishes first.',
+        'Rows are published only after the grant transaction commits, and marked sent only after the broker acknowledges; publishing before the commit can announce a grant that then rolls back. The starter publishes first.',
       match: {
         python: {order: [/store\.commit_assignment\(/, /producer\.produce\(/, /store\.mark_sent\(/]},
         typescript: {order: [/store\.commitAssignment\(/, /producer\.send\(/, /store\.markSent\(/]},
@@ -118,7 +118,7 @@ version leaves the log unable to explain the counter — and the cache — it wa
       id: 'event-fields',
       title: 'Carries the role ids, scopes and grant version',
       detail:
-        'Each event carries the type, subject, `role_id`, scope and `grant_version`, which is what makes the stream replayable into the version counter. The draft’s payload has no version, so the stream cannot be folded back into the cache.',
+        'Each event carries the type, subject, `role_id`, scope and `grant_version`, which is what makes the stream replayable into the version counter. The starter’s payload has no version, so the stream cannot be folded back into the cache.',
       match: {
         python: {all: [/grant_version/, /role_id/]},
         typescript: {all: [/grant_version/, /role_id/]},
@@ -131,7 +131,7 @@ version leaves the log unable to explain the counter — and the cache — it wa
       id: 'rebuild-version',
       title: 'Rebuilds the cache version from the event stream',
       detail:
-        'A projector folds `permission.event` back into the `grant_version` counter, so the cache can be rebuilt from the log after a Redis loss. The draft has no such path.',
+        'A projector folds `permission.event` back into the `grant_version` counter, so the cache can be rebuilt from the log after a Redis loss. The starter has no such path.',
       match: {
         python: {all: [/def rebuild_version\(/, /permission\.event/]},
         typescript: {all: [/rebuildVersion\(/, /permission\.event/]},
@@ -173,9 +173,9 @@ store = GrantStore()
 
 @app.post("/v1/roles/assignments")
 def assign(body: Assignment, assigner: str = Header(alias="X-Assigner-Id")) -> dict:
-    # TODO: this draft keys the event by the role instead of the subject, publishes before the
+    # TODO: this starter keys the event by the role instead of the subject, publishes before the
     # grant row is stored, has no outbox for a broker rejection, and its payload carries no
-    # version, so the stream cannot be folded back into the cache. Review all four.
+    # version, so the stream cannot be folded back into the cache. Fix all four.
     logger.info("assign assigner=%s subject=%s role=%s scope=%s", assigner, body.subject, body.role, body.scope)
     event = {"type": "granted", "subject": body.subject, "role": body.role, "scope": body.scope}
     producer.produce("permission.event", key=body.role, value=json.dumps(event))
@@ -308,7 +308,7 @@ def rebuild_version() -> None:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/roles/assignments: a model-generated draft that tells Kafka before it stores the grant. */
+      starter: `/** POST /v1/roles/assignments: flawed code that tells Kafka before it stores the grant. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -332,7 +332,7 @@ const store = {} as GrantStore;
 app.post('/v1/roles/assignments', async (request, reply) => {
   // TODO: the event is keyed by the role instead of the subject, it is published before the grant
   // row is stored, there is no outbox for a rejected produce and the payload carries no version,
-  // so the stream cannot be folded back into the cache. Review all four.
+  // so the stream cannot be folded back into the cache. Fix all four.
   const body = request.body as Assignment;
   request.log.info({subject: body.subject, role: body.role, scope: body.scope}, 'assign');
   const event = {type: 'granted', subject: body.subject, role: body.role, scope: body.scope};
@@ -484,9 +484,9 @@ func saveAssignment(ctx context.Context, body Assignment) error {
 	return nil
 }
 
-// TODO: the draft keys the event by the role instead of the subject, writes the event before the
+// TODO: the starter keys the event by the role instead of the subject, writes the event before the
 // grant row is stored, has no outbox for a broker rejection and its payload carries no version,
-// so the stream cannot be folded back into the cache. Review all four.
+// so the stream cannot be folded back into the cache. Fix all four.
 func assign(rw http.ResponseWriter, r *http.Request) {
 	body := Assignment{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -643,7 +643,7 @@ object PermissionEvents {
 
   // TODO: key the event by the role instead of the subject, publish it only after the grant row is
   // stored, add an outbox for a broker rejection and carry a version in the payload so the stream
-  // can be folded back into the cache. Review all four.
+  // can be folded back into the cache. Fix all four.
   def assign(assigner: String, subjectId: String, roleId: String, scope: String): Unit = {
     log.info(s"assign assigner=$assigner subj=$subjectId role=$roleId scope=$scope")
     val payload = Map("type" -> "granted", "subj" -> subjectId, "role" -> roleId, "scope" -> scope).toJson.compactPrint
@@ -775,7 +775,7 @@ std::unique_ptr<RdKafka::Producer> producer;
 
 // TODO: key the event by the role instead of the subject, produce it only after the grant row is
 // stored, add an outbox for a broker rejection and carry a version in the payload so the stream
-// can be folded back into the cache. Review all four.
+// can be folded back into the cache. Fix all four.
 void assign(const std::string& subject, const std::string& roleId, const std::string& scope) {
   const json event = {{"type", "granted"}, {"subject", subject}, {"role", roleId}, {"scope", scope}};
   const auto payload = event.dump();
@@ -905,5 +905,5 @@ long rebuildVersion() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you can review an event-publishing path whose failure modes are all ordering and durability rather than syntax. The draft is convincing because the demo shows a well-shaped record arriving; nothing in it survives a broker rejection, a rollback or a Redis flush. Four contracts are under review. The key is an ordering contract: partition by subject, and every change to that subject’s authority replays in the order it happened, so a revocation can never be applied before the grant it revokes. The outbox is the atomicity contract: the event row commits with the grant, so the topic and the store can never disagree about whether a grant exists. Publish-after-commit and mark-sent-after-ack are the same contract pointed at the broker — announce only what is durable, and never forget what was not delivered. And \`grant_version\` in the payload is what makes the stream an authority instead of a notification: a projector can rebuild the counter, and therefore the cache, from the log alone. Real platforms add a schema registry with compatibility rules, relay lag metrics, per-partition ordering guarantees and a compacted subject-state topic.`,
+  debrief: `The interviewer is checking whether you can debug an event-publishing path whose failure modes are all ordering and durability rather than syntax. The starter is convincing because the demo shows a well-shaped record arriving; nothing in it survives a broker rejection, a rollback or a Redis flush. Four contracts are being checked. The key is an ordering contract: partition by subject, and every change to that subject’s authority replays in the order it happened, so a revocation can never be applied before the grant it revokes. The outbox is the atomicity contract: the event row commits with the grant, so the topic and the store can never disagree about whether a grant exists. Publish-after-commit and mark-sent-after-ack are the same contract pointed at the broker — announce only what is durable, and never forget what was not delivered. And \`grant_version\` in the payload is what makes the stream an authority instead of a notification: a projector can rebuild the counter, and therefore the cache, from the log alone. Real platforms add a schema registry with compatibility rules, relay lag metrics, per-partition ordering guarantees and a compacted subject-state topic.`,
 };

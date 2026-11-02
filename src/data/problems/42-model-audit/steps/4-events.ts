@@ -8,24 +8,24 @@ export const eventsStep: Step = {
   focus: ['auditd', 'kafka', 'mirror', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it serialises an event, produces
+**Starting point.** The starter is working code: it serialises an event, produces
 it and updates the ledger. It compiles, a mirror built from it works, and it hides three flaws that
-only a broker failure or an auditor will expose. Review it, fix it, and prove the fix.
+only a broker failure or an auditor will expose. Debug it, fix it, and prove the fix.
 
 Every chain advance publishes one \`audit.appended\` event:
 
 - **Keyed by tenant.** The record key is the tenant, so every event for one tenant lands on one
-  partition and a mirror sees them in chain order. The draft keys by model version, which scatters
+  partition and a mirror sees them in chain order. The starter keys by model version, which scatters
   one tenant’s history across partitions and reorders it under any concurrency.
 - **A payload of ids and digests only.** The event carries \`{"record_id", "position", "digest"}\`.
-  The draft ships the whole decision record "so mirrors need no read access" — which turns a retained,
+  The starter ships the whole decision record "so mirrors need no read access" — which turns a retained,
   replicated topic into a copy of tenant content and defeats the point of storing digests at all.
 - **Publish after the append is durable.** The ledger row is written first; the produce happens
-  afterwards, and only for entries that are already committed. The draft acks the produce first and
+  afterwards, and only for entries that are already committed. The starter acks the produce first and
   appends "best effort" after, so a crashed mirror can be ahead of the ledger it is supposed to
   mirror.
 - **An outbox row when the broker rejects the produce.** The event is not lost: \`INSERT INTO outbox
-  (id, topic, key, payload)\` keeps the row for the relay. The draft logs the failure and moves on.
+  (id, topic, key, payload)\` keeps the row for the relay. The starter logs the failure and moves on.
 - **A resync path.** \`resync_from_ledger(tenant, from_position)\` re-reads committed entries above a
   position and publishes them again, so a mirror that fell behind can always catch up.
 
@@ -63,7 +63,7 @@ copy of the trail — and when it is keyed by the wrong field, it is a second co
       id: 'key-tenant',
       title: 'Events are keyed by tenant',
       detail:
-        'The record key is the tenant, so one tenant’s events stay on one partition in chain order. The draft keys by model version, which scatters and reorders history.',
+        'The record key is the tenant, so one tenant’s events stay on one partition in chain order. The starter keys by model version, which scatters and reorders history.',
       match: {
         python: {all: [/key=tenant/]},
         typescript: {all: [/key:\s*tenant/]},
@@ -76,7 +76,7 @@ copy of the trail — and when it is keyed by the wrong field, it is a second co
       id: 'ids-only-payload',
       title: 'The payload is ids and digests, never the decision',
       detail:
-        'The event carries `record_id`, `position` and `digest` only; the word `decision` appears nowhere in the payload. The draft publishes the full record so mirrors need no read access — a retained topic is the last place that content may live.',
+        'The event carries `record_id`, `position` and `digest` only; the word `decision` appears nowhere in the payload. The starter publishes the full record so mirrors need no read access — a retained topic is the last place that content may live.',
       match: {
         python: {all: [/record_id/, /position/, /digest/], none: [/decision/]},
         typescript: {all: [/record_id/, /position/, /digest/], none: [/decision/]},
@@ -89,7 +89,7 @@ copy of the trail — and when it is keyed by the wrong field, it is a second co
       id: 'outbox',
       title: 'A rejected produce leaves an outbox row',
       detail:
-        'When the broker refuses the event, the row is written to `outbox` for the relay. The draft logs the failure and loses the event.',
+        'When the broker refuses the event, the row is written to `outbox` for the relay. The starter logs the failure and loses the event.',
       match: {
         python: {all: [/outbox/]},
         typescript: {all: [/outbox/]},
@@ -102,7 +102,7 @@ copy of the trail — and when it is keyed by the wrong field, it is a second co
       id: 'after-durable',
       title: 'The produce happens after the append is durable',
       detail:
-        '`INSERT INTO audit_entries` comes before the produce call, so nothing is published that the ledger has not committed. The draft produces first and appends after, so a mirror can be ahead of the ledger.',
+        '`INSERT INTO audit_entries` comes before the produce call, so nothing is published that the ledger has not committed. The starter produces first and appends after, so a mirror can be ahead of the ledger.',
       match: {
         python: {order: [/INSERT INTO audit_entries/, /produce\(/]},
         typescript: {order: [/INSERT INTO audit_entries/, /producer\.send\(/]},
@@ -115,7 +115,7 @@ copy of the trail — and when it is keyed by the wrong field, it is a second co
       id: 'resync',
       title: 'A mirror can resync from the ledger',
       detail:
-        'A resync path re-reads committed entries above a position and republishes them, so a mirror that fell behind is not stuck. The draft has no way back to the ledger.',
+        'A resync path re-reads committed entries above a position and republishes them, so a mirror that fell behind is not stuck. The starter has no way back to the ledger.',
       match: {
         python: {all: [/resync/]},
         typescript: {all: [/resync/]},
@@ -137,7 +137,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish_appended(conn, tenant: str, record_id: str, model_version: str, record: dict) -> None:
-    # TODO: the draft keys by model version, ships the whole decision record so mirrors need no read
+    # TODO: the starter keys by model version, ships the whole decision record so mirrors need no read
     # access, and acks before the append is durable. Key by tenant, publish ids and digests only,
     # and write the ledger row first.
     payload = json.dumps({"record_id": record_id, "decision": record}).encode()
@@ -194,7 +194,7 @@ def resync_from_ledger(conn, tenant: str, from_position: int) -> int:
 `,
     },
     typescript: {
-      starter: `/** A model-generated publisher that ships the record and keys by version. */
+      starter: `/** A publisher that ships the record and keys by version. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'audit.appended';
@@ -210,7 +210,7 @@ export async function publishAppended(
   modelVersion: string,
   record: unknown,
 ): Promise<void> {
-  // TODO: the draft keys by model version, ships the whole decision record so mirrors need no read
+  // TODO: the starter keys by model version, ships the whole decision record so mirrors need no read
   // access, and acks before the append is durable. Key by tenant, publish ids and digests only,
   // and write the ledger row first.
   const payload = JSON.stringify({record_id: recordId, decision: record});
@@ -292,7 +292,7 @@ const topic = "audit.appended"
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
 func publishAppended(ctx context.Context, db *sql.DB, tenant, recordID, modelVersion string, record any) error {
-	// TODO: the draft keys by model version, ships the whole decision record so mirrors need no read
+	// TODO: the starter keys by model version, ships the whole decision record so mirrors need no read
 	// access, and acks before the append is durable. Key by tenant, publish ids and digests only,
 	// and write the ledger row first.
 	payload, _ := json.Marshal(map[string]any{"record_id": recordID, "decision": record})
@@ -395,7 +395,7 @@ object AuditEvents {
   props.put("bootstrap.servers", "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: the draft keys by model version, ships the whole decision record so mirrors need no read
+  // TODO: the starter keys by model version, ships the whole decision record so mirrors need no read
   // access, and acks before the append is durable. Key by tenant, publish ids and digests only,
   // and write the ledger row first.
   def publishAppended(conn: java.sql.Connection, tenant: String, recordId: String, modelVersion: String, record: String): Unit = {
@@ -488,7 +488,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 auto producer = make_producer();
 
 void publish_appended(pqxx::work& tx, const std::string& tenant, const std::string& record_id, const std::string& model_version, const std::string& record) {
-  // TODO: the draft keys by model version, ships the whole decision record so mirrors need no read
+  // TODO: the starter keys by model version, ships the whole decision record so mirrors need no read
   // access, and acks before the append is durable. Key by tenant, publish ids and digests only,
   // and write the ledger row first.
   const std::string payload = nlohmann::json{{"record_id", record_id}, {"decision", record}}.dump();
@@ -562,5 +562,5 @@ int resync_from_ledger(pqxx::work& tx, const std::string& tenant, int from_posit
     'The key is the ordering contract. One tenant → one partition means a mirror applies chain advances in position order; key by model version and two partitions can deliver position 7 before position 6. The tenant is also the natural partition for per-tenant lag metrics.',
     'Publish only what the ledger has committed: `INSERT INTO audit_entries` first, produce second. When the produce is rejected, `INSERT INTO outbox (id, topic, key, payload)` and let the relay retry — plus a `resync_from_ledger(tenant, from_position)` so a mirror that fell behind can catch up without a special backfill tool.',
   ],
-  debrief: `The interviewer is testing whether you understand what an event stream is allowed to become. The draft is the version that "works": mirrors are simple because they get everything they need in the message, and the produce is fast because it happens before the append. Both shortcuts fail an audit. A retained topic with the decision record in it is a second copy of tenant content, replicated to every consumer that was never supposed to see it — the same mistake as storing the prompt, one hop downstream. And publishing before the ledger commits lets a mirror run ahead of the source of truth, which is worse than being behind because nothing detects it. Ordering closes the loop: the tenant key is what makes a mirror’s replay match the chain, and the outbox plus resync path is what makes a rejected produce a delay instead of a hole.`,
+  debrief: `The interviewer is testing whether you understand what an event stream is allowed to become. The starter is the version that "works": mirrors are simple because they get everything they need in the message, and the produce is fast because it happens before the append. Both shortcuts fail an audit. A retained topic with the decision record in it is a second copy of tenant content, replicated to every consumer that was never supposed to see it — the same mistake as storing the prompt, one hop downstream. And publishing before the ledger commits lets a mirror run ahead of the source of truth, which is worse than being behind because nothing detects it. Ordering closes the loop: the tenant key is what makes a mirror’s replay match the chain, and the outbox plus resync path is what makes a rejected produce a delay instead of a hole.`,
 };

@@ -8,7 +8,7 @@ export const triageDependencyStep: Step = {
   focus: ['triage', 'classifier', 'rules'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it calls the classifier and returns whatever it
+**Starting point.** The starter is working code: it calls the classifier and returns whatever it
 says, so the happy path works. It hides three flaws in the failure path. Find them, fix them, and
 prove the fix.
 
@@ -26,7 +26,7 @@ Implement the classifier client every triage call uses:
   queue that swallows every ticket during an outage.
 - **Short failure memory.** After \`5\` consecutive retryable failures the client stops calling the
   classifier for **30 seconds**, then probes it again. A recovered classifier must be used again
-  within a minute — the draft caches the failure for every ticket of the hour, which is how an
+  within a minute — the starter caches the failure for every ticket of the hour, which is how an
   outage hides.
 
 **Failure mode the checks target.** Failing all tickets into one catch-all queue erases the
@@ -75,7 +75,7 @@ healthy again.`,
       id: 'retry-policy',
       title: 'Bounds attempts and retries only retryable statuses',
       detail:
-        'At most 3 attempts, and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; a refusal returns immediately. The draft retries every error until the deadline.',
+        'At most 3 attempts, and only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; a refusal returns immediately. The starter retries every error until the deadline.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /RETRYABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/\bwhile\s+True\b/]},
         typescript: {
@@ -94,7 +94,7 @@ healthy again.`,
       id: 'rules-fallback',
       title: 'Falls back to the versioned keyword ruleset',
       detail:
-        'A timeout or unavailability routes by the keyword rules (`fallback_rules`, `ruleset v3`) instead of giving up, and the decision carries the `fallback_reason`. The draft funnels every ticket into one catch-all queue when the classifier is down.',
+        'A timeout or unavailability routes by the keyword rules (`fallback_rules`, `ruleset v3`) instead of giving up, and the decision carries the `fallback_reason`. The starter funnels every ticket into one catch-all queue when the classifier is down.',
       match: {
         python: {all: [/RULESET_VERSION/, /FALLBACK_RULES/, /rule_queue\(/, /fallback_reason/]},
         typescript: {all: [/RULESET_VERSION/, /FALLBACK_RULES/, /ruleQueue\(/, /fallback_reason/]},
@@ -120,7 +120,7 @@ healthy again.`,
       id: 'breaker-cooldown',
       title: 'Remembers a failure for seconds, not for the hour',
       detail:
-        'After 5 consecutive retryable failures the classifier is skipped for 30 seconds and then probed again, so a recovered classifier is used again within a minute. The draft caches the failure for the whole hour.',
+        'After 5 consecutive retryable failures the classifier is skipped for 30 seconds and then probed again, so a recovered classifier is used again within a minute. The starter caches the failure for the whole hour.',
       match: {
         python: {all: [/BREAKER_COOLDOWN_S\s*=\s*30/, /time\.monotonic\(\)/], none: [/3600/]},
         typescript: {all: [/BREAKER_COOLDOWN_MS\s*=\s*30_000/, /Date\.now\(\)/], none: [/3_600_000/]},
@@ -157,7 +157,7 @@ class Decision:
 
 
 def classify(text: str) -> Decision:
-    # TODO: this draft funnels every failure into one catch-all queue, retries a refusal until the
+    # TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
     # deadline, and caches the failure for every ticket of the hour.
     global _failed_at
     while True:
@@ -267,7 +267,7 @@ def classify(text: str) -> Decision:
 `,
     },
     typescript: {
-      starter: `/** Classifier client: a model-generated draft that hides the outage behind one catch-all queue. */
+      starter: `/** Classifier client: flawed code that hides the outage behind one catch-all queue. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -303,7 +303,7 @@ export interface Decision {
 }
 
 export async function classify(text: string): Promise<Decision> {
-  // TODO: this draft funnels every failure into one catch-all queue, retries a refusal until the
+  // TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
   // deadline, and caches the failure for every ticket of the hour.
   for (;;) {
     try {
@@ -476,7 +476,7 @@ type Decision struct {
 
 // Classify asks the classifier for a routing decision.
 func Classify(ctx context.Context, text string) (Decision, error) {
-	// TODO: this draft funnels every failure into one catch-all queue, retries a refusal until the
+	// TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
 	// deadline, and caches the failure for every ticket of the hour.
 	for {
 		ctx, cancel := context.WithTimeout(ctx, cacheTTL)
@@ -652,7 +652,7 @@ object Classifier {
   private var failedAt = 0L
 
   def classify(text: String): Decision = {
-    // TODO: this draft funnels every failure into one catch-all queue, retries a refusal until the
+    // TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
     // deadline, and caches the failure for every ticket of the hour.
     var done = false
     var result = Decision(CatchAllQueue, "normal", 0.0)
@@ -774,7 +774,7 @@ auto stub = classifier::Classifier::NewStub(channel);
 long long failedAt = 0;
 
 json classify(const std::string& text) {
-  // TODO: this draft funnels every failure into one catch-all queue, retries a refusal until the
+  // TODO: this starter funnels every failure into one catch-all queue, retries a refusal until the
   // deadline, and caches the failure for every ticket of the hour.
   for (;;) {
     grpc::ClientContext ctx;
@@ -905,5 +905,5 @@ json classify(const std::string& text) {
     'Classify the status: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt (bounded to three), everything else is an answer. `INVALID_ARGUMENT` means the classifier understood the request and refused it; retrying it cannot help and only delays the fallback.',
     'The breaker is a clock, not a flag: after five consecutive retryable failures, remember *when* it opened, skip the call for 30 seconds, then let one probe through. `time.monotonic()`/`Date.now()`/`System.nanoTime()` is what makes "used again within a minute" testable.',
   ],
-  debrief: `The interviewer is testing the failure path of a dependency call, which is where generated code is weakest. The draft looks defensive — it has a \`try\`, it has a cache — and it is wrong in three ways. It funnels every failure into one catch-all queue, so an outage looks like a surge of undifferentiated tickets and no dashboards can separate billing from delivery; nothing in the decision records that rules, not the model, chose the queue. It retries every error including a refusal, which is a retry storm pointed at a service that already said no. And its failure memory is measured in hours: once the classifier fails, every ticket for the rest of the hour is routed by rules, long after the classifier recovered. The fix is a deadline, a bounded retry over retryable codes only, a versioned rules fallback that records its reason and ruleset version, and a breaker whose cooldown is short enough to probe recovery.`,
+  debrief: `The interviewer is testing the failure path of a dependency call, which is where most code is weakest. The starter looks defensive — it has a \`try\`, it has a cache — and it is wrong in three ways. It funnels every failure into one catch-all queue, so an outage looks like a surge of undifferentiated tickets and no dashboards can separate billing from delivery; nothing in the decision records that rules, not the model, chose the queue. It retries every error including a refusal, which is a retry storm pointed at a service that already said no. And its failure memory is measured in hours: once the classifier fails, every ticket for the rest of the hour is routed by rules, long after the classifier recovered. The fix is a deadline, a bounded retry over retryable codes only, a versioned rules fallback that records its reason and ruleset version, and a breaker whose cooldown is short enough to probe recovery.`,
 };

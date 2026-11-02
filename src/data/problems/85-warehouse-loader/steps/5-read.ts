@@ -8,10 +8,10 @@ export const readStep: Step = {
   focus: ['reader', 'api', 'db', 'warehouse'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, looks
+**Starting point.** The starter is working code: it registers the route, looks
 the load up and answers with a body of counts, and the demo's numbers look right because the demo
 loads cleanly. It reports the plan instead of the result, hides the rows that were rejected, and reads
-freshness from whichever process happens to answer. Review it like the analyst who has to close the
+freshness from whichever process happens to answer. Debug it like the analyst who has to close the
 month on those numbers, fix it, and prove the fix.
 
 Implement \`GET /v1/loads/{id}\` — the report a finance or ops reader consults after a load.
@@ -76,7 +76,7 @@ The delta flag is the report's contract with its reader: reconcile, or say so.`,
       id: 'written-from-warehouse',
       title: 'Reports rows written as the warehouse holds them',
       detail:
-        '`rows_written` comes from a warehouse query for this load (and the delta is measured against it). The draft reports the manifest’s planned count for both read and written.',
+        '`rows_written` comes from a warehouse query for this load (and the delta is measured against it). The starter reports the manifest’s planned count for both read and written.',
       match: {
         python: {all: [/warehouse\.rows_written\(/, /rows_written/], none: [/rows_planned/]},
         typescript: {all: [/warehouse\.rowsWritten\(/, /rows_written/], none: [/rowsPlanned|rows_planned/]},
@@ -89,7 +89,7 @@ The delta flag is the report's contract with its reader: reconcile, or say so.`,
       id: 'rejected-reasons',
       title: 'Surfaces rejected rows with their reasons',
       detail:
-        'The report carries `rows_rejected` and the per-partition reasons (`partition_id`, `reason`, `rows`). The draft hides them, so missing rows look like a rounding difference.',
+        'The report carries `rows_rejected` and the per-partition reasons (`partition_id`, `reason`, `rows`). The starter hides them, so missing rows look like a rounding difference.',
       match: {
         python: {all: [/rows_rejected/, /reason/]},
         typescript: {all: [/rows_rejected/, /reason/]},
@@ -102,7 +102,7 @@ The delta flag is the report's contract with its reader: reconcile, or say so.`,
       id: 'freshness-scoped',
       title: 'Scopes freshness to the target table',
       detail:
-        'Freshness is the table’s committed position (`freshness:{target}`), so every replica reports the same number. The draft reads a per-worker key and a lagging table looks fresh.',
+        'Freshness is the table’s committed position (`freshness:{target}`), so every replica reports the same number. The starter reads a per-worker key and a lagging table looks fresh.',
       match: {
         python: {all: [/freshness\.table_freshness\(/, /table/], none: [/[Ww]orker/]},
         typescript: {all: [/freshness\.forTable\(/, /table/], none: [/[Ww]orker/]},
@@ -115,7 +115,7 @@ The delta flag is the report's contract with its reader: reconcile, or say so.`,
       id: 'delta-flag',
       title: 'Flags an unexplained read-write delta',
       detail:
-        '`delta = rows_read - rows_written - rows_rejected` and `flagged` is true whenever it is not 0. The draft reports planned counts, so its delta is always zero and nothing is ever flagged.',
+        '`delta = rows_read - rows_written - rows_rejected` and `flagged` is true whenever it is not 0. The starter reports planned counts, so its delta is always zero and nothing is ever flagged.',
       match: {
         python: {all: [/delta/, /flagged/]},
         typescript: {all: [/delta/, /flagged/]},
@@ -150,8 +150,8 @@ r = redis.Redis(host="redis", port=6379)
 
 @app.get("/v1/loads/{load_id}")
 def read_load(load_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft reports the manifest's planned counts, hides the rejected rows, and reads
-    # freshness from a per-process key, so a lagging table looks fresh. Review all three.
+    # TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
+    # freshness from a per-process key, so a lagging table looks fresh. Fix all three.
     load = store.get(tenant, load_id)
     return JSONResponse(
         {
@@ -236,7 +236,7 @@ def read_load(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/loads/{id}: a model-generated draft that reports the plan. */
+      starter: `/** GET /v1/loads/{id}: flawed code that reports the plan. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -246,8 +246,8 @@ export const app = Fastify();
 export const redis = new Redis('redis://redis:6379');
 
 app.get('/v1/loads/:loadId', async (request, reply) => {
-  // TODO: this draft reports the manifest's planned counts, hides the rejected rows, and reads
-  // freshness from a per-process key, so a lagging table looks fresh. Review all three.
+  // TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
+  // freshness from a per-process key, so a lagging table looks fresh. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const {loadId} = request.params as {loadId: string};
   const record = await store.get(tenant, loadId);
@@ -367,8 +367,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readLoad(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reports the manifest's planned counts, hides the rejected rows, and reads
-	// freshness from a per-process key, so a lagging table looks fresh. Review all three.
+	// TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
+	// freshness from a per-process key, so a lagging table looks fresh. Fix all three.
 	tenant := r.Header.Get("X-Tenant-Id")
 	loadID := r.PathValue("load_id")
 	record, err := store.Get(r.Context(), tenant, loadID)
@@ -526,8 +526,8 @@ object LoadReportApi {
     path("v1" / "loads" / Segment) { loadId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this draft reports the manifest's planned counts, hides the rejected rows, and
-          // reads freshness from a per-process key, so a lagging table looks fresh. Review all three.
+          // TODO: this starter reports the manifest's planned counts, hides the rejected rows, and
+          // reads freshness from a per-process key, so a lagging table looks fresh. Fix all three.
           val record = store.get(tenant, loadId)
           complete(
             StatusCodes.OK,
@@ -656,8 +656,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/loads/([A-Za-z0-9-]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reports the manifest's planned counts, hides the rejected rows, and reads
-    // freshness from a per-process key, so a lagging table looks fresh. Review all three.
+    // TODO: this starter reports the manifest's planned counts, hides the rejected rows, and reads
+    // freshness from a per-process key, so a lagging table looks fresh. Fix all three.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     const auto loadId = req.matches[1].str();
     const auto record = store.get(tenant, loadId);
@@ -770,7 +770,7 @@ int main() {
     },
   },
   debrief: `The interviewer is testing whether a report can be trusted, which is a different question from
-whether it is correct. The draft compiles, the numbers are integers, and the demo's table is fresh —
+whether it is correct. The starter compiles, the numbers are integers, and the demo's table is fresh —
 but every field is sourced from the wrong place. Written counts must come back from the warehouse,
 because the plan was the loader's intention and the delta exists precisely to compare the two;
 rejected rows must surface with their reasons, because the only way a reader can repair a feed is to

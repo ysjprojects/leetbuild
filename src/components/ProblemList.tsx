@@ -21,7 +21,7 @@ import {useDialog} from './Dialog';
 import {ActivityHeatmap} from './Heatmap';
 import {ListControls} from './ListControls';
 import {LandingIntro} from './LoadingScreen';
-import {CompanyChip, ConceptChip, DifficultyChip} from './paneShared';
+import {CompanyChip, ConceptChip, DifficultyChip, TagChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
 
 /**
@@ -409,28 +409,12 @@ StepSquares.displayName = 'StepSquares';
 /**
  * What a track asks of the learner, as a strip under the toolbar while its tab is selected: how its
  * courses work in a line, then the skills they test as chips that explain themselves on hover. The
- * AI-era track is not "can you prompt" but can you specify, delegate, verify, evaluate, secure and
- * operate a system whose core is a model; the DL/LM track writes the internals of frontier models.
+ * DL/LM track writes the internals of frontier models; the systems track needs no strip, its
+ * courses say what they are.
  */
 const TRACK_BRIEF: Partial<
   Record<TrackFilter, {lead: string; skills: readonly {title: string; body: string}[]; frame: string; chip: string}>
 > = {
-  ai: {
-    lead: 'In these courses every starter is a model-generated draft with a real flaw. Review it, fix it, prove it. The six signals AI-era interviews probe:',
-    skills: [
-      {title: 'Specify', body: 'Turn an ambiguous ask into interfaces, budgets and acceptance criteria.'},
-      {title: 'Delegate', body: 'Use models where they help; make prompts, versions and fallbacks explicit.'},
-      {title: 'Verify', body: 'Review the generated draft, test the edge cases, and reject what you cannot prove.'},
-      {title: 'Evaluate', body: 'Golden sets, calibrated judges, regression gates and online metrics.'},
-      {
-        title: 'Secure',
-        body: 'Treat retrieved text and tool output as untrusted; scope tenants, allowlists and approvals.',
-      },
-      {title: 'Operate', body: 'Token and cost budgets, latency SLOs, retries, idempotency and traces.'},
-    ],
-    frame: 'border-iris-400/30 from-iris-400/[0.10]',
-    chip: 'border-iris-400/30 bg-iris-400/[0.08] text-iris-200',
-  },
   dllm: {
     lead: 'In these courses you write the internals of frontier models from scratch, in PyTorch or CUDA. The six skills they test:',
     skills: [
@@ -510,11 +494,7 @@ const ProblemRow: FC<{
           <span className="flex flex-wrap items-center gap-2">
             <span className="text-ink-50 group-hover:text-iris-200 text-[14px] font-bold">{problem.title}</span>
             <DifficultyChip difficulty={problem.difficulty} />
-            {problem.track === 'ai' ? (
-              <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
-                AI-era
-              </span>
-            ) : null}
+            {problem.tag !== undefined ? <TagChip tag={problem.tag} /> : null}
             {problem.company !== undefined ? <CompanyChip company={problem.company} /> : null}
             {/* A course covers every concept, so its chips would say nothing; a single-topic problem names its one. */}
             {problem.concepts.length === 1 ? <ConceptChip concept={problem.concepts[0]} /> : null}

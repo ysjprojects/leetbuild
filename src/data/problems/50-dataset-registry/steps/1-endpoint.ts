@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'registry', 'db', 'storage'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the register endpoint: it
+**Starting point.** The starter is working code for the register endpoint: it
 parses the body, writes a version record and answers \`201\`. It compiles, it serves the demo, and it
-hides four production flaws. Review it like the registry owner, fix it, and prove the fix.
+hides four production flaws. Debug it like the registry owner, fix it, and prove the fix.
 
 Implement \`POST /v1/datasets\` with body
 \`{"dataset": "imdb-reviews", "version": "2026-01", "content_sha256": "…", "license": "mit", "owner": "team-lm", "size_bytes": 12}\`.
@@ -26,7 +26,7 @@ Implement \`POST /v1/datasets\` with body
   is a budget hint at most; it is never the recorded truth.
 - Answer **201** with the stored record.
 
-**Failure mode the checks target.** A version name is a promise about bytes. The draft lets a second
+**Failure mode the checks target.** A version name is a promise about bytes. The starter lets a second
 register of the same \`(dataset, version)\` overwrite the pointer, so the content hash stops
 identifying the content and every run recorded against that name becomes unreproducible. The
 missing license check admits data nobody may legally train on, and reporting the caller's size lets
@@ -60,7 +60,7 @@ a client claim a 10 GiB dataset costs 1 KiB of budget.`,
       id: 'immutable',
       title: 'Re-registering an existing version is 409',
       detail:
-        'The handler looks the version up by `(dataset, version)` and answers **409** instead of overwriting the pointer. The draft writes unconditionally, so a hash no longer identifies its bytes.',
+        'The handler looks the version up by `(dataset, version)` and answers **409** instead of overwriting the pointer. The starter writes unconditionally, so a hash no longer identifies its bytes.',
       match: {
         python: {all: [/status_code\s*=\s*409/, /store\.head\(/]},
         typescript: {all: [/code\(\s*409\s*\)/, /store\.head\(/]},
@@ -73,7 +73,7 @@ a client claim a 10 GiB dataset costs 1 KiB of budget.`,
       id: 'license',
       title: 'License must be on the allowlist, else 422',
       detail:
-        '`ALLOWED_LICENSES` is checked server-side and an unknown or missing license is **422**. The draft stores whatever license string the caller sent, including none.',
+        '`ALLOWED_LICENSES` is checked server-side and an unknown or missing license is **422**. The starter stores whatever license string the caller sent, including none.',
       match: {
         python: {all: [/ALLOWED_LICENSES/, /status_code\s*=\s*422/]},
         typescript: {all: [/ALLOWED_LICENSES/, /code\(\s*422\s*\)/]},
@@ -86,7 +86,7 @@ a client claim a 10 GiB dataset costs 1 KiB of budget.`,
       id: 'measured-size',
       title: 'Size comes from a scan of the content',
       detail:
-        '`measure_content(store, sha)` scans the stored object and returns the byte size and row count the record carries. The draft stores `body.size_bytes`, so a client can under-report a dataset to slip past a budget.',
+        '`measure_content(store, sha)` scans the stored object and returns the byte size and row count the record carries. The starter stores `body.size_bytes`, so a client can under-report a dataset to slip past a budget.',
       match: {
         python: {all: [/def measure_content\(/, /measure_content\(store/]},
         typescript: {all: [/function measureContent\(/, /measureContent\(store/]},
@@ -99,7 +99,7 @@ a client claim a 10 GiB dataset costs 1 KiB of budget.`,
       id: 'required-fields',
       title: 'Owner and hash are required before anything is written',
       detail:
-        'A missing `owner` or `content_sha256` is **422** before the store is touched. The draft accepts both defaults and publishes a record with no accountable owner.',
+        'A missing `owner` or `content_sha256` is **422** before the store is touched. The starter accepts both defaults and publishes a record with no accountable owner.',
       match: {
         python: {all: [/if not body\.owner/, /status_code\s*=\s*422/]},
         typescript: {all: [/!body\.owner/, /code\(\s*422\s*\)/]},
@@ -141,8 +141,8 @@ store = RegistryStore()
 
 @app.post("/v1/datasets")
 def register(body: RegisterRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft overwrites an existing version's pointer, accepts a dataset with no
-    # license, stores the caller-supplied size, and never checks the owner. Review all four.
+    # TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
+    # license, stores the caller-supplied size, and never checks the owner. Fix all four.
     record = {
         "dataset": body.dataset,
         "version": body.version,
@@ -227,7 +227,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/datasets: a model-generated draft that trusts whatever the caller sends. */
+      starter: `/** POST /v1/datasets: flawed code that trusts whatever the caller sends. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -262,8 +262,8 @@ class RegistryStore {
 const store = new RegistryStore();
 
 app.post('/v1/datasets', async (request, reply) => {
-  // TODO: this draft overwrites an existing version's pointer, accepts a dataset with no
-  // license, stores the caller-supplied size, and never checks the owner. Review all four.
+  // TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
+  // license, stores the caller-supplied size, and never checks the owner. Fix all four.
   const body = request.body as RegisterBody;
   const record: VersionRecord = {
     dataset: body.dataset,
@@ -414,8 +414,8 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft overwrites an existing version's pointer, accepts a dataset with no
-	// license, stores the caller-supplied size, and never checks the owner. Review all four.
+	// TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
+	// license, stores the caller-supplied size, and never checks the owner. Fix all four.
 	record := map[string]any{
 		"dataset":        body.Dataset,
 		"version":        body.Version,
@@ -597,7 +597,7 @@ object DatasetApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RegisterRequest]) { body =>
-            // TODO: this draft overwrites an existing version's pointer, accepts a dataset with
+            // TODO: this starter overwrites an existing version's pointer, accepts a dataset with
             // no license, stores the caller-supplied size, and never checks the owner.
             val record = VersionRecord(
               body.dataset,
@@ -742,8 +742,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft overwrites an existing version's pointer, accepts a dataset with no
-    // license, stores the caller-supplied size, and never checks the owner. Review all four.
+    // TODO: this starter overwrites an existing version's pointer, accepts a dataset with no
+    // license, stores the caller-supplied size, and never checks the owner. Fix all four.
     const auto dataset = body.value("dataset", std::string());
     const auto version = body.value("version", std::string());
     const auto license = body.value("license", std::string());
@@ -858,5 +858,5 @@ int main() {
     "Size is not an input. `measure_content(store, content_sha256)` scans the object once and returns bytes and rows; the caller's `size_bytes` is a budget hint at most and must never be the recorded truth.",
     'Immutability is a store contract, not a handler convention: `head(dataset, version)` must read the same key `put_version` writes, and the store must fail when that key appears twice. A handler-only check still races two concurrent registers.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary, where a version name is a promise about bytes. The draft reads fine because the demo registers each dataset once from one tenant. Four defects are checked: the missing required fields (no accountable owner, no hash identity), the license allowlist (legal exposure, not a style choice), immutability (409 on a re-register, keyed exactly like the write), and provenance measured by scanning the content instead of trusting a number the caller sent. Real registries add server-side hash verification of the uploaded object, per-license obligations recorded alongside the id, a size budget checked against the measured value, and an approval trail on the version record.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary, where a version name is a promise about bytes. The starter reads fine because the demo registers each dataset once from one tenant. Four defects are checked: the missing required fields (no accountable owner, no hash identity), the license allowlist (legal exposure, not a style choice), immutability (409 on a re-register, keyed exactly like the write), and provenance measured by scanning the content instead of trusting a number the caller sent. Real registries add server-side hash verification of the uploaded object, per-license obligations recorded alongside the id, a size budget checked against the measured value, and an approval trail on the version record.`,
 };

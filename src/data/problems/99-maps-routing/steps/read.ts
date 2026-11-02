@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it parses the route id, loads
+**Starting point.** The starter is working code: it parses the route id, loads
 the record and returns the geometry. It compiles, it serves the demo, and it quietly lies about the
-age of what it returns. Review it like the service owner, fix it, and prove the fix with the checks
+age of what it returns. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`GET /v1/routes/{id}\`, the read that hands one stored route back to a caller:
@@ -63,7 +63,7 @@ read that trusts only the id turns route ids into a cross-tenant enumeration ora
       id: 'route-read',
       title: 'Answers GET /v1/routes/{id} with the stored route',
       detail:
-        'The read is registered on `GET /v1/routes/{route_id}` (the language’s path-parameter route) and its response carries the stored `geometry` together with `epoch`, `engine_version` and the `degraded` marker. The draft already answers this route, so this check passes on it — the four below are where it fails.',
+        'The read is registered on `GET /v1/routes/{route_id}` (the language’s path-parameter route) and its response carries the stored `geometry` together with `epoch`, `engine_version` and the `degraded` marker. The starter already answers this route, so this check passes on it — the four below are where it fails.',
       match: {
         python: {
           all: [
@@ -85,7 +85,7 @@ read that trusts only the id turns route ids into a cross-tenant enumeration ora
       id: 'tenant-required',
       title: 'Requires the tenant, 401 without it',
       detail:
-        'The read is a tenant surface: no `X-Tenant-Id` is **401**, before the store is touched. The draft has no tenant gate at all, so a request with no credential is served like any other.',
+        'The read is a tenant surface: no `X-Tenant-Id` is **401**, before the store is touched. The starter has no tenant gate at all, so a request with no credential is served like any other.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
@@ -98,7 +98,7 @@ read that trusts only the id turns route ids into a cross-tenant enumeration ora
       id: 'ownership-scope',
       title: 'Foreign route ids answer 404, same as unknown ones',
       detail:
-        'The stored record carries its `tenant`, and the read returns it only to that tenant: an unknown id and a foreign id get the same **404** body, so the endpoint never confirms that another tenant’s route exists. The draft reads by id alone and hands any record to any caller.',
+        'The stored record carries its `tenant`, and the read returns it only to that tenant: an unknown id and a foreign id get the same **404** body, so the endpoint never confirms that another tenant’s route exists. The starter reads by id alone and hands any record to any caller.',
       match: {
         python: {all: [/route\[["']tenant["']\]\s*!=\s*tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/route\.tenant\s*!==\s*tenant/, /code\(\s*404\s*\)/]},
@@ -111,7 +111,7 @@ read that trusts only the id turns route ids into a cross-tenant enumeration ora
       id: 'epoch-provenance',
       title: 'Reports the geometry’s real epoch, never the current clock',
       detail:
-        'The response `epoch` is the epoch the geometry was computed in, read from the record; the current traffic epoch is used only to compute `stale`, true whenever they differ, so a stored route is never sold as a fresh computation. The draft stamps `current_epoch()` on geometry from an older epoch, so a rush-hour route reads as freshly computed forever.',
+        'The response `epoch` is the epoch the geometry was computed in, read from the record; the current traffic epoch is used only to compute `stale`, true whenever they differ, so a stored route is never sold as a fresh computation. The starter stamps `current_epoch()` on geometry from an older epoch, so a rush-hour route reads as freshly computed forever.',
       match: {
         python: {
           all: [/route\[["']epoch["']\]/, /stale/, /current_epoch\(\)/],
@@ -136,7 +136,7 @@ read that trusts only the id turns route ids into a cross-tenant enumeration ora
       id: 'degraded-marker',
       title: 'Serves the stored geometry with its degraded marker intact',
       detail:
-        'The record’s `geometry` is returned verbatim and `degraded` travels with it: a straight-line estimate produced by the fallback stays marked instead of being dressed up as a road route, and a marker is never replaced by a hardcoded healthy default. The draft drops `degraded` from the response entirely, so the marker is hidden.',
+        'The record’s `geometry` is returned verbatim and `degraded` travels with it: a straight-line estimate produced by the fallback stays marked instead of being dressed up as a road route, and a marker is never replaced by a hardcoded healthy default. The starter drops `degraded` from the response entirely, so the marker is hidden.',
       match: {
         python: {
           all: [/route\[["']geometry["']\]/, /route\[["']degraded["']\]/],
@@ -173,8 +173,8 @@ def current_epoch() -> int:
 
 @app.get("/v1/routes/{route_id}")
 def read_route(route_id: str) -> JSONResponse:
-    # TODO: this draft ignores the tenant, stamps the current epoch on stored geometry and drops
-    # the degraded marker. Review all three.
+    # TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
+    # the degraded marker. Fix all three.
     route = store.get(route_id)
     if route is None:
         return JSONResponse({"error": "route not found"}, status_code=404)
@@ -233,7 +233,7 @@ def read_route(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/routes/{id}: a model-generated draft that trusts whatever the store returns. */
+      starter: `/** GET /v1/routes/{id}: flawed code that trusts whatever the store returns. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -260,8 +260,8 @@ function currentEpoch(): number {
 }
 
 app.get('/v1/routes/:routeId', async (request, reply) => {
-  // TODO: this draft ignores the tenant, stamps the current epoch on stored geometry and drops
-  // the degraded marker. Review all three.
+  // TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
+  // the degraded marker. Fix all three.
   const {routeId} = request.params as {routeId: string};
   const route = await store.get(routeId);
   if (route === null) return reply.code(404).send({error: 'route not found'});
@@ -362,8 +362,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readRoute(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft ignores the tenant, stamps the current epoch on stored geometry and drops
-	// the degraded marker. Review all three.
+	// TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
+	// the degraded marker. Fix all three.
 	routeID := r.PathValue("route_id")
 	route, err := store.Get(r.Context(), routeID)
 	if err != nil {
@@ -499,8 +499,8 @@ object ReadApi {
   val route: Route =
     path("v1" / "routes" / Segment) { routeId =>
       get {
-        // TODO: this draft ignores the tenant, stamps the current epoch on stored geometry and
-        // drops the degraded marker. Review all three.
+        // TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and
+        // drops the degraded marker. Fix all three.
         store.get(routeId) match {
           case None => complete(StatusCodes.NotFound, """{"error":"route not found"}""")
           case Some(stored) =>
@@ -616,8 +616,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/routes/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft ignores the tenant, stamps the current epoch on stored geometry and drops
-    // the degraded marker. Review all three.
+    // TODO: this starter ignores the tenant, stamps the current epoch on stored geometry and drops
+    // the degraded marker. Fix all three.
     const std::string route_id = req.matches[1];
     const auto stored = store.get(route_id);
     if (!stored) {
@@ -702,5 +702,5 @@ int main() {
     'The `epoch` you return is the geometry’s, not the clock’s: read it from the record. The current epoch (floor(now / 300)) is only for the `stale` comparison — true whenever the geometry was not computed in the current epoch — because a stored route is a snapshot, never a substitute for a fresh computation.',
     'Return the record as stored: `geometry` verbatim and `degraded` alongside it. Dropping the marker, or replacing it with a hardcoded false, dresses a straight-line fallback up as a road route — and the caller has no way to tell until the car is on a road that does not exist.',
   ],
-  debrief: `The interviewer is testing the read half of a routing cache: not “does it return geometry” but “can the caller tell what it is holding”. Three truths the draft breaks, and each check owns one. Ownership: the record’s \`tenant\` decides who may read it, and a foreign id answers the same 404 as an unknown one, so the read cannot be used to enumerate another tenant’s routes. Provenance: the epoch on the response is the epoch the geometry was computed in, and the current traffic epoch is used only to say \`stale\` — never to relabel old geometry as fresh. Honest degradation: \`degraded\` travels with the geometry, so a straight-line fallback estimate is never mistaken for a road route. Real platforms add a signed route token so a client can prove what it was served, per-epoch metric labels on the read path, and a reaper that deletes routes older than the retention window instead of serving them forever.`,
+  debrief: `The interviewer is testing the read half of a routing cache: not “does it return geometry” but “can the caller tell what it is holding”. Three truths the starter breaks, and each check owns one. Ownership: the record’s \`tenant\` decides who may read it, and a foreign id answers the same 404 as an unknown one, so the read cannot be used to enumerate another tenant’s routes. Provenance: the epoch on the response is the epoch the geometry was computed in, and the current traffic epoch is used only to say \`stale\` — never to relabel old geometry as fresh. Honest degradation: \`degraded\` travels with the geometry, so a straight-line fallback estimate is never mistaken for a road route. Real platforms add a signed route token so a client can prove what it was served, per-epoch metric labels on the read path, and a reaper that deletes routes older than the retention window instead of serving them forever.`,
 };

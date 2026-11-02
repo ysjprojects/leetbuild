@@ -7,14 +7,13 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Batch inference on the AI-era track: the course is not "run a job over a file", it is the review
- * you owe a model-generated batch pipeline before it burns a million model calls and then lies about
- * it. An idempotent, capped submit whose manifest is durable before any shard starts → Redis claims
- * with an atomic lease, a heartbeat and a reaper so a dead worker's shard is retried → a per-shard
- * model call bounded by a deadline, two UNAVAILABLE retries and a contained failure → batch-keyed
- * shard events published only after the output is flushed, with an outbox and an idempotent fold →
- * a read endpoint that derives progress from the live shard set and never calls a partial batch a
- * success.
+ * Batch inference: the course is not "run a job over a file", it is the debugging you owe a batch
+ * pipeline before it burns a million model calls and then lies about it. An idempotent, capped
+ * submit whose manifest is durable before any shard starts → Redis claims with an atomic lease, a
+ * heartbeat and a reaper so a dead worker's shard is retried → a per-shard model call bounded by a
+ * deadline, two UNAVAILABLE retries and a contained failure → batch-keyed shard events published
+ * only after the output is flushed, with an outbox and an idempotent fold → a read endpoint that
+ * derives progress from the live shard set and never calls a partial batch a success.
  */
 export const batchInferenceProblem: Problem = {
   id: 'batch-inference',
@@ -22,7 +21,7 @@ export const batchInferenceProblem: Problem = {
   tagline: 'Big batch jobs that survive one bad shard and report honest partial progress.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Batch Inference Service
 
@@ -67,12 +66,12 @@ One service, **batchd**, and its workers, with five pieces:
    pending counts and a manifest of output objects — success only when every shard is terminal, and
    a foreign batch id is a \`404\`.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
+failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

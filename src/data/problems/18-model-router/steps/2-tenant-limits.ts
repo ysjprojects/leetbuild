@@ -8,7 +8,7 @@ export const tenantLimitsStep: Step = {
   focus: ['router', 'redis', 'provider'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a tenant with budget left gets its request
+The starter is working code: a tenant with budget left gets its request
 through, so the demo passes. The limiter hides a race, a leak and a wrong order of operations.
 Find them, fix them, and prove the fix.
 
@@ -25,7 +25,7 @@ Implement the per-tenant rate limit used by every routed request:
   the counters reset instead of living forever.
 - When either budget is exhausted, answer **429** with \`Retry-After\` (seconds, the key's TTL) and
   \`X-RateLimit-Remaining\` (tokens left), and **do not call the provider**.
-- Reserve **before** the provider call. The draft bills after the answer, so a rejected request has
+- Reserve **before** the provider call. The starter bills after the answer, so a rejected request has
   already been paid for.
 
 **Failure mode the checks target.** Two concurrent requests both pass the same check and overspend;
@@ -108,7 +108,7 @@ charging after the call means the provider is paid even when the tenant was over
       id: 'reserve-first',
       title: 'Reserves before the provider call',
       detail:
-        'The reservation runs before the provider call; a rejected request never touches the provider. The draft calls the model first and charges afterwards, so over-budget requests are still paid for.',
+        'The reservation runs before the provider call; a rejected request never touches the provider. The starter calls the model first and charges afterwards, so over-budget requests are still paid for.',
       match: {
         python: {order: [/reserve\(/, /providers\.Complete\(/]},
         typescript: {order: [/reserve\(/, /provider\.Complete\(/]},
@@ -240,7 +240,7 @@ def route(body: RouteRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict
 `,
     },
     typescript: {
-      starter: `/** POST /v1/route: a model-generated draft that charges after the call and never expires keys. */
+      starter: `/** POST /v1/route: flawed code that charges after the call and never expires keys. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

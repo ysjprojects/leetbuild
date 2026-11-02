@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['recsvc', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every ranked response publishes
+**Starting point.** The starter is working code: every ranked response publishes
 an impression and the counters move, so the exposure dashboard fills in. It also copies the raw
 feature values that ranked the items into a topic that is retained and replicated, keys the produce by
-the first item, and treats the produce as fire-and-forget. Review it like the service owner, fix it,
+the first item, and treats the produce as fire-and-forget. Debug it like the service owner, fix it,
 and prove the fix with the checks below.
 
 \`publish_impression(tenant, user_id, items, model_version, fallback)\` is how the Recommendation API
@@ -21,7 +21,7 @@ consumer folds each event into per-item counters.
 
 - The produce key is the **user id** (\`key=user_id\`, \`key: userId\`, \`Key: []byte(userID)\`), so
   every impression of one user lands on one partition in order — a user's exposure stream is only
-  replayable while it keeps that order. The draft keys by the id of the first item.
+  replayable while it keeps that order. The starter keys by the id of the first item.
 - The payload carries identifiers and rendition facts only: \`candidate_ids\` (the candidates that
   were shown, in rank order), the \`positions\` they were rendered at, the \`model_version\` that
   ranked them, and \`fallback\` when the ranking was degraded. Ids alone cannot say which slot an item
@@ -86,7 +86,7 @@ missing from the counters and nothing will ever re-capture it.`,
       id: 'user-key',
       title: 'Keyed by the user id, so one user’s exposure stream stays ordered',
       detail:
-        'The message key is the user id — `key=user_id`, `key: userId`, `Key: []byte(userID)` — so all impressions of one user land on one partition in order. The draft keys by the first item id, so a user’s exposure stream is scattered across partitions and the order the counters are reconciled against is gone.',
+        'The message key is the user id — `key=user_id`, `key: userId`, `Key: []byte(userID)` — so all impressions of one user land on one partition in order. The starter keys by the first item id, so a user’s exposure stream is scattered across partitions and the order the counters are reconciled against is gone.',
       match: {
         python: {all: [/recsys\.impression/, /key=user_id/]},
         typescript: {all: [/recsys\.impression/, /key:\s*userId/]},
@@ -99,7 +99,7 @@ missing from the counters and nothing will ever re-capture it.`,
       id: 'no-features',
       title: 'Carries identifiers only — no feature values, no PII',
       detail:
-        'The payload never carries a raw feature vector (`features` / `vector` / `embedding`) and never user PII (`email`, `name`). The draft copies the item features into the event so the training pipeline can skip a join — and the topic is retained and replicated for days, so that copy outlives the request.',
+        'The payload never carries a raw feature vector (`features` / `vector` / `embedding`) and never user PII (`email`, `name`). The starter copies the item features into the event so the training pipeline can skip a join — and the topic is retained and replicated for days, so that copy outlives the request.',
       match: {
         python: {
           all: [/recsys\.impression/],
@@ -127,7 +127,7 @@ missing from the counters and nothing will ever re-capture it.`,
       id: 'payload-ids',
       title: 'Payload carries the shown ids, their positions, model_version and fallback',
       detail:
-        'The event carries `candidate_ids`, the `positions` they were rendered at, the `model_version` that ranked them and the `fallback` flag for a degraded ranking. The draft ships ids and a feature blob and no positions or flag, so an impression can be neither attributed to a slot nor told apart from a real model result.',
+        'The event carries `candidate_ids`, the `positions` they were rendered at, the `model_version` that ranked them and the `fallback` flag for a degraded ranking. The starter ships ids and a feature blob and no positions or flag, so an impression can be neither attributed to a slot nor told apart from a real model result.',
       match: {
         python: {
           all: [
@@ -160,7 +160,7 @@ missing from the counters and nothing will ever re-capture it.`,
       id: 'outbox',
       title: 'A rejected produce is kept in the outbox, not dropped',
       detail:
-        'When the broker rejects the produce the event is written as an outbox row (`outbox.put(...)` / `outbox.Put(...)`) inside the failure branch, for a relay to republish. The draft acks the produce and drops the rejection, so an impression that was served is lost without a trace.',
+        'When the broker rejects the produce the event is written as an outbox row (`outbox.put(...)` / `outbox.Put(...)`) inside the failure branch, for a relay to republish. The starter acks the produce and drops the rejection, so an impression that was served is lost without a trace.',
       match: {
         python: {all: [/outbox\.put\(/, /except\s+KafkaException/]},
         typescript: {all: [/outbox\.put\(/, /catch\s*\(/]},
@@ -1000,5 +1000,5 @@ void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& redis) {
     'The payload is a join key, not a data dump. The trainer can join on `candidate_ids` against the feature store it already owns; copying the feature values into a retained, replicated topic only means the event becomes a de-facto feature store with no schema, no owner and no way to expire a value. Ids, `positions`, `model_version` and the `fallback` flag are what an exposure row needs.',
     'The outbox is the durability half: catch the broker failure (`except KafkaException`, `catch`, `err != nil`) and write the event as a row the relay republishes. Without it a rejected produce is an impression that was served but never recorded, and nothing re-captures it — the counters just under-report.',
   ],
-  debrief: `The interviewer is testing whether you can review a publish path that looks fire-and-forget and actually decides what the training pipeline can prove later. Three decisions are being checked, and each is invisible in the happy path. First the key: partitioning by user is what makes an exposure stream ordered and replayable; partitioning by item looks natural because every event is about items, and silently reorders a user’s shows. Second the payload: an event is a join key, not a transport for the features that produced it — publishing raw feature values into a topic retained for days turns a convenience into a data-retention problem, and the same payload is the obvious place a future edit adds an email. Third durability: \`acks=all\` and an idempotent producer protect against the client’s own retry duplicating an event, but only an outbox protects the impression the broker refused, and an impression no one recorded can never be reconstructed. Real pipelines add a schema registry so a producer cannot smuggle a new field into the topic, an event id the consumer dedupes on so a replay is idempotent, and a retention/compaction policy per topic; the counters themselves are folded before the offset is committed, so a crash replays the event instead of losing it.`,
+  debrief: `The interviewer is testing whether you can debug a publish path that looks fire-and-forget and actually decides what the training pipeline can prove later. Three decisions are being checked, and each is invisible in the happy path. First the key: partitioning by user is what makes an exposure stream ordered and replayable; partitioning by item looks natural because every event is about items, and silently reorders a user’s shows. Second the payload: an event is a join key, not a transport for the features that produced it — publishing raw feature values into a topic retained for days turns a convenience into a data-retention problem, and the same payload is the obvious place a future edit adds an email. Third durability: \`acks=all\` and an idempotent producer protect against the client’s own retry duplicating an event, but only an outbox protects the impression the broker refused, and an impression no one recorded can never be reconstructed. Real pipelines add a schema registry so a producer cannot smuggle a new field into the topic, an event id the consumer dedupes on so a replay is idempotent, and a retention/compaction policy per topic; the counters themselves are folded before the offset is committed, so a crash replays the event instead of losing it.`,
 };

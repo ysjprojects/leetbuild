@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Session store on the AI-era track: the course is the review you owe a model-generated session
- * layer before it guards a platform. Rotation that mints a new id and retires the old one →
- * Redis records with a sliding TTL under a hard absolute cap and an atomic rotation → a gRPC
- * validation path with a short cache that fails closed on timeout → session events keyed by user
- * carrying hashes, never tokens, persisted before publish → a read endpoint whose last-seen is
- * accurate, whose revoke-all is atomic and whose sessions are private.
+ * Session store: the course is not "put a token in Redis", it is the debugging you owe a session
+ * layer before it guards a platform. Rotation that mints a new id and retires the old one → Redis
+ * records with a sliding TTL under a hard absolute cap and an atomic rotation → a gRPC validation
+ * path with a short cache that fails closed on timeout → session events keyed by user carrying
+ * hashes, never tokens, persisted before publish → a read endpoint whose last-seen is accurate,
+ * whose revoke-all is atomic and whose sessions are private.
  */
 export const sessionStoreProblem: Problem = {
   id: 'session-store',
@@ -20,7 +20,6 @@ export const sessionStoreProblem: Problem = {
   tagline: 'Session tokens that rotate, fail closed and never outlive their notice.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Session Store
 
@@ -63,12 +62,12 @@ One service, **sessiond**, with five pieces:
    and rotation count, a revoke-all that invalidates every id before returning, and **403** when a
    caller asks for another user's sessions.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real session
-layer: read the draft against the failure modes, name the subtle one, fix it, and prove the fix with
-checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real session layer: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

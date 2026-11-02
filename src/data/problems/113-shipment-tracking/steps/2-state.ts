@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'carrier'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a scan arrives, the status is
+**Starting point.** The starter is working code: a scan arrives, the status is
 written, the tracking page moves. It never fails in a demo where scans arrive in order and one
-carrier scans at a time. Both of those assumptions are false in production. Review it, fix it, and
+carrier scans at a time. Both of those assumptions are false in production. Debug it, fix it, and
 prove the fix with the checks below.
 
 Implement \`POST /v1/shipments/{shipment_id}/scans\` with body
@@ -28,14 +28,14 @@ Implement \`POST /v1/shipments/{shipment_id}/scans\` with body
 - The read, the comparison and the write happen inside **one atomic Lua \`EVAL\`**
   (\`APPLY_LUA\`). Two carriers scanning at once must resolve to the **furthest valid state**, not
   to whichever request was slower to write; a client-side \`GET\` followed by \`HSET\` is the race
-  the draft ships.
+  the starter ships.
 - A dropped transition is not applied and is **recorded**: \`LPUSH\` the attempted edge
   (\`delivered->in_transit\`) onto \`shipment:rejects:{shipment_id}\` and keep it on the hash, so
   operations can see which carrier is reporting out of order.
 - Answer with \`{"applied": bool, "status": "<current>", "attempted": "<from>-><to>",
   "terminal": bool}\`.
 
-**Failure mode the checks target.** The draft applies whatever status the latest poll reports, so a
+**Failure mode the checks target.** The starter applies whatever status the latest poll reports, so a
 delayed in-transit scan after delivery rolls the shipment backward and the customer's page
 "un-delivers" a parcel that is already on the porch. Two carriers scanning the same shipment both
 read and both write, and the later write wins regardless of rank, so the outcome depends on
@@ -96,7 +96,7 @@ Every one of those is invisible until a real carrier network disagrees with itse
       id: 'monotonic',
       title: 'Rejects any transition that is not strictly forward',
       detail:
-        'The statuses carry a rank (`STATUS_RANK`) and the script keeps only strictly forward moves: `ranks[new] <= ranks[current]` is dropped. The draft writes whatever status the poll reported, so a delayed in-transit scan rolls a delivered shipment backward.',
+        'The statuses carry a rank (`STATUS_RANK`) and the script keeps only strictly forward moves: `ranks[new] <= ranks[current]` is dropped. The starter writes whatever status the poll reported, so a delayed in-transit scan rolls a delivered shipment backward.',
       match: {
         python: {all: [/STATUS_RANK/, /ranks\[new\]/, /ranks\[current\]/]},
         typescript: {all: [/STATUS_RANK/, /ranks\[new\]/, /ranks\[current\]/]},
@@ -122,7 +122,7 @@ Every one of those is invisible until a real carrier network disagrees with itse
       id: 'terminal-immutable',
       title: 'Keeps delivered and returned terminal',
       detail:
-        '`delivered` and `returned` are terminal: the script tests `terminals[current]` before the rank comparison, and the response reports `terminal` through the language-side `TERMINAL` set and `is_terminal()`. The draft lets a `returned` scan follow a delivery and reopen a closed shipment.',
+        '`delivered` and `returned` are terminal: the script tests `terminals[current]` before the rank comparison, and the response reports `terminal` through the language-side `TERMINAL` set and `is_terminal()`. The starter lets a `returned` scan follow a delivery and reopen a closed shipment.',
       match: {
         python: {all: [/terminals\[current\]/, /TERMINAL\s*=/, /is_terminal\(/]},
         typescript: {all: [/terminals\[current\]/, /TERMINAL\s*[:=]/, /isTerminal\(/]},
@@ -135,7 +135,7 @@ Every one of those is invisible until a real carrier network disagrees with itse
       id: 'no-client-write',
       title: 'Never writes the status from the client after a read',
       detail:
-        'The status is written only by the script; there is no client-side `HSET` after a `GET`. The draft reads the status, then writes whatever the poll reported, which is exactly the read-modify-write race that loses the furthest state.',
+        'The status is written only by the script; there is no client-side `HSET` after a `GET`. The starter reads the status, then writes whatever the poll reported, which is exactly the read-modify-write race that loses the furthest state.',
       match: {
         python: {all: [/\.eval\(/], none: [/r\.hset\(/]},
         typescript: {all: [/\.eval\(/], none: [/r\.hset\(/]},
@@ -170,7 +170,7 @@ def status_key(shipment_id: str) -> str:
 
 @app.post("/v1/shipments/{shipment_id}/scans")
 def record_scan(shipment_id: str, body: ScanRequest) -> dict:
-    # TODO: this draft applies whatever status the poll reports: a delayed in-transit scan after a
+    # TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
     # delivery rolls the shipment backward, two carriers scanning at once race and the later write
     # wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
     # keep only strictly forward moves, and record the rejected edge instead of applying it.
@@ -261,7 +261,7 @@ def record_scan(shipment_id: str, body: ScanRequest) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/shipments/:shipmentId/scans: a model-generated draft that writes whatever it is told. */
+      starter: `/** POST /v1/shipments/:shipmentId/scans: flawed code that writes whatever it is told. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -279,7 +279,7 @@ function statusKey(shipmentId: string): string {
 }
 
 app.post('/v1/shipments/:shipmentId/scans', async (request, reply) => {
-  // TODO: this draft applies whatever status the poll reports: a delayed in-transit scan after a
+  // TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
   // delivery rolls the shipment backward, two carriers scanning at once race and the later write
   // wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
   // keep only strictly forward moves, and record the rejected edge instead of applying it.
@@ -415,7 +415,7 @@ func recordScan(rw http.ResponseWriter, r *http.Request) {
 		Carrier string \`json:"carrier"\`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this draft applies whatever status the poll reports: a delayed in-transit scan after a
+	// TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
 	// delivery rolls the shipment backward, two carriers scanning at once race and the later write
 	// wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
 	// keep only strictly forward moves, and record the rejected edge instead of applying it.
@@ -562,7 +562,7 @@ object StateApi {
     path("v1" / "shipments" / Segment / "scans") { shipmentId =>
       post {
         entity(as[ScanRequest]) { body =>
-          // TODO: this draft applies whatever status the poll reports: a delayed in-transit scan
+          // TODO: this starter applies whatever status the poll reports: a delayed in-transit scan
           // after a delivery rolls the shipment backward, two carriers scanning at once race and
           // the later write wins, and nothing protects a terminal state. Apply the transition in
           // one atomic Lua script, keep only strictly forward moves, and record the rejected edge.
@@ -702,7 +702,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft applies whatever status the poll reports: a delayed in-transit scan after a
+    // TODO: this starter applies whatever status the poll reports: a delayed in-transit scan after a
     // delivery rolls the shipment backward, two carriers scanning at once race and the later write
     // wins, and nothing protects a terminal state. Apply the transition in one atomic Lua script,
     // keep only strictly forward moves, and record the rejected edge instead of applying it.

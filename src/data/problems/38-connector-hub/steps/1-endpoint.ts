@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'hub', 'db', 'oauth'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and returns a connector. It compiles, it serves the demo, and it hides four production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/connectors\` with body
 \`{"source_type": "github", "token_ref": "oauth/acme/github", "base_url": "https://api.github.com"}\`.
@@ -32,7 +32,7 @@ Implement \`POST /v1/connectors\` with body
   returns the **existing** connector with 200 instead of creating a second one.
 
 **Failure mode the checks target.** Trusting the caller's \`base_url\` turns registration into an
-SSRF probe: the draft fetches it "to validate it", so any tenant can make the platform issue an
+SSRF probe: the starter fetches it "to validate it", so any tenant can make the platform issue an
 authenticated request to whatever host it names — the cloud metadata endpoint included. Echoing the
 token reference back means it lands in access logs, browser histories and support tickets, where it
 outlives the connector. The missing allowlist and the un-keyed registration are the loud ones: an
@@ -87,7 +87,7 @@ arbitrary source type and a duplicate connector on every client retry.`,
       id: 'source-allowlist',
       title: 'Authenticates the tenant and allowlists the source type',
       detail:
-        'The tenant is required — **401** when absent — and `source_type` is checked against the `github`/`slack`/`stripe`/`notion` allowlist. The draft accepts any source type and never requires a tenant.',
+        'The tenant is required — **401** when absent — and `source_type` is checked against the `github`/`slack`/`stripe`/`notion` allowlist. The starter accepts any source type and never requires a tenant.',
       match: {
         python: {all: [/ALLOWED_SOURCES/, /status_code\s*=\s*401/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_SOURCES/, /code\(\s*401\s*\)/, /code\(\s*400\s*\)/]},
@@ -100,7 +100,7 @@ arbitrary source type and a duplicate connector on every client retry.`,
       id: 'registered-host',
       title: 'Matches the base URL against the registered host, before any fetch',
       detail:
-        '`base_url` must be `https` on the host the platform registered for that source type — **403** otherwise — and the check compares strings instead of fetching the URL. The draft probes the caller-supplied URL, which turns registration into an SSRF request from inside your network.',
+        '`base_url` must be `https` on the host the platform registered for that source type — **403** otherwise — and the check compares strings instead of fetching the URL. The starter probes the caller-supplied URL, which turns registration into an SSRF request from inside your network.',
       match: {
         python: {all: [/REGISTERED_HOSTS/, /status_code\s*=\s*403/], none: [/httpx|requests\.get/]},
         typescript: {all: [/REGISTERED_HOSTS/, /code\(\s*403\s*\)/], none: [/fetch\(|https?\.request\(/]},
@@ -113,7 +113,7 @@ arbitrary source type and a duplicate connector on every client retry.`,
       id: 'no-token-leak',
       title: 'Keeps the token reference out of responses and logs',
       detail:
-        'The token reference is stored on the connector row and never written to a response body or a log line. The draft echoes it back to the caller and logs it, so every registration ships the reference into sinks that outlive it.',
+        'The token reference is stored on the connector row and never written to a response body or a log line. The starter echoes it back to the caller and logs it, so every registration ships the reference into sinks that outlive it.',
       match: {
         python: {all: [/token_ref/], none: [/JSONResponse\(\{[^}]*token_ref/, /logger\.\w+\([^)]*token_ref/]},
         typescript: {all: [/token_ref/], none: [/\.send\(\{[^}]*token_ref\s*:/, /log\.\w+\([^)]*token_ref/]},
@@ -129,7 +129,7 @@ arbitrary source type and a duplicate connector on every client retry.`,
       id: 'replay-idempotent',
       title: 'Returns the existing connector on a replay',
       detail:
-        '`Idempotency-Key` is required and the connector is stored under `(tenant, key)`; a replay returns the connector that already exists instead of creating a second one. The draft ignores the header and inserts unconditionally.',
+        '`Idempotency-Key` is required and the connector is stored under `(tenant, key)`; a replay returns the connector that already exists instead of creating a second one. The starter ignores the header and inserts unconditionally.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -178,8 +178,8 @@ def register(
     tenant: str = Header(alias="X-Tenant-Id"),
     idem_key: str = Header(alias="Idempotency-Key"),
 ) -> JSONResponse:
-    # TODO: this draft accepts any source type, never requires a tenant or an Idempotency-Key,
-    # fetches the caller-supplied base_url to "validate" it, and echoes token_ref back. Review all
+    # TODO: this starter accepts any source type, never requires a tenant or an Idempotency-Key,
+    # fetches the caller-supplied base_url to "validate" it, and echoes token_ref back. Fix all
     # four before this handler ships.
     probe = httpx.get(f"{body.base_url}/user", timeout=2.0)
     logger.info("registered tenant=%s source=%s token=%s", tenant, body.source_type, body.token_ref)
@@ -288,7 +288,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/connectors: a model-generated draft that trusts the caller's URL. */
+      starter: `/** POST /v1/connectors: flawed code that trusts the caller's URL. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -302,8 +302,8 @@ interface RegisterBody {
 }
 
 app.post('/v1/connectors', async (request, reply) => {
-  // TODO: this draft accepts any source type, requires neither a tenant nor an Idempotency-Key,
-  // fetches the caller-supplied base_url to "validate" it, and echoes token_ref back. Review all
+  // TODO: this starter accepts any source type, requires neither a tenant nor an Idempotency-Key,
+  // fetches the caller-supplied base_url to "validate" it, and echoes token_ref back. Fix all
   // four before this handler ships.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RegisterBody;
@@ -440,8 +440,8 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts any source type, requires neither a tenant nor an Idempotency-Key,
-	// fetches the caller-supplied base_url to "validate" it, and echoes the token back. Review all
+	// TODO: this starter accepts any source type, requires neither a tenant nor an Idempotency-Key,
+	// fetches the caller-supplied base_url to "validate" it, and echoes the token back. Fix all
 	// four before this handler ships.
 	probe, err := http.Get(body.BaseURL + "/user")
 	if err != nil {
@@ -620,9 +620,9 @@ object ConnectorApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RegisterRequest]) { body =>
-            // TODO: this draft accepts any source type, requires neither a tenant nor an
+            // TODO: this starter accepts any source type, requires neither a tenant nor an
             // Idempotency-Key, fetches the caller-supplied base_url to "validate" it, and echoes
-            // tokenRef back. Review all four before this handler ships.
+            // tokenRef back. Fix all four before this handler ships.
             val probe = Http().singleRequest(HttpRequest(uri = body.base_url.getOrElse("") + "/user"))
             system.log.info(s"registered tenant=$tenant source=\${body.source_type} token=\${body.token_ref}")
             complete(StatusCodes.Created, s"""{"token_ref":"\${body.token_ref}","probe":"$probe"}""")
@@ -756,8 +756,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts any source type, requires neither a tenant nor an Idempotency-Key,
-    // fetches the caller-supplied base_url to "validate" it, and echoes the token back. Review all
+    // TODO: this starter accepts any source type, requires neither a tenant nor an Idempotency-Key,
+    // fetches the caller-supplied base_url to "validate" it, and echoes the token back. Fix all
     // four before this handler ships.
     const auto baseUrl = body.value("base_url", std::string());
     const auto tokenRef = body.value("token_ref", std::string());
@@ -889,5 +889,5 @@ int main() {
     'The replay lookup is keyed by `(tenant, Idempotency-Key)` and happens before the connector is created; a hit returns the stored connector with 200. Storing the connector — not the request hash — is what lets a replay answer without re-validating or re-creating anything.',
     'The response is a view, not the row: build the connector from ids and status, and filter `token_ref` out of anything you return or log. Log the tenant, the connector id and the source; a token reference in a log line is a credential leak with a retention policy attached.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo posts a well-formed body with the vendor's canonical URL from one tenant and never retries. Four separate defects are being checked: authentication and the source allowlist (the caller names a source the platform supports, not an arbitrary one), URL validation that compares against a held registration instead of fetching the caller's URL, token hygiene (a reference that never appears in a response or a log), and idempotency keyed by tenant so a retry cannot create a second connector. The SSRF probe is the one interviewers press on: "validate this URL for me" is a request your service makes with its own network position, so the only safe validation is the one that needs no request at all. Real hubs add per-tenant registrations with operator approval, signed webhook secrets, egress allowlists at the network layer, and a token broker that never hands the raw token to the connector process.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo posts a well-formed body with the vendor's canonical URL from one tenant and never retries. Four separate defects are being checked: authentication and the source allowlist (the caller names a source the platform supports, not an arbitrary one), URL validation that compares against a held registration instead of fetching the caller's URL, token hygiene (a reference that never appears in a response or a log), and idempotency keyed by tenant so a retry cannot create a second connector. The SSRF probe is the one interviewers press on: "validate this URL for me" is a request your service makes with its own network position, so the only safe validation is the one that needs no request at all. Real hubs add per-tenant registrations with operator approval, signed webhook secrets, egress allowlists at the network layer, and a token broker that never hands the raw token to the connector process.`,
 };

@@ -8,7 +8,7 @@ export const providerFailoverStep: Step = {
   focus: ['gateway', 'providers', 'budget'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it passes the happy path on the primary provider,
+The starter is working code: it passes the happy path on the primary provider,
 and when the primary is healthy it streams tokens correctly. The retry path is where it hides its
 bugs. Find them, fix them, and prove the fix.
 
@@ -41,7 +41,7 @@ and never fails over because it only ever calls “primary”.`,
     ],
   },
   hints: [
-    'Bound the work with the provider list, not with a counter you hope will stop: two providers, one attempt each, and a `break` once the first token has been yielded. The retry loop from the draft has no exit on a non-retryable error.',
+    'Bound the work with the provider list, not with a counter you hope will stop: two providers, one attempt each, and a `break` once the first token has been yielded. The retry loop from the starter has no exit on a non-retryable error.',
     'The idempotency key belongs in the outgoing metadata of every attempt, and the early return for an empty key must happen before the first call. Same key plus provider-side deduplication is what makes a retry safe; the gateway cannot fix a double charge after the fact.',
     'The breaker is a Redis counter with a TTL: `INCR circuit:{provider}`, set the expiry on the first failure, and when the count reaches five replace the value with `open` and a 30 second expiry. Check it before each attempt, and record only retryable failures — a 400 should not open a circuit.',
   ],
@@ -726,5 +726,5 @@ export async function streamWithFailover(
 `,
     },
   },
-  debrief: `The interview signal is **retry safety**: can you state, before writing code, which errors are retryable, how many attempts are allowed, and what makes a retry idempotent? The draft answers none of those and looks shorter and simpler for it. The reviewer is checking that you know an unbounded catch-all retry is an outage amplifier, that a deadline must be per attempt rather than one budget for the whole failover, and that a fallback without the same idempotency key is a double-charge waiting to happen. The circuit breaker is the third leg: it protects the provider from the gateway, not just the gateway from the provider. Real gateways add half-open probing, success-based breaker resets, and per-provider concurrency limits.`,
+  debrief: `The interview signal is **retry safety**: can you state, before writing code, which errors are retryable, how many attempts are allowed, and what makes a retry idempotent? The starter answers none of those and looks shorter and simpler for it. The interviewer is checking that you know an unbounded catch-all retry is an outage amplifier, that a deadline must be per attempt rather than one budget for the whole failover, and that a fallback without the same idempotency key is a double-charge waiting to happen. The circuit breaker is the third leg: it protects the provider from the gateway, not just the gateway from the provider. Real gateways add half-open probing, success-based breaker resets, and per-provider concurrency limits.`,
 };

@@ -8,9 +8,8 @@ export const stateStep: Step = {
   focus: ['scheduler', 'registry', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: one allocation on an idle node
-succeeds, the demo job is placed and the counters look right. It hides four defects. Review it like
-the owner of the node ledger, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: one allocation on an idle node
+succeeds, the demo job is placed and the counters look right. It hides four defects. Debug it like the owner of the node ledger, fix it, and prove the fix with the checks below.
 
 The ledger the placement path calls lives in Redis:
 
@@ -23,28 +22,28 @@ The ledger the placement path calls lives in Redis:
   allocated, refuses the request when it does not fit, and moves \`allocated_*\` in the same call. A
   client-side \`HGET\` followed by a separate \`HINCRBY\` leaves a window in which two placements both
   read the same free count and both decide they fit.
-- The counter move and the placement record \`placement:{id}\` are **one decision**. The draft writes
+- The counter move and the placement record \`placement:{id}\` are **one decision**. The starter writes
   the record first and moves the counters afterwards, so a second placement can claim the GPUs the
   first one already promised while the counters still agree with the first request.
 - \`heartbeat:{id}\` is a TTL marker set to \`HEARTBEAT_TTL_S\` (**30** seconds). While it exists the
   node is schedulable; when it lapses the node is dead. The handler checks the node is alive before
-  it selects it. The draft never sets a TTL, so a machine that died hours ago stays in the scheduling
+  it selects it. The starter never sets a TTL, so a machine that died hours ago stays in the scheduling
   set forever and keeps being handed work.
 - Release is **idempotent** and keyed by the placement id: \`released:{placement_id}\` is set with
   \`SET ... NX EX\`, and the release script moves \`allocated_*\` only when the marker was newly set. A
   doubled release that simply decrements again inflates free capacity and lets the next placement
   oversubscribe the node.
 - The loser of a race is reported honestly: the script returns \`NO_CAPACITY\` and the handler answers
-  **409** instead of granting capacity it could not move. The draft's client-side check looks fine
+  **409** instead of granting capacity it could not move. The starter's client-side check looks fine
   serially, but under load it grants what the ledger cannot back.
 
 **What each check looks for.**
 
 1. \`node-ledger-keys\` — the counters live under the node's own key: \`node:{id}\` with the
-   \`capacity_gpus\` and \`allocated_gpus\` fields, moved by allocation and release. The draft already
+   \`capacity_gpus\` and \`allocated_gpus\` fields, moved by allocation and release. The starter already
    keys per node, so this check passes on it; the four below are where it fails.
 2. \`atomic-allocation\` — one \`EVAL\` of \`NODE_ALLOCATE_LUA\` reads capacity and allocated, compares
-   and moves the counters in the same script, and the draft's client-side \`HINCRBY\` is gone.
+   and moves the counters in the same script, and the starter's client-side \`HINCRBY\` is gone.
 3. \`heartbeat-liveness\` — \`HEARTBEAT_TTL_S\`, the \`heartbeat:{id}\` key and a \`node_alive\` check
    gate every allocation, so a node whose heartbeat lapsed is refused before it is selected.
 4. \`idempotent-release\` — \`RELEASE_LUA\` moves the counters only behind a \`released:{placement_id}\`
@@ -120,7 +119,7 @@ capacity the fleet does not have.`,
       id: 'node-ledger-keys',
       title: 'Per-node counters live under the node key',
       detail:
-        'The counters live in Redis under the node’s own key: `node:{id}` carries the `capacity_gpus` and `allocated_gpus` fields, written by registration and moved by allocation and release. The draft already keys per node — this check passes on it — but the four below are where it fails: a shared key or a key without the node id would let one machine spend another’s capacity.',
+        'The counters live in Redis under the node’s own key: `node:{id}` carries the `capacity_gpus` and `allocated_gpus` fields, written by registration and moved by allocation and release. The starter already keys per node — this check passes on it — but the four below are where it fails: a shared key or a key without the node id would let one machine spend another’s capacity.',
       match: {
         python: {all: [/def node_key\(/, /node:\{node_id\}/, /capacity_gpus/, /allocated_gpus/]},
         typescript: {all: [/function nodeKey\(/, /node:\$\{nodeId\}/, /capacity_gpus/, /allocated_gpus/]},
@@ -133,7 +132,7 @@ capacity the fleet does not have.`,
       id: 'atomic-allocation',
       title: 'One atomic script admits and moves the counters',
       detail:
-        'Allocation is one `EVAL` of `NODE_ALLOCATE_LUA`: the script reads capacity and allocated, compares, and `HINCRBY`s `allocated_gpus` in the same call, writing the placement record in the same transaction. The draft reads the counters from the client and moves them only after the record is written, so two placements can both pass the same check and both be granted the same GPUs. A client-side `HINCRBY` of `allocated_gpus` is the flawed order.',
+        'Allocation is one `EVAL` of `NODE_ALLOCATE_LUA`: the script reads capacity and allocated, compares, and `HINCRBY`s `allocated_gpus` in the same call, writing the placement record in the same transaction. The starter reads the counters from the client and moves them only after the record is written, so two placements can both pass the same check and both be granted the same GPUs. A client-side `HINCRBY` of `allocated_gpus` is the flawed order.',
       match: {
         python: {
           all: [/NODE_ALLOCATE_LUA/, /\.eval\(/, /HINCRBY/, /HSET/],
@@ -161,7 +160,7 @@ capacity the fleet does not have.`,
       id: 'heartbeat-liveness',
       title: 'A node without a live heartbeat is refused',
       detail:
-        '`heartbeat:{id}` carries a TTL of `HEARTBEAT_TTL_S` seconds, set when the node registers, and the `node_alive` check runs before the node is selected — the script refuses a node whose heartbeat key has lapsed with `NO_HEARTBEAT`. The draft never sets a TTL, so a node that died hours ago stays schedulable forever and keeps being handed placements.',
+        '`heartbeat:{id}` carries a TTL of `HEARTBEAT_TTL_S` seconds, set when the node registers, and the `node_alive` check runs before the node is selected — the script refuses a node whose heartbeat key has lapsed with `NO_HEARTBEAT`. The starter never sets a TTL, so a node that died hours ago stays schedulable forever and keeps being handed placements.',
       match: {
         python: {all: [/HEARTBEAT_TTL_S/, /def heartbeat_key\(/, /def node_alive\(/]},
         typescript: {all: [/HEARTBEAT_TTL_S/, /function heartbeatKey\(/, /function nodeAlive\(/]},
@@ -174,7 +173,7 @@ capacity the fleet does not have.`,
       id: 'idempotent-release',
       title: 'Release is idempotent, keyed by the placement id',
       detail:
-        'Release runs `RELEASE_LUA`, which sets `released:{placement_id}` with `SET ... NX EX` and moves `allocated_*` only when the marker was newly set. The draft decrements the counters on every call, so a doubled release inflates free capacity and the next placement oversubscribes the node.',
+        'Release runs `RELEASE_LUA`, which sets `released:{placement_id}` with `SET ... NX EX` and moves `allocated_*` only when the marker was newly set. The starter decrements the counters on every call, so a doubled release inflates free capacity and the next placement oversubscribes the node.',
       match: {
         python: {all: [/RELEASE_LUA/, /def released_key\(/, /\.eval\(\s*RELEASE_LUA/, /NX/]},
         typescript: {all: [/RELEASE_LUA/, /function releasedKey\(/, /\.eval\(\s*RELEASE_LUA/, /NX/]},
@@ -187,7 +186,7 @@ capacity the fleet does not have.`,
       id: 'honest-contention',
       title: 'The loser of a race gets NO_CAPACITY, not a grant',
       detail:
-        'The atomic script returns `NO_CAPACITY` when the request does not fit and the handler answers **409** — the loser of a race is told it lost instead of being granted capacity the ledger could not move. The draft decides on the client, so under contention both requests see the same free count and both are granted.',
+        'The atomic script returns `NO_CAPACITY` when the request does not fit and the handler answers **409** — the loser of a race is told it lost instead of being granted capacity the ledger could not move. The starter decides on the client, so under contention both requests see the same free count and both are granted.',
       match: {
         python: {all: [/LUA_NO_CAPACITY/, /result\[0\]/, /status_code\s*=\s*409/]},
         typescript: {all: [/LUA_NO_CAPACITY/, /result\[0\]/, /code\(\s*409\s*\)/]},
@@ -234,9 +233,9 @@ def register(node_id: str, body: RegisterRequest) -> dict:
 
 @app.post("/v1/nodes/{node_id}/allocations")
 def allocate(node_id: str, body: AllocationRequest) -> dict:
-    # TODO: this draft reads the counters, decides client-side, writes the placement record and only
+    # TODO: this starter reads the counters, decides client-side, writes the placement record and only
     # then moves the counters. Two allocations can pass the same check, there is no heartbeat TTL and
-    # release is not idempotent. Review all four.
+    # release is not idempotent. Fix all four.
     capacity = int(r.hget(node_key(node_id), "capacity_gpus") or 0)
     capacity_mem = int(r.hget(node_key(node_id), "capacity_memory_gb") or 0)
     held = int(r.hget(node_key(node_id), "allocated_gpus") or 0)
@@ -379,7 +378,7 @@ def release(placement_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Node ledger: a model-generated draft that decides on the client and moves the counters last. */
+      starter: `/** Node ledger: flawed code that decides on the client and moves the counters last. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -418,9 +417,9 @@ app.post('/v1/nodes/:nodeId/register', async (request, reply) => {
 app.post('/v1/nodes/:nodeId/allocations', async (request, reply) => {
   const {nodeId} = request.params as {nodeId: string};
   const body = request.body as AllocationBody;
-  // TODO: this draft reads the counters, decides on the client, writes the placement record and only
+  // TODO: this starter reads the counters, decides on the client, writes the placement record and only
   // then moves the counters. Two allocations can pass the same check, there is no heartbeat TTL and
-  // release is not idempotent. Review all four.
+  // release is not idempotent. Fix all four.
   const capacity = Number((await r.hget(nodeKey(nodeId), 'capacity_gpus')) ?? 0);
   const capacityMem = Number((await r.hget(nodeKey(nodeId), 'capacity_memory_gb')) ?? 0);
   const held = Number((await r.hget(nodeKey(nodeId), 'allocated_gpus')) ?? 0);
@@ -630,9 +629,9 @@ func allocate(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.PathValue("nodeID")
 	var body allocationBody
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this draft reads the counters, decides in the handler, writes the placement record and
+	// TODO: this starter reads the counters, decides in the handler, writes the placement record and
 	// only then moves the counters. Two allocations can pass the same check, there is no heartbeat
-	// TTL and release is not idempotent. Review all four.
+	// TTL and release is not idempotent. Fix all four.
 	capacity, _ := rdb.HGet(r.Context(), nodeKey(nodeID), "capacity_gpus").Int64()
 	capacityMem, _ := rdb.HGet(r.Context(), nodeKey(nodeID), "capacity_memory_gb").Int64()
 	held, _ := rdb.HGet(r.Context(), nodeKey(nodeID), "allocated_gpus").Int64()
@@ -868,9 +867,9 @@ object NodeLedger {
       path("v1" / "nodes" / Segment / "allocations") { nodeId =>
         post {
           entity(as[AllocationBody]) { body =>
-            // TODO: this draft reads the counters, decides in the handler, writes the placement record
+            // TODO: this starter reads the counters, decides in the handler, writes the placement record
             // and only then moves the counters. Two allocations can pass the same check, there is no
-            // heartbeat TTL and release is not idempotent. Review all four.
+            // heartbeat TTL and release is not idempotent. Fix all four.
             val capacity = Option(jedis.hget(nodeKey(nodeId), "capacity_gpus")).map(_.toLong).getOrElse(0L)
             val capacityMem = Option(jedis.hget(nodeKey(nodeId), "capacity_memory_gb")).map(_.toLong).getOrElse(0L)
             val held = Option(jedis.hget(nodeKey(nodeId), "allocated_gpus")).map(_.toLong).getOrElse(0L)
@@ -1078,9 +1077,9 @@ int main() {
     const auto placement_id = body.value("placement_id", std::string());
     const long long gpus = body.value("gpu_count", 0LL);
     const long long memory = body.value("memory_gb", 0LL);
-    // TODO: this draft reads the counters, decides in the handler, writes the placement record and
+    // TODO: this starter reads the counters, decides in the handler, writes the placement record and
     // only then moves the counters. Two allocations can pass the same check, there is no heartbeat
-    // TTL and release is not idempotent. Review all four.
+    // TTL and release is not idempotent. Fix all four.
     const auto raw_capacity = redis.hget(nodeKey(node_id), "capacity_gpus");
     const long long capacity = raw_capacity ? std::stoll(*raw_capacity) : 0;
     const auto raw_capacity_mem = redis.hget(nodeKey(node_id), "capacity_memory_gb");
@@ -1246,5 +1245,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing three properties of a ledger that hands out a scarce resource. **Atomicity**: the admission test and the counter move must be one server-side step, because a read-then-write pair is correct in every serial test and wrong exactly when two placements race — and the race is the only time the answer matters. **Order**: the counter move and the placement record are one decision; the draft commits the record first and moves the counters afterwards, so the record promises GPUs the ledger has not yet claimed, and the fix puts both in the same script. **Liveness**: the heartbeat key’s TTL is what removes a dead machine from the scheduling set. Without it the fleet keeps offering capacity that no longer exists, and the scheduler keeps handing work to a node that will never report back. **Idempotency** is the fourth: release keyed by the placement id, guarded by a \`SET NX\` marker, so a retried release cannot manufacture capacity. The honest 409 is what makes the loser of a race observable rather than a silent oversubscription. Real schedulers add per-resource-request queues with FIFO fairness, leases with a reaper for allocations whose owner vanished, and a reconciliation pass that rebuilds the counters from the placement ledger after a Redis failover.`,
+  debrief: `The interviewer is testing three properties of a ledger that hands out a scarce resource. **Atomicity**: the admission test and the counter move must be one server-side step, because a read-then-write pair is correct in every serial test and wrong exactly when two placements race — and the race is the only time the answer matters. **Order**: the counter move and the placement record are one decision; the starter commits the record first and moves the counters afterwards, so the record promises GPUs the ledger has not yet claimed, and the fix puts both in the same script. **Liveness**: the heartbeat key’s TTL is what removes a dead machine from the scheduling set. Without it the fleet keeps offering capacity that no longer exists, and the scheduler keeps handing work to a node that will never report back. **Idempotency** is the fourth: release keyed by the placement id, guarded by a \`SET NX\` marker, so a retried release cannot manufacture capacity. The honest 409 is what makes the loser of a race observable rather than a silent oversubscription. Real schedulers add per-resource-request queues with FIFO fairness, leases with a reaper for allocations whose owner vanished, and a reconciliation pass that rebuilds the counters from the placement ledger after a Redis failover.`,
 };

@@ -8,10 +8,10 @@ export const glossaryCacheStep: Step = {
   focus: ['api', 'redis', 'glossary'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated cache module: it caches glossaries by
+**Starting point.** The starter is working code for the cache module: it caches glossaries by
 locale pair and translation-memory hits by pair and text, and it updates glossary entries with one
-call. It compiles, the demo is fast, and it hides two production flaws. Review it, fix it, and prove
-the fix with the checks below.
+call. It compiles, the demo is fast, and it hides two production flaws. Debug it like the owner of
+the cache, fix it, and prove the fix with the checks below.
 
 Implement the glossary and translation-memory caches used by \`POST /v1/translations\`.
 
@@ -28,7 +28,7 @@ Implement the glossary and translation-memory caches used by \`POST /v1/translat
 - Translation-memory lookups are keyed by the same tuple plus the source text, so a hit from one
   tenant can never be replayed for another.
 
-**Failure mode the checks target.** The draft's key is \`glossary:{pair}\`, so tenant B's request
+**Failure mode the checks target.** The starter's key is \`glossary:{pair}\`, so tenant B's request
 reads tenant A's terms; its \`HSET\` mutates the entry another request is reading, so a translation
 can apply half of an update; and with no TTL the wrong terms live forever. The version counter is the
 third one candidates miss: with an immutable versioned key, a bump makes every old entry
@@ -50,7 +50,7 @@ unreachable in the same request that published the change.`,
       id: 'cache-key',
       title: 'Scopes glossary and translation-memory keys by tenant, pair and version',
       detail:
-        'Both key builders take `(tenant, source, target, version)` so a shared locale pair cannot share an entry. The draft keys by locale pair alone.',
+        'Both key builders take `(tenant, source, target, version)` so a shared locale pair cannot share an entry. The starter keys by locale pair alone.',
       match: {
         python: {all: [/glossary_cache_key/, /tm_cache_key/]},
         typescript: {all: [/glossaryCacheKey/, /tmCacheKey/]},
@@ -63,7 +63,7 @@ unreachable in the same request that published the change.`,
       id: 'ttl',
       title: 'Expires every cached glossary and TM entry after one hour',
       detail:
-        'Entries are written with a **3600**-second TTL. The draft writes them with no expiry, so a superseded glossary or a wrong TM hit outlives the incident.',
+        'Entries are written with a **3600**-second TTL. The starter writes them with no expiry, so a superseded glossary or a wrong TM hit outlives the incident.',
       match: {
         python: {all: [/CACHE_TTL_SECONDS/, /3600/]},
         typescript: {all: [/CACHE_TTL_SECONDS/, /3600/]},
@@ -76,7 +76,7 @@ unreachable in the same request that published the change.`,
       id: 'version-bump',
       title: 'Publishes glossary changes as a new version, never an in-place edit',
       detail:
-        'Editing a term bumps a version **counter** and writes under the new version key. The draft `HSET`s the live entry, so a request in flight can read a half-updated glossary.',
+        'Editing a term bumps a version **counter** and writes under the new version key. The starter `HSET`s the live entry, so a request in flight can read a half-updated glossary.',
       match: {
         python: {all: [/bump_glossary_version/, /\.incr\(/]},
         typescript: {all: [/bumpGlossaryVersion/, /\.incr\(/]},
@@ -89,7 +89,7 @@ unreachable in the same request that published the change.`,
       id: 'active-version',
       title: 'Resolves the active version once, through its pointer',
       detail:
-        'A request reads the version **pointer** for `(tenant, source, target)` at its start and pins that value for the rest of the request. The draft has no pointer at all.',
+        'A request reads the version **pointer** for `(tenant, source, target)` at its start and pins that value for the rest of the request. The starter has no pointer at all.',
       match: {
         python: {all: [/active_glossary_version/, /GLOSSARY_VERSION_KEY/]},
         typescript: {all: [/activeGlossaryVersion/, /glossaryVersionKey/]},
@@ -130,7 +130,7 @@ glossaries = GlossaryStore()
 
 
 def cache_key(pair: str) -> str:
-    """The key the draft wrote for a locale pair."""
+    """The key the starter wrote for a locale pair."""
     return f"glossary:{pair}"
 
 
@@ -139,9 +139,9 @@ def load_glossary(pair: str) -> list[dict]:
 
 
 def add_term(pair: str, source: str, target: str) -> None:
-    # TODO: this draft keys the glossary cache by locale pair alone and updates a live glossary in
+    # TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary in
     # place, so one tenant's terms leak into another's text and an in-flight request can read a
-    # half-updated glossary. Review both.
+    # half-updated glossary. Fix both.
     r.hset(cache_key(pair), source, target)
 
 
@@ -205,7 +205,7 @@ def tm_lookup(tenant: str, source: str, target: str, version: str, text: str) ->
 `,
     },
     typescript: {
-      starter: `/** The model-generated cache draft: pair-keyed, no TTL, and it edits a live glossary. */
+      starter: `/** The cache module: pair-keyed, no TTL, and it edits a live glossary. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -225,9 +225,9 @@ async function loadGlossary(pair: string): Promise<Term[]> {
 }
 
 async function addTerm(pair: string, source: string, target: string): Promise<void> {
-  // TODO: this draft keys the glossary cache by locale pair alone and updates a live glossary with
+  // TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary with
   // HSET, so one tenant's terms leak into another's text and an in-flight request can read a
-  // half-updated glossary. Review both.
+  // half-updated glossary. Fix both.
   await r.hset(cacheKey(pair), source, target);
 }
 
@@ -330,9 +330,9 @@ func loadGlossary(ctx context.Context, pair string) ([]Term, error) {
 }
 
 func addTerm(ctx context.Context, pair, source, target string) error {
-	// TODO: this draft keys the glossary cache by locale pair alone and updates a live glossary with
+	// TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary with
 	// HSet, so one tenant's terms leak into another's text and an in-flight request can read a
-	// half-updated glossary. Review both.
+	// half-updated glossary. Fix both.
 	return rdb.HSet(ctx, cacheKey(pair), source, target).Err()
 }
 
@@ -441,9 +441,9 @@ object GlossaryCache {
     redis.get(cacheKey(pair)).map(_.parseJson.convertTo[List[Term]]).getOrElse(Nil)
 
   def addTerm(pair: String, source: String, target: String): Unit = {
-    // TODO: this draft keys the glossary cache by locale pair alone and updates a live glossary in
+    // TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary in
     // place, so one tenant's terms leak into another's text and an in-flight request can read a
-    // half-updated glossary. Review both.
+    // half-updated glossary. Fix both.
     redis.hset(cacheKey(pair), source, target)
   }
 
@@ -506,9 +506,9 @@ std::vector<Term> loadGlossary(const std::string& pair) {
 }
 
 void addTerm(const std::string& pair, const std::string& source, const std::string& target) {
-  // TODO: this draft keys the glossary cache by locale pair alone and updates a live glossary in
+  // TODO: this starter keys the glossary cache by locale pair alone and updates a live glossary in
   // place, so one tenant's terms leak into another's text and an in-flight request can read a
-  // half-updated glossary. Review both.
+  // half-updated glossary. Fix both.
   redis.hset(cacheKey(pair), source, target);
 }
 
@@ -570,5 +570,5 @@ std::optional<std::string> tmLookup(const std::string& tenant, const std::string
     'A glossary is a value, not a mutable row: `INCR glossary:version:{tenant}:{source}:{target}` publishes the new version, and the terms are written under `…:v{version}`. Readers resolve the version once per request and keep it, so a concurrent writer can never expose a half-updated glossary.',
     'Every write goes through `SETEX`/`set(..., "EX", 3600)`. A cache without a TTL turns a bad glossary version or a wrong TM hit into a permanent bug that survives the deploy you ship to fix it.',
   ],
-  debrief: `The interviewer is checking whether you understand that a cache key is an isolation boundary. The draft looks faster than the fix because it drops the tenant and the version from the key — exactly the two dimensions a multi-tenant localization system cannot drop. In-place mutation is the second defect: an entry that a request is reading must be treated as immutable, so a change becomes a new version and the counter is the pointer. That also gives the invalidation story for free: bumping the version makes every old entry unreachable in the same request, with no deletes to race. Real services add negative caching for unknown versions, per-tenant memory limits, and a periodic reconciler that compares the counter with the stored blobs.`,
+  debrief: `The interviewer is checking whether you understand that a cache key is an isolation boundary. The starter looks faster than the fix because it drops the tenant and the version from the key — exactly the two dimensions a multi-tenant localization system cannot drop. In-place mutation is the second defect: an entry that a request is reading must be treated as immutable, so a change becomes a new version and the counter is the pointer. That also gives the invalidation story for free: bumping the version makes every old entry unreachable in the same request, with no deletes to race. Real services add negative caching for unknown versions, per-tenant memory limits, and a periodic reconciler that compares the counter with the stored blobs.`,
 };

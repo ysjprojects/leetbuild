@@ -7,11 +7,11 @@ import {checkpointEventsStep} from './steps/4-events';
 import {readCheckpointStep} from './steps/5-read';
 
 /**
- * Checkpoint store on the AI-era track: the course is not "write a chunk to a bucket", it is the
- * review you owe a model-generated checkpoint path before a training run resumes from it. Chunked,
- * resumable writes whose replays are idempotent → an atomic Redis commit marker written only for a
- * complete chunk set → object-store calls that verify before acknowledging → run-keyed checkpoint
- * events with an outbox → a read endpoint that serves only committed, verified checkpoints.
+ * Checkpoint store: the course is not "write a chunk to a bucket", it is the debugging you owe a
+ * checkpoint path before a training run resumes from it. Chunked, resumable writes whose replays
+ * are idempotent → an atomic Redis commit marker written only for a complete chunk set →
+ * object-store calls that verify before acknowledging → run-keyed checkpoint events with an
+ * outbox → a read endpoint that serves only committed, verified checkpoints.
  */
 export const checkpointStoreProblem: Problem = {
   id: 'checkpoint-store',
@@ -19,7 +19,7 @@ export const checkpointStoreProblem: Problem = {
   tagline: 'Checkpoints that are cheap to write, safe to read and correct after crashes.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Checkpoint Store
 
@@ -66,12 +66,12 @@ One service, the checkpoint store, with five pieces:
    step number, verification status and last verified chunk, a signed URL that expires in
    **15 minutes**, and a **404** for an uncommitted, missing or foreign run.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,10 +8,10 @@ export const dependencyStep: Step = {
   focus: ['api', 'carrier', 'scheduler'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the carrier answers, the
+**Starting point.** The starter is working code: when the carrier answers, the
 status flows and the shipment moves. It has no deadline, it retries inside the request, and it
 treats a failed poll as "still in transit", so a carrier that has been unreachable for a day looks
-identical to a parcel sitting at a depot. Review it, fix it, and prove the fix with the checks below.
+identical to a parcel sitting at a depot. Debug it, fix it, and prove the fix with the checks below.
 
 Implement \`poll_carrier(shipment_id)\`, the only path that talks to the carrier gateway:
 
@@ -59,7 +59,7 @@ carrier is least able to answer.`,
       id: 'deadline',
       title: 'Every poll carries a 4-second deadline',
       detail:
-        'The carrier call is created with a 4-second deadline (`DEADLINE_S` / `DEADLINE_MS` / `deadlineMS` / `DeadlineMs` / `kDeadlineMs`). The draft calls the carrier with no deadline, so one unresponsive gateway holds the request open indefinitely.',
+        'The carrier call is created with a 4-second deadline (`DEADLINE_S` / `DEADLINE_MS` / `deadlineMS` / `DeadlineMs` / `kDeadlineMs`). The starter calls the carrier with no deadline, so one unresponsive gateway holds the request open indefinitely.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*4/, /timeout=DEADLINE_S/, /\.PollStatus\(/]},
         typescript: {
@@ -74,7 +74,7 @@ carrier is least able to answer.`,
       id: 'no-invented-status',
       title: 'A failed poll never invents a status',
       detail:
-        'On failure the poll path records the failure (`mark_poll_failed`) and writes no status at all. The draft writes `in_transit` with the previous timestamp, so a stalled carrier feed is indistinguishable from a healthy shipment.',
+        'On failure the poll path records the failure (`mark_poll_failed`) and writes no status at all. The starter writes `in_transit` with the previous timestamp, so a stalled carrier feed is indistinguishable from a healthy shipment.',
       match: {
         python: {all: [/mark_poll_failed\(/], none: [/write_status\([^)]*"in_transit"/]},
         typescript: {all: [/markPollFailed\(/], none: [/writeStatus\([^)]*'in_transit'/]},
@@ -87,7 +87,7 @@ carrier is least able to answer.`,
       id: 'stale-threshold',
       title: 'Marks a shipment stale after STALE_AFTER_S without a successful poll',
       detail:
-        '`poll_health(shipment_id, now)` compares `now - last_ok_at` against `STALE_AFTER_S` (900) and reports `stale` with the last success and the failure count. The draft keeps the previous timestamp on failure, so nothing ever goes stale.',
+        '`poll_health(shipment_id, now)` compares `now - last_ok_at` against `STALE_AFTER_S` (900) and reports `stale` with the last success and the failure count. The starter keeps the previous timestamp on failure, so nothing ever goes stale.',
       match: {
         python: {all: [/STALE_AFTER_S/, /last_ok_at/, /def poll_health\(/]},
         typescript: {all: [/STALE_AFTER_S/, /lastOkAt/, /function pollHealth\(/]},
@@ -100,7 +100,7 @@ carrier is least able to answer.`,
       id: 'ops-surface',
       title: 'Surfaces stale shipments for operations',
       detail:
-        '`stale_shipments(now)` returns the ids whose carrier feed is stale and `poll_health()` is the same derived view the operations console reads. The draft exposes nothing: a shipment with a dead poll looks like any other.',
+        '`stale_shipments(now)` returns the ids whose carrier feed is stale and `poll_health()` is the same derived view the operations console reads. The starter exposes nothing: a shipment with a dead poll looks like any other.',
       match: {
         python: {all: [/def stale_shipments\(/, /poll_health\(/]},
         typescript: {all: [/function staleShipments\(/, /pollHealth\(/]},
@@ -113,7 +113,7 @@ carrier is least able to answer.`,
       id: 'scheduler',
       title: 'Moves the retry to the scheduler with a backoff',
       detail:
-        'A failed poll calls `schedule_retry(shipment_id, attempt, backoff_s)` and returns instead of looping on the carrier inside the request. The draft retries the carrier five times in the request and turns a carrier outage into self-inflicted load.',
+        'A failed poll calls `schedule_retry(shipment_id, attempt, backoff_s)` and returns instead of looping on the carrier inside the request. The starter retries the carrier five times in the request and turns a carrier outage into self-inflicted load.',
       match: {
         python: {all: [/schedule_retry\(/, /backoff/], none: [/for\s+attempt\s+in\s+range\(/, /while\s+True/]},
         typescript: {all: [/scheduleRetry\(/, /backoff/], none: [/for\s*\(\s*let\s+attempt/, /while\s*\(\s*true\s*\)/]},
@@ -156,7 +156,7 @@ polls = PollStore()
 
 @app.post("/v1/shipments/{shipment_id}/poll")
 def poll(shipment_id: str) -> dict:
-    # TODO: this draft has no deadline, retries the carrier in a tight loop inside the request, and
+    # TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
     # treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
     # healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
     # a status, and move the next attempt to the scheduler with a backoff.
@@ -256,7 +256,7 @@ def poll_carrier(shipment_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Carrier polls: a model-generated draft with no deadline and a tight retry loop. */
+      starter: `/** Carrier polls: flawed code with no deadline and a tight retry loop. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -306,7 +306,7 @@ function pollOnce(client: CarrierClient, shipmentId: string): Promise<PollReply>
 }
 
 export async function pollCarrier(shipmentId: string): Promise<{status: string}> {
-  // TODO: this draft has no deadline, retries the carrier in a tight loop inside the request, and
+  // TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
   // treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
   // healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
   // a status, and move the next attempt to the scheduler with a backoff.
@@ -455,7 +455,7 @@ func (s *pollStore) MarkPollOk(ctx context.Context, shipmentID string, at int64)
 var polls = &pollStore{}
 
 func pollCarrier(ctx context.Context, carrier pb.CarrierClient, shipmentID string) (string, error) {
-	// TODO: this draft has no deadline, retries the carrier in a tight loop inside the request, and
+	// TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
 	// treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
 	// healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
 	// a status, and move the next attempt to the scheduler with a backoff.
@@ -579,7 +579,7 @@ object PollCarrier {
 
   def markPollOk(shipmentId: String, at: Long): Unit = ()
 
-  // TODO: this draft has no deadline, retries the carrier in a tight loop inside the request, and
+  // TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
   // treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
   // healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing
   // a status, and move the next attempt to the scheduler with a backoff.
@@ -673,7 +673,7 @@ struct PollStore {
 
 PollStore polls;
 
-// TODO: this draft has no deadline, retries the carrier in a tight loop inside the request, and
+// TODO: this starter has no deadline, retries the carrier in a tight loop inside the request, and
 // treats a failed poll as "still in transit" at the previous timestamp, so a stalled feed looks
 // healthy. Add the 4-second deadline, record the failure and its staleness instead of inventing a
 // status, and move the next attempt to the scheduler with a backoff.

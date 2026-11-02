@@ -8,10 +8,10 @@ export const monitorEndpointStep: Step = {
   focus: ['client', 'monitor', 'registry'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and returns a monitor id. It compiles, the demo registers one monitor against a promoted
 version, and the three ways a monitor can be born useless are all invisible until drift fails to
-fire. Review it like the service owner, fix it, and prove the fix with the checks below.
+fire. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/monitors\` with body
 \`{"model_version": "…", "metric": "input_distribution", "window_s": 3600, "baseline": "…"}\`.
@@ -23,11 +23,11 @@ Implement \`POST /v1/monitors\` with body
   unpromoted version watches traffic that does not exist yet, and its alerts can never be attributed
   to a release.
 - \`baseline\` must be a **resolvable** reference in the form \`baseline:{model_version}:{yyyy-mm-dd}\`
-  (**400** otherwise), and it must not point at **live traffic**: the draft lets the baseline be the
+  (**400** otherwise), and it must not point at **live traffic**: the starter lets the baseline be the
   very traffic the monitor is meant to watch, so it compares the signal with itself and drift can
   never fire.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same \`(tenant, key)\`
-  returns the **original** monitor instead of registering a second one; the draft has no key, so a
+  returns the **original** monitor instead of registering a second one; the starter has no key, so a
   client retry multiplies monitors and pages twice.
 - The response carries the monitor id, tenant, model version, metric, window and baseline reference.
 - Log the registration with tenant, monitor id and metric — never the whole body.
@@ -66,7 +66,7 @@ twice — and none of them shows up in a happy-path demo.`,
       id: 'metric-window',
       title: 'Whitelists the metric, bounds the window and requires a tenant',
       detail:
-        'The metric is checked against `input_distribution`/`outcome_rate`/`calibration` and `window_s` against 300..86400 (**400**), and a missing `X-Tenant-Id` is **401**. The draft accepts any metric and any window for anybody.',
+        'The metric is checked against `input_distribution`/`outcome_rate`/`calibration` and `window_s` against 300..86400 (**400**), and a missing `X-Tenant-Id` is **401**. The starter accepts any metric and any window for anybody.',
       match: {
         python: {all: [/METRICS/, /MIN_WINDOW_S/, /MAX_WINDOW_S/, /status_code\s*=\s*401/]},
         typescript: {all: [/METRICS/, /MIN_WINDOW_S/, /MAX_WINDOW_S/, /code\(\s*401\s*\)/]},
@@ -79,7 +79,7 @@ twice — and none of them shows up in a happy-path demo.`,
       id: 'promoted',
       title: 'Refuses a monitor on an unpromoted model version',
       detail:
-        'The model version is resolved against the registry and an unpromoted version is **400**, before the monitor is stored. The draft registers against any version it is handed.',
+        'The model version is resolved against the registry and an unpromoted version is **400**, before the monitor is stored. The starter registers against any version it is handed.',
       match: {
         python: {all: [/registry\.is_promoted\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/registry\.isPromoted\(/, /code\(\s*400\s*\)/]},
@@ -92,7 +92,7 @@ twice — and none of them shows up in a happy-path demo.`,
       id: 'baseline',
       title: 'Rejects a baseline that is live traffic',
       detail:
-        'The reference must match the frozen form `baseline:{version}:{date}` and a reference that points at live traffic is **400**. The draft accepts the live traffic it is meant to watch as the baseline, so the reference drifts with the signal and nothing can ever fire.',
+        'The reference must match the frozen form `baseline:{version}:{date}` and a reference that points at live traffic is **400**. The starter accepts the live traffic it is meant to watch as the baseline, so the reference drifts with the signal and nothing can ever fire.',
       match: {
         python: {all: [/BASELINE_RE\.match\(/, /is_live_baseline\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/BASELINE_RE\.test\(/, /isLiveBaseline\(/, /code\(\s*400\s*\)/]},
@@ -105,7 +105,7 @@ twice — and none of them shows up in a happy-path demo.`,
       id: 'idempotency',
       title: 'Returns the original monitor for a replayed registration',
       detail:
-        '`Idempotency-Key` is required and the monitor is stored under `(tenant, key)`; a replay returns the stored monitor instead of registering a second one. The draft ignores the header and registers a duplicate every time a client retries.',
+        '`Idempotency-Key` is required and the monitor is stored under `(tenant, key)`; a replay returns the stored monitor instead of registering a second one. The starter ignores the header and registers a duplicate every time a client retries.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -142,9 +142,9 @@ def create_monitor(
     body: MonitorRequest,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft registers a monitor against any model version, lets the baseline be the live
+    # TODO: this starter registers a monitor against any model version, lets the baseline be the live
     # traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-    # registers a second monitor. Review all three.
+    # registers a second monitor. Fix all three.
     monitor = {
         "monitor_id": str(uuid.uuid4()),
         "tenant": tenant,
@@ -246,7 +246,7 @@ def create_monitor(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/monitors: a model-generated draft that registers whatever it is handed. */
+      starter: `/** POST /v1/monitors: flawed code that registers whatever it is handed. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -263,9 +263,9 @@ interface MonitorBody {
 }
 
 app.post('/v1/monitors', async (request, reply) => {
-  // TODO: this draft registers a monitor against any model version, lets the baseline be the live
+  // TODO: this starter registers a monitor against any model version, lets the baseline be the live
   // traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-  // registers a second monitor. Review all three.
+  // registers a second monitor. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as MonitorBody;
   const monitor = {
@@ -392,9 +392,9 @@ func createMonitor(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft registers a monitor against any model version, lets the baseline be the live
+	// TODO: this starter registers a monitor against any model version, lets the baseline be the live
 	// traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-	// registers a second monitor. Review all three.
+	// registers a second monitor. Fix all three.
 	log.Printf("monitor registered tenant=%s version=%s", tenant, body.ModelVersion)
 	writeJSON(rw, http.StatusCreated, map[string]any{
 		"monitor_id":    uuid.NewString(),
@@ -591,9 +591,9 @@ object MonitorApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[MonitorRequest]) { body =>
-            // TODO: this draft registers a monitor against any model version, lets the baseline be
+            // TODO: this starter registers a monitor against any model version, lets the baseline be
             // the live traffic the monitor is meant to watch, and ignores Idempotency-Key, so a
-            // client retry registers a second monitor. Review all three.
+            // client retry registers a second monitor. Fix all three.
             system.log.info(s"monitor registered tenant=$tenant")
             complete(
               StatusCodes.Created,
@@ -724,9 +724,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft registers a monitor against any model version, lets the baseline be the live
+    // TODO: this starter registers a monitor against any model version, lets the baseline be the live
     // traffic the monitor is meant to watch, and ignores Idempotency-Key, so a client retry
-    // registers a second monitor. Review all three.
+    // registers a second monitor. Fix all three.
     std::cerr << "monitor registered tenant=" << tenant << "\\n";
     res.status = 201;
     res.set_content(
@@ -865,8 +865,8 @@ int main() {
     'The baseline check is two questions: is the reference resolvable at all (`BASELINE_RE`), and does it point at frozen traffic? `baseline:model-7:2026-09-01` is frozen; `baseline:live:2026-10-21` is the traffic you are trying to watch, and comparing it with itself can never fire.',
     'The idempotency lookup is keyed by `(tenant, key)` and happens before the store write; a hit returns the stored monitor with 200. Storing the monitor — not just the request hash — is what lets a replay answer without generating a second id.',
   ],
-  debrief: `The interviewer is testing whether you can review a registration endpoint at the trust boundary. The
-draft reads fine because a demo registers one monitor, for one promoted version, once. Three defects
+  debrief: `The interviewer is testing whether you can debug a registration endpoint at the trust boundary. The
+starter reads fine because a demo registers one monitor, for one promoted version, once. Three defects
 are being checked: authentication and the metric/window whitelist (cheap rejections before anything is
 written), resolution against the registry (a monitor on an unpromoted version is watching a release
 that does not exist), and baseline validity — the subtle one. A baseline that is live traffic makes the

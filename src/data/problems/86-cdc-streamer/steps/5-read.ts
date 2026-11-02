@@ -8,9 +8,9 @@ export const lagReadStep: Step = {
   focus: ['client', 'api', 'redis', 'replicator'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the lag route,
+**Starting point.** The starter is working code: it registers the lag route,
 reads a number for the id in the path and answers 200 for the demo subscription. It compiles, it
-serves the demo, and it hides three production flaws. Review it like the on-call engineer who is
+serves the demo, and it hides three production flaws. Debug it like the on-call engineer who is
 supposed to page on this endpoint, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/subscriptions/{id}/lag\`.
@@ -28,7 +28,7 @@ Implement \`GET /v1/subscriptions/{id}/lag\`.
   (\`lsn_gap\`) named — the distance between what the sink confirmed and what the database still
   retains — instead of a generic error.
 
-**Failure mode the checks target.** The draft reports lag in seconds only, read from
+**Failure mode the checks target.** The starter reports lag in seconds only, read from
 \`cdc:lag:{id}\` — a cached value with a 300 s TTL — so the number an operator pages on is minutes
 old and unrelated to the log; it hides a cold cache and a dropped slot behind the same
 \`{"error": "lag unavailable"}\` **502**; and it never checks ownership, so any tenant can read any
@@ -69,7 +69,7 @@ page with an amount of data attached, and a subscription that is not the caller'
       id: 'lsn-arithmetic',
       title: 'Derives lag from the confirmed and head LSNs',
       detail:
-        'The response carries the confirmed LSN and the source head LSN, and the lag is computed as `lag_changes = head_lsn - confirmed_lsn` with `lag_seconds` divided out of it by `LSN_PER_SECOND`. The draft reports a cached age in seconds and never reads either LSN.',
+        'The response carries the confirmed LSN and the source head LSN, and the lag is computed as `lag_changes = head_lsn - confirmed_lsn` with `lag_seconds` divided out of it by `LSN_PER_SECOND`. The starter reports a cached age in seconds and never reads either LSN.',
       match: {
         python: {all: [/head_lsn/, /confirmed_lsn/, /lag_changes/, /lag_seconds/]},
         typescript: {
@@ -84,7 +84,7 @@ page with an amount of data attached, and a subscription that is not the caller'
       id: 'foreign-404',
       title: 'Scopes the read to the caller and answers 404 otherwise',
       detail:
-        'The subscription is looked up under `(tenant, id)` by `owned_subscription` / `ownedSubscription`, and a subscription that is not the caller’s — or does not exist — is **404**, so ids cannot be probed. The draft reads whatever id it is given.',
+        'The subscription is looked up under `(tenant, id)` by `owned_subscription` / `ownedSubscription`, and a subscription that is not the caller’s — or does not exist — is **404**, so ids cannot be probed. The starter reads whatever id it is given.',
       match: {
         python: {all: [/def owned_subscription\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/function ownedSubscription\(/, /code\(\s*404\s*\)/]},
@@ -97,7 +97,7 @@ page with an amount of data attached, and a subscription that is not the caller'
       id: 'retention-critical',
       title: 'Flags a lag past the retention window',
       detail:
-        'A lag larger than the retention window (`RETENTION_WINDOW_CHANGES`) is reported as a `"critical"` state, because the slot is about to run out of log to retain. The draft has no notion of a window and no state field.',
+        'A lag larger than the retention window (`RETENTION_WINDOW_CHANGES`) is reported as a `"critical"` state, because the slot is about to run out of log to retain. The starter has no notion of a window and no state field.',
       match: {
         python: {all: [/RETENTION_WINDOW_CHANGES/, /"critical"/]},
         typescript: {all: [/RETENTION_WINDOW_CHANGES/, /'critical'/]},
@@ -110,7 +110,7 @@ page with an amount of data attached, and a subscription that is not the caller'
       id: 'slot-drop-named',
       title: 'Names a dropped slot and its LSN gap',
       detail:
-        'A slot that is no longer active is reported as `SLOT_DROPPED` with a `"critical"` state and the `lsn_gap` (restart LSN minus confirmed LSN) named, so the operator learns how much change the database is about to discard. The draft folds it into the same generic error as a cold cache.',
+        'A slot that is no longer active is reported as `SLOT_DROPPED` with a `"critical"` state and the `lsn_gap` (restart LSN minus confirmed LSN) named, so the operator learns how much change the database is about to discard. The starter folds it into the same generic error as a cold cache.',
       match: {
         python: {all: [/SLOT_DROPPED/, /lsn_gap/]},
         typescript: {all: [/SLOT_DROPPED/, /lsn_gap/]},
@@ -135,7 +135,7 @@ rds = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 async def slot_active(subscription_id: str) -> bool:
-    """Whether the replication slot is still active — the draft asks the replicator once."""
+    """Whether the replication slot is still active — the starter asks the replicator once."""
     raise NotImplementedError
 
 
@@ -143,7 +143,7 @@ async def slot_active(subscription_id: str) -> bool:
 async def subscription_lag(
     id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")
 ) -> JSONResponse:
-    # TODO: this draft answers from the cached \`cdc:lag:{id}\` value (300 s TTL) instead of deriving
+    # TODO: this starter answers from the cached \`cdc:lag:{id}\` value (300 s TTL) instead of deriving
     # the lag from the confirmed and head LSNs, hides a cold cache and a dropped slot behind the same
     # generic 502, and never checks that the subscription belongs to the caller.
     cached = await rds.get(f"cdc:lag:{id}")
@@ -241,7 +241,7 @@ async def subscription_lag(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/subscriptions/:id/lag: a model-generated draft that reads a cached lag. */
+      starter: `/** GET /v1/subscriptions/:id/lag: flawed code that reads a cached lag. */
 import Fastify from 'fastify';
 import Redis from 'ioredis';
 
@@ -249,12 +249,12 @@ export const app = Fastify();
 const redis = new Redis({host: 'redis', port: 6379});
 
 async function slotActive(id: string): Promise<boolean> {
-  /** Whether the replication slot is still active — asked once by the draft. */
+  /** Whether the replication slot is still active — asked once by the starter. */
   throw new Error('not implemented');
 }
 
 app.get('/v1/subscriptions/:id/lag', async (request, reply) => {
-  // TODO: this draft answers from the cached cdc:lag:{id} value (300 s TTL) instead of deriving the
+  // TODO: this starter answers from the cached cdc:lag:{id} value (300 s TTL) instead of deriving the
   // lag from the confirmed and head LSNs, hides a cold cache and a dropped slot behind the same
   // generic 502, and never checks that the subscription belongs to the caller.
   const {id} = request.params as {id: string};
@@ -375,7 +375,7 @@ func slotActive(ctx context.Context, id string) bool {
 }
 
 func subscriptionLag(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft answers from the cached cdc:lag:{id} value (300 s TTL) instead of deriving the
+	// TODO: this starter answers from the cached cdc:lag:{id} value (300 s TTL) instead of deriving the
 	// lag from the confirmed and head LSNs, hides a cold cache and a dropped slot behind the same
 	// generic 502, and never checks that the subscription belongs to the caller.
 	id := r.PathValue("id")
@@ -566,7 +566,7 @@ object CdcApi {
     path("v1" / "subscriptions" / Segment / "lag") { id =>
       get {
         val tenant = "anonymous"
-        // TODO: this draft answers from the cached cdc:lag:{id} value (300 s TTL) instead of
+        // TODO: this starter answers from the cached cdc:lag:{id} value (300 s TTL) instead of
         // deriving the lag from the confirmed and head LSNs, hides a cold cache and a dropped slot
         // behind the same generic 502, and never checks that the subscription belongs to the caller.
         val cached = jedis.get(s"cdc:lag:$id")
@@ -694,7 +694,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/subscriptions/([^/]+)/lag)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft answers from the cached cdc:lag:{id} value (300 s TTL) instead of deriving
+    // TODO: this starter answers from the cached cdc:lag:{id} value (300 s TTL) instead of deriving
     // the lag from the confirmed and head LSNs, hides a cold cache and a dropped slot behind the
     // same generic 502, and never checks that the subscription belongs to the caller.
     const auto id = req.matches[1];
@@ -829,5 +829,5 @@ int main() {
     'Lag is arithmetic on two LSNs, not a stored number: `lag_changes = head_lsn - confirmed_lsn` from the confirmed cursor and the head LSN the slot reader returns, and `lag_seconds = lag_changes // LSN_PER_SECOND`. A cached age under `cdc:lag:{id}` is minutes stale and tells an operator nothing about the log.',
     'Two page-worthy answers still return the numbers, with 200: `lag_changes > RETENTION_WINDOW_CHANGES` is a `"critical"` state, and a slot that is gone is `"critical"` too — `SLOT_DROPPED` with the `lsn_gap` (restart LSN minus confirmed LSN) named, the amount of change the database is about to discard, instead of one generic 502 for both.',
   ],
-  debrief: `The interviewer is testing whether you can review generated code for the difference between a number that is stored and a number that is derived. The draft returns a lag in seconds from \`cdc:lag:{id}\`, a 300 s cache; it looks right on the dashboard and is meaningless on the day it matters, because the value an operator pages on has to come from the two LSNs the system actually holds — the confirmed cursor and the source head — with the seconds divided out of the difference. The second defect is the failure mode of every "unavailable" endpoint: one 502 for a cold cache and for a subscription whose slot has been dropped. A slot that is gone is not an outage of this endpoint, it is the database about to discard the log the stream still needs, and it deserves a name — \`SLOT_DROPPED\` — a state, and the \`lsn_gap\` that says how much change is at risk. The third is the quiet one: the draft reads any id it is given, so the endpoint is an oracle for other tenants' subscription ids and positions; scoping the lookup to the caller and answering 404 for a foreign id is the fix. Real streamers add the sink's applied LSN per table, an alert that fires on the state rather than on the seconds, and a retention forecast — time until the slot's \`restart_lsn\` reaches the confirmed LSN — so the page arrives before the data is gone.`,
+  debrief: `The interviewer is testing whether you can debug a read for the difference between a number that is stored and a number that is derived. The starter returns a lag in seconds from \`cdc:lag:{id}\`, a 300 s cache; it looks right on the dashboard and is meaningless on the day it matters, because the value an operator pages on has to come from the two LSNs the system actually holds — the confirmed cursor and the source head — with the seconds divided out of the difference. The second defect is the failure mode of every "unavailable" endpoint: one 502 for a cold cache and for a subscription whose slot has been dropped. A slot that is gone is not an outage of this endpoint, it is the database about to discard the log the stream still needs, and it deserves a name — \`SLOT_DROPPED\` — a state, and the \`lsn_gap\` that says how much change is at risk. The third is the quiet one: the starter reads any id it is given, so the endpoint is an oracle for other tenants' subscription ids and positions; scoping the lookup to the caller and answering 404 for a foreign id is the fix. Real streamers add the sink's applied LSN per table, an alert that fires on the state rather than on the seconds, and a retention forecast — time until the slot's \`restart_lsn\` reaches the confirmed LSN — so the page arrives before the data is gone.`,
 };

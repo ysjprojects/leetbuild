@@ -7,12 +7,12 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Identity service on the AI-era track: the course is not "store a user row", it is the review you
- * owe a model-generated signup path before it hands accounts to people who never proved they own the
- * address. Normalized, idempotent signup → one atomic Redis claim per identity handle → a gRPC
- * verification call with a deadline and a queued retry → user-keyed lifecycle events with minimal
- * PII published after the commit → a profile read that scopes the owner, the public projection and
- * the audited support path.
+ * Identity service: the course is not "store a user row", it is the debugging you owe a signup
+ * path before it hands accounts to people who never proved they own the address. Normalized,
+ * idempotent signup → one atomic Redis claim per identity handle → a gRPC verification call with a
+ * deadline and a queued retry → user-keyed lifecycle events with minimal PII published after the
+ * commit → a profile read that scopes the owner, the public projection and the audited support
+ * path.
  */
 export const identityServiceProblem: Problem = {
   id: 'identity-service',
@@ -20,7 +20,6 @@ export const identityServiceProblem: Problem = {
   tagline: 'Accounts that are unique, verified deliberately and minimal in what they expose.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Identity Service
 
@@ -64,12 +63,12 @@ One service, **identityd**, with five pieces:
 5. \`GET /v1/users/{id}\`: the owner's full record, a public projection with no contact data and
    always a verification state, and a support path that reads only through an audit record.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real identity feature: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,9 +8,9 @@ export const guardEndpointsStep: Step = {
   focus: ['assistant', 'guard'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers both guard
+**Starting point.** The starter is working code: it registers both guard
 routes, parses the body and returns a decision. It compiles, it serves the demo, and it hides four
-production flaws. Review it like the owner of a compliance service, fix it, and prove the fix with
+production flaws. Debug it like the owner of a compliance service, fix it, and prove the fix with
 the checks below.
 
 Implement \`POST /v1/guard/input\` and \`POST /v1/guard/output\` with body
@@ -71,7 +71,7 @@ protected classes are exactly the data a log pipeline should never retain.`,
       id: 'api-key',
       title: 'Requires a known X-Api-Key',
       detail:
-        'The caller is identified by `X-Api-Key` and looked up in the key store; a missing or unknown key is **401**. The draft serves anonymous callers.',
+        'The caller is identified by `X-Api-Key` and looked up in the key store; a missing or unknown key is **401**. The starter serves anonymous callers.',
       match: {
         python: {all: [/X-Api-Key/, /api_keys\.caller\(/, /status_code\s*=\s*401/]},
         typescript: {all: [/x-api-key/, /apiKeys\.caller\(/, /code\(\s*401\s*\)/]},
@@ -84,7 +84,7 @@ protected classes are exactly the data a log pipeline should never retain.`,
       id: 'caps',
       title: 'Enforces the 8 KiB text cap and the conversation_id format',
       detail:
-        'Text over `1 << 13` bytes is **413**; a `conversation_id` outside `[A-Za-z0-9_-]{1,64}` is **400**. The draft forwards anything to the tiers.',
+        'Text over `1 << 13` bytes is **413**; a `conversation_id` outside `[A-Za-z0-9_-]{1,64}` is **400**. The starter forwards anything to the tiers.',
       match: {
         python: {all: [/MAX_TEXT_BYTES/, /CONVERSATION_ID_RE/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /CONVERSATION_ID_RE/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -99,7 +99,7 @@ protected classes are exactly the data a log pipeline should never retain.`,
       id: 'policy-version',
       title: 'Requires X-Policy-Version and echoes it',
       detail:
-        'The pinned `X-Policy-Version` is required and validated, passed to the tiers, and returned as `policy_version`. The draft has no notion of a policy version, so a conversation can be judged under two policies and the audit cannot say which.',
+        'The pinned `X-Policy-Version` is required and validated, passed to the tiers, and returned as `policy_version`. The starter has no notion of a policy version, so a conversation can be judged under two policies and the audit cannot say which.',
       match: {
         python: {all: [/X-Policy-Version/, /POLICY_VERSION_RE/, /policy_version/]},
         typescript: {all: [/x-policy-version/, /POLICY_VERSION_RE/, /policy_version/]},
@@ -112,7 +112,7 @@ protected classes are exactly the data a log pipeline should never retain.`,
       id: 'no-bypass',
       title: 'No caller can skip the guard; the text is never logged',
       detail:
-        'There is no `skip_guard` flag: every request is evaluated and the response carries `reasons`. The log line names direction, conversation, verdict and policy — never the text. The draft honours `skip_guard` and logs the text on every request.',
+        'There is no `skip_guard` flag: every request is evaluated and the response carries `reasons`. The log line names direction, conversation, verdict and policy — never the text. The starter honours `skip_guard` and logs the text on every request.',
       match: {
         python: {all: [/reasons/, /logger\.info\(/], none: [/skip_guard/, /logger\.\w+\([^)]*text/]},
         typescript: {all: [/reasons/, /\.log\.info\(/], none: [/skip_guard/, /log\.\w+\([^)]*text/]},
@@ -150,8 +150,8 @@ guard = Guard()
 
 
 def run_guard(direction: str, body: GuardRequest) -> JSONResponse:
-    # TODO: this draft serves anonymous callers, lets the body skip the guard, knows nothing about
-    # the policy version, caps nothing, and logs the text. Review all four.
+    # TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
+    # the policy version, caps nothing, and logs the text. Fix all four.
     logger.info("guard direction=%s conversation=%s text=%r", direction, body.conversation_id, body.text)
     if body.skip_guard:
         return JSONResponse({"allowed": True}, status_code=200)
@@ -268,7 +268,7 @@ def guard_output(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/guard/{input,output}: a model-generated draft with a skip flag and no policy version. */
+      starter: `/** POST /v1/guard/{input,output}: flawed code with a skip flag and no policy version. */
 import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
 
 import {guard} from './guard';
@@ -282,8 +282,8 @@ interface GuardBody {
 }
 
 async function runGuard(direction: 'input' | 'output', request: FastifyRequest, reply: FastifyReply) {
-  // TODO: this draft serves anonymous callers, lets the body skip the guard, knows nothing about
-  // the policy version, caps nothing, and logs the text. Review all four.
+  // TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
+  // the policy version, caps nothing, and logs the text. Fix all four.
   const body = request.body as GuardBody;
   request.log.info({direction, conversation: body.conversation_id, text: body.text}, 'guard');
   if (body.skip_guard === true) return reply.code(200).send({allowed: true});
@@ -389,8 +389,8 @@ func runGuard(direction string) http.HandlerFunc {
 			writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		// TODO: this draft serves anonymous callers, lets the body skip the guard, knows nothing
-		// about the policy version, caps nothing, and logs the text. Review all four.
+		// TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing
+		// about the policy version, caps nothing, and logs the text. Fix all four.
 		log.Printf("guard direction=%s conversation=%s text=%q", direction, body.ConversationID, body.Text)
 		if body.SkipGuard {
 			writeJSON(rw, http.StatusOK, map[string]any{"allowed": true})
@@ -540,8 +540,8 @@ object GuardApi {
 
   val guard = Guard.open()
 
-  // TODO: this draft serves anonymous callers, lets the body skip the guard, knows nothing about
-  // the policy version, caps nothing, and logs the text. Review all four.
+  // TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
+  // the policy version, caps nothing, and logs the text. Fix all four.
   def guardRoute(direction: String): Route =
     post {
       entity(as[GuardRequest]) { body =>
@@ -660,8 +660,8 @@ void runGuard(const std::string& direction, const httplib::Request& req, httplib
     res.set_content(R"({"error":"invalid json"})", "application/json");
     return;
   }
-  // TODO: this draft serves anonymous callers, lets the body skip the guard, knows nothing about
-  // the policy version, caps nothing, and logs the text. Review all four.
+  // TODO: this starter serves anonymous callers, lets the body skip the guard, knows nothing about
+  // the policy version, caps nothing, and logs the text. Fix all four.
   const auto text = body.value("text", std::string());
   const auto conversationId = body.value("conversation_id", std::string());
   std::cerr << "guard direction=" << direction << " conversation=" << conversationId << " text=" << text << "\\n";
@@ -767,5 +767,5 @@ int main() {
     'The policy version is a header the assistant pins per conversation, not something the guard chooses: validate it against `fh-YYYY-MM-DD[.n]`, pass it to `evaluate`, and echo it as `policy_version` so the caller and the audit agree on which rules applied.',
     'Delete `skip_guard` from the request model, the handler and the response path; there is no "trusted caller" branch in a compliance control. The log line is a contract: direction, conversation, verdict, tier, policy — the text itself never goes to a log sink.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the boundary of a legal control. The draft reads fine because the demo sends one well-formed request from one trusted client. Four defects are being checked: authentication (a compliance guard has no anonymous callers), input caps (cheap rejections before classifier work), the policy version as a required, echoed contract (so one conversation is judged under one set of rules and the audit can name it), and the absence of any bypass — a \`skip_guard\` flag is the kind of "helpful" option a model adds and the kind a reviewer must delete. The text in the log line is the one candidates miss: queries about protected classes are the most sensitive content this service sees, and a log pipeline retains them far longer than the request. Real guards add per-caller rate limits, request ids threaded to the audit event, and a hashed text fingerprint for dedupe and debugging.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the boundary of a legal control. The starter reads fine because the demo sends one well-formed request from one trusted client. Four defects are being checked: authentication (a compliance guard has no anonymous callers), input caps (cheap rejections before classifier work), the policy version as a required, echoed contract (so one conversation is judged under one set of rules and the audit can name it), and the absence of any bypass — a \`skip_guard\` flag is the kind of "helpful" option that creeps into a first version and the kind the owner must delete. The text in the log line is the one candidates miss: queries about protected classes are the most sensitive content this service sees, and a log pipeline retains them far longer than the request. Real guards add per-caller rate limits, request ids threaded to the audit event, and a hashed text fingerprint for dedupe and debugging.`,
 };

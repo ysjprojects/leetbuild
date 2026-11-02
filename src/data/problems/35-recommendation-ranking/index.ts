@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Recommendation ranking on the AI-era track: the course is not "call a model and show a list", it
- * is the review you owe a model-generated ranking service before real users see its output.
- * Validated, identity-scoped candidate intake → a tenant-keyed feature cache with one refresh per
- * miss → a deadline-bounded gRPC rank with a popularity fallback that is honest about degrading →
- * impression events keyed by user with ids instead of features and an outbox behind them → a
- * surface config read that every reader resolves so a rollout is one switch.
+ * Recommendation ranking: the course is not "call a model and show a list", it is the debugging
+ * you owe a ranking service before real users see its output. Validated, identity-scoped candidate
+ * intake → a tenant-keyed feature cache with one refresh per miss → a deadline-bounded gRPC rank
+ * with a popularity fallback that is honest about degrading → impression events keyed by user with
+ * ids instead of features and an outbox behind them → a surface config read that every reader
+ * resolves so a rollout is one switch.
  */
 export const recommendationRankingProblem: Problem = {
   id: 'recommendation-ranking',
@@ -20,7 +20,7 @@ export const recommendationRankingProblem: Problem = {
   tagline: 'Rank candidates per user with a fallback that still recommends, and impressions that carry no PII.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Recommendation Ranking
 
@@ -65,12 +65,12 @@ One service, **recsvc**, with five pieces:
    from a short-lived cache, 404 for a version that was never promoted, so a rollback lands in
    seconds.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real AI feature: debug it against the
+failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with checks
+that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

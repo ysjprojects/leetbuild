@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and returns a created schedule, so the demo passes. The time spec it accepts is not a
-contract. Review it like the owner of the scheduler, fix it, and prove the fix with the checks
+contract. Debug it like the owner of the scheduler, fix it, and prove the fix with the checks
 below.
 
 Implement \`POST /v1/schedules\` with body
@@ -35,7 +35,7 @@ Implement \`POST /v1/schedules\` with body
   the caller makes, not the default the service invents.
 - Answer **201** with the stored schedule, including its generated \`id\`.
 
-**Failure mode the checks target.** The draft resolves nothing: it stores whatever timezone string
+**Failure mode the checks target.** The starter resolves nothing: it stores whatever timezone string
 the caller sent and quietly runs on server time; it accepts a seconds-level expression and turns a
 one-second cadence into a queue flood; it lets \`job_ref\` be empty; and it defaults
 \`misfire_policy\` to \`skip\`, so a caller who never thought about misfires loses every missed run
@@ -78,7 +78,7 @@ without ever seeing it. All four are invisible in a demo that sends one well-for
       id: 'timezone',
       title: 'Resolves the timezone against the IANA set',
       detail:
-        '`timezone` is checked against `IANA_TIMEZONES` and then actually resolved (`ZoneInfo` / `Intl.DateTimeFormat` / `time.LoadLocation` / `ZoneId.of` / the lookup table); an unresolvable name is **400**. The draft keeps the caller string and falls back to server time.',
+        '`timezone` is checked against `IANA_TIMEZONES` and then actually resolved (`ZoneInfo` / `Intl.DateTimeFormat` / `time.LoadLocation` / `ZoneId.of` / the lookup table); an unresolvable name is **400**. The starter keeps the caller string and falls back to server time.',
       match: {
         python: {all: [/IANA_TIMEZONES/, /ZoneInfo\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/IANA_TIMEZONES/, /Intl\.DateTimeFormat\(\s*'en-US'/, /code\(\s*400\s*\)/]},
@@ -91,7 +91,7 @@ without ever seeing it. All four are invisible in a demo that sends one well-for
       id: 'frequency',
       title: 'Refuses expressions that fire more often than once a minute',
       detail:
-        'A seconds field, or any cadence closer than `MIN_INTERVAL_SECONDS = 60`, is **400** when `MAX_FIRES_PER_MINUTE = 1`. The draft lets a caller register a one-second schedule that floods the queue.',
+        'A seconds field, or any cadence closer than `MIN_INTERVAL_SECONDS = 60`, is **400** when `MAX_FIRES_PER_MINUTE = 1`. The starter lets a caller register a one-second schedule that floods the queue.',
       match: {
         python: {all: [/MAX_FIRES_PER_MINUTE/, /MIN_INTERVAL_SECONDS/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_FIRES_PER_MINUTE/, /MIN_INTERVAL_SECONDS/, /code\(\s*400\s*\)/]},
@@ -104,7 +104,7 @@ without ever seeing it. All four are invisible in a demo that sends one well-for
       id: 'misfire-policy',
       title: 'Requires an explicit, known misfire policy',
       detail:
-        '`misfire_policy` is required and checked against `MISFIRE_POLICIES` = `skip`, `fire_once_now`, `catch_up`; a missing or unknown one is **400**. The draft defaults it to `skip`, so missed windows are dropped by accident rather than by decision.',
+        '`misfire_policy` is required and checked against `MISFIRE_POLICIES` = `skip`, `fire_once_now`, `catch_up`; a missing or unknown one is **400**. The starter defaults it to `skip`, so missed windows are dropped by accident rather than by decision.',
       match: {
         python: {all: [/MISFIRE_POLICIES/, /"fire_once_now"/, /status_code\s*=\s*400/]},
         typescript: {all: [/MISFIRE_POLICIES/, /'fire_once_now'/, /code\(\s*400\s*\)/]},
@@ -117,7 +117,7 @@ without ever seeing it. All four are invisible in a demo that sends one well-for
       id: 'job-ref',
       title: 'Validates the job reference',
       detail:
-        '`job_ref` is required and must match `JOB_REF_PATTERN` (`^[a-z][a-z0-9_.-]{0,127}$`); anything else is **400**. The draft stores whatever string arrives, so a schedule can name a job that cannot be resolved.',
+        '`job_ref` is required and must match `JOB_REF_PATTERN` (`^[a-z][a-z0-9_.-]{0,127}$`); anything else is **400**. The starter stores whatever string arrives, so a schedule can name a job that cannot be resolved.',
       match: {
         python: {all: [/JOB_REF_PATTERN/, /job_ref/, /status_code\s*=\s*400/]},
         typescript: {all: [/JOB_REF_PATTERN/, /job_ref/, /code\(\s*400\s*\)/]},
@@ -160,9 +160,9 @@ def create_schedule(
     body: ScheduleRequest,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft keeps whatever timezone string the caller sent (and runs on server time
+    # TODO: this starter keeps whatever timezone string the caller sent (and runs on server time
     # when it cannot resolve it), accepts a seconds-level cron, validates no job reference, and
-    # defaults the misfire policy to skip. Review all four.
+    # defaults the misfire policy to skip. Fix all four.
     schedule = {
         "id": "sched-1",
         "tenant": tenant,
@@ -275,7 +275,7 @@ def create_schedule(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/schedules: a model-generated draft that stores the caller's time spec. */
+      starter: `/** POST /v1/schedules: flawed code that stores the caller's time spec. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -288,9 +288,9 @@ interface ScheduleBody {
 }
 
 app.post('/v1/schedules', async (request, reply) => {
-  // TODO: this draft keeps whatever timezone string the caller sent (and runs on server time when
+  // TODO: this starter keeps whatever timezone string the caller sent (and runs on server time when
   // it cannot resolve it), accepts a seconds-level cron, validates no job reference, and defaults
-  // the misfire policy to skip. Review all four.
+  // the misfire policy to skip. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as ScheduleBody;
   const schedule = {
@@ -430,9 +430,9 @@ func createSchedule(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft keeps whatever timezone string the caller sent (and runs on server time
+	// TODO: this starter keeps whatever timezone string the caller sent (and runs on server time
 	// when it cannot resolve it), accepts a seconds-level cron, validates no job reference, and
-	// defaults the misfire policy to skip. Review all four.
+	// defaults the misfire policy to skip. Fix all four.
 	timezone := body.Timezone
 	if timezone == "" {
 		timezone = "UTC"
@@ -613,9 +613,9 @@ object ScheduleApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[ScheduleRequest]) { body =>
-            // TODO: this draft keeps whatever timezone string the caller sent (and runs on server
+            // TODO: this starter keeps whatever timezone string the caller sent (and runs on server
             // time when it cannot resolve it), accepts a seconds-level cron, validates no job
-            // reference, and defaults the misfire policy to skip. Review all four.
+            // reference, and defaults the misfire policy to skip. Fix all four.
             val timezone = if (body.timezone.isEmpty) "UTC" else body.timezone
             val policy = if (body.misfire_policy.isEmpty) "skip" else body.misfire_policy
             val schedule = Map(
@@ -744,9 +744,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft keeps whatever timezone string the caller sent (and runs on server time
+    // TODO: this starter keeps whatever timezone string the caller sent (and runs on server time
     // when it cannot resolve it), accepts a seconds-level cron, validates no job reference, and
-    // defaults the misfire policy to skip. Review all four.
+    // defaults the misfire policy to skip. Fix all four.
     const auto cron = body.value("cron", std::string());
     const auto timezone = body.value("timezone", std::string("UTC"));
     const json schedule = {
@@ -880,5 +880,5 @@ int main() {
     'A cadence is a number, not a vibe: count the fields and treat a six-field expression as a seconds field. `*/30 * * * * *` is 120 fires a minute; `MIN_INTERVAL_SECONDS = 60` with `MAX_FIRES_PER_MINUTE = 1` is the bound that keeps one job from owning the queue.',
     'The misfire policy is the field a caller must never omit. Keep the allowlist as data (`MISFIRE_POLICIES`), reject anything outside it with a 400, and store the policy on the schedule so the fire path and the history read consult the same value.',
   ],
-  debrief: `The interviewer is testing whether the endpoint treats the time spec as a contract. The draft reads fine because the demo sends one well-formed request with a timezone the server happens to be in and a cadence nobody measured. Four defects are checked: an unresolvable timezone that silently degrades to server time, an unbounded cadence that lets a caller schedule 120 fires a minute, a job reference that can never resolve, and a misfire policy defaulted instead of chosen. A real scheduler also stores the next fire time in UTC, caps the number of schedules per tenant, and echoes the computed next fire so the caller can confirm that the timezone it asked for is the one it got.`,
+  debrief: `The interviewer is testing whether the endpoint treats the time spec as a contract. The starter reads fine because the demo sends one well-formed request with a timezone the server happens to be in and a cadence nobody measured. Four defects are checked: an unresolvable timezone that silently degrades to server time, an unbounded cadence that lets a caller schedule 120 fires a minute, a job reference that can never resolve, and a misfire policy defaulted instead of chosen. A real scheduler also stores the next fire time in UTC, caps the number of schedules per tenant, and echoes the computed next fire so the caller can confirm that the timezone it asked for is the one it got.`,
 };

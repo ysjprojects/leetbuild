@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * CDN purge on the AI-era track: the course is not "call an invalidate API", it is the review you
- * owe a model-generated purge control plane before it runs against a production CDN. Gated blast
- * radius and an idempotent intake → one atomic Redis reservation for dedupe and the domain's purge
- * budget → a provider call with a deadline, per-path outcomes and bounded retries under one batch
- * id → domain-keyed, confirmed purge events with an outbox → a status read that admits accepted is
- * not propagated and never leaks another tenant's purge.
+ * CDN purge: the course is not "call an invalidate API", it is the debugging you owe a purge
+ * control plane before it runs against a production CDN. Gated blast radius and an idempotent
+ * intake → one atomic Redis reservation for dedupe and the domain's purge budget → a provider call
+ * with a deadline, per-path outcomes and bounded retries under one batch id → domain-keyed,
+ * confirmed purge events with an outbox → a status read that admits accepted is not propagated and
+ * never leaks another tenant's purge.
  */
 export const cdnPurgeProblem: Problem = {
   id: 'cdn-purge',
@@ -20,7 +20,6 @@ export const cdnPurgeProblem: Problem = {
   tagline: 'Purge exactly what changed, prove propagation and never stampede the origin.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# CDN Purge
 
@@ -66,12 +65,12 @@ One service, **purged**, with five pieces:
    outcomes (\`accepted\`, \`propagated\`, \`partially_failed\`), the full outcome map with the failed
    paths in it, and \`propagated_at\` only once propagation has actually confirmed.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real delivery
-platform: read the draft against the failure modes, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real delivery platform: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

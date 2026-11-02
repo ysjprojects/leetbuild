@@ -7,13 +7,13 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Crawl & Index on the AI-era track: the course is not "follow links from a seed URL", it is the
- * review you owe a model-generated crawler before it points itself at the internet. A target that
- * passes scheme, host and robots policy before it is enqueued → one Redis frontier per host with
- * tokens refilled and taken in one atomic script → a fetcher call with a deadline, a bounded retry
- * policy that treats 403 as terminal and 429 as a host-level backoff → page events keyed by host
- * that carry references and are announced only after the index confirms the write → a job report
- * that computes coverage from the live frontier and says out loud when a crawl has stalled.
+ * Crawl & Index: the course is not "follow links from a seed URL", it is the debugging you owe a
+ * crawler before it points itself at the internet. A target that passes scheme, host and robots
+ * policy before it is enqueued → one Redis frontier per host with tokens refilled and taken in one
+ * atomic script → a fetcher call with a deadline, a bounded retry policy that treats 403 as
+ * terminal and 429 as a host-level backoff → page events keyed by host that carry references and
+ * are announced only after the index confirms the write → a job report that computes coverage from
+ * the live frontier and says out loud when a crawl has stalled.
  */
 export const crawlIndexProblem: Problem = {
   id: 'crawl-index',
@@ -21,7 +21,6 @@ export const crawlIndexProblem: Problem = {
   tagline: 'Polite crawling with a durable frontier and an index whose freshness is provable.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Crawl & Index
 
@@ -65,12 +64,12 @@ One service, **crawld**, with five pieces:
    from the live frontier, the oldest pending URL's age, a coverage number that excludes refused
    pages, and a \`stalled\` flag.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

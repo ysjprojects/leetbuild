@@ -8,13 +8,13 @@ export const slotReadStep: Step = {
   focus: ['replicator', 'pg', 'redis', 'sink'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads batches from the slot,
+**Starting point.** The starter is working code: it reads batches from the slot,
 applies them to the sink and keeps the lag chart flat by moving the cursor on after anything that
 fails. It compiles, it serves the demo, and it hides the flaw that costs a tenant its changes.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Replication slots are read over gRPC with a 5-second deadline, and a batch that fails is retried
-from its first LSN with the same batch id; no batch is ever skipped to keep up. The draft drops a
+from its first LSN with the same batch id; no batch is ever skipped to keep up. The starter drops a
 failed batch and advances the cursor to avoid back-pressure, so a database blip silently loses
 tenant changes, and it retries a slot-lost error forever. The fix must prove a failed batch is
 retried from its first LSN until it succeeds or the subscription halts, a slot loss surfaces as a
@@ -37,7 +37,7 @@ page-worthy state, and back-pressure applies at the sink instead of dropped batc
 - The sink applies each batch **before** the cursor is confirmed, so back-pressure lands on the
   sink (\`sink.apply_batch(...)\` or \`sink.applyBatch(...)\` then \`confirm(...)\`).
 
-**Failure mode the checks target.** The draft drops a failed batch and advances the cursor to avoid
+**Failure mode the checks target.** The starter drops a failed batch and advances the cursor to avoid
 back-pressure, so a database blip silently loses tenant changes, and it retries a slot-lost error
 forever. The quiet one is the cursor itself: a confirmed LSN is a promise that everything up to it
 is durably downstream, so moving it past a batch that never applied turns at-least-once delivery
@@ -71,7 +71,7 @@ the slot keeps discarding the segments the stream still needs.`,
       id: 'deadline',
       title: 'Reads a batch under a 5-second deadline',
       detail:
-        'Every `ReadSlot` carries a five-second deadline: `timeout=DEADLINE_S` with `DEADLINE_S = 5`, `deadline: Date.now() + DEADLINE_MS` with `DEADLINE_MS = 5000`, `context.WithTimeout` with `readSlotTimeout = 5 * time.Second`, `withDeadlineAfter(DeadlineSeconds.seconds)` with `DeadlineSeconds = 5`, `set_deadline(...)` with `kDeadlineMs = 5000`. The draft calls the reader with no deadline at all, so one stalled slot pins the replicator for the life of the process.',
+        'Every `ReadSlot` carries a five-second deadline: `timeout=DEADLINE_S` with `DEADLINE_S = 5`, `deadline: Date.now() + DEADLINE_MS` with `DEADLINE_MS = 5000`, `context.WithTimeout` with `readSlotTimeout = 5 * time.Second`, `withDeadlineAfter(DeadlineSeconds.seconds)` with `DeadlineSeconds = 5`, `set_deadline(...)` with `kDeadlineMs = 5000`. The starter calls the reader with no deadline at all, so one stalled slot pins the replicator for the life of the process.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*5/, /timeout=DEADLINE_S/, /\.ReadSlot\(/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.ReadSlot\(/]},
@@ -84,7 +84,7 @@ the slot keeps discarding the segments the stream still needs.`,
       id: 'same-batch-retry',
       title: 'Retries a failed batch from its first LSN with the same batch id',
       detail:
-        'A batch that fails is retried from `first_lsn` under the same `batch_id`, at most `MAX_BATCH_RETRIES` (5) times, so a re-delivery is a duplicate the sink can absorb and a loss is impossible. The draft reads the next batch instead, which is how a blip in the source becomes a hole in the tenant stream.',
+        'A batch that fails is retried from `first_lsn` under the same `batch_id`, at most `MAX_BATCH_RETRIES` (5) times, so a re-delivery is a duplicate the sink can absorb and a loss is impossible. The starter reads the next batch instead, which is how a blip in the source becomes a hole in the tenant stream.',
       match: {
         python: {all: [/MAX_BATCH_RETRIES\s*=\s*5/, /range\(MAX_BATCH_RETRIES\)/, /batch_id/, /first_lsn/]},
         typescript: {
@@ -104,7 +104,7 @@ the slot keeps discarding the segments the stream still needs.`,
       id: 'no-skip',
       title: 'Halts the subscription when the attempts are exhausted',
       detail:
-        'When the retries run out the subscription stops in a `HALTED` state through `halt(...)`; nothing may advance the cursor past a batch that never applied. The draft moves the cursor to the next batch to keep the lag chart flat, and the tenant never learns which changes are missing.',
+        'When the retries run out the subscription stops in a `HALTED` state through `halt(...)`; nothing may advance the cursor past a batch that never applied. The starter moves the cursor to the next batch to keep the lag chart flat, and the tenant never learns which changes are missing.',
       match: {
         python: {all: [/HALTED/, /def halt\(/], none: [/skip/]},
         typescript: {all: [/HALTED/, /function halt\(/], none: [/skip/]},
@@ -117,7 +117,7 @@ the slot keeps discarding the segments the stream still needs.`,
       id: 'slot-lost',
       title: 'Surfaces a lost slot as a page-worthy state',
       detail:
-        'An inactive or lost slot becomes `SLOT_LOST` and a `CRITICAL` `page_oncall`, because the source database discards the segments the stream still needs while the slot is unread — a permanent condition, not a retry. The draft loops on it forever and pages nobody.',
+        'An inactive or lost slot becomes `SLOT_LOST` and a `CRITICAL` `page_oncall`, because the source database discards the segments the stream still needs while the slot is unread — a permanent condition, not a retry. The starter loops on it forever and pages nobody.',
       match: {
         python: {all: [/SLOT_LOST/, /def page_oncall\(/, /CRITICAL/]},
         typescript: {all: [/SLOT_LOST/, /function pageOncall\(/, /CRITICAL/]},
@@ -289,7 +289,7 @@ def run(subscription: str, slot: str, sink, start_lsn: int) -> str:
 `,
     },
     typescript: {
-      starter: `/** Slot reader: a model-generated draft that moves the cursor on past whatever fails. */
+      starter: `/** Slot reader: flawed code that moves the cursor on past whatever fails. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -1003,5 +1003,5 @@ std::string run(
     'The retry loop is around the batch, not around the read: keep `batch_id` and `first_lsn` fixed across attempts, loop `for attempt in range(MAX_BATCH_RETRIES)` (or `attempt < MAX_BATCH_RETRIES`), and when the attempts run out call `halt(` and return `HALTED`. Advancing the cursor past a batch that never applied is how a tenant loses changes while the dashboard stays green.',
     'An inactive slot is not a transient error: page it (`pageOncall(CRITICAL, SLOT_LOST, ...)`) and stop, because the source will discard the segments the stream still needs. And order the write side as `sink.apply_batch(...)` (or `sink.applyBatch(...)`) then `confirm(...)`: the cursor is a promise that everything below it is downstream, so it moves only after the sink took the batch — back-pressure belongs to the sink, not to a dropped batch.',
   ],
-  debrief: `The interviewer is testing whether you can review a replication reader that owns the cursor. The draft reads fine because the demo's sink never fails and its slot never dies: every happy path is correct and every failure path silently destroys data. Five defects are being checked. The deadline bounds one read, so a stalled slot cannot pin the worker. The same-batch retry is the delivery rule: a batch that failed is retried from its first LSN under the same batch id and the batch id is what makes the sink's re-apply idempotent. The halt is the one candidates get wrong under pressure — when the attempts run out the subscription stops in a named state, because moving the cursor is the same as deleting the changes it passed. Slot loss is the operational defect: an inactive slot is permanent and page-worthy, since the source keeps discarding segments while nothing reads, and an infinite retry loop is how a data-loss incident stays invisible. The last one is ordering: the sink applies the batch before the cursor is confirmed, so back-pressure slows the reader instead of costing the tenant rows. Real replicators add jittered backoff between attempts, a per-subscription lag budget, an alert on the distance between the confirmed LSN and the slot's retention, and an operator-approved quarantine path for a batch that can never apply.`,
+  debrief: `The interviewer is testing whether you can debug a replication reader that owns the cursor. The starter reads fine because the demo's sink never fails and its slot never dies: every happy path is correct and every failure path silently destroys data. Five defects are being checked. The deadline bounds one read, so a stalled slot cannot pin the worker. The same-batch retry is the delivery rule: a batch that failed is retried from its first LSN under the same batch id and the batch id is what makes the sink's re-apply idempotent. The halt is the one candidates get wrong under pressure — when the attempts run out the subscription stops in a named state, because moving the cursor is the same as deleting the changes it passed. Slot loss is the operational defect: an inactive slot is permanent and page-worthy, since the source keeps discarding segments while nothing reads, and an infinite retry loop is how a data-loss incident stays invisible. The last one is ordering: the sink applies the batch before the cursor is confirmed, so back-pressure slows the reader instead of costing the tenant rows. Real replicators add jittered backoff between attempts, a per-subscription lag budget, an alert on the distance between the confirmed LSN and the slot's retention, and an operator-approved quarantine path for a batch that can never apply.`,
 };

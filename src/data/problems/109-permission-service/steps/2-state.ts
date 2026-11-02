@@ -8,11 +8,11 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it caches the effective
-permission set per \`(subject, scope)\` in Redis, serves it for 300 s, and clears the entry on every
-assignment change, so the demo — assign, then read — always shows the new set. It compiles, it
-serves the happy path, and it hides the flaw that makes a revocation unreliable. Review it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it caches the effective permission set per
+\`(subject, scope)\` in Redis, serves it for 300 s, and clears the entry on every assignment change,
+so the demo — assign, then read — always shows the new set. It compiles, it serves the happy path,
+and it hides the flaw that makes a revocation unreliable. Debug it like the service owner, fix it,
+and prove the fix with the checks below.
 
 Implement the effective-permission cache behind every read:
 
@@ -72,7 +72,7 @@ mechanism — bumping the shared counter is.`,
       id: 'version-stamp',
       title: 'Cache entries carry the grant version',
       detail:
-        'Every cached entry is stamped with the value of the global `grant_version` counter at write time. The draft stores the set under a TTL and no version, so a reader cannot tell a fresh entry from one written before the last revocation.',
+        'Every cached entry is stamped with the value of the global `grant_version` counter at write time. The starter stores the set under a TTL and no version, so a reader cannot tell a fresh entry from one written before the last revocation.',
       match: {
         python: {all: [/GRANT_VERSION_KEY/, /CACHE_VERSION_FIELD/]},
         typescript: {all: [/GRANT_VERSION_KEY/, /CACHE_VERSION_FIELD/]},
@@ -124,7 +124,7 @@ mechanism — bumping the shared counter is.`,
       id: 'bump-after-commit',
       title: 'Bumps the version after the grant commits and before the ack',
       detail:
-        'The bump happens after the grant store records the change and before the response is acked, so no read can serve an entry older than the bump. The draft never bumps at all.',
+        'The bump happens after the grant store records the change and before the response is acked, so no read can serve an entry older than the bump. The starter never bumps at all.',
       match: {
         python: {order: [/store\.record_change\(/, /\.incr\(/]},
         typescript: {order: [/store\.recordChange\(/, /\.incr\(/]},
@@ -136,7 +136,7 @@ mechanism — bumping the shared counter is.`,
   ],
   code: {
     python: {
-      starter: `"""Effective-permission cache: a model-generated draft that deletes the key on every change."""
+      starter: `"""Effective-permission cache: flawed code that deletes the key on every change."""
 import logging
 
 from fastapi import FastAPI
@@ -194,7 +194,7 @@ def get_permissions(subject: str, scope: str = "org") -> JSONResponse:
 
 @app.post("/v1/roles/assignments")
 def assign(body: Assignment) -> JSONResponse:
-    # TODO: this draft invalidates by deleting the cached key after the write and leans on the
+    # TODO: this starter invalidates by deleting the cached key after the write and leans on the
     # 300 s TTL. A read that slips in between the write and the re-derive repopulates the old set,
     # so a revoked permission survives. There is no version stamp, no counter and no lock either.
     store.put(body.subject, body.scope, body.role)
@@ -315,7 +315,7 @@ def bump_version() -> int:
 `,
     },
     typescript: {
-      starter: `/** Effective-permission cache: a model-generated draft that deletes the key on every change. */
+      starter: `/** Effective-permission cache: flawed code that deletes the key on every change. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -357,7 +357,7 @@ app.get('/v1/users/:subject/permissions', async (request, reply) => {
 });
 
 app.post('/v1/roles/assignments', async (request, reply) => {
-  // TODO: this draft invalidates by deleting the cached key after the write and leans on the 300 s
+  // TODO: this starter invalidates by deleting the cached key after the write and leans on the 300 s
   // TTL. A read that slips in between the write and the re-derive repopulates the old set, so a
   // revoked permission survives. There is no version stamp, no counter and no lock either.
   const body = request.body as {subject: string; role: string; scope: string};
@@ -466,7 +466,7 @@ async function bumpVersion(): Promise<number> {
 `,
     },
     go: {
-      starter: `// Effective-permission cache: a model-generated draft that deletes the key on every change.
+      starter: `// Effective-permission cache: flawed code that deletes the key on every change.
 package main
 
 import (
@@ -540,7 +540,7 @@ func getPermissions(rw http.ResponseWriter, r *http.Request) {
 }
 
 func assign(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft invalidates by deleting the cached key after the write and leans on the
+	// TODO: this starter invalidates by deleting the cached key after the write and leans on the
 	// 300 s TTL. A read that slips in between the write and the re-derive repopulates the old set,
 	// so a revoked permission survives. There is no version stamp, no counter and no lock either.
 	var body AssignmentRequest
@@ -774,7 +774,7 @@ object StateCache {
       path("v1" / "roles" / "assignments") {
         post {
           entity(as[AssignmentRequest]) { body =>
-            // TODO: this draft invalidates by deleting the cached key after the write and leans on
+            // TODO: this starter invalidates by deleting the cached key after the write and leans on
             // the 300 s TTL. A read that slips in between the write and the re-derive repopulates
             // the old set, so a revoked permission survives. No version, no counter, no lock.
             store.put(body.subject, body.scope, body.role)
@@ -905,7 +905,7 @@ object StateCache {
 `,
     },
     cpp: {
-      starter: `// Effective-permission cache: a model-generated draft that deletes the key on every change.
+      starter: `// Effective-permission cache: flawed code that deletes the key on every change.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
@@ -977,7 +977,7 @@ int main() {
   });
 
   svr.Post("/v1/roles/assignments", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft invalidates by deleting the cached key after the write and leans on the
+    // TODO: this starter invalidates by deleting the cached key after the write and leans on the
     // 300 s TTL. A read that slips in between the write and the re-derive repopulates the old set,
     // so a revoked permission survives. There is no version stamp, no counter and no lock either.
     json body = json::parse(req.body, nullptr, false);

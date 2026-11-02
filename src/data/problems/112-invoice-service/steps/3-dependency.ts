@@ -13,7 +13,7 @@ gRPC. That call fails in two very different ways: **transiently** (the service i
 or the answer did not arrive inside the deadline) or **terminally** (the invoicing jurisdiction itself
 refuses to tax the document). The two demand opposite responses, and the starter gets both wrong.
 
-The starter is a plausible model-generated draft: it quotes the tax service, retries, and finalizes,
+**Starting point.** The starter is working code: it quotes the tax service, retries, and finalizes,
 so the happy-path demo passes. Every failure path is wrong. It calls \`Quote\` **without a deadline**,
 so one stuck tax service pins the finalize. On \`DEADLINE_EXCEEDED\` it swallows the error and
 finalizes anyway with \`tax_cents = 0\` — an accounting incident nobody reconciles. And it treats
@@ -96,7 +96,7 @@ loud in an audit.`,
       id: 'hold-marker',
       title: 'An unanswered quote holds the invoice as a draft',
       detail:
-        'A `DEADLINE_EXCEEDED` / `UNAVAILABLE` outcome must **not** finalize: the invoice stays a `draft`, a `tax_hold` marker records the `reason` and the `attempts`, and the API answers 202 with a `held` body. The draft swallows the timeout and finalizes with `tax_cents = 0`, issuing a document nobody reconciles.',
+        'A `DEADLINE_EXCEEDED` / `UNAVAILABLE` outcome must **not** finalize: the invoice stays a `draft`, a `tax_hold` marker records the `reason` and the `attempts`, and the API answers 202 with a `held` body. The starter swallows the timeout and finalizes with `tax_cents = 0`, issuing a document nobody reconciles.',
       match: {
         python: {all: [/tax_hold/, /reason/, /attempts/, /"held"/, /202/]},
         typescript: {all: [/tax_hold/, /reason/, /attempts/, /'held'/, /202/]},
@@ -109,7 +109,7 @@ loud in an audit.`,
       id: 'terminal-jurisdiction',
       title: 'A jurisdiction rejection is terminal, named and 422',
       detail:
-        'A jurisdiction that refuses the document (`INVALID_ARGUMENT` / `FAILED_PRECONDITION`) is a permanent business answer, not a transient one: it is **never** retried, the finalize is refused with **422**, and the blocking `jurisdiction` is named in the payload. The draft lists both codes as retryable, so it hammers a deterministic refusal and then finalizes with zero.',
+        'A jurisdiction that refuses the document (`INVALID_ARGUMENT` / `FAILED_PRECONDITION`) is a permanent business answer, not a transient one: it is **never** retried, the finalize is refused with **422**, and the blocking `jurisdiction` is named in the payload. The starter lists both codes as retryable, so it hammers a deterministic refusal and then finalizes with zero.',
       match: {
         python: {
           all: [/StatusCode\.INVALID_ARGUMENT/, /StatusCode\.FAILED_PRECONDITION/, /jurisdiction/, /422/],
@@ -152,7 +152,7 @@ loud in an audit.`,
       id: 'bounded-retry',
       title: 'At most three attempts, only the two retryable codes',
       detail:
-        'Attempts are bounded by `TAX_MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried — the retryable set never contains `INVALID_ARGUMENT` / `FAILED_PRECONDITION`. The draft retries every status and finalizes when they run out.',
+        'Attempts are bounded by `TAX_MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried — the retryable set never contains `INVALID_ARGUMENT` / `FAILED_PRECONDITION`. The starter retries every status and finalizes when they run out.',
       match: {
         python: {
           all: [
@@ -771,5 +771,5 @@ Result FinalizeManual(Invoice& invoice, long tax_cents, const std::string& tax_s
 `,
     },
   },
-  debrief: `The interview question is really "what does the tax call do when it cannot answer?" A deadline bounds one attempt, \`TAX_MAX_ATTEMPTS\` bounds the whole call, and the retryable set is the policy: only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are transient, so a jurisdiction rejection and every other status must return immediately. The draft's two bugs are the same bug in two directions — it treats every failure as retryable, and it treats "no answer" as "zero tax". Once the deadline or the retry budget is spent, the honest outcome is a hold: the invoice is still a draft, a \`tax_hold\` marker records why and how many attempts it took, and a 202 tells the caller to come back, so a later retry picks up the same draft instead of the system guessing a figure nobody can defend. Finally, the \`tax_source\` is what makes the amount auditable: a persisted quote, an exemption, a zero-rated line or a reverse-charge note is the difference between a number an auditor can reconstruct and one nobody can explain. Real tax clients add jittered backoff, a circuit breaker so a struggling tax service is not hammered, cached quotes keyed by a rule version so a retry does not re-price the invoice, and a reconciliation job that sweeps \`tax_hold\` drafts.`,
+  debrief: `The interview question is really "what does the tax call do when it cannot answer?" A deadline bounds one attempt, \`TAX_MAX_ATTEMPTS\` bounds the whole call, and the retryable set is the policy: only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are transient, so a jurisdiction rejection and every other status must return immediately. The starter's two bugs are the same bug in two directions — it treats every failure as retryable, and it treats "no answer" as "zero tax". Once the deadline or the retry budget is spent, the honest outcome is a hold: the invoice is still a draft, a \`tax_hold\` marker records why and how many attempts it took, and a 202 tells the caller to come back, so a later retry picks up the same draft instead of the system guessing a figure nobody can defend. Finally, the \`tax_source\` is what makes the amount auditable: a persisted quote, an exemption, a zero-rated line or a reverse-charge note is the difference between a number an auditor can reconstruct and one nobody can explain. Real tax clients add jittered backoff, a circuit breaker so a struggling tax service is not hammered, cached quotes keyed by a rule version so a retry does not re-price the invoice, and a reconciliation job that sweeps \`tax_hold\` drafts.`,
 };

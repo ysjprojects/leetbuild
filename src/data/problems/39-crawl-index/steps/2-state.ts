@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['crawler', 'redis', 'fetcher'],
   task: `## Task
 
-The starter is a plausible model-generated draft: with one host and an idle crawl it hands out URLs
+**Starting point.** The starter is working code: with one host and an idle crawl it hands out URLs
 at about the right speed, so the demo looks polite. It is impolite by construction. Find the flaws,
 fix them, and prove the fix.
 
@@ -27,7 +27,7 @@ Implement the **frontier** the crawl workers take work from:
   holds a not-before timestamp derived from \`Retry-After\` and doubled per consecutive attempt, and
   \`take\` returns nothing while that timestamp is in the future.
 
-**Failure mode the checks target.** The draft keeps one global queue and one global bucket, so the
+**Failure mode the checks target.** The starter keeps one global queue and one global bucket, so the
 whole crawl's capacity can land on a single host. Its client-side refill overshoots under concurrency,
 and it has nowhere to record “this host said 429, come back in 30 seconds”, so a hostile or
 overloaded host is hammered at exactly the rate that provoked it.`,
@@ -64,7 +64,7 @@ overloaded host is hammered at exactly the rate that provoked it.`,
       id: 'host-queue',
       title: 'One frontier queue per host',
       detail:
-        'URLs are enqueued on `frontier:{job_id}:{host}` — a queue per host, pushed with `RPUSH`. The draft pushes every discovery onto one shared `frontier:{job_id}` list.',
+        'URLs are enqueued on `frontier:{job_id}:{host}` — a queue per host, pushed with `RPUSH`. The starter pushes every discovery onto one shared `frontier:{job_id}` list.',
       match: {
         python: {all: [/frontier:\{job_id\}:\{host\}/, /rpush\(/]},
         typescript: {all: [/frontier:\$\{jobId\}:\$\{host\}/, /rpush\(/]},
@@ -77,7 +77,7 @@ overloaded host is hammered at exactly the rate that provoked it.`,
       id: 'atomic-refill',
       title: 'Refill and take in one atomic Lua script',
       detail:
-        'The bucket is read, accrued, spent and written inside one `EVAL` (`REFILL_LUA`). The draft reads with `GET` and writes with `SET` from the client, so two workers can both spend the same token.',
+        'The bucket is read, accrued, spent and written inside one `EVAL` (`REFILL_LUA`). The starter reads with `GET` and writes with `SET` from the client, so two workers can both spend the same token.',
       match: {
         python: {all: [/REFILL_LUA/, /\.eval\(/], none: [/r\.set\(\s*bucket_key/]},
         typescript: {all: [/REFILL_LUA/, /\.eval\(/], none: [/\.set\(\s*bucketKey/]},
@@ -103,7 +103,7 @@ overloaded host is hammered at exactly the rate that provoked it.`,
       id: 'throttle-429',
       title: 'A 429 throttles the host with exponential backoff',
       detail:
-        'A 429 writes a not-before timestamp on `throttle:{job_id}:{host}` computed from `Retry-After`, doubled per consecutive attempt, and `take` skips the host until it passes. The draft cannot express “come back later” at all.',
+        'A 429 writes a not-before timestamp on `throttle:{job_id}:{host}` computed from `Retry-After`, doubled per consecutive attempt, and `take` skips the host until it passes. The starter cannot express “come back later” at all.',
       match: {
         python: {all: [/throttle:\{job_id\}:\{host\}/, /retry_after/, /backoff/]},
         typescript: {all: [/throttle:\$\{jobId\}:\$\{host\}/, /retry_after/, /backoff/]},
@@ -149,7 +149,7 @@ def enqueue(job_id: str, host: str, url: str) -> None:
 
 def take(job_id: str, host: str, policy: HostPolicy) -> str | None:
     """The next URL for a host, if the shared bucket allows a fetch right now."""
-    # TODO: this draft keeps one global queue and one global bucket, so a slow host stalls the
+    # TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
     # whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
     # GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
     # one queue and one bucket per host, do the refill and take in one Lua script, and give a
@@ -248,7 +248,7 @@ def throttle(job_id: str, host: str, retry_after_s: int, attempts: int) -> int:
 `,
     },
     typescript: {
-      starter: `/** The Redis frontier: a model-generated draft with one queue and one bucket. */
+      starter: `/** The Redis frontier: flawed code with one queue and one bucket. */
 import Redis from 'ioredis';
 
 export const r = new Redis({host: 'redis', port: 6379});
@@ -263,7 +263,7 @@ const FRONTIER_KEY = 'frontier:job';
 const BUCKET_KEY = 'bucket:global';
 
 export async function enqueue(_jobId: string, _host: string, url: string): Promise<void> {
-  // TODO: this draft keeps one global queue and one global bucket, so a slow host stalls the
+  // TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
   // whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
   // GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
   // one queue and one bucket per host, do the refill and take in one Lua script, and give a
@@ -376,7 +376,7 @@ func (p HostPolicy) rate() int {
 }
 
 func Enqueue(ctx context.Context, jobID, host, url string) error {
-	// TODO: this draft keeps one global queue and one global bucket, so a slow host stalls the
+	// TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
 	// whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
 	// GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
 	// one queue and one bucket per host, do the refill and take in one Lua script, and give a
@@ -517,7 +517,7 @@ object Frontier {
   val bucketKey = "bucket:global"
 
   def enqueue(jobId: String, host: String, url: String): Unit = {
-    // TODO: this draft keeps one global queue and one global bucket, so a slow host stalls the
+    // TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
     // whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
     // GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
     // one queue and one bucket per host, do the refill and take in one Lua script, and give a
@@ -621,7 +621,7 @@ struct HostPolicy {
 };
 
 void enqueue(const std::string& jobId, const std::string& host, const std::string& url) {
-  // TODO: this draft keeps one global queue and one global bucket, so a slow host stalls the
+  // TODO: this starter keeps one global queue and one global bucket, so a slow host stalls the
   // whole crawl while a fast one absorbs the entire rate budget; it refills with a client-side
   // GET-then-SET so a busy minute over-fetches; and it cannot back a host off after a 429. Use
   // one queue and one bucket per host, do the refill and take in one Lua script, and give a
@@ -723,5 +723,5 @@ int throttle(const std::string& jobId, const std::string& host, int retry_after_
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand politeness as a per-host property. The draft looks reasonable because a crawl of one host cannot show the difference: one queue and one bucket behave exactly like per-host ones when there is only one host. Three defects are being checked: the shared queue and shared bucket couple every host's progress to the slowest and fastest one, the client-side refill is a read-modify-write race that overshoots under concurrency, and there is no representation of "this host asked us to come back later". Real crawlers also spread the frontier across instances with a lease (so a crashing worker does not lose its URL), keep the bucket in memory for the hot path with Redis as the arbiter, and lower a host's rate permanently when 429s keep arriving.`,
+  debrief: `The interviewer is testing whether you understand politeness as a per-host property. The starter looks reasonable because a crawl of one host cannot show the difference: one queue and one bucket behave exactly like per-host ones when there is only one host. Three defects are being checked: the shared queue and shared bucket couple every host's progress to the slowest and fastest one, the client-side refill is a read-modify-write race that overshoots under concurrency, and there is no representation of "this host asked us to come back later". Real crawlers also spread the frontier across instances with a lease (so a crashing worker does not lose its URL), keep the bucket in memory for the hot path with Redis as the arbiter, and lower a host's rate permanently when 429s keep arriving.`,
 };

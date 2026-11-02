@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['api', 'engine', 'fallback'],
   task: `## Task
 
-The starter is a plausible model-generated draft of the routing-engine client: when the engine is
+**Starting point.** The starter is working code for the routing-engine client: when the engine is
 healthy and answers with geometry for the traffic epoch the caller asked about, the demo passes.
 Every failure path is wrong. Find them, fix them, and prove the fix.
 
@@ -18,7 +18,7 @@ client:
 - The gRPC call to the engine carries a **1.5 s deadline** on every attempt. A call without one lets
   one stuck solver pin the request worker indefinitely.
 - At most **3 attempts**, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retryable; every
-  other status is returned to the caller immediately. The draft retries a \`NO_ROUTE\` answer
+  other status is returned to the caller immediately. The starter retries a \`NO_ROUTE\` answer
   because "there must be some route".
 - When the attempts are exhausted, return a **straight-line distance estimate** between origin and
   destination, marked \`degraded = true\`. It is honest about what it is; a road route cached at
@@ -29,7 +29,7 @@ client:
 - \`NO_ROUTE\` is **terminal**: there is no road, so a retry cannot invent one, and the fallback must
   not turn "unroutable" into "here is a rough guess".
 
-**Failure mode the checks target.** The draft keeps a \`last_known\` cache keyed by nothing in
+**Failure mode the checks target.** The starter keeps a \`last_known\` cache keyed by nothing in
 particular and serves whatever it happens to hold when the engine times out, so a route computed
 for an old epoch is presented as the current one; it loops \`while True\` on every error, so a
 \`NO_ROUTE\` burns the solver until the request deadline; and it never sets a deadline on the call.
@@ -66,7 +66,7 @@ Each of those is invisible while the engine is up and loud the moment it is not.
     ],
   },
   hints: [
-    'The deadline belongs to the call, not to the process: `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. The draft retries with `while True`, which has no exit for a `NO_ROUTE` or a `PERMISSION_DENIED`; bound the attempts with a constant and a `for` loop.',
+    'The deadline belongs to the call, not to the process: `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`. The starter retries with `while True`, which has no exit for a `NO_ROUTE` or a `PERMISSION_DENIED`; bound the attempts with a constant and a `for` loop.',
     '`NO_ROUTE` is data, not an error: return it before the retry branch. Retrying it asks the solver to invent a road that does not exist, and the fallback estimate would turn "unroutable" into a plausible-looking lie.',
     'The degraded answer is constructed, not looked up: build the response with `degraded = true`, the straight-line distance and the caller’s `epoch`. If you keep a cache at all, key it by epoch and refuse a hit whose epoch differs — the geometry you return must describe the traffic state the caller asked about.',
   ],
@@ -103,7 +103,7 @@ Each of those is invisible while the engine is up and loud the moment it is not.
       id: 'terminal-no-route',
       title: 'A no-route answer is terminal',
       detail:
-        'A `NO_ROUTE` response is returned to the caller immediately: it is not retried and it does not fall back to a straight-line guess. The draft retries it because "there must be some route".',
+        'A `NO_ROUTE` response is returned to the caller immediately: it is not retried and it does not fall back to a straight-line guess. The starter retries it because "there must be some route".',
       match: {
         python: {all: [/NO_ROUTE/, /if response\.status\s*==/], none: [/while\s+True/]},
         typescript: {
@@ -132,7 +132,7 @@ Each of those is invisible while the engine is up and loud the moment it is not.
       id: 'bounded-retry',
       title: 'At most three attempts, only the two retryable codes',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The draft retries every error forever.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The starter retries every error forever.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*3/, /range\(MAX_ATTEMPTS\)/, /RETRYABLE/],
@@ -245,7 +245,7 @@ def compute_route(origin, destination, waypoints, epoch):
 `,
     },
     typescript: {
-      starter: `/** Engine client: a model-generated draft that retries every failure forever. */
+      starter: `/** Engine client: flawed code that retries every failure forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -668,5 +668,5 @@ RouteResponse ComputeRoute(
 `,
     },
   },
-  debrief: `The interviewer is probing one question under many names: what does the client owe the caller when the engine is not there? A deadline bounds one attempt, a bounded attempt count bounds the call, the retryable set decides which failures are worth another try, and NO_ROUTE is an answer rather than a failure. The fallback is the honesty answer: a straight-line estimate marked \`degraded = true\` tells the caller what it is, while a cached route from another epoch tells them a story about traffic that is no longer true. The draft looks fine because a healthy engine never enters any of these paths. Real clients add jittered backoff between attempts, a breaker per engine endpoint, coverage checks before the call, and a response field that distinguishes "no road exists" from "we could not ask".`,
+  debrief: `The interviewer is probing one question under many names: what does the client owe the caller when the engine is not there? A deadline bounds one attempt, a bounded attempt count bounds the call, the retryable set decides which failures are worth another try, and NO_ROUTE is an answer rather than a failure. The fallback is the honesty answer: a straight-line estimate marked \`degraded = true\` tells the caller what it is, while a cached route from another epoch tells them a story about traffic that is no longer true. The starter looks fine because a healthy engine never enters any of these paths. Real clients add jittered backoff between attempts, a breaker per engine endpoint, coverage checks before the call, and a response field that distinguishes "no road exists" from "we could not ask".`,
 };

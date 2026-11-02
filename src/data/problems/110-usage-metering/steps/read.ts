@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['api', 'coverage', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the read, looks up a
-number and returns it. It compiles, it serves the demo, and it hides three production flaws. Review it
-like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the read, looks up a number and
+returns it. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/accounts/{account}/usage\`.
 
@@ -26,7 +26,7 @@ Implement \`GET /v1/accounts/{account}/usage\`.
 - The \`period\` in the response is the window bucket the number was read from, so the reader knows
   when it resets.
 
-**Failure mode the checks target.** The draft reads \`batch:usage:{account}\`, a key a nightly job
+**Failure mode the checks target.** The starter reads \`batch:usage:{account}\`, a key a nightly job
 writes, so the number is up to a day stale and disagrees with the counters the limiter is enforcing
 right now; it drops the overage flag, so an account past its cap still reads "fine"; and it never
 compares the caller to the account, so any authenticated client can read any account's usage.`,
@@ -62,7 +62,7 @@ compares the caller to the account, so any authenticated client can read any acc
       id: 'window',
       title: 'Reads the current window',
       detail:
-        'The number comes from the current `usage:{account}:{window}` key — the same counter the limiter sees — not a nightly batch. The draft reads `batch:usage:{account}`, which lags up to a day.',
+        'The number comes from the current `usage:{account}:{window}` key — the same counter the limiter sees — not a nightly batch. The starter reads `batch:usage:{account}`, which lags up to a day.',
       match: {
         python: {all: [/def window_key\(/, /WINDOW_SECONDS/]},
         typescript: {all: [/windowKey\(/, /WINDOW_SECONDS/]},
@@ -75,7 +75,7 @@ compares the caller to the account, so any authenticated client can read any acc
       id: 'overage',
       title: 'Reports the cap and the overage flag',
       detail:
-        'The response carries the cap and the `overage` flag read from the window, so a plan past its cap cannot read "fine". The draft hides overage entirely.',
+        'The response carries the cap and the `overage` flag read from the window, so a plan past its cap cannot read "fine". The starter hides overage entirely.',
       match: {
         python: {all: [/overage/]},
         typescript: {all: [/overage/]},
@@ -88,7 +88,7 @@ compares the caller to the account, so any authenticated client can read any acc
       id: 'close-id',
       title: 'Returns the last reconciled close id',
       detail:
-        'The response names the last reconciled close id for the period, so the number can be tied to the billing close that confirmed it. The draft returns none.',
+        'The response names the last reconciled close id for the period, so the number can be tied to the billing close that confirmed it. The starter returns none.',
       match: {
         python: {all: [/close_id/, /"close:/]},
         typescript: {all: [/close_id:/, /close:/]},
@@ -101,7 +101,7 @@ compares the caller to the account, so any authenticated client can read any acc
       id: 'authz',
       title: 'Rejects a foreign account with 403',
       detail:
-        'The authenticated `X-Account-Id` must equal the path account; a mismatch is **403** and a missing caller is **401**. The draft serves whatever account the path names to whoever asks.',
+        'The authenticated `X-Account-Id` must equal the path account; a mismatch is **403** and a missing caller is **401**. The starter serves whatever account the path names to whoever asks.',
       match: {
         python: {all: [/\b403\b/, /X-Account-Id/]},
         typescript: {all: [/code\(\s*403\s*\)/, /x-account-id/]},
@@ -123,9 +123,9 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/accounts/{account}/usage")
 def get_usage(account: str) -> JSONResponse:
-    # TODO: this draft reads the nightly batch key, so the number lags up to a day and disagrees with
+    # TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
     # the counters the limiter enforces; it never reports overage; and it serves whatever account the
-    # path names to whoever asks. Review all three.
+    # path names to whoever asks. Fix all three.
     units = int(r.get(f"batch:usage:{account}") or 0)
     return JSONResponse({"account": account, "units": units}, status_code=200)
 `,
@@ -174,7 +174,7 @@ def get_usage(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/accounts/:account/usage: a model-generated draft that reads a nightly batch. */
+      starter: `/** GET /v1/accounts/:account/usage: flawed code that reads a nightly batch. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -182,9 +182,9 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/accounts/:account/usage', async (request, reply) => {
-  // TODO: this draft reads the nightly batch key, so the number lags up to a day and disagrees with
+  // TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
   // the counters the limiter enforces; it never reports overage; and it serves whatever account the
-  // path names to whoever asks. Review all three.
+  // path names to whoever asks. Fix all three.
   const {account} = request.params as {account: string};
   const units = Number((await r.get(\`batch:usage:\${account}\`)) ?? 0);
   return reply.code(200).send({account, units});
@@ -239,9 +239,9 @@ import (
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func getUsage(rw http.ResponseWriter, req *http.Request) {
-	// TODO: this draft reads the nightly batch key, so the number lags up to a day and disagrees with
+	// TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
 	// the counters the limiter enforces; it never reports overage; and it serves whatever account the
-	// path names to whoever asks. Review all three.
+	// path names to whoever asks. Fix all three.
 	account := req.PathValue("account")
 	units, _ := rdb.Get(req.Context(), "batch:usage:"+account).Int64()
 	writeJSON(rw, http.StatusOK, map[string]any{"account": account, "units": units})
@@ -322,9 +322,9 @@ object Read {
   val route: Route =
     path("v1" / "accounts" / Segment / "usage") { account =>
       get {
-        // TODO: this draft reads the nightly batch key, so the number lags up to a day and disagrees
+        // TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees
         // with the counters the limiter enforces; it never reports overage; and it serves whatever
-        // account the path names to whoever asks. Review all three.
+        // account the path names to whoever asks. Fix all three.
         val units = MeteringState.r.get(s"batch:usage:$account").toLongOption.getOrElse(0L)
         complete(StatusCodes.OK, s"""{"account":"$account","units":$units}""")
       }
@@ -393,9 +393,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/accounts/:account/usage", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reads the nightly batch key, so the number lags up to a day and disagrees with
+    // TODO: this starter reads the nightly batch key, so the number lags up to a day and disagrees with
     // the counters the limiter enforces; it never reports overage; and it serves whatever account the
-    // path names to whoever asks. Review all three.
+    // path names to whoever asks. Fix all three.
     const auto account = req.path_params.at("account");
     const auto units = std::stoll(redisGet("batch:usage:" + account));
     res.status = 200;

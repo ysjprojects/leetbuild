@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Moderation service on the AI-era track: the course is not "call a classifier from an endpoint",
- * it is the review you owe a model-generated triage pipeline before it touches a real reporter.
- * A validated, per-reporter-unique report intake → an atomic Redis claim with a renewable lease →
- * a classifier call that may only auto-act on strong, corroborated evidence → content-keyed action
- * events with the reporter stripped and an outbox before the offset commit → a scoped case file
- * that redacts the reporter and escapes the free text.
+ * Moderation service: the course is not "call a classifier from an endpoint", it is the debugging
+ * you owe a triage pipeline before it touches a real reporter. A validated, per-reporter-unique
+ * report intake → an atomic Redis claim with a renewable lease → a classifier call that may only
+ * auto-act on strong, corroborated evidence → content-keyed action events with the reporter
+ * stripped and an outbox before the offset commit → a scoped case file that redacts the reporter
+ * and escapes the free text.
  */
 export const moderationServiceProblem: Problem = {
   id: 'moderation-service',
@@ -20,7 +20,7 @@ export const moderationServiceProblem: Problem = {
   tagline: 'Auto-triage reports to a human queue with atomic claims and reporter-safe records.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Moderation Service
 
@@ -69,12 +69,12 @@ One service, **moderated**, with five pieces:
    the content owner's tenant (**404** for a foreign case), with reporter identity only for the
    surveyor role and the detail text truncated and escaped.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real trust-and-
-safety feature: read the draft against the failure modes, name the subtle one, fix it, and prove the
-fix with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and it
+looks right. Your job in every step is the job you will have on a real trust-and-safety feature:
+debug it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,16 +8,16 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'model'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: compute the vector, \`SET\` it,
+**Starting point.** The starter is working code: compute the vector, \`SET\` it,
 give the key a TTL. The demo is fast and the cache is warm. It hides a lost version, a race and a
 two-command write. Find them, fix them, and prove the fix.
 
 Implement \`store_vector(tenant, model_version, text, compute)\`, the cache the write and read paths share:
 
 - The key is **\`(tenant, model version, content hash)\`**, where the content hash is the SHA-256 of the
-  input text. The draft drops the model version, so a new model is a hit on an old vector.
+  input text. The starter drops the model version, so a new model is a hit on an old vector.
 - The write is a single **\`SET … NX EX 604800\`** command: the first writer wins deterministically,
-  and the seven-day TTL travels in the same command. The draft \`SET\`s first and \`EXPIRE\`s second, so
+  and the seven-day TTL travels in the same command. The starter \`SET\`s first and \`EXPIRE\`s second, so
   a crash between them leaves an immortal key, and a concurrent compute overwrites the first.
 - On a lost \`NX\` the winner's vector is read back and returned, so two workers that compute the same
   input **converge on one cached vector** instead of returning two stochastic ones.
@@ -49,7 +49,7 @@ the first.`,
       id: 'key-shape',
       title: 'Keys by tenant, model version and content hash',
       detail:
-        "The key is built from `(tenant, model version, content hash)`. The draft drops the model version, so a new model reads the previous model's vectors.",
+        "The key is built from `(tenant, model version, content hash)`. The starter drops the model version, so a new model reads the previous model's vectors.",
       match: {
         python: {all: [/def cache_key\(/, /model_version/, /content_hash/]},
         typescript: {all: [/function cacheKey\(/, /modelVersion/, /contentHash/]},
@@ -62,7 +62,7 @@ the first.`,
       id: 'set-nx',
       title: 'Writes with SET NX so the first writer wins',
       detail:
-        'The write is conditional (`SET … NX`): the draft writes unconditionally, so two workers race and the later result wins.',
+        'The write is conditional (`SET … NX`): the starter writes unconditionally, so two workers race and the later result wins.',
       match: {
         python: {all: [/nx=True/]},
         typescript: {all: [/['"]NX['"]/]},
@@ -75,7 +75,7 @@ the first.`,
       id: 'ttl-in-write',
       title: 'Carries the 7-day TTL in the same command',
       detail:
-        'The TTL (`604800` seconds) travels with the write, not in a separate `EXPIRE`. The draft SETs and then EXPIREs, so a crash between them leaves the key immortal.',
+        'The TTL (`604800` seconds) travels with the write, not in a separate `EXPIRE`. The starter SETs and then EXPIREs, so a crash between them leaves the key immortal.',
       match: {
         python: {all: [/CACHE_TTL_S\s*=\s*604800/, /ex\s*=\s*CACHE_TTL_S/], none: [/\bexpire\(/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*604800/, /['"]EX['"]/], none: [/\bexpire\(/]},
@@ -88,7 +88,7 @@ the first.`,
       id: 'first-writer-wins',
       title: 'Reads the winner back when the NX write loses',
       detail:
-        "After a lost `NX` the code reads the key it failed to write and returns the winner's vector, so two concurrent computes converge on one cached value. The draft just overwrites.",
+        "After a lost `NX` the code reads the key it failed to write and returns the winner's vector, so two concurrent computes converge on one cached value. The starter just overwrites.",
       match: {
         python: {order: [/nx=True/, /r\.get\(/]},
         typescript: {order: [/['"]NX['"]/, /redis\.get\(/]},
@@ -101,7 +101,7 @@ the first.`,
       id: 'cache-hit',
       title: 'A hit skips the compute',
       detail:
-        'The cache is consulted before `compute`: a hit returns the stored vector without a model call. The draft computes first and writes afterwards.',
+        'The cache is consulted before `compute`: a hit returns the stored vector without a model call. The starter computes first and writes afterwards.',
       match: {
         python: {order: [/r\.get\(/, /compute\(/]},
         typescript: {order: [/redis\.get\(/, /compute\(/]},
@@ -125,7 +125,7 @@ CACHE_TTL_S = 604800
 
 
 def cache_key(tenant: str, content_hash: str) -> str:
-    """The draft keys by tenant and content hash only."""
+    """The starter keys by tenant and content hash only."""
     return f"vector:{tenant}:{content_hash}"
 
 
@@ -188,7 +188,7 @@ const redis = new Redis({host: 'redis', port: 6379});
 
 const CACHE_TTL_S = 604800;
 
-/** The draft keys by tenant and content hash only. */
+/** The starter keys by tenant and content hash only. */
 function cacheKey(tenant: string, contentHash: string): string {
   return \`vector:\${tenant}:\${contentHash}\`;
 }
@@ -267,7 +267,7 @@ const cacheTTL = 7 * 24 * 60 * 60 * 1000000000
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// The draft keys by tenant and content hash only.
+// The starter keys by tenant and content hash only.
 func cacheKey(tenant, contentHash string) string {
 	return "vector:" + tenant + ":" + contentHash
 }
@@ -356,7 +356,7 @@ object VectorCache {
   val jedis = new JedisPooled("redis", 6379)
   val TtlSeconds = 604800L
 
-  // The draft keys by tenant and content hash only.
+  // The starter keys by tenant and content hash only.
   def cacheKey(tenant: String, contentHash: String): String = s"vector:$tenant:$contentHash"
 
   def contentHash(text: String): String =
@@ -434,7 +434,7 @@ constexpr long kTtlSeconds = 604800;
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-// The draft keys by tenant and content hash only.
+// The starter keys by tenant and content hash only.
 std::string cache_key(const std::string& tenant, const std::string& content_hash) {
   return "vector:" + tenant + ":" + content_hash;
 }

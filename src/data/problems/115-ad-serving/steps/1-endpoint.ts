@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'server', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body, ranks the candidate campaigns by bid and returns the highest bidder. It compiles, it serves
-the demo, and it hides three production flaws. Review it like the service owner, fix it, and prove
+the demo, and it hides three production flaws. Debug it like the service owner, fix it, and prove
 the fix with the checks below.
 
 Implement \`POST /v1/ads/serve\` with body
@@ -30,7 +30,7 @@ Implement \`POST /v1/ads/serve\` with body
   "latest", never a bare campaign id. A delivery report has to be able to say which creative, cap
   and budget a served impression used.
 
-**Failure mode the checks target.** The draft ranks first and filters never. A capped user keeps
+**Failure mode the checks target.** The starter ranks first and filters never. A capped user keeps
 seeing the highest bidder on every page — the same ad fifty times — and a campaign whose pacing
 budget is spent, or whose state is \`paused\`/\`exhausted\`, keeps serving because nothing reads its
 state. Dropping \`campaign_version\` is the quiet one: with it, a mid-flight campaign edit rewrites
@@ -64,7 +64,7 @@ history and the reconciliation between serve and render cannot be replayed.`,
       id: 'request-guard',
       title: 'Validates placement, user_hash and format before any lookup',
       detail:
-        '`placement` is 1–64 characters and `user_hash` is required (**400** otherwise); an unknown `page_context.format` is **400**. The draft sends whatever arrives straight to ranking, so a malformed request is answered with an ad and no request is ever cheaply rejected.',
+        '`placement` is 1–64 characters and `user_hash` is required (**400** otherwise); an unknown `page_context.format` is **400**. The starter sends whatever arrives straight to ranking, so a malformed request is answered with an ad and no request is ever cheaply rejected.',
       match: {
         python: {all: [/MAX_PLACEMENT_CHARS/, /user_hash/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_PLACEMENT_CHARS/, /user_hash/, /code\(\s*400\s*\)/]},
@@ -77,7 +77,7 @@ history and the reconciliation between serve and render cannot be replayed.`,
       id: 'frequency-cap',
       title: 'Enforces the campaign frequency cap per user',
       detail:
-        'The user’s impressions for the campaign are read from the frequency counters and compared with `freq_cap_impressions` inside the campaign’s `freq_window_s`; a capped user receives no ad from that campaign. The draft never reads a cap, so the highest bidder saturates one user.',
+        'The user’s impressions for the campaign are read from the frequency counters and compared with `freq_cap_impressions` inside the campaign’s `freq_window_s`; a capped user receives no ad from that campaign. The starter never reads a cap, so the highest bidder saturates one user.',
       match: {
         python: {all: [/freq_cap_impressions/, /freq_window_s/, /store\.frequency\(/]},
         typescript: {all: [/freq_cap_impressions/, /freq_window_s/, /\.frequency\(/]},
@@ -90,7 +90,7 @@ history and the reconciliation between serve and render cannot be replayed.`,
       id: 'exhausted',
       title: 'Never serves a paused or budget-exhausted campaign',
       detail:
-        'A campaign whose `state` is `paused`/`exhausted`, or whose `budget_spent_micros` has reached `paced_budget_micros`, is filtered out before ranking. The draft serves exhausted budgets because it reads neither the state nor the pacing fields.',
+        'A campaign whose `state` is `paused`/`exhausted`, or whose `budget_spent_micros` has reached `paced_budget_micros`, is filtered out before ranking. The starter serves exhausted budgets because it reads neither the state nor the pacing fields.',
       match: {
         python: {all: [/INACTIVE_STATES/, /paced_budget_micros/, /budget_spent_micros/]},
         typescript: {all: [/INACTIVE_STATES/, /paced_budget_micros/, /budget_spent_micros/]},
@@ -103,7 +103,7 @@ history and the reconciliation between serve and render cannot be replayed.`,
       id: 'served-version',
       title: 'Names the campaign version it served',
       detail:
-        'The response carries `campaign_version` for the campaign that won, so a delivery report can tell which creative, cap and budget the decision used. The draft returns the ad without a version.',
+        'The response carries `campaign_version` for the campaign that won, so a delivery report can tell which creative, cap and budget the decision used. The starter returns the ad without a version.',
       match: {
         python: {all: [/campaign_version/]},
         typescript: {all: [/campaign_version/]},
@@ -148,9 +148,9 @@ store = CampaignStore()
 
 @app.post("/v1/ads/serve")
 def serve(body: ServeRequest) -> JSONResponse:
-    # TODO: this draft ranks the highest bidder without consulting the campaign's state, its
+    # TODO: this starter ranks the highest bidder without consulting the campaign's state, its
     # pacing budget or the user's frequency cap, and the response omits the campaign version
-    # the decision was made against. Review all three flaws.
+    # the decision was made against. Fix all three flaws.
     campaigns = store.active_campaigns(body.placement)
     won = max(campaigns, key=lambda c: c["bid_micros"], default=None)
     if won is None:
@@ -249,7 +249,7 @@ def serve(body: ServeRequest) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/ads/serve: a model-generated draft that ranks before it filters. */
+      starter: `/** POST /v1/ads/serve: flawed code that ranks before it filters. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -279,9 +279,9 @@ interface CampaignStore {
 declare const store: CampaignStore;
 
 app.post('/v1/ads/serve', async (request, reply) => {
-  // TODO: this draft ranks the highest bidder without consulting the campaign's state, its
+  // TODO: this starter ranks the highest bidder without consulting the campaign's state, its
   // pacing budget or the user's frequency cap, and the response omits the campaign version
-  // the decision was made against. Review all three flaws.
+  // the decision was made against. Fix all three flaws.
   const body = request.body as ServeBody;
   const campaigns = store.activeCampaigns(body.placement);
   if (campaigns.length === 0) return reply.code(200).send({ad: null, reason: 'no_fill'});
@@ -407,9 +407,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func serve(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft ranks the highest bidder without consulting the campaign's state, its
+	// TODO: this starter ranks the highest bidder without consulting the campaign's state, its
 	// pacing budget or the user's frequency cap, and the response omits the campaign version
-	// the decision was made against. Review all three flaws.
+	// the decision was made against. Fix all three flaws.
 	var body ServeRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -594,9 +594,9 @@ object AdApi {
     path("v1" / "ads" / "serve") {
       post {
         entity(as[ServeRequest]) { body =>
-          // TODO: this draft ranks the highest bidder without consulting the campaign's state,
+          // TODO: this starter ranks the highest bidder without consulting the campaign's state,
           // its pacing budget or the user's frequency cap, and the response omits the campaign
-          // version the decision was made against. Review all three flaws.
+          // version the decision was made against. Fix all three flaws.
           val won = store.activeCampaigns(body.placement).maxByOption(_.bid_micros)
           won match {
             case None =>
@@ -750,9 +750,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft ranks the highest bidder without consulting the campaign's state, its
+    // TODO: this starter ranks the highest bidder without consulting the campaign's state, its
     // pacing budget or the user's frequency cap, and the response omits the campaign version
-    // the decision was made against. Review all three flaws.
+    // the decision was made against. Fix all three flaws.
     const std::string placement = body.value("placement", std::string());
     const std::string userHash = body.value("user_hash", std::string());
     const auto campaigns = store.activeCampaigns(placement);
@@ -887,5 +887,5 @@ int main() {
     'The frequency counter lives behind a store call, not in the request: `frequency(campaign_id, user_hash, window_s)` answers "impressions for this user inside the campaign window". Compare it with `freq_cap_impressions` and drop the campaign when it is reached.',
     'Return `campaign_version` with the ad — the version the decision used, which is the one whose caps and budget you just checked. If a report later asks why this impression appeared, the version is how you replay the decision instead of guessing from the current config.',
   ],
-  debrief: `The interviewer is testing whether you review a generated handler at the point where revenue meets policy. The draft reads fine because the demo has one user, one page and an unspent budget; the flaws only show up under repetition, which is exactly what a frequency cap exists for. Three separate defects are checked: cheap rejection of malformed requests before any lookup, limits (state, pacing, per-user cap) applied before relevance, and a response that names the campaign version rather than an anonymous ad. The version is the one candidates forget: without it, a mid-flight campaign edit makes yesterday's delivery figures unreproducible and the render reconciliation cannot tell which cap was in force. Real servers go further: auction-level floors, per-placement pacing as its own control loop, budget smoothing against a diurnal curve, and a serving log with feature ids only — never the user identity.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the point where revenue meets policy. The starter reads fine because the demo has one user, one page and an unspent budget; the flaws only show up under repetition, which is exactly what a frequency cap exists for. Three separate defects are checked: cheap rejection of malformed requests before any lookup, limits (state, pacing, per-user cap) applied before relevance, and a response that names the campaign version rather than an anonymous ad. The version is the one candidates forget: without it, a mid-flight campaign edit makes yesterday's delivery figures unreproducible and the render reconciliation cannot tell which cap was in force. Real servers go further: auction-level floors, per-placement pacing as its own control loop, budget smoothing against a diurnal curve, and a serving log with feature ids only — never the user identity.`,
 };

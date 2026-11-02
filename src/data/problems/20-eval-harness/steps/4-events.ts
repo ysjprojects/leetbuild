@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['harness', 'kafka', 'worker', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it publishes a result on the happy path and the
+The starter is working code: it publishes a result on the happy path and the
 consumer moves the counters, so the dashboard shows progress. Four production contracts are broken.
 Find them, fix them, and prove the fix.
 
@@ -56,7 +56,7 @@ exactly-once *looking* code — the run then reports fewer samples than it score
       id: 'run-key',
       title: 'Keyed by run id, event id is the sample id',
       detail:
-        'The message key is the run id (partition by run) and the event carries the sample id as its id. The draft keys by worker id, so one run’s samples scatter across partitions and the replay order the counters rely on is gone.',
+        'The message key is the run id (partition by run) and the event carries the sample id as its id. The starter keys by worker id, so one run’s samples scatter across partitions and the replay order the counters rely on is gone.',
       match: {
         python: {all: [/eval\.sample/, /key=body\.run_id/]},
         typescript: {all: [/eval\.sample/, /key:\s*runId/]},
@@ -82,7 +82,7 @@ exactly-once *looking* code — the run then reports fewer samples than it score
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the sample. The draft ignores the broker result and lets the worker report success.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) inside the error branch instead of dropping the sample. The starter ignores the broker result and lets the worker report success.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -95,7 +95,7 @@ exactly-once *looking* code — the run then reports fewer samples than it score
       id: 'counters-before-commit',
       title: 'Folds the sample into the counters before committing',
       detail:
-        'The consumer runs `HINCRBY` on the run’s counters before it commits the offset; committing first makes a crash lose the counter update forever. The draft commits first and folds afterwards.',
+        'The consumer runs `HINCRBY` on the run’s counters before it commits the offset; committing first makes a crash lose the counter update forever. The starter commits first and folds afterwards.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -108,7 +108,7 @@ exactly-once *looking* code — the run then reports fewer samples than it score
       id: 'no-text',
       title: 'No sample text in the event or the logs',
       detail:
-        'Neither the event payload nor a log line carries the sample text or the model output. The draft logs the output and copies it into the event — a leak that is retained and replicated with the topic.',
+        'Neither the event payload nor a log line carries the sample text or the model output. The starter logs the output and copies it into the event — a leak that is retained and replicated with the topic.',
       match: {
         python: {all: [/eval\.sample/], none: [/output_text|OutputText/]},
         typescript: {all: [/eval\.sample/], none: [/output_text|OutputText/]},
@@ -254,7 +254,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** publish_result: a model-generated draft that keys by worker and commits too early. */
+      starter: `/** publish_result: flawed code that keys by worker and commits too early. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';

@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['generator', 'judge', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: while the judge is healthy every
+**Starting point.** The starter is working code: while the judge is healthy every
 record comes back scored and admitted, and the demo looks finished. Its failure paths are all wrong,
 and it does not even judge the whole job. Find the flaws, fix them, and prove the fix.
 
@@ -21,12 +21,12 @@ admitted to the corpus:
   retrying. A malformed record — \`INVALID_ARGUMENT\` — returns to the caller immediately.
 - When the attempts run out on a timeout, the record is **parked**, not admitted and not discarded:
   \`park(record_id, "judge_timeout")\`. Parking is the honest third outcome — the record was generated,
-  nobody scored it, and the report has to say so. The draft logs the timeout and admits the record
+  nobody scored it, and the report has to say so. The starter logs the timeout and admits the record
   "as likely fine", which turns an infrastructure hiccup into silent label noise.
 - The judge answers a verdict. \`VERDICT_REFUSED\` is **terminal**: the record is rejected
   (\`reject(record_id, "refused")\`) and never retried or re-judged. Only \`VERDICT_ADMIT\` carries a
   score into \`admit(record_id, score)\`; a record is never admitted without a score.
-- Every record of the job is judged. The draft skips everything after the first
+- Every record of the job is judged. The starter skips everything after the first
   \`JUDGE_PREFIX = 100\` records "to save cost", which is exactly the prefix a demo never looks past.
 
 **Failure mode the checks target.** The quiet one is the timeout: a judge that is slow rather than
@@ -53,7 +53,7 @@ because only the first hundred records were ever in scope.`,
     ],
   },
   hints: [
-    'The deadline belongs on the call itself — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline` — and the attempts belong in a counted loop with a named bound. The draft has no deadline and no bound, so a slow judge is indistinguishable from a hanging one.',
+    'The deadline belongs on the call itself — `timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline` — and the attempts belong in a counted loop with a named bound. The starter has no deadline and no bound, so a slow judge is indistinguishable from a hanging one.',
     'Three outcomes, not two: admit with a score, reject on a refusal, and park on an exhausted timeout. Parked records are the ones the report counts separately, because a record that was neither scored nor refused is a data-quality fact the reviewer has to see.',
     'Retryability is a property of the status, not of "it threw": compare the code and return anything outside `UNAVAILABLE`/`DEADLINE_EXCEEDED` at once. And drop the prefix: judging the first hundred records of a ten-thousand-record job is not a cost saving, it is an admission that the rest of the corpus is unverified.',
   ],
@@ -75,7 +75,7 @@ because only the first hundred records were ever in scope.`,
       id: 'park-timeout',
       title: 'Parks a timed-out record instead of admitting it',
       detail:
-        'An exhausted timeout calls `park(record_id, "judge_timeout")`, so the record is counted as unscored rather than admitted or silently dropped. The draft logs the timeout and admits the record as likely fine.',
+        'An exhausted timeout calls `park(record_id, "judge_timeout")`, so the record is counted as unscored rather than admitted or silently dropped. The starter logs the timeout and admits the record as likely fine.',
       match: {
         python: {all: [/park\(/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/park\(/, /DEADLINE_EXCEEDED/]},
@@ -88,7 +88,7 @@ because only the first hundred records were ever in scope.`,
       id: 'refusal-terminal',
       title: 'Treats a refusal as terminal',
       detail:
-        '`VERDICT_REFUSED` is recognized and rejected immediately, with no blanket handler turning every failure into another attempt. The draft retries a refusal and swallows every error on the way.',
+        '`VERDICT_REFUSED` is recognized and rejected immediately, with no blanket handler turning every failure into another attempt. The starter retries a refusal and swallows every error on the way.',
       match: {
         python: {all: [/VERDICT_REFUSED/, /reject\(/], none: [/except\s+Exception\s*:/]},
         typescript: {all: [/VERDICT_REFUSED/, /reject\(/], none: [/catch\s*\{\s*continue/]},
@@ -101,7 +101,7 @@ because only the first hundred records were ever in scope.`,
       id: 'judge-every-record',
       title: 'Judges every record, not a prefix',
       detail:
-        'All records of the job are judged; there is no `JUDGE_PREFIX`/`JUDGE_PREFIX`-style cut-off that quietly leaves the tail of the corpus unverified. The draft stops after the first hundred.',
+        'All records of the job are judged; there is no `JUDGE_PREFIX`/`JUDGE_PREFIX`-style cut-off that quietly leaves the tail of the corpus unverified. The starter stops after the first hundred.',
       match: {
         python: {all: [/records/], none: [/JUDGE_PREFIX/]},
         typescript: {all: [/records/], none: [/JUDGE_PREFIX/]},
@@ -114,7 +114,7 @@ because only the first hundred records were ever in scope.`,
       id: 'score-before-admit',
       title: 'Never admits a record without a judge score',
       detail:
-        '`admit` is only reached with a real score; no default score stands in for a timeout and no "likely fine" path exists. The draft admits unscored records with `DEFAULT_SCORE = 1`.',
+        '`admit` is only reached with a real score; no default score stands in for a timeout and no "likely fine" path exists. The starter admits unscored records with `DEFAULT_SCORE = 1`.',
       match: {
         python: {all: [/admit\(/, /score/], none: [/likely fine|assume_ok|DEFAULT_SCORE\s*=\s*1/]},
         typescript: {all: [/admit\(/, /score/], none: [/likely fine|assumeOk|DEFAULT_SCORE\s*=\s*1/]},
@@ -222,7 +222,7 @@ def judge_job(records: list[dict]) -> None:
 `,
     },
     typescript: {
-      starter: `/** judgeRecord: a model-generated draft that retries every failure and skips the tail of the job. */
+      starter: `/** judgeRecord: flawed code that retries every failure and skips the tail of the job. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -703,5 +703,5 @@ void judgeJob(const std::vector<Record>& records) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can name a third outcome. Most drafts have admit and reject, and then a timeout error that has to become one of them; the correct answer is neither — park it, count it, and let the report carry the number. That is what stops infrastructure flakiness from becoming label noise: an unscored record cannot be admitted as truth because the admission path requires a score. The refusal matters because it is the one verdict the judge will repeat forever: retrying it spends budget on an answer that does not change. The prefix cap is the trap for the cost-minded candidate: judging a prefix optimizes a metric that no longer measures the corpus. Real systems add a rejudge queue for parked records, per-entity judge cost budgets, and a separate score for the judge's own confidence.`,
+  debrief: `The interviewer is testing whether you can name a third outcome. Most first attempts have admit and reject, and then a timeout error that has to become one of them; the correct answer is neither — park it, count it, and let the report carry the number. That is what stops infrastructure flakiness from becoming label noise: an unscored record cannot be admitted as truth because the admission path requires a score. The refusal matters because it is the one verdict the judge will repeat forever: retrying it spends budget on an answer that does not change. The prefix cap is the trap for the cost-minded candidate: judging a prefix optimizes a metric that no longer measures the corpus. Real systems add a rejudge queue for parked records, per-entity judge cost budgets, and a separate score for the judge's own confidence.`,
 };

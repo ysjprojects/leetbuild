@@ -8,9 +8,9 @@ export const subscriptionEndpointStep: Step = {
   focus: ['client', 'api', 'redis', 'pg'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the subscription
+**Starting point.** The starter is working code: it registers the subscription
 route, parses the body, runs the caller's filter against the source database and returns a record.
-It compiles, it serves the demo, and it hides three production flaws. Review it like the service
+It compiles, it serves the demo, and it hides three production flaws. Debug it like the service
 owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/subscriptions\` with body \`{"table": "orders", "filter": "status = 'paid'", "sink": "warehouse-1"}\`.
@@ -31,7 +31,7 @@ Implement \`POST /v1/subscriptions\` with body \`{"table": "orders", "filter": "
   returns the **existing** subscription — same \`id\` — instead of creating a second stream.
 - Log the created subscription id, tenant, table and sink — never the filter text.
 
-**Failure mode the checks target.** Approval is a catalog decision, not an existence check: the draft
+**Failure mode the checks target.** Approval is a catalog decision, not an existence check: the starter
 streams \`auth_users\` and \`sessions\` because they are rows in the same database, which turns a
 tenant's subscription into an exfiltration path for every other tenant's credentials. The filter is
 the second defect: \`WHERE {filter}\` is tenant-authored SQL evaluated with the replication
@@ -73,7 +73,7 @@ same table, two slots, two WAL readers and two copies of every change in the sin
       id: 'approved-table',
       title: 'Refuses an unapproved table with 403 before replication',
       detail:
-        'The table is checked against the tenant’s approved list (`APPROVED_TABLES`, `approvedTable`) and an unapproved one is **403** — decided before any slot, replication or source query. The draft streams whatever table exists in the database, `auth_users` included.',
+        'The table is checked against the tenant’s approved list (`APPROVED_TABLES`, `approvedTable`) and an unapproved one is **403** — decided before any slot, replication or source query. The starter streams whatever table exists in the database, `auth_users` included.',
       match: {
         python: {all: [/APPROVED_TABLES/, /def approved_table\(/, /status_code\s*=\s*403/]},
         typescript: {all: [/APPROVED_TABLES/, /function approvedTable\(/, /code\(\s*403\s*\)/]},
@@ -86,7 +86,7 @@ same table, two slots, two WAL readers and two copies of every change in the sin
       id: 'filter-columns',
       title: 'Parses the filter and rejects sensitive columns',
       detail:
-        '`parseFilter` turns the filter into structured predicates and anything that is not a `column op literal` clause is **400**; a column in `SENSITIVE_COLUMNS` is **400** as well. The draft forwards the raw string and lets the source database decide what it means.',
+        '`parseFilter` turns the filter into structured predicates and anything that is not a `column op literal` clause is **400**; a column in `SENSITIVE_COLUMNS` is **400** as well. The starter forwards the raw string and lets the source database decide what it means.',
       match: {
         python: {all: [/SENSITIVE_COLUMNS/, /def parse_filter\(/, /status_code\s*=\s*400/]},
         typescript: {all: [/SENSITIVE_COLUMNS/, /function parseFilter\(/, /code\(\s*400\s*\)/]},
@@ -99,7 +99,7 @@ same table, two slots, two WAL readers and two copies of every change in the sin
       id: 'idempotent-create',
       title: 'Keys the create by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the subscription is stored under `(tenant, key)`; a replay returns the stored subscription instead of creating a second stream. The draft ignores the header, so a client retry opens a second slot over the same table.',
+        '`Idempotency-Key` is required and the subscription is stored under `(tenant, key)`; a replay returns the stored subscription instead of creating a second stream. The starter ignores the header, so a client retry opens a second slot over the same table.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -112,7 +112,7 @@ same table, two slots, two WAL readers and two copies of every change in the sin
       id: 'no-raw-filter',
       title: 'Compiles predicates instead of interpolating the filter',
       detail:
-        'The validated predicates are rendered into SQL with placeholders by `buildPredicate`; the caller’s filter text never reaches the statement. The draft builds `WHERE {filter}` and runs it with the replication credentials.',
+        'The validated predicates are rendered into SQL with placeholders by `buildPredicate`; the caller’s filter text never reaches the statement. The starter builds `WHERE {filter}` and runs it with the replication credentials.',
       match: {
         python: {all: [/def build_predicate\(/, /placeholders/], none: [/run_source_query\(/]},
         typescript: {all: [/function buildPredicate\(/, /placeholders/], none: [/runSourceQuery\(/]},
@@ -149,9 +149,9 @@ def run_source_query(sql: str) -> int:
 
 @app.post("/v1/subscriptions")
 def create_subscription(body: SubscriptionRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft streams any table in STREAMABLE_TABLES — auth_users and sessions included —
+    # TODO: this starter streams any table in STREAMABLE_TABLES — auth_users and sessions included —
     # interpolates the caller's filter straight into the SQL it runs with replication credentials,
-    # and ignores Idempotency-Key. Review all three.
+    # and ignores Idempotency-Key. Fix all three.
     sql = f"SELECT count(*) FROM {body.table} WHERE {body.filter}"
     rows = run_source_query(sql)
     logger.info("subscription tenant=%s table=%s filter=%s", tenant, body.table, body.filter)
@@ -277,7 +277,7 @@ def create_subscription(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/subscriptions: a model-generated draft that streams whatever the caller names. */
+      starter: `/** POST /v1/subscriptions: flawed code that streams whatever the caller names. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -296,9 +296,9 @@ async function runSourceQuery(sql: string): Promise<number> {
 }
 
 app.post('/v1/subscriptions', async (request, reply) => {
-  // TODO: this draft streams any table in STREAMABLE_TABLES — auth_users and sessions included —
+  // TODO: this starter streams any table in STREAMABLE_TABLES — auth_users and sessions included —
   // interpolates the caller's filter straight into the SQL it runs with replication credentials,
-  // and ignores Idempotency-Key. Review all three.
+  // and ignores Idempotency-Key. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as SubscriptionBody;
   const sql = \`SELECT count(*) FROM \${body.table} WHERE \${body.filter ?? 'true'}\`;
@@ -446,9 +446,9 @@ func createSubscription(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft streams any table in streamableTables — auth_users and sessions included —
+	// TODO: this starter streams any table in streamableTables — auth_users and sessions included —
 	// interpolates the caller's filter straight into the SQL it runs with replication credentials,
-	// and ignores Idempotency-Key. Review all three.
+	// and ignores Idempotency-Key. Fix all three.
 	sql := fmt.Sprintf("SELECT count(*) FROM %s WHERE %s", body.Table, body.Filter)
 	rows, _ := runSourceQuery(sql)
 	log.Printf("subscription tenant=%s table=%s filter=%s", tenant, body.Table, body.Filter)
@@ -666,9 +666,9 @@ object CdcApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[SubscriptionRequest]) { body =>
-            // TODO: this draft streams any table in StreamableTables — auth_users and sessions
+            // TODO: this starter streams any table in StreamableTables — auth_users and sessions
             // included — interpolates the caller's filter straight into the SQL it runs with
-            // replication credentials, and ignores Idempotency-Key. Review all three.
+            // replication credentials, and ignores Idempotency-Key. Fix all three.
             val sql = s"SELECT count(*) FROM \${body.table} WHERE \${body.filter}"
             val rows = runSourceQuery(sql)
             system.log.info(s"subscription tenant=$tenant table=\${body.table} filter=\${body.filter}")
@@ -826,9 +826,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft streams any table in kStreamableTables — auth_users and sessions included —
+    // TODO: this starter streams any table in kStreamableTables — auth_users and sessions included —
     // interpolates the caller's filter straight into the SQL it runs with replication credentials,
-    // and ignores Idempotency-Key. Review all three.
+    // and ignores Idempotency-Key. Fix all three.
     const auto table = body.value("table", std::string());
     const auto filter = body.value("filter", std::string());
     if (kStreamableTables.count(table) == 0) {
@@ -998,5 +998,5 @@ int main() {
     'A filter is not a string to forward: split it on ` AND `, match each clause against `column op literal`, and check the column against the allowed set. Then render the predicates with placeholders, so `buildPredicate` produces the SQL and the caller only ever supplies values.',
     'Idempotency is keyed by `(tenant, Idempotency-Key)` and checked before the subscription is written; a hit returns the stored record, id included, with 200. Without it a client retry after a timeout opens a second slot, a second reader and a second copy of every change in the sink.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler that has database credentials in its hand. The draft reads fine because the demo subscribes to \`orders\` from a tenant whose whole database is that tenant's. Three defects are being checked. Authorization is a catalog decision: \`auth_users\` is a table in the same database, and "the table exists" is not "this tenant may stream it" — the refusal must be 403 and must happen before a slot exists. The filter is the second one, and it is the one candidates skip: an arbitrary filter string is tenant-authored SQL executed with replication credentials, so parsing it to structured predicates over non-sensitive columns is the difference between a stream and a database client. The third is idempotency: creating a subscription is a replication side effect, and a retried create must return the subscription it already has. Real streamers add per-table column allow-lists, a filter AST stored beside the subscription, and a hard cap on subscriptions per tenant.`,
+  debrief: `The interviewer is testing whether you can debug a handler that has database credentials in its hand. The starter reads fine because the demo subscribes to \`orders\` from a tenant whose whole database is that tenant's. Three defects are being checked. Authorization is a catalog decision: \`auth_users\` is a table in the same database, and "the table exists" is not "this tenant may stream it" — the refusal must be 403 and must happen before a slot exists. The filter is the second one, and it is the one candidates skip: an arbitrary filter string is tenant-authored SQL executed with replication credentials, so parsing it to structured predicates over non-sensitive columns is the difference between a stream and a database client. The third is idempotency: creating a subscription is a replication side effect, and a retried create must return the subscription it already has. Real streamers add per-table column allow-lists, a filter AST stored beside the subscription, and a hard cap on subscriptions per tenant.`,
 };

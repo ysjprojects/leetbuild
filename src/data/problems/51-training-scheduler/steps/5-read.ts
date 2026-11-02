@@ -8,27 +8,27 @@ export const trainingReadStep: Step = {
   focus: ['client', 'scheduler', 'store', 'cluster'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the status endpoint: it
+**Starting point.** The starter is working code for the status endpoint: it
 registers the route, looks the run up and returns the stored row with its state, queue position,
 node list and last checkpoint. It compiles, it answers for a healthy demo run, and it hides three
-production flaws. Review it like the owner of the shared fleet, fix it, and prove the fix with the
+production flaws. Debug it like the owner of the shared fleet, fix it, and prove the fix with the
 checks below.
 
 Implement \`GET /v1/training/runs/{id}\`:
 
 - The tenant comes from the authenticated \`X-Tenant-Id\` header (**401** when absent). The run is
   resolved by id **and** owner: a run that belongs to another tenant — or does not exist — is
-  **404**, never **403**. The draft looks a run up by id alone, so any caller who knows a run id
+  **404**, never **403**. The starter looks a run up by id alone, so any caller who knows a run id
   reads any tenant's run.
 - The reported state is **reconciled against the cluster's view within \`RECONCILE_WINDOW_S\` = 60**:
   the handler asks the cluster for the run's live assignment and nodes and only then answers. The
-  draft answers from the run store alone, so it reports a state the cluster has already moved past.
+  starter answers from the run store alone, so it reports a state the cluster has already moved past.
 - The response carries \`run_id\`, \`state\`, \`queue_position\`, \`lease_state\`, \`nodes\` and
   \`last_checkpoint_id\`. \`nodes\` is the **cluster's** list, never the run row's: the row is a
   record of what the scheduler wrote, and it keeps naming workers the cluster has since preempted.
 - A run whose **start lease expired with no worker confirmation** is reported \`failed\` with a
   \`reason\` (\`start_lease_expired\`) — never the stored \`queued\`. That is the one case an operator
-  opens this endpoint to see, and the draft hides it.
+  opens this endpoint to see, and the starter hides it.
 - A \`reason\` appears only on a run that failed; a live run reports its reconciled state.
 
 **Failure mode the checks target.** The status endpoint is what an operator trusts mid-incident, so
@@ -81,7 +81,7 @@ answering **404** for a foreign id are what make the endpoint safe to page on.`,
       id: 'reconcile-window',
       title: 'Reconciles against the cluster before answering',
       detail:
-        'The cluster is queried for the run’s live assignment inside `RECONCILE_WINDOW_S` = 60 and only then is the answer built; it carries `queue_position`, `lease_state`, `nodes` and `last_checkpoint_id`. The draft answers from the run row alone, so it reports a state the cluster has already moved past.',
+        'The cluster is queried for the run’s live assignment inside `RECONCILE_WINDOW_S` = 60 and only then is the answer built; it carries `queue_position`, `lease_state`, `nodes` and `last_checkpoint_id`. The starter answers from the run row alone, so it reports a state the cluster has already moved past.',
       match: {
         python: {
           all: [/RECONCILE_WINDOW_S\s*=\s*60/, /"queue_position"/, /"lease_state"/, /"nodes"/, /"last_checkpoint_id"/],
@@ -109,7 +109,7 @@ answering **404** for a foreign id are what make the endpoint safe to page on.`,
       id: 'orphaned-failed',
       title: 'An orphaned start is failed with a reason',
       detail:
-        'A run still waiting whose start lease `training:lease:{run_id}` is gone and whose worker never confirmed is reported `failed` with `reason: start_lease_expired`, not the stored `queued`. The draft echoes `queued`, which is exactly the run an operator is looking for.',
+        'A run still waiting whose start lease `training:lease:{run_id}` is gone and whose worker never confirmed is reported `failed` with `reason: start_lease_expired`, not the stored `queued`. The starter echoes `queued`, which is exactly the run an operator is looking for.',
       match: {
         python: {
           all: [/start_lease_expired/, /"failed"/, /lease is None/, /worker_confirmed/],
@@ -137,7 +137,7 @@ answering **404** for a foreign id are what make the endpoint safe to page on.`,
       id: 'tenant-scoped-404',
       title: 'Another tenant’s run id is 404',
       detail:
-        'The caller is resolved from `X-Tenant-Id` and compared with the run’s tenant; a mismatch — or an unknown id — answers **404**, never **403** or **200**. The draft serves any id it is handed, so a run id is treated as a capability.',
+        'The caller is resolved from `X-Tenant-Id` and compared with the run’s tenant; a mismatch — or an unknown id — answers **404**, never **403** or **200**. The starter serves any id it is handed, so a run id is treated as a capability.',
       match: {
         python: {all: [/X-Tenant-Id/, /run\["tenant"\]/, /\b404\b/], order: [/run\["tenant"\]/, /\b404\b/]},
         typescript: {all: [/x-tenant-id/, /run\.tenant/, /\b404\b/], order: [/run\.tenant/, /\b404\b/]},
@@ -156,7 +156,7 @@ answering **404** for a foreign id are what make the endpoint safe to page on.`,
       id: 'no-stale-nodes',
       title: 'Nodes come from the cluster’s view, not the run row',
       detail:
-        'The response’s `nodes` are the cluster’s answer for the run. Returning the node list stored on the run row is the draft’s shape and is forbidden: the row still names workers the cluster has preempted.',
+        'The response’s `nodes` are the cluster’s answer for the run. Returning the node list stored on the run row is the starter’s shape and is forbidden: the row still names workers the cluster has preempted.',
       match: {
         python: {none: [/run\["nodes"\]/], all: [/cluster\.assignment\(/, /"nodes": view\["nodes"\]/]},
         typescript: {none: [/run\.nodes/], all: [/cluster\.assignment\(/, /nodes: view\.nodes/]},
@@ -168,7 +168,7 @@ answering **404** for a foreign id are what make the endpoint safe to page on.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/training/runs/{run_id}: a model-generated draft that echoes the stored run row."""
+      starter: `"""GET /v1/training/runs/{run_id}: flawed code that echoes the stored run row."""
 import logging
 
 from fastapi import FastAPI, Header
@@ -189,9 +189,9 @@ runs = RunStore()
 
 @app.get("/v1/training/runs/{run_id}")
 def read_run(run_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft serves any tenant's run id, reports the stored state verbatim — queued for a
+    # TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
     # run whose start lease already expired — and returns the node list straight from the run row
-    # instead of the cluster's view. Review all three before the status endpoint ships.
+    # instead of the cluster's view. Fix all three before the status endpoint ships.
     run = runs.get(run_id)
     if run is None:
         return JSONResponse({"error": "unknown run"}, status_code=404)
@@ -276,7 +276,7 @@ def read_run(run_id: str, tenant: str | None = Header(default=None, alias="X-Ten
 `,
     },
     typescript: {
-      starter: `/** GET /v1/training/runs/{id}: a model-generated draft that echoes the stored run row. */
+      starter: `/** GET /v1/training/runs/{id}: flawed code that echoes the stored run row. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -300,9 +300,9 @@ class RunStore {
 const runs = new RunStore();
 
 app.get('/v1/training/runs/:runId', async (request, reply) => {
-  // TODO: this draft serves any tenant's run id, reports the stored state verbatim — queued for a
+  // TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
   // run whose start lease already expired — and returns the node list straight from the run row
-  // instead of the cluster's view. Review all three before the status endpoint ships.
+  // instead of the cluster's view. Fix all three before the status endpoint ships.
   const tenant = request.headers['x-tenant-id'] as string;
   const {runId} = request.params as {runId: string};
   const run = await runs.get(runId);
@@ -423,9 +423,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readRun(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft serves any tenant's run id, reports the stored state verbatim — queued for a
+	// TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
 	// run whose start lease already expired — and returns the node list straight from the run row
-	// instead of the cluster's view. Review all three before the status endpoint ships.
+	// instead of the cluster's view. Fix all three before the status endpoint ships.
 	tenant := r.Header.Get("X-Tenant-Id")
 	runID := r.PathValue("runID")
 	run, _ := runs.Get(r.Context(), runID)
@@ -601,9 +601,9 @@ object RunRead {
   val route: Route =
     path("v1" / "training" / "runs" / Segment) { runId =>
       get {
-        // TODO: this draft serves any tenant's run id, reports the stored state verbatim — queued
+        // TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued
         // for a run whose start lease already expired — and returns the node list straight from the
-        // run row instead of the cluster's view. Review all three.
+        // run row instead of the cluster's view. Fix all three.
         runs.get(runId) match {
           case Some(run) =>
             val status = RunStatus(runId, run.state, run.queue_position, "none", run.nodes, run.last_checkpoint_id)
@@ -743,9 +743,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/training/runs/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft serves any tenant's run id, reports the stored state verbatim — queued for a
+    // TODO: this starter serves any tenant's run id, reports the stored state verbatim — queued for a
     // run whose start lease already expired — and returns the node list straight from the run row
-    // instead of the cluster's view. Review all three before the status endpoint ships.
+    // instead of the cluster's view. Fix all three before the status endpoint ships.
     const std::string tenant = req.get_header_value("X-Tenant-Id");
     const std::string runId = req.matches[1];
     const auto run = runs.get(runId);
@@ -861,12 +861,12 @@ int main() {
     },
   },
   hints: [
-    'Resolve the caller before you read the run: tenant from `X-Tenant-Id`, and a run row whose `tenant` differs is **404**, never **403** — a run id is not a capability. The draft looks runs up by id alone.',
+    'Resolve the caller before you read the run: tenant from `X-Tenant-Id`, and a run row whose `tenant` differs is **404**, never **403** — a run id is not a capability. The starter looks runs up by id alone.',
     'The run row records what the scheduler did, not what the cluster has. Query the cluster for the run’s assignment inside `RECONCILE_WINDOW_S` and answer from the reconciled state, or the dashboard reports a state the fleet has already moved past.',
     'Reconcile before you answer: a run still waiting (`queued`/`starting`) whose start lease `training:lease:{run_id}` is gone and whose worker never confirmed is `failed` with `reason: start_lease_expired` — and `nodes` comes from the cluster view, never from the row.',
   ],
   debrief: `The interviewer is testing the read side of a scheduler, where the question is never "does it return a
-state" but "is it the state the cluster is acting on". The draft looks right because the demo run is
+state" but "is it the state the cluster is acting on". The starter looks right because the demo run is
 alive, confirmed and owned by the caller — every one of the three failures needs a run that died, a
 node the cluster preempted, or a caller who guessed an id. The checks are the route; the tenant-scoped
 **404**; the cluster query inside \`RECONCILE_WINDOW_S\` carrying \`queue_position\`, \`lease_state\`,

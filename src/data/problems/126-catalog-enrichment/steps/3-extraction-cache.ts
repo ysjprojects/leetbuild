@@ -8,9 +8,9 @@ export const extractionCacheStep: Step = {
   focus: ['catalogd', 'redis', 'llm'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it caches extraction results,
+**Starting point.** The starter is working code: it caches extraction results,
 counts a merchant's extractions against a daily budget, and lets a reviewer claim a SKU. In a demo
-with one worker and one reviewer it all works. It hides five production flaws. Review it like the
+with one worker and one reviewer it all works. It hides five production flaws. Debug it like the
 engineer paying the model bill, fix it, and prove the fix with the checks below.
 
 Implement the Redis layer in front of \`extract_attributes\` from the previous step:
@@ -18,7 +18,7 @@ Implement the Redis layer in front of \`extract_attributes\` from the previous s
 - **Cache key** \`extract:{taxonomy_version}:{content_hash}\` — the hash from the intake job, and
   the taxonomy version the result is valid under. Two merchants selling the same product share the
   entry; a taxonomy release invalidates every entry at once; an updated title never hits a stale
-  one. The draft keys by SKU id, so the second merchant pays again and a changed title is served
+  one. The starter keys by SKU id, so the second merchant pays again and a changed title is served
   the old attributes.
 - **Cache TTL** of **7 days** (\`CACHE_TTL_S = 604800\`), set with the write.
 - **Daily budget**: at most **50 000** extractions per merchant per UTC day
@@ -27,10 +27,10 @@ Implement the Redis layer in front of \`extract_attributes\` from the previous s
   (\`BUDGET_TTL_S = 172800\`). A client-side read followed by an increment lets concurrent workers
   overspend.
 - **Reserve before the model call** — a cache miss reserves budget, then extracts, then caches. The
-  draft calls the model and counts afterwards, so an over-budget merchant is still billed.
+  starter calls the model and counts afterwards, so an over-budget merchant is still billed.
 - **Review leases**: \`claim_review(sku_id, reviewer)\` takes \`review:lease:{sku_id}\` with
   \`SET NX EX 900\` (\`LEASE_TTL_S = 900\`) and reports whether the claim won;
-  \`release_review\` deletes the lease only when this reviewer still holds it. The draft's plain
+  \`release_review\` deletes the lease only when this reviewer still holds it. The starter's plain
   \`SET\` lets two reviewers edit the same SKU and never expires.
 
 **Failure mode the checks target.** A cache keyed by id costs money on every duplicate product and
@@ -61,7 +61,7 @@ lock in name only.`,
       id: 'cache-key',
       title: 'Caches by taxonomy version and content hash',
       detail:
-        'The cache key is `extract:{taxonomy_version}:{content_hash}`; the SKU id appears nowhere in it. The draft keys by id, so identical products are extracted once per merchant and a changed title hits a stale entry.',
+        'The cache key is `extract:{taxonomy_version}:{content_hash}`; the SKU id appears nowhere in it. The starter keys by id, so identical products are extracted once per merchant and a changed title hits a stale entry.',
       match: {
         python: {all: [/extract:\{taxonomy_version\}:\{content_hash\}/], none: [/extract:\{sku/]},
         typescript: {all: [/extract:\$\{taxonomyVersion\}:\$\{contentHash\}/], none: [/extract:\$\{sku/]},
@@ -77,7 +77,7 @@ lock in name only.`,
       id: 'cache-ttl',
       title: 'Cache entries expire after 7 days',
       detail:
-        'The result is written with a 7-day expiry (`CACHE_TTL_S = 604800`) in the same `SET`. The draft writes without a TTL and the cache grows until eviction.',
+        'The result is written with a 7-day expiry (`CACHE_TTL_S = 604800`) in the same `SET`. The starter writes without a TTL and the cache grows until eviction.',
       match: {
         python: {all: [/CACHE_TTL_S\s*=\s*604_?800/, /ex=CACHE_TTL_S/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*604_?800/, /['"]EX['"],\s*CACHE_TTL_S/]},
@@ -90,7 +90,7 @@ lock in name only.`,
       id: 'budget-atomic',
       title: 'Reserves the merchant’s daily budget with one atomic Lua script',
       detail:
-        'A Lua script keyed `budget:{merchant}:{day}` reads, checks against `DAILY_BUDGET = 50_000`, increments and sets `EXPIRE` on first write, in one `EVAL`. The draft reads, compares and increments from the client, which races.',
+        'A Lua script keyed `budget:{merchant}:{day}` reads, checks against `DAILY_BUDGET = 50_000`, increments and sets `EXPIRE` on first write, in one `EVAL`. The starter reads, compares and increments from the client, which races.',
       match: {
         python: {
           all: [
@@ -148,7 +148,7 @@ lock in name only.`,
       id: 'reserve-first',
       title: 'Reserves budget before the model call, on a cache miss only',
       detail:
-        'On a cache miss, `reserve_budget` runs before `extract_attributes` and a refused reservation never reaches the model. The draft extracts first and counts afterwards.',
+        'On a cache miss, `reserve_budget` runs before `extract_attributes` and a refused reservation never reaches the model. The starter extracts first and counts afterwards.',
       match: {
         python: {order: [/= reserve_budget\(/, /= extract_attributes\(/]},
         typescript: {order: [/= await reserveBudget\(/, /= await extractAttributes\(/]},
@@ -161,7 +161,7 @@ lock in name only.`,
       id: 'lease-nx',
       title: 'Claims a review lease with SET NX EX 900',
       detail:
-        '`claim_review` sets `review:lease:{sku_id}` only if absent (`NX`) with a 15-minute expiry (`LEASE_TTL_S = 900`) and returns whether it won; `release_review` deletes only when the caller still holds it. The draft’s plain `SET` is neither exclusive nor expiring.',
+        '`claim_review` sets `review:lease:{sku_id}` only if absent (`NX`) with a 15-minute expiry (`LEASE_TTL_S = 900`) and returns whether it won; `release_review` deletes only when the caller still holds it. The starter’s plain `SET` is neither exclusive nor expiring.',
       match: {
         python: {all: [/LEASE_TTL_S\s*=\s*900/, /nx=True/, /ex=LEASE_TTL_S/, /RELEASE_LUA/]},
         typescript: {all: [/LEASE_TTL_S\s*=\s*900/, /['"]EX['"],\s*LEASE_TTL_S,\s*['"]NX['"]/, /RELEASE_LUA/]},
@@ -192,8 +192,8 @@ class BudgetExhausted(Exception):
 
 
 def enrich(sku: dict) -> dict:
-    # TODO: this draft caches by SKU id with no TTL, counts the budget from the client after the
-    # model call, and takes a review lease with a plain SET. Review all five.
+    # TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
+    # model call, and takes a review lease with a plain SET. Fix all five.
     key = f"extract:{sku['sku_id']}"
     cached = r.get(key)
     if cached is not None:
@@ -300,7 +300,7 @@ def release_review(sku_id: str, reviewer: str) -> bool:
 `,
     },
     typescript: {
-      starter: `/** Extraction cache and budget: a model-generated draft that keys by id and counts after the call. */
+      starter: `/** Extraction cache and budget: flawed code that keys by id and counts after the call. */
 import {Redis} from 'ioredis';
 
 import {extractAttributes, type ExtractionResult, type SkuJob} from './extract_attributes';
@@ -312,8 +312,8 @@ const DAILY_BUDGET = 50_000;
 export class BudgetExhausted extends Error {}
 
 export async function enrich(sku: SkuJob): Promise<ExtractionResult> {
-  // TODO: this draft caches by SKU id with no TTL, counts the budget from the client after the
-  // model call, and takes a review lease with a plain SET. Review all five.
+  // TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
+  // model call, and takes a review lease with a plain SET. Fix all five.
   const key = \`extract:\${sku.sku_id}\`;
   const cached = await r.get(key);
   if (cached !== null) return JSON.parse(cached) as ExtractionResult;
@@ -425,8 +425,8 @@ var rdb *redis.Client
 
 var ErrBudgetExhausted = errors.New("merchant has no extractions left today")
 
-// TODO: this draft caches by SKU id with no TTL, counts the budget from the client after the
-// model call, and takes a review lease with a plain SET. Review all five.
+// TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
+// model call, and takes a review lease with a plain SET. Fix all five.
 func enrich(ctx context.Context, sku SkuJob) (Result, error) {
 	key := "extract:" + sku.SkuID
 	if cached, err := rdb.Get(ctx, key).Result(); err == nil {
@@ -587,8 +587,8 @@ object ExtractionCache {
 
   final class BudgetExhausted(merchant: String) extends RuntimeException(s"$merchant has no extractions left today")
 
-  // TODO: this draft caches by SKU id with no TTL, counts the budget from the client after the
-  // model call, and takes a review lease with a plain SET. Review all five.
+  // TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
+  // model call, and takes a review lease with a plain SET. Fix all five.
   def enrich(sku: SkuJob): JsObject = {
     val key = s"extract:\${sku.sku_id}"
     Option(jedis.get(key)) match {
@@ -723,8 +723,8 @@ std::string today() {
   return buf;
 }
 
-// TODO: this draft caches by SKU id with no TTL, counts the budget from the client after the
-// model call, and takes a review lease with a plain SET. Review all five.
+// TODO: this starter caches by SKU id with no TTL, counts the budget from the client after the
+// model call, and takes a review lease with a plain SET. Fix all five.
 json enrich(const json& sku) {
   const auto skuId = sku["sku_id"].get<std::string>();
   const auto merchant = sku["merchant"].get<std::string>();

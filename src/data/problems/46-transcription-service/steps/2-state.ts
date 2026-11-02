@@ -8,7 +8,7 @@ export const transcriptionStateStep: Step = {
   focus: ['worker', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it records finished chunks in
+**Starting point.** The starter is working code: it records finished chunks in
 Redis and the demo shows progress. Two workers that receive the same redelivered chunk both
 transcribe it, a failed chunk is marked done anyway, and the set it writes to never expires. Find
 the flaws, fix them, and prove the fix.
@@ -16,16 +16,16 @@ the flaws, fix them, and prove the fix.
 The chunk worker records per-chunk progress for a 30-second-chunk job:
 
 - The progress key is **per job**: \`progress:{job_id}:chunks\`, a Redis set whose members are chunk
-  indices. The draft writes every job into one \`progress:chunks\` set, so chunk 7 of one job blocks
+  indices. The starter writes every job into one \`progress:chunks\` set, so chunk 7 of one job blocks
   chunk 7 of every other job and no single job's progress is countable.
 - The claim is **one atomic operation and it runs before the ASR call**: a Lua \`EVAL\` that does
-  \`SISMEMBER\` + \`SADD\` and returns 1 only to the delivery that won. The draft checks on the
+  \`SISMEMBER\` + \`SADD\` and returns 1 only to the delivery that won. The starter checks on the
   client, calls the provider, then \`SADD\`s — a redelivered chunk passes the check in both workers
   and the provider bills twice.
 - A failed chunk is **not** progress: when the provider call throws, release the claim (\`SREM\`) so
-  a retry can transcribe the chunk. The draft catches the failure and marks the chunk done anyway.
+  a retry can transcribe the chunk. The starter catches the failure and marks the chunk done anyway.
 - When the job completes — the set holds the expected chunk count — set an \`EXPIRE\` of **86 400**
-  seconds on the progress key. The draft sets no TTL, so finished jobs pin memory forever.
+  seconds on the progress key. The starter sets no TTL, so finished jobs pin memory forever.
 - Report the completed chunk count (\`SCARD\`) with the result.
 
 **Failure mode the checks target.** At-least-once delivery guarantees the same chunk arrives twice,
@@ -63,7 +63,7 @@ gets back, and a failed chunk that was marked done makes the job look more compl
       id: 'chunk-key',
       title: 'Scopes the progress set to the job',
       detail:
-        'The progress key is `progress:{job_id}:chunks`, one set per job whose members are chunk indices. The draft writes every job into one `progress:chunks` set, so chunk 7 of one job blocks chunk 7 of another.',
+        'The progress key is `progress:{job_id}:chunks`, one set per job whose members are chunk indices. The starter writes every job into one `progress:chunks` set, so chunk 7 of one job blocks chunk 7 of another.',
       match: {
         python: {all: [/progress:\{job_id\}:chunks/]},
         typescript: {all: [/progress:\$\{jobId\}:chunks/]},
@@ -76,7 +76,7 @@ gets back, and a failed chunk that was marked done makes the job look more compl
       id: 'atomic-claim',
       title: 'Claims the chunk in one atomic step before the provider call',
       detail:
-        'One Lua `EVAL` does `SISMEMBER` + `SADD` and runs before the ASR call, so of two concurrent deliveries of one chunk exactly one transcribes. The draft checks on the client, transcribes, then adds — both deliveries pass the check and both bill.',
+        'One Lua `EVAL` does `SISMEMBER` + `SADD` and runs before the ASR call, so of two concurrent deliveries of one chunk exactly one transcribes. The starter checks on the client, transcribes, then adds — both deliveries pass the check and both bill.',
       match: {
         python: {all: [/CLAIM_LUA/, /SISMEMBER/, /SADD/, /\.eval\(/], order: [/\.eval\(/, /asr\.transcribe\(/]},
         typescript: {all: [/CLAIM_LUA/, /SISMEMBER/, /SADD/, /\.eval\(/], order: [/\.eval\(/, /asr\.transcribe\(/]},
@@ -89,7 +89,7 @@ gets back, and a failed chunk that was marked done makes the job look more compl
       id: 'ttl',
       title: 'Expires the progress key 24 hours after completion',
       detail:
-        'Once the set holds every expected chunk the completion script sets `EXPIRE` to 86400 seconds on the progress key, so finished jobs free themselves. The draft never sets a TTL, so progress keys pin memory forever.',
+        'Once the set holds every expected chunk the completion script sets `EXPIRE` to 86400 seconds on the progress key, so finished jobs free themselves. The starter never sets a TTL, so progress keys pin memory forever.',
       match: {
         python: {all: [/EXPIRE/, /86400|86_400/]},
         typescript: {all: [/EXPIRE/, /86400|86_400/]},
@@ -102,7 +102,7 @@ gets back, and a failed chunk that was marked done makes the job look more compl
       id: 'mark-on-success',
       title: 'A failed chunk is not recorded as complete',
       detail:
-        'When the provider call throws, the claim is released (`SREM`) so the chunk can be retried and never counts as progress. The draft catches the failure and marks the chunk done anyway.',
+        'When the provider call throws, the claim is released (`SREM`) so the chunk can be retried and never counts as progress. The starter catches the failure and marks the chunk done anyway.',
       match: {
         python: {all: [/SREM/], order: [/asr\.transcribe\(/, /release_chunk\(/]},
         typescript: {all: [/SREM/], order: [/asr\.transcribe\(/, /eval\(RELEASE_LUA/]},
@@ -115,7 +115,7 @@ gets back, and a failed chunk that was marked done makes the job look more compl
       id: 'completed-count',
       title: 'Reports the completed chunk count',
       detail:
-        'The completion script returns `SCARD` and the result carries it as `completed`. The draft computes no count, so nothing can tell how much of a job is done.',
+        'The completion script returns `SCARD` and the result carries it as `completed`. The starter computes no count, so nothing can tell how much of a job is done.',
       match: {
         python: {all: [/SCARD/, /"completed":\s*completed/]},
         typescript: {all: [/SCARD/, /completed:\s*completed/]},
@@ -229,7 +229,7 @@ def process_chunk(job_id: str, index: int, work: ChunkWork) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcriptions/:jobId/chunks/:index: a model-generated draft around one chunk. */
+      starter: `/** POST /v1/transcriptions/:jobId/chunks/:index: flawed code around one chunk. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

@@ -8,7 +8,7 @@ export const citationStateStep: Step = {
   focus: ['api', 'redis', 'docstore'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a span resolves and the second request is fast, so
+**Starting point.** The starter is working code: a span resolves and the second request is fast, so
 the demo looks cached. The key is wrong in two ways and the entry never expires. Find the flaws, fix
 them, and prove the fix.
 
@@ -30,7 +30,7 @@ Implement the span cache used by every resolution, exposed as
 - A missing \`X-Tenant-Id\` is **401** and \`version < 1\`, \`start < 0\` or \`end <= start\` is
   **400**; an unknown version is **404**.
 
-**Failure mode the checks target.** The draft’s key is \`span:{document_id}:{start}:{end}\` with the
+**Failure mode the checks target.** The starter’s key is \`span:{document_id}:{start}:{end}\` with the
 raw query strings, written without a TTL and deleted whenever a document is updated. Each mistake is
 invisible on a document that is never edited and never re-read with padded offsets — the two things
 a real corpus does constantly.`,
@@ -68,7 +68,7 @@ a real corpus does constantly.`,
       id: 'version-key',
       title: 'The cache key names the immutable version',
       detail:
-        'The key is `span:{document_id}:{version}:{start}:{end}`. The draft keys by document id and offsets, so after a document update one version’s cached text answers another version’s request.',
+        'The key is `span:{document_id}:{version}:{start}:{end}`. The starter keys by document id and offsets, so after a document update one version’s cached text answers another version’s request.',
       match: {
         python: {all: [/span_key\(/, /span:\{document_id\}:\{version\}/]},
         typescript: {all: [/spanKey\(/, /span:\$\{documentId\}:\$\{version\}/]},
@@ -81,7 +81,7 @@ a real corpus does constantly.`,
       id: 'numeric-offsets',
       title: 'Offsets are normalized to integers in the key',
       detail:
-        'The offsets are cast to integers before they are keyed, so `10` and `010` are one key. The draft pastes the raw query strings into the key, so the same span is cached under several keys.',
+        'The offsets are cast to integers before they are keyed, so `10` and `010` are one key. The starter pastes the raw query strings into the key, so the same span is cached under several keys.',
       match: {
         python: {all: [/span_key\(/, /int\(start\)/, /int\(end\)/]},
         typescript: {all: [/Math\.trunc\(start\)/, /Math\.trunc\(end\)/]},
@@ -94,7 +94,7 @@ a real corpus does constantly.`,
       id: 'long-ttl',
       title: 'Span entries carry a long TTL',
       detail:
-        'The entry is written with `SPAN_TTL_S`, a long TTL that matches the immutability of the version. The draft writes span keys with no expiry at all, so every span a tenant ever resolves is kept forever.',
+        'The entry is written with `SPAN_TTL_S`, a long TTL that matches the immutability of the version. The starter writes span keys with no expiry at all, so every span a tenant ever resolves is kept forever.',
       match: {
         python: {all: [/SPAN_TTL_S/, /ex=SPAN_TTL_S/]},
         typescript: {all: [/SPAN_TTL_S/, /'EX',\s*SPAN_TTL_S/]},
@@ -143,7 +143,7 @@ def get_span(
     end: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: the draft keys the cache by document id and the raw offset strings instead of the
+    # TODO: the starter keys the cache by document id and the raw offset strings instead of the
     # immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
     # Key by (document_id, version, start, end) with numeric offsets and a long TTL.
     raw = r.get(cache_key(document_id, start, end))
@@ -222,7 +222,7 @@ def get_span(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/spans: a model-generated draft that caches by document id and string offsets. */
+      starter: `/** GET /v1/spans: flawed code that caches by document id and string offsets. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -237,7 +237,7 @@ function cacheKey(documentId: string, start: string, end: string): string {
 }
 
 app.get('/v1/spans', async (request, reply) => {
-  // TODO: the draft keys the cache by document id and the raw offset strings instead of the
+  // TODO: the starter keys the cache by document id and the raw offset strings instead of the
   // immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
   // Key by (document_id, version, start, end) with numeric offsets and a long TTL.
   const query = request.query as {document_id: string; version: string; start: string; end: string};
@@ -369,7 +369,7 @@ func getSpan(rw http.ResponseWriter, r *http.Request) {
 	version := query.Get("version")
 	start := query.Get("start")
 	end := query.Get("end")
-	// TODO: the draft keys the cache by document id and the raw offset strings instead of the
+	// TODO: the starter keys the cache by document id and the raw offset strings instead of the
 	// immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
 	// Key by (document_id, version, start, end) with numeric offsets and a long TTL.
 	if raw, err := rdb.Get(r.Context(), cacheKey(documentID, start, end)).Result(); err == nil {
@@ -522,7 +522,7 @@ object SpanApi {
     path("v1" / "spans") {
       get {
         parameters("document_id", "version", "start", "end") { (documentId, version, start, end) =>
-          // TODO: the draft keys the cache by document id and the raw offset strings instead of the
+          // TODO: the starter keys the cache by document id and the raw offset strings instead of the
           // immutable version, writes the entry with no TTL, and deletes keys when a document is
           // updated. Key by (document_id, version, start, end) with numeric offsets and a long TTL.
           Option(jedis.get(cacheKey(documentId, start, end))) match {
@@ -651,7 +651,7 @@ int main() {
     const auto documentId = req.get_param_value("document_id");
     const auto start = req.get_param_value("start");
     const auto end = req.get_param_value("end");
-    // TODO: the draft keys the cache by document id and the raw offset strings instead of the
+    // TODO: the starter keys the cache by document id and the raw offset strings instead of the
     // immutable version, writes the entry with no TTL, and deletes keys when a document is updated.
     // Key by (document_id, version, start, end) with numeric offsets and a long TTL.
     if (const auto raw = redis.get(cacheKey(documentId, start, end))) {

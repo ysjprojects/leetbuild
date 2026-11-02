@@ -8,9 +8,9 @@ export const bookingEndpointStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and takes a hold. It compiles, it serves the demo, and it hides three production flaws.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/bookings\` with body \`{"resource_id": "…", "start": "…", "end": "…"}\` — ISO-8601
 instants — and the following rules, evaluated in this order:
@@ -31,7 +31,7 @@ instants — and the following rules, evaluated in this order:
   and the hold itself is atomic in the next step.
 - Log the booking id, the tenant and the resource — never the range owner's details.
 
-**Failure mode the checks target.** The draft takes a hold for whatever body it is handed: a past
+**Failure mode the checks target.** The starter takes a hold for whatever body it is handed: a past
 range, an inverted range, a range two years out. Worse, it keys nothing, so a client that retries
 after a timeout — the exact case an \`Idempotency-Key\` exists for — books the slot twice.`,
   sequence: {
@@ -62,7 +62,7 @@ after a timeout — the exact case an \`Idempotency-Key\` exists for — books t
       id: 'range-order',
       title: 'Rejects an inverted or zero-length range with 400',
       detail:
-        'A range whose `end` is not strictly after its `start` is a shape error — **400** with `invalid_range`. The draft takes a hold for `end < start` and for `end == start`.',
+        'A range whose `end` is not strictly after its `start` is a shape error — **400** with `invalid_range`. The starter takes a hold for `end < start` and for `end == start`.',
       match: {
         python: {all: [/invalid_range/, /status_code\s*=\s*400/]},
         typescript: {all: [/invalid_range/, /code\(\s*400\s*\)/]},
@@ -75,7 +75,7 @@ after a timeout — the exact case an \`Idempotency-Key\` exists for — books t
       id: 'past-start',
       title: 'Rejects a start in the past with 422',
       detail:
-        'A `start` before now is **422** with `range_in_past`: the request is well-formed but the calendar cannot honour it. The draft books it.',
+        'A `start` before now is **422** with `range_in_past`: the request is well-formed but the calendar cannot honour it. The starter books it.',
       match: {
         python: {all: [/range_in_past/, /status_code\s*=\s*422/]},
         typescript: {all: [/range_in_past/, /code\(\s*422\s*\)/]},
@@ -88,7 +88,7 @@ after a timeout — the exact case an \`Idempotency-Key\` exists for — books t
       id: 'horizon',
       title: 'Rejects a range past the 90-day horizon',
       detail:
-        'The horizon is `90` days from now, and a range that ends past it is **422** with `beyond_horizon`. The draft accepts any end date.',
+        'The horizon is `90` days from now, and a range that ends past it is **422** with `beyond_horizon`. The starter accepts any end date.',
       match: {
         python: {all: [/MAX_HORIZON_DAYS/, /beyond_horizon/]},
         typescript: {all: [/MAX_HORIZON_DAYS/, /beyond_horizon/]},
@@ -101,7 +101,7 @@ after a timeout — the exact case an \`Idempotency-Key\` exists for — books t
       id: 'replay',
       title: 'Returns the first booking for a replayed (tenant, resource, range)',
       detail:
-        'The idempotency key is built from `(tenant, resource, range)` and looked up before any hold, so a retry after a timeout returns the stored booking instead of a second hold. The draft keys nothing.',
+        'The idempotency key is built from `(tenant, resource, range)` and looked up before any hold, so a retry after a timeout returns the stored booking instead of a second hold. The starter keys nothing.',
       match: {
         python: {all: [/def idempotency_key\(/, /book:/, /store\.get\(/]},
         typescript: {all: [/function idempotencyKey\(/, /book:/, /await store\.get\(/]},
@@ -138,9 +138,9 @@ def take_hold(tenant: str, resource_id: str, start: str, end: str) -> dict:
 
 @app.post("/v1/bookings")
 def create_booking(body: BookingRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft books whatever range it is handed — past, inverted or beyond the horizon —
+    # TODO: this starter books whatever range it is handed — past, inverted or beyond the horizon —
     # and it ignores Idempotency-Key, so a client retry after a timeout takes a second hold.
-    # Review the range rules and the idempotency lookup.
+    # Check the range rules and the idempotency lookup.
     hold = take_hold(tenant, body.resource_id, body.start, body.end)
     logger.info("hold=%s tenant=%s email=%s", hold["hold_id"], tenant, body.customer_email)
     return JSONResponse(hold, status_code=201)
@@ -249,9 +249,9 @@ async function takeHold(tenant: string, resourceId: string, start: string, end: 
 }
 
 app.post('/v1/bookings', async (request, reply) => {
-  // TODO: this draft books whatever range it is handed — past, inverted or beyond the horizon —
+  // TODO: this starter books whatever range it is handed — past, inverted or beyond the horizon —
   // and it ignores Idempotency-Key, so a client retry after a timeout takes a second hold.
-  // Review the range rules and the idempotency lookup.
+  // Check the range rules and the idempotency lookup.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as BookingBody;
   const hold = await takeHold(tenant, body.resource_id, body.start, body.end);
@@ -371,9 +371,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createBooking(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft books whatever range it is handed — past, inverted or beyond the horizon —
+	// TODO: this starter books whatever range it is handed — past, inverted or beyond the horizon —
 	// and it ignores Idempotency-Key, so a client retry after a timeout takes a second hold.
-	// Review the range rules and the idempotency lookup.
+	// Check the range rules and the idempotency lookup.
 	var body BookingRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -535,9 +535,9 @@ object BookingApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[BookingRequest]) { body =>
-            // TODO: this draft books whatever range it is handed — past, inverted or beyond the
+            // TODO: this starter books whatever range it is handed — past, inverted or beyond the
             // horizon — and it ignores Idempotency-Key, so a client retry after a timeout takes a
-            // second hold. Review the range rules and the idempotency lookup.
+            // second hold. Check the range rules and the idempotency lookup.
             val hold = takeHold(tenant, body.resource_id, body.start, body.end)
             system.log.info(s"hold=\${hold("hold_id")} tenant=$tenant")
             complete(StatusCodes.Created, hold("hold_id"))
@@ -647,9 +647,9 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/bookings", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft books whatever range it is handed — past, inverted or beyond the horizon —
+    // TODO: this starter books whatever range it is handed — past, inverted or beyond the horizon —
     // and it ignores Idempotency-Key, so a client retry after a timeout takes a second hold.
-    // Review the range rules and the idempotency lookup.
+    // Check the range rules and the idempotency lookup.
     const auto body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
       res.status = 400;
@@ -769,7 +769,7 @@ int main() {
     'The idempotency key is a function of the booking identity — `(tenant, resource, range)` — not of the request. Look it up before taking the hold, and return the stored booking with `200` so a retry is visibly a replay.',
   ],
   debrief: `The interviewer is testing the funnel in front of the expensive, stateful part of the system.
-The draft is plausible because a demo sends one future range from one client; the defects only appear
+The starter looks right because a demo sends one future range from one client; the defects only appear
 with a stale client clock, a client that sends \`end\` before \`start\`, and the timeout-then-retry that
 every mobile network produces. Three things are being checked: the range is a real interval, the range
 is in the future within the tenant's horizon, and the booking is keyed so a retry returns the first

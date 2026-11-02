@@ -5,9 +5,11 @@ import {
   type Concept,
   type Difficulty,
   type Language,
+  type ProblemTag,
   CONCEPT_LABEL,
   LANGUAGE_LABEL,
   LANGUAGES,
+  TAG_LABEL,
 } from '@/lib/types';
 import {concept} from '@/styles/palette';
 
@@ -79,6 +81,16 @@ export const CompanyChip: FC<{company: Company}> = memo(({company}) => (
   </span>
 ));
 CompanyChip.displayName = 'CompanyChip';
+
+/** A course's tag beside its difficulty (`AI Systems`), in the tint its filter chip wears. */
+export const TagChip: FC<{tag: ProblemTag}> = memo(({tag}) => (
+  <span
+    className="border-iris-400/40 bg-iris-400/10 text-iris-300 shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+    title="a system with a model at its core">
+    {TAG_LABEL[tag]}
+  </span>
+));
+TagChip.displayName = 'TagChip';
 
 export const ghostButtonClass =
   'rounded-lg px-3 py-1.5 text-[12px] font-semibold text-ink-200 transition hover:bg-ink-800 hover:text-ink-50 disabled:cursor-not-allowed disabled:opacity-30';

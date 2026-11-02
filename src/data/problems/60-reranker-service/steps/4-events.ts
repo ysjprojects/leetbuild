@@ -8,9 +8,9 @@ export const rerankEventsStep: Step = {
   focus: ['api', 'kafka', 'db', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds a producer, assembles
-a payload and publishes the outcome. It works until the broker blinks or someone reads the topic.
-Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it builds a producer, assembles a payload and
+publishes the outcome. It works until the broker blinks or someone reads the topic. Debug it like
+the service owner, fix it, and prove the fix with the checks below.
 
 Publish one \`rerank.done\` event per reranked request:
 
@@ -24,7 +24,7 @@ Publish one \`rerank.done\` event per reranked request:
 - When the produce fails, write an **outbox** row with the topic, the key and the payload, so a relay
   can publish it after the broker recovers instead of losing it.
 
-**Failure mode the checks target.** The draft keys by tenant, so one tenant's events scatter across
+**Failure mode the checks target.** The starter keys by tenant, so one tenant's events scatter across
 partitions and a query's history is not ordered; it publishes the query and the passages "for
 tuning", which ships tenant content into a retained topic; and it has no outbox, so a produce failure
 silently drops the outcome.`,
@@ -44,7 +44,7 @@ silently drops the outcome.`,
       id: 'fingerprint-key',
       title: 'Keys the event by query fingerprint',
       detail:
-        'The record key is the query fingerprint, so all events for one query share a partition and stay ordered. The draft keys by tenant.',
+        'The record key is the query fingerprint, so all events for one query share a partition and stay ordered. The starter keys by tenant.',
       match: {
         python: {all: [/key\s*=\s*fingerprint/]},
         typescript: {all: [/key:\s*fingerprint/]},
@@ -57,7 +57,7 @@ silently drops the outcome.`,
       id: 'payload-fields',
       title: 'Publishes counts, latency and a score histogram',
       detail:
-        'The payload carries `candidate_count`, `latency_ms` and `score_histogram`. The draft omits the histogram, so the distribution of scores never reaches production.',
+        'The payload carries `candidate_count`, `latency_ms` and `score_histogram`. The starter omits the histogram, so the distribution of scores never reaches production.',
       match: {
         python: {all: [/candidate_count/, /latency_ms/, /score_histogram/]},
         typescript: {all: [/candidate_count/, /latency_ms/, /score_histogram/]},
@@ -70,7 +70,7 @@ silently drops the outcome.`,
       id: 'no-content',
       title: 'Never publishes the query or a passage',
       detail:
-        'No field named `query` or `passages` is built into the payload; the topic carries numbers, not tenant text. The draft publishes both for tuning.',
+        'No field named `query` or `passages` is built into the payload; the topic carries numbers, not tenant text. The starter publishes both for tuning.',
       match: {
         python: {all: [/histogram/], none: [/["']?(query|passages?)["']?\s*:/]},
         typescript: {all: [/histogram/], none: [/["']?(query|passages?)["']?\s*:/]},
@@ -83,7 +83,7 @@ silently drops the outcome.`,
       id: 'idempotent-producer',
       title: 'Configures an idempotent producer with acks=all',
       detail:
-        'The producer waits for all in-sync replicas and enables idempotence, so a retry cannot duplicate an outcome. The draft sets neither.',
+        'The producer waits for all in-sync replicas and enables idempotence, so a retry cannot duplicate an outcome. The starter sets neither.',
       match: {
         python: {all: [/acks\s*=\s*["']all["']/, /enable_idempotence/]},
         typescript: {all: [/acks/, /idempotent/]},
@@ -96,7 +96,7 @@ silently drops the outcome.`,
       id: 'outbox',
       title: 'Writes an outbox row when the produce fails',
       detail:
-        'A failed produce inserts a row into the outbox with the topic, key and payload, so the outcome survives until the broker recovers. The draft drops it.',
+        'A failed produce inserts a row into the outbox with the topic, key and payload, so the outcome survives until the broker recovers. The starter drops it.',
       match: {
         python: {all: [/outbox/, /write|insert/]},
         typescript: {all: [/outbox/, /insert/]},
@@ -121,7 +121,7 @@ def build_producer(bootstrap):
 
 
 def publish_outcome(producer, tenant: str, query: str, passages, outcome) -> None:
-    # TODO: this draft keys by tenant, publishes the query and the passages for tuning, and has no
+    # TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
     # outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
     # and write an outbox row when the send fails.
     payload = {
@@ -182,7 +182,7 @@ export async function publishOutcome(
   passages: string[],
   outcome: Outcome,
 ): Promise<void> {
-  // TODO: this draft keys by tenant, publishes the query and the passages for tuning, and has no
+  // TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
   // outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
   // and write an outbox row when the send fails.
   const payload = {
@@ -254,7 +254,7 @@ func buildWriter(brokers []string) *kafka.Writer {
 }
 
 func publishOutcome(ctx context.Context, writer *kafka.Writer, tenant string, query string, passages []string, outcome Outcome) error {
-	// TODO: this draft keys by tenant, publishes the query and the passages for tuning, and has no
+	// TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
 	// outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
 	// and write an outbox row when the write fails.
 	payload, err := json.Marshal(map[string]any{
@@ -340,7 +340,7 @@ object RerankEvents {
   }
 
   def publishOutcome(producer: KafkaProducer[String, String], tenant: String, query: String, passages: Seq[String], outcome: Outcome): Unit = {
-    // TODO: this draft keys by tenant, publishes the query and the passages for tuning, and has no
+    // TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
     // outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
     // and write an outbox row when the send fails.
     val payload = Map(
@@ -408,7 +408,7 @@ RdKafka::Producer* buildProducer(const std::string& brokers) {
 
 void publishOutcome(RdKafka::Producer* producer, const std::string& tenant, const std::string& query,
                     const std::vector<std::string>& passages, const Outcome& outcome) {
-  // TODO: this draft keys by tenant, publishes the query and the passages for tuning, and has no
+  // TODO: this starter keys by tenant, publishes the query and the passages for tuning, and has no
   // outbox, so a produce failure loses the outcome. Key by the query fingerprint, drop the text,
   // and write an outbox row when the produce fails.
   const std::string payload = "{\\"query\\":\\"" + query + "\\",\\"passages\\":[],\\"candidate_count\\":" +
@@ -462,7 +462,7 @@ void publishOutcome(RdKafka::Producer* producer, Outbox& outbox, const std::stri
     'Publish inside a `try`; on failure insert an outbox row with the topic, the key and the payload and let a relay retry. `acks=all` and idempotence make that retry safe to repeat.',
   ],
   debrief: `The interviewer is testing whether you treat an event stream as a durable contract rather than a debug
-drain. The draft reads fine because the topic is empty and the demo never fails a produce. Three
+drain. The starter reads fine because the topic is empty and the demo never fails a produce. Three
 defects are being checked: the wrong key (tenant scatters one query's history across partitions), a
 payload that carries tenant content into a retained topic, and a missing outbox (so a produce failure
 loses the outcome). The hash balancer and per-key partitioning are why the fingerprint is the right

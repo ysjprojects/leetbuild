@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'broker', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the endpoint answers with a
+**Starting point.** The starter is working code: the endpoint answers with a
 quota, a reserved count and an available number, and the demo looks right. It disagrees with the
-enforcement path the moment anything is reserved today. Review it, fix it, and prove the fix.
+enforcement path the moment anything is reserved today. Debug it, fix it, and prove the fix.
 
 Implement the read endpoint used by schedulers and dashboards:
 
@@ -18,11 +18,11 @@ Implement the read endpoint used by schedulers and dashboards:
   "available"}\`. The tenant comes from the authenticated \`X-Team-Id\` header — a missing one is
   **401** — and the team in the path must be the authenticated team or the answer is **403**, not
   404: unlike a document, a quota is not a secret, but it is not somebody else’s to read either.
-  The draft serves any team id to any caller.
+  The starter serves any team id to any caller.
 - \`window\` is a required query parameter of the form \`YYYY-MM-DDTHH:MMZ\`; anything else is
   **400**. A quota is per window, so a read without a window has no answer.
 - \`quota\`, \`reserved\` and \`consumed\` are read from the **same ledger the reserve path writes**:
-  the \`quota:{team}:{window}\` hash. The draft computes available from a nightly aggregate that
+  the \`quota:{team}:{window}\` hash. The starter computes available from a nightly aggregate that
   ignores same-day reservations, so the number it reports is capacity nobody can actually reserve.
 - \`available\` is \`quota - reserved - consumed\`, floored at 0, and it must **never exceed what a
   fresh reservation would be granted**: a scheduler that reads it and then asks for that many units
@@ -30,7 +30,7 @@ Implement the read endpoint used by schedulers and dashboards:
   read and the enforcement have to be the same arithmetic over the same ledger.
 
 **Failure mode the checks target.** Two proofs: the read agrees with a fresh reservation attempt
-exactly (no phantom capacity), and a foreign team id is **403**. The draft fails both: it reports
+exactly (no phantom capacity), and a foreign team id is **403**. The starter fails both: it reports
 the nightly aggregate as available, and it answers for any team that asks.
 
 **What to keep.** The response shape and the window-aware view are fine. The fix is the source of
@@ -69,7 +69,7 @@ truth, the formula and the authorization.`,
       id: 'same-ledger',
       title: 'Reads the ledger the reserve path writes',
       detail:
-        'The counters come from the `quota:{team}:{window}` hash the reserve script mutates, so the read cannot disagree with the enforcement. The draft reads a nightly aggregate instead, which ignores everything reserved today.',
+        'The counters come from the `quota:{team}:{window}` hash the reserve script mutates, so the read cannot disagree with the enforcement. The starter reads a nightly aggregate instead, which ignores everything reserved today.',
       match: {
         python: {all: [/quota:\{team\}:\{window\}/, /hgetall\(/]},
         typescript: {all: [/quota:\$\{team\}:\$\{window\}/, /hgetall\(/]},
@@ -82,7 +82,7 @@ truth, the formula and the authorization.`,
       id: 'available-formula',
       title: 'Computes available from quota, reserved and consumed',
       detail:
-        '`available = quota - reserved - consumed` (floored at 0) over the ledger’s own fields, so the number reported is the number a reservation would be granted. The draft subtracts its aggregate’s reserved count from the limit and calls the difference available.',
+        '`available = quota - reserved - consumed` (floored at 0) over the ledger’s own fields, so the number reported is the number a reservation would be granted. The starter subtracts its aggregate’s reserved count from the limit and calls the difference available.',
       match: {
         python: {all: [/available/, /limit/, /reserved/, /consumed/]},
         typescript: {all: [/available/, /limit/, /reserved/, /consumed/]},
@@ -95,7 +95,7 @@ truth, the formula and the authorization.`,
       id: 'team-scope',
       title: 'Answers only for the authenticated team',
       detail:
-        'A missing `X-Team-Id` is **401** and a path team that is not the authenticated one is **403**. The draft serves any team id in the path, so any caller can enumerate another team’s capacity.',
+        'A missing `X-Team-Id` is **401** and a path team that is not the authenticated one is **403**. The starter serves any team id in the path, so any caller can enumerate another team’s capacity.',
       match: {
         python: {all: [/X-Team-Id/, /status_code\s*=\s*401/, /status_code\s*=\s*403/]},
         typescript: {all: [/x-team-id/, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
@@ -120,7 +120,7 @@ truth, the formula and the authorization.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/quotas/{team}: a model-generated draft that serves a nightly aggregate."""
+      starter: `"""GET /v1/quotas/{team}: flawed code that serves a nightly aggregate."""
 import redis
 from fastapi import FastAPI
 
@@ -130,7 +130,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/quotas/{team}")
 def read_quota(team: str) -> dict:
-    # TODO: this draft computes available from a nightly aggregate that ignores same-day
+    # TODO: this starter computes available from a nightly aggregate that ignores same-day
     # reservations, and it serves any team id to any caller. Read the same ledger the reserve path
     # writes (quota:{team}:{window}), compute available = limit - reserved - consumed, require a
     # valid window, and answer 403 when the path team is not the authenticated one.
@@ -181,7 +181,7 @@ def read_quota(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/quotas/:team: a model-generated draft that serves a nightly aggregate. */
+      starter: `/** GET /v1/quotas/:team: flawed code that serves a nightly aggregate. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -190,7 +190,7 @@ const r = new Redis('redis://redis:6379');
 
 app.get('/v1/quotas/:team', async (request, reply) => {
   const {team} = request.params as {team: string};
-  // TODO: this draft computes available from a nightly aggregate that ignores same-day
+  // TODO: this starter computes available from a nightly aggregate that ignores same-day
   // reservations, and it serves any team id to any caller. Read the same ledger the reserve path
   // writes (quota:{team}:{window}), compute available = limit - reserved - consumed, require a
   // valid window, and answer 403 when the path team is not the authenticated one.
@@ -249,7 +249,7 @@ var rdb *redis.Client
 func readQuota(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	team := r.PathValue("team")
-	// TODO: this draft computes available from a nightly aggregate that ignores same-day
+	// TODO: this starter computes available from a nightly aggregate that ignores same-day
 	// reservations, and it serves any team id to any caller. Read the same ledger the reserve path
 	// writes (quota:{team}:{window}), compute available = limit - reserved - consumed, require a
 	// valid window, and answer 403 when the path team is not the authenticated one.
@@ -351,7 +351,7 @@ object ReadApi {
   val route: Route =
     path("v1" / "quotas" / Segment) { team =>
       get {
-        // TODO: this draft computes available from a nightly aggregate that ignores same-day
+        // TODO: this starter computes available from a nightly aggregate that ignores same-day
         // reservations, and it serves any team id to any caller. Read the same ledger the reserve
         // path writes (quota:{team}:{window}), compute available = limit - reserved - consumed,
         // require a valid window, and answer 403 when the path team is not the authenticated one.
@@ -432,7 +432,7 @@ int main() {
 
   svr.Get("/v1/quotas/:team", [&redis](const httplib::Request& req, httplib::Response& res) {
     const auto team = req.path_params.at("team");
-    // TODO: this draft computes available from a nightly aggregate that ignores same-day
+    // TODO: this starter computes available from a nightly aggregate that ignores same-day
     // reservations, and it serves any team id to any caller. Read the same ledger the reserve path
     // writes (quota:{team}:{window}), compute available = limit - reserved - consumed, require a
     // valid window, and answer 403 when the path team is not the authenticated one.

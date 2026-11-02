@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Semantic cache on the AI-era track: the course is not "put a vector in Redis", it is the review
- * you owe a model-generated answer cache before it serves one tenant's answer to another tenant's
- * question. A lookup whose similarity floor the caller cannot lower → entries written atomically
- * into a per-tenant, per-version index → a model call on miss with a deadline and a cacheability
- * policy → text-free result events with an outbox → stats that report age, not just a hit rate.
+ * Semantic cache: the course is not "put a vector in Redis", it is the debugging you owe an answer
+ * cache before it serves one tenant's answer to another tenant's question. A lookup whose
+ * similarity floor the caller cannot lower → entries written atomically into a per-tenant,
+ * per-version index → a model call on miss with a deadline and a cacheability policy → text-free
+ * result events with an outbox → stats that report age, not just a hit rate.
  */
 export const semanticCacheProblem: Problem = {
   id: 'semantic-cache',
@@ -19,7 +19,7 @@ export const semanticCacheProblem: Problem = {
   tagline: 'Answer cache by meaning, not bytes, with tenant and version safety.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Semantic Cache
 
@@ -63,12 +63,12 @@ One service, **semcached**, with five pieces:
    automated near-duplicate traffic, an average similarity over hits, and the share of hits older
    than an hour — and **403** for anyone asking about another tenant.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

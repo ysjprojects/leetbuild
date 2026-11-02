@@ -8,9 +8,9 @@ export const shadowReadStep: Step = {
   focus: ['client', 'shadow', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it loads a config's samples,
-computes a delta and returns a verdict. It compiles and the demo shows a winner. The flaw is that it
-celebrates. Review it, fix it, and prove the fix.
+**Starting point.** The starter is working code: it loads a config's samples, computes a delta and
+returns a verdict. It compiles and the demo shows a winner. The flaw is that it celebrates. Debug
+it, fix it, and prove the fix.
 
 Implement \`GET /v1/shadow/configs/{id}/report\`, the endpoint that turns paired samples into a
 usable answer.
@@ -27,7 +27,7 @@ usable answer.
 - Never return the raw samples or any request content; the report is counts, deltas, an interval and
   a window.
 
-**Failure mode the checks target.** The draft declares a winner from **12 pairs** because the delta
+**Failure mode the checks target.** The starter declares a winner from **12 pairs** because the delta
 is positive; it **hides the sample count** and returns no interval; and it serves **any config to any
 caller**, so one tenant can read another's experiment. Each of those turns a measurement into a
 decision it cannot support.`,
@@ -59,7 +59,7 @@ decision it cannot support.`,
       id: 'samples',
       title: 'Reports the sample count and refuses to decide below 500 pairs',
       detail:
-        'The response carries the paired sample count and the verdict is `inconclusive` when it is under 500. The draft declares a winner on 12 pairs and hides the count, so a positive fluke ships.',
+        'The response carries the paired sample count and the verdict is `inconclusive` when it is under 500. The starter declares a winner on 12 pairs and hides the count, so a positive fluke ships.',
       match: {
         python: {all: [/MIN_PAIRED_SAMPLES\s*=\s*500/, /sample_count|samples/]},
         typescript: {all: [/MIN_PAIRED_SAMPLES\s*=\s*500/, /sample_count|samples/]},
@@ -72,7 +72,7 @@ decision it cannot support.`,
       id: 'interval',
       title: 'Returns a confidence interval with the delta',
       detail:
-        'The report returns `ci_low` and `ci_high` alongside the delta. The draft reports a bare delta, so the reader cannot tell a real effect from noise.',
+        'The report returns `ci_low` and `ci_high` alongside the delta. The starter reports a bare delta, so the reader cannot tell a real effect from noise.',
       match: {
         python: {all: [/ci_low/, /ci_high/]},
         typescript: {all: [/ci_low/, /ci_high/]},
@@ -85,7 +85,7 @@ decision it cannot support.`,
       id: 'window',
       title: 'Reports the exact traffic window',
       detail:
-        'The response carries `window_start` and `window_end` for the samples. The draft returns none, so a delta cannot be tied to the period and traffic mix it came from.',
+        'The response carries `window_start` and `window_end` for the samples. The starter returns none, so a delta cannot be tied to the period and traffic mix it came from.',
       match: {
         python: {all: [/window_start/, /window_end/]},
         typescript: {all: [/window_start/, /window_end/]},
@@ -98,7 +98,7 @@ decision it cannot support.`,
       id: 'tenant-scope',
       title: 'Scopes the report to the tenant and 404s a foreign config',
       detail:
-        'The config is loaded for the authenticated tenant, and a config that is not theirs is **404**. The draft serves any config to any caller, so one tenant reads another’s experiment.',
+        'The config is loaded for the authenticated tenant, and a config that is not theirs is **404**. The starter serves any config to any caller, so one tenant reads another’s experiment.',
       match: {
         python: {all: [/status_code\s*=\s*404/, /tenant/]},
         typescript: {all: [/code\(\s*404\s*\)/, /tenant/i]},
@@ -133,8 +133,8 @@ def shadow_report(
     id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: the draft declares a winner from twelve pairs because the delta is positive, hides the
-    # sample count and the interval, and serves any config to any caller. Review all three.
+    # TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
+    # sample count and the interval, and serves any config to any caller. Fix all three.
     report = store.load(id)
     deltas = report["deltas"]
     delta = sum(deltas) / len(deltas)
@@ -210,7 +210,7 @@ def shadow_report(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/shadow/configs/{id}/report: a model-generated draft that celebrates too early. */
+      starter: `/** GET /v1/shadow/configs/{id}/report: flawed code that celebrates too early. */
 import Fastify from 'fastify';
 
 import {reportStore} from './store';
@@ -218,8 +218,8 @@ import {reportStore} from './store';
 export const app = Fastify();
 
 app.get<{Params: {id: string}}>('/v1/shadow/configs/:id/report', async (request, reply) => {
-  // TODO: the draft declares a winner from twelve pairs because the delta is positive, hides the
-  // sample count and the interval, and serves any config to any caller. Review all three.
+  // TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
+  // sample count and the interval, and serves any config to any caller. Fix all three.
   const {id} = request.params;
   const report = await reportStore.load(id);
   const delta = report.deltas.reduce((sum: number, d: number) => sum + d, 0) / report.deltas.length;
@@ -299,8 +299,8 @@ func (s *ReportStore) Load(configID string) (map[string]any, error) {
 var reportStore = &ReportStore{}
 
 func shadowReport(rw http.ResponseWriter, r *http.Request) {
-	// TODO: the draft declares a winner from twelve pairs because the delta is positive, hides the
-	// sample count and the interval, and serves any config to any caller. Review all three.
+	// TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
+	// sample count and the interval, and serves any config to any caller. Fix all three.
 	configID := r.PathValue("id")
 	report, _ := reportStore.Load(configID)
 	verdict := "inconclusive"
@@ -419,8 +419,8 @@ object ShadowReport {
   val route: Route =
     path("v1" / "shadow" / "configs" / Segment / "report") { configId =>
       get {
-        // TODO: the draft declares a winner from twelve pairs because the delta is positive, hides
-        // the sample count and the interval, and serves any config to any caller. Review all three.
+        // TODO: the starter declares a winner from twelve pairs because the delta is positive, hides
+        // the sample count and the interval, and serves any config to any caller. Fix all three.
         val report = reportStore.load(configId)
         val verdict = if (report.delta > 0) "candidate_better" else "inconclusive"
         complete(StatusCodes.OK, "{\\"config_id\\":\\"" + configId + "\\",\\"verdict\\":\\"" + verdict + "\\"}")
@@ -524,8 +524,8 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/shadow/configs/(\\d+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft declares a winner from twelve pairs because the delta is positive, hides the
-    // sample count and the interval, and serves any config to any caller. Review all three.
+    // TODO: the starter declares a winner from twelve pairs because the delta is positive, hides the
+    // sample count and the interval, and serves any config to any caller. Fix all three.
     const auto configId = req.matches[1].str();
     const auto report = reportStore.load(configId);
     const std::string verdict = report.delta > 0 ? "candidate_better" : "inconclusive";

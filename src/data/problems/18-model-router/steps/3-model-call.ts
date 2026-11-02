@@ -8,7 +8,7 @@ export const modelCallStep: Step = {
   focus: ['router', 'provider', 'fallback'],
   task: `## Task
 
-The starter is a plausible model-generated draft: when the provider is healthy it streams tokens
+The starter is working code: when the provider is healthy it streams tokens
 correctly, so the demo passes. Every failure path is wrong. Find them, fix them, and prove the fix.
 
 Implement \`generate(model, prompt, on_token)\` for the router’s provider layer:
@@ -24,9 +24,9 @@ Implement \`generate(model, prompt, on_token)\` for the router’s provider laye
 - Once the **first token has been delivered** to the caller, **never retry**: a replay would
   duplicate output the user already read and bill it twice.
 
-**Failure mode the checks target.** The draft catches every error and loops forever: a permanent
+**Failure mode the checks target.** The starter catches every error and loops forever: a permanent
 \`INVALID_ARGUMENT\` spins the worker, a bad deployment becomes a hot loop against a struggling
-provider, there is nothing to fall back to, and after a partial answer the draft replays the stream
+provider, there is nothing to fall back to, and after a partial answer the starter replays the stream
 from the start. Each of those is silent in a demo and loud in production.`,
   sequence: {
     participants: ['Model Router', 'Provider', 'Fallback'],
@@ -46,7 +46,7 @@ from the start. Each of those is silent in a demo and loud in production.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with a constant and a `for` loop: the draft’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
+    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with a constant and a `for` loop: the starter’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
     'Retryability is a property of the status, not of “it threw”: capture the error, compare its code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, and return anything else to the caller immediately.',
     'A breaker is a failure counter per provider: record only retryable failures, check it before each attempt, and open it for 30 s after five. Track `delivered` as you yield tokens: once a token is out, a retry is a duplicate, so raise instead.',
   ],
@@ -68,7 +68,7 @@ from the start. Each of those is silent in a demo and loud in production.`,
       id: 'retry-policy',
       title: 'At most three attempts, only the two retryable codes',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The draft retries every error forever.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The starter retries every error forever.',
       match: {
         python: {
           all: [
@@ -106,7 +106,7 @@ from the start. Each of those is silent in a demo and loud in production.`,
       id: 'fallback',
       title: 'Fails over to the fallback model',
       detail:
-        'When the primary’s attempts are exhausted, the same bounded loop runs against the fallback model. The draft only ever talks to the primary.',
+        'When the primary’s attempts are exhausted, the same bounded loop runs against the fallback model. The starter only ever talks to the primary.',
       match: {
         python: {all: [/fallback/, /\.Stream\(/]},
         typescript: {all: [/fallback/, /\.Stream\(/]},
@@ -246,7 +246,7 @@ def generate(model: str, prompt: str, on_token) -> str:
 `,
     },
     typescript: {
-      starter: `/** Provider call: a model-generated draft that retries every failure forever. */
+      starter: `/** Provider call: flawed code that retries every failure forever. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -748,5 +748,5 @@ std::string generate(
 `,
     },
   },
-  debrief: `The interviewer is probing one question under many names: what is the worst case of this call? A deadline bounds one attempt, max attempts bound the call, the retryable set decides which failures are even worth another attempt, and the breaker bounds the damage to a struggling provider across requests. The fallback is the business continuity answer, and the delivered flag is the correctness answer: streaming is not idempotent, so a retry after the first token duplicates output and usage. The draft looks fine because a healthy provider never enters any of these paths. Real clients add jittered backoff between attempts, per-endpoint concurrency limits, and a half-open breaker that lets one probe request through to test recovery.`,
+  debrief: `The interviewer is probing one question under many names: what is the worst case of this call? A deadline bounds one attempt, max attempts bound the call, the retryable set decides which failures are even worth another attempt, and the breaker bounds the damage to a struggling provider across requests. The fallback is the business continuity answer, and the delivered flag is the correctness answer: streaming is not idempotent, so a retry after the first token duplicates output and usage. The starter looks fine because a healthy provider never enters any of these paths. Real clients add jittered backoff between attempts, per-endpoint concurrency limits, and a half-open breaker that lets one probe request through to test recovery.`,
 };

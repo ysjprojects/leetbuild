@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'registry', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route,
+**Starting point.** The starter is working code: it registers the route,
 parses the body and answers 201, so the demo shows a version being stored. It overwrites versions in
-place, ships undeclared placeholders, and mints a new version on every retry. Review it like the
+place, ships undeclared placeholders, and mints a new version on every retry. Debug it like the
 service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/prompts\`, the registration endpoint of the prompt registry. Body:
@@ -32,7 +32,7 @@ Implement \`POST /v1/prompts\`, the registration endpoint of the prompt registry
   template is **409**; the same \`(name, version)\` with the same template is a replay and returns
   the **original** \`content_hash\` with **200**.
 
-**Failure mode the checks target.** The draft's \`put\` overwrites whatever was there, so an edit
+**Failure mode the checks target.** The starter's \`put\` overwrites whatever was there, so an edit
 silently rewrites history that evals were run against; it never compares the template’s placeholders
 with the declared variables, so \`{{name}}\` typos ship verbatim; and it has no key, so a client
 retry forks the version history into two versions with the same number.`,
@@ -69,7 +69,7 @@ retry forks the version history into two versions with the same number.`,
       id: 'template-cap',
       title: 'Requires a tenant and caps the template at 32 KiB',
       detail:
-        'A missing `X-Tenant-Id` is **401** and a template over `1 << 15` bytes is **413**, checked before anything is stored. The draft authenticates nobody and stores a template of any size.',
+        'A missing `X-Tenant-Id` is **401** and a template over `1 << 15` bytes is **413**, checked before anything is stored. The starter authenticates nobody and stores a template of any size.',
       match: {
         python: {all: [/MAX_TEMPLATE_BYTES/, /status_code\s*=\s*413/, /status_code\s*=\s*401/]},
         typescript: {all: [/MAX_TEMPLATE_BYTES/, /code\(\s*413\s*\)/, /code\(\s*401\s*\)/]},
@@ -82,7 +82,7 @@ retry forks the version history into two versions with the same number.`,
       id: 'immutable',
       title: 'A version is immutable: a different write is 409',
       detail:
-        'The stored version is fetched first; a second write of the same `(name, version)` with a different content hash answers **409**, and the same hash is a replay. The draft overwrites the record in place.',
+        'The stored version is fetched first; a second write of the same `(name, version)` with a different content hash answers **409**, and the same hash is a replay. The starter overwrites the record in place.',
       match: {
         python: {all: [/\b409\b/, /content_hash/, /store\.get_version\(/]},
         typescript: {all: [/\b409\b/, /content_hash/, /store\.getVersion\(/]},
@@ -95,7 +95,7 @@ retry forks the version history into two versions with the same number.`,
       id: 'variable-allowlist',
       title: 'Rejects undeclared placeholders',
       detail:
-        'Placeholders are extracted from the template and compared with the declared `variables` and the `ALLOWED_VARIABLES` set; an undeclared or unknown placeholder answers **422**. The draft never reads either.',
+        'Placeholders are extracted from the template and compared with the declared `variables` and the `ALLOWED_VARIABLES` set; an undeclared or unknown placeholder answers **422**. The starter never reads either.',
       match: {
         python: {all: [/ALLOWED_VARIABLES/, /PLACEHOLDER_RE/, /status_code\s*=\s*422/]},
         typescript: {all: [/ALLOWED_VARIABLES/, /PLACEHOLDER_RE/, /code\(\s*422\s*\)/]},
@@ -146,9 +146,9 @@ store = VersionStore()
 
 @app.post("/v1/prompts")
 def register(body: PromptRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft overwrites an existing version in place, ships the template without
+    # TODO: this starter overwrites an existing version in place, ships the template without
     # checking its placeholders against the variable allowlist, and mints a new version on every
-    # retry because the registration is not keyed by Idempotency-Key. Review all three.
+    # retry because the registration is not keyed by Idempotency-Key. Fix all three.
     store.put(tenant, body.name, body.version, {"name": body.name, "version": body.version})
     return JSONResponse({"name": body.name, "version": body.version, "stored": True}, status_code=201)
 `,
@@ -250,7 +250,7 @@ def register(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/prompts: a model-generated draft that overwrites versions in place. */
+      starter: `/** POST /v1/prompts: flawed code that overwrites versions in place. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -266,9 +266,9 @@ interface PromptBody {
 }
 
 app.post('/v1/prompts', async (request, reply) => {
-  // TODO: this draft overwrites an existing version in place, ships the template without checking
+  // TODO: this starter overwrites an existing version in place, ships the template without checking
   // its placeholders against the variable allowlist, and mints a new version on every retry
-  // because the registration is not keyed by Idempotency-Key. Review all three.
+  // because the registration is not keyed by Idempotency-Key. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as PromptBody;
   await store.put(tenant, body.name, body.version, {name: body.name, version: body.version});
@@ -393,9 +393,9 @@ func register(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft overwrites an existing version in place, ships the template without
+	// TODO: this starter overwrites an existing version in place, ships the template without
 	// checking its placeholders against the variable allowlist, and mints a new version on every
-	// retry because the registration is not keyed by Idempotency-Key. Review all three.
+	// retry because the registration is not keyed by Idempotency-Key. Fix all three.
 	store.Put(r.Context(), tenant, body.Name, body.Version, map[string]any{
 		"name": body.Name, "version": body.Version,
 	})
@@ -621,7 +621,7 @@ object PromptApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[PromptRequest]) { body =>
-            // TODO: this draft overwrites an existing version in place, ships the template without
+            // TODO: this starter overwrites an existing version in place, ships the template without
             // checking its placeholders against the variable allowlist, and mints a new version on
             // every retry because the registration is not keyed by Idempotency-Key.
             store.put(tenant, body.name, body.version, s"""{"name":"\${body.name}","version":\${body.version}}""")
@@ -761,9 +761,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft overwrites an existing version in place, ships the template without
+    // TODO: this starter overwrites an existing version in place, ships the template without
     // checking its placeholders against the variable allowlist, and mints a new version on every
-    // retry because the registration is not keyed by Idempotency-Key. Review all three.
+    // retry because the registration is not keyed by Idempotency-Key. Fix all three.
     store.put(tenant, body.value("name", std::string()), body.value("version", 0), body);
     res.status = 201;
     res.set_content(json{{"name", body.value("name", std::string())}, {"version", body.value("version", 0)}, {"stored", true}}.dump(), "application/json");

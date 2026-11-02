@@ -8,10 +8,9 @@ export const readStep: Step = {
   focus: ['api', 'trending', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads recent queries and
-returns the popular ones for the trending rail. It compiles, it shows something on the demo, and it
-hides three production flaws. Review it like the service owner, fix it, and prove the fix with the
-checks below.
+**Starting point.** The starter is working code: it reads recent queries and returns the popular
+ones for the trending rail. It compiles, it shows something on the demo, and it hides three
+production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/trending\`.
 
@@ -56,7 +55,7 @@ without it, a high-count term from a category that should never surface becomes 
       id: 'occurrence-floor',
       title: 'Applies the 100-occurrence floor',
       detail:
-        'A term trends only at `MIN_TREND_COUNT = 100` occurrences in the window. The draft promotes single-occurrence queries.',
+        'A term trends only at `MIN_TREND_COUNT = 100` occurrences in the window. The starter promotes single-occurrence queries.',
       match: {
         python: {all: [/MIN_TREND_COUNT/, /count\s*[<>]=?\s*MIN_TREND_COUNT/]},
         typescript: {all: [/MIN_TREND_COUNT/, /count\s*[<>]=?\s*MIN_TREND_COUNT/]},
@@ -69,7 +68,7 @@ without it, a high-count term from a category that should never surface becomes 
       id: 'window',
       title: 'Bounds trends to an explicit window',
       detail:
-        'The read aggregates over `WINDOW_SECONDS`, so "popular" has a time bound. The draft has no window and trends are unbounded in time.',
+        'The read aggregates over `WINDOW_SECONDS`, so "popular" has a time bound. The starter has no window and trends are unbounded in time.',
       match: {
         python: {all: [/WINDOW_SECONDS/]},
         typescript: {all: [/WINDOW_SECONDS/]},
@@ -81,7 +80,7 @@ without it, a high-count term from a category that should never surface becomes 
     {
       id: 'sensitive-filter',
       title: 'Filters sensitive categories',
-      detail: 'Terms in a sensitive category never trend, whatever their count. The draft has no category filter.',
+      detail: 'Terms in a sensitive category never trend, whatever their count. The starter has no category filter.',
       match: {
         python: {all: [/SENSITIVE_CATEGORIES/]},
         typescript: {all: [/SENSITIVE_CATEGORIES/]},
@@ -94,7 +93,7 @@ without it, a high-count term from a category that should never surface becomes 
       id: 'no-user-linkage',
       title: 'Carries no user linkage',
       detail:
-        'A trend entry is the term and its count — no user id, no session id. The draft attaches the `user_id` that triggered the trend.',
+        'A trend entry is the term and its count — no user id, no session id. The starter attaches the `user_id` that triggered the trend.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/trending["']/], none: [/\buser_id\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/trending['"]/], none: [/\buser_id\b/]},
@@ -113,7 +112,7 @@ app = FastAPI()
 
 @app.get("/v1/trending")
 def trending(x_tenant_id: str = ""):
-    # TODO: this draft promotes raw queries with a single occurrence as trends and links each
+    # TODO: this starter promotes raw queries with a single occurrence as trends and links each
     # trend entry to the user who triggered it, so a person's name trends after one search.
     rows = index.recent_queries(x_tenant_id)
     return {
@@ -150,7 +149,7 @@ def trending(x_tenant_id: str = Header(default="")):
 export const app = Fastify();
 
 app.get('/v1/trending', async (request, reply) => {
-  // TODO: this draft promotes raw queries with a single occurrence as trends and links each
+  // TODO: this starter promotes raw queries with a single occurrence as trends and links each
   // trend entry to the user who triggered it, so a person's name trends after one search.
   const tenant = request.headers['x-tenant-id'] as string;
   const rows = await index.recentQueries(tenant);
@@ -187,7 +186,7 @@ import (
 )
 
 func trending(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft promotes raw queries with a single occurrence as trends and links each
+	// TODO: this starter promotes raw queries with a single occurrence as trends and links each
 	// trend entry to the user who triggered it, so a person's name trends after one search.
 	tenant := r.Header.Get("X-Tenant-Id")
 	rows := index.RecentQueries(tenant)
@@ -265,7 +264,7 @@ object Read {
     path("v1" / "trending") {
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: this draft promotes raw queries with a single occurrence as trends and links
+          // TODO: this starter promotes raw queries with a single occurrence as trends and links
           // each trend entry to the user who triggered it.
           val rows = index.recentQueries(tenant)
           val entries = rows.map(row => s"""{"term":"\${row.text}","count":\${row.count},"user_id":"\${row.userId}"}""")
@@ -326,7 +325,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/trending", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft promotes raw queries with a single occurrence as trends and links each
+    // TODO: this starter promotes raw queries with a single occurrence as trends and links each
     // trend entry to the user who triggered it.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json entries = json::array();
@@ -383,5 +382,5 @@ int main() {
     'Filter by category, not by count: a sensitive term with 100 000 occurrences still must not trend. Exclude the category before you rank.',
     'The response is the term and its count. Nothing about the user who searched belongs in it — not the user id, not the session id, not the tenant. Aggregates are safe to cache and to log; per-user rows are not.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated analytics read at the privacy boundary. The draft reads fine because the demo searches the same term many times. Three defects are being checked. No occurrence floor means the first search of a person's name publishes it to everyone on the next page load — the trending rail is the highest-traffic place a term can land. Attaching the user who triggered the trend turns an aggregate read into a per-user leak that survives in caches and logs. The missing sensitive-category filter is the third: a high-count term from a category that should never surface becomes the top trend. Real reads add k-anonymity over distinct searchers, a rolling window computed offline so the read is a cache hit, and a review path for terms that are trending but should not be.`,
+  debrief: `The interviewer is testing whether you can debug an analytics read at the privacy boundary. The starter reads fine because the demo searches the same term many times. Three defects are being checked. No occurrence floor means the first search of a person's name publishes it to everyone on the next page load — the trending rail is the highest-traffic place a term can land. Attaching the user who triggered the trend turns an aggregate read into a per-user leak that survives in caches and logs. The missing sensitive-category filter is the third: a high-count term from a category that should never surface becomes the top trend. Real reads add k-anonymity over distinct searchers, a rolling window computed offline so the read is a cache hit, and a review path for terms that are trending but should not be.`,
 };

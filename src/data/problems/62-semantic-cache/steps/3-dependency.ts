@@ -8,10 +8,10 @@ export const dependencyStep: Step = {
   focus: ['cache', 'llm', 'policy'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: on a cache miss it calls the
-model, retries when the reply is refused or the call fails, and writes whatever came back into the
-store. It compiles, the demo answers, and every flaw it has either burns model calls or poisons the
-entry that the next near-duplicate question will hit. Review the miss path, fix it, prove the fix.
+**Starting point.** The starter is working code: on a cache miss it calls the model, retries when
+the reply is refused or the call fails, and writes whatever came back into the store. It compiles,
+the demo answers, and every flaw it has either burns model calls or poisons the entry that the next
+near-duplicate question will hit. Debug the miss path, fix it, prove the fix.
 
 Implement the model client the cache calls on a miss:
 
@@ -36,7 +36,7 @@ Implement the model client the cache calls on a miss:
 
 **Failure mode the checks target.** Every flaw is the same confusion between "a reply arrived" and
 "an answer may be reused". A refusal is a decision, a tool result is a fragment of one conversation,
-and a sampled or partial answer is one draw from a distribution — yet the draft writes all of them
+and a sampled or partial answer is one draw from a distribution — yet the starter writes all of them
 under a key whose whole promise is "this question has this answer". The retry loop is the other half:
 it spends three model calls on a refusal that cannot change, and after the third it caches the
 refusal, so the next near-duplicate question is answered "I can't help with that" for the entry's
@@ -74,7 +74,7 @@ whole TTL — with no policy version on it that could ever invalidate it.`,
       id: 'deadline',
       title: 'One attempt under a 4-second deadline',
       detail:
-        'The single `Answer` call carries the `MODEL_DEADLINE_SECONDS = 4` per-call deadline (`timeout=`, `deadline: Date.now() + 4s`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) and there is no retry loop around it. The draft calls the model with no bound and retries three times, so one stuck model turns a single miss into twelve seconds of held thread and connection.',
+        'The single `Answer` call carries the `MODEL_DEADLINE_SECONDS = 4` per-call deadline (`timeout=`, `deadline: Date.now() + 4s`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) and there is no retry loop around it. The starter calls the model with no bound and retries three times, so one stuck model turns a single miss into twelve seconds of held thread and connection.',
       match: {
         python: {
           all: [/MODEL_DEADLINE_SECONDS\s*=\s*4\b/, /timeout=MODEL_DEADLINE_SECONDS/, /\.Answer\(/],
@@ -114,7 +114,7 @@ whole TTL — with no policy version on it that could ever invalidate it.`,
       id: 'refusal-terminal',
       title: 'A refusal is terminal',
       detail:
-        'A refused reply raises `RefusalError` and is never retried and never written back: the model made a decision, and a cached refusal would answer an unrelated near-duplicate question with "I can not help with that" for the entry\u2019s whole TTL. The draft retries the refusal three times and then hands it to `write_back` like an answer.',
+        'A refused reply raises `RefusalError` and is never retried and never written back: the model made a decision, and a cached refusal would answer an unrelated near-duplicate question with "I can not help with that" for the entry\u2019s whole TTL. The starter retries the refusal three times and then hands it to `write_back` like an answer.',
       match: {
         python: {all: [/class RefusalError/, /refused/, /raise RefusalError\(/]},
         typescript: {all: [/class RefusalError/, /refused/, /throw new RefusalError\(/]},
@@ -127,7 +127,7 @@ whole TTL — with no policy version on it that could ever invalidate it.`,
       id: 'cacheable-gate',
       title: 'Only self-contained, deterministic, policy-cacheable answers are cached',
       detail:
-        '`is_cacheable` is true only when the reply is `self_contained`, `deterministic` and its `policy.cacheable` flag is set; everything else is returned to its own caller and stored for nobody. The draft has no gate, so the first caller\u2019s sample or partial answer becomes the answer for the whole index.',
+        '`is_cacheable` is true only when the reply is `self_contained`, `deterministic` and its `policy.cacheable` flag is set; everything else is returned to its own caller and stored for nobody. The starter has no gate, so the first caller\u2019s sample or partial answer becomes the answer for the whole index.',
       match: {
         python: {all: [/def is_cacheable\(/, /self_contained/, /deterministic/, /policy\.cacheable/]},
         typescript: {all: [/isCacheable\s*[(=]/, /self_contained/, /deterministic/, /policy\.cacheable/]},
@@ -147,7 +147,7 @@ whole TTL — with no policy version on it that could ever invalidate it.`,
       id: 'no-tool-cache',
       title: 'A tool-dependent answer is never cached',
       detail:
-        'A result carrying `tool_calls` fails the gate and returns false: a tool result belongs to the question that triggered the tool, not to every near-duplicate the index will match. The draft stores it like any other answer, so a one-time tool result is served as an answer for an hour.',
+        'A result carrying `tool_calls` fails the gate and returns false: a tool result belongs to the question that triggered the tool, not to every near-duplicate the index will match. The starter stores it like any other answer, so a one-time tool result is served as an answer for an hour.',
       match: {
         python: {all: [/if[^\n]*tool_calls[^\n]*:/, /return False/]},
         typescript: {all: [/if[^\n]*tool_calls[^\n]*\)/, /return false/]},
@@ -160,7 +160,7 @@ whole TTL — with no policy version on it that could ever invalidate it.`,
       id: 'policy-version',
       title: 'Cacheable answers carry their policy version',
       detail:
-        'The entry written back carries `policy_version: SERVING_POLICY_VERSION` (`"2024-06-1"`), so a policy change can invalidate every answer the old policy approved. The draft stores the answer with no version, so a policy change can never reach the entries already in the index.',
+        'The entry written back carries `policy_version: SERVING_POLICY_VERSION` (`"2024-06-1"`), so a policy change can invalidate every answer the old policy approved. The starter stores the answer with no version, so a policy change can never reach the entries already in the index.',
       match: {
         python: {all: [/SERVING_POLICY_VERSION\s*=\s*["']2024-06-1["']/, /"policy_version"\s*:/]},
         typescript: {all: [/SERVING_POLICY_VERSION\s*=\s*'2024-06-1'/, /policy_version\s*:/]},
@@ -187,9 +187,9 @@ class EntryStore:
 
 
 def answer_once(channel: grpc.Channel, question: str):
-    # TODO: this draft calls the model with no deadline, retries three times — the refusal
+    # TODO: this starter calls the model with no deadline, retries three times — the refusal
     # included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-    # for the next near-duplicate, and no policy version is stamped on the entry. Review it all.
+    # for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
     stub = answer_pb2_grpc.AnswerServiceStub(channel)
     reply = None
     for attempt in range(3):
@@ -262,7 +262,7 @@ def write_back(store: EntryStore, tenant: str, model_version: str, result) -> st
 `,
     },
     typescript: {
-      starter: `/** The model client the cache calls on a miss: a model-generated draft. */
+      starter: `/** The model client the cache calls on a miss: flawed code. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';
@@ -291,9 +291,9 @@ interface EntryStore {
 }
 
 export async function answerOnce(stub: AnswerClient, question: string): Promise<AnswerResult> {
-  // TODO: this draft calls the model with no deadline, retries three times — the refusal included —
+  // TODO: this starter calls the model with no deadline, retries three times — the refusal included —
   // and writes every reply: a refusal or a tool-dependent answer becomes the answer for the next
-  // near-duplicate, and no policy version is stamped on the entry. Review all of it.
+  // near-duplicate, and no policy version is stamped on the entry. Fix all of it.
   let reply: AnswerResult | null = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
@@ -421,9 +421,9 @@ func (s *EntryStore) Put(ctx context.Context, key string, entry CacheEntry) erro
 }
 
 func answerOnce(ctx context.Context, client pb.AnswerServiceClient, question string) (*pb.AnswerResult, error) {
-	// TODO: this draft calls the model with no deadline, retries three times — the refusal
+	// TODO: this starter calls the model with no deadline, retries three times — the refusal
 	// included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-	// for the next near-duplicate, and no policy version is stamped on the entry. Review it all.
+	// for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
 	var reply *pb.AnswerResult
 	for attempt := 0; attempt < 3; attempt++ {
 		got, err := client.Answer(ctx, &pb.AnswerRequest{Question: question})
@@ -538,9 +538,9 @@ trait EntryStore {
 
 object AnswerClient {
   def answerOnce(stub: AnswerServiceGrpc.AnswerServiceBlockingStub, question: String): AnswerResult = {
-    // TODO: this draft calls the model with no deadline, retries three times — the refusal
+    // TODO: this starter calls the model with no deadline, retries three times — the refusal
     // included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-    // for the next near-duplicate, and no policy version is stamped on the entry. Review it all.
+    // for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
     var reply: Option[AnswerResult] = None
     var attempt = 0
     while (attempt < 3) {
@@ -623,9 +623,9 @@ std::string uuidString();
 
 std::optional<answer::AnswerResult> answerOnce(answer::AnswerService::StubInterface* stub,
                                                const std::string& question) {
-  // TODO: this draft calls the model with no deadline, retries three times — the refusal
+  // TODO: this starter calls the model with no deadline, retries three times — the refusal
   // included — and writes every reply: a refusal or a tool-dependent answer becomes the answer
-  // for the next near-duplicate, and no policy version is stamped on the entry. Review it all.
+  // for the next near-duplicate, and no policy version is stamped on the entry. Fix all of it.
   answer::AnswerRequest request;
   request.set_question(question);
   std::optional<answer::AnswerResult> reply;
@@ -700,5 +700,5 @@ std::optional<std::string> writeBack(EntryStore& store, const std::string& tenan
 `,
     },
   },
-  debrief: `The interviewer is testing the miss path, which a generated draft always gets "working" because the demo's model only ever returns text. The four defects are one idea: a cache entry is a promise about future questions, so only an answer that is self-contained, deterministic and approved by the serving policy may be written — a refusal is a decision about one question, and a tool result is a fragment of one conversation, so both are returned to their own caller and stored for nobody. The 4-second deadline and the single attempt are the other half of the contract: without them one slow or refusing model turns a single miss into three calls and an unbounded wait. Real clients add jittered backoff one layer above, shadow traffic that compares cached answers against fresh ones before the cache is trusted, and a policy version on every entry so a policy change can invalidate what the old policy approved.`,
+  debrief: `The interviewer is testing the miss path, which a first attempt always gets "working" because the demo's model only ever returns text. The four defects are one idea: a cache entry is a promise about future questions, so only an answer that is self-contained, deterministic and approved by the serving policy may be written — a refusal is a decision about one question, and a tool result is a fragment of one conversation, so both are returned to their own caller and stored for nobody. The 4-second deadline and the single attempt are the other half of the contract: without them one slow or refusing model turns a single miss into three calls and an unbounded wait. Real clients add jittered backoff one layer above, shadow traffic that compares cached answers against fresh ones before the cache is trusted, and a policy version on every entry so a policy change can invalidate what the old policy approved.`,
 };

@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'registry', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, mints a
+**Starting point.** The starter is working code: it registers the route, mints a
 job id and answers \`201 queued\`. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the owner of the queue, fix it, and prove the fix with the checks below.
+flaws. Debug it like the owner of the queue, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/jobs\` with body \`{"type": "email.send", "payload": {"to": "…", "subject": "…"}}\`.
 
@@ -69,7 +69,7 @@ dead-lettered it for a reason that was knowable at the door.`,
       id: 'job-type',
       title: 'An unregistered job type is 400 before anything is enqueued',
       detail:
-        'The type is looked up in the job registry and rejected with **400** before the dedupe reservation, the job row and the queue write. The draft accepts whatever it is given, so a typo produces a job no worker will ever run.',
+        'The type is looked up in the job registry and rejected with **400** before the dedupe reservation, the job row and the queue write. The starter accepts whatever it is given, so a typo produces a job no worker will ever run.',
       match: {
         python: {all: [/JOB_REGISTRY/, /status_code\s*=\s*400/], order: [/JOB_REGISTRY/, /\.enqueue\(/]},
         typescript: {all: [/JOB_REGISTRY/, /code\(400\)/], order: [/JOB_REGISTRY/, /enqueue\(/]},
@@ -82,7 +82,7 @@ dead-lettered it for a reason that was knowable at the door.`,
       id: 'payload-schema',
       title: 'A schema-invalid payload is 422 with the offending path',
       detail:
-        'The payload is validated against the type’s schema and the first rejected path is returned: missing field, wrong type, or a field the closed schema does not list. The draft passes the payload straight through, so the failure surfaces in a worker after five attempts instead of at the door.',
+        'The payload is validated against the type’s schema and the first rejected path is returned: missing field, wrong type, or a field the closed schema does not list. The starter passes the payload straight through, so the failure surfaces in a worker after five attempts instead of at the door.',
       match: {
         python: {all: [/def validate_payload\(/, /status_code\s*=\s*422/, /['"]path['"]/]},
         typescript: {all: [/function validatePayload\(/, /code\(422\)/, /path:/]},
@@ -95,7 +95,7 @@ dead-lettered it for a reason that was knowable at the door.`,
       id: 'dedupe-window',
       title: 'A replayed Dedupe-Key returns the original job id',
       detail:
-        'The key is reserved with `SET jobs:dedupe:{tenant}:{key} <job_id> NX EX DEDUPE_WINDOW_S` (86 400 s) before the job is enqueued, and a replay reads the reserved id back and answers **200** with it instead of enqueueing a second job. The draft has no dedupe at all: a client retry runs the side effect twice.',
+        'The key is reserved with `SET jobs:dedupe:{tenant}:{key} <job_id> NX EX DEDUPE_WINDOW_S` (86 400 s) before the job is enqueued, and a replay reads the reserved id back and answers **200** with it instead of enqueueing a second job. The starter has no dedupe at all: a client retry runs the side effect twice.',
       match: {
         python: {all: [/DEDUPE_WINDOW_S/, /Dedupe-Key/, /reserve_dedupe\(/, /peek_dedupe\(/]},
         typescript: {all: [/DEDUPE_WINDOW_S/, /dedupe-key/, /reserveDedupe\(/, /peekDedupe\(/]},
@@ -108,7 +108,7 @@ dead-lettered it for a reason that was knowable at the door.`,
       id: 'durable-enqueue',
       title: 'The API issues the id, persists the job, and logs no payload',
       detail:
-        'The job id is an API-issued UUID and the job row is written before the response, so a retry can find the job it was told about. The log line carries ids and the type, never the payload. The draft mints a counter id, stores nothing and logs the request.',
+        'The job id is an API-issued UUID and the job row is written before the response, so a retry can find the job it was told about. The log line carries ids and the type, never the payload. The starter mints a counter id, stores nothing and logs the request.',
       match: {
         python: {all: [/uuid\.uuid4\(\)/, /store\.put\(/], none: [/logger\.\w+\([^)]*payload/]},
         typescript: {all: [/randomUUID\(\)/, /store\.put\(/], none: [/\.log\.\w+\([^)]*payload/]},
@@ -156,9 +156,9 @@ queue = JobQueue()
 
 @app.post("/v1/jobs")
 def enqueue(body: EnqueueRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft accepts any job type (so a worker silently skips an unknown one), passes the
+    # TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
     # payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-    # Review all three before a job is allowed to reach a worker.
+    # Fix all three before a job is allowed to reach a worker.
     job_id = f"job-{next(job_counter)}"
     logger.info("job enqueued job_id=%s tenant=%s type=%s", job_id, tenant, body.type)
     queue.enqueue({"job_id": job_id, "type": body.type, "payload": body.payload})
@@ -268,7 +268,7 @@ def enqueue(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/jobs: a model-generated draft that queues whatever it is handed. */
+      starter: `/** POST /v1/jobs: flawed code that queues whatever it is handed. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -285,9 +285,9 @@ const queue = {
 };
 
 app.post('/v1/jobs', async (request, reply) => {
-  // TODO: this draft accepts any job type (so a worker silently skips an unknown one), passes the
+  // TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
   // payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-  // Review all three before a job is allowed to reach a worker.
+  // Fix all three before a job is allowed to reach a worker.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as EnqueueBody;
   const jobId = \`job-\${++jobCounter}\`;
@@ -406,9 +406,9 @@ func enqueue(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts any job type (so a worker silently skips an unknown one), passes the
+	// TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
 	// payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-	// Review all three before a job is allowed to reach a worker.
+	// Fix all three before a job is allowed to reach a worker.
 	jobID := fmt.Sprintf("job-%d", jobCounter.Add(1))
 	log.Printf("job enqueued job_id=%s tenant=%s type=%s", jobID, tenant, body.Type)
 	queue.Enqueue(r.Context(), map[string]any{"job_id": jobID, "type": body.Type, "payload": body.Payload})
@@ -592,9 +592,9 @@ object JobApi {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[String]) { raw =>
             val body = raw.parseJson.asJsObject
-            // TODO: this draft accepts any job type (so a worker silently skips an unknown one),
+            // TODO: this starter accepts any job type (so a worker silently skips an unknown one),
             // passes the payload through unvalidated, and has no dedupe key, so a retried enqueue
-            // runs the job twice. Review all three before a job is allowed to reach a worker.
+            // runs the job twice. Fix all three before a job is allowed to reach a worker.
             val jobType = body.fields.get("type").collect { case JsString(value) => value }.getOrElse("")
             val jobId = s"job-\${jobCounter.incrementAndGet()}"
             system.log.info(s"job enqueued job_id=$jobId tenant=$tenant type=$jobType")
@@ -724,9 +724,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts any job type (so a worker silently skips an unknown one), passes the
+    // TODO: this starter accepts any job type (so a worker silently skips an unknown one), passes the
     // payload through unvalidated, and has no dedupe key, so a retried enqueue runs the job twice.
-    // Review all three before a job is allowed to reach a worker.
+    // Fix all three before a job is allowed to reach a worker.
     const auto jobId = "job-" + std::to_string(++jobCounter);
     const auto jobType = body.value("type", std::string());
     std::cerr << "job enqueued job_id=" << jobId << " tenant=" << tenant << " type=" << jobType << "\\n";
@@ -865,8 +865,8 @@ int main() {
     'The dedupe reservation must be one command: `SET jobs:dedupe:{tenant}:{key} <job_id> NX EX DEDUPE_WINDOW_S`. `NX` is what makes concurrent enqueues of the same key pick exactly one winner; the expiry is the documented window, so the key is a suppression window and not a permanent lock.',
     'The payload schema is closed and the rejection names a path, not the payload: `{"error": "invalid payload", "path": "amount_cents"}`. Return the path so the caller can fix the producer, and keep the payload out of the response and out of the log line.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the admission boundary of
-a queue. The draft reads fine because the demo posts one valid job from one tenant and never retries.
+  debrief: `The interviewer is testing whether you can debug a handler at the admission boundary of a
+queue. The starter reads fine because the demo posts one valid job from one tenant and never retries.
 Three defects are being checked: the registry lookup that keeps an unknown type from becoming a job
 no worker will ever run, the schema validation that turns a producer bug into a 422 at the door
 instead of five failed attempts in a worker, and the dedupe reservation that makes a client retry

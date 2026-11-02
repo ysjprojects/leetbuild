@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'gateway', 'sessions'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the body and hands back a session id, so the demo call connects. It hides four production flaws at
-the trust boundary. Review it like the service owner, fix it, and prove the fix with the checks below.
+the trust boundary. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/voice/sessions\` with body \`{"codec": "opus", "sample_rate": 48000, "max_duration_s": 1800}\`.
 
@@ -73,7 +73,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
       id: 'codec',
       title: 'Rejects an unsupported codec or sample rate with 415',
       detail:
-        '`codec` is checked against the supported set and `sample_rate` against the rates the pipeline accepts; an unsupported pair is **415**. The draft accepts any codec string and opens a stream the media pipeline cannot decode.',
+        '`codec` is checked against the supported set and `sample_rate` against the rates the pipeline accepts; an unsupported pair is **415**. The starter accepts any codec string and opens a stream the media pipeline cannot decode.',
       match: {
         python: {all: [/SUPPORTED_CODECS/, /status_code\s*=\s*415/]},
         typescript: {all: [/SUPPORTED_CODECS/, /code\(\s*415\s*\)/]},
@@ -86,7 +86,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
       id: 'duration',
       title: 'Caps the session at 30 minutes',
       detail:
-        'The duration defaults to 1800 s and anything from 1..1800 is accepted; a longer or non-positive value is **400**. The draft leaves the duration unlimited by default.',
+        'The duration defaults to 1800 s and anything from 1..1800 is accepted; a longer or non-positive value is **400**. The starter leaves the duration unlimited by default.',
       match: {
         python: {all: [/MAX_DURATION_S/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_DURATION_S/, /code\(\s*400\s*\)/]},
@@ -99,7 +99,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
       id: 'idempotent-resume',
       title: 'Resumes the live session for a replayed Idempotency-Key',
       detail:
-        '`Idempotency-Key` is required and `(tenant, key)` maps to the session that already exists; a replay answers 200 with the same `session_id` and its prior `turn_count`. The draft ignores the header and forks a second session on every reconnect.',
+        '`Idempotency-Key` is required and `(tenant, key)` maps to the session that already exists; a replay answers 200 with the same `session_id` and its prior `turn_count`. The starter ignores the header and forks a second session on every reconnect.',
       match: {
         python: {all: [/Idempotency-Key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count/]},
         typescript: {all: [/idempotency-key/, /sessions\.get\(/, /sessions\.put\(/, /turn_count/]},
@@ -112,7 +112,7 @@ network, so the idempotent resume is the flaw candidates miss most.`,
       id: 'tenant',
       title: 'Authenticates the tenant with 401',
       detail:
-        'The tenant comes from `X-Tenant-Id` and a missing or empty one is **401** before anything else happens. The draft reads the header but lets an anonymous caller through.',
+        'The tenant comes from `X-Tenant-Id` and a missing or empty one is **401** before anything else happens. The starter reads the header but lets an anonymous caller through.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
@@ -134,7 +134,7 @@ from pydantic import BaseModel
 app = FastAPI()
 logger = logging.getLogger("voice-gateway")
 
-DRAFT_DURATION_S = 86400
+DEFAULT_DURATION_S = 86400
 
 
 class CreateSession(BaseModel):
@@ -145,14 +145,14 @@ class CreateSession(BaseModel):
 
 @app.post("/v1/voice/sessions")
 def create_session(body: CreateSession, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft accepts any codec string and any sample rate, defaults the duration to a day
+    # TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
     # with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-    # anonymous caller through. Review all four.
+    # anonymous caller through. Fix all four.
     session = {
         "session_id": f"vs_{uuid.uuid4().hex}",
         "codec": body.codec,
         "sample_rate": body.sample_rate,
-        "max_duration_s": body.max_duration_s if body.max_duration_s is not None else DRAFT_DURATION_S,
+        "max_duration_s": body.max_duration_s if body.max_duration_s is not None else DEFAULT_DURATION_S,
     }
     logger.info("session open tenant=%s session=%s codec=%s", tenant, session["session_id"], body.codec)
     return JSONResponse(session, status_code=201)
@@ -239,7 +239,7 @@ import Fastify from 'fastify';
 
 export const app = Fastify();
 
-const DRAFT_DURATION_S = 86400;
+const DEFAULT_DURATION_S = 86400;
 
 interface CreateSessionBody {
   codec: string;
@@ -248,16 +248,16 @@ interface CreateSessionBody {
 }
 
 app.post('/v1/voice/sessions', async (request, reply) => {
-  // TODO: this draft accepts any codec string and any sample rate, defaults the duration to a day
+  // TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
   // with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-  // anonymous caller through. Review all four.
+  // anonymous caller through. Fix all four.
   const tenant = request.headers['x-tenant-id'];
   const body = request.body as CreateSessionBody;
   const session = {
     session_id: \`vs_\${randomUUID().replace(/-/g, '')}\`,
     codec: body.codec,
     sample_rate: body.sample_rate,
-    max_duration_s: body.max_duration_s ?? DRAFT_DURATION_S,
+    max_duration_s: body.max_duration_s ?? DEFAULT_DURATION_S,
   };
   request.log.info({tenant, session_id: session.session_id, codec: session.codec}, 'session open');
   return reply.code(201).send(session);
@@ -360,7 +360,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const draftDurationS = 86400
+const defaultDurationS = 86400
 
 type createSessionRequest struct {
 	Codec        string \`json:"codec"\`
@@ -381,12 +381,12 @@ func createSession(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts any codec string and any sample rate, defaults the duration to a day
+	// TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
 	// with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-	// anonymous caller through. Review all four.
+	// anonymous caller through. Fix all four.
 	maxDuration := body.MaxDurationS
 	if maxDuration == 0 {
-		maxDuration = draftDurationS
+		maxDuration = defaultDurationS
 	}
 	session := map[string]any{
 		"session_id":     "vs_" + uuid.NewString(),
@@ -549,21 +549,21 @@ object Api {
   implicit val createFormat: RootJsonFormat[CreateSession] = jsonFormat3(CreateSession)
   implicit val sessionFormat: RootJsonFormat[VoiceSession] = jsonFormat4(VoiceSession)
 
-  val DraftDurationS = 86400
+  val DefaultDurationS = 86400
 
   val route: Route =
     path("v1" / "voice" / "sessions") {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[CreateSession]) { body =>
-            // TODO: this draft accepts any codec string and any sample rate, defaults the duration
+            // TODO: this starter accepts any codec string and any sample rate, defaults the duration
             // to a day with no cap, ignores Idempotency-Key (a reconnect forks a second session)
-            // and lets an anonymous caller through. Review all four.
+            // and lets an anonymous caller through. Fix all four.
             val session = VoiceSession(
               s"vs_\${java.util.UUID.randomUUID()}",
               body.codec,
               body.sample_rate,
-              body.max_duration_s.getOrElse(DraftDurationS))
+              body.max_duration_s.getOrElse(DefaultDurationS))
             system.log.info(s"session open tenant=$tenant session=\${session.session_id} codec=\${body.codec}")
             complete(StatusCodes.Created, session)
           }
@@ -678,7 +678,7 @@ object Api {
 
 using json = nlohmann::json;
 
-constexpr int kDraftDurationS = 86400;
+constexpr int kDefaultDurationS = 86400;
 
 std::string uuidString();
 
@@ -693,14 +693,14 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts any codec string and any sample rate, defaults the duration to a day
+    // TODO: this starter accepts any codec string and any sample rate, defaults the duration to a day
     // with no cap, ignores Idempotency-Key (a reconnect forks a second session) and lets an
-    // anonymous caller through. Review all four.
+    // anonymous caller through. Fix all four.
     const json session = {
         {"session_id", "vs_" + uuidString()},
         {"codec", body.value("codec", std::string())},
         {"sample_rate", body.value("sample_rate", 0)},
-        {"max_duration_s", body.value("max_duration_s", kDraftDurationS)},
+        {"max_duration_s", body.value("max_duration_s", kDefaultDurationS)},
     };
     std::cerr << "session open tenant=" << tenant << " session=" << session["session_id"]
               << " codec=" << session["codec"] << "\\n";
@@ -816,5 +816,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The draft reads fine because the demo call sends one well-formed request from one tenant that never reconnects; the flaws only appear when the traffic does. A missing 401 lets an anonymous caller open media sessions on your capacity, and a codec whitelist is not pedantry: the media pipeline can only decode \`opus\`, \`pcm16\` and \`g711_ulaw\`, so any other string is a stream that is admitted and then dies mid-sentence, after the caller has already been billed for the attempt. The duration cap is what keeps one stuck client from holding a stream and its GPU forever, and the default matters as much as the cap — an omitted \`max_duration_s\` must mean 1800 seconds, not "unbounded". The idempotent resume is the flaw candidates miss most: on a flaky mobile network the reconnect is the common case, not the exception, so keying by \`Idempotency-Key\` and returning the live session with its prior \`turn_count\` is the difference between one conversation and two forked ones that bill twice and split the transcript. Real voice platforms layer on a per-tenant codec policy (the whitelist is the intersection of what the pipeline decodes and what the tenant negotiated), session affinity so the media node that owns the stream serves the resume, capacity accounting per media node before a session is admitted, and a reconnect path that rejoins the live session instead of starting over.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo call sends one well-formed request from one tenant that never reconnects; the flaws only appear when the traffic does. A missing 401 lets an anonymous caller open media sessions on your capacity, and a codec whitelist is not pedantry: the media pipeline can only decode \`opus\`, \`pcm16\` and \`g711_ulaw\`, so any other string is a stream that is admitted and then dies mid-sentence, after the caller has already been billed for the attempt. The duration cap is what keeps one stuck client from holding a stream and its GPU forever, and the default matters as much as the cap — an omitted \`max_duration_s\` must mean 1800 seconds, not "unbounded". The idempotent resume is the flaw candidates miss most: on a flaky mobile network the reconnect is the common case, not the exception, so keying by \`Idempotency-Key\` and returning the live session with its prior \`turn_count\` is the difference between one conversation and two forked ones that bill twice and split the transcript. Real voice platforms layer on a per-tenant codec policy (the whitelist is the intersection of what the pipeline decodes and what the tenant negotiated), session affinity so the media node that owns the stream serves the resume, capacity accounting per media node before a session is admitted, and a reconnect path that rejoins the live session instead of starting over.`,
 };

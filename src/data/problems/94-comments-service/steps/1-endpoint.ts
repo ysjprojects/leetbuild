@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the JSON, writes a row and returns \`201\`. It compiles, it serves the demo, and it hides three
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/comments\` with body
 \`{"thread_id": "t-1", "parent_id": "c-7", "text": "…"}\`.
@@ -33,7 +33,7 @@ Implement \`POST /v1/comments\` with body
   "revision", "text"}\`; a replay answers **200** with the stored comment.
 
 **Failure mode the checks target.** Three defects, and every one of them is invisible in a demo.
-The draft never compares \`parent_id\`'s thread with the \`thread_id\` in the request, so a reply
+The starter never compares \`parent_id\`'s thread with the \`thread_id\` in the request, so a reply
 can be grafted onto any thread — the parent lookup is the only thing that knows where a comment
 lives. It ignores \`Idempotency-Key\` entirely, so a client retry (or a queue redelivery) creates a
 second comment with a second id. And it stores \`text\` verbatim, so whatever markup the client sent
@@ -69,7 +69,7 @@ believe the other one escaped.`,
       id: 'body-cap',
       title: 'Caps the body at 16 KiB',
       detail:
-        'A body over `16 * 1024` bytes is **413** before anything is stored. The draft accepts any size, so one client can write an unbounded row.',
+        'A body over `16 * 1024` bytes is **413** before anything is stored. The starter accepts any size, so one client can write an unbounded row.',
       match: {
         python: {all: [/MAX_BODY_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_BODY_BYTES/, /code\(\s*413\s*\)/]},
@@ -82,7 +82,7 @@ believe the other one escaped.`,
       id: 'parent-thread',
       title: 'Rejects a parent from another thread with 422',
       detail:
-        'The parent is looked up and its thread compared with the request’s `thread_id`; a mismatch is **422**. The draft never resolves the parent, so a reply can be grafted onto any thread.',
+        'The parent is looked up and its thread compared with the request’s `thread_id`; a mismatch is **422**. The starter never resolves the parent, so a reply can be grafted onto any thread.',
       match: {
         python: {all: [/parent_thread\(/, /status_code\s*=\s*422/]},
         typescript: {all: [/store\.parentThread\(/, /code\(\s*422\s*\)/]},
@@ -95,7 +95,7 @@ believe the other one escaped.`,
       id: 'idempotency-key',
       title: 'Keys retries by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required, looked up under `(tenant, key)` and the created comment is stored under it; a replay returns the stored comment instead of inserting again. The draft ignores the header.',
+        '`Idempotency-Key` is required, looked up under `(tenant, key)` and the created comment is stored under it; a replay returns the stored comment instead of inserting again. The starter ignores the header.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get_by_key\(/, /store\.insert\(/]},
         typescript: {all: [/idempotency-key/, /store\.getByKey\(/, /store\.insert\(/]},
@@ -108,7 +108,7 @@ believe the other one escaped.`,
       id: 'escape-at-rest',
       title: 'Stores the body escaped and renders from a safe subset',
       detail:
-        'The body is escaped before it is stored (`html.escape` / `escapeHtml` / `html.EscapeString`) and rendering unescapes only the tags in `ALLOWED_MARKUP`. The draft stores the client’s markup verbatim.',
+        'The body is escaped before it is stored (`html.escape` / `escapeHtml` / `html.EscapeString`) and rendering unescapes only the tags in `ALLOWED_MARKUP`. The starter stores the client’s markup verbatim.',
       match: {
         python: {all: [/html\.escape\(/, /ALLOWED_MARKUP/]},
         typescript: {all: [/escapeHtml\(/, /ALLOWED_MARKUP/]},
@@ -154,8 +154,8 @@ store = CommentStore()
 
 @app.post("/v1/comments")
 def create_comment(body: CommentRequest, tenant: str = Header(default="", alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft accepts a parent from another thread, ignores Idempotency-Key so a replay
-    # posts twice, stores the body as markup the client renders raw and caps no size. Review all of it.
+    # TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
+    # posts twice, stores the body as markup the client renders raw and caps no size. Fix all of it.
     comment = {
         "id": str(uuid.uuid4()),
         "thread_id": body.thread_id,
@@ -246,7 +246,7 @@ def create_comment(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/comments: a model-generated draft that trusts its client. */
+      starter: `/** POST /v1/comments: flawed code that trusts its client. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -262,7 +262,7 @@ interface CommentBody {
 }
 
 app.post('/v1/comments', async (request, reply) => {
-  // TODO: this draft accepts a parent from another thread, ignores Idempotency-Key so a replay
+  // TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
   // posts twice, stores the body as markup the client renders raw and caps no size.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as CommentBody;
@@ -426,7 +426,7 @@ func createComment(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts a parent from another thread, ignores Idempotency-Key so a replay
+	// TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
 	// posts twice, stores the text as markup the client renders raw and caps no size.
 	comment := &Comment{
 		ID:        uuid.NewString(),
@@ -611,7 +611,7 @@ object CommentsApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[CommentRequest]) { body =>
-            // TODO: this draft accepts a parent from another thread, ignores Idempotency-Key so a
+            // TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a
             // replay posts twice, stores the text as markup the client renders raw and caps no size.
             val comment = Comment(
               UUID.randomUUID().toString,
@@ -756,7 +756,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts a parent from another thread, ignores Idempotency-Key so a replay
+    // TODO: this starter accepts a parent from another thread, ignores Idempotency-Key so a replay
     // posts twice, stores the text as markup the client renders raw and caps no size.
     const json comment = {
         {"id", uuidString()},
@@ -898,5 +898,5 @@ int main() {
     'The parent check is a comparison of two thread ids, not a truthiness test: `parent_thread(parent_id) != thread_id` is 422, which also covers a parent that does not exist. Fetch the parent’s thread from the store rather than trusting a client-supplied `thread_id`.',
     'Escape once, at the boundary where the value becomes durable: `html.escape(text)` / `escapeHtml(text)` / `html.EscapeString(text)` before the insert. Rendering then unescapes only the tags in the safe subset — storing raw markup means the renderer is the only thing standing between a comment and the next client.',
   ],
-  debrief: `The interviewer is testing whether you review a generated write endpoint at two boundaries at once: the trust boundary (who says which thread this reply belongs to) and the data boundary (what a client’s bytes become once they are stored). The draft is convincing because every demo passes: one thread, one well-formed body, no retries. The parent comparison is the subtle one — the request carries both ids, and only the store can say whether they agree; grafting a reply onto another thread silently corrupts a thread’s tree and cannot be repaired by a later read. Idempotency keyed by \`(tenant, key)\` is what makes a retried POST safe, and it has to be checked before the insert, not after. Escaping at rest is the third: two services that each assume the other escaped are how stored XSS ships. Real comment services add a moderation hook before the write is visible, an edit revision column, soft deletes, and a rate limit per author — the next steps of this course build exactly those.`,
+  debrief: `The interviewer is testing whether you can debug a write endpoint at two boundaries at once: the trust boundary (who says which thread this reply belongs to) and the data boundary (what a client’s bytes become once they are stored). The starter looks right because every demo passes: one thread, one well-formed body, no retries. The parent comparison is the subtle one — the request carries both ids, and only the store can say whether they agree; grafting a reply onto another thread silently corrupts a thread’s tree and cannot be repaired by a later read. Idempotency keyed by \`(tenant, key)\` is what makes a retried POST safe, and it has to be checked before the insert, not after. Escaping at rest is the third: two services that each assume the other escaped are how stored XSS ships. Real comment services add a moderation hook before the write is visible, an edit revision column, soft deletes, and a rate limit per author — the next steps of this course build exactly those.`,
 };

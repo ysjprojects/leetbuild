@@ -7,12 +7,12 @@ import {shadowEventsStep} from './steps/4-events';
 import {shadowReadStep} from './steps/5-read';
 
 /**
- * Shadow evaluation on the AI-era track: the course is not "send a copy of the request to another
- * model", it is the review you owe a model-generated shadow runner before it is trusted with live
- * production traffic. An observe-only config boundary → Redis state in its own namespace with one
- * fleet-wide flag and its own budget → a candidate call that can never block the request thread →
- * paired comparison events keyed by config and free of user content → a report that refuses to
- * declare a winner before the samples justify it.
+ * Shadow evaluation: the course is not "send a copy of the request to another model", it is the
+ * debugging you owe a shadow runner before it is trusted with live production traffic. An
+ * observe-only config boundary → Redis state in its own namespace with one fleet-wide flag and its
+ * own budget → a candidate call that can never block the request thread → paired comparison events
+ * keyed by config and free of user content → a report that refuses to declare a winner before the
+ * samples justify it.
  */
 export const shadowEvalProblem: Problem = {
   id: 'shadow-eval',
@@ -20,7 +20,7 @@ export const shadowEvalProblem: Problem = {
   tagline: 'Run a candidate version beside production on live traffic without letting it act.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Shadow Evaluation
 
@@ -64,12 +64,12 @@ One service, the shadow runner, with five pieces:
    intervals and the exact traffic window, an **inconclusive** verdict below 500 paired samples, and
    a **404** for another tenant's config.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

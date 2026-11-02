@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db', 'registry'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the body and returns a shipment, so the demo prints a tracking number and the happy path looks
-complete. Three production contracts around it are broken. Review it like the service owner, fix
+complete. Three production contracts around it are broken. Debug it like the service owner, fix
 it, and prove the fix with the checks below.
 
 Implement \`POST /v1/shipments\` with body
@@ -37,7 +37,7 @@ active check, a retried checkout creates a second label for the same parcel, and
 for both. Without the registry lookup, the API accepts \`carrier: "ups"\` typed by a caller and the
 label is born broken. Without idempotency keyed by \`(tenant, key)\`, a client retry after a timeout
 creates the second label the active check was supposed to prevent — and after a cancellation, the
-draft hands the replacement the voided id, so its first scan lands on a shipment the carrier has
+starter hands the replacement the voided id, so its first scan lands on a shipment the carrier has
 already closed.`,
   sequence: {
     participants: ['Client', 'Shipment API', 'partner registry', 'shipments'],
@@ -64,7 +64,7 @@ already closed.`,
       id: 'route',
       title: 'Handles POST /v1/shipments',
       detail:
-        'Register the create route on `POST /v1/shipments`. The draft already answers this route, so this check passes on it — the four below are where it fails.',
+        'Register the create route on `POST /v1/shipments`. The starter already answers this route, so this check passes on it — the four below are where it fails.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/shipments["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/shipments['"]/]},
@@ -77,7 +77,7 @@ already closed.`,
       id: 'validate',
       title: 'Authenticates the tenant and validates the carrier against the registry',
       detail:
-        'A missing tenant is **401**, a missing `Idempotency-Key` or a service level outside the allowed set is **400**, and a carrier code the partner registry does not know is **422**. The draft accepts any carrier string, so labels are created for carriers that will never scan them.',
+        'A missing tenant is **401**, a missing `Idempotency-Key` or a service level outside the allowed set is **400**, and a carrier code the partner registry does not know is **422**. The starter accepts any carrier string, so labels are created for carriers that will never scan them.',
       match: {
         python: {
           all: [/status_code\s*=\s*401/, /status_code\s*=\s*400/, /status_code\s*=\s*422/, /registry\.lookup\(/],
@@ -99,7 +99,7 @@ already closed.`,
       id: 'single-active',
       title: 'Answers 409 with the existing shipment for a second active shipment',
       detail:
-        'A second shipment for an order that already has one in `label`, `in_transit` or `out_for_delivery` is **409** with `active_shipment_exists` and the existing shipment id, decided by `active_for_order`. The draft creates the second label and bills it.',
+        'A second shipment for an order that already has one in `label`, `in_transit` or `out_for_delivery` is **409** with `active_shipment_exists` and the existing shipment id, decided by `active_for_order`. The starter creates the second label and bills it.',
       match: {
         python: {all: [/status_code\s*=\s*409/, /active_shipment_exists/, /store\.active_for_order\(/]},
         typescript: {all: [/code\(\s*409\s*\)/, /active_shipment_exists/, /store\.activeForOrder\(/]},
@@ -112,7 +112,7 @@ already closed.`,
       id: 'idempotency-key',
       title: 'Keys creations by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the shipment is stored under `(tenant, key)`; a replay returns the stored shipment with **200** instead of creating a second one. The draft ignores the header entirely.',
+        '`Idempotency-Key` is required and the shipment is stored under `(tenant, key)`; a replay returns the stored shipment with **200** instead of creating a second one. The starter ignores the header entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get_by_key\(/, /store\.put_by_key\(/]},
         typescript: {all: [/idempotency-key/, /store\.getByKey\(/, /store\.putByKey\(/]},
@@ -125,7 +125,7 @@ already closed.`,
       id: 'replacement',
       title: 'Replaces a cancelled shipment with a new id',
       detail:
-        'A cancelled shipment does not block a replacement, but the replacement carries a fresh `new_shipment_id()` and records `replacement_of` instead of reusing the voided id. The draft hands the cancelled shipment id to the replacement, so its first scan lands on a closed shipment.',
+        'A cancelled shipment does not block a replacement, but the replacement carries a fresh `new_shipment_id()` and records `replacement_of` instead of reusing the voided id. The starter hands the cancelled shipment id to the replacement, so its first scan lands on a closed shipment.',
       match: {
         python: {all: [/CANCELLED/, /replacement_of/, /new_shipment_id\(\)/]},
         typescript: {all: [/CANCELLED/, /replacement_of/, /newShipmentId\(\)/]},
@@ -175,7 +175,7 @@ store = ShipmentStore()
 
 @app.post("/v1/shipments")
 def create_shipment(body: CreateShipment) -> JSONResponse:
-    # TODO: this draft never checks the tenant, the Idempotency-Key, the carrier registry or the
+    # TODO: this starter never checks the tenant, the Idempotency-Key, the carrier registry or the
     # service level; it lets an order hold a second active shipment, and on a retry it reuses the
     # id of the order's previous (possibly cancelled) shipment instead of minting a new one.
     previous = store.last_for_order("", body.order_id)
@@ -292,7 +292,7 @@ def create_shipment(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/shipments: a model-generated draft that lets an order hold two labels. */
+      starter: `/** POST /v1/shipments: flawed code that lets an order hold two labels. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -325,7 +325,7 @@ const registry = new PartnerRegistry();
 const store = new ShipmentStore();
 
 app.post('/v1/shipments', async (request, reply) => {
-  // TODO: this draft never checks the tenant, the Idempotency-Key, the carrier registry or the
+  // TODO: this starter never checks the tenant, the Idempotency-Key, the carrier registry or the
   // service level; it lets an order hold a second active shipment, and on a retry it reuses the
   // id of the order's previous (possibly cancelled) shipment instead of minting a new one.
   const body = request.body as CreateShipment;
@@ -479,7 +479,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createShipmentRoute(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft never checks the tenant, the Idempotency-Key, the carrier registry or the
+	// TODO: this starter never checks the tenant, the Idempotency-Key, the carrier registry or the
 	// service level; it lets an order hold a second active shipment, and on a retry it reuses the
 	// id of the order's previous (possibly cancelled) shipment instead of minting a new one.
 	var body createShipment
@@ -699,7 +699,7 @@ object ShipmentApi {
     path("v1" / "shipments") {
       post {
         entity(as[CreateShipment]) { body =>
-          // TODO: this draft never checks the tenant, the Idempotency-Key, the carrier registry or
+          // TODO: this starter never checks the tenant, the Idempotency-Key, the carrier registry or
           // the service level; it lets an order hold a second active shipment, and on a retry it
           // reuses the id of the order's previous (possibly cancelled) shipment.
           val previous = store.lastForOrder("", body.order_id)
@@ -867,7 +867,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft never checks the tenant, the Idempotency-Key, the carrier registry or the
+    // TODO: this starter never checks the tenant, the Idempotency-Key, the carrier registry or the
     // service level; it lets an order hold a second active shipment, and on a retry it reuses the
     // id of the order's previous (possibly cancelled) shipment instead of minting a new one.
     const auto orderId = body.value("order_id", std::string());
@@ -988,5 +988,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is reviewing a generated handler at the trust boundary. The draft reads fine because the demo sends well-formed requests from one tenant and never retries. Four separate contracts are being checked: authentication (the tenant is never optional), the partner registry as the authority on carrier codes (a caller cannot invent a partner), the one-active-shipment invariant that protects the customer from paying for two labels, and idempotency keyed by \`(tenant, key)\` so a client retry cannot slip past that invariant. The subtle one is the cancelled shipment: the naive fix reuses the order's last id, but that id was voided at the carrier, so the replacement must be a new shipment that names its predecessor in \`replacement_of\`. Real platforms add per-carrier credential checks, label voiding as an explicit API call, and a shipment ledger that ties every replacement back to the claim that caused it.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The starter reads fine because the demo sends well-formed requests from one tenant and never retries. Four separate contracts are being checked: authentication (the tenant is never optional), the partner registry as the authority on carrier codes (a caller cannot invent a partner), the one-active-shipment invariant that protects the customer from paying for two labels, and idempotency keyed by \`(tenant, key)\` so a client retry cannot slip past that invariant. The subtle one is the cancelled shipment: the naive fix reuses the order's last id, but that id was voided at the carrier, so the replacement must be a new shipment that names its predecessor in \`replacement_of\`. Real platforms add per-carrier credential checks, label voiding as an explicit API call, and a shipment ledger that ties every replacement back to the claim that caused it.`,
 };

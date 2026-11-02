@@ -8,7 +8,7 @@ export const publishEnrichedStep: Step = {
   focus: ['catalogd', 'enriched', 'indexer', 'search'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an event when a
+**Starting point.** The starter is working code: it produces an event when a
 SKU's attributes are ready and a consumer writes them into the catalog. In the demo the catalog
 updates, so it looks done. Five production contracts are broken. Find them, fix them, and prove
 the fix with the checks below.
@@ -75,7 +75,7 @@ it is only visible as a reviewer's fix mysteriously reverting a week later.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) in the error branch instead of dropping the event. The draft ignores the broker result.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`/`InsertOutbox`) in the error branch instead of dropping the event. The starter ignores the broker result.',
       match: {
         python: {all: [/outbox\.insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /catch\s*\{/]},
@@ -88,7 +88,7 @@ it is only visible as a reviewer's fix mysteriously reverting a week later.`,
       id: 'human-wins',
       title: 'Never overwrites a human correction with a model result',
       detail:
-        'The consumer reads `catalog.current(sku_id)` and skips the event when its version is not newer or when a `model` event would replace `human` attributes (`SOURCE_HUMAN`, `SOURCE_MODEL`). The draft applies every event in arrival order.',
+        'The consumer reads `catalog.current(sku_id)` and skips the event when its version is not newer or when a `model` event would replace `human` attributes (`SOURCE_HUMAN`, `SOURCE_MODEL`). The starter applies every event in arrival order.',
       match: {
         python: {
           all: [
@@ -121,7 +121,7 @@ it is only visible as a reviewer's fix mysteriously reverting a week later.`,
       id: 'index-update',
       title: 'Updates the search index as well as the catalog',
       detail:
-        'The consumer writes the attributes to the catalog and upserts them into the search index (`search_index.upsert`). The draft updates the catalog only, so search keeps serving the old attributes.',
+        'The consumer writes the attributes to the catalog and upserts them into the search index (`search_index.upsert`). The starter updates the catalog only, so search keeps serving the old attributes.',
       match: {
         python: {all: [/catalog\.apply\(/, /search_index\.upsert\(/]},
         typescript: {all: [/catalog\.apply\(/, /searchIndex\.upsert\(/]},
@@ -134,7 +134,7 @@ it is only visible as a reviewer's fix mysteriously reverting a week later.`,
       id: 'commit-after-write',
       title: 'Commits the offset after both writes, with auto-commit off',
       detail:
-        'Auto-commit is disabled and the offset is committed after the catalog and index writes; committing first makes a crash lose the version. The draft commits as soon as it has polled.',
+        'Auto-commit is disabled and the offset is committed after the catalog and index writes; committing first makes a crash lose the version. The starter commits as soon as it has polled.',
       match: {
         python: {all: [/["']enable\.auto\.commit["']\s*:\s*False/], order: [/catalog\.apply\(/, /consumer\.commit\(/]},
         typescript: {all: [/autoCommit:\s*false/], order: [/catalog\.apply\(/, /commitOffsets\(/]},
@@ -172,9 +172,9 @@ def publish(
     taxonomy_version: str,
     source: str,
 ) -> None:
-    # TODO: this draft's producer is neither idempotent nor acks=all, it ignores a failed produce,
+    # TODO: this starter's producer is neither idempotent nor acks=all, it ignores a failed produce,
     # and the consumer commits before it writes, skips the search index, and lets a model event
-    # overwrite a human correction. Review all five.
+    # overwrite a human correction. Fix all five.
     event = {
         "id": f"{sku_id}:{attributes_version}",
         "sku_id": sku_id,
@@ -299,7 +299,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** sku.enriched: a model-generated draft that drops failed produces and commits too early. */
+      starter: `/** sku.enriched: flawed code that drops failed produces and commits too early. */
 import {Kafka} from 'kafkajs';
 
 import {catalog} from './catalog';
@@ -329,9 +329,9 @@ export async function publish(
   taxonomyVersion: string,
   source: string,
 ): Promise<void> {
-  // TODO: this draft's producer is neither idempotent nor acks=all, it ignores a failed produce,
+  // TODO: this starter's producer is neither idempotent nor acks=all, it ignores a failed produce,
   // and the consumer commits before it writes, skips the search index, and lets a model event
-  // overwrite a human correction. Review all five.
+  // overwrite a human correction. Fix all five.
   const event: EnrichedEvent = {
     id: \`\${skuId}:\${attributesVersion}\`,
     sku_id: skuId,
@@ -471,9 +471,9 @@ func (c *Catalog) Apply(ctx context.Context, skuID string, attributes map[string
 
 var catalog = &Catalog{}
 
-// TODO: this draft's producer is neither idempotent nor acks=all, it ignores a failed produce,
+// TODO: this starter's producer is neither idempotent nor acks=all, it ignores a failed produce,
 // and the consumer commits before it writes, skips the search index, and lets a model event
-// overwrite a human correction. Review all five.
+// overwrite a human correction. Fix all five.
 func publish(ctx context.Context, skuID, merchant string, attributes map[string]any, attributesVersion int64, taxonomyVersion, source string) {
 	event := EnrichedEvent{
 		ID:                fmt.Sprintf("%s:%d", skuID, attributesVersion),
@@ -672,9 +672,9 @@ object EnrichedEvents {
   })
   val catalog = Catalog.open()
 
-  // TODO: this draft's producer is neither idempotent nor acks=all, it ignores a failed produce,
+  // TODO: this starter's producer is neither idempotent nor acks=all, it ignores a failed produce,
   // and the consumer commits before it writes, skips the search index, and lets a model event
-  // overwrite a human correction. Review all five.
+  // overwrite a human correction. Fix all five.
   def publish(
       skuId: String,
       merchant: String,
@@ -833,9 +833,9 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
 
 std::unique_ptr<RdKafka::Producer> producer = makeProducer();
 
-// TODO: this draft's producer is neither idempotent nor acks=all, it ignores a failed produce,
+// TODO: this starter's producer is neither idempotent nor acks=all, it ignores a failed produce,
 // and the consumer commits before it writes, skips the search index, and lets a model event
-// overwrite a human correction. Review all five.
+// overwrite a human correction. Fix all five.
 void publish(const std::string& skuId, const std::string& merchant, const json& attributes, long long attributesVersion,
              const std::string& taxonomyVersion, const std::string& source) {
   const json event = {{"id", skuId + ":" + std::to_string(attributesVersion)},
@@ -973,5 +973,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking the three things a generated Kafka snippet almost always gets wrong — the producer needs idempotence and acks=all for retries, a failed produce goes to an outbox rather than the void, and the consumer applies its writes before the offset commit — plus two that are specific to a catalog fed by a model. The search index is the first: the source post's reason for extracting attributes at all is that search, ranking and substitutions read them, and a consumer that updates the catalog table but not the index leaves the most visible reader stale. The precedence rule is the second: once a human has corrected a SKU, a later model result — a re-extraction after a taxonomy release, a replayed partition — must not undo it, and a consumer that applies events in arrival order will. Checking the current version and source before the write makes the consumer safe to replay and keeps the humans in charge. Real pipelines add schema registry enforcement on the topic, a compacted topic keyed by SKU so a new consumer can bootstrap from the latest version, and an alert on the age of the oldest outbox row.`,
+  debrief: `The interviewer is checking the three things a Kafka snippet almost always gets wrong — the producer needs idempotence and acks=all for retries, a failed produce goes to an outbox rather than the void, and the consumer applies its writes before the offset commit — plus two that are specific to a catalog fed by a model. The search index is the first: the source post's reason for extracting attributes at all is that search, ranking and substitutions read them, and a consumer that updates the catalog table but not the index leaves the most visible reader stale. The precedence rule is the second: once a human has corrected a SKU, a later model result — a re-extraction after a taxonomy release, a replayed partition — must not undo it, and a consumer that applies events in arrival order will. Checking the current version and source before the write makes the consumer safe to replay and keeps the humans in charge. Real pipelines add schema registry enforcement on the topic, a compacted topic keyed by SKU so a new consumer can bootstrap from the latest version, and an alert on the age of the oldest outbox row.`,
 };

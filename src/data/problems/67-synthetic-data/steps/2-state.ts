@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['synth', 'redis', 'generator'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every generated record moves a
+**Starting point.** The starter is working code: every generated record moves a
 counter and the dashboard shows the corpus growing. It measures the wrong thing, it lets one seed
 entity collapse the set, and its keys live forever. Find the flaws, fix them, and prove the fix.
 
@@ -25,11 +25,11 @@ seed entity:
   that the record is **throttled**: nothing is admitted, nothing is counted, and the caller is told
   \`throttled: true\`. A throttled attempt must **not** consume the job's record cap — the cap counts
   records the corpus actually keeps.
-- The counting, the limit comparison and the expiry happen in **one atomic Lua \`EVAL\`**. The draft
+- The counting, the limit comparison and the expiry happen in **one atomic Lua \`EVAL\`**. The starter
   reads the counter and writes it back as two client calls, so two workers landing together both
   observe a count of 4 and admit a sixth record.
 - Both keys expire: the windowed key with **\`EXPIRE\` set to \`WINDOW_S\`** inside the script, the
-  job's coverage hash with \`JOB_TTL_S = 86400\`. The draft sets no TTL anywhere, so every finished
+  job's coverage hash with \`JOB_TTL_S = 86400\`. The starter sets no TTL anywhere, so every finished
   job's keys accumulate forever.
 - Return \`{"admitted": bool, "throttled": bool, "coverage": {entity_id: count, …}}\`, where
   \`coverage\` is the job's per-entity breakdown — not a single total.
@@ -61,7 +61,7 @@ the silent one that keeps every generation attempt in Redis for months.`,
       id: 'atomic-window',
       title: 'Moves the counter and the limit in one atomic script',
       detail:
-        'The increment, the limit comparison and the expiry happen inside one `EVAL`/`NewScript` call driven by `COVERAGE_LUA`. The draft reads the counter, compares on the client and writes it back, so two workers both observe the same value and one of them admits past the limit.',
+        'The increment, the limit comparison and the expiry happen inside one `EVAL`/`NewScript` call driven by `COVERAGE_LUA`. The starter reads the counter, compares on the client and writes it back, so two workers both observe the same value and one of them admits past the limit.',
       match: {
         python: {all: [/COVERAGE_LUA/, /\.eval\(/, /INCR/]},
         typescript: {all: [/COVERAGE_LUA/, /\.eval\(/, /INCR/]},
@@ -74,7 +74,7 @@ the silent one that keeps every generation attempt in Redis for months.`,
       id: 'per-entity-key',
       title: 'Scopes the throttle to (job, entity, window)',
       detail:
-        'The throttled counter is `synth:cov:{job_id}:{entity_id}:{window}`, so a repeat of one seed entity is what is limited and the bucket changes on schedule. The draft counts records, not entities, and has no window at all.',
+        'The throttled counter is `synth:cov:{job_id}:{entity_id}:{window}`, so a repeat of one seed entity is what is limited and the bucket changes on schedule. The starter counts records, not entities, and has no window at all.',
       match: {
         python: {all: [/synth:cov:/, /entity_id/, /window/]},
         typescript: {all: [/synth:cov:/, /entityId/, /window/]},
@@ -87,7 +87,7 @@ the silent one that keeps every generation attempt in Redis for months.`,
       id: 'entity-limit',
       title: 'Throttles beyond five records of one entity per window',
       detail:
-        '`ENTITY_LIMIT = 5` is enforced inside the script and the denied record comes back as `throttled`, admitted nowhere and counted nowhere. The draft has no per-entity limit, so a recipe can regenerate one popular entity without bound.',
+        '`ENTITY_LIMIT = 5` is enforced inside the script and the denied record comes back as `throttled`, admitted nowhere and counted nowhere. The starter has no per-entity limit, so a recipe can regenerate one popular entity without bound.',
       match: {
         python: {all: [/ENTITY_LIMIT\s*=\s*5/, /throttled/]},
         typescript: {all: [/ENTITY_LIMIT\s*=\s*5/, /throttled/]},
@@ -100,7 +100,7 @@ the silent one that keeps every generation attempt in Redis for months.`,
       id: 'window-ttl',
       title: 'Expires the window counters on schedule',
       detail:
-        'The windowed counter is written with `EXPIRE` set from `WINDOW_S = 60` inside the script, so the throttle resets with the window and Redis does not accumulate a key per attempt per entity forever. The draft sets no TTL on any key.',
+        'The windowed counter is written with `EXPIRE` set from `WINDOW_S = 60` inside the script, so the throttle resets with the window and Redis does not accumulate a key per attempt per entity forever. The starter sets no TTL on any key.',
       match: {
         python: {all: [/WINDOW_S\s*=\s*60/, /EXPIRE/]},
         typescript: {all: [/WINDOW_S\s*=\s*60/, /EXPIRE/]},
@@ -113,7 +113,7 @@ the silent one that keeps every generation attempt in Redis for months.`,
       id: 'coverage-not-totals',
       title: 'Reports per-entity coverage, not a total',
       detail:
-        'The result carries the job’s coverage hash read from `synth:cov:{job_id}` — one count per seed entity — so diversity is measurable after the fact. The draft returns a single total, which is exactly the number that hid the collapse.',
+        'The result carries the job’s coverage hash read from `synth:cov:{job_id}` — one count per seed entity — so diversity is measurable after the fact. The starter returns a single total, which is exactly the number that hid the collapse.',
       match: {
         python: {all: [/coverage/, /hgetall\(/]},
         typescript: {all: [/coverage/, /hgetall\(/]},
@@ -213,7 +213,7 @@ def record_generated(record: GeneratedRecord) -> dict:
 `,
     },
     typescript: {
-      starter: `/** recordGenerated: a model-generated draft that moves one total per job. */
+      starter: `/** recordGenerated: flawed code that moves one total per job. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

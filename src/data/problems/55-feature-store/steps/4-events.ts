@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes an event for every
+**Starting point.** The starter is working code: it publishes an event for every
 partition it materializes. The event is unorderable, it describes a plan instead of a result, and it
 can announce a write that never committed. Find the flaws, fix them, and prove the fix with the checks
 below.
@@ -16,17 +16,17 @@ below.
 Implement the \`feature.event\` producer behind the materialization worker:
 
 - Events go to the **\`feature.event\`** topic **keyed by the feature name**, so every event for one
-  feature lands in one partition and a consumer reads its lineage in order. The draft keys by entity,
+  feature lands in one partition and a consumer reads its lineage in order. The starter keys by entity,
   which scatters one feature across partitions and lets a consumer see partition 7 before partition 2.
 - The payload carries **version, partition range and row counts**:
   \`{feature, version, partition_start, partition_end, rows}\`. The event is the lineage record other
   services hang scheduling, backfills and alerts on.
 - The producer uses **\`acks=all\`**, so an acknowledged produce is replicated rather than buffered on
   one broker.
-- Publish **after the partition commits**. The draft sends the event before it has written anything, so
+- Publish **after the partition commits**. The starter sends the event before it has written anything, so
   a crash between the two leaves a consumer that believes a partition exists when it does not. Commit
   the partition, then publish.
-- The row count is measured **after the write**, from the rows that were actually written. The draft
+- The row count is measured **after the write**, from the rows that were actually written. The starter
   reports the planner's estimate, so the count is a promise the worker never checks.
 - When the broker rejects the produce, the event goes to an **outbox** instead, so a broker outage
   delays lineage rather than losing it.
@@ -69,7 +69,7 @@ acknowledgement level, the order of the two writes, the source of the count, and
       id: 'feature-key',
       title: 'Keys the event by feature name',
       detail:
-        'The record key is the feature name, so every event of one feature shares a partition and keeps its lineage ordered. The draft keys by entity and scatters one feature across partitions.',
+        'The record key is the feature name, so every event of one feature shares a partition and keeps its lineage ordered. The starter keys by entity and scatters one feature across partitions.',
       match: {
         python: {all: [/key=feature/]},
         typescript: {all: [/key:\s*feature\b/]},
@@ -82,7 +82,7 @@ acknowledgement level, the order of the two writes, the source of the count, and
       id: 'acks-all',
       title: 'Produce with acks=all',
       detail:
-        'The producer acknowledges only after every in-sync replica has the record. The draft leaves the acknowledgement level at its default.',
+        'The producer acknowledges only after every in-sync replica has the record. The starter leaves the acknowledgement level at its default.',
       match: {
         python: {all: [/ACKS_ALL/]},
         typescript: {all: [/ACKS_ALL/]},
@@ -95,7 +95,7 @@ acknowledgement level, the order of the two writes, the source of the count, and
       id: 'commit-before-publish',
       title: 'Publishes only after the partition commits',
       detail:
-        'The partition commit happens before the produce call, so a consumer never sees a materialized event for a partition that was not written. The draft publishes first and writes afterwards.',
+        'The partition commit happens before the produce call, so a consumer never sees a materialized event for a partition that was not written. The starter publishes first and writes afterwards.',
       match: {
         python: {order: [/commit[A-Za-z_]*\(/, /producer\.send\(/]},
         typescript: {order: [/commit[A-Za-z_]*\(/, /producer\.send\(/]},
@@ -108,7 +108,7 @@ acknowledgement level, the order of the two writes, the source of the count, and
       id: 'counts-from-execution',
       title: 'Reports the rows that were written',
       detail:
-        'The row count in the event comes from the rows the write actually produced, not from the planner. The draft reports `planned_rows`, a number nothing ever checks.',
+        'The row count in the event comes from the rows the write actually produced, not from the planner. The starter reports `planned_rows`, a number nothing ever checks.',
       match: {
         python: {all: [/len\(rows\)/], none: [/planned/]},
         typescript: {all: [/rows\.length/], none: [/planned/]},
@@ -121,7 +121,7 @@ acknowledgement level, the order of the two writes, the source of the count, and
       id: 'outbox',
       title: 'Writes an outbox row when the produce fails',
       detail:
-        'A rejected produce parks the same payload in an outbox so lineage can be replayed. The draft drops the event when the broker rejects it.',
+        'A rejected produce parks the same payload in an outbox so lineage can be replayed. The starter drops the event when the broker rejects it.',
       match: {
         python: {all: [/outbox/i, /rpush\(/]},
         typescript: {all: [/outbox/i, /rpush\(/]},
@@ -199,7 +199,7 @@ def materialize(feature: str, version: int, partition_start: int, partition_end:
 `,
     },
     typescript: {
-      starter: `/** Materialize a feature version: a model-generated draft that announces its plan. */
+      starter: `/** Materialize a feature version: flawed code that announces its plan. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'feature.event';

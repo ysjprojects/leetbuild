@@ -8,10 +8,10 @@ export const stateStep: Step = {
   focus: ['cache', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a single tenant asking its own
-question gets the cached answer, so the demo passes. It hides three production flaws — one write
-that is not atomic, one index shared by every tenant, and one read that accepts a half-written
-entry. Review it like the cache's owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: a single tenant asking its own question gets the
+cached answer, so the demo passes. It hides three production flaws — one write that is not atomic,
+one index shared by every tenant, and one read that accepts a half-written entry. Debug it like the
+cache's owner, fix it, and prove the fix with the checks below.
 
 Cached answers live in a Redis vector index. Implement the cache store the semantic cache calls:
 
@@ -20,14 +20,14 @@ Cached answers live in a Redis vector index. Implement the cache store the seman
   executed with a single \`eval\`. Two separate \`HSET\`s can be interrupted between them, leaving an
   embedding whose answer write never landed — a lookup then "hits" an entry that cannot be served.
 - \`index_name(tenant, model_version)\` returns \`semantic:{tenant}:{model_version}\`. Every entry lives
-  in exactly one tenant's vector space; the draft indexes all tenants together under \`semantic:all\`,
+  in exactly one tenant's vector space; the starter indexes all tenants together under \`semantic:all\`,
   so a similar question from another tenant surfaces an answer that is not theirs to see.
 - \`search_entries(tenant, model_version, embedding, threshold)\` runs the KNN query against **only**
   the caller's index, clamps the requested threshold into \`[0.82, 0.99]\`, and skips any entry whose
   \`expires_at\` has already passed. Searching a shared index returns another tenant's nearest
   neighbour, which is both a correctness bug and a data-boundary bug.
 - \`get_entry(tenant, model_version, entry_id)\` raises an \`IncompleteEntry\` error when the stored
-  hash exists but has no \`answer\` field. An embedding without an answer is never a hit: the draft
+  hash exists but has no \`answer\` field. An embedding without an answer is never a hit: the starter
   returns the partial hash and the caller caches a poisoned answer.
 - Every written entry gets an \`EXPIRE\` of \`ENTRY_TTL_SECONDS\` (**3600** seconds) in the same script.
   Without it the entry outlives its model version and is served forever.
@@ -77,7 +77,7 @@ partial write is served instead of rejected.`,
       id: 'tenant-scope',
       title: 'Scopes the index per (tenant, model version)',
       detail:
-        '`index_name(tenant, model_version)` returns `semantic:{tenant}:{model_version}`, so two tenants never share a vector space. The draft indexes everyone under the literal `semantic:all`, and a similar question from one tenant then surfaces another tenant’s answer.',
+        '`index_name(tenant, model_version)` returns `semantic:{tenant}:{model_version}`, so two tenants never share a vector space. The starter indexes everyone under the literal `semantic:all`, and a similar question from one tenant then surfaces another tenant’s answer.',
       match: {
         python: {all: [/def index_name\(tenant: str, model_version: str\)/, /semantic:\{tenant\}:\{model_version\}/]},
         typescript: {
@@ -95,7 +95,7 @@ partial write is served instead of rejected.`,
       id: 'answer-required',
       title: 'An embedding without an answer is never a hit',
       detail:
-        'The read path checks that the stored hash carries an `answer` and raises `IncompleteEntry` when it does not. The draft returns whatever the hash holds, so an interrupted write looks like a valid entry and its empty answer gets served.',
+        'The read path checks that the stored hash carries an `answer` and raises `IncompleteEntry` when it does not. The starter returns whatever the hash holds, so an interrupted write looks like a valid entry and its empty answer gets served.',
       match: {
         python: {all: [/raise IncompleteEntry\(/, /"answer" not in raw/]},
         typescript: {all: [/throw new IncompleteEntry\(/, /'answer' in raw|answer === undefined/]},
@@ -245,7 +245,7 @@ def get_entry(tenant, model_version, entry_id):
 `,
     },
     typescript: {
-      starter: `/** Cache store: a model-generated draft that writes the embedding and the answer as two commands. */
+      starter: `/** Cache store: flawed code that writes the embedding and the answer as two commands. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -934,5 +934,5 @@ CacheEntry getEntry(sw::redis::Redis& redis, const std::string& tenant, const st
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated cache at its three failure seams: the write, the key, and the read. The draft passes every serial test because one tenant, one question and one healthy write is the whole demo. Atomicity is the seam candidates miss — two \`HSET\`s are two round trips, and the window between them is exactly where a crash turns an embedding into a hit with no answer. Tenancy is the seam that turns a cache into a data leak: one global index means the nearest neighbour of a tenant's question can be another tenant's answer, and a KNN result carries no tenant label to check afterwards. The read path is the third seam: a hash is not an entry, so the guard on \`answer\` is what makes "half-written" observable instead of silently served. Real systems add an \`expires_at\` field beside the key TTL so a stale document can be dropped even if Redis has not evicted it yet, per-model-version index aliases so a model rollout gets a clean vector space, and a background compaction job that re-indexes after an embedding model change.`,
+  debrief: `The interviewer is testing whether you can debug a cache at its three failure seams: the write, the key, and the read. The starter passes every serial test because one tenant, one question and one healthy write is the whole demo. Atomicity is the seam candidates miss — two \`HSET\`s are two round trips, and the window between them is exactly where a crash turns an embedding into a hit with no answer. Tenancy is the seam that turns a cache into a data leak: one global index means the nearest neighbour of a tenant's question can be another tenant's answer, and a KNN result carries no tenant label to check afterwards. The read path is the third seam: a hash is not an entry, so the guard on \`answer\` is what makes "half-written" observable instead of silently served. Real systems add an \`expires_at\` field beside the key TTL so a stale document can be dropped even if Redis has not evicted it yet, per-model-version index aliases so a model rollout gets a clean vector space, and a background compaction job that re-indexes after an embedding model change.`,
 };

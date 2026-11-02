@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Feature store on the AI-era track: the course is not "cache some numbers in Redis", it is the
- * review you owe a feature platform before a model is trained on what it serves. An immutable,
- * reference-checked definition → versioned online values with an as-of read → a backfill with bounded
- * concurrency and honest failures → per-feature lineage events published after the partition commits →
- * a stats read where null rate, a pinned baseline and staleness are all visible.
+ * Feature store: the course is not "cache some numbers in Redis", it is the debugging you owe a
+ * feature platform before a model is trained on what it serves. An immutable, reference-checked
+ * definition → versioned online values with an as-of read → a backfill with bounded concurrency
+ * and honest failures → per-feature lineage events published after the partition commits → a
+ * stats read where null rate, a pinned baseline and staleness are all visible.
  */
 export const featureStoreProblem: Problem = {
   id: 'feature-store',
@@ -19,7 +19,7 @@ export const featureStoreProblem: Problem = {
   tagline: 'Training and serving read the same features, computed once and versioned.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Feature Store
 
@@ -65,12 +65,12 @@ One service, **featured**, with five pieces:
 5. \`GET /v1/features/{name}/versions/{v}/stats\`: distribution summaries, the **null rate**, a
    **pinned baseline** version, a **three-sigma** drift flag, and \`freshness_s\`/\`stale\`.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

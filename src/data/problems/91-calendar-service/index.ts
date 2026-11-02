@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Calendar service on the AI-era track: the course is not "store an event", it is the review you
- * owe a model-generated calendar before it re-invites four hundred people. Recurrence rules that
- * provably terminate → generation-stamped Redis caches where an exception can never be read
- * against a stale expansion → gRPC notifications that carry their change kind and one idempotency
- * token per change → a calendar-keyed change stream published after the commit → a read endpoint
- * that bounds the window it expands and returns each overridden instance exactly once.
+ * Calendar service: the course is not "store an event", it is the debugging you owe a calendar
+ * before it re-invites four hundred people. Recurrence rules that provably terminate →
+ * generation-stamped Redis caches where an exception can never be read against a stale expansion
+ * → gRPC notifications that carry their change kind and one idempotency token per change → a
+ * calendar-keyed change stream published after the commit → a read endpoint that bounds the
+ * window it expands and returns each overridden instance exactly once.
  */
 export const calendarServiceProblem: Problem = {
   id: 'calendar-service',
@@ -20,7 +20,6 @@ export const calendarServiceProblem: Problem = {
   tagline: 'Recurring events that expand correctly, notify once and never loop forever.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Calendar Service
 
@@ -70,12 +69,12 @@ One service, **calendard**, with five pieces:
    per-occurrence revision id, returning each overridden instance once, and refusing private
    calendars to non-members.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the demo,
-and it sounds confident. Your job in every step is the job you will have on a real feature: read the
-draft against the failure modes, name the subtle one, fix it, and prove the fix with checks that
-fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw: it compiles, it serves the demo, and it
+looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

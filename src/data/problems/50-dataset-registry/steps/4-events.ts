@@ -8,21 +8,21 @@ export const eventsStep: Step = {
   focus: ['registry', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the event publisher: it
+**Starting point.** The starter is working code for the event publisher: it
 builds a payload, produces to \`dataset.event\` and acks. It compiles, it serves the demo, and it
 hides three production flaws that only show up once there is more than one producer or a consumer
-that acts on the event. Review it like the owner of the topic training pins live on.
+that acts on the event. Debug it like the owner of the topic training pins live on.
 
 Implement the event path behind \`POST /v1/datasets/{dataset}/purge\`.
 
 - Every event is produced to the topic \`dataset.event\` **keyed by the dataset name** (\`key\`,
   \`Key: []byte(dataset)\`, \`ProducerRecord(topic, dataset, payload)\`, the message key argument), so
-  one dataset's history is ordered and lands in one partition. The draft keys by owner team, so a
+  one dataset's history is ordered and lands in one partition. The starter keys by owner team, so a
   dataset's events scatter and reorder whenever its team changes.
 - The payload carries \`type\`, \`dataset\`, \`version\`, the license id and the validator outcome —
   **never the content sample the validator inspected**. A retained topic is the last place tenant
   bytes should live.
-- The registry write **commits first, then the event is published**. The draft acks the produce
+- The registry write **commits first, then the event is published**. The starter acks the produce
   before the write commits, so a consumer can act on a version the registry never recorded.
 - If the broker rejects the produce, write an **outbox** row and answer \`503\`, so the event is
   retried instead of lost.
@@ -60,7 +60,7 @@ consumer cannot detect.`,
       id: 'key-by-dataset',
       title: 'Events are keyed by the dataset name',
       detail:
-        'The produce call passes the dataset name as the message key (`key=dataset`, `key: event.dataset`, `Key: []byte(event.Dataset)`, `ProducerRecord(topic, event.dataset, …)`). The draft keys by owner team, so a dataset’s history reorders.',
+        'The produce call passes the dataset name as the message key (`key=dataset`, `key: event.dataset`, `Key: []byte(event.Dataset)`, `ProducerRecord(topic, event.dataset, …)`). The starter keys by owner team, so a dataset’s history reorders.',
       match: {
         python: {all: [/key=dataset/]},
         typescript: {all: [/key:\s*event\.dataset/]},
@@ -73,7 +73,7 @@ consumer cannot detect.`,
       id: 'no-content-sample',
       title: 'Payloads carry identity and outcomes, not content',
       detail:
-        'The topic is `dataset.event` and no payload field carries the sample the validator inspected (`content_sample` / `contentSample`). The draft ships the inspected rows into a retained, replicated topic.',
+        'The topic is `dataset.event` and no payload field carries the sample the validator inspected (`content_sample` / `contentSample`). The starter ships the inspected rows into a retained, replicated topic.',
       match: {
         python: {all: [/TOPIC\s*=\s*"dataset\.event"/], none: [/content_sample|contentSample/]},
         typescript: {all: [/TOPIC\s*=\s*'dataset\.event'/], none: [/contentSample/]},
@@ -86,7 +86,7 @@ consumer cannot detect.`,
       id: 'outbox',
       title: 'A rejected produce lands in the outbox',
       detail:
-        'When the broker rejects the produce the event is written to an outbox row (`write_outbox` / `writeOutbox` / `WriteOutbox`) and the request answers 503, so the event is retried instead of dropped. The draft lets the exception escape.',
+        'When the broker rejects the produce the event is written to an outbox row (`write_outbox` / `writeOutbox` / `WriteOutbox`) and the request answers 503, so the event is retried instead of dropped. The starter lets the exception escape.',
       match: {
         python: {all: [/store\.write_outbox\(/, /KafkaException/]},
         typescript: {all: [/store\.writeOutbox\(/, /catch\s*\(/]},
@@ -99,7 +99,7 @@ consumer cannot detect.`,
       id: 'publish-after-commit',
       title: 'The registry write commits before the event is published',
       detail:
-        'The commit happens before the publish (`store.commit_purge` then `publish_dataset_event`), so no consumer can act on an uncommitted version. The draft acks the produce first.',
+        'The commit happens before the publish (`store.commit_purge` then `publish_dataset_event`), so no consumer can act on an uncommitted version. The starter acks the produce first.',
       match: {
         python: {order: [/store\.commit_purge\(/, /publish_dataset_event\(/]},
         typescript: {order: [/store\.commitPurge\(/, /publishDatasetEvent\(/]},
@@ -142,8 +142,8 @@ store = RegistryStore()
 
 
 def publish_dataset_event(event: dict) -> None:
-    # TODO: this draft keys by owner team, ships the content sample the validator inspected, and
-    # acks the produce before the registry write commits. Review all three.
+    # TODO: this starter keys by owner team, ships the content sample the validator inspected, and
+    # acks the produce before the registry write commits. Fix all three.
     team = event["team"]
     producer.produce(TOPIC, key=team.encode("utf-8"), value=json.dumps(event).encode("utf-8"))
     producer.flush()
@@ -232,7 +232,7 @@ def purge(
 `,
     },
     typescript: {
-      starter: `/** Registry events: a model-generated draft. */
+      starter: `/** Registry events: flawed code. */
 import Fastify from 'fastify';
 import {Kafka, type Producer} from 'kafkajs';
 
@@ -269,8 +269,8 @@ class RegistryStore {
 const store = new RegistryStore();
 
 async function publishDatasetEvent(event: DatasetEvent): Promise<void> {
-  // TODO: this draft keys by owner team, ships the content sample the validator inspected, and
-  // acks the produce before the registry write commits. Review all three.
+  // TODO: this starter keys by owner team, ships the content sample the validator inspected, and
+  // acks the produce before the registry write commits. Fix all three.
   await producer.send({topic: TOPIC, messages: [{key: event.team, value: JSON.stringify(event)}]});
 }
 
@@ -391,8 +391,8 @@ type DatasetEvent struct {
 }
 
 func publishDatasetEvent(ctx context.Context, writer *kafka.Writer, event DatasetEvent) error {
-	// TODO: this draft keys by owner team, ships the content sample the validator inspected, and
-	// acks the produce before the registry write commits. Review all three.
+	// TODO: this starter keys by owner team, ships the content sample the validator inspected, and
+	// acks the produce before the registry write commits. Fix all three.
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -514,8 +514,8 @@ object Events {
   val producer = new KafkaProducer[String, String](new Properties())
 
   def publishDatasetEvent(event: DatasetEvent): Unit = {
-    // TODO: this draft keys by owner team, ships the content sample the validator inspected, and
-    // acks the produce before the registry write commits. Review all three.
+    // TODO: this starter keys by owner team, ships the content sample the validator inspected, and
+    // acks the produce before the registry write commits. Fix all three.
     producer.send(new ProducerRecord[String, String](DatasetEventTopic, event.team, event.toString))
   }
 
@@ -615,8 +615,8 @@ static std::string toJson(const DatasetEvent& event) {
 }
 
 static void publish_dataset_event(RdKafka::Producer* producer, const DatasetEvent& event) {
-  // TODO: this draft keys by owner team, ships the content sample the validator inspected, and
-  // acks the produce before the registry write commits. Review all three.
+  // TODO: this starter keys by owner team, ships the content sample the validator inspected, and
+  // acks the produce before the registry write commits. Fix all three.
   const std::string payload = toJson(event);
   producer->produce(kDatasetEventTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                     const_cast<char*>(payload.data()), payload.size(), event.team.c_str(), event.team.size(), 0,
@@ -721,5 +721,5 @@ int main() {
     'A payload carries identity and outcomes: type, dataset, version, license id, validator result. The inspected sample belongs to the validator’s report, not to a retained topic with a longer retention than the dataset itself.',
     'Publish after the commit, and keep the produce inside the same try: a rejection writes an outbox row and returns 503. An event is a promise that the registry state exists; published early, it is a promise the consumer cannot verify.',
   ],
-  debrief: `The interviewer is testing whether you understand a topic as an ordered log per key and an event as a promise about committed state. The draft reads fine with one producer, one team and a fast broker. Three defects are checked: the key (ordering), the payload (content leakage into a retained topic), and the ordering relative to the registry commit (consumers acting on uncommitted versions), with the outbox as the durability half of the same argument. Real registries add a schema registry with a compatibility policy, a per-dataset event version in the payload, compaction with a tombstone for purged datasets, and a consumer that stores the last applied version so a replayed partition cannot move a view backwards.`,
+  debrief: `The interviewer is testing whether you understand a topic as an ordered log per key and an event as a promise about committed state. The starter reads fine with one producer, one team and a fast broker. Three defects are checked: the key (ordering), the payload (content leakage into a retained topic), and the ordering relative to the registry commit (consumers acting on uncommitted versions), with the outbox as the durability half of the same argument. Real registries add a schema registry with a compatibility policy, a per-dataset event version in the payload, compaction with a tombstone for purged datasets, and a consumer that stores the last applied version so a replayed partition cannot move a view backwards.`,
 };

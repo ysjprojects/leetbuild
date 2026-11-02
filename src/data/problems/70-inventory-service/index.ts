@@ -7,11 +7,10 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Inventory service on the AI-era track: the course is not "store a number and subtract", it is the
- * review you owe a model-generated reservation path before a flash sale finds the flaw. A validated,
- * idempotent reservation → one atomic Redis decrement with a floor at zero → a warehouse
- * confirmation with a deadline that keeps a hold on timeout → sku-keyed stock events with an outbox
- * → a stock read the storefront can trust.
+ * Inventory service: the course is not "store a number and subtract", it is the debugging you owe
+ * a reservation path before a flash sale finds the flaw. A validated, idempotent reservation → one
+ * atomic Redis decrement with a floor at zero → a warehouse confirmation with a deadline that keeps
+ * a hold on timeout → sku-keyed stock events with an outbox → a stock read the storefront can trust.
  */
 export const inventoryServiceProblem: Problem = {
   id: 'inventory-service',
@@ -19,7 +18,6 @@ export const inventoryServiceProblem: Problem = {
   tagline: 'Reserve stock without overselling, with holds that release cleanly.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Inventory Service
 
@@ -65,12 +63,12 @@ One service, **inventoryd**, with five pieces:
    counter the reservation path decrements, with staleness reported when the warehouse sync is
    behind, and **404** for a sku the caller's tenant does not own.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real inventory
-platform: read the draft against the failure modes, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real inventory platform: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

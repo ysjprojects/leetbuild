@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['scheduler', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an event on the
+**Starting point.** The starter is working code: it produces an event on the
 happy path and moves a Redis counter right after, so the demo shows \`gpu.placement\` filling up and
-the ledger looking busy. Four contracts are broken. Review it like the owner of the stream, fix it,
+the ledger looking busy. Four contracts are broken. Debug it like the owner of the stream, fix it,
 and prove the fix with the checks below.
 
 \`gpu.placement\` is not telemetry. Every consumer replays it to answer "what is this node running
@@ -19,7 +19,7 @@ counters it mirrors.
 
 - **Key the record by the NODE id.** The message key is the partition key, and partitioning by node
   is what keeps one node's occupancy stream ordered, so a replay sees its allocations and releases
-  in the order the scheduler committed them. The draft sends \`key=tenant\`: every node behind a
+  in the order the scheduler committed them. The starter sends \`key=tenant\`: every node behind a
   tenant is interleaved across partitions and the per-node history is no longer recoverable.
 - **Carry what a replay needs.** Each value is \`event_type\` (\`allocation\` / \`release\`) plus
   \`placement_id\`, \`node_id\`, \`gpu_count\` and \`memory_gb\`. Ids and numbers only — the topic is
@@ -42,7 +42,7 @@ counters it mirrors.
 **What each check looks for.**
 
 1. \`node-key\` — the record goes to the topic \`gpu.placement\` and its key is the node id
-   (\`key=node_id\` / \`Key: []byte(nodeID)\` / \`ProducerRecord(topic, nodeId, …)\`); the draft's
+   (\`key=node_id\` / \`Key: []byte(nodeID)\` / \`ProducerRecord(topic, nodeId, …)\`); the starter's
    tenant key is gone.
 2. \`event-fields\` — the payload builder the handlers use emits \`placement_id\`, \`gpu_count\` and
    \`memory_gb\` next to the event type, so a replay can attribute and rebuild occupancy.
@@ -105,7 +105,7 @@ with allocations only can never be reconciled with the ledger it claims to mirro
       id: 'node-key',
       title: 'Publishes to gpu.placement keyed by the node id',
       detail:
-        'The record goes to the topic `gpu.placement` and the message key is the **node** id, so one node’s occupancy stream stays ordered in a single partition. The draft uses the tenant as the key, which interleaves every node behind a tenant.',
+        'The record goes to the topic `gpu.placement` and the message key is the **node** id, so one node’s occupancy stream stays ordered in a single partition. The starter uses the tenant as the key, which interleaves every node behind a tenant.',
       match: {
         python: {all: [/PLACEMENT_TOPIC/, /key=body\.node_id/], none: [/key=[^\n]*tenant/]},
         typescript: {all: [/PLACEMENT_TOPIC/, /key:\s*body\.node_id/], none: [/key:\s*tenant/]},
@@ -124,7 +124,7 @@ with allocations only can never be reconciled with the ledger it claims to mirro
       id: 'event-fields',
       title: 'The payload carries placement id, gpu count and memory',
       detail:
-        'The event builder the handlers publish emits the event type plus `placement_id`, `gpu_count` and `memory_gb` — the ids and numbers a replay needs to attribute occupancy and rebuild it. The draft forwards a bare `{id, tenant, gpus}` blob.',
+        'The event builder the handlers publish emits the event type plus `placement_id`, `gpu_count` and `memory_gb` — the ids and numbers a replay needs to attribute occupancy and rebuild it. The starter forwards a bare `{id, tenant, gpus}` blob.',
       match: {
         python: {all: [/def placement_event\(/, /"placement_id"/, /"gpu_count"/, /"memory_gb"/]},
         typescript: {
@@ -139,7 +139,7 @@ with allocations only can never be reconciled with the ledger it claims to mirro
       id: 'publish-after-commit',
       title: 'The counters commit before the event is produced',
       detail:
-        'The atomic counter script (`eval` of the allocate script, both `HINCRBY`s together) runs first and the produce follows. Publishing first means a crash between the two leaves the stream claiming capacity the ledger never booked; the draft produces before any counter call.',
+        'The atomic counter script (`eval` of the allocate script, both `HINCRBY`s together) runs first and the produce follows. Publishing first means a crash between the two leaves the stream claiming capacity the ledger never booked; the starter produces before any counter call.',
       match: {
         python: {order: [/\.eval\(ALLOCATE_LUA/, /producer\.produce\(/]},
         typescript: {order: [/\.eval\(ALLOCATE_LUA/, /producer\.send\(/]},
@@ -152,7 +152,7 @@ with allocations only can never be reconciled with the ledger it claims to mirro
       id: 'outbox-relay',
       title: 'Outbox row on rejection, relayed idempotently',
       detail:
-        'A rejected produce writes an outbox row inside the error branch instead of dropping the event; a relay resends the unsent rows and marks them sent, and the producer is idempotent with `acks=all`. The draft ignores the broker result entirely and has no outbox.',
+        'A rejected produce writes an outbox row inside the error branch instead of dropping the event; a relay resends the unsent rows and marks them sent, and the producer is idempotent with `acks=all`. The starter ignores the broker result entirely and has no outbox.',
       match: {
         python: {
           all: [
@@ -196,7 +196,7 @@ with allocations only can never be reconciled with the ledger it claims to mirro
       id: 'release-reconcile',
       title: 'Releases are published and the stream reconciles with Redis',
       detail:
-        'Both `allocation` and `release` events are produced — with a release subtractive script against the same counters — and a reconstruction helper folds a node’s ordered stream and compares it with the node’s Redis counters. The draft publishes no release at all, so reconstructed utilization only ever grows.',
+        'Both `allocation` and `release` events are produced — with a release subtractive script against the same counters — and a reconstruction helper folds a node’s ordered stream and compares it with the node’s Redis counters. The starter publishes no release at all, so reconstructed utilization only ever grows.',
       match: {
         python: {all: [/EVENT_ALLOCATION/, /EVENT_RELEASE/, /RELEASE_LUA/, /reconstruct_utilization\(/]},
         typescript: {all: [/EVENT_ALLOCATION/, /EVENT_RELEASE/, /RELEASE_LUA/, /reconstructUtilization\(/]},
@@ -234,8 +234,8 @@ class Placement(BaseModel):
 
 @app.post("/v1/placements")
 def place(body: Placement, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: the draft keys by tenant, produces the allocation before the counters confirm it,
-    # publishes no release event, and has no outbox. Review all four.
+    # TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
+    # publishes no release event, and has no outbox. Fix all four.
     logger.info("place node=%s placement=%s", body.node_id, body.placement_id)
     event = {"id": body.placement_id, "tenant": tenant, "gpus": body.gpu_count}
     producer.produce(PLACEMENT_TOPIC, key=tenant, value=json.dumps(event))
@@ -393,7 +393,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** gpu.placement: a model-generated draft that keys by tenant and produces before the counters. */
+      starter: `/** gpu.placement: flawed code that keys by tenant and produces before the counters. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
@@ -414,8 +414,8 @@ interface PlacementBody {
 }
 
 app.post('/v1/placements', async (request, reply) => {
-  // TODO: the draft keys by tenant, produces the allocation before the counters confirm it,
-  // publishes no release event, and has no outbox. Review all four.
+  // TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
+  // publishes no release event, and has no outbox. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as PlacementBody;
   const event = {id: body.placement_id, tenant, gpus: body.gpu_count};
@@ -614,8 +614,8 @@ func place(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	body := Placement{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: the draft keys by tenant, produces the allocation before the counters confirm it,
-	// publishes no release event, and has no outbox. Review all four.
+	// TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
+	// publishes no release event, and has no outbox. Fix all four.
 	log.Printf("place node=%s placement=%s", body.NodeID, body.PlacementID)
 	event := map[string]any{"id": body.PlacementID, "tenant": tenant, "gpus": body.GPUCount}
 	payload, _ := json.Marshal(event)
@@ -817,8 +817,8 @@ object PlacementEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: the draft keys by tenant, produces the allocation before the counters confirm it,
-  // publishes no release event, and has no outbox. Review all four.
+  // TODO: the starter keys by tenant, produces the allocation before the counters confirm it,
+  // publishes no release event, and has no outbox. Fix all four.
   def place(placementId: String, tenant: String, nodeId: String, gpuCount: Int): Unit = {
     log.info(s"place node=$nodeId placement=$placementId")
     val payload = Map("id" -> placementId, "tenant" -> tenant, "gpus" -> gpuCount).toJson.compactPrint
@@ -963,8 +963,8 @@ const std::string kPlacementTopic = "gpu.placement";
 std::unique_ptr<RdKafka::Producer> producer = nullptr;
 std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
 
-// TODO: the draft keys by tenant, produces the allocation before the counters confirm it, publishes
-// no release event, and has no outbox. Review all four.
+// TODO: the starter keys by tenant, produces the allocation before the counters confirm it, publishes
+// no release event, and has no outbox. Fix all four.
 json draftEvent(const std::string& placementId, const std::string& tenant, int gpuCount) {
   return json{{"id", placementId}, {"tenant", tenant}, {"gpus", gpuCount}};
 }
@@ -1106,9 +1106,9 @@ void consume(const std::string& group) {
     },
   },
   hints: [
-    'The message key is the partition key: key by the node id and one node’s allocations and releases stay in one partition in commit order. Key by the tenant and every node behind that tenant is interleaved, so a replay cannot rebuild a single node’s occupancy. The draft also never publishes the release that would end the interval.',
+    'The message key is the partition key: key by the node id and one node’s allocations and releases stay in one partition in commit order. Key by the tenant and every node behind that tenant is interleaved, so a replay cannot rebuild a single node’s occupancy. The starter also never publishes the release that would end the interval.',
     'Order between the two writes is the contract: the counter script (`EVAL` of the allocate/release Lua that moves `allocated_gpus` and `allocated_memory_gb` together) runs before the produce. Produce first and a crash in between gives you a stream that claims GPUs the ledger never booked — and the read path then promises capacity that does not exist.',
     'Durability is an outbox plus an idempotent producer: `enable.idempotence` with `acks=all` (`idempotent: true` + `acks: -1` in KafkaJS, `RequireAll` + a hash balancer in kafka-go) makes a resend safe, so when the produce fails you can insert an outbox row, have the relay resend it under the same node key, and only then mark the row sent. Finish with `reconstruct_utilization`: fold the node’s ordered events, subtract releases, and compare with `HGET node:{id} allocated_gpus`.',
   ],
-  debrief: `The interviewer is checking whether you treat an event stream as a replica of state rather than as logging. Four decisions carry the whole step. The key is an ordering contract: partition by node and a node’s allocation and release history is replayable; partition by tenant and one node’s stream is scattered, so every reconstruction is a guess. The order of the two writes decides what a crash can mean: committing the Redis counters first makes the ledger the source of truth and the event its replication, so a failed produce is a delayed record, not a lie about capacity. The outbox is what turns that failure into durability — a row written in the error branch, resent by a relay under the same node key, marked sent only after an idempotent producer (\`enable.idempotence\`, \`acks=all\`) confirms it, so a retry cannot duplicate a record. And the release event is the half everyone omits: a stream that only records allocations produces a utilization curve that rises forever, which is exactly what a reviewer catches by reconstructing a node’s number from the events and comparing it with the counters the read path uses. Real systems add schema-registry validation, a per-node partition budget, dead-letter topics for permanently unprocessable events, and a reconciliation job that alarms when the reconstructed and ledger numbers diverge.`,
+  debrief: `The interviewer is checking whether you treat an event stream as a replica of state rather than as logging. Four decisions carry the whole step. The key is an ordering contract: partition by node and a node’s allocation and release history is replayable; partition by tenant and one node’s stream is scattered, so every reconstruction is a guess. The order of the two writes decides what a crash can mean: committing the Redis counters first makes the ledger the source of truth and the event its replication, so a failed produce is a delayed record, not a lie about capacity. The outbox is what turns that failure into durability — a row written in the error branch, resent by a relay under the same node key, marked sent only after an idempotent producer (\`enable.idempotence\`, \`acks=all\`) confirms it, so a retry cannot duplicate a record. And the release event is the half everyone omits: a stream that only records allocations produces a utilization curve that rises forever, which is exactly what you catch by reconstructing a node’s number from the events and comparing it with the counters the read path uses. Real systems add schema-registry validation, a per-node partition budget, dead-letter topics for permanently unprocessable events, and a reconciliation job that alarms when the reconstructed and ledger numbers diverge.`,
 };

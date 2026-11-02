@@ -7,19 +7,19 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Chat memory service on the AI-era track: the course is not "store messages in Redis", it is the
- * review you owe a model-generated memory layer before it serves long conversations to real tenants.
- * Validated, idempotent turn appends → one atomic, capped, expiring buffer per (tenant, session) →
- * a deadline-bounded summarizer call with a deterministic span identity → tenant-keyed session
- * events without content and with an outbox → a tenant-scoped, capped, fresh context read.
+ * Chat memory service: the course is not "store messages in Redis", it is the debugging you owe a
+ * memory layer before it serves long conversations to real tenants. Validated, idempotent turn
+ * appends → one atomic, capped, expiring buffer per (tenant, session) → a deadline-bounded
+ * summarizer call with a deterministic span identity → tenant-keyed session events without
+ * content and with an outbox → a tenant-scoped, capped, fresh context read.
  */
 export const chatMemoryProblem: Problem = {
   id: 'chat-memory',
   title: 'Chat Memory Service',
-  tagline: 'Bounded, tenant-scoped, crash-safe conversation memory — reviewed like production.',
+  tagline: 'Bounded, tenant-scoped, crash-safe conversation memory, debugged until it is safe to ship.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Chat Memory Service
 
@@ -60,12 +60,12 @@ One service, **memd**, with five pieces:
 5. \`GET /v1/sessions/{id}/context\`: tenant-scoped, summary plus recent turns, a 6000-token cap
    that drops the oldest first, citable turn ids, and a cache keyed on the latest turn id.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path,
+and it looks right. Your job in every step is the job you will have on a real feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

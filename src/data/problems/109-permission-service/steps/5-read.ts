@@ -8,11 +8,11 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'engine'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the read, merges
-every permission the subject holds into one list, caches that list for 600 seconds and answers. It
-compiles, it serves the demo, and it hides three production flaws — no provenance, a cache a
-revocation cannot invalidate, and no check on who is asking. Review it like the service owner, fix
-it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it registers the read, merges every permission
+the subject holds into one list, caches that list for 600 seconds and answers. It compiles, it
+serves the demo, and it hides three production flaws — no provenance, a cache a revocation cannot
+invalidate, and no check on who is asking. Debug it like the service owner, fix it, and prove the
+fix with the checks below.
 
 Implement \`GET /v1/users/{id}/permissions\` and \`POST /v1/permissions/check\`.
 
@@ -93,7 +93,7 @@ caller enumerates any user's access with one request.`,
       id: 'provenance',
       title: 'Every permission carries its derivation',
       detail:
-        'Each entry names the roles and grants that produce it in `granted_by`, instead of a bare merged set. The draft returns the merged permissions with no provenance at all.',
+        'Each entry names the roles and grants that produce it in `granted_by`, instead of a bare merged set. The starter returns the merged permissions with no provenance at all.',
       match: {
         python: {all: [/granted_by/, /def explain_permissions\(/]},
         typescript: {all: [/granted_by/, /function explainPermissions\(/]},
@@ -106,7 +106,7 @@ caller enumerates any user's access with one request.`,
       id: 'live-parity',
       title: 'The list and the live check share one computation',
       detail:
-        '`POST /v1/permissions/check` and the read both call the same `effective_permissions` computation, so a revoked permission is absent from the list and denied by the check in the same pass. The draft has no check endpoint at all.',
+        '`POST /v1/permissions/check` and the read both call the same `effective_permissions` computation, so a revoked permission is absent from the list and denied by the check in the same pass. The starter has no check endpoint at all.',
       match: {
         python: {all: [/effective_permissions\(/, /@app\.post\(\s*["']\/v1\/permissions\/check["']/]},
         typescript: {all: [/effectivePermissions\(/, /app\.post\(\s*['"]\/v1\/permissions\/check['"]/]},
@@ -119,7 +119,7 @@ caller enumerates any user's access with one request.`,
       id: 'fresh-cache',
       title: 'Serves only cache entries that match the grant version',
       detail:
-        'The read is served from the version-stamped cache and recomputes when the entry’s version differs from the current `grant_version`, so the list cannot outlive a revocation. The draft serves a 600-second cache with no version at all.',
+        'The read is served from the version-stamped cache and recomputes when the entry’s version differs from the current `grant_version`, so the list cannot outlive a revocation. The starter serves a 600-second cache with no version at all.',
       match: {
         python: {all: [/cache_is_current\(/, /grant_version/]},
         typescript: {all: [/cacheIsCurrent\(/, /grant_version/]},
@@ -132,7 +132,7 @@ caller enumerates any user's access with one request.`,
       id: 'foreign-403',
       title: 'Refuses to read another subject without the audit permission',
       detail:
-        'A caller may read only its own permissions unless it holds `permissions:read:any`; a foreign `id` is `403`. The draft answers for any caller, so one subject can enumerate another’s access.',
+        'A caller may read only its own permissions unless it holds `permissions:read:any`; a foreign `id` is `403`. The starter answers for any caller, so one subject can enumerate another’s access.',
       match: {
         python: {all: [/permissions:read:any/, /status_code\s*=\s*403/]},
         typescript: {all: [/permissions:read:any/, /code\(\s*403\s*\)/]},
@@ -144,7 +144,7 @@ caller enumerates any user's access with one request.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/users/{id}/permissions: a model-generated draft that returns a merged blob."""
+      starter: `"""GET /v1/users/{id}/permissions: flawed code that returns a merged blob."""
 import json
 import logging
 
@@ -170,8 +170,8 @@ store = GrantStore()
 
 @app.get("/v1/users/{id}/permissions")
 def read_permissions(id: str, caller: str = Header(alias="X-Caller-Id")) -> JSONResponse:
-    # TODO: this draft returns the merged permission list with no provenance, serves it from a 600 s
-    # cache with no version stamp, and never compares X-Caller-Id with {id}. Review all three.
+    # TODO: this starter returns the merged permission list with no provenance, serves it from a 600 s
+    # cache with no version stamp, and never compares X-Caller-Id with {id}. Fix all three.
     key = f"perms:{id}"
     cached = r.get(key)
     if cached is not None:
@@ -287,7 +287,7 @@ def check(body: CheckRequest, caller: str | None = Header(default=None, alias="X
 `,
     },
     typescript: {
-      starter: `/** GET /v1/users/:id/permissions: a model-generated draft that returns a merged blob. */
+      starter: `/** GET /v1/users/:id/permissions: flawed code that returns a merged blob. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -307,8 +307,8 @@ export const store: GrantStore = {
 };
 
 app.get('/v1/users/:id/permissions', async (request, reply) => {
-  // TODO: this draft returns the merged permission list with no provenance, caches it for 600 s
-  // with no version stamp, and never compares X-Caller-Id with :id. Review all three.
+  // TODO: this starter returns the merged permission list with no provenance, caches it for 600 s
+  // with no version stamp, and never compares X-Caller-Id with :id. Fix all three.
   const {id} = request.params as {id: string};
   const caller = request.headers['X-Caller-Id'];
   const key = \`perms:\${id}\`;
@@ -485,7 +485,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 func readPermissions(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	caller := r.Header.Get("X-Caller-Id")
-	// TODO: this draft returns the merged permission list with no provenance, caches it for 600 s
+	// TODO: this starter returns the merged permission list with no provenance, caches it for 600 s
 	// with no version stamp, and never compares X-Caller-Id with the {id} in the path.
 	key := "perms:" + id
 	if cached, err := rdb.Get(r.Context(), key).Bytes(); err == nil {
@@ -737,7 +737,7 @@ object ReadApi {
     path("v1" / "users" / Segment / "permissions") { id =>
       get {
         optionalHeaderValueByName("X-Caller-Id") { caller =>
-          // TODO: this draft returns the merged permission list with no provenance, caches it for
+          // TODO: this starter returns the merged permission list with no provenance, caches it for
           // 600 s with no version stamp, and never compares X-Caller-Id with the id in the path.
           val key = s"perms:$id"
           Option(jedis.get(key)) match {
@@ -898,7 +898,7 @@ GrantStore store;
 sw::redis::Redis redis("tcp://redis:6379");
 
 void readPermissions(const httplib::Request& req, httplib::Response& res) {
-  // TODO: this draft returns the merged permission list with no provenance, caches it for 600 s
+  // TODO: this starter returns the merged permission list with no provenance, caches it for 600 s
   // with no version stamp, and never compares X-Caller-Id with the id in the path.
   const std::string id = req.matches[1];
   const std::string caller = req.get_header_value("X-Caller-Id");

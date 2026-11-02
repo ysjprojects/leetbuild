@@ -8,10 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
-the report and answers that the usage was counted. It compiles, it serves the demo, and it hides
-three production flaws. Review it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter is working code: it registers the route, parses the report and
+answers that the usage was counted. It compiles, it serves the demo, and it hides three production
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/usage\` with body
 \`{"request_id": "req_8f21", "account": "acct_1", "route": "/v1/generate", "units": 1200}\` and the
@@ -31,7 +30,7 @@ reporting gateway in the \`X-Gateway-Id\` header.
   response echoes the counted units and the gateway.
 - Log the report with the account, the gateway and the units — never the request body.
 
-**Failure mode the checks target.** A retrying gateway re-sends the same report and the draft counts
+**Failure mode the checks target.** A retrying gateway re-sends the same report and the starter counts
 it again, so an hour of retries reads as twice the traffic; the missing per-request cap turns one
 bad \`units\` value into an account-wide overage; and the record without a gateway leaves on-call
 unable to tell which edge produced a spike. The subtle one is the dedupe: it has to be keyed by
@@ -64,7 +63,7 @@ unable to tell which edge produced a spike. The subtle one is the dedupe: it has
       id: 'units-cap',
       title: 'Caps units per request',
       detail:
-        'A report whose `units` fall outside 0..`MAX_UNITS_PER_REQUEST` is **400**. The draft accepts any magnitude, so one malformed report can dominate the hour.',
+        'A report whose `units` fall outside 0..`MAX_UNITS_PER_REQUEST` is **400**. The starter accepts any magnitude, so one malformed report can dominate the hour.',
       match: {
         python: {all: [/MAX_UNITS_PER_REQUEST/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_UNITS_PER_REQUEST/, /code\(\s*400\s*\)/]},
@@ -77,7 +76,7 @@ unable to tell which edge produced a spike. The subtle one is the dedupe: it has
       id: 'dedupe',
       title: 'Counts a request id once',
       detail:
-        'The endpoint asks the ledger whether `(account, request_id)` was already counted and returns the stored count instead of counting again. The draft counts every report, so a retrying gateway inflates usage.',
+        'The endpoint asks the ledger whether `(account, request_id)` was already counted and returns the stored count instead of counting again. The starter counts every report, so a retrying gateway inflates usage.',
       match: {
         python: {all: [/already_counted\(/, /request_id/]},
         typescript: {all: [/alreadyCounted\(/, /requestId|request_id/]},
@@ -90,7 +89,7 @@ unable to tell which edge produced a spike. The subtle one is the dedupe: it has
       id: 'gateway',
       title: 'Requires the reporting gateway',
       detail:
-        'A report without `X-Gateway-Id` is **400** with `missing X-Gateway-Id`; an unattributed row cannot be reconciled against gateway logs. The draft treats the gateway as optional and never rejects it.',
+        'A report without `X-Gateway-Id` is **400** with `missing X-Gateway-Id`; an unattributed row cannot be reconciled against gateway logs. The starter treats the gateway as optional and never rejects it.',
       match: {
         python: {all: [/X-Gateway-Id/, /missing X-Gateway-Id/]},
         typescript: {all: [/x-gateway-id/, /missing X-Gateway-Id/]},
@@ -103,7 +102,7 @@ unable to tell which edge produced a spike. The subtle one is the dedupe: it has
       id: 'record',
       title: 'Stores the record with the gateway',
       detail:
-        'The stored record names the account, the route, the units and the reporting gateway, so reconciliation has something to join on. The draft writes the row without the gateway.',
+        'The stored record names the account, the route, the units and the reporting gateway, so reconciliation has something to join on. The starter writes the row without the gateway.',
       match: {
         python: {all: [/ledger\.record\(/, /"gateway"\s*:/]},
         typescript: {all: [/interface UsageEntry/, /gateway\s*:/]},
@@ -143,9 +142,9 @@ ledger = UsageLedger()
 
 @app.post("/v1/usage")
 def report_usage(body: UsageReport, gateway: str | None = Header(default=None, alias="X-Gateway-Id")) -> JSONResponse:
-    # TODO: this draft counts every report, so a retrying gateway inflates usage; it accepts a units
+    # TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
     # value of any magnitude, never checks whether the request id was already counted, and does not
-    # store which gateway reported it. Review all four.
+    # store which gateway reported it. Fix all four.
     entry = {"request_id": body.request_id, "account": body.account, "route": body.route, "units": body.units}
     ledger.record(entry)
     logger.info("usage account=%s gateway=%s units=%d", body.account, gateway, body.units)
@@ -211,7 +210,7 @@ def report_usage(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/usage: a model-generated draft that counts every report. */
+      starter: `/** POST /v1/usage: flawed code that counts every report. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -235,9 +234,9 @@ const ledger = {
 };
 
 app.post('/v1/usage', async (request, reply) => {
-  // TODO: this draft counts every report, so a retrying gateway inflates usage; it accepts a units
+  // TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
   // value of any magnitude, never checks whether the request id was already counted, and does not
-  // store which gateway reported it. Review all four.
+  // store which gateway reported it. Fix all four.
   const gateway = request.headers['x-gateway-id'] as string;
   const body = request.body as UsageReport;
   const entry: UsageEntry = {
@@ -364,9 +363,9 @@ func reportUsage(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft counts every report, so a retrying gateway inflates usage; it accepts a units
+	// TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
 	// value of any magnitude, never checks whether the request id was already counted, and does not
-	// store which gateway reported it. Review all four.
+	// store which gateway reported it. Fix all four.
 	entry := UsageEntry{RequestID: body.RequestID, Account: body.Account, Route: body.Route, Units: body.Units}
 	if err := ledger.Record(r.Context(), entry); err != nil {
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
@@ -509,9 +508,9 @@ object Api {
       post {
         optionalHeaderValueByName("X-Gateway-Id") { gatewayOpt =>
           entity(as[UsageReport]) { body =>
-            // TODO: this draft counts every report, so a retrying gateway inflates usage; it accepts
+            // TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts
             // a units value of any magnitude, never checks whether the request id was already
-            // counted, and does not store which gateway reported it. Review all four.
+            // counted, and does not store which gateway reported it. Fix all four.
             val entry = UsageEntry(body.request_id, body.account, body.route, body.units)
             ledger.record(entry)
             system.log.info(s"usage account=\${body.account} gateway=\${gatewayOpt.getOrElse("-")} units=\${body.units}")
@@ -621,9 +620,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft counts every report, so a retrying gateway inflates usage; it accepts a units
+    // TODO: this starter counts every report, so a retrying gateway inflates usage; it accepts a units
     // value of any magnitude, never checks whether the request id was already counted, and does not
-    // store which gateway reported it. Review all four.
+    // store which gateway reported it. Fix all four.
     const UsageEntry entry{body.value("request_id", std::string()), body.value("account", std::string()),
                            body.value("route", std::string()), body.value("units", 0)};
     ledger.record(entry);
@@ -713,8 +712,8 @@ int main() {
     'Order the guards by cost: gateway header, then the three non-empty strings, then the units cap. Each returns before the ledger is touched, so a malformed report can never be counted at all.',
     'The row you store is the reconciliation join: account, route, units and the reporting gateway. If the gateway is not in the row, the only way to find a spike is to guess — which is exactly what the missing `X-Gateway-Id` check leaves on-call doing.',
   ],
-  debrief: `The interviewer is testing whether you review a generated handler at the trust boundary. The
-draft reads fine because the demo sends one well-formed report from one gateway and never retries.
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The
+starter reads fine because the demo sends one well-formed report from one gateway and never retries.
 Four separate defects are being checked: the request id is the unit of truth (so a replay is answered
 from the ledger instead of counted again), the per-request units cap (so one bad report cannot
 dominate an account's hour), the reporting gateway (so every row can be joined to gateway logs), and

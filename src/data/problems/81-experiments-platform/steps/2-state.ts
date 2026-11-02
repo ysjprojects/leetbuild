@@ -8,7 +8,7 @@ export const experimentStateStep: Step = {
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it hashes a unit, looks at the
+**Starting point.** The starter is working code: it hashes a unit, looks at the
 experiment's split, and serves a variant. It works for one experiment whose split never moves. Read
 it like the service owner, name the subtle defect, fix it, and prove the fix with the checks below.
 
@@ -33,7 +33,7 @@ one of the three and the bucket is no longer this unit's bucket. Implement the a
 - New assignments get a TTL (\`exp:{id}:assign:{unit}\` with \`EX\`/\`ex=\` of the experiment's remaining
   life, or 30 days) so an abandoned unit does not keep a dead row forever.
 
-**Failure mode the checks target.** The draft recomputes the bucket from the experiment's *current*
+**Failure mode the checks target.** The starter recomputes the bucket from the experiment's *current*
 weights and salt on every request (the cache read, when it happens at all, comes after the hash), so
 a user can see two variants in one session when the split is edited; the key omits the experiment id,
 so quotas collide across experiments; and a stopped experiment returns control for everyone instead
@@ -70,7 +70,7 @@ of the assignment already written.`,
       id: 'bucket-hash',
       title: 'Hashes experiment id, unit and the frozen salt together',
       detail:
-        'The hash input names the experiment id, the assignment unit and the experiment’s frozen salt in one expression. The draft hashes the unit and a mutable salt and recomputes on every request.',
+        'The hash input names the experiment id, the assignment unit and the experiment’s frozen salt in one expression. The starter hashes the unit and a mutable salt and recomputes on every request.',
       match: {
         python: {all: [/sha256\([^)]*experiment\.id[^)]*unit[^)]*salt/]},
         typescript: {all: [/update\(`[^`]*\$\{experiment\.id\}[^`]*\$\{unit\}[^`]*\$\{experiment\.salt\}/]},
@@ -83,7 +83,7 @@ of the assignment already written.`,
       id: 'cache-key',
       title: 'Keys by experiment and unit, writes conditionally',
       detail:
-        'The key is `exp:{experiment_id}:assign:{unit}` and the write is conditional (`SET NX`/`setnx`-style), so a concurrent request cannot overwrite an existing assignment. The draft keys by unit alone and writes unconditionally.',
+        'The key is `exp:{experiment_id}:assign:{unit}` and the write is conditional (`SET NX`/`setnx`-style), so a concurrent request cannot overwrite an existing assignment. The starter keys by unit alone and writes unconditionally.',
       match: {
         python: {all: [/exp:/, /experiment\.id/, /assign:/, /(unit|assignment_unit)/, /(nx=True|setnx|NX)/]},
         typescript: {all: [/exp:/, /experiment\.id/, /assign:/, /(unit|assignmentUnit)/, /(NX|nx|setnx)/]},
@@ -96,7 +96,7 @@ of the assignment already written.`,
       id: 'cache-first',
       title: 'Reads the cache before computing the bucket',
       detail:
-        'The cached assignment is read before any bucket computation. The draft computes the bucket first and only then consults the cache, so a split edit re-buckets a unit that already had an assignment.',
+        'The cached assignment is read before any bucket computation. The starter computes the bucket first and only then consults the cache, so a split edit re-buckets a unit that already had an assignment.',
       match: {
         python: {order: [/(r\.get|redis\.get|GET)/, /(sha256|bucket_for)/]},
         typescript: {order: [/\.get\(/, /(createHash|bucketFor)/]},
@@ -109,7 +109,7 @@ of the assignment already written.`,
       id: 'split-fill',
       title: 'Walks the cumulative frozen split',
       detail:
-        'The bucket walks the split’s cumulative weights to pick a variant (`0–49` → control, `50–99` → treatment). The draft uses a single threshold on the first weight, so a 30/70 split is served as if it were 50/50.',
+        'The bucket walks the split’s cumulative weights to pick a variant (`0–49` → control, `50–99` → treatment). The starter uses a single threshold on the first weight, so a 30/70 split is served as if it were 50/50.',
       match: {
         python: {all: [/(cumulative|cum_sum|split)/, /(control|treatment)/]},
         typescript: {all: [/(cumulative|split)/, /(control|treatment)/]},
@@ -122,7 +122,7 @@ of the assignment already written.`,
       id: 'stopped-serves',
       title: 'Stopped experiment serves the stored assignment',
       detail:
-        'A stopped or disabled experiment returns the assignment already stored instead of flipping everyone to control; only a unit with no assignment is refused. The draft returns control for everyone when the experiment is stopped.',
+        'A stopped or disabled experiment returns the assignment already stored instead of flipping everyone to control; only a unit with no assignment is refused. The starter returns control for everyone when the experiment is stopped.',
       match: {
         python: {
           all: [/(stopped|disabled)/, /(cached|assignment|stored)/],
@@ -167,7 +167,7 @@ class Experiment(BaseModel):
 
 
 def bucket_for(experiment: Experiment, unit: str) -> int:
-    # TODO: this draft recomputes the bucket from the current split and salt on every request,
+    # TODO: this starter recomputes the bucket from the current split and salt on every request,
     # keys by unit alone so quotas collide across experiments, and returns control for everyone
     # when the experiment is stopped.
     raw = hashlib.sha256(f"{unit}:{experiment.salt}".encode()).hexdigest()[:8]
@@ -230,7 +230,7 @@ def assign(experiment: Experiment, unit: str) -> str:
 `,
     },
     typescript: {
-      starter: `/** Variant assignment: a model-generated draft that re-buckets every request. */
+      starter: `/** Variant assignment: flawed code that re-buckets every request. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 import {createHash} from 'node:crypto';
@@ -246,7 +246,7 @@ interface Experiment {
 }
 
 function bucketFor(experiment: Experiment, unit: string): number {
-  // TODO: this draft recomputes the bucket from the current split and salt on every request,
+  // TODO: this starter recomputes the bucket from the current split and salt on every request,
   // keys by unit alone so quotas collide across experiments, and returns control for everyone
   // when the experiment is stopped.
   const digest = createHash('sha256').update(\`\${unit}:\${experiment.salt}\`).digest('hex').slice(0, 8);
@@ -335,7 +335,7 @@ type Experiment struct {
 }
 
 func bucketHash(unit string, salt string) int {
-	// TODO: this draft recomputes the bucket from the current split and salt on every request,
+	// TODO: this starter recomputes the bucket from the current split and salt on every request,
 	// keys by unit alone so quotas collide across experiments, and returns control for everyone
 	// when the experiment is stopped.
 	sum := sha256.Sum256([]byte(unit + ":" + salt))
@@ -435,7 +435,7 @@ object AssignmentStore {
   private val jedis = new Jedis("redis", 6379)
 
   def bucketHash(unit: String, salt: String): Int = {
-    // TODO: this draft recomputes the bucket from the current split and salt on every request,
+    // TODO: this starter recomputes the bucket from the current split and salt on every request,
     // keys by unit alone so quotas collide across experiments, and returns control for everyone
     // when the experiment is stopped.
     val digest = MessageDigest.getInstance("SHA-256").digest(s"$unit:$salt".getBytes("UTF-8"))
@@ -522,7 +522,7 @@ std::string digest(const std::string& value) {
 }
 
 int bucketHash(const std::string& unit, const std::string& salt) {
-  // TODO: this draft recomputes the bucket from the current split and salt on every request,
+  // TODO: this starter recomputes the bucket from the current split and salt on every request,
   // keys by unit alone so quotas collide across experiments, and returns control for everyone
   // when the experiment is stopped.
   const std::string value = unit + ":" + salt;
@@ -596,7 +596,7 @@ std::string assign(sw::redis::Redis& redis, const Experiment& experiment, const 
     },
   },
   debrief: `The interview question behind this step is determinism: an assignment must be a pure function of an
-experiment id, an assignment unit and a salt that is frozen at launch. The draft reads fine because
+experiment id, an assignment unit and a salt that is frozen at launch. The starter reads fine because
 the demo edits no split and stops no experiment. Three defects are being checked: a hash that omits
 the experiment id or uses a live salt (so a split edit moves a user from treatment to control), a key
 that names only the unit (so one experiment's quota answers another's request), and a stopped

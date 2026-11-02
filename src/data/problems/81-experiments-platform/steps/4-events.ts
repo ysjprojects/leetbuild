@@ -8,9 +8,9 @@ export const experimentEventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an exposure on every
+**Starting point.** The starter is working code: it produces an exposure on every
 call, the consumer counts it, and the demo shows a number climbing. It compiles, it serves the happy
-path, and it quietly corrupts the analysis it exists to feed. Review it like the service owner, fix
+path, and it quietly corrupts the analysis it exists to feed. Debug it like the service owner, fix
 it, and prove the fix with the checks below.
 
 Every exposure — the moment a unit is shown a variant — is a record on the **\`experiment.exposure\`**
@@ -42,7 +42,7 @@ topic. Implement the exposure path of \`expd\`:
   commits the offset: \`HINCRBY stats:{experiment_id} {variant} 1\` (a store row is the same shape),
   then the commit. A broker error commits nothing, so the record is redelivered.
 
-**Failure mode the checks target.** The draft keys the record by the unit id, so the exposures of one
+**Failure mode the checks target.** The starter keys the record by the unit id, so the exposures of one
 experiment are scattered across partitions and its analysis stream has no order; it publishes on every
 call with no dedupe, so a re-rendered page is a second exposure and every rate is inflated; it ships
 \`user_id\` in the payload, so the topic and the consumer logs carry the user's identity; it leaves the
@@ -85,7 +85,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
       id: 'key-by-experiment',
       title: 'Keys every exposure by experiment id',
       detail:
-        "The produced record is keyed by the **experiment id**, so every exposure of one experiment lands on one partition, in the order it happened — the only key that keeps an experiment's analysis stream ordered. The draft keys by the unit id, which scatters one experiment across partitions.",
+        "The produced record is keyed by the **experiment id**, so every exposure of one experiment lands on one partition, in the order it happened — the only key that keeps an experiment's analysis stream ordered. The starter keys by the unit id, which scatters one experiment across partitions.",
       match: {
         python: {all: [/producer\.produce\(\s*TOPIC\s*,\s*key\s*=\s*experiment_id\b/]},
         typescript: {all: [/topic:\s*TOPIC/, /key:\s*experimentId\b/]},
@@ -100,7 +100,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
       id: 'dedupe',
       title: 'Claims the exposure with SET NX before the produce',
       detail:
-        'A conditional `SET NX` on `dedupe:exp:{id}:{unit}:{variant}` with the dedupe TTL claims the exposure **before** the record is produced; a second call for the same triple returns without producing. The draft publishes on every call, so a re-rendered page counts a second exposure.',
+        'A conditional `SET NX` on `dedupe:exp:{id}:{unit}:{variant}` with the dedupe TTL claims the exposure **before** the record is produced; a second call for the same triple returns without producing. The starter publishes on every call, so a re-rendered page counts a second exposure.',
       match: {
         python: {all: [/dedupe:exp:/, /nx=True/, /ex=DEDUPE_TTL_S/], order: [/r\.set\(/, /producer\.produce\(/]},
         typescript: {all: [/dedupe:exp:/, /['"]NX['"]/, /['"]EX['"]/], order: [/redis\.set\(/, /producer\.send\(/]},
@@ -116,7 +116,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
       id: 'payload',
       title: 'Carries the variant, a unit hash and a timestamp — never the raw unit',
       detail:
-        "The event carries `experiment_id`, `variant`, `unit_hash` (a SHA-256 digest of the unit) and `ts`; a raw user identifier is PII and must not appear in the event or in a log line. The draft ships `user_id`, so the topic and the consumer logs carry the user's identity.",
+        "The event carries `experiment_id`, `variant`, `unit_hash` (a SHA-256 digest of the unit) and `ts`; a raw user identifier is PII and must not appear in the event or in a log line. The starter ships `user_id`, so the topic and the consumer logs carry the user's identity.",
       match: {
         python: {
           all: [/["']unit_hash["']\s*:/, /["']variant["']\s*:/, /["']ts["']\s*:/],
@@ -135,7 +135,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
       id: 'idempotent-producer',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence and `acks=all` (`enable.idempotence` with `"acks": "all"`, KafkaJS’s `idempotent: true` with `acks: -1`, kafka-go’s `RequireAll` with a stable `Hash` balancer), so a retry of an acknowledged produce cannot write the exposure twice. The draft leaves the producer at its defaults.',
+        'The producer is configured for idempotence and `acks=all` (`enable.idempotence` with `"acks": "all"`, KafkaJS’s `idempotent: true` with `acks: -1`, kafka-go’s `RequireAll` with a stable `Hash` balancer), so a retry of an acknowledged produce cannot write the exposure twice. The starter leaves the producer at its defaults.',
       match: {
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -148,7 +148,7 @@ the counter, so a crash in between loses the exposure while the offset says it w
       id: 'state-before-commit',
       title: 'Writes the analysis counter before committing the offset',
       detail:
-        'The consumer applies the exposure to the analysis state — `HINCRBY stats:{experiment_id} {variant} 1` — and only then commits the offset, so a crash replays the record instead of losing it, and a broker error commits nothing. The draft commits first, so the exposure is lost while the offset says it was applied.',
+        'The consumer applies the exposure to the analysis state — `HINCRBY stats:{experiment_id} {variant} 1` — and only then commits the offset, so a crash replays the record instead of losing it, and a broker error commits nothing. The starter commits first, so the exposure is lost while the offset says it was applied.',
       match: {
         python: {all: [/hincrby/, /"enable\.auto\.commit"\s*:\s*False/], order: [/r\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {all: [/hincrby/, /autoCommit:\s*false/], order: [/redis\.hincrby\(/, /commitOffsets\(/]},
@@ -186,7 +186,7 @@ consumer = Consumer(
 
 
 def record_exposure(experiment_id: str, unit: str, variant: str, ts: float) -> None:
-    # TODO: this draft keys the record by the unit, produces on every call (a re-rendered page counts a
+    # TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
     # second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
     event = json.dumps({"experiment_id": experiment_id, "variant": variant, "user_id": unit, "ts": ts})
     producer.produce(TOPIC, key=unit, value=event)
@@ -299,7 +299,7 @@ export async function recordExposure(
   variant: string,
   ts: number,
 ): Promise<void> {
-  // TODO: this draft keys the record by the unit, produces on every call (a re-rendered page counts a
+  // TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
   // second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
   const event = JSON.stringify({experiment_id: experimentId, variant, user_id: unit, ts});
   await producer.send({topic: TOPIC, messages: [{key: unit, value: event}]});
@@ -419,7 +419,7 @@ type exposureEvent struct {
 	Ts           float64 \`json:"ts"\`
 }
 
-// TODO: this draft keys the record by the unit, produces on every call (a re-rendered page counts a
+// TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
 // second exposure), ships the raw user id in the payload, and leaves the writer at its defaults.
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: exposureTopic}
 
@@ -582,7 +582,7 @@ object ExposureEvents {
   producerProps.put("bootstrap.servers", "kafka:9092")
   private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
 
-  // TODO: this draft keys the record by the unit, produces on every call (a re-rendered page counts a
+  // TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
   // second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
   def recordExposure(experimentId: String, unit: String, variant: String, ts: Double): Unit = {
     val payload = s"""{"experiment_id":"$experimentId","variant":"$variant","user_id":"$unit","ts":$ts}"""
@@ -727,7 +727,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 
 auto producer = make_producer();
 
-// TODO: this draft keys the record by the unit, produces on every call (a re-rendered page counts a
+// TODO: this starter keys the record by the unit, produces on every call (a re-rendered page counts a
 // second exposure), ships the raw user id in the payload, and leaves the producer at its defaults.
 void record_exposure(const std::string& experiment_id, const std::string& unit, const std::string& variant,
                      double ts) {
@@ -880,8 +880,8 @@ void run() {
     'Redis makes `record_exposure` idempotent: `SET NX` on `dedupe:exp:{id}:{unit}:{variant}` with the dedupe TTL, *before* the produce, and a refused claim returns without a record. `unit_hash` is the only unit-derived field the event may carry, and producer durability is configuration (`enable.idempotence` + `acks=all`, KafkaJS `idempotent: true` + `acks: -1`, kafka-go `RequireAll` + `Hash`).',
     'In the consumer the order is the point: `HINCRBY stats:{experiment_id} {variant} 1` first, commit second. Commit first and a crash loses the exposure the offset claims was applied; a broker error must commit nothing at all.',
   ],
-  debrief: `The interviewer is testing whether you can review a Kafka exposure path as the analysis contract
-instead of a publish call. The draft looks right because the demo renders one page, on one cluster, with
+  debrief: `The interviewer is testing whether you can debug a Kafka exposure path as the analysis contract
+instead of a publish call. The starter looks right because the demo renders one page, on one cluster, with
 no re-render and no crash. Five defects are being checked: a unit-keyed record (the stream of an
 experiment loses its order), a produce with no dedupe claim (a re-rendered page is a second exposure and
 every rate is inflated), a payload carrying \`user_id\` (PII on the topic and in the logs), a producer at

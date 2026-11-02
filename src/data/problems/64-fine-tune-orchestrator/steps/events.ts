@@ -8,15 +8,15 @@ export const eventsStep: Step = {
   focus: ['kafka', 'api'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated event publisher: it produces a
-lifecycle event when a job changes. It compiles, the happy path shows an event, and it leaks the
-training recipe and a slice of the loss curve into a topic that is retained and replicated. Review it
-like the data owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the event publisher: it produces a lifecycle
+event when a job changes. It compiles, the happy path shows an event, and it leaks the training
+recipe and a slice of the loss curve into a topic that is retained and replicated. Debug it like
+the data owner, fix it, and prove the fix with the checks below.
 
 Publish lifecycle events to the topic \`finetune.job\`.
 
 - **Key by job id.** Every event carries \`key = job_id\`, so all events for one job land on one
-  partition and stay in order. The draft keys by team.
+  partition and stay in order. The starter keys by team.
 - **Reference, not a copy.** The payload carries the \`config_hash\`, the \`dataset_version\`, the
   \`checkpoint_ids\` and the \`status\` — enough to find the job, never enough to reproduce the data
   from the topic.
@@ -24,7 +24,7 @@ Publish lifecycle events to the topic \`finetune.job\`.
   the datastore; a topic is retained, replicated and often mirrored, so it is the wrong place for
   either.
 - **Publish after commit.** The job record is committed **before** the produce, so an event can never
-  announce a state that is not durable. The draft acknowledges the produce first.
+  announce a state that is not durable. The starter acknowledges the produce first.
 - **Idempotent producer.** The producer is configured idempotent with \`acks=all\`, so a retried
   produce does not duplicate an event.
 
@@ -54,7 +54,7 @@ before the commit means a consumer can act on a transition that the datastore la
       id: 'topic-key',
       title: 'Publishes finetune.job keyed by job id',
       detail:
-        'The event goes to `finetune.job` with `key = job_id`, so all events for a job stay ordered on one partition. The draft keys by team.',
+        'The event goes to `finetune.job` with `key = job_id`, so all events for a job stay ordered on one partition. The starter keys by team.',
       match: {
         python: {all: [/finetune\.job/, /key=job\["id"\]/]},
         typescript: {all: [/finetune\.job/, /key:\s*job\.id/]},
@@ -67,7 +67,7 @@ before the commit means a consumer can act on a transition that the datastore la
       id: 'payload-hash',
       title: 'Carries the config hash, dataset version and checkpoint ids',
       detail:
-        'The payload references the job by `config_hash`, `dataset_version` and `checkpoint_ids` instead of copying the recipe. The draft sends neither hash.',
+        'The payload references the job by `config_hash`, `dataset_version` and `checkpoint_ids` instead of copying the recipe. The starter sends neither hash.',
       match: {
         python: {all: [/config_hash/, /dataset_version/, /checkpoint_ids/]},
         typescript: {all: [/configHash/, /datasetVersion/, /checkpointIds/]},
@@ -80,7 +80,7 @@ before the commit means a consumer can act on a transition that the datastore la
       id: 'no-config-no-logs',
       title: 'Never ships the hyperparameter block or a loss log sample',
       detail:
-        'Neither the hyperparameter block nor any slice of the training log appears in the event or the topic. The draft embeds both.',
+        'Neither the hyperparameter block nor any slice of the training log appears in the event or the topic. The starter embeds both.',
       match: {
         python: {none: [/hyperparameters/, /loss_log/]},
         typescript: {none: [/hyperparameters/, /lossLog/]},
@@ -93,7 +93,7 @@ before the commit means a consumer can act on a transition that the datastore la
       id: 'publish-after-commit',
       title: 'Produces only after the job record commits',
       detail:
-        'The job record is committed before the produce, so an event never announces an uncommitted state. The draft produces first and commits later — or never.',
+        'The job record is committed before the produce, so an event never announces an uncommitted state. The starter produces first and commits later — or never.',
       match: {
         python: {all: [/commit\(/, /produce\(/], order: [/commit\(/, /produce\(/]},
         typescript: {all: [/\.commit\(/, /\.send\(/], order: [/\.commit\(/, /\.send\(/]},
@@ -106,7 +106,7 @@ before the commit means a consumer can act on a transition that the datastore la
       id: 'idempotent-producer',
       title: 'Runs an idempotent producer with acks=all',
       detail:
-        'The producer is configured idempotent and waits for all in-sync replicas, so a retried produce does not duplicate an event. The draft uses the client defaults.',
+        'The producer is configured idempotent and waits for all in-sync replicas, so a retried produce does not duplicate an event. The starter uses the client defaults.',
       match: {
         python: {all: [/enable\.idempotence/, /"acks": "all"/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -118,7 +118,7 @@ before the commit means a consumer can act on a transition that the datastore la
   ],
   code: {
     python: {
-      starter: `"""Fine-tune lifecycle events on Kafka (model-generated draft)."""
+      starter: `"""Fine-tune lifecycle events on Kafka: flawed code that leaks the recipe into the topic."""
 import json
 import logging
 
@@ -196,7 +196,7 @@ class EventPublisher:
 `,
     },
     typescript: {
-      starter: `/** Fine-tune lifecycle events on Kafka (model-generated draft). */
+      starter: `/** Fine-tune lifecycle events on Kafka: flawed code that leaks the recipe into the topic. */
 import {Kafka, type Producer} from 'kafkajs';
 
 export class EventPublisher {
@@ -263,7 +263,7 @@ export class EventPublisher {
 `,
     },
     go: {
-      starter: `// Package events publishes fine-tune lifecycle events to Kafka (model-generated draft).
+      starter: `// Package events publishes fine-tune lifecycle events to Kafka: flawed code that leaks the recipe into the topic.
 package events
 
 import (
@@ -416,7 +416,7 @@ object Events {
 `,
     },
     cpp: {
-      starter: `// Fine-tune lifecycle events on Kafka (model-generated draft).
+      starter: `// Fine-tune lifecycle events on Kafka: flawed code that leaks the recipe into the topic.
 #include <librdkafka/rdkafkacpp.h>
 
 #include <string>
@@ -500,5 +500,5 @@ class EventPublisher {
     'The payload is a pointer to the job — `config_hash`, `dataset_version`, `checkpoint_ids`, `status`. The recipe and the loss curve stay in the datastore.',
     'Commit the job record first, then produce with an idempotent `acks=all` producer, so no event announces a state that is not durable.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated event path against ordering, payload hygiene and durability. The draft reads fine because the topic shows a plausible event. Four separate defects are being checked: the key must be the job id so per-job order holds; the payload must carry hashes and ids rather than the recipe and the loss curve; the produce must follow the commit so a consumer cannot act on a rolled-back transition; and the producer must be idempotent with acks=all so a retry does not duplicate. The payload flaw is the one candidates miss: a retained topic is a second, unmanaged copy of whatever you put in it. Real systems also carry an event id so consumers can dedupe redeliveries.`,
+  debrief: `The interviewer is testing whether you can debug an event path against ordering, payload hygiene and durability. The starter reads fine because the topic shows a healthy-looking event. Four separate defects are being checked: the key must be the job id so per-job order holds; the payload must carry hashes and ids rather than the recipe and the loss curve; the produce must follow the commit so a consumer cannot act on a rolled-back transition; and the producer must be idempotent with acks=all so a retry does not duplicate. The payload flaw is the one candidates miss: a retained topic is a second, unmanaged copy of whatever you put in it. Real systems also carry an event id so consumers can dedupe redeliveries.`,
 };

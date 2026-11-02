@@ -8,7 +8,7 @@ export const toolCallsStep: Step = {
   focus: ['subagent', 'tools', 'citation'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the tool service is
+**Starting point.** The starter is working code: when the tool service is
 healthy it returns the page text, and the citation pass returns every citation marked verified, so
 the demo passes. Every failure path and every trust boundary is wrong. Find the four flaws, fix
 them, and prove the fix.
@@ -30,7 +30,7 @@ and the citation pass:
   source** it names. A span that is not in the source is a claim with no evidence; it stays in the
   report unverified and the end-state judge scores citation accuracy accordingly.
 
-**Failure mode the checks target.** The draft catches every error and loops forever — a permanent
+**Failure mode the checks target.** The starter catches every error and loops forever — a permanent
 \`INVALID_ARGUMENT\` spins the subagent, and a struggling tool service gets a hot loop with no
 pause between attempts; a result forwarded verbatim lets any web page inject instructions into a
 subagent that has tools; and a citation pass that marks everything verified turns the report's
@@ -59,7 +59,7 @@ strongest promise — every claim attributed to a source — into decoration.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). Bound the attempts with a constant and a `for` loop: the draft’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
+    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`). Bound the attempts with a constant and a `for` loop: the starter’s `while True` has no exit for a permanent error like `INVALID_ARGUMENT`.',
     'Retryability is a property of the status, not of “it threw”: compare the code against `UNAVAILABLE` / `DEADLINE_EXCEEDED`, raise anything else immediately, and sleep `BACKOFF_BASE_S * 2 ** attempt` before the next try.',
     'Two small pure functions carry the trust boundary: `sanitize_result` splits the text into lines, drops the ones `INSTRUCTION_PATTERN` matches and counts them; `verify_citations` sets `verified` to whether the span is a substring (`in`, `includes`, `strings.Contains`, `contains`, `find`) of the named source’s text.',
   ],
@@ -83,7 +83,7 @@ strongest promise — every claim attributed to a source — into decoration.`,
       id: 'retry-policy',
       title: 'At most three attempts, only the two retryable codes',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The draft retries every error forever.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The starter retries every error forever.',
       match: {
         python: {
           all: [
@@ -121,7 +121,7 @@ strongest promise — every claim attributed to a source — into decoration.`,
       id: 'backoff',
       title: 'Backs off exponentially from 500 ms between attempts',
       detail:
-        'A retry waits `BACKOFF_BASE_S = 0.5` seconds doubled per attempt before the next call. The draft retries immediately, turning a struggling tool service into a hot loop.',
+        'A retry waits `BACKOFF_BASE_S = 0.5` seconds doubled per attempt before the next call. The starter retries immediately, turning a struggling tool service into a hot loop.',
       match: {
         python: {all: [/BACKOFF_BASE_S\s*=\s*0\.5/, /sleep\(/]},
         typescript: {all: [/BACKOFF_BASE_MS\s*=\s*500/, /setTimeout\(/]},
@@ -134,7 +134,7 @@ strongest promise — every claim attributed to a source — into decoration.`,
       id: 'untrusted-text',
       title: 'Strips and counts instruction-like lines from tool results',
       detail:
-        '`sanitize_result` drops every line matching `INSTRUCTION_PATTERN` and returns the count, so a page that says "ignore the previous instructions" never reaches the model as text it might follow. The draft forwards the result verbatim.',
+        '`sanitize_result` drops every line matching `INSTRUCTION_PATTERN` and returns the count, so a page that says "ignore the previous instructions" never reaches the model as text it might follow. The starter forwards the result verbatim.',
       match: {
         python: {all: [/INSTRUCTION_PATTERN/, /sanitize_result\(/]},
         typescript: {all: [/INSTRUCTION_PATTERN/, /sanitizeResult\(/]},
@@ -147,7 +147,7 @@ strongest promise — every claim attributed to a source — into decoration.`,
       id: 'literal-citation',
       title: 'Verifies a citation only when its span is in the fetched source',
       detail:
-        '`verify_citations` marks a citation verified only when `span` is a literal substring of the named source’s text. The draft marks every citation verified without looking.',
+        '`verify_citations` marks a citation verified only when `span` is a literal substring of the named source’s text. The starter marks every citation verified without looking.',
       match: {
         python: {all: [/def verify_citations\(/, /\.span\s+in\s+/]},
         typescript: {all: [/function verifyCitations\(/, /\.includes\(/]},
@@ -187,7 +187,7 @@ class Citation:
 def call_tool(name: str, args: dict) -> ToolResult:
     # TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
     # UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-    # pass check the span against the source. Review all four.
+    # pass check the span against the source. Fix all four.
     while True:
         try:
             reply = tools.Call(tools_pb2.CallRequest(name=name, args=args))
@@ -271,7 +271,7 @@ def verify_citations(citations: list[Citation], sources: dict[str, str]) -> list
 `,
     },
     typescript: {
-      starter: `/** Tool calls: a model-generated draft that retries forever and trusts every result and citation. */
+      starter: `/** Tool calls: flawed code that retries forever and trusts every result and citation. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -307,7 +307,7 @@ export interface Citation {
 export async function callTool(name: string, args: Record<string, string>): Promise<ToolResult> {
   // TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
   // UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-  // pass check the span against the source. Review all four.
+  // pass check the span against the source. Fix all four.
   for (;;) {
     try {
       const reply = await new Promise<CallReply>((resolve, reject) => {
@@ -436,7 +436,7 @@ type Citation struct {
 
 // TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
 // UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-// pass check the span against the source. Review all four.
+// pass check the span against the source. Fix all four.
 func callTool(ctx context.Context, client pb.ToolsClient, name string, args map[string]string) (ToolResult, error) {
 	for {
 		reply, err := client.Call(ctx, &pb.CallRequest{Name: name, Args: args})
@@ -556,7 +556,7 @@ object ToolCalls {
 
   // TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
   // UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-  // pass check the span against the source. Review all four.
+  // pass check the span against the source. Fix all four.
   def callTool(name: String, args: Map[String, String]): ToolResult = {
     var result: Option[ToolResult] = None
     while (result.isEmpty) {
@@ -645,7 +645,7 @@ struct Citation {
 
 // TODO: add the 30 s deadline, bound the attempts to 3 with backoff and retry only
 // UNAVAILABLE / DEADLINE_EXCEEDED, treat the result as untrusted text, and make the citation
-// pass check the span against the source. Review all four.
+// pass check the span against the source. Fix all four.
 ToolResult callTool(Tools::Stub* stub, const std::string& name, const std::map<std::string, std::string>& args) {
   while (true) {
     grpc::ClientContext ctx;

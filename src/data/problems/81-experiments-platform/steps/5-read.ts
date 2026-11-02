@@ -8,7 +8,7 @@ export const experimentReadStep: Step = {
   focus: ['client', 'api', 'store', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it reads the analysis state, computes a p-value
+**Starting point.** The starter is working code: it reads the analysis state, computes a p-value
 and names a winner the moment that number is small. It looks like a report; it is a peeking
 machine. Find the flaws, fix them, and prove the fix.
 
@@ -33,7 +33,7 @@ Implement \`GET /v1/experiments/{id}/report\` for a signed-in tenant:
   \`inconclusive\` or \`blocked\`.
 - Missing \`X-Tenant-Id\` is **401**; an unknown experiment (or one of another tenant) is **404**.
 
-**Failure mode the checks target.** The draft decides from the p-value alone —
+**Failure mode the checks target.** The starter decides from the p-value alone —
 \`winner: p < 0.05 ? treatment : control\` at any sample size — so every peek mints a winner. It
 never computes the sample ratio mismatch, so a split that has drifted from the frozen design is
 hidden instead of surfaced as a blocking caveat. And it reports the lift as one number, so a reader
@@ -78,7 +78,7 @@ run **before** the p-value comparison, not after it.`,
       id: 'min-sample',
       title: 'Refuses a winner below the pinned minimum sample',
       detail:
-        'Below `min_sample` the report is **200** with `status: "inconclusive"`, `winner: null` and `reason: "minimum sample not reached"` — no winner, however small the p-value. The draft names a winner at any sample size.',
+        'Below `min_sample` the report is **200** with `status: "inconclusive"`, `winner: null` and `reason: "minimum sample not reached"` — no winner, however small the p-value. The starter names a winner at any sample size.',
       match: {
         python: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /winner["']?\s*:\s*None/]},
         typescript: {all: [/min_sample/, /inconclusive/, /minimum sample not reached/, /winner:\s*null/]},
@@ -91,7 +91,7 @@ run **before** the p-value comparison, not after it.`,
       id: 'srm-caveat',
       title: 'Reports a sample ratio mismatch as a blocking caveat',
       detail:
-        'A deviation of the observed variant share from the frozen split above **2 %** becomes `{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}` and prevents the winner call even when `p < 0.05`. The draft never computes SRM.',
+        'A deviation of the observed variant share from the frozen split above **2 %** becomes `{"caveat": {"kind": "srm", "blocking": true, "observed": ..., "expected": ...}}` and prevents the winner call even when `p < 0.05`. The starter never computes SRM.',
       match: {
         python: {all: [/SRM_THRESHOLD/, /"kind":\s*"srm"/, /"blocking":\s*True/, /caveat/]},
         typescript: {all: [/SRM_THRESHOLD/, /kind:\s*'srm'/, /blocking:\s*true/, /caveat/]},
@@ -104,7 +104,7 @@ run **before** the p-value comparison, not after it.`,
       id: 'intervals',
       title: 'Reports every lift with a 95 % confidence interval',
       detail:
-        'A lift is always returned with `ci_low` and `ci_high` — the 95 % interval computed from the two proportions — including on a significant result. The draft reports a bare `lift`.',
+        'A lift is always returned with `ci_low` and `ci_high` — the 95 % interval computed from the two proportions — including on a significant result. The starter reports a bare `lift`.',
       match: {
         python: {all: [/ci_low/, /ci_high/, /lift/]},
         typescript: {all: [/ci_low/, /ci_high/, /lift/]},
@@ -117,7 +117,7 @@ run **before** the p-value comparison, not after it.`,
       id: 'no-peek',
       title: 'The sample guard and the SRM check run before the p-value',
       detail:
-        'The sample guard runs first, then the blocking SRM check, and only then is `p_value < 0.05` consulted for a winner. The draft compares the p-value before either guard.',
+        'The sample guard runs first, then the blocking SRM check, and only then is `p_value < 0.05` consulted for a winner. The starter compares the p-value before either guard.',
       match: {
         python: {
           order: [
@@ -187,7 +187,7 @@ def report(
     experiment_id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft declares a winner whenever p < 0.05, at any sample size, never computes
+    # TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
     # the sample ratio mismatch, and reports the lift with no confidence interval.
     if tenant is None or tenant == "":
         raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
@@ -322,7 +322,7 @@ def report(
 `,
     },
     typescript: {
-      starter: `/** Experiment report: a model-generated draft that calls a winner straight from the p-value. */
+      starter: `/** Experiment report: flawed code that calls a winner straight from the p-value. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -360,7 +360,7 @@ function computePValue(control: VariantTotals, treatment: VariantTotals): number
 
 export function routes(store: ExperimentStore): void {
   app.get('/v1/experiments/:experimentId/report', async (request, reply) => {
-    // TODO: this draft declares a winner whenever p < 0.05, at any sample size, never computes
+    // TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
     // the sample ratio mismatch, and reports the lift with no confidence interval.
     const tenant = request.headers['x-tenant-id'];
     if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
@@ -547,7 +547,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func report(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft declares a winner whenever p < 0.05, at any sample size, never computes
+	// TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
 	// the sample ratio mismatch, and reports the lift with no confidence interval.
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
@@ -755,7 +755,7 @@ object ExperimentReport {
     path("v1" / "experiments" / Segment / "report") { experimentId =>
       get {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: this draft declares a winner whenever p < 0.05, at any sample size, never
+          // TODO: this starter declares a winner whenever p < 0.05, at any sample size, never
           // computes the sample ratio mismatch, and reports the lift with no confidence interval.
           val tenant = tenantOpt.filter(_.nonEmpty)
           if (tenant.isEmpty) {
@@ -920,7 +920,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/experiments/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft declares a winner whenever p < 0.05, at any sample size, never computes
+    // TODO: this starter declares a winner whenever p < 0.05, at any sample size, never computes
     // the sample ratio mismatch, and reports the lift with no confidence interval.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     if (tenant.empty()) {
@@ -1093,12 +1093,12 @@ int main() {
     },
   },
   hints: [
-    'The guards have an order: read the per-variant totals, refuse the peek below `min_sample`, run the SRM check, and only then look at the p-value. The draft runs the last one first.',
+    'The guards have an order: read the per-variant totals, refuse the peek below `min_sample`, run the SRM check, and only then look at the p-value. The starter runs the last one first.',
     'The interval is not decoration: compute `ci_low` and `ci_high` from the two proportions and return all three keys on every branch — including the significant one — so nobody reads a lift without its error bar.',
     'SRM belongs to the assignment, not the outcome: compare the observed share against the frozen split and report a deviation over **2 %** as `{"caveat": {"kind": "srm", "blocking": true, ...}}` — a caveat that survives `p < 0.05`.',
   ],
   debrief: `The interviewer is testing whether the read side can say "no" while an experiment is still
-running. The draft is a peeking machine: it computes a p-value on whatever data exists and names a
+running. The starter is a peeking machine: it computes a p-value on whatever data exists and names a
 winner, which is exactly how a 5 % false-positive rate becomes a coin flip when someone refreshes
 the dashboard every morning. It hides the sample ratio mismatch, so a split that drifted from the
 frozen design — the failure that invalidates the whole comparison — never appears, and it prints a

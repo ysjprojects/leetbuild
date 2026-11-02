@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['runner', 'redis', 'sandbox'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a probe runs, the target's counter goes up, and a
+**Starting point.** The starter is working code: a probe runs, the target's counter goes up, and a
 duplicate is skipped. It races under concurrency, it keeps spending after the cap is reached, and
 its keys never die. Find the flaws, fix them, and prove the fix.
 
@@ -18,7 +18,7 @@ Implement \`record_probe\`, called once per executed probe with
 - A probe is identified by \`(target, probe_hash)\` and lives under its **own dedupe key**
   \`redteam:probe:{target}:{probe_hash}\`, claimed with **one atomic \`SET\` … \`NX\` \`EX\`** with
   \`DEDUPE_TTL_S = 86_400\`. Two workers replaying the same probe must not both run it; a client-side
-  \`GET\` followed by a \`SET\` is exactly the race the draft has.
+  \`GET\` followed by a \`SET\` is exactly the race the starter has.
 - Each target gets an **hourly probe budget** under \`redteam:budget:{target}:{window}\`, where the
   window is \`int(time.time()) // WINDOW_S\` and \`WINDOW_S = 3600\`. The read, the check and the
   increment happen in **one atomic Lua \`EVAL\`** that also sets \`EXPIRE\` from the window at first
@@ -53,7 +53,7 @@ blocks every future run, forever.`,
       id: 'dedupe-atomic',
       title: 'Claims the probe with one SET NX EX',
       detail:
-        '`(target, probe_hash)` is claimed with a single atomic `SET … NX … EX`, so concurrent duplicates cannot both win. The draft reads the key with `GET` and writes it back, which is a check-then-set race.',
+        '`(target, probe_hash)` is claimed with a single atomic `SET … NX … EX`, so concurrent duplicates cannot both win. The starter reads the key with `GET` and writes it back, which is a check-then-set race.',
       match: {
         python: {all: [/nx=True/, /ex=DEDUPE_TTL_S/, /dedupe_key\(/], none: [/r\.get\(\s*dedupe_key\(/]},
         typescript: {all: [/'NX'/, /'EX'/, /dedupeKey\(/], none: [/\.get\(\s*dedupeKey\(/]},
@@ -66,7 +66,7 @@ blocks every future run, forever.`,
       id: 'budget-script',
       title: 'Reserves the hourly budget inside one script',
       detail:
-        'One Lua `EVAL` reads the spent count, compares it against the cap, increments and sets `EXPIRE` from the window. The draft increments from the client and never expires the key.',
+        'One Lua `EVAL` reads the spent count, compares it against the cap, increments and sets `EXPIRE` from the window. The starter increments from the client and never expires the key.',
       match: {
         python: {all: [/RESERVE_LUA/, /INCRBY/, /EXPIRE/, /\.eval\(/]},
         typescript: {all: [/RESERVE_LUA/, /INCRBY/, /EXPIRE/, /\.eval\(/]},
@@ -79,7 +79,7 @@ blocks every future run, forever.`,
       id: 'destructive-budget',
       title: 'Caps destructive categories on their own budget',
       detail:
-        'A destructive category draws from `DESTRUCTIVE_PROBE_BUDGET` under its own key, checked against `DESTRUCTIVE_CATEGORIES` before the reservation. The draft has one shared cap, so destructive payloads can consume the whole target budget.',
+        'A destructive category draws from `DESTRUCTIVE_PROBE_BUDGET` under its own key, checked against `DESTRUCTIVE_CATEGORIES` before the reservation. The starter has one shared cap, so destructive payloads can consume the whole target budget.',
       match: {
         python: {all: [/DESTRUCTIVE_PROBE_BUDGET/, /DESTRUCTIVE_CATEGORIES/, /budget_key\(/]},
         typescript: {all: [/DESTRUCTIVE_PROBE_BUDGET/, /DESTRUCTIVE_CATEGORIES/, /budgetKey\(/]},
@@ -92,7 +92,7 @@ blocks every future run, forever.`,
       id: 'claim-before-reserve',
       title: 'Claims the probe before it spends budget',
       detail:
-        'The dedupe claim happens before the budget reservation, so a replayed probe neither counts nor re-spends. A draft that reserves first charges the target for every retry of a probe it already ran.',
+        'The dedupe claim happens before the budget reservation, so a replayed probe neither counts nor re-spends. A version that reserves first charges the target for every retry of a probe it already ran.',
       match: {
         python: {order: [/nx=True/, /reserve_budget\(/]},
         typescript: {order: [/'NX'/, /reserveBudget\(/]},
@@ -105,7 +105,7 @@ blocks every future run, forever.`,
       id: 'window-scoped-keys',
       title: 'Scopes keys to the target and the hour',
       detail:
-        'Keys are built by a `budget_key`/`dedupe_key` helper from the target and the hour window, with the TTL taken from `WINDOW_S`/`DEDUPE_TTL_S`. The draft writes one key per target with no expiry, so an exhausted target stays exhausted.',
+        'Keys are built by a `budget_key`/`dedupe_key` helper from the target and the hour window, with the TTL taken from `WINDOW_S`/`DEDUPE_TTL_S`. The starter writes one key per target with no expiry, so an exhausted target stays exhausted.',
       match: {
         python: {all: [/def budget_key\(/, /WINDOW_S/]},
         typescript: {all: [/function budgetKey\(/, /WINDOW_S/]},
@@ -139,7 +139,7 @@ def dedupe_key(target: str, probe_hash: str) -> str:
 
 @app.post("/v1/redteam/probes")
 def record_probe(body: ProbeResult) -> dict:
-    # TODO: this draft reads the dedupe key with GET before writing it, so two concurrent
+    # TODO: this starter reads the dedupe key with GET before writing it, so two concurrent
     # duplicates both run; it increments a single never-expiring counter per target with no window,
     # and it has no separate cap for destructive categories. Make the claim atomic, move the budget
     # into one script with a TTL, and give destructive probes their own cap.
@@ -224,7 +224,7 @@ def record_probe(body: ProbeResult) -> dict:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/redteam/probes: a model-generated draft that counts its own duplicates. */
+      starter: `/** POST /v1/redteam/probes: flawed code that counts its own duplicates. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -244,7 +244,7 @@ function dedupeKey(target: string, probeHash: string): string {
 }
 
 app.post('/v1/redteam/probes', async (request, reply) => {
-  // TODO: this draft reads the dedupe key with get before writing it, so two concurrent duplicates
+  // TODO: this starter reads the dedupe key with get before writing it, so two concurrent duplicates
   // both run; it increments a single never-expiring counter per target with no window, and it has
   // no separate cap for destructive categories. Make the claim atomic, move the budget into one
   // script with a TTL, and give destructive probes their own cap.
@@ -363,7 +363,7 @@ func dedupeKey(target, probeHash string) string {
 }
 
 func recordProbe(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reads the dedupe key with Get before writing it, so two concurrent
+	// TODO: this starter reads the dedupe key with Get before writing it, so two concurrent
 	// duplicates both run; it increments a single never-expiring counter per target with no window,
 	// and it has no separate cap for destructive categories. Make the claim atomic, move the budget
 	// into one script with a TTL, and give destructive probes their own cap.
@@ -490,7 +490,7 @@ object State {
 
   def dedupeKey(target: String, probeHash: String): String = s"redteam:probe:$target:$probeHash"
 
-  // TODO: this draft reads the dedupe key with get before writing it, so two concurrent duplicates
+  // TODO: this starter reads the dedupe key with get before writing it, so two concurrent duplicates
   // both run; it increments a single never-expiring counter per target with no window, and it has
   // no separate cap for destructive categories. Make the claim atomic, move the budget into one
   // script with a TTL, and give destructive probes their own cap.
@@ -598,7 +598,7 @@ std::string dedupeKey(const std::string& target, const std::string& probeHash) {
   return "redteam:probe:" + target + ":" + probeHash;
 }
 
-// TODO: this draft reads the dedupe key with get before writing it, so two concurrent duplicates
+// TODO: this starter reads the dedupe key with get before writing it, so two concurrent duplicates
 // both run; it increments a single never-expiring counter per target with no window, and it has no
 // separate cap for destructive categories. Make the claim atomic, move the budget into one script
 // with a TTL, and give destructive probes their own cap.

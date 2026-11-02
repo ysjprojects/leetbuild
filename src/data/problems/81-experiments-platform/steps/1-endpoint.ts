@@ -14,7 +14,7 @@ export const experimentEndpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers both routes,
+**Starting point.** The starter is working code: it registers both routes,
 creates experiments, and its 201 looks right for a 50/50 split. It hides the four defects that turn
 an experiment into an anecdote — read it like the platform owner, fix it, and prove the fix with the
 checks below.
@@ -41,7 +41,7 @@ Implement \`POST /v1/experiments\` with body
   design change is a new version.
 - Log the creation with the tenant and the experiment id; never log the request body wholesale.
 
-**Failure mode the checks target.** The draft accepts any split and normalizes it
+**Failure mode the checks target.** The starter accepts any split and normalizes it
 (\`sum(...) or 1\` reweighting), so a design that sums to 99 or 101 is silently turned into a
 different experiment instead of rejected; it accepts any \`unit\` string, so a typo randomizes a
 different entity than the report assumes; it never looks at the variant count, so a one-variant
@@ -109,7 +109,7 @@ so one edit moves users between variants mid-flight and every downstream number 
       id: 'variants',
       title: 'Requires at least 2 variants with distinct non-empty keys',
       detail:
-        'The create path counts the variants against `MIN_VARIANTS` (2) and rejects duplicate or empty `key`s with **400**. The draft never looks at the count, so a one-variant "experiment" is accepted and its whole traffic lands in a single arm that cannot be compared to anything.',
+        'The create path counts the variants against `MIN_VARIANTS` (2) and rejects duplicate or empty `key`s with **400**. The starter never looks at the count, so a one-variant "experiment" is accepted and its whole traffic lands in a single arm that cannot be compared to anything.',
       match: {
         python: {
           all: [
@@ -147,7 +147,7 @@ so one edit moves users between variants mid-flight and every downstream number 
       id: 'split-exact',
       title: 'Weights must sum to exactly 100 — rejected, never normalized',
       detail:
-        'The weights are validated as non-negative integers whose sum is compared against `SPLIT_TOTAL` (100) and a split that sums to 99 or 101 answers **400**. The draft divides by `sum(...) or 1` instead, so an unapproved split is silently reweighted and the experiment that runs is not the experiment that was asked for.',
+        'The weights are validated as non-negative integers whose sum is compared against `SPLIT_TOTAL` (100) and a split that sums to 99 or 101 answers **400**. The starter divides by `sum(...) or 1` instead, so an unapproved split is silently reweighted and the experiment that runs is not the experiment that was asked for.',
       match: {
         python: {
           all: [
@@ -190,7 +190,7 @@ so one edit moves users between variants mid-flight and every downstream number 
       id: 'unit-frozen',
       title: 'Unit is restricted to the allowed set and frozen after launch',
       detail:
-        'Create validates `unit` against the allowed set (**400**), and the update path treats a `unit` in the patch body as a design change (**409**). The draft takes any string as the unit and overwrites it in place on `PATCH`, so a typo silently re-randomizes a different entity than the one the analysis assumes.',
+        'Create validates `unit` against the allowed set (**400**), and the update path treats a `unit` in the patch body as a design change (**409**). The starter takes any string as the unit and overwrites it in place on `PATCH`, so a typo silently re-randomizes a different entity than the one the analysis assumes.',
       match: {
         python: {
           all: [
@@ -237,7 +237,7 @@ so one edit moves users between variants mid-flight and every downstream number 
       id: 'new-version',
       title: 'A design change is 409 and demands a new version',
       detail:
-        'A `PATCH` that carries `variants`, `unit`, `min_sample` or `salt` answers **409** with an error naming the frozen design and `required: "new version"`, so the live experiment is never mutated. The draft re-writes `weights` and `unit` of the running experiment and returns 200, which is exactly the incident this step exists for.',
+        'A `PATCH` that carries `variants`, `unit`, `min_sample` or `salt` answers **409** with an error naming the frozen design and `required: "new version"`, so the live experiment is never mutated. The starter re-writes `weights` and `unit` of the running experiment and returns 200, which is exactly the incident this step exists for.',
       match: {
         python: {
           all: [
@@ -284,7 +284,7 @@ so one edit moves users between variants mid-flight and every downstream number 
   ],
   code: {
     python: {
-      starter: `"""api.py — a model-generated first draft of the experiment endpoint."""
+      starter: `"""api.py — a first version of the experiment endpoint."""
 import logging
 import uuid
 
@@ -315,8 +315,8 @@ def split_shares(variants: list[Variant]) -> list[dict]:
     return [{"key": variant.key, "weight": round(variant.weight * 100 / total, 2)} for variant in variants]
 
 
-# TODO: this draft normalizes whatever split it is handed, validates neither the variant count nor
-# the unit, and lets PATCH overwrite weights/unit in place with no version check. Review it.
+# TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
+# the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
 
 
 @app.post("/v1/experiments")
@@ -509,7 +509,7 @@ def update_experiment(
 `,
     },
     typescript: {
-      starter: `/** api.ts — a model-generated first draft of the experiment endpoint. */
+      starter: `/** api.ts — a first version of the experiment endpoint. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -536,8 +536,8 @@ interface Experiment extends ExperimentDesign {
 
 const experiments = new Map<string, Experiment>();
 
-// TODO: this draft normalizes whatever split it is handed, validates neither the variant count nor
-// the unit, and lets PATCH overwrite weights/unit in place with no version check. Review it.
+// TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
+// the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
 
 app.post('/v1/experiments', async (request, reply) => {
   const body = request.body as ExperimentDesign;
@@ -735,7 +735,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// api.go — a model-generated first draft of the experiment endpoint.
+      starter: `// api.go — a first version of the experiment endpoint.
 package main
 
 import (
@@ -775,8 +775,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// TODO: this draft normalizes whatever split it is handed, validates neither the variant count nor
-// the unit, and lets PATCH overwrite weights/unit in place with no version check. Review it.
+// TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
+// the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
 
 func createExperiment(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -1081,7 +1081,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `// api.scala — a model-generated first draft of the experiment endpoint.
+      starter: `// api.scala — a first version of the experiment endpoint.
 import java.util.UUID
 
 import org.apache.pekko.actor.ActorSystem
@@ -1113,8 +1113,8 @@ object ExperimentApi {
 
   val experiments = scala.collection.mutable.Map.empty[String, Experiment]
 
-  // TODO: this draft normalizes whatever split it is handed, validates neither the variant count nor
-  // the unit, and lets PATCH overwrite weights/unit in place with no version check. Review it.
+  // TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
+  // the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
 
   val route: Route =
     path("v1" / "experiments") {
@@ -1318,7 +1318,7 @@ object ExperimentApi {
 `,
     },
     cpp: {
-      starter: `// api.cpp — a model-generated first draft of the experiment endpoint.
+      starter: `// api.cpp — a first version of the experiment endpoint.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -1336,8 +1336,8 @@ std::string new_id() {
   return "exp-" + std::to_string(++counter);
 }
 
-// TODO: this draft normalizes whatever split it is handed, validates neither the variant count nor
-// the unit, and lets PATCH overwrite weights/unit in place with no version check. Review it.
+// TODO: this starter normalizes whatever split it is handed, validates neither the variant count nor
+// the unit, and lets PATCH overwrite weights/unit in place with no version check. Fix it.
 
 int main() {
   httplib::Server svr;
@@ -1554,7 +1554,7 @@ int main() {
     'The `PATCH` path may write only `name`/`description`. If the body carries `variants`, `unit`, `min_sample` or `salt`, answer 409 with `{"error": SPLIT_FROZEN, "required": REQUIRED_NEW_VERSION}`: a new version is a new experiment document copied forward, not an edit of the live one.',
   ],
   debrief: `The interviewer is testing whether you understand that an experiment's design is a document, not a
-setting. The draft reads fine because the demo sends a clean 50/50 split and never patches it; the
+setting. The starter reads fine because the demo sends a clean 50/50 split and never patches it; the
 flaws only surface when a human edits the thing.
 
 Three defects are being checked. Exactness: a split that sums to 99 or 101 must be rejected, because

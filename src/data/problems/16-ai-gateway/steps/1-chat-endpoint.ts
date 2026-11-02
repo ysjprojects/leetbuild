@@ -8,8 +8,8 @@ export const chatEndpointStep: Step = {
   focus: ['client', 'gateway', 'providers'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it passes the happy path — one authenticated
-request with a small prompt gets a completion — but it hides several review problems. Find them,
+The starter is working code: it passes the happy path — one authenticated
+request with a small prompt gets a completion — but it hides several problems. Find them,
 fix them, and prove the fix.
 
 Implement \`POST /v1/chat\` with body \`{"model": "…", "messages": [{"role": "…", "content": "…"}], "max_tokens": 512}\`.
@@ -1095,5 +1095,5 @@ await app.listen({host: '0.0.0.0', port: 8443});
 `,
     },
   },
-  debrief: `The review question an interviewer is really asking here is: **can you tell the difference between a draft that works and a contract you would put in front of tenants?** The draft did the visible thing — decode, call, return content — and skipped the invisible edges: rejecting before spending money, putting a deadline on a network call, and returning the provider's accounting rather than guessing. The 504/502 split matters because the client can retry a 504 with backoff but should not retry a 502 blindly; the hidden prompt is the security failure. Real gateways add per-route input limits, provider-specific tokenizers instead of the chars/4 estimate, and structured audit logs that record ids and token counts but never message content.`,
+  debrief: `The question an interviewer is really asking here is: **can you tell the difference between code that works and a contract you would put in front of tenants?** The starter did the visible thing — decode, call, return content — and skipped the invisible edges: rejecting before spending money, putting a deadline on a network call, and returning the provider's accounting rather than guessing. The 504/502 split matters because the client can retry a 504 with backoff but should not retry a 502 blindly; the hidden prompt is the security failure. Real gateways add per-route input limits, provider-specific tokenizers instead of the chars/4 estimate, and structured audit logs that record ids and token counts but never message content.`,
 };

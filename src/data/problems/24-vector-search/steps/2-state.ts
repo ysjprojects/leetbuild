@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['search', 'cache', 'index'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the second identical query is
+**Starting point.** The starter is working code: the second identical query is
 fast and the demo looks great. The cache hides a leak, a stale entry and the wrong expiry
 discipline. Find them, fix them, and prove the fix with the checks below.
 
@@ -16,13 +16,13 @@ Identical lookups must be served from a Redis cache in front of the index.
 
 - The key is \`search:{tenant}:{index_version}:{query_digest}:{k}\` — built from the authenticated
   tenant, the active index version, a stable digest of the query vector and the cap that was
-  actually searched. The draft hashes the query and appends \`k\`, so the first tenant to run a
+  actually searched. The starter hashes the query and appends \`k\`, so the first tenant to run a
   query populates an entry that the next tenant reads.
 - The digest must be stable across processes: pack the vector's IEEE-754 bytes (or quantize them)
   and hash that. \`str(vector)\` (or any float formatting) is not a key — the same floats print
   differently in another runtime and the hit rate silently drops to zero.
 - Entries **expire**: write with a **60-second TTL** in the same \`SET\` (\`ex=TTL_S\`, \`EX\`,
-  \`setex\`, \`std::chrono::seconds\`). The draft deletes entries by hand before writing, which
+  \`setex\`, \`std::chrono::seconds\`). The starter deletes entries by hand before writing, which
   leaves a window where the entry is gone for every tenant and never bounds staleness.
 - The read path keys by the authenticated tenant only and never trusts a body tenant for the cache.
 
@@ -52,7 +52,7 @@ as a key makes the cache miss forever.`,
       id: 'cache-key',
       title: 'Key carries tenant, version, digest and k',
       detail:
-        'The key is `search:{tenant}:{version}:{digest}:{k}`. The draft builds it from the digest and `k` alone, so a hit one tenant wrote is served to the next tenant that runs the same query.',
+        'The key is `search:{tenant}:{version}:{digest}:{k}`. The starter builds it from the digest and `k` alone, so a hit one tenant wrote is served to the next tenant that runs the same query.',
       match: {
         python: {all: [/def cache_key\(/, /\{tenant\}/, /\{version\}/, /\{digest\}/, /\{k\}/]},
         typescript: {all: [/function cacheKey\(/, /\$\{tenant\}/, /\$\{version\}/, /\$\{digest\}/, /\$\{k\}/]},
@@ -78,7 +78,7 @@ as a key makes the cache miss forever.`,
       id: 'ttl',
       title: 'Entries expire with a 60-second TTL',
       detail:
-        'Writes carry a 60-second expiry — `ex=TTL_S`, `SET ... EX TTL_S`, `setex(key, TtlSeconds, …)`, `std::chrono::seconds(kCacheTtlSeconds)`. The draft writes without an expiry and deletes by hand, so staleness is unbounded.',
+        'Writes carry a 60-second expiry — `ex=TTL_S`, `SET ... EX TTL_S`, `setex(key, TtlSeconds, …)`, `std::chrono::seconds(kCacheTtlSeconds)`. The starter writes without an expiry and deletes by hand, so staleness is unbounded.',
       match: {
         python: {all: [/TTL_S\s*=\s*60/, /ex\s*=\s*TTL_S/]},
         typescript: {all: [/TTL_S\s*=\s*60/, /['"]EX['"],\s*TTL_S/]},
@@ -91,7 +91,7 @@ as a key makes the cache miss forever.`,
       id: 'no-manual-invalidation',
       title: 'Expires, never invalidates by hand',
       detail:
-        'No `DEL`/`delete`/`.del(` call anywhere: the 60-second TTL is the only invalidation. The draft deletes the key before writing, which opens a window where every tenant misses and leaves entries with no staleness bound.',
+        'No `DEL`/`delete`/`.del(` call anywhere: the 60-second TTL is the only invalidation. The starter deletes the key before writing, which opens a window where every tenant misses and leaves entries with no staleness bound.',
       match: {
         python: {none: [/\.del\(/, /\bDEL\b/, /\.delete\(/]},
         typescript: {none: [/\.del\(/, /\bDEL\b/, /\.delete\(/]},
@@ -104,7 +104,7 @@ as a key makes the cache miss forever.`,
       id: 'tenant-isolation',
       title: 'Reads and writes are scoped by the authenticated tenant',
       detail:
-        'The tenant that builds the key is the authenticated `X-Tenant-Id` one; a body tenant that contradicts it is **403**. The draft passes the body tenant straight into the search and the key, so tenant isolation is only as good as the caller.',
+        'The tenant that builds the key is the authenticated `X-Tenant-Id` one; a body tenant that contradicts it is **403**. The starter passes the body tenant straight into the search and the key, so tenant isolation is only as good as the caller.',
       match: {
         python: {all: [/X-Tenant-Id/, /cache_key\(tenant,/, /status_code\s*=\s*403/]},
         typescript: {all: [/x-tenant-id/, /cacheKey\(tenant,/, /code\(\s*403\s*\)/]},
@@ -153,7 +153,7 @@ def query_digest(query: list[float]) -> str:
 @app.post("/v1/search")
 def search(body: SearchRequest) -> JSONResponse:
     # TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-    # that every other tenant then reads. The draft also deletes entries by hand instead of giving
+    # that every other tenant then reads. The starter also deletes entries by hand instead of giving
     # them a TTL, and it takes the tenant straight from the body.
     tenant = body.tenant
     key = f"search:{query_digest(body.query)}:{body.k}"
@@ -244,7 +244,7 @@ def search(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/search: a model-generated draft whose cache key forgot the tenant. */
+      starter: `/** POST /v1/search: flawed code whose cache key forgot the tenant. */
 import {createHash} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -269,7 +269,7 @@ function queryDigest(query: number[]): string {
 
 app.post('/v1/search', async (request, reply) => {
   // TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-  // that every other tenant then reads. The draft also deletes entries by hand instead of giving
+  // that every other tenant then reads. The starter also deletes entries by hand instead of giving
   // them a TTL, and it takes the tenant straight from the body.
   const body = request.body as SearchBody;
   const k = body.k ?? 10;
@@ -400,7 +400,7 @@ func search(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-	// that every other tenant then reads. The draft also deletes entries by hand instead of giving
+	// that every other tenant then reads. The starter also deletes entries by hand instead of giving
 	// them a TTL, and it takes the tenant straight from the body.
 	k := body.K
 	if k == 0 {
@@ -590,7 +590,7 @@ object SearchApi {
       post {
         entity(as[SearchRequest]) { body =>
           // TODO: the key is the digest and k alone, so the first tenant to run a query populates an
-          // entry that every other tenant then reads. The draft also deletes entries by hand instead
+          // entry that every other tenant then reads. The starter also deletes entries by hand instead
           // of giving them a TTL, and it takes the tenant straight from the body.
           val k = math.max(1, math.min(body.k, 100))
           val key = s"search:\${queryDigest(body.query)}:$k"
@@ -744,7 +744,7 @@ int main() {
       return;
     }
     // TODO: the key is the digest and k alone, so the first tenant to run a query populates an entry
-    // that every other tenant then reads. The draft also deletes entries by hand instead of giving
+    // that every other tenant then reads. The starter also deletes entries by hand instead of giving
     // them a TTL, and it takes the tenant straight from the body.
     const auto tenant = body.value("tenant", std::string());
     const auto query = body.value("query", std::vector<double>());
@@ -880,9 +880,9 @@ int main() {
 `,
     },
   },
-  debrief: `The cache key is the security boundary of a tenant-scoped service, and the draft's key is a
-model-generated sentence that reads fine: hash the query, append the cap, cache the hits. The four
-things a reviewer has to notice are that the key must name the tenant (otherwise one tenant's
+  debrief: `The cache key is the security boundary of a tenant-scoped service, and the starter's key is a
+sentence that reads fine: hash the query, append the cap, cache the hits. The four
+things you have to notice are that the key must name the tenant (otherwise one tenant's
 popular query populates an entry another tenant reads), the index version (otherwise a hit can outlive
 the snapshot it came from), the digest must be built from the vector's bytes rather than its formatted
 text, and expiry — not deletion — is what bounds staleness. Two tenants embedding different private

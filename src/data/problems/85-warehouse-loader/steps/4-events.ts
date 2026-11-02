@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'outbox'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes an event per
+**Starting point.** The starter is working code: it publishes an event per
 partition, then a completion event, and the demo shows a table light up in the consumer. It keyed the
 topic wrong, announced the load before it finished, reported the plan instead of the result, and
-dropped the event when the broker was unhappy. Review it like the service owner, fix it, and prove
+dropped the event when the broker was unhappy. Debug it like the service owner, fix it, and prove
 the fix.
 
 Implement the \`load.event\` publisher that runs after each partition write.
@@ -63,7 +63,7 @@ ordering the consumer's offset assumes.`,
       id: 'key-by-table',
       title: 'Keys load.event by the target table',
       detail:
-        'The message key is the target table, so a table’s events share a partition and stay ordered. The draft keys by manifest id, scattering one table’s stream.',
+        'The message key is the target table, so a table’s events share a partition and stay ordered. The starter keys by manifest id, scattering one table’s stream.',
       match: {
         python: {all: [/load\.event/, /key=table/]},
         typescript: {all: [/load\.event/, /key:\s*table/]},
@@ -76,7 +76,7 @@ ordering the consumer's offset assumes.`,
       id: 'written-counts',
       title: 'Carries written row counts, not planned ones',
       detail:
-        'The event reports the rows the warehouse wrote for the partition (`rows_written`). The draft puts the manifest’s planned count in that field, so a partial load looks complete.',
+        'The event reports the rows the warehouse wrote for the partition (`rows_written`). The starter puts the manifest’s planned count in that field, so a partial load looks complete.',
       match: {
         python: {all: [/rows_written/], none: [/rows_planned|planned_rows/]},
         typescript: {all: [/rows_written/], none: [/rowsPlanned|planned_rows/]},
@@ -89,7 +89,7 @@ ordering the consumer's offset assumes.`,
       id: 'publish-after-commit',
       title: 'Publishes only after the partition is committed',
       detail:
-        'The partition is committed in the progress set before the event is produced, and `load_completed` follows the final commit. The draft produces the completion event first.',
+        'The partition is committed in the progress set before the event is produced, and `load_completed` follows the final commit. The starter produces the completion event first.',
       match: {
         python: {order: [/state\.commit_partition\(/, /producer\.produce\(/]},
         typescript: {order: [/state\.commitPartition\(/, /producer\.send\(/]},
@@ -102,7 +102,7 @@ ordering the consumer's offset assumes.`,
       id: 'outbox',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A failed produce records the event in the outbox instead of dropping it or failing silently. The draft logs and forgets.',
+        'A failed produce records the event in the outbox instead of dropping it or failing silently. The starter logs and forgets.',
       match: {
         python: {all: [/outbox/, /except\s+/]},
         typescript: {all: [/outbox/, /catch\s*\(/]},
@@ -115,7 +115,7 @@ ordering the consumer's offset assumes.`,
       id: 'idempotent-producer',
       title: 'Configures an idempotent producer with acks=all',
       detail:
-        '`enable.idempotence` plus `acks=all` (KafkaJS’s `idempotent: true` + `acks: -1`, kafka-go’s `RequiredAcks: kafka.RequireAll` and a hashing balancer). The draft leaves the producer default: retries may duplicate a record.',
+        '`enable.idempotence` plus `acks=all` (KafkaJS’s `idempotent: true` + `acks: -1`, kafka-go’s `RequiredAcks: kafka.RequireAll` and a hashing balancer). The starter leaves the producer default: retries may duplicate a record.',
       match: {
         python: {all: [/enable\.idempotence/, /"acks":\s*"all"/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -139,9 +139,9 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 
 def publish(producer, state, manifest_id, target, partition_id, total_partitions, rows_planned):
-    # TODO: this draft keys the event by manifest, publishes the completion event before the final
+    # TODO: this starter keys the event by manifest, publishes the completion event before the final
     # partition commits, reports the manifest's planned row count, and drops the event when the
-    # broker rejects the produce. Review all four.
+    # broker rejects the produce. Fix all four.
     if partition_id == f"{total_partitions - 1}":
         producer.produce(
             TOPIC,
@@ -226,7 +226,7 @@ def emit(table, manifest_id, event):
 `,
     },
     typescript: {
-      starter: `/** load.event: a model-generated draft that publishes the completion before the commit. */
+      starter: `/** load.event: flawed code that publishes the completion before the commit. */
 import {Kafka} from 'kafkajs';
 
 export const TOPIC = 'load.event';
@@ -254,9 +254,9 @@ export async function publish(
   totalPartitions: number,
   rowsPlanned: number,
 ): Promise<void> {
-  // TODO: this draft keys the event by manifest, publishes the completion event before the final
+  // TODO: this starter keys the event by manifest, publishes the completion event before the final
   // partition commits, reports the manifest's planned row count, and drops the event when the
-  // broker rejects the produce. Review all four.
+  // broker rejects the produce. Fix all four.
   connected ??= producer.connect();
   await connected;
   const value = JSON.stringify({type: 'partition_committed', manifest_id: manifestId, partition_id: partitionId, target, rows_written: rowsPlanned});
@@ -383,9 +383,9 @@ type LoadEvent struct {
 
 // Publish announces a partition commit (and the load completion) on load.event.
 func Publish(ctx context.Context, state LoadState, manifestID, target, partitionID string, totalPartitions int, rowsPlanned int64) error {
-	// TODO: this draft keys the event by manifest, publishes the completion event before the final
+	// TODO: this starter keys the event by manifest, publishes the completion event before the final
 	// partition commits, reports the manifest's planned row count, and drops the event when the
-	// broker rejects the produce. Review all four.
+	// broker rejects the produce. Fix all four.
 	completion, _ := json.Marshal(LoadEvent{Type: "load_completed", ManifestID: manifestID, Target: target, RowsWritten: rowsPlanned})
 	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(manifestID), Value: completion}); err != nil {
 		log.Printf("dropping event: %v", err)
@@ -506,9 +506,9 @@ object LoadEvents {
 
   def publish(state: LoadState, manifestId: String, target: String, partitionId: String, totalPartitions: Int,
               rowsPlanned: Long): Unit = {
-    // TODO: this draft keys the event by manifest, publishes the completion event before the final
+    // TODO: this starter keys the event by manifest, publishes the completion event before the final
     // partition commits, reports the manifest's planned row count, and drops the event when the
-    // broker rejects the produce. Review all four.
+    // broker rejects the produce. Fix all four.
     val payload = s"""{"type":"partition_committed","manifest_id":"$manifestId","partition_id":"$partitionId","target":"$target","rows_written":$rowsPlanned}"""
     try {
       producer.send(new ProducerRecord[String, String](Topic, manifestId, payload)).get()
@@ -591,9 +591,9 @@ struct LoadState {
 // Announces a partition commit (and the load completion) on load.event.
 void publish(LoadState& state, const std::string& manifestId, const std::string& target,
              const std::string& partitionId, int totalPartitions, long rowsPlanned) {
-  // TODO: this draft keys the event by manifest, publishes the completion event before the final
+  // TODO: this starter keys the event by manifest, publishes the completion event before the final
   // partition commits, reports the manifest's planned row count, and drops the event when the
-  // broker rejects the produce. Review all four.
+  // broker rejects the produce. Fix all four.
   const std::string payload = "{\\"type\\":\\"partition_committed\\",\\"manifest_id\\":\\"" + manifestId +
                               "\\",\\"partition_id\\":\\"" + partitionId + "\\",\\"target\\":\\"" + target +
                               "\\",\\"rows_written\\":" + std::to_string(rowsPlanned) + "}";

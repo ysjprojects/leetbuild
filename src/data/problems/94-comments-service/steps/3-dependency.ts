@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'moderation', 'notifier', 'review'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it notifies the author, calls
+**Starting point.** The starter is working code: it notifies the author, calls
 moderation, and returns a status. It compiles, the happy path redirects correctly, and it hides
-three production flaws. Review it like the service owner, fix it, and prove the fix with the checks
+three production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement the fan-out that a comment write performs against two gRPC services.
@@ -33,7 +33,7 @@ Implement the fan-out that a comment write performs against two gRPC services.
   pings once, not twice.
 - Return the moderation outcome (\`allowed\` / \`blocked\` / \`pending_review\`) to the caller.
 
-**Failure mode the checks target.** The draft fans out in the wrong order and with the wrong
+**Failure mode the checks target.** The starter fans out in the wrong order and with the wrong
 identity. It calls the notifier first and mints a brand-new token for that call **and** for the retry
 entry, so a single comment eventually rings the author twice — a duplicate that no rate limit
 catches because both calls are "successful". It calls moderation with no deadline, so a slow
@@ -66,7 +66,7 @@ entirely — a failed ping silently ships an unchecked comment.`,
       id: 'deadline',
       title: 'Bounds every fan-out call with a 500 ms deadline',
       detail:
-        'Both calls run under `FANOUT_DEADLINE_MS = 500`, applied as the call deadline. The draft calls moderation with no deadline at all, so a slow moderation service holds the write open.',
+        'Both calls run under `FANOUT_DEADLINE_MS = 500`, applied as the call deadline. The starter calls moderation with no deadline at all, so a slow moderation service holds the write open.',
       match: {
         python: {all: [/FANOUT_DEADLINE_MS = 500/, /timeout=FANOUT_DEADLINE_S/]},
         typescript: {all: [/FANOUT_DEADLINE_MS = 500/, /deadline: Date\.now\(\) \+ FANOUT_DEADLINE_MS/]},
@@ -79,7 +79,7 @@ entirely — a failed ping silently ships an unchecked comment.`,
       id: 'shared-token',
       title: 'Derives one token from the comment id and reuses it',
       detail:
-        '`idempotency_token(comment_id)` returns `comment:{id}` and that same value is sent as the `idempotency-token` metadata on every attempt, including retries. The draft mints a fresh UUID per attempt.',
+        '`idempotency_token(comment_id)` returns `comment:{id}` and that same value is sent as the `idempotency-token` metadata on every attempt, including retries. The starter mints a fresh UUID per attempt.',
       match: {
         python: {
           all: [/def idempotency_token\(/, /"idempotency-token"/, /idempotency_token\(comment_id\)/],
@@ -107,7 +107,7 @@ entirely — a failed ping silently ships an unchecked comment.`,
       id: 'timeout-review',
       title: 'Flags a moderation timeout for asynchronous review',
       detail:
-        'A `DEADLINE_EXCEEDED` from moderation sets the status to `pending_review` and enqueues the comment on `review_queue` instead of failing the write. The draft lets the timeout surface as a failed post.',
+        'A `DEADLINE_EXCEEDED` from moderation sets the status to `pending_review` and enqueues the comment on `review_queue` instead of failing the write. The starter lets the timeout surface as a failed post.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/, /pending_review/, /review_queue\.enqueue\(/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /pending_review/, /reviewQueue\.enqueue\(/]},
@@ -120,7 +120,7 @@ entirely — a failed ping silently ships an unchecked comment.`,
       id: 'isolate',
       title: 'Moderation survives a notification failure',
       detail:
-        'Moderation is called before the notification, so a notifier exception cannot skip it. The draft notifies first and returns from the catch block, shipping an unchecked comment.',
+        'Moderation is called before the notification, so a notifier exception cannot skip it. The starter notifies first and returns from the catch block, shipping an unchecked comment.',
       match: {
         python: {order: [/moderation\.Check\(/, /notifier\.Notify\(/]},
         typescript: {order: [/moderation\.Check\(/, /notifier\.Notify\(/]},
@@ -181,7 +181,7 @@ notifier = notification_pb2.NotifierStub()
 
 
 def fanout(comment_id: str, thread_id: str, author_id: str) -> str:
-    # TODO: this draft retries the notification with a fresh token, blocks the post on a moderation
+    # TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
     # timeout, and drops the moderation call entirely when the notification path throws.
     try:
         notifier.Notify(
@@ -275,7 +275,7 @@ def create_comment(body: CommentRequest, tenant: str = Header(default="", alias=
 `,
     },
     typescript: {
-      starter: `/** Comment fan-out: a model-generated draft that pings twice and skips moderation. */
+      starter: `/** Comment fan-out: flawed code that pings twice and skips moderation. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {randomUUID} from 'node:crypto';
@@ -302,7 +302,7 @@ export const reviewQueue = {enqueue: async (_commentId: string): Promise<void> =
 export const retryQueue = {put: async (_entry: {comment_id: string; author_id: string; token: string}): Promise<void> => {}};
 
 export async function fanout(commentId: string, threadId: string, authorId: string): Promise<string> {
-  // TODO: this draft retries the notification with a fresh token, blocks the post on a moderation
+  // TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
   // timeout, and drops the moderation call entirely when the notification path throws.
   const meta = new grpc.Metadata();
   meta.set('idempotency-token', randomUUID());
@@ -411,7 +411,7 @@ var (
 	retryQueue RetryQueue
 )
 
-// TODO: this draft retries the notification with a fresh token, blocks the post on a moderation
+// TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
 // timeout, and drops the moderation call entirely when the notification path throws.
 func Fanout(ctx context.Context, commentID, threadID, authorID string) (string, error) {
 	ctx = metadata.AppendToOutgoingContext(ctx, "idempotency-token", uuid.NewString())
@@ -508,7 +508,7 @@ object CommentFanout {
     meta
   }
 
-  // TODO: this draft retries the notification with a fresh token, blocks the post on a moderation
+  // TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
   // timeout, and drops the moderation call entirely when the notification path throws.
   def fanout(commentId: String, threadId: String, authorId: String): String = {
     try {
@@ -593,7 +593,7 @@ std::unique_ptr<Notifier::Stub> notifier;
 RetryQueue retryQueue;
 std::string uuidString();
 
-// TODO: this draft retries the notification with a fresh token, blocks the post on a moderation
+// TODO: this starter retries the notification with a fresh token, blocks the post on a moderation
 // timeout, and drops the moderation call entirely when the notification path throws.
 std::string fanout(const std::string& commentId, const std::string& threadId, const std::string& authorId) {
   NotifyRequest notifyRequest;
@@ -689,5 +689,5 @@ std::string fanout(const std::string& commentId, const std::string& threadId, co
     'One token per comment, not per attempt: `idempotency_token(comment_id)` → `comment:{id}`, attached as `idempotency-token` metadata by a helper both calls use, and written into the retry entry unchanged. A retry that mints a new UUID is a second ping, and neither service can tell it apart from a new comment.',
     'A deadline is not an error path to swallow: `DEADLINE_EXCEEDED` from moderation means "we do not know yet", so set the status to `pending_review`, enqueue the comment for the review queue, and let the write succeed. Anything else still raises — the product depends on the decision being real.',
   ],
-  debrief: `The interviewer is asking three questions about a fan-out. Who decides the outcome? Moderation does, so it runs first and cannot be cancelled by a best-effort side effect — the draft reverses that and ships an unchecked comment whenever the notifier hiccups. What is the unit of identity? The comment, not the attempt: one token derived from the comment id means the retry the queue eventually performs lands on the same moderation check and the same notification, instead of creating two of each. And what does a timeout mean? Not failure, but "unknown": the honest answer to a moderation service that is too slow is to accept the comment and flag it for asynchronous review, which keeps the write path's latency bound and never lets a dependency decide the availability of posting. Real platforms add a review queue with a deadline of its own, per-dependency circuit breakers, and a notification service that deduplicates on the token server-side as a second line of defence.`,
+  debrief: `The interviewer is asking three questions about a fan-out. Who decides the outcome? Moderation does, so it runs first and cannot be cancelled by a best-effort side effect — the starter reverses that and ships an unchecked comment whenever the notifier hiccups. What is the unit of identity? The comment, not the attempt: one token derived from the comment id means the retry the queue eventually performs lands on the same moderation check and the same notification, instead of creating two of each. And what does a timeout mean? Not failure, but "unknown": the honest answer to a moderation service that is too slow is to accept the comment and flag it for asynchronous review, which keeps the write path's latency bound and never lets a dependency decide the availability of posting. Real platforms add a review queue with a deadline of its own, per-dependency circuit breakers, and a notification service that deduplicates on the token server-side as a second line of defence.`,
 };

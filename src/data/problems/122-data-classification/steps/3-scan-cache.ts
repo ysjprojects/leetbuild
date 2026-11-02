@@ -8,9 +8,9 @@ export const scanCacheStep: Step = {
   focus: ['metasense', 'redis', 'llm'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: a second scan of the same
+**Starting point.** The starter is working code: a second scan of the same
 entity comes back from the cache, the day's counter goes up, and the owner's pending verification is
-recorded, so the demo passes. It hides four production flaws. Review it like the person who gets
+recorded, so the demo passes. It hides four production flaws. Debug it like the person who gets
 the model invoice and the "why is this table still Tier 1" ticket, fix it, and prove the fix.
 
 Implement \`classify_entity(entity, owner, columns)\`, the worker's path around the gateway call
@@ -67,7 +67,7 @@ limit; and the verification key without a TTL grows the keyspace by one entry pe
       id: 'cache-key',
       title: 'Caches results under classify:{entity}:{schema_hash} with a 7-day TTL',
       detail:
-        'The result key carries the schema hash and is set with `RESULT_TTL_S = 604800`. The draft keys by entity name alone and never expires the entry, so a schema change keeps serving old tags.',
+        'The result key carries the schema hash and is set with `RESULT_TTL_S = 604800`. The starter keys by entity name alone and never expires the entry, so a schema change keeps serving old tags.',
       match: {
         python: {all: [/classify:\{entity\}:\{schema_hash\}/, /RESULT_TTL_S\s*=\s*604800/, /ex=RESULT_TTL_S/]},
         typescript: {
@@ -101,7 +101,7 @@ limit; and the verification key without a TTL grows the keyspace by one entry pe
       id: 'budget-cap',
       title: 'Caps the day at 400 entities under budget:{day}',
       detail:
-        'A `DAILY_ENTITY_BUDGET = 400` constant and a `budget:{day}` key (UTC date) bound the model calls per day; a rejected reservation raises `BudgetExhausted`. The draft counts but never refuses.',
+        'A `DAILY_ENTITY_BUDGET = 400` constant and a `budget:{day}` key (UTC date) bound the model calls per day; a rejected reservation raises `BudgetExhausted`. The starter counts but never refuses.',
       match: {
         python: {all: [/DAILY_ENTITY_BUDGET\s*=\s*400/, /budget:\{day\}/, /BudgetExhausted/]},
         typescript: {all: [/DAILY_ENTITY_BUDGET\s*=\s*400/, /budget:\$\{day\}/, /BudgetExhausted/]},
@@ -114,7 +114,7 @@ limit; and the verification key without a TTL grows the keyspace by one entry pe
       id: 'verify-expiry',
       title: 'Pending verification expires after 7 days',
       detail:
-        'The `verify:{entity}` hash is written with a `VERIFY_TTL_S = 604800` expiry. The draft writes it without one, so every entity ever scanned keeps a reminder record forever.',
+        'The `verify:{entity}` hash is written with a `VERIFY_TTL_S = 604800` expiry. The starter writes it without one, so every entity ever scanned keeps a reminder record forever.',
       match: {
         python: {all: [/verify:\{entity\}/, /VERIFY_TTL_S\s*=\s*604800/, /\.expire\(\s*\w+,\s*VERIFY_TTL_S\s*\)/]},
         typescript: {
@@ -129,7 +129,7 @@ limit; and the verification key without a TTL grows the keyspace by one entry pe
       id: 'reserve-before-call',
       title: 'Reserves budget before the gateway call',
       detail:
-        'The reservation runs before `classify_columns(...)`; a cache hit never reserves and a rejected reservation never calls. The draft counts after the call, so the cap never stops a call.',
+        'The reservation runs before `classify_columns(...)`; a cache hit never reserves and a rejected reservation never calls. The starter counts after the call, so the cap never stops a call.',
       match: {
         python: {order: [/reserve_budget\(/, /classify_columns\(/]},
         typescript: {order: [/reserveBudget\(/, /classifyColumns\(/]},
@@ -151,7 +151,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def classify_entity(entity: str, owner: str, columns: list[str]) -> list[dict]:
-    # TODO: this draft caches by entity name alone with no TTL, counts the day's entities after
+    # TODO: this starter caches by entity name alone with no TTL, counts the day's entities after
     # the call with a non-atomic read, never refuses, and leaves the verification record forever.
     cached = r.get(f"classify:{entity}")
     if cached is not None:
@@ -224,7 +224,7 @@ def classify_entity(entity: str, owner: str, columns: list[str]) -> list[dict]:
 `,
     },
     typescript: {
-      starter: `/** Scan cache: a model-generated draft that keys by entity name and counts after the call. */
+      starter: `/** Scan cache: flawed code that keys by entity name and counts after the call. */
 import {Redis} from 'ioredis';
 
 import {classifyColumns, type ColumnTag} from './classify_columns';
@@ -232,7 +232,7 @@ import {classifyColumns, type ColumnTag} from './classify_columns';
 const r = new Redis('redis://redis:6379');
 
 export async function classifyEntity(entity: string, owner: string, columns: string[]): Promise<ColumnTag[]> {
-  // TODO: this draft caches by entity name alone with no TTL, counts the day's entities after
+  // TODO: this starter caches by entity name alone with no TTL, counts the day's entities after
   // the call with a non-atomic read, never refuses, and leaves the verification record forever.
   const cached = await r.get(\`classify:\${entity}\`);
   if (cached !== null) return JSON.parse(cached) as ColumnTag[];
@@ -316,7 +316,7 @@ var (
 	client pb.ClassifierClient
 )
 
-// TODO: this draft caches by entity name alone with no TTL, counts the day's entities after the
+// TODO: this starter caches by entity name alone with no TTL, counts the day's entities after the
 // call with a non-atomic read, never refuses, and leaves the verification record forever.
 func classifyEntity(ctx context.Context, entity, owner string, columns []string) ([]ColumnTag, error) {
 	cached, err := rdb.Get(ctx, "classify:"+entity).Result()
@@ -444,7 +444,7 @@ object ScanCache {
   implicit val tagFormat: RootJsonFormat[ColumnTag] = DefaultJsonProtocol.jsonFormat3(ColumnTag)
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: this draft caches by entity name alone with no TTL, counts the day's entities after the
+  // TODO: this starter caches by entity name alone with no TTL, counts the day's entities after the
   // call with a non-atomic read, never refuses, and leaves the verification record forever.
   def classifyEntity(entity: String, owner: String, columns: List[String]): List[ColumnTag] = {
     Option(jedis.get(s"classify:$entity")) match {
@@ -548,7 +548,7 @@ std::vector<ColumnTag> classifyColumns(Classifier::Stub* stub, const std::string
 json toJson(const std::vector<ColumnTag>& tags);
 std::vector<ColumnTag> fromJson(const json& data);
 
-// TODO: this draft caches by entity name alone with no TTL, counts the day's entities after the
+// TODO: this starter caches by entity name alone with no TTL, counts the day's entities after the
 // call with a non-atomic read, never refuses, and leaves the verification record forever.
 std::vector<ColumnTag> classifyEntity(sw::redis::Redis& redis, Classifier::Stub* stub, const std::string& entity,
                                       const std::string& owner, const std::vector<std::string>& columns) {

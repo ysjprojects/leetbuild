@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, parses
+**Starting point.** The starter is working code: it registers the route, parses
 the manifest and answers \`202\` with a new load id, so the demo reads a file into a table. It hides
-four production flaws. Review it like the service owner, fix it, and prove the fix with the checks
+four production flaws. Debug it like the service owner, fix it, and prove the fix with the checks
 below.
 
 Implement \`POST /v1/loads\` with body
@@ -71,7 +71,7 @@ exactly how a table ends up with the same day counted twice.`,
       id: 'registered-transform',
       title: 'Compiles a registered transform instead of executing caller SQL',
       detail:
-        '`transform` must be a key of the registry; anything else is **400**, and the SQL that runs comes from the registry, not from the body. The draft stores the caller’s string as the transform.',
+        '`transform` must be a key of the registry; anything else is **400**, and the SQL that runs comes from the registry, not from the body. The starter stores the caller’s string as the transform.',
       match: {
         python: {
           all: [/REGISTERED_TRANSFORMS/, /status_code\s*=\s*400/],
@@ -90,7 +90,7 @@ exactly how a table ends up with the same day counted twice.`,
       id: 'tenant-schema',
       title: 'Refuses a target outside the tenant’s schema',
       detail:
-        'The target schema must equal `wh_{tenant}`; a cross-tenant or malformed target is **403** (or **400** when it is not `schema.table`). The draft defaults the target to a shared schema, so one tenant writes into another’s table.',
+        'The target schema must equal `wh_{tenant}`; a cross-tenant or malformed target is **403** (or **400** when it is not `schema.table`). The starter defaults the target to a shared schema, so one tenant writes into another’s table.',
       match: {
         python: {all: [/schema_for\(/, /status_code\s*=\s*403/]},
         typescript: {all: [/schemaFor\(/, /code\(\s*403\s*\)/]},
@@ -103,7 +103,7 @@ exactly how a table ends up with the same day counted twice.`,
       id: 'manifest-key',
       title: 'Keys the load by the manifest and returns the original on replay',
       detail:
-        '`Idempotency-Key` is required and the load is stored under `(tenant, key)` with the manifest fingerprint; a replay of the same manifest returns the original load, a different manifest under the same key is **409**. The draft ignores the header and starts a second load.',
+        '`Idempotency-Key` is required and the load is stored under `(tenant, key)` with the manifest fingerprint; a replay of the same manifest returns the original load, a different manifest under the same key is **409**. The starter ignores the header and starts a second load.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/, /status_code\s*=\s*409/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/, /code\(\s*409\s*\)/]},
@@ -116,7 +116,7 @@ exactly how a table ends up with the same day counted twice.`,
       id: 'manifest-bounds',
       title: 'Bounds the manifest and validates the load mode',
       detail:
-        'A rendered manifest over `1 << 16` bytes is **413** and a `mode` outside `append`/`merge`/`replace` is **400**. The draft never checks the size and lets any mode through.',
+        'A rendered manifest over `1 << 16` bytes is **413** and a `mode` outside `append`/`merge`/`replace` is **400**. The starter never checks the size and lets any mode through.',
       match: {
         python: {all: [/MAX_MANIFEST_BYTES/, /status_code\s*=\s*413/, /LOAD_MODES/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_MANIFEST_BYTES/, /code\(\s*413\s*\)/, /LOAD_MODES/, /code\(\s*400\s*\)/]},
@@ -166,9 +166,9 @@ store = LoadStore()
 
 @app.post("/v1/loads")
 def create_load(body: LoadRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft takes the raw transform the caller sent, lets the target default to a shared
+    # TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
     # schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-    # the manifest size or the load mode. Review all four.
+    # the manifest size or the load mode. Fix all four.
     load = {
         "load_id": str(uuid.uuid4()),
         "status": "queued",
@@ -295,7 +295,7 @@ def create_load(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/loads: a model-generated draft that trusts the whole manifest. */
+      starter: `/** POST /v1/loads: flawed code that trusts the whole manifest. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -312,9 +312,9 @@ interface LoadBody {
 }
 
 app.post('/v1/loads', async (request, reply) => {
-  // TODO: this draft takes the raw transform the caller sent, lets the target default to a shared
+  // TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
   // schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-  // the manifest size or the load mode. Review all four.
+  // the manifest size or the load mode. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as LoadBody;
   const load = {
@@ -485,9 +485,9 @@ func createLoad(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft takes the raw transform the caller sent, lets the target default to a shared
+	// TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
 	// schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-	// the manifest size or the load mode. Review all four.
+	// the manifest size or the load mode. Fix all four.
 	target := body.Target
 	if target == "" {
 		target = "shared.loads"
@@ -704,9 +704,9 @@ object LoadApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[Manifest]) { body =>
-            // TODO: this draft takes the raw transform the caller sent, lets the target default to
+            // TODO: this starter takes the raw transform the caller sent, lets the target default to
             // a shared schema, ignores Idempotency-Key so a client retry starts a second load, and
-            // never validates the manifest size or the load mode. Review all four.
+            // never validates the manifest size or the load mode. Fix all four.
             val load = Map(
               "load_id" -> java.util.UUID.randomUUID().toString,
               "status" -> "queued",
@@ -877,9 +877,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft takes the raw transform the caller sent, lets the target default to a shared
+    // TODO: this starter takes the raw transform the caller sent, lets the target default to a shared
     // schema, ignores Idempotency-Key so a client retry starts a second load, and never validates
-    // the manifest size or the load mode. Review all four.
+    // the manifest size or the load mode. Fix all four.
     const json load = {
         {"load_id", uuidString()},
         {"status", "queued"},
@@ -1019,8 +1019,8 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a load endpoint at the trust boundary the
-warehouse hands you. The draft reads fine because the demo loads one well-formed manifest from one
+  debrief: `The interviewer is testing whether you can debug a load endpoint at the trust boundary the
+warehouse hands you. The starter reads fine because the demo loads one well-formed manifest from one
 tenant and never retries. Four separate defects are being checked: the transform is a registry lookup,
 not a string the caller controls (raw SQL here runs with the loader's credentials); the target schema
 is derived from the authenticated tenant, so a cross-tenant write is a 403 and not a default; the

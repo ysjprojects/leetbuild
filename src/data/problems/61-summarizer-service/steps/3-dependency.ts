@@ -8,10 +8,10 @@ export const summarizerClientStep: Step = {
   focus: ['api', 'model', 'extract'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the summarizer, loops
-until it gets something back, and returns *something* on failure. It compiles, it serves the happy
-path, and it hides four production flaws. Review it like the service owner, fix it, and prove the fix
-with the checks below.
+**Starting point.** The starter is working code: it calls the summarizer, loops until it gets
+something back, and returns *something* on failure. It compiles, it serves the happy path, and it
+hides four production flaws. Debug it like the service owner, fix it, and prove the fix with the
+checks below.
 
 Call the summary model over gRPC. The call is allowed to fail, but the answer it returns must never
 pretend the model spoke when it did not.
@@ -32,7 +32,7 @@ pretend the model spoke when it did not.
   makes an extractive answer look generated, which is exactly the confusion the label exists to
   prevent.
 
-**Failure mode the checks target.** The draft has no deadline and retries in an unbounded \`while\`
+**Failure mode the checks target.** The starter has no deadline and retries in an unbounded \`while\`
 loop, treating a refusal as a transient hiccup and hammering the model until the caller gives up. On
 failure it returns the first 400 characters of the source labelled \`abstractive\` — or the literal
 sentence \`summary unavailable\` — so a caller cannot tell a generated summary from a truncated source
@@ -53,7 +53,7 @@ or from nothing at all.`,
       id: 'deadline',
       title: 'Every attempt carries the 5-second deadline',
       detail:
-        '`DEADLINE_S = 5` is applied to the call (a per-attempt `timeout`/`deadline`, context or client-context deadline). The draft calls the model with no deadline at all, so one slow call can hold the request until the caller times out.',
+        '`DEADLINE_S = 5` is applied to the call (a per-attempt `timeout`/`deadline`, context or client-context deadline). The starter calls the model with no deadline at all, so one slow call can hold the request until the caller times out.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout=DEADLINE_S|wait_for/]},
         typescript: {all: [/DEADLINE_S/, /deadline:/]},
@@ -66,7 +66,7 @@ or from nothing at all.`,
       id: 'terminal-refusal',
       title: 'A refusal is terminal',
       detail:
-        'A provider refusal (`REFUSED`) and the other non-retryable statuses in `TERMINAL_CODES` end the call immediately; they are never retried. The draft treats a refusal as transient and loops on it until the caller gives up.',
+        'A provider refusal (`REFUSED`) and the other non-retryable statuses in `TERMINAL_CODES` end the call immediately; they are never retried. The starter treats a refusal as transient and loops on it until the caller gives up.',
       match: {
         python: {all: [/TERMINAL_CODES/, /REFUSED/]},
         typescript: {all: [/TERMINAL_CODES/, /REFUSED/]},
@@ -79,7 +79,7 @@ or from nothing at all.`,
       id: 'retry-bounded',
       title: 'Only retryable failures are retried, at most three times',
       detail:
-        '`RETRYABLE_CODES` (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) is the whole retry surface and `MAX_ATTEMPTS = 3` bounds it. The draft retries every failure forever.',
+        '`RETRYABLE_CODES` (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) is the whole retry surface and `MAX_ATTEMPTS = 3` bounds it. The starter retries every failure forever.',
       match: {
         python: {all: [/RETRYABLE_CODES/, /MAX_ATTEMPTS/]},
         typescript: {all: [/RETRYABLE_CODES/, /MAX_ATTEMPTS/]},
@@ -92,7 +92,7 @@ or from nothing at all.`,
       id: 'extractive-fallback',
       title: 'A failure yields a marked extractive fallback',
       detail:
-        'Failure returns `trim_extract(source)` bounded by `EXTRACT_CHARS`, labelled `OUTPUT_EXTRACTIVE`, so the answer is the source’s own words and is marked as such. The draft returns a slice of the source with no trimming rule and no label.',
+        'Failure returns `trim_extract(source)` bounded by `EXTRACT_CHARS`, labelled `OUTPUT_EXTRACTIVE`, so the answer is the source’s own words and is marked as such. The starter returns a slice of the source with no trimming rule and no label.',
       match: {
         python: {all: [/trim_extract/, /EXTRACT_CHARS/, /OUTPUT_EXTRACTIVE/]},
         typescript: {all: [/trimExtract/, /EXTRACT_CHARS/, /OUTPUT_EXTRACTIVE/]},
@@ -105,7 +105,7 @@ or from nothing at all.`,
       id: 'output-labelled',
       title: 'The output type is always labelled',
       detail:
-        'Every result carries `kind`, one of `OUTPUT_ABSTRACTIVE` or `OUTPUT_EXTRACTIVE`, and no result is a placeholder sentence presented as a summary. The draft labels everything `abstractive` and can return `summary unavailable`.',
+        'Every result carries `kind`, one of `OUTPUT_ABSTRACTIVE` or `OUTPUT_EXTRACTIVE`, and no result is a placeholder sentence presented as a summary. The starter labels everything `abstractive` and can return `summary unavailable`.',
       match: {
         python: {all: [/OUTPUT_ABSTRACTIVE/, /OUTPUT_EXTRACTIVE/, /kind/], none: [/summary unavailable/i]},
         typescript: {all: [/OUTPUT_ABSTRACTIVE/, /OUTPUT_EXTRACTIVE/, /kind/], none: [/summary unavailable/i]},
@@ -137,9 +137,9 @@ class SummaryModel:
 
 
 def summarize_with_model(stub: SummaryModel, content: str, band: str) -> dict:
-    # TODO: this draft calls the model with no deadline and retries every failure — refusals
+    # TODO: this starter calls the model with no deadline and retries every failure — refusals
     # included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-    # the sentence "summary unavailable") as if it were a summary. Review all four.
+    # the sentence "summary unavailable") as if it were a summary. Fix all four.
     while True:
         try:
             reply = stub.Summarize(SummaryRequest(content=content, band=band))
@@ -221,7 +221,7 @@ def summarize_with_model(stub: SummaryModel, content: str, band: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Summarize over gRPC: a model-generated draft that loops until something comes back. */
+      starter: `/** Summarize over gRPC: flawed code that loops until something comes back. */
 import * as grpc from '@grpc/grpc-js';
 
 import type {SummaryModelClient} from './client_pb';
@@ -236,9 +236,9 @@ export async function summarizeWithModel(
   content: string,
   band: string,
 ): Promise<SummaryResult> {
-  // TODO: this draft calls the model with no deadline and retries every failure — refusals
+  // TODO: this starter calls the model with no deadline and retries every failure — refusals
   // included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-  // the sentence "summary unavailable") as if it were a summary. Review all four.
+  // the sentence "summary unavailable") as if it were a summary. Fix all four.
   for (;;) {
     try {
       const reply = await client.summarize({content, band});
@@ -328,11 +328,11 @@ type Result struct {
 	Summary string \`json:"summary"\`
 }
 
-// summarizeWithModel asks the model for a summary. The model-generated draft loops until it gets one.
+// summarizeWithModel asks the model for a summary. The starter loops until it gets one.
 func summarizeWithModel(ctx context.Context, client pb.SummaryModelClient, content, band string) Result {
-	// TODO: this draft calls the model with no deadline and retries every failure — refusals
+	// TODO: this starter calls the model with no deadline and retries every failure — refusals
 	// included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-	// the sentence "summary unavailable") as if it were a summary. Review all four.
+	// the sentence "summary unavailable") as if it were a summary. Fix all four.
 	for {
 		reply, err := client.Summarize(ctx, &pb.SummarizeRequest{Content: content, Band: band})
 		if err == nil {
@@ -436,11 +436,11 @@ object SummaryClient {
 
   case class Result(kind: String, summary: String)
 
-  /** Ask the model for a summary. The model-generated draft loops until it gets one. */
+  /** Ask the model for a summary. The starter loops until it gets one. */
   def summarizeWithModel(stub: SummaryModelGrpc.SummaryModelStub, content: String, band: String): Result = {
-    // TODO: this draft calls the model with no deadline and retries every failure — refusals
+    // TODO: this starter calls the model with no deadline and retries every failure — refusals
     // included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-    // the sentence "summary unavailable") as if it were a summary. Review all four.
+    // the sentence "summary unavailable") as if it were a summary. Fix all four.
     var result: Option[Result] = None
     while (result.isEmpty) {
       try {
@@ -532,11 +532,11 @@ struct Result {
   std::string summary;
 };
 
-// summarize_with_model asks the model for a summary. The model-generated draft loops until it gets one.
+// summarize_with_model asks the model for a summary. The starter loops until it gets one.
 Result summarize_with_model(std::shared_ptr<SummaryModel::Stub> stub, const std::string& content, const std::string& band) {
-  // TODO: this draft calls the model with no deadline and retries every failure — refusals
+  // TODO: this starter calls the model with no deadline and retries every failure — refusals
   // included — in an unbounded loop, then returns a slice of the source labelled abstractive (or
-  // the sentence "summary unavailable") as if it were a summary. Review all four.
+  // the sentence "summary unavailable") as if it were a summary. Fix all four.
   while (true) {
     grpc::ClientContext context;
     SummarizeRequest request;

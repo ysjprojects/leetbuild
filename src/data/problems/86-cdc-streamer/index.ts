@@ -7,11 +7,11 @@ import {changeEventsStep} from './steps/4-events';
 import {lagReadStep} from './steps/5-read';
 
 /**
- * CDC streamer on the AI-era track: the course is not "tail the WAL", it is the review you owe a
- * model-generated replication service before it drops a tenant's changes. An authorized,
- * idempotent subscription → a durable LSN cursor that only moves after the sink confirms → a slot
- * reader whose failed batches are retried from their first LSN instead of skipped → change events
- * keyed by table and primary key so one row stays ordered → a lag read an operator can page on.
+ * CDC streamer: the course is not "tail the WAL", it is the debugging you owe a replication
+ * service before it drops a tenant's changes. An authorized, idempotent subscription → a durable
+ * LSN cursor that only moves after the sink confirms → a slot reader whose failed batches are
+ * retried from their first LSN instead of skipped → change events keyed by table and primary key
+ * so one row stays ordered → a lag read an operator can page on.
  */
 export const cdcStreamerProblem: Problem = {
   id: 'cdc-streamer',
@@ -19,7 +19,6 @@ export const cdcStreamerProblem: Problem = {
   tagline: 'Change data capture that never skips a change and keeps per-row order.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# CDC Streamer
 
@@ -73,12 +72,12 @@ One service, **cdcd**, with five pieces:
    seconds derived from LSN arithmetic, whether the slot is still active, a critical state beyond the
    retention window, and **404** for a subscription that belongs to someone else.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real data
-platform: read the draft against the failure modes, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real data platform: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

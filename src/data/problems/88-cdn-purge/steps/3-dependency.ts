@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['purge', 'cdn', 'edges'],
   task: `## Task
 
-**Review premise.** The starter calls the provider’s \`BatchPurge\` RPC and loops until something
+**Starting point.** The starter calls the provider’s \`BatchPurge\` RPC and loops until something
 comes back. It compiles, it works against a healthy provider, and it hides three flaws that only
-appear when the provider is unhappy. Review it like the owner of the client library, fix it, and
+appear when the provider is unhappy. Debug it like the owner of the client library, fix it, and
 prove the fix with the checks below.
 
 Implement \`submit_batch(purge_id, domain, paths)\` against \`PurgeService.BatchPurge\`:
@@ -38,7 +38,7 @@ Implement \`submit_batch(purge_id, domain, paths)\` against \`PurgeService.Batch
 
 :::widget deadline-retry {"base": 100, "deadline": 2000, "attempts": 3}
 
-**Failure mode the checks target.** The draft \`while True:\`s on every error, so a rejected
+**Failure mode the checks target.** The starter \`while True:\`s on every error, so a rejected
 pattern is retried until someone kills the pod; it marks the batch \`succeeded\` as soon as one path
 comes back accepted, so a partial purge looks complete; and it throws away the per-path results, so
 the operator who has to purge those thirty paths by hand never learns which ones they are.`,
@@ -68,7 +68,7 @@ the operator who has to purge those thirty paths by hand never learns which ones
       id: 'deadline',
       title: 'Every attempt runs under a two-second deadline',
       detail:
-        'The call carries a deadline (`DEADLINE_S` = 2 s per attempt) so a hung provider cannot pin the request. The draft calls the RPC with no deadline at all.',
+        'The call carries a deadline (`DEADLINE_S` = 2 s per attempt) so a hung provider cannot pin the request. The starter calls the RPC with no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:/, /\b2000\b/]},
@@ -81,7 +81,7 @@ the operator who has to purge those thirty paths by hand never learns which ones
       id: 'outcomes',
       title: 'Reports a per-path outcome for every path',
       detail:
-        'Paths end as `OUTCOME_ACCEPTED`, `OUTCOME_INVALID_PATTERN` or `OUTCOME_FAILED`, and the result carries the `outcomes` map. The draft returns a single status and drops the per-path results.',
+        'Paths end as `OUTCOME_ACCEPTED`, `OUTCOME_INVALID_PATTERN` or `OUTCOME_FAILED`, and the result carries the `outcomes` map. The starter returns a single status and drops the per-path results.',
       match: {
         python: {all: [/OUTCOME_ACCEPTED/, /OUTCOME_INVALID_PATTERN/, /OUTCOME_FAILED/, /outcomes/]},
         typescript: {
@@ -96,7 +96,7 @@ the operator who has to purge those thirty paths by hand never learns which ones
       id: 'terminal',
       title: 'Terminal 4xx stops its path instead of looping forever',
       detail:
-        '`INVALID_ARGUMENT`/`FAILED_PRECONDITION` are terminal for the paths in the batch, and only the `RETRYABLE` set (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) earns another attempt. The draft retries every failure forever, including a rejected pattern.',
+        '`INVALID_ARGUMENT`/`FAILED_PRECONDITION` are terminal for the paths in the batch, and only the `RETRYABLE` set (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) earns another attempt. The starter retries every failure forever, including a rejected pattern.',
       match: {
         python: {all: [/RETRYABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /INVALID_ARGUMENT/]},
         typescript: {all: [/RETRYABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /INVALID_ARGUMENT/]},
@@ -118,7 +118,7 @@ the operator who has to purge those thirty paths by hand never learns which ones
       id: 'batch-id',
       title: 'One batch id, bounded attempts, only pending paths replayed',
       detail:
-        'The `batch_id` is minted once for the batch and reused by every attempt, the loop is bounded by `MAX_ATTEMPTS`, and a retry sends only the paths that are still `pending`. The draft mints a fresh id per attempt, which lets the provider purge the same path twice.',
+        'The `batch_id` is minted once for the batch and reused by every attempt, the loop is bounded by `MAX_ATTEMPTS`, and a retry sends only the paths that are still `pending`. The starter mints a fresh id per attempt, which lets the provider purge the same path twice.',
       match: {
         python: {all: [/batch_id/, /MAX_ATTEMPTS/, /pending/]},
         typescript: {all: [/batchId/, /MAX_ATTEMPTS/, /pending/]},
@@ -131,7 +131,7 @@ the operator who has to purge those thirty paths by hand never learns which ones
       id: 'complete',
       title: 'A batch completes only when every path is terminal',
       detail:
-        'The terminal set is closed over `accepted`/`invalid_pattern`/`failed`, the leftover paths are resolved by `unfinished`, and `succeeded` is true only when every outcome is accepted. The draft declares success when a single path is accepted.',
+        'The terminal set is closed over `accepted`/`invalid_pattern`/`failed`, the leftover paths are resolved by `unfinished`, and `succeeded` is true only when every outcome is accepted. The starter declares success when a single path is accepted.',
       match: {
         python: {all: [/TERMINAL/, /unfinished\(/, /succeeded =/]},
         typescript: {all: [/TERMINAL/, /unfinished\(/, /succeeded =/]},
@@ -155,9 +155,9 @@ cdn = cdn_pb2_grpc.PurgeServiceStub(channel)
 
 
 def submit_batch(purge_id: str, domain: str, paths: list[str]) -> dict:
-    # TODO: this draft retries a rejected pattern forever, mints a new batch id on every attempt,
+    # TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
     # marks the whole batch successful as soon as one path is accepted, and throws away the
-    # per-path outcomes. Review all four: one batch id for the batch, a terminal set that stops
+    # per-path outcomes. Fix all four: one batch id for the batch, a terminal set that stops
     # invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried
     # under a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
     while True:
@@ -240,7 +240,7 @@ def submit_batch(purge_id: str, domain: str, paths: list[str]) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Batch purge client: a model-generated draft that retries every failure forever. */
+      starter: `/** Batch purge client: flawed code that retries every failure forever. */
 import {randomUUID} from 'node:crypto';
 import {promisify} from 'node:util';
 
@@ -265,9 +265,9 @@ const cdnProvider = new cdn.PurgeService('cdn-provider:9000', grpc.credentials.c
 const purge = promisify(cdnProvider.Purge.bind(cdnProvider));
 
 export async function submitBatch(purgeId: string, domain: string, paths: string[]): Promise<unknown> {
-  // TODO: this draft retries a rejected pattern forever, mints a new batch id on every attempt,
+  // TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
   // marks the whole batch successful as soon as one path is accepted, and throws away the per-path
-  // outcomes. Review all four: one batch id for the batch, a terminal set that stops
+  // outcomes. Fix all four: one batch id for the batch, a terminal set that stops
   // invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried under
   // a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
   for (;;) {
@@ -391,9 +391,9 @@ import (
 )
 
 func submitBatch(ctx context.Context, client pb.PurgeServiceClient, purgeID, domain string, paths []string) (*BatchResult, error) {
-	// TODO: this draft retries a rejected pattern forever, mints a new batch id on every attempt,
+	// TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
 	// marks the whole batch successful as soon as one path is accepted, and throws away the
-	// per-path outcomes. Review all four: one batch id for the batch, a terminal set that stops
+	// per-path outcomes. Fix all four: one batch id for the batch, a terminal set that stops
 	// invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried
 	// under a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
 	for {
@@ -548,9 +548,9 @@ object PurgeClient {
   val stub = PurgeServiceGrpc
     .blockingStub(ManagedChannelBuilder.forAddress("cdn-provider", 9000).usePlaintext().build())
 
-  // TODO: this draft retries a rejected pattern forever, mints a new batch id on every attempt,
+  // TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
   // marks the whole batch successful as soon as one path is accepted, and throws away the per-path
-  // outcomes. Review all four: one batch id for the batch, a terminal set that stops
+  // outcomes. Fix all four: one batch id for the batch, a terminal set that stops
   // invalid_pattern and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried under
   // a 2 s deadline and a bounded attempt count, and a per-path outcome map in the result.
   def submitBatch(purgeId: String, domain: String, paths: List[String]): Map[String, String] = {
@@ -656,9 +656,9 @@ object PurgeClient {
 
 std::string uuidString();
 
-// TODO: this draft retries a rejected pattern forever, mints a new batch id on every attempt,
+// TODO: this starter retries a rejected pattern forever, mints a new batch id on every attempt,
 // marks the whole batch successful as soon as one path is accepted, and throws away the per-path
-// outcomes. Review all four: one batch id for the batch, a terminal set that stops invalid_pattern
+// outcomes. Fix all four: one batch id for the batch, a terminal set that stops invalid_pattern
 // and INVALID_ARGUMENT paths, only UNAVAILABLE / DEADLINE_EXCEEDED retried under a 2 s deadline and
 // a bounded attempt count, and a per-path outcome map in the result.
 std::vector<std::string> submitBatch(

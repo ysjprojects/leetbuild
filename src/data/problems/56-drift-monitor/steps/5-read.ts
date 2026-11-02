@@ -8,9 +8,8 @@ export const monitorReportStep: Step = {
   focus: ['client', 'monitor', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the endpoint returns a distance,
-the demo looks right, and the number is meaningless. It hides three flaws. Review it, fix it, and prove
-the fix.
+**Starting point.** The starter is working code: the endpoint returns a distance, the demo looks
+right, and the number is meaningless. It hides three flaws. Debug it, fix it, and prove the fix.
 
 Implement \`GET /v1/monitors/{monitor_id}/report\`:
 
@@ -19,9 +18,9 @@ Implement \`GET /v1/monitors/{monitor_id}/report\`:
   another tenant's drift.
 - The report always carries the **sample counts** on both sides (\`sample_count\`,
   \`baseline_sample_count\`), the current window boundaries and the **baseline window**. A distance
-  without counts cannot be judged; the draft hides them.
+  without counts cannot be judged; the starter hides them.
 - The state is **explicit**: fewer than \`MIN_SAMPLES = 200\` samples on either side reports
-  \`state: "insufficient_data"\` rather than an alert. The draft calls a distance computed from a single
+  \`state: "insufficient_data"\` rather than an alert. The starter calls a distance computed from a single
   batch of 20 samples significant.
 - \`threshold_crossed\` is true only when the samples are sufficient **and** \`distance >= threshold\`;
   otherwise it is false, and the state says why.
@@ -64,7 +63,7 @@ every demo, because demos ask for their own monitor and never look at the sample
       id: 'tenant-scope',
       title: 'Resolves the monitor inside the tenant',
       detail:
-        'The lookup is `store.report(tenant, monitor_id)` and a missing or foreign monitor is **404** — not another tenant’s drift and not a 403. The draft resolves by monitor id alone, so any caller can read any monitor.',
+        'The lookup is `store.report(tenant, monitor_id)` and a missing or foreign monitor is **404** — not another tenant’s drift and not a 403. The starter resolves by monitor id alone, so any caller can read any monitor.',
       match: {
         python: {all: [/store\.report\(tenant, monitor_id\)/, /status_code\s*=\s*404/]},
         typescript: {all: [/store\.report\(tenant, monitorId\)/, /code\(\s*404\s*\)/]},
@@ -77,7 +76,7 @@ every demo, because demos ask for their own monitor and never look at the sample
       id: 'sample-counts',
       title: 'Always returns the sample counts and the baseline window',
       detail:
-        'The report includes `sample_count`, `baseline_sample_count` and `baseline_window` alongside the distance. The draft returns the distance and hides everything a reader needs to judge it.',
+        'The report includes `sample_count`, `baseline_sample_count` and `baseline_window` alongside the distance. The starter returns the distance and hides everything a reader needs to judge it.',
       match: {
         python: {all: [/sample_count/, /baseline_sample_count/, /baseline_window/]},
         typescript: {all: [/sample_count/, /baseline_sample_count/, /baseline_window/]},
@@ -90,7 +89,7 @@ every demo, because demos ask for their own monitor and never look at the sample
       id: 'insufficient-data',
       title: 'Calls out insufficient data below the sample floor',
       detail:
-        'Fewer than `MIN_SAMPLES = 200` samples on either side reports `insufficient_data` instead of a crossing. The draft treats 20 samples as significant because the distance looked large.',
+        'Fewer than `MIN_SAMPLES = 200` samples on either side reports `insufficient_data` instead of a crossing. The starter treats 20 samples as significant because the distance looked large.',
       match: {
         python: {all: [/MIN_SAMPLES\s*=\s*200/, /insufficient_data/]},
         typescript: {all: [/MIN_SAMPLES\s*=\s*200/, /insufficient_data/]},
@@ -103,7 +102,7 @@ every demo, because demos ask for their own monitor and never look at the sample
       id: 'threshold-crossed',
       title: 'Reports a crossing only for a sufficient, over-threshold window',
       detail:
-        '`threshold_crossed` is computed as `sufficient and distance >= threshold`, never hardcoded. The draft returns `"significant": true` for whatever it found.',
+        '`threshold_crossed` is computed as `sufficient and distance >= threshold`, never hardcoded. The starter returns `"significant": true` for whatever it found.',
       match: {
         python: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
         typescript: {all: [/threshold_crossed/, /distance\s*>=\s*threshold/]},
@@ -138,9 +137,9 @@ def monitor_report(
     monitor_id: str,
     tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft resolves the monitor by id alone, so any tenant can read any monitor; it
+    # TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
     # reports a distance computed from a single 20-sample batch as significant; and it hides the
-    # sample counts. Review all three.
+    # sample counts. Fix all three.
     latest = store.resolve(monitor_id)
     if latest is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -211,7 +210,7 @@ def monitor_report(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/monitors/{id}/report: a model-generated draft. */
+      starter: `/** GET /v1/monitors/{id}/report: flawed code. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -219,9 +218,9 @@ import {store} from './store';
 export const app = Fastify();
 
 app.get('/v1/monitors/:monitor_id/report', async (request, reply) => {
-  // TODO: this draft resolves the monitor by id alone, so any tenant can read any monitor; it
+  // TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
   // reports a distance computed from a single 20-sample batch as significant; and it hides the
-  // sample counts. Review all three.
+  // sample counts. Fix all three.
   const {monitor_id: monitorId} = request.params as {monitor_id: string};
   const latest = await store.resolve(monitorId);
   if (latest === null) return reply.code(404).send({error: 'not found'});
@@ -303,9 +302,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func monitorReport(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft resolves the monitor by id alone, so any tenant can read any monitor; it
+	// TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
 	// reports a distance computed from a single 20-sample batch as significant; and it hides the
-	// sample counts. Review all three.
+	// sample counts. Fix all three.
 	monitorID := r.PathValue("monitor_id")
 	latest, err := store.Resolve(r.Context(), monitorID)
 	if err != nil {
@@ -424,9 +423,9 @@ object ReportApi {
   val route: Route =
     path("v1" / "monitors" / Segment / "report") { monitorId =>
       get {
-        // TODO: this draft resolves the monitor by id alone, so any tenant can read any monitor; it
+        // TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
         // reports a distance computed from a single 20-sample batch as significant; and it hides the
-        // sample counts. Review all three.
+        // sample counts. Fix all three.
         store.resolve(monitorId) match {
           case None =>
             complete(StatusCodes.NotFound, """{"error":"not found"}""")
@@ -541,9 +540,9 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/monitors/([^/]+)/report)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft resolves the monitor by id alone, so any tenant can read any monitor; it
+    // TODO: this starter resolves the monitor by id alone, so any tenant can read any monitor; it
     // reports a distance computed from a single 20-sample batch as significant; and it hides the
-    // sample counts. Review all three.
+    // sample counts. Fix all three.
     const auto monitorId = req.matches[1].str();
     const auto latest = store.resolve(monitorId);
     if (!latest) {
@@ -636,7 +635,7 @@ int main() {
     },
   },
   hints: [
-    'Authorize with the same lookup you read with: `store.report(tenant, monitor_id)` returns nothing when the monitor belongs to someone else, and that nothing is a **404**. Resolving by monitor id alone and then comparing owners in the handler is the bug the draft ships.',
+    'Authorize with the same lookup you read with: `store.report(tenant, monitor_id)` returns nothing when the monitor belongs to someone else, and that nothing is a **404**. Resolving by monitor id alone and then comparing owners in the handler is the bug the starter ships.',
     'Ship the counts with the number. `sample_count`, `baseline_sample_count` and `baseline_window` are what let a reader decide whether a distance of 0.4 is drift or noise — a report without them is an opinion.',
     'Make the state explicit rather than implied: `sufficient = sample_count >= MIN_SAMPLES and baseline_sample_count >= MIN_SAMPLES`, `state = "ok" / "insufficient_data"`, and `threshold_crossed = sufficient and distance >= threshold`. Never return a crossing the samples cannot support.',
   ],

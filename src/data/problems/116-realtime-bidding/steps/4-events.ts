@@ -12,29 +12,29 @@ export const eventsStep: Step = {
   focus: ['bidding', 'kafka', 'outbox', 'consumer'],
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. The analytics team cannot compute a win
+**Starting point.** You are the bidding platform engineer on call. The analytics team cannot compute a win
 rate: the \`bid.event\` topic holds bids and wins but no losses at all, and the losses it was told to
 expect disappeared. Worse, one auction's events are spread over every partition because the producer
 keys by bidder, so a consumer replaying the topic sees a win before the bid that produced it. And a
 crash during a produce left a spend charge that no event explains.
 
-Review \`events\` and make the auction's history complete, ordered and reconcilable.
+Debug \`events\` and make the auction's history complete, ordered and reconcilable.
 
 - Every event about one auction must share a partition: key the produce with the **auction id**
   (\`partition_key(event)\` returning \`event["auction_id"]\` / \`event.auction_id\` / \`event.AuctionID\`),
   so a consumer sees one auction's bid, win or loss in the order they happened.
 - **Losses are published, and they always carry a reason.** Build them with a named
   \`loss_event\` / \`lossEvent\` that sets \`result: "loss"\` and a \`loss_reason\`. A win rate computed
-  without loss reasons cannot be diagnosed — the draft drops every loss instead.
+  without loss reasons cannot be diagnosed — the starter drops every loss instead.
 - **Publish after the spend claim commits**: \`spend.commit(claim)\` happens first, so an event can
   never reference a charge that was rolled back.
 - A produce the broker rejects must **not** be dropped: keep it in the outbox
   (\`publish_with_outbox\` / \`publishWithOutbox\` → \`outbox.put\`), so a retry can republish it.
 - Produce durably: \`acks=all\` with idempotent retries where the client exposes them
   (Go: \`RequiredAcks: kafka.RequireAll\` plus a \`kafka.Hash\` balancer so the auction key picks the
-  partition). The draft asks for \`acks=1\` and calls the produce successful on the local send.
+  partition). The starter asks for \`acks=1\` and calls the produce successful on the local send.
 
-**Failure mode the checks target.** The draft is a working publisher that answers the wrong questions:
+**Failure mode the checks target.** The starter is a working publisher that answers the wrong questions:
 keying by bidder scatters an auction across partitions, so ordering is lost and a consumer that
 replays cannot rebuild the auction; dropping losses makes the win rate undiagnosable — a bidder whose
 bids are always too low looks identical to one whose bids are never delivered; and publishing before
@@ -56,7 +56,7 @@ the claim commits leaves the reconciliation job chasing an event for a spend tha
       id: 'auction-key',
       title: 'Every event is keyed by its auction',
       detail:
-        'A `partition_key` / `partitionKey` returns the auction id and the produce uses it as the message key, so every event about one auction lands in one partition in order. The draft keys by bidder, so an auction’s history scatters and a replay cannot rebuild it.',
+        'A `partition_key` / `partitionKey` returns the auction id and the produce uses it as the message key, so every event about one auction lands in one partition in order. The starter keys by bidder, so an auction’s history scatters and a replay cannot rebuild it.',
       match: {
         python: {all: [/def partition_key\(/, /return event\["auction_id"\]/]},
         typescript: {all: [/function partitionKey\(/, /return event\.auction_id/]},
@@ -69,7 +69,7 @@ the claim commits leaves the reconciliation job chasing an event for a spend tha
       id: 'loss-reason',
       title: 'Losses are published with a reason',
       detail:
-        'A `loss_event` / `lossEvent` builds `result: "loss"` together with a `loss_reason`, and the settlement publishes it. The draft drops every loss, so the win rate in the stats read has no inputs.',
+        'A `loss_event` / `lossEvent` builds `result: "loss"` together with a `loss_reason`, and the settlement publishes it. The starter drops every loss, so the win rate in the stats read has no inputs.',
       match: {
         python: {all: [/def loss_event\(/, /loss_reason/, /"result": "loss"/]},
         typescript: {all: [/function lossEvent\(/, /loss_reason/, /result: 'loss'/]},
@@ -82,7 +82,7 @@ the claim commits leaves the reconciliation job chasing an event for a spend tha
       id: 'publish-after-claim',
       title: 'The spend is committed before the event is published',
       detail:
-        '`spend.commit(claim)` runs before the event is published, so a published event always corresponds to a charge that stands. The draft publishes first and commits afterwards.',
+        '`spend.commit(claim)` runs before the event is published, so a published event always corresponds to a charge that stands. The starter publishes first and commits afterwards.',
       match: {
         python: {order: [/spend\.commit\(claim\)/, /publish_with_outbox\(event\)/]},
         typescript: {order: [/spend\.commit\(claim\)/, /publishWithOutbox\(event\)/]},
@@ -95,7 +95,7 @@ the claim commits leaves the reconciliation job chasing an event for a spend tha
       id: 'outbox',
       title: 'A rejected produce is kept in the outbox',
       detail:
-        'The produce goes through `publish_with_outbox` / `publishWithOutbox`, and a rejection writes an `outbox` row instead of dropping the event, so a retry can republish it. The draft treats the local send as success.',
+        'The produce goes through `publish_with_outbox` / `publishWithOutbox`, and a rejection writes an `outbox` row instead of dropping the event, so a retry can republish it. The starter treats the local send as success.',
       match: {
         python: {all: [/def publish_with_outbox\(/, /outbox\.put\(/]},
         typescript: {all: [/function publishWithOutbox\(/, /outbox\.put\(/]},
@@ -151,7 +151,7 @@ class BidEvents:
         producer.poll(0)
 
     def record_result(self, claim: dict, result: str, auction_id: str, loss_reason: str = "") -> None:
-        # TODO: this draft keys by bidder so one auction's history scatters across partitions,
+        # TODO: this starter keys by bidder so one auction's history scatters across partitions,
         # drops every loss so win rate cannot be diagnosed, and publishes before the spend claim
         # commits, so a crash between the two leaves a charge that no event explains.
         if result == "win":
@@ -264,7 +264,7 @@ export class BidEvents {
   }
 
   async recordResult(claim: Claim, result: string, auctionId: string): Promise<void> {
-    // TODO: this draft keys by bidder so one auction's history scatters across partitions, drops
+    // TODO: this starter keys by bidder so one auction's history scatters across partitions, drops
     // every loss so win rate cannot be diagnosed, and publishes before the spend claim commits,
     // so a crash between the two leaves a charge that no event explains.
     if (result === 'win') {
@@ -395,7 +395,7 @@ func (b *BidEvents) Publish(ctx context.Context, event BidEvent) error {
 }
 
 func (b *BidEvents) RecordResult(ctx context.Context, claim Claim, result, auctionID string) error {
-	// TODO: this draft keys by bidder so one auction's history scatters across partitions, drops
+	// TODO: this starter keys by bidder so one auction's history scatters across partitions, drops
 	// every loss so win rate cannot be diagnosed, and publishes before the spend claim commits,
 	// so a crash between the two leaves a charge that no event explains.
 	if result == "win" {
@@ -539,7 +539,7 @@ object BidEvents {
 
 class BidEvents(spend: SpendLedger) {
   def recordResult(claim: Claim, result: String, auctionId: String, lossReason: String): Unit = {
-    // TODO: this draft keys by bidder so one auction's history scatters across partitions, drops
+    // TODO: this starter keys by bidder so one auction's history scatters across partitions, drops
     // every loss so win rate cannot be diagnosed, and publishes before the spend claim commits,
     // so a crash between the two leaves a charge that no event explains.
     if (result == "win") {
@@ -669,7 +669,7 @@ void publish(RdKafka::Producer* rk, RdKafka::Topic* tp, const BidEvent& event) {
 
 void recordResult(SpendLedger& spend, const Claim& claim, const std::string& result, const std::string& auctionId,
                   const std::string& lossReason) {
-  // TODO: this draft keys by bidder so one auction's history scatters across partitions, drops
+  // TODO: this starter keys by bidder so one auction's history scatters across partitions, drops
   // every loss so win rate cannot be diagnosed, and publishes before the spend claim commits, so a
   // crash between the two leaves a charge that no event explains.
   if (result == "win") {
@@ -758,14 +758,14 @@ void recordResult(SpendLedger& spend, RdKafka::Producer* rk, RdKafka::Topic* top
     'Losses are first-class events: build them with `loss_event(...)` that always sets `result: "loss"` and a `loss_reason`, and publish them on the loss path. A topic with only bids and wins cannot compute the win rate the stats read promises.',
     'Order the two writes deliberately: `spend.commit(claim)` first, publish second, and send through `publish_with_outbox(...)` so a broker rejection lands in the outbox instead of disappearing. `acks=all` with idempotent retries finishes the job: a produce is not successful until the replicas hold it, and a retry cannot duplicate a bid.',
   ],
-  debrief: `The interviewer is testing whether you can review an event pipeline for what it cannot answer. The
-draft produces events, and its happy path looks correct in a demo where every auction is won and no
+  debrief: `The interviewer is testing whether you can debug an event pipeline for what it cannot answer. The
+starter produces events, and its happy path looks correct in a demo where every auction is won and no
 broker ever rejects.
 
 Three defects are being checked. Ordering: the partition key decides what a consumer can reconstruct,
 so one auction's events must share a partition — keyed by bidder, a replay interleaves auctions and
 ordering is gone. Completeness: a loss event carries the reason, and without losses the win rate is
-undefined; the draft silently publishes only wins, which is how a bidder can look healthy while
+undefined; the starter silently publishes only wins, which is how a bidder can look healthy while
 winning nothing. Consistency: the publish must follow the spend claim, and a rejection must land in
 the outbox, because an event that outruns its charge, or a charge with no event, is a reconciliation
 incident rather than a metric.

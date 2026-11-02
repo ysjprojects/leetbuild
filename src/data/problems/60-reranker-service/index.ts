@@ -7,12 +7,12 @@ import {rerankEventsStep} from './steps/4-events';
 import {readStatsStep} from './steps/5-read';
 
 /**
- * Reranking service on the AI-era track: the course is not "call a cross-encoder and sort", it is
- * the review you owe a model-generated reranker before anyone trusts the order it returns. A query
- * and candidate set with hard caps → a Redis score cache keyed by the whole (query, passage,
- * version) triple → a gRPC batch call whose failures become unscored markers that keep retrieval
- * order → outcomes published by query fingerprint with an outbox → a stats read that reports the
- * unscored share per version so silent degradation cannot hide.
+ * Reranking service: the course is not "call a cross-encoder and sort", it is the debugging you
+ * owe a reranker before anyone trusts the order it returns. A query and candidate set with hard
+ * caps → a Redis score cache keyed by the whole (query, passage, version) triple → a gRPC batch
+ * call whose failures become unscored markers that keep retrieval order → outcomes published by
+ * query fingerprint with an outbox → a stats read that reports the unscored share per version so
+ * silent degradation cannot hide.
  */
 export const rerankerServiceProblem: Problem = {
   id: 'reranker-service',
@@ -20,7 +20,7 @@ export const rerankerServiceProblem: Problem = {
   tagline: 'Reorder candidate passages for relevance with a bounded budget and honest scores.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Reranking Service
 
@@ -68,12 +68,12 @@ One service, **rerankd**, with five pieces:
 5. \`GET /v1/rerank/cache/stats\`: hit ratio, unscored batch share and latency percentiles per model
    version, plus the share of requests that used fallback order.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

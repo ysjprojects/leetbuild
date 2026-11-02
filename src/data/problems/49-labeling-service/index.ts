@@ -7,13 +7,12 @@ import {labelEventsStep} from './steps/4-events';
 import {progressReadStep} from './steps/5-read';
 
 /**
- * Labeling service on the AI-era track: the course is not "accept a label over HTTP", it is the
- * review you owe a model-generated labeling queue before a human's hour is spent in it. Validated,
- * idempotent task creation pinned to a spec version → a Redis pool with 15-minute leases that
- * return abandoned work → a gRPC pre-label call with a 2-second deadline that degrades to an
- * unlabeled item instead of a frozen queue → task-keyed `label.submitted` events written after the
- * label persists, with an outbox → a progress read that reports agreement without showing one
- * annotator another annotator's labels.
+ * Labeling service: the course is not "accept a label over HTTP", it is the debugging you owe a
+ * labeling queue before a human's hour is spent in it. Validated, idempotent task creation pinned
+ * to a spec version → a Redis pool with 15-minute leases that return abandoned work → a gRPC
+ * pre-label call with a 2-second deadline that degrades to an unlabeled item instead of a frozen
+ * queue → task-keyed `label.submitted` events written after the label persists, with an outbox →
+ * a progress read that reports agreement without showing one annotator another annotator's labels.
  */
 export const labelingServiceProblem: Problem = {
   id: 'labeling-service',
@@ -21,7 +20,7 @@ export const labelingServiceProblem: Problem = {
   tagline: 'Human labeling queues with leases, idle-time pre-labels and agreement-safe progress.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Labeling Service
 
@@ -69,12 +68,12 @@ One service, **labeld**, with five pieces:
    labels visible and a peer's labels hidden until they submit, annotators flagged by quality review
    excluded from the agreement math, and metrics that rebuild from the events alone.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

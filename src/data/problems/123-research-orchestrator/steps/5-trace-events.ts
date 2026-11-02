@@ -8,7 +8,7 @@ export const traceEventsStep: Step = {
   focus: ['lead', 'kafka', 'evaluator', 'judge'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every decision produces an
+**Starting point.** The starter is working code: every decision produces an
 event, and a consumer marks finished jobs good or bad, so the dashboard shows numbers moving. Four
 production contracts are broken. Find them, fix them, and prove the fix.
 
@@ -67,7 +67,7 @@ silently picked up by whichever worker restarts first after a deploy.`,
       id: 'job-key-idempotent',
       title: 'Keyed by job id from an idempotent producer with acks=all',
       detail:
-        'The message key is the job id and the producer is configured for idempotence and `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true`, or required acks `all` with a hash balancer. The draft keys by agent id from a default producer.',
+        'The message key is the job id and the producer is configured for idempotence and `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true`, or required acks `all` with a hash balancer. The starter keys by agent id from a default producer.',
       match: {
         python: {all: [/key=job_id/, /enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/key:\s*jobId\b/, /idempotent:\s*true/, /acks:\s*-1/]},
@@ -80,7 +80,7 @@ silently picked up by whichever worker restarts first after a deploy.`,
       id: 'no-content',
       title: 'No query, findings or tool text in the event or logs',
       detail:
-        'The event carries ids, tool name, latency, tokens, outcome and version; no field or log line carries the query, the findings or fetched text. The draft copies both into the event and logs them.',
+        'The event carries ids, tool name, latency, tokens, outcome and version; no field or log line carries the query, the findings or fetched text. The starter copies both into the event and logs them.',
       match: {
         python: {none: [/\bquery\b/i, /\bfindings\b/i]},
         typescript: {none: [/\bquery\b/i, /\bfindings\b/i]},
@@ -93,7 +93,7 @@ silently picked up by whichever worker restarts first after a deploy.`,
       id: 'rubric-eval',
       title: 'Scores completed jobs against the five-part rubric',
       detail:
-        'The consumer calls the judge with `RUBRIC` — factual accuracy, citation accuracy, completeness, source quality, tool efficiency — and stores each score and the pass/fail grade. The draft asks for a single yes/no.',
+        'The consumer calls the judge with `RUBRIC` — factual accuracy, citation accuracy, completeness, source quality, tool efficiency — and stores each score and the pass/fail grade. The starter asks for a single yes/no.',
       match: {
         python: {all: [/RUBRIC/, /citation_accuracy/, /tool_efficiency/, /judge\.score\(/]},
         typescript: {all: [/RUBRIC/, /citation_accuracy/, /tool_efficiency/, /judge\.score\(/]},
@@ -106,7 +106,7 @@ silently picked up by whichever worker restarts first after a deploy.`,
       id: 'write-before-commit',
       title: 'Writes the evaluation before committing the offset',
       detail:
-        'The consumer writes `research:{job_id}:eval` with `HSET` before committing the offset; committing first makes a crash lose the evaluation forever. The draft commits first.',
+        'The consumer writes `research:{job_id}:eval` with `HSET` before committing the offset; committing first makes a crash lose the evaluation forever. The starter commits first.',
       match: {
         python: {order: [/\.hset\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hset\(/, /commitOffsets\(/]},
@@ -119,7 +119,7 @@ silently picked up by whichever worker restarts first after a deploy.`,
       id: 'version-pin',
       title: 'Pins each job to the version that started it',
       detail:
-        'Every event carries `SERVICE_VERSION` under `version`, and `claim_job` runs a job only when its record’s version matches — the rainbow deployment contract. The draft claims every job and records no version.',
+        'Every event carries `SERVICE_VERSION` under `version`, and `claim_job` runs a job only when its record’s version matches — the rainbow deployment contract. The starter claims every job and records no version.',
       match: {
         python: {all: [/SERVICE_VERSION/, /"version"/, /def claim_job\(/]},
         typescript: {all: [/SERVICE_VERSION/, /\bversion\b/, /function claimJob\(/]},
@@ -164,7 +164,7 @@ def trace(
 ) -> None:
     # TODO: key by job id from an idempotent producer with acks=all, keep the query and the
     # findings out of the event and the logs, score completed jobs with the rubric before the
-    # commit, and pin jobs to the service version. Review all four.
+    # commit, and pin jobs to the service version. Fix all four.
     logger.info("trace job=%s agent=%s findings=%r", job_id, agent_id, findings)
     event = {
         "job_id": job_id,
@@ -270,7 +270,7 @@ def evaluate() -> None:
 `,
     },
     typescript: {
-      starter: `/** research.trace: a model-generated draft that keys by agent, ships content, and commits too early. */
+      starter: `/** research.trace: flawed code that keys by agent, ships content, and commits too early. */
 import {Kafka} from 'kafkajs';
 import {Redis} from 'ioredis';
 
@@ -295,7 +295,7 @@ export interface Decision {
 export async function trace(decision: Decision): Promise<void> {
   // TODO: key by job id from an idempotent producer with acks=all, keep the query and the
   // findings out of the event and the logs, score completed jobs with the rubric before the
-  // commit, and pin jobs to the service version. Review all four.
+  // commit, and pin jobs to the service version. Fix all four.
   console.log(\`trace job=\${decision.jobId} agent=\${decision.agentId} findings=\${decision.findings}\`);
   const event = {
     job_id: decision.jobId,
@@ -429,7 +429,7 @@ var judge = &Judge{}
 
 // TODO: key by job id from an idempotent producer with acks=all, keep the query and the
 // findings out of the event and the logs, score completed jobs with the rubric before the
-// commit, and pin jobs to the service version. Review all four.
+// commit, and pin jobs to the service version. Fix all four.
 func trace(ctx context.Context, jobID, agentID, tool string, latencyMS, tokens int, outcome, query, findings string) {
 	log.Printf("trace job=%s agent=%s findings=%q", jobID, agentID, findings)
 	event := map[string]any{
@@ -598,7 +598,7 @@ object TraceEvents {
 
   // TODO: key by job id from an idempotent producer with acks=all, keep the query and the
   // findings out of the event and the logs, score completed jobs with the rubric before the
-  // commit, and pin jobs to the service version. Review all four.
+  // commit, and pin jobs to the service version. Fix all four.
   def trace(
       jobId: String,
       agentId: String,
@@ -739,7 +739,7 @@ std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tc
 
 // TODO: key by job id from an idempotent producer with acks=all, keep the query and the
 // findings out of the event and the logs, score completed jobs with the rubric before the
-// commit, and pin jobs to the service version. Review all four.
+// commit, and pin jobs to the service version. Fix all four.
 void trace(const std::string& jobId, const std::string& agentId, const std::string& tool, long latencyMs, long tokens, const std::string& outcome, const std::string& query, const std::string& findings) {
   std::cerr << "trace job=" << jobId << " agent=" << agentId << " findings=" << findings << "\\n";
   const json event = {
@@ -862,5 +862,5 @@ void evaluate() {
 `,
     },
   },
-  debrief: `The interviewer is checking four things a generated tracing snippet gets wrong, and all four come straight from the source's production chapter. First, the message key is an ordering contract: keyed by job, one job's decisions arrive in order and can be replayed as a story; keyed by agent they cannot. Second, observability without content: the source monitors decision patterns and interaction structures and deliberately not the contents of conversations, because a trace topic is retained, replicated and read by people the user never agreed to share with — ids, counts and latencies explain a bad answer, the text does not need to be there. Third, exactly-once-looking code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must write the evaluation before the commit, or a crash between the two loses the only score that job will ever get. Fourth, the version pin is what makes a rainbow deployment safe: old and new workers run together, and a job keeps running on the version whose checkpoints it wrote. The end-state evaluation is the source's answer to grading agents that take different valid paths — judge the final report with one rubric call, not the steps. Real systems add schema registries for the event, a sampled copy of the full trace for debugging under explicit consent, and a drift alarm when the pass rate of a new version falls below the old one.`,
+  debrief: `The interviewer is checking four things a tracing snippet gets wrong, and all four come straight from the source's production chapter. First, the message key is an ordering contract: keyed by job, one job's decisions arrive in order and can be replayed as a story; keyed by agent they cannot. Second, observability without content: the source monitors decision patterns and interaction structures and deliberately not the contents of conversations, because a trace topic is retained, replicated and read by people the user never agreed to share with — ids, counts and latencies explain a bad answer, the text does not need to be there. Third, exactly-once-looking code is not exactly-once: the producer needs idempotence and acks=all, and the consumer must write the evaluation before the commit, or a crash between the two loses the only score that job will ever get. Fourth, the version pin is what makes a rainbow deployment safe: old and new workers run together, and a job keeps running on the version whose checkpoints it wrote. The end-state evaluation is the source's answer to grading agents that take different valid paths — judge the final report with one rubric call, not the steps. Real systems add schema registries for the event, a sampled copy of the full trace for debugging under explicit consent, and a drift alarm when the pass rate of a new version falls below the old one.`,
 };

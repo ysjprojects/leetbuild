@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['kafka', 'api', 'store', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes a rollup event per
-report. It compiles, it serves the demo, and it hides three production flaws. Review it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it publishes a rollup event per report. It
+compiles, it serves the demo, and it hides three production flaws. Debug it like the service owner,
+fix it, and prove the fix with the checks below.
 
 Implement the rollup publisher for \`usage.rollup\`.
 
@@ -25,7 +25,7 @@ Implement the rollup publisher for \`usage.rollup\`.
   rollup will disagree with billing forever.
 - The topic is \`usage.rollup\` and the producer waits for all in-sync replicas.
 
-**Failure mode the checks target.** The draft keys by the gateway, so ordering is lost; it copies the
+**Failure mode the checks target.** The starter keys by the gateway, so ordering is lost; it copies the
 query string into the event, so user data lands in a topic that outlives the request; and it produces
 before the counters commit, so a crash between the two leaves an event for usage that was never
 counted — an analytics total that can never tie out against the meter.`,
@@ -48,7 +48,7 @@ counted — an analytics total that can never tie out against the meter.`,
       id: 'key-account',
       title: 'Keys the event by account',
       detail:
-        'The produced message is keyed by the account so one account’s usage stays in one partition and in order. The draft keys by the gateway, which scatters the stream.',
+        'The produced message is keyed by the account so one account’s usage stays in one partition and in order. The starter keys by the gateway, which scatters the stream.',
       match: {
         python: {all: [/key=account/], none: [/key=gateway/]},
         typescript: {all: [/key: account/], none: [/key: gateway/]},
@@ -61,7 +61,7 @@ counted — an analytics total that can never tie out against the meter.`,
       id: 'no-content',
       title: 'Keeps request content out of the event',
       detail:
-        'The event carries the period, the units and the cap state only — no query strings, no paths, no payloads. The draft publishes the query string for "product analytics".',
+        'The event carries the period, the units and the cap state only — no query strings, no paths, no payloads. The starter publishes the query string for "product analytics".',
       match: {
         python: {all: [/cap_state/], none: [/query/]},
         typescript: {all: [/capState/], none: [/query/]},
@@ -74,7 +74,7 @@ counted — an analytics total that can never tie out against the meter.`,
       id: 'publish-after-commit',
       title: 'Publishes only after the counters commit',
       detail:
-        'The rollup is produced after `apply_usage` has committed the counters. The draft produces first and counts second, so an event can describe usage the meter never recorded.',
+        'The rollup is produced after `apply_usage` has committed the counters. The starter produces first and counts second, so an event can describe usage the meter never recorded.',
       match: {
         python: {order: [/apply_usage\(/, /producer\.produce\(/]},
         typescript: {order: [/applyUsage\(/, /producer\.send\(/]},
@@ -99,7 +99,7 @@ counted — an analytics total that can never tie out against the meter.`,
       id: 'event-fields',
       title: 'Carries period, units and cap state',
       detail:
-        'The event names the period, the units and the cap state so a rollup can be computed without re-reading the meter. The draft’s event has neither the period nor the cap state.',
+        'The event names the period, the units and the cap state so a rollup can be computed without re-reading the meter. The starter’s event has neither the period nor the cap state.',
       match: {
         python: {all: [/period/, /units/, /cap_state/]},
         typescript: {all: [/period/, /units/, /capState/]},
@@ -128,10 +128,10 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 def publish_rollup(
     account: str, period: str, units: int, route: str, gateway: str, query_string: str
 ) -> None:
-    # TODO: this draft keys by the gateway, so an account's usage scatters across partitions and the
+    # TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
     # rollup loses ordering; it publishes the query string for product analytics, copying user data
     # into a retained topic; and it produces before the counters commit, so an event can describe
-    # usage the meter never recorded. Review all three.
+    # usage the meter never recorded. Fix all three.
     event = {"account": account, "gateway": gateway, "query": query_string, "units": units}
     producer.produce(TOPIC, key=gateway, value=json.dumps(event).encode("utf-8"))
     producer.poll(0)
@@ -164,7 +164,7 @@ def publish_rollup(account: str, period: str, units: int, route: str, gateway: s
 `,
     },
     typescript: {
-      starter: `/** usage.rollup: a model-generated draft that keys by gateway and copies the query string. */
+      starter: `/** usage.rollup: flawed code that keys by gateway and copies the query string. */
 import {Kafka} from 'kafkajs';
 
 import {applyUsage} from './state';
@@ -182,10 +182,10 @@ export async function publishRollup(
   gateway: string,
   queryString: string,
 ): Promise<void> {
-  // TODO: this draft keys by the gateway, so an account's usage scatters across partitions and the
+  // TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
   // rollup loses ordering; it publishes the query string for product analytics, copying user data
   // into a retained topic; and it produces before the counters commit, so an event can describe
-  // usage the meter never recorded. Review all three.
+  // usage the meter never recorded. Fix all three.
   const event = {account, gateway, query: queryString, units};
   await producer.send({topic: TOPIC, messages: [{key: gateway, value: JSON.stringify(event)}]});
   await applyUsage(account, period, route, units, gateway);
@@ -246,10 +246,10 @@ var producer = &kafka.Writer{
 }
 
 func PublishRollup(ctx context.Context, account, period string, units int, route, gateway, queryString string) error {
-	// TODO: this draft keys by the gateway, so an account's usage scatters across partitions and the
+	// TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
 	// rollup loses ordering; it publishes the query string for product analytics, copying user data
 	// into a retained topic; and it produces before the counters commit, so an event can describe
-	// usage the meter never recorded. Review all three.
+	// usage the meter never recorded. Fix all three.
 	event := map[string]any{"account": account, "gateway": gateway, "query": queryString, "units": units}
 	value, err := json.Marshal(event)
 	if err != nil {
@@ -321,10 +321,10 @@ object Events {
   val producer = new KafkaProducer[String, String](props)
 
   def publishRollup(account: String, period: String, units: Int, route: String, gateway: String, queryString: String): Unit = {
-    // TODO: this draft keys by the gateway, so an account's usage scatters across partitions and the
+    // TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
     // rollup loses ordering; it publishes the query string for product analytics, copying user data
     // into a retained topic; and it produces before the counters commit, so an event can describe
-    // usage the meter never recorded. Review all three.
+    // usage the meter never recorded. Fix all three.
     val payload = s"""{"account":"$account","gateway":"$gateway","query":"$queryString","units":$units}"""
     producer.send(new ProducerRecord[String, String](Topic, gateway, payload))
     MeteringState.applyUsage(account, period, route, units, gateway)
@@ -366,10 +366,10 @@ const std::string kTopic = "usage.rollup";
 void publishRollup(RdKafka::Producer* producer, const std::string& account, const std::string& period,
                    int units, const std::string& route, const std::string& gateway,
                    const std::string& queryString) {
-  // TODO: this draft keys by the gateway, so an account's usage scatters across partitions and the
+  // TODO: this starter keys by the gateway, so an account's usage scatters across partitions and the
   // rollup loses ordering; it publishes the query string for product analytics, copying user data
   // into a retained topic; and it produces before the counters commit, so an event can describe
-  // usage the meter never recorded. Review all three.
+  // usage the meter never recorded. Fix all three.
   const std::string key = gateway;
   const std::string payload = "{\\"account\\":\\"" + account + "\\",\\"query\\":\\"" + queryString +
                               "\\",\\"units\\":" + std::to_string(units) + "}";

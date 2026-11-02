@@ -8,20 +8,20 @@ export const cacheEventsStep: Step = {
   focus: ['cache', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every decision publishes a
+**Starting point.** The starter is working code: every decision publishes a
 \`cache.result\` event and the topic looks healthy in the console. Its three flaws are the three things
 analysts get wrong about a cache topic — the partition key, the payload, and the moment the offset is
-committed. Review it, fix it, and prove the fix.
+committed. Debug it, fix it, and prove the fix.
 
 Publish one event per decision (hit, miss) and maintain the ratio counter from the same events.
 
 - **The record key is the tenant.** The key decides the partition, so one tenant’s events keep their
-  order on one partition and one tenant’s traffic cannot land behind another’s. The draft keys by
+  order on one partition and one tenant’s traffic cannot land behind another’s. The starter keys by
   prompt version, which scatters a tenant across every partition — the ordering a hit-ratio series
   needs is exactly what it destroys — and puts every tenant that shares a version in one partition.
 - **The payload carries a digest, never prompt text.** The event is
   \`{"prefix_digest", "version", "decision", "latency_ms"}\`: enough to aggregate hits and misses per
-  tenant and prompt version, and enough for latency percentiles. The draft ships \`"prefix":
+  tenant and prompt version, and enough for latency percentiles. The starter ships \`"prefix":
   prefix[:512]\` so analysts can "eyeball traffic" — a 512-byte slice of customer prompt text in a
   retained, replicated topic, which is the leak the cache was supposed to reduce.
 - **\`cache.result\` is the topic, and every decision produces exactly one record** — a hit and a miss
@@ -29,13 +29,13 @@ Publish one event per decision (hit, miss) and maintain the ratio counter from t
   \`acks=all\` and the idempotent producer, so a broker failover cannot drop a decision and the
   producer’s own retries cannot duplicate one.
 - **The consumer updates the hit-ratio counter before it commits the offset.** \`HINCRBY
-  pc:access:{tenant}:{version} hits|misses 1\`, *then* \`commit\`. The draft commits first, so a crash
+  pc:access:{tenant}:{version} hits|misses 1\`, *then* \`commit\`. The starter commits first, so a crash
   between the two loses the counter update while the offset says the event was processed — the ratio
   drifts downward for the rest of the version’s life.
 - **Never put the prompt, the completion or a sample of either in the event.** The topic is the one
   place where "we only keep metadata" has to be literally true.
 
-**Failure mode the checks target.** The draft treats the cache topic as a log of everything it knows
+**Failure mode the checks target.** The starter treats the cache topic as a log of everything it knows
 rather than a stream of decisions: a version key that destroys per-tenant ordering, a payload that
 carries the prompt, and an offset commit that runs ahead of the state it is supposed to describe.`,
   sequence: {
@@ -60,7 +60,7 @@ carries the prompt, and an offset commit that runs ahead of the state it is supp
   },
   hints: [
     'The key is the ordering contract, and the ordering you want is per tenant. `key = tenant` puts every event for one tenant on one partition in produce order — which is what a hit-ratio series and a debugging session both need. Keying by prompt version is a decision to shuffle one tenant’s traffic through every partition.',
-    'A digest is enough for everything an analyst legitimately does with this topic: aggregate per tenant and version, compute ratio, plot latency. `prefix[:512]` buys "eyeballing" and pays with prompt text in a retained topic; if a reviewer really needs the text they can ask the caller who owns it.',
+    'A digest is enough for everything an analyst legitimately does with this topic: aggregate per tenant and version, compute ratio, plot latency. `prefix[:512]` buys "eyeballing" and pays with prompt text in a retained topic; if an analyst really needs the text they can ask the caller who owns it.',
     'Commit is a statement about work already done, so do the work first: `HINCRBY` the counter, then `commit`. If the process dies in between, the event is replayed and the counter is incremented twice rather than lost — which is why the counter update should be idempotent-friendly (count from the event, not a blind `INCR`) when you get to production.',
   ],
   checks: [
@@ -68,7 +68,7 @@ carries the prompt, and an offset commit that runs ahead of the state it is supp
       id: 'topic',
       title: 'Publishes one decision event to cache.result',
       detail:
-        'The topic is `cache.result` and each decision produces one record. The draft publishes to the right topic, so this is the one shape it gets right — the checks below are the ones it fails.',
+        'The topic is `cache.result` and each decision produces one record. The starter publishes to the right topic, so this is the one shape it gets right — the checks below are the ones it fails.',
       match: {
         python: {all: [/TOPIC = "cache\.result"/, /producer\.produce\(/]},
         typescript: {all: [/TOPIC = 'cache\.result'/, /producer\.send\(/]},
@@ -81,7 +81,7 @@ carries the prompt, and an offset commit that runs ahead of the state it is supp
       id: 'tenant-key',
       title: 'Keys the record by tenant, not by prompt version',
       detail:
-        'The record key is the authenticated tenant, so one tenant’s events stay on one partition in order. The draft keys by prompt version, which scatters one tenant’s traffic across partitions and mixes unrelated tenants in one.',
+        'The record key is the authenticated tenant, so one tenant’s events stay on one partition in order. The starter keys by prompt version, which scatters one tenant’s traffic across partitions and mixes unrelated tenants in one.',
       match: {
         python: {all: [/key=tenant/], none: [/key=version/, /key=str\(version\)/]},
         typescript: {all: [/key:\s*tenant\b/], none: [/key:\s*String\(version\)/, /key:\s*version\b/]},
@@ -97,7 +97,7 @@ carries the prompt, and an offset commit that runs ahead of the state it is supp
       id: 'digest-fields',
       title: 'The payload carries digest, version, decision and latency',
       detail:
-        'The event is `{prefix_digest, version, decision, latency_ms}` — nothing more. The draft emits `prefix` (a 512-byte sample), no digest, and no latency, so the topic cannot answer per-tenant latency questions and does carry customer text.',
+        'The event is `{prefix_digest, version, decision, latency_ms}` — nothing more. The starter emits `prefix` (a 512-byte sample), no digest, and no latency, so the topic cannot answer per-tenant latency questions and does carry customer text.',
       match: {
         python: {all: [/"prefix_digest"/, /"version"/, /"decision"/, /"latency_ms"/]},
         typescript: {all: [/prefix_digest/, /version/, /decision/, /latency_ms/]},
@@ -110,7 +110,7 @@ carries the prompt, and an offset commit that runs ahead of the state it is supp
       id: 'no-prompt-fragment',
       title: 'No prompt text or prefix sample in the event',
       detail:
-        'The payload contains a digest and never the prefix itself: no `"prefix"`, `"sample"` or `"text"` field and no `[:512]` slice. The draft ships a 512-byte sample of customer prompt text into a retained, replicated topic.',
+        'The payload contains a digest and never the prefix itself: no `"prefix"`, `"sample"` or `"text"` field and no `[:512]` slice. The starter ships a 512-byte sample of customer prompt text into a retained, replicated topic.',
       match: {
         python: {all: [/digest/], none: [/["'](?:prefix|sample|text)["']\s*:/, /prefix\[:\s*512\]/]},
         typescript: {
@@ -126,7 +126,7 @@ carries the prompt, and an offset commit that runs ahead of the state it is supp
       id: 'counter-before-commit',
       title: 'Updates the ratio counter before committing the offset',
       detail:
-        'The consumer runs `HINCRBY pc:access:{tenant}:{version} …` **before** `commit`/`commitSync`/`CommitMessages`. The draft commits first, so a crash between the two drops the counter update while the offset claims the event was processed.',
+        'The consumer runs `HINCRBY pc:access:{tenant}:{version} …` **before** `commit`/`commitSync`/`CommitMessages`. The starter commits first, so a crash between the two drops the counter update while the offset claims the event was processed.',
       match: {
         python: {order: [/\bhincrby\(/, /\.commit\(/]},
         typescript: {order: [/\.incrby\(/, /commitOffsets\(/]},
@@ -149,7 +149,7 @@ TOPIC = "cache.result"
 
 
 def publish_decision(tenant: str, version: int, prefix: str, decision: str, latency_ms: int) -> None:
-    # TODO: the draft keys by prompt version, so one tenant's events scatter across partitions; it
+    # TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it
     # ships a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the
     # offset before it updates the hit-ratio counter.
     producer.produce(
@@ -205,7 +205,7 @@ def consume(consumer, r) -> None:
 `,
     },
     typescript: {
-      starter: `/** A model-generated cache-event publisher that ships a 512-byte prefix sample. */
+      starter: `/** A cache-event publisher that ships a 512-byte prefix sample. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'prompt-cache', brokers: ['kafka:9092']});
@@ -221,7 +221,7 @@ export async function publishDecision(
   decision: string,
   latency_ms: number,
 ): Promise<void> {
-  // TODO: the draft keys by prompt version, so one tenant's events scatter across partitions; it
+  // TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it
   // ships a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the
   // offset before it updates the hit-ratio counter.
   await producer.connect();
@@ -306,7 +306,7 @@ const topic = "cache.result"
 
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
-// TODO: the draft keys by prompt version, so one tenant's events scatter across partitions; it ships
+// TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it ships
 // a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the offset
 // before it updates the hit-ratio counter.
 func publishDecision(ctx context.Context, tenant string, version int, prefix, decision string, latencyMs int) error {
@@ -409,7 +409,7 @@ object CacheEvents {
   props.put("bootstrap.servers", "kafka:9092")
   val producer = new KafkaProducer[String, String](props)
 
-  // TODO: the draft keys by prompt version, so one tenant's events scatter across partitions; it
+  // TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it
   // ships a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the
   // offset before it updates the hit-ratio counter.
   def publishDecision(tenant: String, version: Int, prefix: String, decision: String, latencyMs: Int): Unit = {
@@ -469,7 +469,7 @@ object CacheEvents {
 
 const std::string kTopic = "cache.result";
 
-// TODO: the draft keys by prompt version, so one tenant's events scatter across partitions; it ships
+// TODO: the starter keys by prompt version, so one tenant's events scatter across partitions; it ships
 // a 512-byte prefix sample so analysts can eyeball traffic; and its consumer commits the offset
 // before it updates the hit-ratio counter.
 void publish_decision(RdKafka::Producer* producer, const std::string& tenant, int version, const std::string& prefix,
@@ -535,5 +535,5 @@ void consume(RdKafka::KafkaConsumer* consumer, sw::redis::Redis& cache) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can design a cache’s event stream as a stream of *decisions* rather than a copy of traffic. All three defects come from treating the topic as an observability dump: the draft keys for its own convenience (version) instead of for the reader’s ordering needs (tenant), it ships the payload "in case someone wants to look", and it commits the offset as though the commit were bookkeeping rather than a claim about state. The correct shape is deliberately thin — tenant key, digest, version, decision, latency — because a cache that leaks completions through its logs, its metrics or its analytics topic has not reduced the leak at all; it has moved it somewhere with a longer retention period. The commit ordering is the same principle applied to the counter: the offset must never be able to say "processed" about a counter update that did not happen.`,
+  debrief: `The interviewer is testing whether you can design a cache’s event stream as a stream of *decisions* rather than a copy of traffic. All three defects come from treating the topic as an observability dump: the starter keys for its own convenience (version) instead of for the reader’s ordering needs (tenant), it ships the payload "in case someone wants to look", and it commits the offset as though the commit were bookkeeping rather than a claim about state. The correct shape is deliberately thin — tenant key, digest, version, decision, latency — because a cache that leaks completions through its logs, its metrics or its analytics topic has not reduced the leak at all; it has moved it somewhere with a longer retention period. The commit ordering is the same principle applied to the counter: the offset must never be able to say "processed" about a counter update that did not happen.`,
 };

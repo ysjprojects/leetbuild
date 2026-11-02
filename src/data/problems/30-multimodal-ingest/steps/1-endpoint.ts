@@ -8,8 +8,8 @@ export const endpointStep: Step = {
   focus: ['client', 'ingest', 'db', 'objects'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers an asset, returns
-a pending record and serves the demo. It compiles, and it hides three production flaws. Review it
+**Starting point.** The starter is working code: it registers an asset, returns
+a pending record and serves the demo. It compiles, and it hides three production flaws. Debug it
 like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/assets\` — the registration half of ingest. The bytes never travel through this
@@ -31,7 +31,7 @@ endpoint: it registers metadata under a content hash, and the client then upload
 **Failure mode the checks target.** Trusting the client's \`mime\` puts an SVG or a polyglot file in
 front of the indexer; an uncapped caption turns one request into an unbounded vision bill; and a
 registration that ignores the content hash duplicates the asset *and its embeddings* on every retry,
-so search returns the same image twice with two different scores. The draft also writes
+so search returns the same image twice with two different scores. The starter also writes
 \`store.put(tenant, body.mime, …)\` — keyed by a value the caller controls, which is how one tenant's
 re-upload can collide with another's.`,
   sequence: {
@@ -73,7 +73,7 @@ re-upload can collide with another's.`,
       id: 'mime',
       title: 'Rejects a mime type outside the allowlist with 415',
       detail:
-        'The mime type is matched against an allowlist and anything else is **415 Unsupported Media Type**. The draft stores whatever the client declared, so the indexer receives formats it cannot embed.',
+        'The mime type is matched against an allowlist and anything else is **415 Unsupported Media Type**. The starter stores whatever the client declared, so the indexer receives formats it cannot embed.',
       match: {
         python: {all: [/ALLOWED_MIME_TYPES/, /status_code\s*=\s*415/]},
         typescript: {all: [/ALLOWED_MIME_TYPES/, /code\(\s*415\s*\)/]},
@@ -86,7 +86,7 @@ re-upload can collide with another's.`,
       id: 'caps',
       title: 'Caps the bytes at 20 MiB and the caption at 4 KiB with 413',
       detail:
-        '`byte_size` is bounded by `20 << 20` and the UTF-8 caption by `4 << 10`, and both refusals are **413**. The draft accepts any size and any caption length.',
+        '`byte_size` is bounded by `20 << 20` and the UTF-8 caption by `4 << 10`, and both refusals are **413**. The starter accepts any size and any caption length.',
       match: {
         python: {all: [/MAX_ASSET_BYTES/, /MAX_CAPTION_BYTES/, /20 << 20/, /4 << 10/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_ASSET_BYTES/, /MAX_CAPTION_BYTES/, /20 << 20/, /4 << 10/, /code\(\s*413\s*\)/]},
@@ -99,7 +99,7 @@ re-upload can collide with another's.`,
       id: 'content-hash',
       title: 'Keys the registration by the content hash',
       detail:
-        '`Idempotency-Key` is required and carries the `sha256:<64 hex>` content hash; the record is stored and looked up under `(tenant, hash)`, so a re-registration returns the original asset id. The draft hashes nothing and stores under the mime type.',
+        '`Idempotency-Key` is required and carries the `sha256:<64 hex>` content hash; the record is stored and looked up under `(tenant, hash)`, so a re-registration returns the original asset id. The starter hashes nothing and stores under the mime type.',
       match: {
         python: {all: [/sha256/, /Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/sha256/, /idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -124,7 +124,7 @@ re-upload can collide with another's.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/assets: registers asset metadata. A model-generated draft."""
+      starter: `"""POST /v1/assets: registers asset metadata. The starter."""
 
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
@@ -154,7 +154,7 @@ store = AssetStore()
 
 @app.post("/v1/assets")
 def create_asset(body: AssetRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft trusts the client-declared mime, accepts a caption of any length, and keys
+    # TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
     # the registration by the mime type instead of the content hash, so re-uploading the same bytes
     # registers a second asset and a second set of embeddings.
     store.put(tenant, body.mime, {"mime": body.mime, "byte_size": body.byte_size, "caption": body.caption})
@@ -238,7 +238,7 @@ def create_asset(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/assets: registers asset metadata. A model-generated draft. */
+      starter: `/** POST /v1/assets: registers asset metadata. The starter. */
 import Fastify from 'fastify';
 
 import {store} from './asset_store';
@@ -252,7 +252,7 @@ interface AssetBody {
 }
 
 app.post('/v1/assets', async (request, reply) => {
-  // TODO: this draft trusts the client-declared mime, accepts a caption of any length, and keys
+  // TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
   // the registration by the mime type instead of the content hash, so re-uploading the same bytes
   // registers a second asset and a second set of embeddings.
   const tenant = request.headers['x-tenant-id'] as string;
@@ -382,7 +382,7 @@ func createAsset(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts the client-declared mime, accepts a caption of any length, and keys
+	// TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
 	// the registration by the mime type instead of the content hash, so re-uploading the same bytes
 	// registers a second asset and a second set of embeddings.
 	asset := Asset{Mime: body.Mime, ByteSize: body.ByteSize, Caption: body.Caption}
@@ -542,7 +542,7 @@ object AssetApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[AssetRequest]) { body =>
-            // TODO: this draft trusts the client-declared mime, accepts a caption of any length,
+            // TODO: this starter trusts the client-declared mime, accepts a caption of any length,
             // and keys the registration by the mime type instead of the content hash, so a
             // re-upload registers a second asset and a second set of embeddings.
             store.put(tenant, body.mime, body)
@@ -656,7 +656,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft trusts the client-declared mime, accepts a caption of any length, and keys
+    // TODO: this starter trusts the client-declared mime, accepts a caption of any length, and keys
     // the registration by the mime type instead of the content hash, so re-uploading the same
     // bytes registers a second asset and a second set of embeddings.
     const auto mime = body.value("mime", std::string());
@@ -761,7 +761,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing the trust boundary of an upload path. The draft reads fine because the
+  debrief: `The interviewer is testing the trust boundary of an upload path. The starter reads fine because the
 demo uploads one PNG with no caption and never retries; four defects sit underneath. The mime
 allowlist is a security control, not a nicety — SVG and polyglot files are how an "image" becomes a
 script. The two caps are cost controls: a caption is a model input and a byte size is a bill. The

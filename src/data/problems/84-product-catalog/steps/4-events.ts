@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: publish a product and an event
+**Starting point.** The starter is working code: publish a product and an event
 shows up on \`catalog.event\`, so the demo passes. Three production contracts are broken. Find them,
 fix them, and prove the fix.
 
@@ -24,7 +24,7 @@ they commit a version.
   \`version\`, the \`published_version\` and \`changed_fields\` (names). Publishing the draft *content*
   so downstream "can preview" ships unpublished prices into a retained topic.
 - **The snapshot commits before the event is acknowledged.** An event may lag the state it
-  describes; it must never describe a version the catalog has not committed. The draft acks first,
+  describes; it must never describe a version the catalog has not committed. The starter acks first,
   so a crash between the two leaves the storefront synced to a version that does not exist.
 - **The producer is idempotent with \`acks=all\`** (or the stack's equivalent: required acks \`all\`
   plus a stable hash balancer), so a retried produce cannot duplicate a record, and a rejected
@@ -55,7 +55,7 @@ dependency, so the storefront can learn about a version before the catalog has i
       id: 'product-key',
       title: 'Keyed by product id',
       detail:
-        "The message key is the product id (`key=product_id`, `key: productId`, `[]byte(productID)`, `ProducerRecord(topic, productId, …)`), so one product's events land in one partition and stay ordered. The draft keys by category.",
+        "The message key is the product id (`key=product_id`, `key: productId`, `[]byte(productID)`, `ProducerRecord(topic, productId, …)`), so one product's events land in one partition and stay ordered. The starter keys by category.",
       match: {
         python: {all: [/key=product_id/, /catalog\.event/]},
         typescript: {all: [/key:\s*productId\b/, /catalog\.event/]},
@@ -68,7 +68,7 @@ dependency, so the storefront can learn about a version before the catalog has i
       id: 'event-types',
       title: 'Publish, hold and rollback events with version ids',
       detail:
-        'All three lifecycle events are emitted as `catalog.publish`, `catalog.hold` and `catalog.rollback`, carrying the `version` they refer to. The draft forwards whatever `kind` the caller sent.',
+        'All three lifecycle events are emitted as `catalog.publish`, `catalog.hold` and `catalog.rollback`, carrying the `version` they refer to. The starter forwards whatever `kind` the caller sent.',
       match: {
         python: {all: [/catalog\.publish/, /catalog\.hold/, /catalog\.rollback/, /version/]},
         typescript: {all: [/catalog\.publish/, /catalog\.hold/, /catalog\.rollback/, /version/]},
@@ -94,7 +94,7 @@ dependency, so the storefront can learn about a version before the catalog has i
       id: 'commit-before-produce',
       title: 'Commits the snapshot before producing the event',
       detail:
-        'The snapshot commit runs before the produce, so the event can never describe a version the catalog has not committed. The draft acks first and commits afterwards.',
+        'The snapshot commit runs before the produce, so the event can never describe a version the catalog has not committed. The starter acks first and commits afterwards.',
       match: {
         python: {order: [/commit_snapshot\(/, /\.produce\(/]},
         typescript: {order: [/commitSnapshot\(/, /producer\.send\(/]},
@@ -133,8 +133,8 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def record_event(kind: str, product_id: str, category: str, draft: dict) -> dict:
-    # TODO: this draft keys by category, publishes the draft content so downstream can preview,
-    # and acks before the snapshot commits. Review all three.
+    # TODO: this starter keys by category, publishes the draft content so downstream can preview,
+    # and acks before the snapshot commits. Fix all three.
     event = {
         "type": kind,
         "category": category,
@@ -205,7 +205,7 @@ def record_event(
 `,
     },
     typescript: {
-      starter: `/** catalog.event: a model-generated draft that keys by category and ships the draft. */
+      starter: `/** catalog.event: flawed code that keys by category and ships the draft content. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -229,8 +229,8 @@ export async function recordEvent(
   category: string,
   body: CatalogEventBody,
 ): Promise<Record<string, unknown>> {
-  // TODO: this draft keys by category, publishes the draft content so downstream can preview,
-  // and acks before the snapshot commits. Review all three.
+  // TODO: this starter keys by category, publishes the draft content so downstream can preview,
+  // and acks before the snapshot commits. Fix all three.
   const payload = {
     type: kind,
     category,
@@ -314,8 +314,8 @@ import (
 var catalogWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "catalog.event"}
 
 func recordEvent(ctx context.Context, kind, productID, category string, draft map[string]any) (map[string]any, error) {
-	// TODO: this draft keys by category, publishes the draft content so downstream can preview,
-	// and acks before the snapshot commits. Review all three.
+	// TODO: this starter keys by category, publishes the draft content so downstream can preview,
+	// and acks before the snapshot commits. Fix all three.
 	payload := map[string]any{
 		"type":        kind,
 		"category":    category,
@@ -405,8 +405,8 @@ object CatalogEvents {
   val EventTopic = "catalog.event"
   val producer = new KafkaProducer[String, String](new Properties())
 
-  // TODO: this draft keys by category, publishes the draft content so downstream can preview,
-  // and acks before the snapshot commits. Review all three.
+  // TODO: this starter keys by category, publishes the draft content so downstream can preview,
+  // and acks before the snapshot commits. Fix all three.
   def recordEvent(kind: String, productId: String, category: String, draft: Map[String, String]): String = {
     val payload = Map(
       "type" -> kind,
@@ -492,8 +492,8 @@ void initProducer() {
 void commitSnapshot(const std::string& productId, int version);
 
 json recordEvent(const std::string& kind, const std::string& productId, const std::string& category, const json& draft) {
-  // TODO: this draft keys by category, publishes the draft content so downstream can preview,
-  // and acks before the snapshot commits. Review all three.
+  // TODO: this starter keys by category, publishes the draft content so downstream can preview,
+  // and acks before the snapshot commits. Fix all three.
   const json payload = {
       {"type", kind},
       {"category", category},
@@ -574,5 +574,5 @@ json recordEvent(const std::string& kind, const std::string& productId, int vers
     'An event describes state, it does not carry it. Pass the changed field **names** (`changed_fields`) and the version ids; anything else is tenant data in a retained, replicated topic. If downstream needs the content, it reads the published snapshot — that is what the pointer is for.',
     'Order the two writes: commit the snapshot, then produce the event. The other order makes the broker the source of truth for a version the catalog has not committed, so a crash in between leaves the storefront ahead of the catalog. The producer side is configuration: `enable.idempotence` plus `acks=all`, and an outbox row when the broker rejects the produce.',
   ],
-  debrief: `The interviewer is checking the contract between state and its event stream, which generated Kafka code gets wrong in the same three ways every time. First, the key is an ordering contract: partition by product, and a product's publish, hold and rollback arrive in the order they happened. Second, an event is a *description* of a change, not a copy of the data: field names and version ids in, values out — the topic is retained, replicated and read by services that were never meant to see an unpublished price. Third, the dependency direction: commit first, then announce, and make the announce idempotent (idempotent producer, outbox on rejection). Real platforms add a schema registry so a future producer cannot smuggle content in, a consumer group per downstream system, and an ordered replay of outbox rows keyed by product so a broker outage cannot reorder a product's history.`,
+  debrief: `The interviewer is checking the contract between state and its event stream, which Kafka code gets wrong in the same three ways every time. First, the key is an ordering contract: partition by product, and a product's publish, hold and rollback arrive in the order they happened. Second, an event is a *description* of a change, not a copy of the data: field names and version ids in, values out — the topic is retained, replicated and read by services that were never meant to see an unpublished price. Third, the dependency direction: commit first, then announce, and make the announce idempotent (idempotent producer, outbox on rejection). Real platforms add a schema registry so a future producer cannot smuggle content in, a consumer group per downstream system, and an ordered replay of outbox rows keyed by product so a broker outage cannot reorder a product's history.`,
 };

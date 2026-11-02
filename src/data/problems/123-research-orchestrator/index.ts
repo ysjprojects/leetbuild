@@ -20,10 +20,10 @@ export const researchOrchestratorProblem: Problem = {
   id: 'research-orchestrator',
   title: 'Research Orchestrator',
   tagline:
-    'Run a lead agent over parallel subagents with effort budgets, checkpoints, bounded tool calls, literal citations and rainbow deployments — reviewed like production.',
+    'Run a lead agent over parallel subagents with effort budgets, checkpoints, bounded tool calls, literal citations and rainbow deployments.',
   difficulty: 'hard',
   concepts: ['http', 'grpc', 'redis', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 75,
   company: ANTHROPIC,
   sources: [
@@ -119,13 +119,13 @@ One service, **researchd**, with five pieces:
    and commits only afterwards; and a job record pinned to the version that started it so a rainbow
    deployment never moves an in-flight job to new code.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real agent
-system: read the draft against the failure modes the source names — cost, duplicated work, lost
-state, unbounded retries, text that is not a source — fix it, and prove the fix with checks that
-fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real agent system: debug it
+against the failure modes the source names — cost, duplicated work, lost state, unbounded retries,
+text that is not a source — fix it, optimize what is wasteful, and prove the fix with checks that
+fail on the starter and pass on your version.
 
 ## Left out on purpose
 

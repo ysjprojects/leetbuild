@@ -8,7 +8,7 @@ export const refundStateStep: Step = {
   focus: ['api', 'ledger', 'records'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the ledger module: a payment
+**Starting point.** The starter is working code for the ledger module: a payment
 with room gets its refund recorded and the total comes back, so the demo passes. It hides a race, a
 lifetime bug and the wrong key. Find them, fix them, and prove the fix.
 
@@ -31,7 +31,7 @@ Implement the Redis refund ledger that every refund goes through:
   rewrites the key. A crash between the PSP's success and the refund row is repairable only because
   the records, not the cache, are the source of truth.
 
-**Failure mode the checks target.** The draft reads the total with \`GET\`, compares it in the
+**Failure mode the checks target.** The starter reads the total with \`GET\`, compares it in the
 handler and adds with \`INCRBY\`: two concurrent partial refunds both observe the same remaining
 balance and both pass, so a ¥100 payment can refund ¥200. It also keys the ledger under the tenant,
 mixes payments that share a total, sets a 24-hour expiry on a lifetime cap, and has no rebuild path
@@ -98,7 +98,7 @@ at all.`,
       id: 'lifetime-no-ttl',
       title: 'Lifetime cap: the ledger never expires',
       detail:
-        'The ledger is a lifetime total with no `EXPIRE`, no `.expire(...)` and no `SETEX`: an expiring key turns a fully refunded payment back into a refundable one. The draft expires the key after a day.',
+        'The ledger is a lifetime total with no `EXPIRE`, no `.expire(...)` and no `SETEX`: an expiring key turns a fully refunded payment back into a refundable one. The starter expires the key after a day.',
       match: {
         python: {all: [/HINCRBY/], none: [/\bEXPIRE\b/, /\.expire\(/, /SETEX/]},
         typescript: {all: [/HINCRBY/], none: [/\bEXPIRE\b/, /\.expire\(/, /setex/]},
@@ -111,7 +111,7 @@ at all.`,
       id: 'cap-in-script',
       title: 'Refuses above the payment total inside the script',
       detail:
-        'The payment total is passed into the script as the cap and the script returns the refusal itself (`return {0, …}`) when `refunded + amount` does not fit. The draft compares a cached read in the handler and then increments unconditionally.',
+        'The payment total is passed into the script as the cap and the script returns the refusal itself (`return {0, …}`) when `refunded + amount` does not fit. The starter compares a cached read in the handler and then increments unconditionally.',
       match: {
         python: {all: [/cap_minor/, /return \{0/]},
         typescript: {all: [/capMinor/, /return \{0/]},
@@ -124,7 +124,7 @@ at all.`,
       id: 'rebuildable',
       title: 'Rebuilds the ledger from the durable refund records',
       detail:
-        '`rebuild_ledger` (or `rebuildLedger`) sums the durable refund rows with `sum_refunds` and rewrites the ledger key, so the cache can be repaired after a crash between PSP success and the record write. The draft has no rebuild path.',
+        '`rebuild_ledger` (or `rebuildLedger`) sums the durable refund rows with `sum_refunds` and rewrites the ledger key, so the cache can be repaired after a crash between PSP success and the record write. The starter has no rebuild path.',
       match: {
         python: {all: [/rebuild_ledger/, /sum_refunds/]},
         typescript: {all: [/rebuildLedger/, /sumRefunds/]},
@@ -160,7 +160,7 @@ def refunded_total(tenant: str) -> int:
 
 
 def check_and_add_refund(tenant: str, amount_minor: int, paid_minor: int) -> tuple[bool, int, int]:
-    # TODO: this draft reads the total with GET and adds with INCRBY, so two concurrent partial
+    # TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial
     # refunds both pass the same remaining balance; it keys the ledger under the tenant instead of
     # the payment, expires a lifetime cap after a day, and has no rebuild path from the records.
     refunded = refunded_total(tenant)
@@ -224,7 +224,7 @@ def rebuild_ledger(payment_id: str) -> int:
 `,
     },
     typescript: {
-      starter: `/** The refund ledger: a model-generated draft that reads, checks and then adds. */
+      starter: `/** The refund ledger: flawed code that reads, checks and then adds. */
 import {Redis} from 'ioredis';
 
 export const r = new Redis('redis://redis:6379');
@@ -253,7 +253,7 @@ export async function refundedTotal(tenant: string): Promise<number> {
 }
 
 export async function checkAndAddRefund(tenant: string, amountMinor: number, paidMinor: number): Promise<RefundClaim> {
-  // TODO: this draft reads the total with GET and adds with INCRBY, so two concurrent partial
+  // TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial
   // refunds both pass the same remaining balance; it keys the ledger under the tenant instead of
   // the payment, expires a lifetime cap after a day, and has no rebuild path from the records.
   const refunded = await refundedTotal(tenant);
@@ -357,7 +357,7 @@ func refundedTotal(ctx context.Context, tenant string) int64 {
 	return current
 }
 
-// TODO: this draft reads the total with GET and adds with INCRBY, so two concurrent partial refunds
+// TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial refunds
 // both pass the same remaining balance; it keys the ledger under the tenant instead of the payment,
 // expires a lifetime cap after a day, and has no rebuild path from the records.
 func checkAndAddRefund(ctx context.Context, tenant string, amountMinor, paidMinor int64) (bool, int64, int64) {
@@ -456,7 +456,7 @@ object State {
 
   def refundedTotal(tenant: String): Long = Option(jedis.get(ledgerKey(tenant))).map(_.toLong).getOrElse(0L)
 
-  // TODO: this draft reads the total with GET and adds with INCRBY, so two concurrent partial
+  // TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial
   // refunds both pass the same remaining balance; it keys the ledger under the tenant instead of
   // the payment, expires a lifetime cap after a day, and has no rebuild path from the records.
   def checkAndAddRefund(tenant: String, amountMinor: Long, paidMinor: Long): (Boolean, Long, Long) = {
@@ -539,7 +539,7 @@ long long refundedTotal(sw::redis::Redis& redis, const std::string& tenant) {
   return current ? std::stoll(*current) : 0;
 }
 
-// TODO: this draft reads the total with GET and adds with INCRBY, so two concurrent partial refunds
+// TODO: this starter reads the total with GET and adds with INCRBY, so two concurrent partial refunds
 // both pass the same remaining balance; it keys the ledger under the tenant instead of the payment,
 // expires a lifetime cap after a day, and has no rebuild path from the records.
 std::tuple<bool, long long, long long> checkAndAddRefund(

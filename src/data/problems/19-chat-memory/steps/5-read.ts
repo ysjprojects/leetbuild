@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a context comes back and the demo shows a
+The starter is working code: a context comes back and the demo shows a
 conversation. It authorizes nothing, bounds nothing, and serves a stale cache. Find the flaws, fix
 them, and prove the fix.
 
@@ -18,11 +18,11 @@ Implement the context-read endpoint used when a model call or the UI needs the c
   from the request context and the session is authorized like any other read: a foreign session id
   answers **404**, never another tenant's conversation.
 - The assembled context is capped at **6000 tokens**. Drop from the **oldest** end until the budget
-  fits, so the newest turns always survive; the draft loads the whole list and never measures it.
+  fits, so the newest turns always survive; the starter loads the whole list and never measures it.
 - The response carries the **turn ids** the UI cites (\`turn_id\`) alongside the role and content,
-  so a reviewer can point at the exact turn that produced an answer.
+  so a reader can point at the exact turn that produced an answer.
 - The cache key includes the **latest turn id**: \`context:{tenant}:{session}:{latest_turn_id}\`.
-  The draft caches under \`context:{session}\` for 60 seconds, so a read right after an append can
+  The starter caches under \`context:{session}\` for 60 seconds, so a read right after an append can
   return a context without the new turn.
 
 **Failure mode the checks target.** A read after an append must see the new turn, a foreign session
@@ -54,7 +54,7 @@ authorization, the budget and the cache key.`,
       id: 'tenant-ownership',
       title: 'Authorizes the read against the authenticated tenant',
       detail:
-        'The session owner is compared with the request tenant before any key is read, and a foreign session answers `404`. The draft serves any session id in the path.',
+        'The session owner is compared with the request tenant before any key is read, and a foreign session answers `404`. The starter serves any session id in the path.',
       match: {
         python: {all: [/assert_tenant_owns/, /404/]},
         typescript: {all: [/assertTenantOwns/, /404/]},
@@ -67,7 +67,7 @@ authorization, the budget and the cache key.`,
       id: 'token-cap',
       title: 'Caps the assembled context at 6000 tokens',
       detail:
-        'The context budget is a named 6000-token constant and the assembled summary plus turns must fit it. The draft returns everything the list holds.',
+        'The context budget is a named 6000-token constant and the assembled summary plus turns must fit it. The starter returns everything the list holds.',
       match: {
         python: {all: [/MAX_CONTEXT_TOKENS/, /6000/]},
         typescript: {all: [/MAX_CONTEXT_TOKENS/, /6000/]},
@@ -93,7 +93,7 @@ authorization, the budget and the cache key.`,
       id: 'fresh-cache',
       title: 'Invalidates the cache when a new turn lands',
       detail:
-        'The cache key carries the latest turn id, so an append changes the key and the next read misses the stale entry. The draft caches per session and serves the old context for the whole TTL.',
+        'The cache key carries the latest turn id, so an append changes the key and the next read misses the stale entry. The starter caches per session and serves the old context for the whole TTL.',
       match: {
         python: {all: [/latest_turn_id/]},
         typescript: {all: [/latestTurnId/]},
@@ -206,7 +206,7 @@ def read_context(id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/sessions/:id/context: a model-generated draft that caches forever and authorizes nothing. */
+      starter: `/** GET /v1/sessions/:id/context: flawed code that caches forever and authorizes nothing. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

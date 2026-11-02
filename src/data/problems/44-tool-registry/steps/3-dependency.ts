@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['registry', 'sandbox', 'vault', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the sandbox is up it
+**Starting point.** The starter is working code: when the sandbox is up it
 validates the candidate and the promotion goes through, so the demo ships. Every failure path
-promotes anyway. Review it like the service owner, fix it, and prove the fix with the checks below.
+promotes anyway. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement the validation the registry runs on a candidate version before promotion — the work behind
 \`POST /v1/tools/{name}/versions/{version}/validate\`:
@@ -31,7 +31,7 @@ Implement the validation the registry runs on a candidate version before promoti
 - **Promotion happens only after a validation that returned OK**: \`catalog.promote(name, version,
   actor)\` is reached by the OK branch, and by nothing else.
 
-**Failure mode the checks target.** Treating silence as consent is the whole bug: the draft reads a
+**Failure mode the checks target.** Treating silence as consent is the whole bug: the starter reads a
 timeout as "the checks would surely have passed" and promotes, so a wedged sandbox ships a version
 nobody validated. The second is the credential: dialling the sandbox with the production provider
 key puts a live key in the process that runs the candidate's own code. The third is the retry on a
@@ -71,7 +71,7 @@ into a load test against the sandbox.`,
   },
   hints: [
     'The deadline is an argument on the call: `timeout=VALIDATE_DEADLINE_S`, `deadline: Date.now() + VALIDATE_DEADLINE_MS`, `context.WithTimeout(ctx, validateDeadline)`, `withDeadlineAfter(ValidateDeadlineMs, …)`, `ctx.set_deadline(…)`. Wrapping the call in a timer changes nothing.',
-    'Credentials are per hop. Build the sandbox client from the sandbox endpoint and put the sandbox token in the call’s `authorization` metadata; the production credential belongs to the provider call, not to the process that runs candidate code. The draft’s `prod_metadata()` is the leak.',
+    'Credentials are per hop. Build the sandbox client from the sandbox endpoint and put the sandbox token in the call’s `authorization` metadata; the production credential belongs to the provider call, not to the process that runs candidate code. The starter’s `prod_metadata()` is the leak.',
     'Sort the failure before you react to it. A transport failure (`DEADLINE_EXCEEDED` / `UNAVAILABLE`) leaves the active version alone and records the rejection with its reason; `INVALID_ARGUMENT` is a verdict on the version, so record it and stop. Check `verdicts.get(name, version)` before you call the sandbox, and let only the OK branch reach `catalog.promote(...)`.',
   ],
   checks: [
@@ -104,7 +104,7 @@ into a load test against the sandbox.`,
       id: 'fail-closed',
       title: 'A timeout keeps the active version and records the reason',
       detail:
-        'The error branch records a rejection with its reason and returns, so `catalog.promote` is unreachable from it and the previously active version stays active. The draft promotes in the `except` / `catch` / `err != nil` branch: a timeout became a release.',
+        'The error branch records a rejection with its reason and returns, so `catalog.promote` is unreachable from it and the previously active version stays active. The starter promotes in the `except` / `catch` / `err != nil` branch: a timeout became a release.',
       match: {
         python: {
           all: [/except\s+grpc\.[\w.]*RpcError/, /verdicts\.record\(/, /reason/],
@@ -132,7 +132,7 @@ into a load test against the sandbox.`,
       id: 'credentials',
       title: 'The sandbox is dialled with its own scoped credential',
       detail:
-        'The sandbox client is built from the sandbox endpoint and carries the sandbox token (`SANDBOX_TOKEN` / `SandboxToken`) as `authorization` metadata; the production provider credential never appears on this path. The draft dials the sandbox with the key the production provider call uses.',
+        'The sandbox client is built from the sandbox endpoint and carries the sandbox token (`SANDBOX_TOKEN` / `SandboxToken`) as `authorization` metadata; the production provider credential never appears on this path. The starter dials the sandbox with the key the production provider call uses.',
       match: {
         python: {all: [/SANDBOX_[A-Z_]+/, /metadata\s*=/, /\.Validate\(/], none: [/provider_?api_?key/i]},
         typescript: {
@@ -154,7 +154,7 @@ into a load test against the sandbox.`,
       id: 'terminal',
       title: 'A schema rejection is terminal for that version',
       detail:
-        '`INVALID_ARGUMENT` is a verdict on the version: it is recorded and returned, and a re-request for the same version is answered from `verdicts.get(name, version)` instead of calling the sandbox again. The draft retries the rejection in a loop until the checks pass.',
+        '`INVALID_ARGUMENT` is a verdict on the version: it is recorded and returned, and a re-request for the same version is answered from `verdicts.get(name, version)` instead of calling the sandbox again. The starter retries the rejection in a loop until the checks pass.',
       match: {
         python: {
           all: [/StatusCode\.INVALID_ARGUMENT/, /verdicts\.get\(/, /reject/i],
@@ -182,7 +182,7 @@ into a load test against the sandbox.`,
       id: 'promote',
       title: 'Promotion happens only after a validation that returned OK',
       detail:
-        'The sandbox call comes first, its reply is checked for `ok`, and `catalog.promote(name, version, …)` is reached only by that branch. The draft promotes whatever the sandbox answered — including nothing at all.',
+        'The sandbox call comes first, its reply is checked for `ok`, and `catalog.promote(name, version, …)` is reached only by that branch. The starter promotes whatever the sandbox answered — including nothing at all.',
       match: {
         python: {
           all: [/catalog\.promote\(\s*name\s*,\s*version/],
@@ -209,7 +209,7 @@ into a load test against the sandbox.`,
   ],
   code: {
     python: {
-      starter: `"""Sandbox validation for a candidate tool version: a generated first pass."""
+      starter: `"""Sandbox validation for a candidate tool version: flawed code that promotes on silence."""
 import os
 
 import grpc
@@ -333,7 +333,7 @@ async def validate_candidate(name: str, version: str, actor: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Sandbox validation for a candidate tool version: a generated first pass. */
+      starter: `/** Sandbox validation for a candidate tool version: flawed code that promotes on silence. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

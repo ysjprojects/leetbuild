@@ -8,17 +8,17 @@ export const readStep: Step = {
   focus: ['client', 'meter', 'redis', 'limiter'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a spend number comes back and the dashboard shows
+The starter is working code: a spend number comes back and the dashboard shows
 it. It authorizes nothing, it reads a table that trails reality, and it rounds every request away.
 Find the flaws, fix them, and prove the fix.
 
 Implement \`GET /v1/tenants/{tenant}/spend\`, the read engineering and finance both quote:
 
 - The caller is authenticated by \`X-Tenant-Id\` and may only read **its own** tenant: a request for
-  another tenant's spend is **403**. The draft serves whatever tenant the path names, so any caller
+  another tenant's spend is **403**. The starter serves whatever tenant the path names, so any caller
   can read any ledger.
 - The number is reconstructed from the **same Redis counters the limiter enforces** —
-  \`meter:{tenant}:{bucket}\`, the current window's \`input_tokens\` and \`output_tokens\`. The draft
+  \`meter:{tenant}:{bucket}\`, the current window's \`input_tokens\` and \`output_tokens\`. The starter
   sums an analytics table that trails by minutes, so the spend it shows and the budget the platform
   blocks on can differ by exactly the traffic that matters.
 - The response carries the window, the tokens, \`spend_micros\`, \`spend_usd\`, the tenant's
@@ -26,7 +26,7 @@ Implement \`GET /v1/tenants/{tenant}/spend\`, the read engineering and finance b
   under. The version comes from server config (\`STATEMENT_VERSION\`), not from the request and not
   from a literal typed into the handler.
 - Costs stay **integer micro-dollars** all the way to the statement, and rounding to cents happens
-  **once, on the total**: \`round(spend_micros / MICROS_PER_USD, 2)\`. The draft rounds each row to
+  **once, on the total**: \`round(spend_micros / MICROS_PER_USD, 2)\`. The starter rounds each row to
   four decimals, so a thousand requests that each cost 0.00004 bill as a thousand zeroes.
 - A tenant that is over budget reports \`remaining_micros = 0\` rather than a negative remainder —
   the limiter is already refusing requests, and the read should say the same thing.
@@ -53,7 +53,7 @@ zero.`,
       id: 'tenant-403',
       title: 'Refuses a cross-tenant read',
       detail:
-        'The authenticated `X-Tenant-Id` must match the tenant in the path; a mismatch is **403**. The draft serves any tenant id it is handed, so one customer can read another’s spend.',
+        'The authenticated `X-Tenant-Id` must match the tenant in the path; a mismatch is **403**. The starter serves any tenant id it is handed, so one customer can read another’s spend.',
       match: {
         python: {all: [/X-Tenant-Id/, /403/]},
         typescript: {all: [/x-tenant-id/, /403/]},
@@ -66,7 +66,7 @@ zero.`,
       id: 'counter-source',
       title: 'Reads the counters the limiter enforces',
       detail:
-        'Spend is reconstructed from `meter:{tenant}:{bucket}` in Redis — the same hash the budget limiter checks. The draft sums an analytics table that trails by minutes, so the number it reports is not the number that was enforced.',
+        'Spend is reconstructed from `meter:{tenant}:{bucket}` in Redis — the same hash the budget limiter checks. The starter sums an analytics table that trails by minutes, so the number it reports is not the number that was enforced.',
       match: {
         python: {all: [/meter:/, /hmget\(|hgetall\(/]},
         typescript: {all: [/meter:/, /hmget\(/]},
@@ -79,7 +79,7 @@ zero.`,
       id: 'remaining-budget',
       title: 'Reports the remaining budget the limiter compares',
       detail:
-        'The response carries the tenant’s budget and what is left of it, so the number on the dashboard is the one a request is refused against. The draft reports no budget at all, leaving the caller to guess why a call started failing.',
+        'The response carries the tenant’s budget and what is left of it, so the number on the dashboard is the one a request is refused against. The starter reports no budget at all, leaving the caller to guess why a call started failing.',
       match: {
         python: {all: [/BUDGET_MICROS/, /remaining/]},
         typescript: {all: [/BUDGET_MICROS/, /remaining/]},
@@ -105,7 +105,7 @@ zero.`,
       id: 'statement-rounding',
       title: 'Rounds once, at statement level',
       detail:
-        'Per-request costs stay integer micro-dollars and the only rounding is on the statement total. The draft rounds each analytics row to four decimals, so a thousand requests that each cost a fraction of a cent are billed as zero.',
+        'Per-request costs stay integer micro-dollars and the only rounding is on the statement total. The starter rounds each analytics row to four decimals, so a thousand requests that each cost a fraction of a cent are billed as zero.',
       match: {
         python: {all: [/spend_micros/, /round\(/], none: [/round\(\s*row\[/]},
         typescript: {all: [/spend_micros/, /Math\.round\(|toFixed\(/], none: [/Math\.round\(row\./]},
@@ -189,7 +189,7 @@ def read_spend(tenant: str, caller: str | None = Header(default=None, alias="X-T
 `,
     },
     typescript: {
-      starter: `/** GET /v1/tenants/{t}/spend: a model-generated draft that trusts the path and rounds per row. */
+      starter: `/** GET /v1/tenants/{t}/spend: flawed code that trusts the path and rounds per row. */
 import Fastify from 'fastify';
 
 export const app = Fastify();

@@ -8,21 +8,21 @@ export const stateStep: Step = {
   focus: ['harness', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a sample is scored and the counter moves, so the
+The starter is working code: a sample is scored and the counter moves, so the
 demo shows progress on the dashboard. It races under load, it counts redeliveries, and it leaks keys
 forever. Find the flaws, fix them, and prove the fix.
 
 Implement \`record_sample\`, the call every worker makes when one sample finishes:
 
 - The run's progress lives in **one Redis hash per run**: \`evals:run:{run_id}\`, with the fields
-  \`scored\`, \`passed\` and \`failed\`. The draft reads and writes the fields as separate client calls,
+  \`scored\`, \`passed\` and \`failed\`. The starter reads and writes the fields as separate client calls,
   so two samples that land together can overwrite each other's \`GET\`.
 - A sample is identified by \`(run_id, sample_id)\` and gets its **own dedupe key**:
   \`sample:{run_id}:{sample_id}\`. A redelivered Kafka message must not score twice.
 - The dedupe flag, the \`scored\` increment and the \`passed\`/\`failed\` increment happen in **one
   atomic Lua \`EVAL\`**: \`SET … NX\` first, and only when the key was actually created do the
   increments run. A worker that decides "already seen" from a client-side read is exactly the race
-  the draft has.
+  the starter has.
 - Both keys **expire with the run**: \`EXPIRE\` from the same script, \`RUN_TTL_S = 86_400\`
   seconds. Counters without a TTL outlive the run record and the release they belonged to.
 - Return the counters the caller reads: \`{applied, scored, passed, failed}\`, where \`applied\` is
@@ -54,7 +54,7 @@ one that keeps every finished run's keys alive for months.`,
       id: 'atomic-script',
       title: 'Moves the counters with one atomic script',
       detail:
-        'The dedupe and both increments happen inside one `EVAL`/`NewScript` call. The draft reads the fields with `GET` and writes them back, so two concurrent samples both observe the same value and one increment is lost.',
+        'The dedupe and both increments happen inside one `EVAL`/`NewScript` call. The starter reads the fields with `GET` and writes them back, so two concurrent samples both observe the same value and one increment is lost.',
       match: {
         python: {all: [/COUNTERS_LUA/, /\.eval\(/, /HINCRBY/]},
         typescript: {all: [/COUNTERS_LUA/, /\.eval\(/, /HINCRBY/]},
@@ -67,7 +67,7 @@ one that keeps every finished run's keys alive for months.`,
       id: 'dedupe-nx',
       title: 'Dedupes a redelivered sample under its own key',
       detail:
-        'A per-sample key `sample:{run_id}:{sample_id}` is claimed with `SET … NX` inside the script, so an at-least-once redelivery leaves the counters unchanged. The draft has no per-sample key at all and counts the replay.',
+        'A per-sample key `sample:{run_id}:{sample_id}` is claimed with `SET … NX` inside the script, so an at-least-once redelivery leaves the counters unchanged. The starter has no per-sample key at all and counts the replay.',
       match: {
         python: {all: [/SET/, /'NX'/, /sample:/]},
         typescript: {all: [/SET/, /'NX'/, /sample:/]},
@@ -80,7 +80,7 @@ one that keeps every finished run's keys alive for months.`,
       id: 'counter-ttl',
       title: 'Expires the counters with the run',
       detail:
-        'The script sets `EXPIRE` from `RUN_TTL_S`, so a finished run’s counters and dedupe flags disappear instead of accumulating forever. The draft sets no TTL on any key.',
+        'The script sets `EXPIRE` from `RUN_TTL_S`, so a finished run’s counters and dedupe flags disappear instead of accumulating forever. The starter sets no TTL on any key.',
       match: {
         python: {all: [/RUN_TTL_S/, /EXPIRE/]},
         typescript: {all: [/RUN_TTL_S/, /EXPIRE/]},
@@ -204,7 +204,7 @@ def record_sample(result: SampleResult) -> dict:
 `,
     },
     typescript: {
-      starter: `/** recordSample: a model-generated draft that reads, then writes, one counter at a time. */
+      starter: `/** recordSample: flawed code that reads, then writes, one counter at a time. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');

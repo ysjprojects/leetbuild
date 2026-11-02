@@ -8,8 +8,8 @@ export const hybridRetrieveStep: Step = {
   focus: ['client', 'api', 'redis', 'embed'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it compiles and passes the
-happy path, so a quick demo makes it look done. Review it like the service owner. Find the subtle
+**Starting point.** The starter is working code: it compiles and passes the
+happy path, so a quick demo makes it look done. Debug it like the service owner. Find the subtle
 flaw, fix it, and prove the fix with the checks below.
 
 Implement \`retrieve(tenant, query, k)\`. It returns \`{"chunks": [...], "citations": [...]}\` for the
@@ -26,7 +26,7 @@ answer step.
 - Cache the final result under \`rag:q:{tenant}:{sha256(query)}\` for **60 seconds**. A cache key
   without the tenant is a cross-tenant leak even when the retrieval logic is scoped.
 
-**Failure mode the checks target.** The draft searches a global lexical set and a global vector
+**Failure mode the checks target.** The starter searches a global lexical set and a global vector
 index, then returns the model's chunk ids with no offsets. The demo passes because there is one
 tenant and one document; the second tenant gets the first tenant's data.
 
@@ -73,7 +73,7 @@ tenant and one document; the second tenant gets the first tenant's data.
       id: 'k-cap',
       title: 'Caps k at 20',
       detail:
-        'Compute `min(k, 20)`; a caller asking for 500 must get at most 20 candidates. The draft forwards the caller value.',
+        'Compute `min(k, 20)`; a caller asking for 500 must get at most 20 candidates. The starter forwards the caller value.',
       match: {
         python: {all: [/(min\(k|k\s*=\s*min|math\.min|std::min)/, /MAX_K|\b20\b/]},
         typescript: {
@@ -225,7 +225,7 @@ def retrieve(tenant: str, query: str, k: int = 10) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Hybrid retrieval: a model-generated draft that concatenates a global lexical list and vector hits. */
+      starter: `/** Hybrid retrieval: flawed code that concatenates a global lexical list and vector hits. */
 import {createHash} from 'node:crypto';
 
 import Redis from 'ioredis';
@@ -696,5 +696,5 @@ std::string retrieve(const std::string& tenant, const std::string& query, int k)
     'Filter the vector hits by `tenant` before you build the ranking. Then rank both lists from 1 and add `1/(60+rank)` into a map keyed by chunk id.',
     'Build citations from the stored chunk metadata, not from the model. `start` and `end` come from the chunk row; the answer step will re-check every quote against that span.',
   ],
-  debrief: `The interviewer is testing whether you review AI-adjacent retrieval as a multi-tenant data path, not as a similarity demo. The draft’s flaw is not the missing RRF; it is the global index and the tenant-less cache key, which turn a correctness bug into a data leak. The second signal is citation geometry: returning chunk ids alone pushes the verification problem into the answer step, where a model can invent a source. RRF is deliberate because the two retrievers have incomparable scores; rank-based fusion needs no calibration and rewards chunks both retrievers agree on. Real systems add a per-tenant allowlist at the index layer, filter inside the vector query rather than after it, version the cache by index generation, and log which retriever contributed each citation for offline recall analysis.`,
+  debrief: `The interviewer is testing whether you treat retrieval as a multi-tenant data path, not as a similarity demo. The starter’s flaw is not the missing RRF; it is the global index and the tenant-less cache key, which turn a correctness bug into a data leak. The second signal is citation geometry: returning chunk ids alone pushes the verification problem into the answer step, where a model can invent a source. RRF is deliberate because the two retrievers have incomparable scores; rank-based fusion needs no calibration and rewards chunks both retrievers agree on. Real systems add a per-tenant allowlist at the index layer, filter inside the vector query rather than after it, version the cache by index generation, and log which retriever contributed each citation for offline recall analysis.`,
 };

@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: parts register and the happy path counts them, so
+The starter is working code: parts register and the happy path counts them, so
 the demo passes. The manifest hides three defects — a double count, a missing range check and a leak.
 Find them, fix them, and prove the fix.
 
@@ -22,7 +22,7 @@ Implement the part manifest in Redis. Each part registers its number, size and c
   the hash and add \`size\` to the byte counter. A list append registers a re-sent part twice and
   the completed manifest double-counts bytes.
 - The manifest, its parts and its byte counter must expire after **24 hours** (\`86400\` seconds),
-  set inside the same script. The draft's key never expires, so an abandoned upload's parts pin
+  set inside the same script. The starter's key never expires, so an abandoned upload's parts pin
   memory forever.
 - Registration is keyed by \`part_number\`, so the manifest has at most \`part_count\` entries and
   \`bytes\` is the sum of the unique part sizes.
@@ -52,7 +52,7 @@ parts in Redis until someone deletes them by hand.`,
       id: 'atomic-register',
       title: 'Registers with one atomic Lua script',
       detail:
-        'The parts hash and the byte counter are updated in a single `EVAL`/`NewScript` call, so two concurrent registrations cannot both observe the same part as new. The draft runs `RPUSH` as a bare command.',
+        'The parts hash and the byte counter are updated in a single `EVAL`/`NewScript` call, so two concurrent registrations cannot both observe the same part as new. The starter runs `RPUSH` as a bare command.',
       match: {
         python: {all: [/REGISTER_PART_SCRIPT/, /\.eval\(/]},
         typescript: {all: [/REGISTER_PART_SCRIPT/, /\.eval\(/]},
@@ -65,7 +65,7 @@ parts in Redis until someone deletes them by hand.`,
       id: 'idempotent-part',
       title: 'A re-sent part registers once',
       detail:
-        'A part already in the hash returns `0` without touching the byte counter; the guard is `HEXISTS` before `HSET`, keyed by `part_number`. The draft appends to a list, so a retried part registers twice.',
+        'A part already in the hash returns `0` without touching the byte counter; the guard is `HEXISTS` before `HSET`, keyed by `part_number`. The starter appends to a list, so a retried part registers twice.',
       match: {
         python: {all: [/HEXISTS/, /HSET/]},
         typescript: {all: [/HEXISTS/, /HSET/]},
@@ -78,7 +78,7 @@ parts in Redis until someone deletes them by hand.`,
       id: 'part-range',
       title: 'Rejects a part number outside 1..part_count',
       detail:
-        'The script rejects `part_number < 1 or part_number > part_count` before writing anything. The draft accepts any number, so a client bug writes entries the object store will never have.',
+        'The script rejects `part_number < 1 or part_number > part_count` before writing anything. The starter accepts any number, so a client bug writes entries the object store will never have.',
       match: {
         python: {all: [/part_number/, /part_count/, /out of range|> part_count/]},
         typescript: {all: [/partNumber/, /partCount/, /out of range|> partCount/]},
@@ -91,7 +91,7 @@ parts in Redis until someone deletes them by hand.`,
       id: 'ttl',
       title: 'Abandoned sessions expire after 24 hours',
       detail:
-        '`EXPIRE` runs inside the registration script with a 24-hour TTL, so an abandoned upload releases its manifest, parts and byte counter. The draft sets no expiry at all.',
+        '`EXPIRE` runs inside the registration script with a 24-hour TTL, so an abandoned upload releases its manifest, parts and byte counter. The starter sets no expiry at all.',
       match: {
         python: {all: [/EXPIRE/, /MANIFEST_TTL_S/]},
         typescript: {all: [/EXPIRE/, /MANIFEST_TTL_S/]},
@@ -104,7 +104,7 @@ parts in Redis until someone deletes them by hand.`,
       id: 'byte-accounting',
       title: 'Counts bytes from unique parts only',
       detail:
-        'A dedicated byte counter is incremented only when a part is new, so `bytes` equals the sum of unique part sizes. The draft’s list makes the completed manifest double-count a re-sent part.',
+        'A dedicated byte counter is incremented only when a part is new, so `bytes` equals the sum of unique part sizes. The starter’s list makes the completed manifest double-count a re-sent part.',
       match: {
         python: {all: [/INCRBY/, /:bytes/]},
         typescript: {all: [/INCRBY/, /:bytes/]},
@@ -122,7 +122,7 @@ redis_client = redis.Redis()
 
 
 def register_part(upload_id: str, part_number: int, size: int, checksum: str) -> None:
-    # TODO: this draft appends parts to a list as they arrive, so a re-sent part registers twice
+    # TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
     # and the completed manifest double-counts bytes; the manifest key never expires either.
     key = f"upload:{{upload_id}}:parts"
     redis_client.rpush(key, f"{part_number}:{size}:{checksum}")
@@ -164,7 +164,7 @@ def register_part(upload_id: str, part_number: int, part_count: int, size: int, 
 `,
     },
     typescript: {
-      starter: `/** Part manifest: a model-generated draft that appends to a Redis list. */
+      starter: `/** Part manifest: flawed code that appends to a Redis list. */
 import Redis from 'ioredis';
 
 const redis = new Redis();
@@ -175,7 +175,7 @@ export async function registerPart(
   size: number,
   checksum: string,
 ): Promise<void> {
-  // TODO: this draft appends parts to a list as they arrive, so a re-sent part registers twice
+  // TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
   // and the completed manifest double-counts bytes; the manifest key never expires either.
   const key = \`upload:\${uploadId}:parts\`;
   await redis.rpush(key, \`\${partNumber}:\${size}:\${checksum}\`);
@@ -243,7 +243,7 @@ import (
 var rdb = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
 func RegisterPart(ctx context.Context, uploadID string, partNumber int, size int64, checksum string) error {
-	// TODO: this draft appends parts to a list as they arrive, so a re-sent part registers twice
+	// TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
 	// and the completed manifest double-counts bytes; the manifest key never expires either.
 	key := fmt.Sprintf("upload:%s:parts", uploadID)
 	return rdb.RPush(ctx, key, fmt.Sprintf("%d:%d:%s", partNumber, size, checksum)).Err()
@@ -301,7 +301,7 @@ import redis.clients.jedis.Jedis
 
 object PartManifest {
   def registerPart(jedis: Jedis, uploadId: String, partNumber: Long, size: Long, checksum: String): Unit = {
-    // TODO: this draft appends parts to a list as they arrive, so a re-sent part registers twice
+    // TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
     // and the completed manifest double-counts bytes; the manifest key never expires either.
     val key = s"upload:$uploadId:parts"
     jedis.rpush(key, s"$partNumber:$size:$checksum")
@@ -366,7 +366,7 @@ bool RegisterPart(
     long long partNumber,
     long long size,
     const std::string& checksum) {
-  // TODO: this draft appends parts to a list as they arrive, so a re-sent part registers twice
+  // TODO: this starter appends parts to a list as they arrive, so a re-sent part registers twice
   // and the completed manifest double-counts bytes; the manifest key never expires either.
   const auto key = "upload:" + uploadId + ":parts";
   redis.rpush(key, std::to_string(partNumber) + ":" + std::to_string(size) + ":" + checksum);
@@ -420,5 +420,5 @@ bool RegisterPart(
 `,
     },
   },
-  debrief: `The manifest is the single source of truth for what has actually arrived, so it must be written exactly once per part and never grow without bound. The draft's \`RPUSH\` looks harmless — a list is a natural place for parts — but a list cannot deduplicate, so a client that retries a part after a timeout inflates the byte count and the manifest disagrees with the object store. The range guard catches client bugs at the edge instead of storing entries the object store will never have. And the 24-hour TTL is what keeps an abandoned upload from pinning memory: without it, the parts hash of a client that gave up lives until an operator deletes it. Production manifests also keep the object store's ETag beside the checksum and a per-part \`stored_at\`, so finalize can reconcile against the store rather than trusting the client's list.`,
+  debrief: `The manifest is the single source of truth for what has actually arrived, so it must be written exactly once per part and never grow without bound. The starter's \`RPUSH\` looks harmless — a list is a natural place for parts — but a list cannot deduplicate, so a client that retries a part after a timeout inflates the byte count and the manifest disagrees with the object store. The range guard catches client bugs at the edge instead of storing entries the object store will never have. And the 24-hour TTL is what keeps an abandoned upload from pinning memory: without it, the parts hash of a client that gave up lives until an operator deletes it. Production manifests also keep the object store's ETag beside the checksum and a per-part \`stored_at\`, so finalize can reconcile against the store rather than trusting the client's list.`,
 };

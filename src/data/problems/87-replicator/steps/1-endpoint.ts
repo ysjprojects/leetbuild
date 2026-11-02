@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers both routes,
+**Starting point.** The starter is working code: it registers both routes,
 parses the body and returns a replication row. It compiles, it serves the demo, and it hides four
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/replications\` and \`PATCH /v1/replications/{id}\` with body
 \`{"source_region": "…", "target_region": "…", "shards": [0, 1], "conflict_policy": "…"}\`.
@@ -34,7 +34,7 @@ Implement \`POST /v1/replications\` and \`PATCH /v1/replications/{id}\` with bod
 - The response is the stored replication: id, owner, both regions, the shard set and the frozen
   policy. A replication the caller does not own is **404**.
 
-**Failure mode the checks target.** The draft accepts any pair of regions, so a typo or a malicious
+**Failure mode the checks target.** The starter accepts any pair of regions, so a typo or a malicious
 caller starts copying data into a region nobody approved. It defaults an absent policy to
 \`last-write-wins\` on raw timestamps without ever measuring skew, which silently reorders writes
 whenever one region's clock drifts past the bound. And its \`PATCH\` handler overwrites the policy
@@ -80,7 +80,7 @@ wrong forever, and no later read can tell which regions applied which policy.`,
       id: 'approved-regions',
       title: 'Only an approved ordered region pair starts a replication',
       detail:
-        'The pair `(source_region, target_region)` is checked against the approved allowlist and an unapproved pair is **400**. The draft replicates anywhere the caller points it.',
+        'The pair `(source_region, target_region)` is checked against the approved allowlist and an unapproved pair is **400**. The starter replicates anywhere the caller points it.',
       match: {
         python: {all: [/APPROVED_REGION_PAIRS/, /status_code\s*=\s*400/]},
         typescript: {all: [/APPROVED_REGION_PAIRS/, /code\(\s*400\s*\)/]},
@@ -93,7 +93,7 @@ wrong forever, and no later read can tell which regions applied which policy.`,
       id: 'conflict-policy',
       title: 'The conflict policy is required and comes from the documented set',
       detail:
-        '`conflict_policy` is validated against the documented set (`source-wins`, `version-vector`, `manual`, `last-write-wins`) and a missing or unknown policy is **400** — the draft defaults it to `last-write-wins`.',
+        '`conflict_policy` is validated against the documented set (`source-wins`, `version-vector`, `manual`, `last-write-wins`) and a missing or unknown policy is **400** — the starter defaults it to `last-write-wins`.',
       match: {
         python: {all: [/CONFLICT_POLICIES/, /"manual"/], none: [/or\s*"last-write-wins"/]},
         typescript: {all: [/CONFLICT_POLICIES/, /'manual'/], none: [/\?\?\s*'last-write-wins'/]},
@@ -109,7 +109,7 @@ wrong forever, and no later read can tell which regions applied which policy.`,
       id: 'policy-immutable',
       title: 'The conflict policy is frozen once the replication starts',
       detail:
-        '`PATCH` compares the requested policy with the frozen one and answers **409** `immutable` instead of overwriting it. The draft rewrites the policy mid-replication.',
+        '`PATCH` compares the requested policy with the frozen one and answers **409** `immutable` instead of overwriting it. The starter rewrites the policy mid-replication.',
       match: {
         python: {
           all: [/status_code\s*=\s*409/, /immutable/],
@@ -167,7 +167,7 @@ store = ReplicationStore()
 
 @app.post("/v1/replications", status_code=201)
 def create_replication(body: ReplicationRequest, x_operator_id: str | None = Header(default=None)):
-    # TODO: the draft accepts any region pair, defaults an absent conflict_policy to
+    # TODO: the starter accepts any region pair, defaults an absent conflict_policy to
     # "last-write-wins" on raw wall-clock timestamps without measuring the clock skew between the
     # two regions, never bounds the shard set, and the PATCH handler below overwrites the policy of
     # a replication that is already running.
@@ -334,7 +334,7 @@ app.post('/v1/replications', async (request, reply) => {
   const operator = request.headers['x-operator-id'];
   if (typeof operator !== 'string' || operator === '') return reply.code(401).send({error: 'missing X-Operator-Id'});
   const body = request.body as ReplicationBody;
-  // TODO: the draft accepts any region pair, defaults an absent conflict_policy to
+  // TODO: the starter accepts any region pair, defaults an absent conflict_policy to
   // 'last-write-wins' without measuring the clock skew between the two regions, never bounds the
   // shard set, and the PATCH handler below overwrites the policy of a running replication.
   const replication: Replication = {
@@ -511,7 +511,7 @@ func createReplication(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: the draft accepts any region pair, defaults an absent conflict_policy to
+	// TODO: the starter accepts any region pair, defaults an absent conflict_policy to
 	// "last-write-wins" without measuring the clock skew between the two regions, never bounds the
 	// shard set, and updateReplication below overwrites the policy of a running replication.
 	policy := body.ConflictPolicy
@@ -732,7 +732,7 @@ object ReplicationApi {
       post {
         headerValueByName("X-Operator-Id") { operator =>
           entity(as[ReplicationRequest]) { body =>
-            // TODO: the draft accepts any region pair, defaults an absent conflict_policy to
+            // TODO: the starter accepts any region pair, defaults an absent conflict_policy to
             // "last-write-wins" without measuring the clock skew between the two regions, never
             // bounds the shard set, and the patch route below overwrites the policy of a
             // replication that is already running.
@@ -893,7 +893,7 @@ int main() {
       return;
     }
     json body = json::parse(req.body, nullptr, false);
-    // TODO: the draft accepts any region pair, defaults an absent conflict_policy to
+    // TODO: the starter accepts any region pair, defaults an absent conflict_policy to
     // "last-write-wins" without measuring the clock skew between the two regions, never bounds the
     // shard set, and the PATCH handler below overwrites the policy of a running replication.
     const json replication = {
@@ -1049,5 +1049,5 @@ int main() {
     'The skew probe belongs inside the policy branch, not in the happy path: `last-write-wins` is the only policy that reads a wall clock, so it is the only one whose soundness depends on the two regions agreeing within `SKEW_BOUND_MS`.',
     'Policy immutability is a comparison, not a delete: store the policy at create time, and let the update path answer **409** when the requested value differs. A `PUT`-style overwrite is what makes the two regions permanently disagree about what the ordering rule was.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a data-copying service. The draft reads fine because the demo starts one replication between two regions the operator happens to own. Four defects are being checked: the approved-pair allowlist (a replication is a data-movement permission, not a destination string), a required policy from a documented set (no silent server default), the skew gate that makes wall-clock ordering defensible, and immutability of the policy once the target has merged rows under it. The immutability check is the one candidates miss: they fix validation and leave the update handler overwriting the rule that the already-applied rows were merged with, which no later read can detect. Real platforms add a policy version recorded on every applied batch, a region catalogue with health, and an audit trail for who started and who stopped a replication.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a data-copying service. The starter reads fine because the demo starts one replication between two regions the operator happens to own. Four defects are being checked: the approved-pair allowlist (a replication is a data-movement permission, not a destination string), a required policy from a documented set (no silent server default), the skew gate that makes wall-clock ordering defensible, and immutability of the policy once the target has merged rows under it. The immutability check is the one candidates miss: they fix validation and leave the update handler overwriting the rule that the already-applied rows were merged with, which no later read can detect. Real platforms add a policy version recorded on every applied batch, a region catalogue with health, and an audit trail for who started and who stopped a replication.`,
 };

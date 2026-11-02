@@ -1,15 +1,23 @@
 /**
  * The problem list's track tabs, search, filters and sort, as pure functions over a `ListQuery` —
- * the same shape the landing page keeps in its URL (`/?track=ai&q=redis&difficulty=hard&sort=points`),
+ * the same shape the landing page keeps in its URL (`/?track=dllm&q=redis&difficulty=hard&sort=points`),
  * so a filtered view is a link. Rows keep their catalogue number whatever the order on screen.
  */
 import {type StepAttempt, problemScore, STEP_POINTS} from './scoring';
-import {type Difficulty, type Problem, type Track, CONCEPT_LABEL, DIFFICULTIES} from './types';
+import {
+  type Difficulty,
+  type Problem,
+  type ProblemTag,
+  type Track,
+  CONCEPT_LABEL,
+  DIFFICULTIES,
+  TAG_LABEL,
+} from './types';
 
 export type StatusFilter = 'all' | 'open' | 'started' | 'solved';
 export type SortKey = 'order' | 'difficulty' | 'points' | 'minutes' | 'progress' | 'title';
-/** The tabs above the list, LeetCode-style: every course, the classic systems track, or the AI-era track. */
-export type TrackFilter = 'all' | 'systems' | 'ai' | 'dllm';
+/** The tabs above the list, LeetCode-style: every course, the systems track, or the deep-learning track. */
+export type TrackFilter = 'all' | 'systems' | 'dllm';
 
 export interface ListQuery {
   /** Which track the list shows; a view rather than a filter, so `reset` and "clear" leave it alone. */
@@ -20,6 +28,8 @@ export interface ListQuery {
   status: StatusFilter;
   /** Only company-tagged courses. */
   company: boolean;
+  /** Only courses carrying this tag (`ai-systems`). */
+  tag: ProblemTag | 'all';
   sort: SortKey;
   /** Reverse the sort's natural direction. */
   desc: boolean;
@@ -31,11 +41,12 @@ export const DEFAULT_LIST_QUERY: ListQuery = {
   difficulty: 'all',
   status: 'all',
   company: false,
+  tag: 'all',
   sort: 'order',
   desc: false,
 };
 
-export const TRACK_LABEL: Record<Track, string> = {systems: 'Systems', ai: 'AI Era', dllm: 'DL/LM'};
+export const TRACK_LABEL: Record<Track, string> = {systems: 'Systems', dllm: 'DL/LM'};
 
 /** What a short label stands for, shown when the pointer rests on it. */
 export const TRACK_HINT: Partial<Record<Track, string>> = {dllm: 'Deep Learning / Language Models'};
@@ -43,14 +54,12 @@ export const TRACK_HINT: Partial<Record<Track, string>> = {dllm: 'Deep Learning 
 /** Each track's colour: its tab icon wears `text`, its progress bar on the profile `bg`. */
 export const TRACK_TINT: Record<Track, {text: string; bg: string}> = {
   systems: {text: 'text-warning-300', bg: 'bg-warning-300'},
-  ai: {text: 'text-iris-300', bg: 'bg-iris-300'},
   dllm: {text: 'text-concept-cuda', bg: 'bg-concept-cuda'},
 };
 
 export const TRACKS: readonly {key: TrackFilter; label: string; hint?: string}[] = [
   {key: 'all', label: 'All topics'},
   {key: 'systems', label: TRACK_LABEL.systems},
-  {key: 'ai', label: TRACK_LABEL.ai},
   {key: 'dllm', label: TRACK_LABEL.dllm, hint: TRACK_HINT.dllm},
 ];
 
@@ -95,6 +104,7 @@ const haystack = (problem: Problem): string =>
     problem.difficulty,
     ...problem.concepts.map(c => CONCEPT_LABEL[c]),
     problem.company?.name ?? '',
+    problem.tag === undefined ? '' : TAG_LABEL[problem.tag],
     ...problem.steps.map(s => s.title),
   ]
     .join('\n')
@@ -125,6 +135,7 @@ export function applyListQuery(
       (query.difficulty === 'all' || p.difficulty === query.difficulty) &&
       (query.status === 'all' || problemStatus(p, attempts) === query.status) &&
       (!query.company || p.company !== undefined) &&
+      (query.tag === 'all' || p.tag === query.tag) &&
       matchesSearch(p, query.q),
   );
   const byOrder = (a: Problem, b: Problem): number => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
@@ -155,7 +166,7 @@ export function applyListQuery(
 }
 
 export const isDefaultQuery = (query: ListQuery): boolean =>
-  query.q === '' && query.difficulty === 'all' && query.status === 'all' && !query.company;
+  query.q === '' && query.difficulty === 'all' && query.status === 'all' && !query.company && query.tag === 'all';
 
 const one = (v: string | string[] | undefined): string | undefined => (Array.isArray(v) ? v[0] : v);
 
@@ -165,12 +176,15 @@ export function parseListQuery(params: Record<string, string | string[] | undefi
   const difficulty = one(params.difficulty);
   const status = one(params.status);
   const sort = one(params.sort);
+  const tag = one(params.tag);
   return {
-    track: track === 'systems' || track === 'ai' || track === 'dllm' ? track : 'all',
+    // `ai` was a tab once; its courses are in the systems track now, so an old link lands there.
+    track: track === 'systems' || track === 'ai' ? 'systems' : track === 'dllm' ? 'dllm' : 'all',
     q: one(params.q) ?? '',
     difficulty: (DIFFICULTIES as readonly string[]).includes(difficulty ?? '') ? (difficulty as Difficulty) : 'all',
     status: status !== undefined && status in STATUS_LABEL && status !== 'all' ? (status as StatusFilter) : 'all',
     company: one(params.company) === '1',
+    tag: tag !== undefined && tag in TAG_LABEL ? (tag as ProblemTag) : 'all',
     sort: SORTS.some(s => s.key === sort) ? (sort as SortKey) : 'order',
     desc: one(params.desc) === '1',
   };
@@ -184,6 +198,7 @@ export function serializeListQuery(query: ListQuery): Record<string, string> {
   if (query.difficulty !== 'all') params.difficulty = query.difficulty;
   if (query.status !== 'all') params.status = query.status;
   if (query.company) params.company = '1';
+  if (query.tag !== 'all') params.tag = query.tag;
   if (query.sort !== 'order') params.sort = query.sort;
   if (query.desc) params.desc = '1';
   return params;

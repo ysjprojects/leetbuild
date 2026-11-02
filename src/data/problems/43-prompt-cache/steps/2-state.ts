@@ -8,34 +8,34 @@ export const cacheStateStep: Step = {
   focus: ['cache', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it writes the completion, reads
+**Starting point.** The starter is working code: it writes the completion, reads
 it back, counts hits, and the demo is a cache that works. What it does under concurrency is overwrite
-a newer value with an older one, and what it does to a hot entry is keep it alive forever. Review the
-draft as the owner of the cache, fix it, and prove both properties.
+a newer value with an older one, and what it does to a hot entry is keep it alive forever. Debug the
+starter as the owner of the cache, fix it, and prove both properties.
 
 Implement the Redis side of the cache — the fill used by the miss path and the read used by every hit.
 
 - **Fill with \`SET … NX\` and a TTL in one command.** The fill writes
   \`SET {key} {payload} NX EX {ttl}\`: the first writer wins and a concurrent fill cannot replace a
-  value that is already there. The draft plain-\`SET\`s, so a slow fill that started before a newer
+  value that is already there. The starter plain-\`SET\`s, so a slow fill that started before a newer
   result can overwrite that newer result when it finishes.
 - **A fill that lost the race returns the winner.** When \`NX\` reports that the write did not happen,
   the fill must \`GET\` the entry that won and return *its* completion. Returning the loser's own
   completion would hand the caller a value the cache does not agree with.
 - **The TTL is the prompt version's lifetime.** Entries expire after \`VERSION_TTL_S = 6 * 3600\`
   seconds — the same horizon as the version they were produced for — and that number comes from one
-  constant, never from the caller. The draft takes a \`ttl\` argument (and defaults it), so a caller can
+  constant, never from the caller. The starter takes a \`ttl\` argument (and defaults it), so a caller can
   pin a stale completion, and two call sites disagree about how long "hot" lasts.
 - **The value key's TTL is never refreshed on a hit.** A hit must not run \`EXPIRE\`/\`PEXPIRE\`/\`PERSIST\`
   against the value key. A hot entry must still die when its version does; refreshing it on read is how
   a deprecated prompt version keeps serving output forever.
 - **Hits are counted in a separate, tenant- and version-scoped counter.** The access counter key is
   \`pc:access:{tenant}:{version}\`; a hit does \`HINCRBY counter hits 1\` and then sets **the counter's**
-  TTL (it may outlive the entry, it must not outlive the version). The draft counts into
+  TTL (it may outlive the entry, it must not outlive the version). The starter counts into
   \`access:{version}\`, which merges every tenant's traffic into one number and cannot answer "how many
   hits did this tenant get on version 7".
 
-**Failure mode the checks target.** The draft is a read-modify-write where a single conditional write
+**Failure mode the checks target.** The starter is a read-modify-write where a single conditional write
 is needed, and a TTL policy where the *wrong key* is being extended. Both bugs are invisible in a demo
 with one writer and one reader, and both are permanent in production: the clobber loses the newer
 answer, and the refresh makes a dead prompt version immortal.`,
@@ -71,7 +71,7 @@ answer, and the refresh makes a dead prompt version immortal.`,
       id: 'atomic-fill',
       title: 'Fill is one conditional write that cannot overwrite',
       detail:
-        'The fill is a single `SET … NX EX` (or the client’s equivalent: `SetArgs{Mode: "NX"}`, `SetParams.nx()`, `UpdateType::NOT_EXIST`), so a writer that loses the race cannot clobber the value that won. The draft plain-writes and replaces whatever is there.',
+        'The fill is a single `SET … NX EX` (or the client’s equivalent: `SetArgs{Mode: "NX"}`, `SetParams.nx()`, `UpdateType::NOT_EXIST`), so a writer that loses the race cannot clobber the value that won. The starter plain-writes and replaces whatever is there.',
       match: {
         python: {all: [/\.set\(key, payload/, /nx=True/]},
         typescript: {all: [/store\.set\(key, payload/, /'NX'/]},
@@ -84,7 +84,7 @@ answer, and the refresh makes a dead prompt version immortal.`,
       id: 'first-writer-wins',
       title: 'A fill that lost the race returns the stored value',
       detail:
-        'When `NX` refuses the write, the fill re-reads the entry and returns the completion that actually won, instead of its own. The draft overwrites unconditionally, so an older slow fill can replace a newer result.',
+        'When `NX` refuses the write, the fill re-reads the entry and returns the completion that actually won, instead of its own. The starter overwrites unconditionally, so an older slow fill can replace a newer result.',
       match: {
         python: {all: [/def fill_if_absent\(/, /await store\.get\(key\)/]},
         typescript: {all: [/function fillIfAbsent\(/, /await store\.get\(key\)/]},
@@ -97,7 +97,7 @@ answer, and the refresh makes a dead prompt version immortal.`,
       id: 'version-ttl',
       title: 'TTL is the prompt version’s lifetime, not a caller argument',
       detail:
-        'The entry expires with `VERSION_TTL_S = 6 * 3600`, a single constant applied in the fill; the draft takes `ttl` from its caller, so an entry can be pinned past its version and two call sites can disagree about the horizon.',
+        'The entry expires with `VERSION_TTL_S = 6 * 3600`, a single constant applied in the fill; the starter takes `ttl` from its caller, so an entry can be pinned past its version and two call sites can disagree about the horizon.',
       match: {
         python: {all: [/VERSION_TTL_S = 6 \* 3600/, /ex=VERSION_TTL_S/], none: [/ex=ttl\b/]},
         typescript: {all: [/VERSION_TTL_S = 6 \* 3600/, /'EX', VERSION_TTL_S/], none: [/'EX', ttl\b/]},
@@ -113,7 +113,7 @@ answer, and the refresh makes a dead prompt version immortal.`,
       id: 'counter-scope',
       title: 'Access counter is keyed by tenant and version',
       detail:
-        'Hits are counted under `pc:access:{tenant}:{version}`. The draft counts under `access:{version}`, which folds every tenant into one number and cannot produce a per-tenant hit ratio.',
+        'Hits are counted under `pc:access:{tenant}:{version}`. The starter counts under `access:{version}`, which folds every tenant into one number and cannot produce a per-tenant hit ratio.',
       match: {
         python: {all: [/pc:access:\{tenant\}:\{version\}/]},
         typescript: {all: [/pc:access:\$\{tenant\}:\$\{version\}/]},
@@ -126,7 +126,7 @@ answer, and the refresh makes a dead prompt version immortal.`,
       id: 'hit-touches-counter',
       title: 'A hit refreshes the counter, never the value’s TTL',
       detail:
-        'On a hit the code increments the access counter and expires **that** key; nothing ever re-expires the value key, so a hot entry still dies with its version. The draft runs `EXPIRE` on the value key and a deprecated prompt version never expires.',
+        'On a hit the code increments the access counter and expires **that** key; nothing ever re-expires the value key, so a hot entry still dies with its version. The starter runs `EXPIRE` on the value key and a deprecated prompt version never expires.',
       match: {
         python: {all: [/hincrby\(counter/, /expire\(counter/], none: [/expire\(key\b/, /persist\(key\b/]},
         typescript: {all: [/hincrby\(counter/, /expire\(counter/], none: [/expire\(key\b/, /persist\(key\b/]},
@@ -148,7 +148,7 @@ VERSION_TTL_S = 3600
 
 
 async def fill(key: str, tenant: str, version: int, completion: str, ttl: int = VERSION_TTL_S) -> str:
-    # TODO: the draft overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
+    # TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
     # newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
     # expires; and it counts hits under a key that has no tenant in it.
     payload = json.dumps({"tenant": tenant, "version": version, "completion": completion})
@@ -200,7 +200,7 @@ async def lookup(key: str, tenant: str, version: int) -> dict | None:
 `,
     },
     typescript: {
-      starter: `/** Redis fill and read paths: the draft writes unconditionally and refreshes on read. */
+      starter: `/** Redis fill and read paths: the starter writes unconditionally and refreshes on read. */
 import {Redis} from 'ioredis';
 
 const store = new Redis('redis://cache:6379');
@@ -220,7 +220,7 @@ export async function fill(
   completion: string,
   ttl: number = VERSION_TTL_S,
 ): Promise<string> {
-  // TODO: the draft overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
+  // TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
   // newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
   // expires; and it counts hits under a key that has no tenant in it.
   await store.set(key, JSON.stringify({tenant, version, completion}), 'EX', ttl);
@@ -290,7 +290,7 @@ import (
 
 const VERSION_TTL_S = 3600
 
-// TODO: the draft overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
+// TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
 // newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
 // expires; and it counts hits under a key that has no tenant in it.
 func fill(ctx context.Context, key, tenant string, version int, completion string, ttl time.Duration) (string, error) {
@@ -385,7 +385,7 @@ func lookup(ctx context.Context, key, tenant string, version int) (*cacheRecord,
 import redis.clients.jedis.params.SetParams
 
 object CacheStore {
-  // TODO: the draft overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
+  // TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
   // newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
   // expires; and it counts hits under a key that has no tenant in it.
   final case class CacheRecord(tenant: String, version: Int, completion: String)
@@ -443,7 +443,7 @@ object CacheStore {
 #include <optional>
 #include <string>
 
-// TODO: the draft overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
+// TODO: the starter overwrites on every fill with a caller-supplied TTL, so a slow fill clobbers a
 // newer result with an older one; it refreshes the value's TTL on every hit so a hot entry never
 // expires; and it counts hits under a key that has no tenant in it.
 constexpr int kVersionTtlS = 3600;
@@ -507,5 +507,5 @@ std::optional<CacheRecord> lookup(sw::redis::Redis& cache, const std::string& ke
 `,
     },
   },
-  debrief: `The interviewer is testing two instincts that separate a cache from a dictionary: a fill is a decision, not an assignment, and a TTL belongs to the data, not to the request that happens to touch it. The draft's plain \`SET\` assumes the writer that finishes last has the best answer — an assumption that only holds in a demo with one writer. \`NX\` makes the first writer win, and re-reading on a lost race keeps the caller's view and the cache's view identical. The TTL half is subtler: refreshing a value on read feels like keeping the cache warm, but it silently converts "entries expire with their prompt version" into "popular entries never expire", so a deprecated template keeps serving its output forever. Moving the refresh to a per-tenant, per-version counter keeps the hot-path statistic and gives the stats endpoint the one number it actually needs — and it is the same counter the consumer in step 4 updates.`,
+  debrief: `The interviewer is testing two instincts that separate a cache from a dictionary: a fill is a decision, not an assignment, and a TTL belongs to the data, not to the request that happens to touch it. The starter's plain \`SET\` assumes the writer that finishes last has the best answer — an assumption that only holds in a demo with one writer. \`NX\` makes the first writer win, and re-reading on a lost race keeps the caller's view and the cache's view identical. The TTL half is subtler: refreshing a value on read feels like keeping the cache warm, but it silently converts "entries expire with their prompt version" into "popular entries never expire", so a deprecated template keeps serving its output forever. Moving the refresh to a per-tenant, per-version counter keeps the hot-path statistic and gives the stats endpoint the one number it actually needs — and it is the same counter the consumer in step 4 updates.`,
 };

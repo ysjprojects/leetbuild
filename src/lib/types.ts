@@ -121,14 +121,18 @@ export type Difficulty = 'easy' | 'medium' | 'hard';
 export const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard'];
 
 /**
- * Which track a problem belongs to. `systems` is the classic build-a-system track (the default
- * when omitted); `ai` is the AI-era track, where every starter is a plausible model-generated
- * draft that the learner has to review, fix and verify; `dllm` is the deep-learning track — PyTorch
- * and CUDA problems in a fixed language, judged by static checks. A PyTorch step's file also runs
- * in the browser as a program (Run executes its self-test, see `runsAsProgram`); CUDA runs only on
- * the learner's own GPU.
+ * Which track a problem belongs to. `systems` is the build-a-system track (the default when
+ * omitted): courses whose steps run in the browser, and courses whose starter is working code
+ * with a flaw to debug, fix and optimize; `dllm` is the deep-learning track — PyTorch and CUDA
+ * problems in a fixed language, judged by static checks. A PyTorch step's file also runs in the
+ * browser as a program (Run executes its self-test, see `runsAsProgram`); CUDA runs only on the
+ * learner's own GPU.
  */
-export type Track = 'systems' | 'ai' | 'dllm';
+export type Track = 'systems' | 'dllm';
+
+/** A label a course carries beside its difficulty: `ai-systems` for a system with a model at its core. */
+export type ProblemTag = 'ai-systems';
+export const TAG_LABEL: Record<ProblemTag, string> = {'ai-systems': 'AI Systems'};
 
 /**
  * What a check looks for in the learner's code once comments are stripped. Every `all` pattern
@@ -318,8 +322,10 @@ export interface Problem {
   concepts: Concept[];
   /** Estimated time for all steps, in minutes. */
   minutes: number;
-  /** Interview track; omitted means the classic systems track. */
+  /** Interview track; omitted means the systems track. */
   track?: Track;
+  /** A label beside the difficulty: `ai-systems` for a course whose system has a model at its core. */
+  tag?: ProblemTag;
   /**
    * A fixed language: the learner cannot switch, and every step carries code and matchers for
    * this language only (the deep-learning track: `python` for PyTorch, `cuda` for kernels).
@@ -333,7 +339,7 @@ export interface Problem {
    * at `/<problem>/learn`, linked from the description, downloadable as Markdown and printable.
    */
   learn?: string;
-  /** The system's architecture: services, stores and the calls between them (systems and AI-era courses). */
+  /** The system's architecture: services, stores and the calls between them (the systems track). */
   diagram?: Diagram;
   /**
    * The deep-learning track's figures, drawn in place of `diagram`: layer stacks for models, GPU

@@ -8,21 +8,21 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it registers the status route and returns a
+The starter is working code: it registers the status route and returns a
 percentage. A dashboard can render a progress bar from that, so the demo passes. But a client on a
-flaky network needs more than a percentage, and the draft also lets anyone read anyone's upload.
+flaky network needs more than a percentage, and the starter also lets anyone read anyone's upload.
 Find the defects, fix them, and prove the fix.
 
 Implement \`GET /v1/uploads/{upload_id}\`, the read a client makes to resume after a dropped connection.
 
 - The response names the **stored** parts (number, size, checksum), the **missing** part numbers and
   the **corrupt** parts (number and the checksum that did not match), plus a \`resume\` list that is
-  exactly the numbers to re-send. The draft returns only a percentage complete, so the client cannot
+  exactly the numbers to re-send. The starter returns only a percentage complete, so the client cannot
   tell which parts to re-send and restarts the upload from zero.
 - A part whose stored checksum does not match the expected checksum is **corrupt** and belongs in
-  \`resume\` — it must not be reported as stored. The draft never verifies anything.
+  \`resume\` — it must not be reported as stored. The starter never verifies anything.
 - The upload belongs to the tenant that created it. A read from a **foreign tenant** — or for an id
-  that does not exist — is **404**. The draft lets any caller read any upload by id.
+  that does not exist — is **404**. The starter lets any caller read any upload by id.
 - \`part_count\` is included so the client can compute the gaps itself.
 
 **Failure mode the checks target.** A percentage is not resumable: the client knows it is 73% done but
@@ -62,7 +62,7 @@ says stored, is reported as fine until finalize discovers it.`,
       id: 'missing-parts',
       title: 'Names the individual missing parts',
       detail:
-        'The response lists the missing part numbers so the client resumes from exact gaps instead of restarting. The draft returns only a percentage complete.',
+        'The response lists the missing part numbers so the client resumes from exact gaps instead of restarting. The starter returns only a percentage complete.',
       match: {
         python: {all: [/missing/, /part_number|part_count/]},
         typescript: {all: [/missing/, /part_number|part_count/]},
@@ -75,7 +75,7 @@ says stored, is reported as fine until finalize discovers it.`,
       id: 'corrupt-parts',
       title: 'Flags corrupt parts for re-send',
       detail:
-        'A part whose checksum does not match the expected checksum is reported as corrupt and appears in the resume list. The draft never verifies anything.',
+        'A part whose checksum does not match the expected checksum is reported as corrupt and appears in the resume list. The starter never verifies anything.',
       match: {
         python: {all: [/corrupt/, /part_number|resume/]},
         typescript: {all: [/corrupt/, /part_number|resume/]},
@@ -88,7 +88,7 @@ says stored, is reported as fine until finalize discovers it.`,
       id: 'tenant-scope',
       title: 'A foreign upload id is 404',
       detail:
-        'The read checks the upload’s tenant against `X-Tenant-Id` and answers **404** for a foreign or unknown id. The draft lets any caller read any upload.',
+        'The read checks the upload’s tenant against `X-Tenant-Id` and answers **404** for a foreign or unknown id. The starter lets any caller read any upload.',
       match: {
         python: {all: [/tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/tenant/, /code\(\s*404\s*\)/]},
@@ -101,7 +101,7 @@ says stored, is reported as fine until finalize discovers it.`,
       id: 'checksums',
       title: 'Returns checksums beside each stored part',
       detail:
-        'Every stored part is returned with its number, size and checksum, so the client can verify what the server has. The draft returns neither the parts nor their checksums.',
+        'Every stored part is returned with its number, size and checksum, so the client can verify what the server has. The starter returns neither the parts nor their checksums.',
       match: {
         python: {all: [/checksum/, /stored/]},
         typescript: {all: [/checksum/, /stored/]},
@@ -121,7 +121,7 @@ app = FastAPI()
 
 @app.get("/v1/uploads/{upload_id}")
 def get_upload(upload_id: str) -> JSONResponse:
-    # TODO: this draft returns only a percentage complete, so a client cannot resume from the exact
+    # TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
     # gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
     manifest = load_manifest(upload_id)
     percent = 100 * len(manifest) // manifest["part_count"]
@@ -174,13 +174,13 @@ def get_upload(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/uploads/{id}: a model-generated draft that returns a percentage. */
+      starter: `/** GET /v1/uploads/{id}: flawed code that returns a percentage. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
 
 app.get('/v1/uploads/:uploadId', async (request, reply) => {
-  // TODO: this draft returns only a percentage complete, so a client cannot resume from the exact
+  // TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
   // gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
   const uploadId = (request.params as {uploadId: string}).uploadId;
   const manifest = await loadManifest(uploadId);
@@ -259,7 +259,7 @@ import (
 )
 
 func getUpload(w http.ResponseWriter, r *http.Request) {
-	// TODO: this draft returns only a percentage complete, so a client cannot resume from the exact
+	// TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
 	// gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
 	uploadID := r.PathValue("uploadId")
 	manifest, _ := loadManifest(r.Context(), uploadID)
@@ -353,7 +353,7 @@ object UploadReadApi {
   val route: Route =
     path("v1" / "uploads" / Segment) { uploadId =>
       get {
-        // TODO: this draft returns only a percentage complete, so a client cannot resume from the
+        // TODO: this starter returns only a percentage complete, so a client cannot resume from the
         // exact gaps and restarts the upload; it also lets any caller read any upload without a
         // tenant check.
         onSuccess(loadManifest(uploadId)) { manifest =>
@@ -437,7 +437,7 @@ object UploadReadApi {
 using json = nlohmann::json;
 
 void GetUpload(const httplib::Request& req, httplib::Response& res) {
-  // TODO: this draft returns only a percentage complete, so a client cannot resume from the exact
+  // TODO: this starter returns only a percentage complete, so a client cannot resume from the exact
   // gaps and restarts the upload; it also lets any caller read any upload without a tenant check.
   const auto uploadId = req.path_params.at("uploadId");
   const auto manifest = LoadManifest(uploadId);

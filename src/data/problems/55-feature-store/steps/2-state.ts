@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: values are written to Redis and
+**Starting point.** The starter is working code: values are written to Redis and
 read back, and the demo shows the latest number. It is wrong in two ways that only matter when it is
 used for training. Find them, fix them, and prove the fix with the checks below.
 
@@ -20,15 +20,15 @@ Implement the online value store behind both handlers:
 Requirements:
 
 - Values live under **\`feature:{name}:{version}:{entity}\`**. Both the version and the entity are part
-  of the key. The draft's \`feature:{name}:{entity}\` key drops the version, so a version bump reads
+  of the key. The starter's \`feature:{name}:{entity}\` key drops the version, so a version bump reads
   the old value; and a version bump must serve the new keys **without deleting the old ones**, because
   a backfill for a past cutoff still has to read the version that was live then.
 - The entry **expires after the definition's freshness SLO** seconds: read
   \`definition:{name}:{version}\` from Redis and use its \`freshness_slo\`, falling back to a small
-  default when the definition is unknown. The draft hard-codes one TTL for every feature, which is
+  default when the definition is unknown. The starter hard-codes one TTL for every feature, which is
   either far too long for a 5-minute feature or uselessly short for a daily one.
 - A read is **as-of**: it may only return a value whose \`event_ts\` is **at or before \`as_of\`**. The
-  draft reads the key and returns whatever is there, so a value computed *after* the training cutoff
+  starter reads the key and returns whatever is there, so a value computed *after* the training cutoff
   leaks into the backfill — the offline score that looks too good and the online score that does not.
 - The response carries the stored **\`event_ts\`** and an **\`age_s\`** so a consumer can decide whether
   the value is usable, and a missing or too-new value is **404** — never a zero-fill, because a zero
@@ -66,7 +66,7 @@ SLO-derived TTL and the as-of guard on the read.`,
       id: 'versioned-key',
       title: 'Keys values by (feature, version, entity)',
       detail:
-        'The key is `feature:{name}:{version}:{entity}`, so a version bump reads its own values and never deletes the old ones. The draft drops the version and reads the previous version’s entry.',
+        'The key is `feature:{name}:{version}:{entity}`, so a version bump reads its own values and never deletes the old ones. The starter drops the version and reads the previous version’s entry.',
       match: {
         python: {all: [/f"feature:\{name\}:\{version\}:\{entity\}"/], none: [/\.delete\(/, /\.unlink\(/]},
         typescript: {all: [/feature:\$\{name\}:\$\{version\}:\$\{entity\}/], none: [/\.del\(/, /\.unlink\(/]},
@@ -82,7 +82,7 @@ SLO-derived TTL and the as-of guard on the read.`,
       id: 'slo-ttl',
       title: 'Expires entries at the definition’s freshness SLO',
       detail:
-        'The write reads `definition:{name}:{version}` and sets the TTL from its `freshness_slo`. The draft uses one hard-coded TTL for every feature.',
+        'The write reads `definition:{name}:{version}` and sets the TTL from its `freshness_slo`. The starter uses one hard-coded TTL for every feature.',
       match: {
         python: {all: [/freshness_slo/, /ex=slo_seconds\(/]},
         typescript: {all: [/freshness_slo/, /'EX'/]},
@@ -95,7 +95,7 @@ SLO-derived TTL and the as-of guard on the read.`,
       id: 'as-of-guard',
       title: 'Never returns a value newer than as_of',
       detail:
-        'The stored `event_ts` is compared with `as_of` and a newer record is refused, so a backfill cannot receive information from after its cutoff. The draft returns the latest value regardless.',
+        'The stored `event_ts` is compared with `as_of` and a newer record is refused, so a backfill cannot receive information from after its cutoff. The starter returns the latest value regardless.',
       match: {
         python: {all: [/as_of/, /event_ts/, /event_ts"\]\s*>\s*as_of/]},
         typescript: {all: [/as_of/, /event_ts/, /event_ts\s*>\s*as_of/]},
@@ -108,7 +108,7 @@ SLO-derived TTL and the as-of guard on the read.`,
       id: 'timestamped-miss',
       title: 'Returns the event timestamp, and 404 when there is nothing',
       detail:
-        'A hit answers with the stored value and its `event_ts`; a missing or too-new value is **404**. The draft hides the timestamp and returns a null-shaped body.',
+        'A hit answers with the stored value and its `event_ts`; a missing or too-new value is **404**. The starter hides the timestamp and returns a null-shaped body.',
       match: {
         python: {all: [/event_ts/, /status_code\s*=\s*404/]},
         typescript: {all: [/event_ts/, /code\(\s*404\s*\)/]},
@@ -121,7 +121,7 @@ SLO-derived TTL and the as-of guard on the read.`,
       id: 'staleness-visible',
       title: 'Reports staleness next to the value',
       detail:
-        'The response carries `age_s` computed from `event_ts`, so a consumer can reject a value that is older than the feature’s SLO. The draft returns the value alone.',
+        'The response carries `age_s` computed from `event_ts`, so a consumer can reject a value that is older than the feature’s SLO. The starter returns the value alone.',
       match: {
         python: {all: [/age_s/, /event_ts/]},
         typescript: {all: [/age_s/, /event_ts/]},
@@ -229,7 +229,7 @@ def read_value(
 `,
     },
     typescript: {
-      starter: `/** POST|GET /v1/features/:name/values: a model-generated draft that reads the latest key. */
+      starter: `/** POST|GET /v1/features/:name/values: flawed code that reads the latest key. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

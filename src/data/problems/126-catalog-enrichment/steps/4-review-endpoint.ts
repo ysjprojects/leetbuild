@@ -8,9 +8,9 @@ export const reviewEndpointStep: Step = {
   focus: ['reviewer', 'catalogd', 'taxonomy', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route,
+**Starting point.** The starter is working code: it registers the route,
 reads the reviewer's decision and writes the attributes to the catalog. It compiles, it serves the
-demo, and it hides five production flaws. Review it like the owner of the labelling pipeline, fix
+demo, and it hides five production flaws. Debug it like the owner of the labelling pipeline, fix
 it, and prove the fix with the checks below.
 
 Implement \`POST /v1/skus/{sku_id}/review\` with body
@@ -33,7 +33,7 @@ Implement \`POST /v1/skus/{sku_id}/review\` with body
   \`source: "human"\`, release the lease, and answer with the label version and the taxonomy
   version. Never log the attributes or the note — log ids and the decision.
 
-**Failure mode the checks target.** The draft lets any caller with a header rewrite the catalog, lets
+**Failure mode the checks target.** The starter lets any caller with a header rewrite the catalog, lets
 two reviewers overwrite each other, double-applies on retry, accepts any attribute key, and — the
 expensive one — throws the correction away: it edits the catalog row and keeps nothing for the
 next model, so the human work the source post relies on to train the next extractor is lost.`,
@@ -79,7 +79,7 @@ next model, so the human work the source post relies on to train the next extrac
       id: 'reviewer-role',
       title: 'Requires a reviewer id and a reviewer role',
       detail:
-        'A missing `X-Reviewer-Id` is **401** and a role outside `REVIEWER_ROLES` (`reviewer`, `catalog-admin`) is **403**, before any store is touched. The draft accepts any caller that sets the header.',
+        'A missing `X-Reviewer-Id` is **401** and a role outside `REVIEWER_ROLES` (`reviewer`, `catalog-admin`) is **403**, before any store is touched. The starter accepts any caller that sets the header.',
       match: {
         python: {all: [/REVIEWER_ROLES/, /X-Reviewer-Role/, /status_code\s*=\s*401/, /status_code\s*=\s*403/]},
         typescript: {all: [/REVIEWER_ROLES/, /x-reviewer-role/, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
@@ -92,7 +92,7 @@ next model, so the human work the source post relies on to train the next extrac
       id: 'validate-decision',
       title: 'Validates the decision, the attribute keys and the note',
       detail:
-        '`decision` must be in `ALLOWED_DECISIONS`, every corrected attribute key in `ALLOWED_ATTRIBUTES`, and the note at most `MAX_NOTE_BYTES = 1024`; each failure is **400**. The draft writes whatever keys the body contains into the catalog.',
+        '`decision` must be in `ALLOWED_DECISIONS`, every corrected attribute key in `ALLOWED_ATTRIBUTES`, and the note at most `MAX_NOTE_BYTES = 1024`; each failure is **400**. The starter writes whatever keys the body contains into the catalog.',
       match: {
         python: {
           all: [/ALLOWED_DECISIONS/, /ALLOWED_ATTRIBUTES/, /MAX_NOTE_BYTES\s*=\s*1024/, /status_code\s*=\s*400/],
@@ -109,7 +109,7 @@ next model, so the human work the source post relies on to train the next extrac
       id: 'idempotency-key',
       title: 'Keys retries by (reviewer, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the outcome is stored under `(reviewer, key)`; a replay returns the stored outcome instead of labelling twice. The draft ignores the header.',
+        '`Idempotency-Key` is required and the outcome is stored under `(reviewer, key)`; a replay returns the stored outcome instead of labelling twice. The starter ignores the header.',
       match: {
         python: {all: [/Idempotency-Key/, /reviews\.get\(/, /reviews\.put\(/]},
         typescript: {all: [/idempotency-key/, /reviews\.get\(/, /reviews\.put\(/]},
@@ -122,7 +122,7 @@ next model, so the human work the source post relies on to train the next extrac
       id: 'lease-and-label',
       title: 'Requires the lease and stores the decision as a versioned label',
       detail:
-        'The caller must hold the SKU’s lease (**409** otherwise); the decision is stored with `labels.put(sku_id, attributes, taxonomy_version, reviewer)` before the catalog is updated with `source: "human"` and the lease released. The draft edits the catalog and keeps no label.',
+        'The caller must hold the SKU’s lease (**409** otherwise); the decision is stored with `labels.put(sku_id, attributes, taxonomy_version, reviewer)` before the catalog is updated with `source: "human"` and the lease released. The starter edits the catalog and keeps no label.',
       match: {
         python: {
           all: [/lease\.holder\(/, /status_code\s*=\s*409/, /taxonomy_version/, /lease\.release\(/],
@@ -179,8 +179,8 @@ catalog = Catalog()
 
 @app.post("/v1/skus/{sku_id}/review")
 def review(sku_id: str, body: ReviewRequest, reviewer: str = Header(alias="X-Reviewer-Id")) -> JSONResponse:
-    # TODO: this draft trusts any caller with a header, ignores Idempotency-Key, accepts any
-    # attribute keys, never checks the review lease, and keeps no label of the decision. Review all five.
+    # TODO: this starter trusts any caller with a header, ignores Idempotency-Key, accepts any
+    # attribute keys, never checks the review lease, and keeps no label of the decision. Fix all five.
     pending = catalog.pending(sku_id) or {"attributes": {}}
     attributes = pending["attributes"] if body.decision == "accept" else {**pending["attributes"], **(body.attributes or {})}
     catalog.apply(sku_id, attributes, source="human")
@@ -301,7 +301,7 @@ def review(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/skus/:skuId/review: a model-generated draft that writes any caller's edit to the catalog. */
+      starter: `/** POST /v1/skus/:skuId/review: flawed code that writes any caller's edit to the catalog. */
 import Fastify from 'fastify';
 
 import {catalog} from './catalog';
@@ -315,8 +315,8 @@ interface ReviewBody {
 }
 
 app.post('/v1/skus/:skuId/review', async (request, reply) => {
-  // TODO: this draft trusts any caller with a header, ignores Idempotency-Key, accepts any
-  // attribute keys, never checks the review lease, and keeps no label of the decision. Review all five.
+  // TODO: this starter trusts any caller with a header, ignores Idempotency-Key, accepts any
+  // attribute keys, never checks the review lease, and keeps no label of the decision. Fix all five.
   const {skuId} = request.params as {skuId: string};
   const reviewer = request.headers['x-reviewer-id'] as string;
   const body = request.body as ReviewBody;
@@ -451,8 +451,8 @@ func review(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts any caller with a header, ignores Idempotency-Key, accepts any
-	// attribute keys, never checks the review lease, and keeps no label of the decision. Review all five.
+	// TODO: this starter trusts any caller with a header, ignores Idempotency-Key, accepts any
+	// attribute keys, never checks the review lease, and keeps no label of the decision. Fix all five.
 	pending, _ := catalog.Pending(skuID)
 	attributes := map[string]any{}
 	if pending != nil {
@@ -687,7 +687,7 @@ object ReviewApi {
       post {
         headerValueByName("X-Reviewer-Id") { reviewer =>
           entity(as[ReviewRequest]) { body =>
-            // TODO: this draft trusts any caller with a header, ignores Idempotency-Key, accepts
+            // TODO: this starter trusts any caller with a header, ignores Idempotency-Key, accepts
             // any attribute keys, never checks the review lease, and keeps no label of the decision.
             val pending = catalog.pending(skuId).map(_.attributes).getOrElse(Map.empty[String, JsValue])
             val attributes = if (body.decision == "accept") pending else pending ++ body.attributes.getOrElse(Map.empty)
@@ -837,8 +837,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft trusts any caller with a header, ignores Idempotency-Key, accepts any
-    // attribute keys, never checks the review lease, and keeps no label of the decision. Review all five.
+    // TODO: this starter trusts any caller with a header, ignores Idempotency-Key, accepts any
+    // attribute keys, never checks the review lease, and keeps no label of the decision. Fix all five.
     const auto pending = catalog.pending(skuId);
     json attributes = pending ? pending->attributes : json::object();
     if (body.value("decision", std::string()) != "accept" && body.contains("attributes"))
@@ -968,5 +968,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the boundary where humans write into a model's world. Three of the five flaws are ordinary trust-boundary work: a role check (anyone who can reach the service is not a reviewer), input whitelists (a correction with an unknown key is a schema change nobody approved), and idempotency keyed by reviewer so a retried request does not label twice. The lease check is the concurrency flaw: without it the lease from step 3 is decorative and two reviewers silently overwrite each other. The label store is the one that matters to the business: in the source posts the reviewers' decisions are the golden annotations that train the next extractor, so a review endpoint that only edits the catalog row is throwing away the most expensive data the system produces. Storing the decision with the taxonomy version it was made under is what lets the training job tell which labels still apply after a taxonomy release. Real systems add reviewer agreement sampling (a second reviewer on a percentage of decisions, the "second human audits the first" the post describes), per-reviewer accuracy against that sample, and a feed from the labels into an eval set that gates the next model.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the boundary where humans write into a model's world. Three of the five flaws are ordinary trust-boundary work: a role check (anyone who can reach the service is not a reviewer), input whitelists (a correction with an unknown key is a schema change nobody approved), and idempotency keyed by reviewer so a retried request does not label twice. The lease check is the concurrency flaw: without it the lease from step 3 is decorative and two reviewers silently overwrite each other. The label store is the one that matters to the business: in the source posts the reviewers' decisions are the golden annotations that train the next extractor, so a review endpoint that only edits the catalog row is throwing away the most expensive data the system produces. Storing the decision with the taxonomy version it was made under is what lets the training job tell which labels still apply after a taxonomy release. Real systems add reviewer agreement sampling (a second reviewer on a percentage of decisions, the "second human audits the first" the post describes), per-reviewer accuracy against that sample, and a feed from the labels into an eval set that gates the next model.`,
 };

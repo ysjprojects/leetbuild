@@ -8,11 +8,11 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'worker', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the pointer swap: it reads
-the current version, writes the new one and returns the old one. It compiles, the demo rotates
-cleanly, and it hides three production flaws — a non-atomic swap, an old version that dies the
-instant the new one activates, and a TTL on the pointer itself. Review it like the service owner,
-fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the pointer swap: it reads the current version,
+writes the new one and returns the old one. It compiles, the demo rotates cleanly, and it hides
+three production flaws — a non-atomic swap, an old version that dies the instant the new one
+activates, and a TTL on the pointer itself. Debug it like the service owner, fix it, and prove the
+fix with the checks below.
 
 Implement the version pointer in Redis. Three keys per secret, all derived from the name:
 
@@ -84,7 +84,7 @@ overlapping at all.`,
       id: 'atomic-swap',
       title: 'Read-and-swap is one atomic EVAL',
       detail:
-        'One Lua script (`SWAP_SCRIPT`) reads the pointer and moves it, evaluated with key count 2. The draft does a client-side GET then SET, so two rotations can interleave and one of them is never recorded as overlapping.',
+        'One Lua script (`SWAP_SCRIPT`) reads the pointer and moves it, evaluated with key count 2. The starter does a client-side GET then SET, so two rotations can interleave and one of them is never recorded as overlapping.',
       match: {
         python: {all: [/SWAP_SCRIPT/, /\beval\(/, /GET['"]?,\s*KEYS\[1\]/]},
         typescript: {all: [/SWAP_SCRIPT/, /\beval\(/, /GET['"]?,\s*KEYS\[1\]/]},
@@ -97,7 +97,7 @@ overlapping at all.`,
       id: 'overlap-window',
       title: 'The previous version stays valid for the overlap',
       detail:
-        '`OVERLAP_SECONDS` (900 — at least one deploy cycle) scopes the overlap key, `valid_versions` returns the active version plus the still-overlapping one, and nothing deletes the key early. The draft deletes the overlap the instant the new version activates.',
+        '`OVERLAP_SECONDS` (900 — at least one deploy cycle) scopes the overlap key, `valid_versions` returns the active version plus the still-overlapping one, and nothing deletes the key early. The starter deletes the overlap the instant the new version activates.',
       match: {
         python: {all: [/OVERLAP_SECONDS/, /OVERLAP_KEY/, /def valid_versions\(/], none: [/\.delete\(/]},
         typescript: {all: [/OVERLAP_SECONDS/, /OVERLAP_KEY/, /function validVersions\(/], none: [/\.del\(/]},
@@ -110,7 +110,7 @@ overlapping at all.`,
       id: 'pointer-permanent',
       title: 'The pointer never expires; only the overlap does',
       detail:
-        'In the swap script the pointer (`KEYS[1]`) is written without a TTL and `EXPIRE` is applied to the overlap key (`KEYS[2]`) alone. The draft puts a TTL on the pointer, so an idle window resets it and the newest material becomes unreachable.',
+        'In the swap script the pointer (`KEYS[1]`) is written without a TTL and `EXPIRE` is applied to the overlap key (`KEYS[2]`) alone. The starter puts a TTL on the pointer, so an idle window resets it and the newest material becomes unreachable.',
       match: {
         python: {
           all: [/SET['"]?,\s*KEYS\[1\]\s*,\s*ARGV\[2\]\s*\)/, /EXPIRE['"]?,\s*KEYS\[2\]/],
@@ -138,7 +138,7 @@ overlapping at all.`,
       id: 'revoke-explicit',
       title: 'Revocation is an explicit call, not a TTL',
       detail:
-        '`revoke(name, version_id)` records the version in `secret:{name}:revoked` (a set) after the overlap, and refuses to revoke the active version. The draft has no revocation path at all, so retiring a version is whatever the TTL happened to do.',
+        '`revoke(name, version_id)` records the version in `secret:{name}:revoked` (a set) after the overlap, and refuses to revoke the active version. The starter has no revocation path at all, so retiring a version is whatever the TTL happened to do.',
       match: {
         python: {all: [/def revoke\(/, /\bsadd\(/, /REVOKED_KEY/]},
         typescript: {all: [/function revoke\(/, /\bsadd\(/, /REVOKED_KEY/]},
@@ -160,8 +160,8 @@ POINTER_TTL_S = 3600
 
 
 def activate(name: str, version_id: str) -> str:
-    # TODO: this draft swaps the pointer with a client-side GET-then-SET, invalidates the previous
-    # version the moment the new one activates, and puts a TTL on the pointer itself. Review all three.
+    # TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
+    # version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
     previous = redis_client.get(ACTIVE_KEY.format(name)) or ""
     redis_client.set(ACTIVE_KEY.format(name), version_id, ex=POINTER_TTL_S)
     redis_client.delete(OVERLAP_KEY.format(name))
@@ -233,7 +233,7 @@ def revoke(name: str, version_id: str) -> bool:
 `,
     },
     typescript: {
-      starter: `/** The active-version pointer: a model-generated draft that drops the old version at the swap. */
+      starter: `/** The active-version pointer: flawed code that drops the old version at the swap. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -243,8 +243,8 @@ const OVERLAP_KEY = (name: string): string => \`secret:\${name}:overlap\`;
 const POINTER_TTL_S = 3600;
 
 export async function activate(name: string, versionId: string): Promise<string> {
-  // TODO: this draft swaps the pointer with a client-side GET-then-SET, invalidates the previous
-  // version the moment the new one activates, and puts a TTL on the pointer itself. Review all three.
+  // TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
+  // version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
   const previous = (await r.get(ACTIVE_KEY(name))) ?? '';
   await r.set(ACTIVE_KEY(name), versionId, 'EX', POINTER_TTL_S);
   await r.del(OVERLAP_KEY(name));
@@ -329,8 +329,8 @@ func activeKey(name string) string  { return "secret:" + name + ":active" }
 func overlapKey(name string) string { return "secret:" + name + ":overlap" }
 
 func activate(ctx context.Context, name, versionID string) (string, error) {
-	// TODO: this draft swaps the pointer with a client-side GET-then-SET, invalidates the previous
-	// version the moment the new one activates, and puts a TTL on the pointer itself. Review all three.
+	// TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
+	// version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
 	previous, _ := rdb.Get(ctx, activeKey(name)).Result()
 	if err := rdb.Set(ctx, activeKey(name), versionID, pointerTTL).Err(); err != nil {
 		return "", err
@@ -424,8 +424,8 @@ object SecretState {
   def activeKey(name: String): String = s"secret:$name:active"
   def overlapKey(name: String): String = s"secret:$name:overlap"
 
-  // TODO: this draft swaps the pointer with a client-side GET-then-SET, invalidates the previous
-  // version the moment the new one activates, and puts a TTL on the pointer itself. Review all three.
+  // TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
+  // version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
   def activate(name: String, versionId: String): String = {
     val previous = jedis.get(activeKey(name))
     jedis.setex(activeKey(name), PointerTtlSeconds, versionId)
@@ -499,8 +499,8 @@ std::string kActiveKey(const std::string& name) { return "secret:" + name + ":ac
 std::string kOverlapKey(const std::string& name) { return "secret:" + name + ":overlap"; }
 
 std::string activate(const std::string& name, const std::string& versionId) {
-  // TODO: this draft swaps the pointer with a client-side GET-then-SET, invalidates the previous
-  // version the moment the new one activates, and puts a TTL on the pointer itself. Review all three.
+  // TODO: this starter swaps the pointer with a client-side GET-then-SET, invalidates the previous
+  // version the moment the new one activates, and puts a TTL on the pointer itself. Fix all three.
   auto previous = redis->get(kActiveKey(name));
   redis->set(kActiveKey(name), versionId, std::chrono::seconds(kPointerTtlSeconds));
   redis->del(kOverlapKey(name));

@@ -8,8 +8,8 @@ export const readStep: Step = {
   focus: ['client', 'api', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it returns "the next 20
-comments", it is one query, and it works perfectly until the thread is busy. Review it like the
+**Starting point.** The starter is working code: it returns "the next 20
+comments", it is one query, and it works perfectly until the thread is busy. Debug it like the
 service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/threads/{id}/comments\` — top-level comments of a thread, one page at a time.
@@ -32,7 +32,7 @@ Implement \`GET /v1/threads/{id}/comments\` — top-level comments of a thread, 
 - The first page is what a new reader sees, and the same comment must never appear twice across a
   page walk, whatever is written while they read.
 
-**Failure mode the checks target.** The draft paginates by **offset**, which is not a position but a
+**Failure mode the checks target.** The starter paginates by **offset**, which is not a position but a
 count: post three comments while the reader is on page 2 and everything shifts, so one comment is
 skipped entirely and another is served again — the bug users describe as "the thread showed the same
 comment twice". It also returns **deleted comments with their text intact**, so a deleted reply keeps
@@ -72,7 +72,7 @@ instead of reading the counter the write path keeps.`,
       id: 'cursor',
       title: 'Paginates on a (created_at, id) cursor',
       detail:
-        'The page position is encoded and decoded as an opaque cursor on `(created_at, id)`. The draft uses an integer offset, which is a count of rows, not a position.',
+        'The page position is encoded and decoded as an opaque cursor on `(created_at, id)`. The starter uses an integer offset, which is a count of rows, not a position.',
       match: {
         python: {all: [/def encode_cursor\(/, /def decode_cursor\(/]},
         typescript: {all: [/function encodeCursor\(/, /function decodeCursor\(/]},
@@ -85,7 +85,7 @@ instead of reading the counter the write path keeps.`,
       id: 'keyset',
       title: 'Reads with a keyset predicate and a limit',
       detail:
-        'The query filters by `(created_at, id) > ($2, $3)` and ends with `LIMIT $4`, so each page is a range scan from a position. The draft runs `OFFSET`, which re-counts every row the thread has written.',
+        'The query filters by `(created_at, id) > ($2, $3)` and ends with `LIMIT $4`, so each page is a range scan from a position. The starter runs `OFFSET`, which re-counts every row the thread has written.',
       match: {
         python: {all: [/\(created_at, id\) >/, /LIMIT/]},
         typescript: {all: [/\(created_at, id\) >/, /LIMIT/]},
@@ -98,7 +98,7 @@ instead of reading the counter the write path keeps.`,
       id: 'tombstone',
       title: 'Returns deleted comments as tombstones without text',
       detail:
-        'A deleted row serialises to identity, parent, reply count and `deleted: true` — the text is never included. The draft returns deleted comments with their bodies intact.',
+        'A deleted row serialises to identity, parent, reply count and `deleted: true` — the text is never included. The starter returns deleted comments with their bodies intact.',
       match: {
         python: {all: [/def serialize_comment\(/, /if row\["deleted"\]/, /"deleted": True/]},
         typescript: {all: [/function serializeComment\(/, /if \(row\.deleted\)/, /deleted: true/]},
@@ -148,9 +148,9 @@ def list_comments(
     tenant: str = Header(default="", alias="X-Tenant-Id"),
     offset: int = Query(default=0),
 ) -> JSONResponse:
-    # TODO: this draft paginates by offset, so a comment posted while the reader scrolls shifts the
+    # TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
     # window: one comment is skipped and another is shown twice. It also returns deleted comments
-    # with their text and reports no counters at all. Review all three.
+    # with their text and reports no counters at all. Fix all three.
     rows = store.page(thread_id, offset, PAGE_SIZE)
     return JSONResponse({"comments": [serialize_comment(row) for row in rows], "next_offset": offset + PAGE_SIZE})
 
@@ -253,7 +253,7 @@ def list_comments(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/threads/:id/comments: a model-generated draft that pages by offset. */
+      starter: `/** GET /v1/threads/:id/comments: flawed code that pages by offset. */
 import Fastify from 'fastify';
 
 import {store} from './store';
@@ -272,9 +272,9 @@ interface CommentRow {
 }
 
 app.get('/v1/threads/:id/comments', async (request, reply) => {
-  // TODO: this draft paginates by offset, so a comment posted while the reader scrolls shifts the
+  // TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
   // window: one comment is skipped and another is shown twice. It also returns deleted comments
-  // with their text and reports no counters at all. Review all three.
+  // with their text and reports no counters at all. Fix all three.
   const {id} = request.params as {id: string};
   const offset = Number((request.query as {offset?: string}).offset ?? 0);
   const rows = await store.page(id, offset, PAGE_SIZE);
@@ -394,9 +394,9 @@ func (s *CommentStore) Page(ctx context.Context, threadID string, offset, limit 
 var store = &CommentStore{}
 
 func listComments(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft paginates by offset, so a comment posted while the reader scrolls shifts the
+	// TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
 	// window: one comment is skipped and another is shown twice. It also returns deleted comments
-	// with their text and reports no counters at all. Review all three.
+	// with their text and reports no counters at all. Fix all three.
 	threadID := r.PathValue("id")
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	rows := store.Page(r.Context(), threadID, offset, pageSize)
@@ -540,9 +540,9 @@ object CommentRead {
   val PageSize = 20
   val store = CommentStore.open()
 
-  // TODO: this draft paginates by offset, so a comment posted while the reader scrolls shifts the
+  // TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
   // window: one comment is skipped and another is shown twice. It also returns deleted comments
-  // with their text and reports no counters at all. Review all three.
+  // with their text and reports no counters at all. Fix all three.
   def list(threadId: String, offset: Long): String = {
     val rows = store.page(threadId, offset, PageSize)
     s"""{"comments":\${rows.map(_.toJson.compactPrint).mkString("[", ",", "]")},"next_offset":\${offset + PageSize}}"""
@@ -659,9 +659,9 @@ using json = nlohmann::json;
 
 constexpr int kPageSize = 20;
 
-// TODO: this draft paginates by offset, so a comment posted while the reader scrolls shifts the
+// TODO: this starter paginates by offset, so a comment posted while the reader scrolls shifts the
 // window: one comment is skipped and another is shown twice. It also returns deleted comments with
-// their text and reports no counters at all. Review all three.
+// their text and reports no counters at all. Fix all three.
 void listComments(CommentStore& store, const httplib::Request& req, httplib::Response& res) {
   const auto threadId = req.matches[1];
   const int offset = req.has_param("offset") ? std::stoi(req.get_param_value("offset")) : 0;

@@ -8,10 +8,10 @@ export const eventsStep: Step = {
   focus: ['queue', 'kafka', 'consumer', 'items'],
   task: `## Task
 
-**Review premise.** The starter publishes one \`review.event\` per resolution. It looks right in a
+**Starting point.** The starter publishes one \`review.event\` per resolution. It looks right in a
 single-reviewer demo. In production the key sends one item's events to different partitions, the
 reviewer's name sits in a retained, replicated topic, and the event can describe a resolution the
-item store never recorded. Review it, fix it, and prove the fix with the checks below.
+item store never recorded. Debug it, fix it, and prove the fix with the checks below.
 
 Implement the **Kafka** lifecycle path for review items:
 
@@ -26,7 +26,7 @@ Implement the **Kafka** lifecycle path for review items:
   payload text: the topic is retained and replicated, so it is exactly the wrong place for user text.
 - **Publish after commit.** The item record commits first; the event is produced only after
   \`store.commit(record)\` succeeds (\`publish_after_commit\`), so an event can never describe a state
-  the item store did not reach. The draft produces first and commits after.
+  the item store did not reach. The starter produces first and commits after.
 - **Idempotent producer with \`acks=all\`.** Set \`acks\` to all (and idempotence on), so a broker
   failover cannot silently drop or duplicate the event.
 
@@ -50,7 +50,7 @@ happened.`,
       id: 'key-source',
       title: 'Events are keyed by source id',
       detail:
-        'The message key is the source id (`event_key(source_id)`), so one source’s lifecycle stays in one partition. The draft keys by the reviewer.',
+        'The message key is the source id (`event_key(source_id)`), so one source’s lifecycle stays in one partition. The starter keys by the reviewer.',
       match: {
         python: {all: [/def event_key\(/, /source_id/]},
         typescript: {all: [/function eventKey\(/, /sourceId/]},
@@ -63,7 +63,7 @@ happened.`,
       id: 'anonymized',
       title: 'Reviewer is an opaque reference; no payload text',
       detail:
-        'The event carries `reviewer_ref` for audit and nothing identifying the reviewer; the payload text never reaches the topic. The draft names the reviewer and inlines the payload.',
+        'The event carries `reviewer_ref` for audit and nothing identifying the reviewer; the payload text never reaches the topic. The starter names the reviewer and inlines the payload.',
       match: {
         python: {all: [/reviewer_ref/], none: [/reviewer_name|reviewer_email|payload_text/]},
         typescript: {all: [/reviewerRef/], none: [/reviewerName|reviewerEmail|payloadText/]},
@@ -76,7 +76,7 @@ happened.`,
       id: 'publish-after-commit',
       title: 'Publish happens after the item record commits',
       detail:
-        'The event is produced through `publish_after_commit`, called only after `store.commit(...)` succeeds. The draft produces first and commits after.',
+        'The event is produced through `publish_after_commit`, called only after `store.commit(...)` succeeds. The starter produces first and commits after.',
       match: {
         python: {all: [/def publish_after_commit\(/]},
         typescript: {all: [/function publishAfterCommit\(/]},
@@ -89,7 +89,7 @@ happened.`,
       id: 'lifecycle-events',
       title: 'Covers the enqueue, assign, resolve and breach lifecycle',
       detail:
-        'The four event types — `enqueued`, `assigned`, `resolved`, `breached` — are all published. The draft only ever publishes a resolution.',
+        'The four event types — `enqueued`, `assigned`, `resolved`, `breached` — are all published. The starter only ever publishes a resolution.',
       match: {
         python: {all: [/enqueued/, /assigned/, /resolved/, /breached/]},
         typescript: {all: [/enqueued/, /assigned/, /resolved/, /breached/]},
@@ -102,7 +102,7 @@ happened.`,
       id: 'acks-all',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer is configured for `acks=all` (and idempotence), so a broker failover cannot drop the event. The draft leaves the default acks.',
+        'The producer is configured for `acks=all` (and idempotence), so a broker failover cannot drop the event. The starter leaves the default acks.',
       match: {
         python: {all: [/acks\s*=\s*['"]all['"]/]},
         typescript: {all: [/acks:\s*-1/]},
@@ -142,8 +142,8 @@ def resolve(
     body: ResolveBody,
     tenant: str = Header(alias="X-Tenant-Id"),
 ) -> JSONResponse:
-    # TODO: this draft keys by the reviewer, names the reviewer in the event and publishes the
-    # resolution before the item record commits. Review all three.
+    # TODO: this starter keys by the reviewer, names the reviewer in the event and publishes the
+    # resolution before the item record commits. Fix all three.
     event = {
         "event_type": "resolution",
         "item_id": item_id,
@@ -241,7 +241,7 @@ def resolve(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/review/items/{id}/resolve: a model-generated draft that publishes too early. */
+      starter: `/** POST /v1/review/items/{id}/resolve: flawed code that publishes too early. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -258,8 +258,8 @@ interface ResolveBody {
 }
 
 app.post('/v1/review/items/:item_id/resolve', async (request, reply) => {
-  // TODO: this draft keys by the reviewer, names the reviewer in the event and publishes the
-  // resolution before the item record commits. Review all three.
+  // TODO: this starter keys by the reviewer, names the reviewer in the event and publishes the
+  // resolution before the item record commits. Fix all three.
   const body = request.body as ResolveBody;
   const event = {
     event_type: 'resolution',
@@ -373,8 +373,8 @@ func resolve(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	var event ReviewEvent
 	_ = json.NewDecoder(r.Body).Decode(&event)
-	// TODO: this draft keys by the reviewer, names the reviewer in the event and publishes the
-	// resolution before the item record commits. Review all three.
+	// TODO: this starter keys by the reviewer, names the reviewer in the event and publishes the
+	// resolution before the item record commits. Fix all three.
 	payload, _ := json.Marshal(event)
 	producer.SendMessage(&sarama.ProducerMessage{
 		Topic: "review.event",
@@ -508,8 +508,8 @@ case class ReviewEvent(eventType: String, itemId: String, sourceId: String, revi
 
 object Events {
   def resolve(tenant: String, event: ReviewEvent): Unit = {
-    // TODO: this draft keys by the reviewer, names the reviewer in the event and publishes the
-    // resolution before the item record commits. Review all three.
+    // TODO: this starter keys by the reviewer, names the reviewer in the event and publishes the
+    // resolution before the item record commits. Fix all three.
     val record = event.copy(eventType = "resolution")
     producer.send(new ProducerRecord[String, String]("review.event", event.reviewerName, record.toString))
     store.commit(tenant, record)
@@ -618,8 +618,8 @@ int main() {
   httplib::Server svr;
   svr.Post("/v1/review/items/([^/]+)/resolve", [](const httplib::Request& req, httplib::Response& res) {
     auto body = json::parse(req.body);
-    // TODO: this draft keys by the reviewer, names the reviewer in the event and publishes the
-    // resolution before the item record commits. Review all three.
+    // TODO: this starter keys by the reviewer, names the reviewer in the event and publishes the
+    // resolution before the item record commits. Fix all three.
     json event = {
         {"event_type", "resolution"},
         {"item_id", "item"},
@@ -711,5 +711,5 @@ int main() {
     'A retained topic is not a place for identity or user text. Carry `reviewer_ref` (an opaque id) for audit and keep the reviewer name, email and payload text out of the event entirely.',
     'Commit first, publish second. Call `publish_after_commit` only after the item record commits, so a crash between the two cannot leave an event describing a resolution that never happened — and set `acks=all` with idempotence so the produce itself survives a broker failover.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated event path. The draft reads fine because one reviewer resolves one item at a time in a single-partition demo. Three defects are being checked. First, the key: keying by reviewer sends one source's events across partitions, so ordering — enqueue, assign, resolve, breach — is no longer guaranteed, and a consumer applying events in order can mark an item resolved and then assigned; key by source id instead. Second, the payload: a retained, replicated topic must not carry reviewer names or payload text, so the event carries an opaque \`reviewer_ref\` and no content. Third, the ordering against the item store: publishing before the commit lets a crash create an event for a resolution that never happened; publish after commit. The subtle point candidates miss is that \`acks=all\` and idempotence are part of correctness here — a failover that drops a resolve event leaves the audit projection disagreeing with the item store forever. Real platforms add a transactional outbox when the store and the broker cannot be committed together, per-tenant topics for isolation, and a schema registry so event fields stay compatible.`,
+  debrief: `The interviewer is testing whether you can debug an event path. The starter reads fine because one reviewer resolves one item at a time in a single-partition demo. Three defects are being checked. First, the key: keying by reviewer sends one source's events across partitions, so ordering — enqueue, assign, resolve, breach — is no longer guaranteed, and a consumer applying events in order can mark an item resolved and then assigned; key by source id instead. Second, the payload: a retained, replicated topic must not carry reviewer names or payload text, so the event carries an opaque \`reviewer_ref\` and no content. Third, the ordering against the item store: publishing before the commit lets a crash create an event for a resolution that never happened; publish after commit. The subtle point candidates miss is that \`acks=all\` and idempotence are part of correctness here — a failover that drops a resolve event leaves the audit projection disagreeing with the item store forever. Real platforms add a transactional outbox when the store and the broker cannot be committed together, per-tenant topics for isolation, and a schema registry so event fields stay compatible.`,
 };

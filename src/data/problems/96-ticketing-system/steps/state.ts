@@ -8,29 +8,29 @@ export const stateStep: Step = {
   focus: ['agent', 'api', 'redis', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the Redis layer: an agent
+**Starting point.** The starter is working code for the Redis layer: an agent
 takes a ticket, replies, and the requester's badge moves. With one agent and no failures it is
 right. It hides a double-ownership race, a lease that never comes back, and a badge that can drift
-from the thread. Review it, fix it, and prove the fix with the checks below.
+from the thread. Debug it, fix it, and prove the fix with the checks below.
 
 Implement the assignment and unread layer the ticket API and the support agents share:
 
 - **The assignment is a lease, one per ticket.** The key is \`lease:{ticket_id}\` and it is taken in
   one round trip: \`SET ... EX LEASE_S NX\` (Python/TypeScript, \`LEASE_S = 120\`),
   \`SetNX\`/\`SetArgs\` with \`leaseTTL\` (Go), \`SetParams.nx().ex(LeaseSeconds)\` (Scala), TTL +
-  \`UpdateType::NOT_EXIST\` (C++, \`kLeaseSeconds\`). The draft assigns with a plain \`SET\`, so a
+  \`UpdateType::NOT_EXIST\` (C++, \`kLeaseSeconds\`). The starter assigns with a plain \`SET\`, so a
   second agent overwrites the first and both believe they own the ticket.
 - **A second owner is refused.** \`POST /v1/tickets/{id}/assign\` that loses the race answers
   **409** with the current owner; the lease's TTL is what frees a ticket when its agent stops
   heartbeating.
 - **Release returns the ticket to the queue.** \`DELETE /v1/tickets/{id}/assign\` checks the
   holder, \`DEL\`s \`lease:{ticket_id}\` and pushes the ticket back onto \`assign:queue\`
-  (\`LPUSH\`/\`ZADD\`); taking the ticket again removes it from the queue. The draft has no release
+  (\`LPUSH\`/\`ZADD\`); taking the ticket again removes it from the queue. The starter has no release
   path at all, so a ticket an agent puts down is stranded.
 - **The unread badge moves with the message.** \`POST /v1/tickets/{id}/messages\` persists the
   message row and then updates the Redis pair — \`RPUSH ticket:{ticket_id}:thread\` and
   \`HINCRBY unread:{requester} {ticket_id} 1\` — in **one atomic unit** (one \`EVAL\`; a
-  \`MULTI\`/\`EXEC\` pipeline is equivalent). The draft issues the append and the counter as two
+  \`MULTI\`/\`EXEC\` pipeline is equivalent). The starter issues the append and the counter as two
   separate calls, so a crash between them leaves a message the badge never counted.
 
 **Failure mode the checks target.** A plain \`SET\` lets two agents own one ticket; a lease with no
@@ -68,7 +68,7 @@ message behind the moment the process dies between the two calls.`,
       id: 'lease-nx',
       title: 'The assignment lease is one SET with NX and a TTL',
       detail:
-        'A ticket lease is taken in a single round trip: `SET lease:{ticket_id} {agent} EX 120 NX` (`nx=True, ex=LEASE_S` in Python, `SetNX`/`SetArgs` with `leaseTTL` in Go, `SetParams.nx().ex(LeaseSeconds)` in Scala, TTL + `UpdateType::NOT_EXIST` in C++). The draft assigns with a plain `SET`, so a second agent overwrites the first and both believe they own the ticket.',
+        'A ticket lease is taken in a single round trip: `SET lease:{ticket_id} {agent} EX 120 NX` (`nx=True, ex=LEASE_S` in Python, `SetNX`/`SetArgs` with `leaseTTL` in Go, `SetParams.nx().ex(LeaseSeconds)` in Scala, TTL + `UpdateType::NOT_EXIST` in C++). The starter assigns with a plain `SET`, so a second agent overwrites the first and both believe they own the ticket.',
       match: {
         python: {all: [/\.set\(/, /\bnx=True/, /\bex=LEASE_S/]},
         typescript: {all: [/\.set\(/, /'NX'/, /'EX'/, /LEASE_S/]},
@@ -81,7 +81,7 @@ message behind the moment the process dies between the two calls.`,
       id: 'lease-release',
       title: 'Release deletes the lease key',
       detail:
-        'Releasing an assignment deletes `lease:{ticket_id}` after checking the caller is the holder, so the ticket can be claimed again. The draft answers release with an `OK` and never touches the key: a ticket an agent puts down stays leased to that agent.',
+        'Releasing an assignment deletes `lease:{ticket_id}` after checking the caller is the holder, so the ticket can be claimed again. The starter answers release with an `OK` and never touches the key: a ticket an agent puts down stays leased to that agent.',
       match: {
         python: {all: [/\.delete\([^\n]*(key|lease)/, /lease_key\(/]},
         typescript: {all: [/\.del\(/, /leaseKey\(/]},
@@ -94,7 +94,7 @@ message behind the moment the process dies between the two calls.`,
       id: 'atomic-append',
       title: 'The message append and the unread badge move in one atomic unit',
       detail:
-        'One `EVAL`/`NewScript` call carries both writes: `RPUSH ticket:{ticket_id}:thread` and `HINCRBY unread:{requester} {ticket_id} 1` (a `MULTI`/`EXEC` pipeline is equivalent). The draft issues them as two separate round trips, so a crash between them leaves a message the badge never counted.',
+        'One `EVAL`/`NewScript` call carries both writes: `RPUSH ticket:{ticket_id}:thread` and `HINCRBY unread:{requester} {ticket_id} 1` (a `MULTI`/`EXEC` pipeline is equivalent). The starter issues them as two separate round trips, so a crash between them leaves a message the badge never counted.',
       match: {
         python: {all: [/(APPEND_LUA|\.pipeline\(|\.multi\()/, /(\.eval\(|\.execute\()/, /RPUSH/, /HINCRBY/]},
         typescript: {all: [/(APPEND_LUA|\.pipeline\(|\.multi\()/, /(\.eval\(|\.exec\()/, /RPUSH/, /HINCRBY/]},
@@ -107,7 +107,7 @@ message behind the moment the process dies between the two calls.`,
       id: 'lease-conflict',
       title: 'A second owner is refused with 409',
       detail:
-        'When the lease is already held, the assignment answers `409 Conflict` with the current owner instead of assigning the ticket to a second agent. The draft writes the lease unconditionally and reports success, so two agents work the same ticket and split the thread.',
+        'When the lease is already held, the assignment answers `409 Conflict` with the current owner instead of assigning the ticket to a second agent. The starter writes the lease unconditionally and reports success, so two agents work the same ticket and split the thread.',
       match: {
         python: {all: [/status_code\s*=\s*409/, /(already|held|owner)/]},
         typescript: {all: [/\.code\(\s*409\s*\)/, /(already|held|owner)/]},
@@ -120,7 +120,7 @@ message behind the moment the process dies between the two calls.`,
       id: 'queue-return',
       title: 'A released lease puts the ticket back on the queue',
       detail:
-        'Release pushes the ticket back onto `assign:queue` (`ZADD` the claim order; the list form `LPUSH` is fine) after deleting the lease, and taking the ticket removes it again, so the next agent can pick it up. The draft has no release path, so a dropped ticket is stranded off the queue.',
+        'Release pushes the ticket back onto `assign:queue` (`ZADD` the claim order; the list form `LPUSH` is fine) after deleting the lease, and taking the ticket removes it again, so the next agent can pick it up. The starter has no release path, so a dropped ticket is stranded off the queue.',
       match: {
         python: {all: [/\.zadd\(|\.lpush\(/, /QUEUE/]},
         typescript: {all: [/\.zadd\(|\.lpush\(/, /QUEUE/]},
@@ -132,7 +132,7 @@ message behind the moment the process dies between the two calls.`,
   ],
   code: {
     python: {
-      starter: `"""Assignment leases and unread badges: a model-generated draft of the Redis layer."""
+      starter: `"""Assignment leases and unread badges: flawed code of the Redis layer."""
 import redis
 from fastapi import FastAPI, Header
 from pydantic import BaseModel
@@ -252,7 +252,7 @@ def add_message(ticket_id: str, message: Message, agent: str = Header(alias="X-A
 `,
     },
     typescript: {
-      starter: `/** Assignment leases and unread badges: a model-generated draft of the Redis layer. */
+      starter: `/** Assignment leases and unread badges: flawed code of the Redis layer. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -356,7 +356,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// Assignment leases and unread badges: a model-generated draft of the Redis layer.
+      starter: `// Assignment leases and unread badges: flawed code of the Redis layer.
 package main
 
 import (
@@ -875,7 +875,7 @@ int main() {
   },
   hints: [
     'The lease is one command: `SET lease:{ticket_id} {agent} EX 120 NX`. A `GET` followed by a `SET`, or a `SET` with no `NX`, is check-then-act — two agents both read the ticket as free and both write it, and last-writer-wins silently fires the previous owner. Only the caller the command answers `OK` to owns the ticket.',
-    'Release is a compare-and-delete on the same key, then a push back onto `assign:queue`, because a ticket nobody owns must be offerable again. Keep the TTL: it is the only thing that frees a ticket whose agent stopped heartbeating. In the draft the release handler answers `OK` while the key stays behind, so the ticket is stranded.',
+    'Release is a compare-and-delete on the same key, then a push back onto `assign:queue`, because a ticket nobody owns must be offerable again. Keep the TTL: it is the only thing that frees a ticket whose agent stopped heartbeating. In the starter the release handler answers `OK` while the key stays behind, so the ticket is stranded.',
     "The append and the badge are two writes to two keys, and two keys are two round trips unless one script carries them: `RPUSH` the message id and `HINCRBY` the requester's counter inside one `EVAL`. A crash between the calls leaves a message in the thread that the badge never counted — and the badge is the only place that fact is stored.",
   ],
   debrief: `The interview question behind this step is ownership under failure: a lease is the only honest way to say "this one agent owns this one ticket right now". A plain \`SET\` looks equivalent because it always writes, but it has no notion of "already taken" and no notion of "taken until", so the ticket ends up with two owners and no way back to the queue. The same instinct produces \`GET\`-then-\`SET\` and the bare \`DEL\` release — a delete can remove a lease that now belongs to someone else, which is why the release path checks the holder first (or does the compare-and-delete in Lua). Candidates also miss the two-key write: the append and the unread badge are separate commands, so a crash between them leaves a message nobody is told about, and the badge is the only place that fact lives. Real systems go further: a heartbeat extends the lease while the agent is actually working, an expired lease escalates instead of quietly returning to the queue, the unread badge is derived from an append-only thread plus a per-requester pointer so it cannot drift, and the lease value carries the holder plus a fencing token so a stale agent's writes can be rejected after its lease expired.`,

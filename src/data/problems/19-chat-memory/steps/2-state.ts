@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a turn is pushed onto a list and the demo shows
+The starter is working code: a turn is pushed onto a list and the demo shows
 it. Two appends in flight and one colliding session id break it. Find the flaws, fix them, and
 prove the fix.
 
@@ -16,18 +16,18 @@ Implement the recent-turn buffer behind the append endpoint:
 
 - Recent turns live in **one Redis list per (tenant, session)**:
   \`turns:{tenant}:{session_id}\`. The tenant in the key is not cosmetic — two tenants can pick the
-  same session id, and the draft's \`turns:{session_id}\` key puts them in one buffer where they
+  same session id, and the starter's \`turns:{session_id}\` key puts them in one buffer where they
   read each other's turns.
 - The list holds the **last 50 turns**: push the new turn, then trim to the most recent 50. The
   trim keeps the newest end (\`LTRIM 0 49\`) and drops the oldest.
 - The list **expires 24 hours after the last write** (\`EXPIRE 86400\`), so an abandoned session
   frees itself instead of living forever.
-- Append, trim and expiry are **one atomic script**. The draft issues \`LPUSH\` and then a
+- Append, trim and expiry are **one atomic script**. The starter issues \`LPUSH\` and then a
   client-side \`LTRIM\`; two concurrent appends can interleave them, and whichever trim runs last
   may drop the turn the other append just added.
 
 **Failure mode the checks target.** Under a small cap a concurrent pair of appends must lose
-nothing: exactly one turn is trimmed past the cap, never an appended turn. The draft also leaks
+nothing: exactly one turn is trimmed past the cap, never an appended turn. The starter also leaks
 memory because nothing ever expires, and it lets one tenant's session id collide with another's.
 
 ## What to keep
@@ -84,7 +84,7 @@ key scope and the atomicity: one Lua script that pushes, trims to the cap and re
       id: 'atomic-lua',
       title: 'Pushes, trims and expires in one atomic script',
       detail:
-        'A single Lua `EVAL` does the push, the trim and the expiry. The draft splits them into client-side calls, so two concurrent appends can interleave and lose a turn.',
+        'A single Lua `EVAL` does the push, the trim and the expiry. The starter splits them into client-side calls, so two concurrent appends can interleave and lose a turn.',
       match: {
         python: {all: [/BUFFER_LUA/, /\.eval\(/]},
         typescript: {all: [/BUFFER_LUA/, /\.eval\(/]},
@@ -110,7 +110,7 @@ key scope and the atomicity: one Lua script that pushes, trims to the cap and re
       id: 'ttl-24h',
       title: 'Expires the buffer 24 hours after the last write',
       detail:
-        'The script sets `EXPIRE` to 86400 seconds on every write. The draft never sets a TTL, so idle sessions accumulate and memory only grows.',
+        'The script sets `EXPIRE` to 86400 seconds on every write. The starter never sets a TTL, so idle sessions accumulate and memory only grows.',
       match: {
         python: {all: [/EXPIRE/, /86400|86_400/]},
         typescript: {all: [/EXPIRE/, /86400|86_400/]},
@@ -180,7 +180,7 @@ def append_turn(id: str, turn: Turn, tenant: str = Header(alias="X-Tenant-Id")) 
 `,
     },
     typescript: {
-      starter: `/** POST /v1/sessions/:id/turns: a model-generated draft that trims from the client. */
+      starter: `/** POST /v1/sessions/:id/turns: flawed code that trims from the client. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

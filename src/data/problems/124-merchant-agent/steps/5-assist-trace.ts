@@ -8,9 +8,9 @@ export const assistTraceStep: Step = {
   focus: ['api', 'kafka', 'builder', 'gtx'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every finished turn becomes an
+**Starting point.** The starter is working code: every finished turn becomes an
 event, and a consumer turns events into ground-truth candidates, so the demo shows the set growing.
-Four production contracts are broken. Review it, fix it, and prove the fix.
+Four production contracts are broken. Debug it, fix it, and prove the fix.
 
 \`publish(turn)\` is how a finished assist turn reaches the evaluation pipeline, and the
 **gtx-builder** consumer is how the ground-truth set of step 4 is fed from production.
@@ -56,7 +56,7 @@ commit-before-insert trades correctness for exactly-once *looking* code.`,
       id: 'shop-key',
       title: 'Keyed by shop, carries the turn id',
       detail:
-        'The message key is the shop (partition by shop) and the event carries `turn_id`. The draft keys by the turn id, so one shop’s turns scatter across partitions and lose order.',
+        'The message key is the shop (partition by shop) and the event carries `turn_id`. The starter keys by the turn id, so one shop’s turns scatter across partitions and lose order.',
       match: {
         python: {all: [/key\s*=\s*turn\.shop/, /turn_id/]},
         typescript: {all: [/key:\s*turn\.shop/, /turn_id/]},
@@ -82,7 +82,7 @@ commit-before-insert trades correctness for exactly-once *looking* code.`,
       id: 'no-merchant-data',
       title: 'No merchant message or tool results in the event or logs',
       detail:
-        'Neither the event nor any log line carries the merchant’s message or the tool results. The draft copies both into the event — a leak that is retained and replicated with the topic.',
+        'Neither the event nor any log line carries the merchant’s message or the tool results. The starter copies both into the event — a leak that is retained and replicated with the topic.',
       match: {
         python: {none: [/merchant_?message|tool_?results/i]},
         typescript: {none: [/merchant_?message|tool_?results/i]},
@@ -95,7 +95,7 @@ commit-before-insert trades correctness for exactly-once *looking* code.`,
       id: 'outbox-fallback',
       title: 'Falls back to the outbox when the produce fails',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`) inside the error branch instead of dropping the trace or failing the turn. The draft ignores the broker result entirely.',
+        'A rejected produce writes an outbox row (`insert_outbox`/`insertOutbox`) inside the error branch instead of dropping the trace or failing the turn. The starter ignores the broker result entirely.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -108,7 +108,7 @@ commit-before-insert trades correctness for exactly-once *looking* code.`,
       id: 'insert-before-commit',
       title: 'Inserts the candidate before committing the offset',
       detail:
-        'The consumer inserts the ground-truth candidate before committing the offset; committing first makes a crash lose the candidate forever. The draft commits first.',
+        'The consumer inserts the ground-truth candidate before committing the offset; committing first makes a crash lose the candidate forever. The starter commits first.',
       match: {
         python: {order: [/\.insert_candidate\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.insertCandidate\(/, /commitOffsets\(/]},
@@ -262,7 +262,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** assist.trace: a model-generated draft that keys by turn id and commits too early. */
+      starter: `/** assist.trace: flawed code that keys by turn id and commits too early. */
 import {Kafka} from 'kafkajs';
 
 import {gtx} from './stores';
@@ -823,5 +823,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is checking the three things a generated Kafka snippet almost always gets wrong, plus the one that is specific to an assistant. The message key is an ordering contract: partition by shop and one merchant's turns arrive in order; key by turn id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer must insert the candidate before the offset commit, or a crash between the two loses it permanently. A broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes. The assistant-specific one is the payload. The source builds its ground-truth sets by sampling real merchant conversations, and that is a deliberate, consented path with labelling by product experts — not a trace topic that every service with a consumer group can read. The trace carries ids, tool names, latency, tokens and the judge's score, which is everything the evaluation pipeline needs to pick what to sample. Real platforms add schema registry enforcement so a field like \`merchant_message\` cannot be added by accident, a relay with backoff for the outbox, and a dead-letter topic for candidates the builder cannot insert.`,
+  debrief: `The interviewer is checking the three things a Kafka snippet almost always gets wrong, plus the one that is specific to an assistant. The message key is an ordering contract: partition by shop and one merchant's turns arrive in order; key by turn id and they do not. Exactly-once *looking* code is not exactly-once: the producer needs idempotence and acks=all for retries, and the consumer must insert the candidate before the offset commit, or a crash between the two loses it permanently. A broker is not a database: when the produce fails, the durable path is an outbox row that a relay republishes. The assistant-specific one is the payload. The source builds its ground-truth sets by sampling real merchant conversations, and that is a deliberate, consented path with labelling by product experts — not a trace topic that every service with a consumer group can read. The trace carries ids, tool names, latency, tokens and the judge's score, which is everything the evaluation pipeline needs to pick what to sample. Real platforms add schema registry enforcement so a field like \`merchant_message\` cannot be added by accident, a relay with backoff for the outbox, and a dead-letter topic for candidates the builder cannot insert.`,
 };

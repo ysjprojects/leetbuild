@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Comments service on the AI-era track: the course is not "write a CRUD endpoint", it is the review
- * you owe a model-generated comment service before real threads scroll through it. Validated,
- * idempotent replies → Redis counters committed atomically with the write → a moderation and
- * notification fan-out with a deadline, one token per attempt and no cross-cancellation → comment
- * events keyed by thread, published after the commit, never carrying bodies → a keyset-paginated
- * read that yields every comment exactly once while the thread keeps moving.
+ * Comments service: the course is not "write a CRUD endpoint", it is the debugging you owe a
+ * comment service before real threads scroll through it. Validated, idempotent replies → Redis
+ * counters committed atomically with the write → a moderation and notification fan-out with a
+ * deadline, one token per attempt and no cross-cancellation → comment events keyed by thread,
+ * published after the commit, never carrying bodies → a keyset-paginated read that yields every
+ * comment exactly once while the thread keeps moving.
  */
 export const commentsServiceProblem: Problem = {
   id: 'comments-service',
@@ -20,7 +20,6 @@ export const commentsServiceProblem: Problem = {
   tagline: 'Threaded comments with stable pagination and moderation that never duplicates.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Comments Service
 
@@ -65,12 +64,12 @@ One service, **commentsd**, with five pieces:
    with their reply counts, tombstones for deleted comments, and a page that is stable while new
    comments arrive.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

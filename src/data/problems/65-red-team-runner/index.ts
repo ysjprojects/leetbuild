@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Red team runner on the AI-era track: the course is not "send a request and see what happens", it
- * is the review you owe a model-generated adversarial runner before it points a probe set at
- * something. A registered, non-production target only → one atomic Redis claim per probe with an
- * hourly per-target budget → a deadline-bounded call with a shared kill switch and a resumable
- * abort → target-keyed finding events that carry an evidence reference, never the attack → a
- * coverage report that calls a skipped category incomplete.
+ * Red team runner: the course is not "send a request and see what happens", it is the debugging
+ * you owe an adversarial runner before it points a probe set at something. A registered,
+ * non-production target only → one atomic Redis claim per probe with an hourly per-target budget →
+ * a deadline-bounded call with a shared kill switch and a resumable abort → target-keyed finding
+ * events that carry an evidence reference, never the attack → a coverage report that calls a
+ * skipped category incomplete.
  */
 export const redTeamRunnerProblem: Problem = {
   id: 'red-team-runner',
@@ -20,7 +20,7 @@ export const redTeamRunnerProblem: Problem = {
   tagline: 'Adversarial probes that run safely, cover their cases and produce reproducible findings.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Red Team Runner
 
@@ -66,12 +66,12 @@ One service, **redteamd**, with five pieces:
    category with blocked, succeeded and unfixed counts, a warning for every category the kill switch
    skipped, and a status that is \`incomplete\` while any category is skipped.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

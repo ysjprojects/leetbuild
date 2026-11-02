@@ -8,20 +8,20 @@ export const dependencyStep: Step = {
   focus: ['api', 'classifier', 'queue'],
   task: `## Task
 
-The starter is a plausible model-generated draft: the classifier answers, the item gets a route, the
-demo passes. The draft treats the model as an authority it is not. Fix the evidence bar, the
+**Starting point.** The starter is working code: the classifier answers, the item gets a route, the
+demo passes. The starter treats the model as an authority it is not. Fix the evidence bar, the
 deadline and the retry set, and prove the fix.
 
 Implement the classifier call that decides between an automatic action and the human queue:
 
-- The call runs under a **400 ms** deadline (\`DEADLINE_MS = 400\`). The draft calls with no deadline,
+- The call runs under a **400 ms** deadline (\`DEADLINE_MS = 400\`). The starter calls with no deadline,
   so a slow classifier holds the request until the client gives up.
 - Retry only on \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`. \`REFUSED\` and every other code is terminal
-  and must **not** be retried — the draft loops on \`REFUSED\`, turning a policy refusal into a hot
+  and must **not** be retried — the starter loops on \`REFUSED\`, turning a policy refusal into a hot
   loop.
 - An automatic removal requires **both** a confidence of at least **0.98**
   (\`AUTO_REMOVE_CONFIDENCE\`) **and** a second, independent corroborating signal
-  (\`corroborates(signal)\`). The draft auto-removes at **0.6** with nothing else behind it, so
+  (\`corroborates(signal)\`). The starter auto-removes at **0.6** with nothing else behind it, so
   borderline content vanishes on a weak score.
 - Everything weaker goes to the human queue: a score below the bar, a missing second signal, and
   critically a **timeout or an unavailable classifier** — a failure to classify is never a licence
@@ -29,7 +29,7 @@ Implement the classifier call that decides between an automatic action and the h
 - Every automatic removal **records its evidence** (score, signal and model version) before it
   returns, so the decision can be audited after the model changes.
 
-**Failure mode the checks target.** A classifier is advice under a deadline, not a judge. The draft
+**Failure mode the checks target.** A classifier is advice under a deadline, not a judge. The starter
 fails three ways: a threshold so low it acts on noise, a retry set that includes a terminal code,
 and a "safe on error" path that lets unclassified content through. Each one is the kind of defect
 that only shows up when the model is wrong or slow.`,
@@ -53,7 +53,7 @@ that only shows up when the model is wrong or slow.`,
       id: 'deadline',
       title: 'Calls the classifier under a 400 ms deadline',
       detail:
-        'Every `Classify` runs under a **400 ms** deadline (`DEADLINE_MS` / `deadlineMS`). The draft calls with no deadline at all, so a wedged classifier holds the request open until the caller times out.',
+        'Every `Classify` runs under a **400 ms** deadline (`DEADLINE_MS` / `deadlineMS`). The starter calls with no deadline at all, so a wedged classifier holds the request open until the caller times out.',
       match: {
         python: {all: [/DEADLINE_MS/, /timeout=/]},
         typescript: {all: [/DEADLINE_MS/, /deadline/]},
@@ -66,7 +66,7 @@ that only shows up when the model is wrong or slow.`,
       id: 'retry-policy',
       title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED',
       detail:
-        'The retry set is exactly `UNAVAILABLE` and `DEADLINE_EXCEEDED`; `REFUSED` is terminal and is never retried. The draft retries `REFUSED`, so a policy refusal becomes an infinite loop.',
+        'The retry set is exactly `UNAVAILABLE` and `DEADLINE_EXCEEDED`; `REFUSED` is terminal and is never retried. The starter retries `REFUSED`, so a policy refusal becomes an infinite loop.',
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/REFUSED/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/REFUSED/]},
@@ -79,7 +79,7 @@ that only shows up when the model is wrong or slow.`,
       id: 'auto-threshold',
       title: 'Requires 0.98 confidence to act',
       detail:
-        'An automatic action needs `AUTO_REMOVE_CONFIDENCE = 0.98`. The draft acts at **0.6**, which is inside the classifier’s noise band, so ordinary posts get removed.',
+        'An automatic action needs `AUTO_REMOVE_CONFIDENCE = 0.98`. The starter acts at **0.6**, which is inside the classifier’s noise band, so ordinary posts get removed.',
       match: {
         python: {all: [/AUTO_REMOVE_CONFIDENCE/, /0\.98/]},
         typescript: {all: [/AUTO_REMOVE_CONFIDENCE/, /0\.98/]},
@@ -92,7 +92,7 @@ that only shows up when the model is wrong or slow.`,
       id: 'corroboration',
       title: 'Acts only with a second signal, and records the evidence',
       detail:
-        '`corroborates(signal)` must confirm a second, independent signal before an automatic removal, and the removal records its `evidence` (score, signal, model version). The draft removes on the score alone and keeps no evidence.',
+        '`corroborates(signal)` must confirm a second, independent signal before an automatic removal, and the removal records its `evidence` (score, signal, model version). The starter removes on the score alone and keeps no evidence.',
       match: {
         python: {all: [/SECOND_SIGNAL/, /corroborates\(/, /evidence/]},
         typescript: {all: [/SECOND_SIGNAL/, /corroborates\(/, /evidence/]},
@@ -105,7 +105,7 @@ that only shows up when the model is wrong or slow.`,
       id: 'timeout-safe',
       title: 'Routes a classifier failure to humans, never to allow',
       detail:
-        'A timeout or an unavailable classifier returns the human queue, not an `allow`. The draft treats the error as safe and publishes the content unclassified.',
+        'A timeout or an unavailable classifier returns the human queue, not an `allow`. The starter treats the error as safe and publishes the content unclassified.',
       match: {
         python: {all: [/except grpc\.RpcError/, /queue_for_human\(/]},
         typescript: {all: [/catch\s*\(\s*err/, /queueForHuman\(/]},
@@ -130,7 +130,7 @@ classifier = classifier_pb2_grpc.ClassifierStub(channel)
 
 
 def triage(content_id: str, text: str, signal: str) -> dict:
-    # TODO: this draft auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
+    # TODO: this starter auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
     # so borderline content is removed on noise and unclassified content is published.
     try:
         request = classifier_pb2.ClassifyRequest(content_id=content_id, text=text)
@@ -196,7 +196,7 @@ def triage(content_id: str, text: str, signal: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Classifier triage: a model-generated draft that acts on noise and retries refusals. */
+      starter: `/** Classifier triage: flawed code that acts on noise and retries refusals. */
 import * as grpc from '@grpc/grpc-js';
 
 import {classifier} from './classifier';
@@ -211,7 +211,7 @@ function classify(contentId: string, text: string): Promise<{confidence: number;
 }
 
 export async function triage(contentId: string, text: string, signal: string): Promise<Record<string, unknown>> {
-  // TODO: this draft auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
+  // TODO: this starter auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
   // so borderline content is removed on noise and unclassified content is published.
   try {
     const score = await classify(contentId, text);
@@ -302,7 +302,7 @@ const autoRemoveConfidence = 0.6
 var retryable = map[codes.Code]bool{codes.Unavailable: true, codes.Refused: true}
 
 func triage(ctx context.Context, client classifierv1.ClassifierClient, contentID, text, signal string) (map[string]any, error) {
-	// TODO: this draft auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
+	// TODO: this starter auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
 	// so borderline content is removed on noise and unclassified content is published.
 	score, err := client.Classify(ctx, &classifierv1.ClassifyRequest{ContentId: contentID, Text: text})
 	if err != nil {
@@ -382,7 +382,7 @@ object Triage {
   val Retryable = Set(Status.UNAVAILABLE, Status.REFUSED)
 
   def triage(client: ClassifierGrpc.ClassifierBlockingStub, contentId: String, text: String, signal: String): Map[String, Any] = {
-    // TODO: this draft auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
+    // TODO: this starter auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
     // so borderline content is removed on noise and unclassified content is published.
     try {
       val score = client.classify(ClassifyRequest(contentId, text))
@@ -458,7 +458,7 @@ using Fields = std::map<std::string, std::string>;
 
 Fields triage(Classifier::Stub& stub, const std::string& contentId, const std::string& text,
               const std::string& signal) {
-  // TODO: this draft auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
+  // TODO: this starter auto-removes at 0.6, retries REFUSED calls, and treats a timeout as safe,
   // so borderline content is removed on noise and unclassified content is published.
   grpc::ClientContext ctx;
   ClassifyRequest request;
@@ -541,5 +541,5 @@ Fields triage(Classifier::Stub& stub, const std::string& contentId, const std::s
     'An automatic action takes two independent facts: a very high confidence and a corroborating signal. Write the bar as a named constant (`AUTO_REMOVE_CONFIDENCE = 0.98`) and require `corroborates(signal)` alongside it. A confidence of 0.6 is the model saying “probably”, which is a reason to queue, not to remove.',
     'Record the evidence before you return the removal. Score, signal and model version are what let an auditor answer “why was this removed?” six months later, when the model has already been replaced and the score cannot be reproduced.',
   ],
-  debrief: `The interviewer is testing whether you treat a classifier as a bounded, fallible dependency rather than an oracle. The draft reads fine because the demo sends clear-cut content to a healthy model. Three defects are being checked: the failure path (a timeout must route to humans, not allow), the retry set (a \`REFUSED\` is a decision, not a transient fault — retrying it is a hot loop), and the evidence bar (a low threshold plus no corroboration means the model alone removes content). Real systems add a canary that shadows auto-actions before they take effect, a per-rule precision dashboard, a review of deleted decisions after a model upgrade, and a hard cap on how much content any single model version may remove.`,
+  debrief: `The interviewer is testing whether you treat a classifier as a bounded, fallible dependency rather than an oracle. The starter reads fine because the demo sends clear-cut content to a healthy model. Three defects are being checked: the failure path (a timeout must route to humans, not allow), the retry set (a \`REFUSED\` is a decision, not a transient fault — retrying it is a hot loop), and the evidence bar (a low threshold plus no corroboration means the model alone removes content). Real systems add a canary that shadows auto-actions before they take effect, a per-rule precision dashboard, a review of deleted decisions after a model upgrade, and a hard cap on how much content any single model version may remove.`,
 };

@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * IoT hub on the AI-era track: the course is not "accept a command from a device", it is the
- * review you owe a model-generated device-management layer before it unlocks a door twice. Commands
- * that carry their identity, a validity window and an acknowledgment → a Redis shadow whose desired
- * and reported documents keep independent versions → gRPC delivery to the device gateway with a
- * deadline and queue-only-until-expiry semantics → command events keyed by device with an outbox →
- * a shadow read that shows desired, reported and their divergence instead of a merged blur.
+ * IoT hub: the course is not "accept a command from a device", it is the debugging you owe a
+ * device-management layer before it unlocks a door twice. Commands that carry their identity, a
+ * validity window and an acknowledgment → a Redis shadow whose desired and reported documents keep
+ * independent versions → gRPC delivery to the device gateway with a deadline and
+ * queue-only-until-expiry semantics → command events keyed by device with an outbox → a shadow read
+ * that shows desired, reported and their divergence instead of a merged blur.
  */
 export const iotHubProblem: Problem = {
   id: 'iot-hub',
@@ -20,7 +20,6 @@ export const iotHubProblem: Problem = {
   tagline: 'Device shadows that reconcile desired and reported state without losing either.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# IoT Hub
 
@@ -64,12 +63,12 @@ One service, **iothub**, with five pieces:
 5. \`GET /v1/devices/{id}/shadow\`: desired and reported documents, both versions, an explicit
    divergence list, and **404** for a device the caller does not own.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real IoT feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real IoT feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

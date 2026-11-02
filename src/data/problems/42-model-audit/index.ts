@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Model audit trail on the AI-era track: the course is not "write a row when the model answers", it
- * is the review you owe a model-generated audit service before an auditor trusts it. An
- * append-only HTTP endpoint that stores digests, never inputs → a per-tenant hash chain whose head
- * advances inside one Lua script → a gRPC receipt signer with a deadline and an unsigned queue → a
- * tenant-keyed `audit.appended` event with no decision payload and an outbox → a verify endpoint
- * that recomputes the chain and reports the first divergence.
+ * Model audit trail: the course is not "write a row when the model answers", it is the debugging
+ * you owe an audit service before an auditor trusts it. An append-only HTTP endpoint that stores
+ * digests, never inputs → a per-tenant hash chain whose head advances inside one Lua script → a
+ * gRPC receipt signer with a deadline and an unsigned queue → a tenant-keyed `audit.appended` event
+ * with no decision payload and an outbox → a verify endpoint that recomputes the chain and reports
+ * the first divergence.
  */
 export const modelAuditProblem: Problem = {
   id: 'model-audit',
@@ -20,7 +20,7 @@ export const modelAuditProblem: Problem = {
   tagline: 'An append-only record of every decision, verifiable later without keeping the inputs.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Model Audit Trail
 
@@ -64,12 +64,12 @@ One service, **auditd**, with five pieces:
    every hash, answers with the chain length covered and the first divergence, and **404**s a foreign
    chain id.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,7 +8,7 @@ export const refundDependencyStep: Step = {
   focus: ['api', 'psp', 'records'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the PSP client: the happy
+**Starting point.** The starter is working code for the PSP client: the happy
 path refunds correctly, so the demo passes. Every failure path is wrong, and one of them pays twice.
 Find them, fix them, and prove the fix.
 
@@ -30,7 +30,7 @@ money at the provider:
   **releases exactly what was reserved** — the reservation this refund took, never the payment's
   whole refundable balance.
 
-**Failure mode the checks target.** The draft calls the PSP once with
+**Failure mode the checks target.** The starter calls the PSP once with
 \`idempotency-key = uuid4()\`, so the first retry by any layer in the call chain is a second refund at
 the provider; it treats the resulting timeout as a failure in its own records while the PSP may have
 succeeded; and it releases the payment's balance on a terminal rejection, handing the customer a
@@ -69,7 +69,7 @@ credit it never took.`,
       id: 'deadline',
       title: 'Every attempt carries a 5-second deadline',
       detail:
-        'The call is made with a 5-second deadline — a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + PSP_DEADLINE_MS`. The draft calls the PSP with no deadline at all.',
+        'The call is made with a 5-second deadline — a call timeout, a context with timeout, `withDeadlineAfter`, `set_deadline` or `deadline: Date.now() + PSP_DEADLINE_MS`. The starter calls the PSP with no deadline at all.',
       match: {
         python: {all: [/PSP_DEADLINE_S\s*=\s*5/, /timeout=PSP_DEADLINE_S/, /\.Refund\(/]},
         typescript: {
@@ -84,7 +84,7 @@ credit it never took.`,
       id: 'stable-key',
       title: 'Sends the refund id as the idempotency key',
       detail:
-        'The `idempotency-key` metadata is the refund id on every attempt, and no key is generated per call. The draft sends `uuid4()`/`randomUUID()`/`NewString()`, so a retry is an independent refund to the PSP.',
+        'The `idempotency-key` metadata is the refund id on every attempt, and no key is generated per call. The starter sends `uuid4()`/`randomUUID()`/`NewString()`, so a retry is an independent refund to the PSP.',
       match: {
         python: {all: [/idempotency-key/, /refund_id/], none: [/uuid4\(\)/]},
         typescript: {all: [/idempotency-key/, /refundId/], none: [/randomUUID\(/]},
@@ -97,7 +97,7 @@ credit it never took.`,
       id: 'retry-policy',
       title: 'Retries the two unknown-outcome codes, three attempts',
       detail:
-        'At most `MAX_ATTEMPTS = 3` attempts, retrying only `DEADLINE_EXCEEDED` and `UNAVAILABLE`; everything else is terminal. The draft makes one attempt and gives up.',
+        'At most `MAX_ATTEMPTS = 3` attempts, retrying only `DEADLINE_EXCEEDED` and `UNAVAILABLE`; everything else is terminal. The starter makes one attempt and gives up.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3/, /range\(MAX_ATTEMPTS\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3/, /attempt\s*<\s*MAX_ATTEMPTS/]},
@@ -110,7 +110,7 @@ credit it never took.`,
       id: 'pending-reconcile',
       title: 'Records an unknown outcome as pending and reconciles it',
       detail:
-        'When the attempts are exhausted the refund is recorded **PENDING** and reconciled with the PSP (`GetRefund`) before the customer is told anything. The draft writes it off as a failure while the PSP may have succeeded.',
+        'When the attempts are exhausted the refund is recorded **PENDING** and reconciled with the PSP (`GetRefund`) before the customer is told anything. The starter writes it off as a failure while the PSP may have succeeded.',
       match: {
         python: {all: [/PENDING/, /mark_pending\(/, /GetRefund/]},
         typescript: {all: [/PENDING/, /markPending\(/, /GetRefund/]},
@@ -123,7 +123,7 @@ credit it never took.`,
       id: 'terminal-release',
       title: 'A terminal rejection releases only the reservation',
       detail:
-        'A terminal rejection marks the refund `REJECTED` and releases the reservation this refund took — never the payment’s balance. The draft releases the payment, giving away credit it never held.',
+        'A terminal rejection marks the refund `REJECTED` and releases the reservation this refund took — never the payment’s balance. The starter releases the payment, giving away credit it never held.',
       match: {
         python: {all: [/REJECTED/, /release_reservation\(/]},
         typescript: {all: [/REJECTED/, /releaseReservation\(/]},
@@ -173,9 +173,9 @@ ledger = Ledger()
 
 
 def refund_via_psp(refund_id: str, payment_id: str, amount_minor: int) -> str:
-    # TODO: this draft mints a fresh idempotency key for every call, so a retry after a timeout
+    # TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout
     # refunds the customer twice; it has no deadline, treats a timeout as a permanent failure, and
-    # releases the whole payment when the PSP rejects the refund. Review all four.
+    # releases the whole payment when the PSP rejects the refund. Fix all four.
     metadata = (("idempotency-key", str(uuid.uuid4())),)
     request = psp_pb2.RefundRequest(payment_id=payment_id, amount_minor=amount_minor, ref=refund_id)
     try:
@@ -262,7 +262,7 @@ def refund_via_psp(refund_id: str, payment_id: str, amount_minor: int) -> str:
 `,
     },
     typescript: {
-      starter: `/** PSP refund call: a model-generated draft that mints a key per attempt. */
+      starter: `/** PSP refund call: flawed code that mints a key per attempt. */
 import {randomUUID} from 'node:crypto';
 
 import * as grpc from '@grpc/grpc-js';
@@ -299,9 +299,9 @@ export const ledger = {
 };
 
 export async function refundViaPsp(refundId: string, paymentId: string, amountMinor: number): Promise<string> {
-  // TODO: this draft mints a fresh idempotency key for every call, so a retry after a timeout
+  // TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout
   // refunds the customer twice; it has no deadline, treats a timeout as a permanent failure, and
-  // releases the whole payment when the PSP rejects the refund. Review all four.
+  // releases the whole payment when the PSP rejects the refund. Fix all four.
   const metadata = new grpc.Metadata();
   metadata.set('idempotency-key', randomUUID());
   try {
@@ -457,9 +457,9 @@ var (
 	ledger  = &Ledger{}
 )
 
-// TODO: this draft mints a fresh idempotency key for every call, so a retry after a timeout refunds
+// TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout refunds
 // the customer twice; it has no deadline, treats a timeout as a permanent failure, and releases the
-// whole payment when the PSP rejects the refund. Review all four.
+// whole payment when the PSP rejects the refund. Fix all four.
 func refundViaPSP(ctx context.Context, refundID, paymentID string, amountMinor int64) string {
 	callCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("idempotency-key", uuid.NewString()))
 	reply, err := psp.Refund(callCtx, &pb.RefundRequest{PaymentId: paymentID, AmountMinor: amountMinor, Ref: refundID})
@@ -577,9 +577,9 @@ object Client {
     def releasePayment(paymentId: String): Unit = ()
   }
 
-  // TODO: this draft mints a fresh idempotency key for every call, so a retry after a timeout
+  // TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout
   // refunds the customer twice; it has no deadline, treats a timeout as a permanent failure, and
-  // releases the whole payment when the PSP rejects the refund. Review all four.
+  // releases the whole payment when the PSP rejects the refund. Fix all four.
   def refundViaPsp(refundId: String, paymentId: String, amountMinor: Long): String = {
     val headers = new Metadata()
     headers.put(Metadata.Key.of("idempotency-key", Metadata.ASCII_STRING_MARSHALLER), UUID.randomUUID().toString)
@@ -694,9 +694,9 @@ RefundStore records;
 Ledger ledger;
 std::string uuidString();
 
-// TODO: this draft mints a fresh idempotency key for every call, so a retry after a timeout refunds
+// TODO: this starter mints a fresh idempotency key for every call, so a retry after a timeout refunds
 // the customer twice; it has no deadline, treats a timeout as a permanent failure, and releases the
-// whole payment when the PSP rejects the refund. Review all four.
+// whole payment when the PSP rejects the refund. Fix all four.
 std::string refund_via_psp(const std::string& refund_id, const std::string& payment_id, long long amount_minor) {
   grpc::ClientContext ctx;
   ctx.AddMetadata("idempotency-key", uuidString());

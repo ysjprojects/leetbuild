@@ -8,9 +8,9 @@ export const scanRequestsStep: Step = {
   focus: ['platforms', 'schema', 'metasense', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it subscribes to the topic,
+**Starting point.** The starter is working code: it subscribes to the topic,
 reads an event and enqueues a classification job, so the demo shows jobs appearing. It hides four
-production flaws. Review it like the owner of the intake, fix it, and prove the fix with the checks
+production flaws. Debug it like the owner of the intake, fix it, and prove the fix with the checks
 below.
 
 Data platforms produce one \`schema.changed\` event per entity whose schema appeared or changed,
@@ -60,7 +60,7 @@ job for an entity named \`null\`.`,
       id: 'manual-commit',
       title: 'Consumes schema.changed with auto-commit off',
       detail:
-        'The consumer subscribes to `schema.changed` in group `metasense` with auto-commit disabled (`enable.auto.commit=false`, `autoCommit: false`, `FetchMessage` + `CommitMessages`). The draft lets the client commit on its own schedule.',
+        'The consumer subscribes to `schema.changed` in group `metasense` with auto-commit disabled (`enable.auto.commit=false`, `autoCommit: false`, `FetchMessage` + `CommitMessages`). The starter lets the client commit on its own schedule.',
       match: {
         python: {all: [/["']schema\.changed["']/, /enable\.auto\.commit["']\s*:\s*False/]},
         typescript: {all: [/['"]schema\.changed['"]/, /autoCommit:\s*false/]},
@@ -73,7 +73,7 @@ job for an entity named \`null\`.`,
       id: 'split-jobs',
       title: 'Splits entities over 150 columns into several jobs',
       detail:
-        'A `MAX_COLUMNS_PER_JOB = 150` constant bounds the columns per job and larger entities are sliced into parts. The draft enqueues the whole column list, however long.',
+        'A `MAX_COLUMNS_PER_JOB = 150` constant bounds the columns per job and larger entities are sliced into parts. The starter enqueues the whole column list, however long.',
       match: {
         python: {all: [/MAX_COLUMNS_PER_JOB\s*=\s*150/, /range\(\s*0,\s*len\(columns\),\s*MAX_COLUMNS_PER_JOB\s*\)/]},
         typescript: {all: [/MAX_COLUMNS_PER_JOB\s*=\s*150/, /columns\.slice\(/]},
@@ -86,7 +86,7 @@ job for an entity named \`null\`.`,
       id: 'dedupe-hash',
       title: 'Skips an (entity, schema_hash) already seen',
       detail:
-        '`schema_hash` is the SHA-256 of the joined columns and `store.seen(entity, schema_hash)` is consulted before any job is created. The draft re-scans every event, including re-emitted ones for unchanged schemas.',
+        '`schema_hash` is the SHA-256 of the joined columns and `store.seen(entity, schema_hash)` is consulted before any job is created. The starter re-scans every event, including re-emitted ones for unchanged schemas.',
       match: {
         python: {all: [/sha256\(/, /store\.seen\(/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /store\.seen\(/]},
@@ -99,7 +99,7 @@ job for an entity named \`null\`.`,
       id: 'dead-letter',
       title: 'Produces malformed events to schema.changed.dlq',
       detail:
-        'An event that fails validation is produced to `schema.changed.dlq` and then committed, so the partition keeps moving and the payload survives for inspection. The draft either crashes on it or turns it into a job.',
+        'An event that fails validation is produced to `schema.changed.dlq` and then committed, so the partition keeps moving and the payload survives for inspection. The starter either crashes on it or turns it into a job.',
       match: {
         python: {all: [/schema\.changed\.dlq/, /producer\.produce\(/]},
         typescript: {all: [/schema\.changed\.dlq/, /producer\.send\(/]},
@@ -112,7 +112,7 @@ job for an entity named \`null\`.`,
       id: 'enqueue-before-commit',
       title: 'Commits the offset only after the job is enqueued',
       detail:
-        'The commit follows `store.enqueue(...)` in the loop body. The draft commits as soon as the record is read, so a crash between read and enqueue loses the schema change.',
+        'The commit follows `store.enqueue(...)` in the loop body. The starter commits as soon as the record is read, so a crash between read and enqueue loses the schema change.',
       match: {
         python: {order: [/store\.enqueue\(/, /consumer\.commit\(/]},
         typescript: {order: [/store\.enqueue\(/, /await commit\(\)/]},
@@ -141,8 +141,8 @@ store = JobStore()
 
 
 def consume() -> None:
-    # TODO: this draft commits before the job exists, enqueues entities of any size as one job,
-    # re-scans schemas it has already seen, and trusts the payload shape. Review all four.
+    # TODO: this starter commits before the job exists, enqueues entities of any size as one job,
+    # re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
     consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "metasense"})
     consumer.subscribe(["schema.changed"])
     while True:
@@ -243,7 +243,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** schema.changed intake: a model-generated draft that commits before the job exists. */
+      starter: `/** schema.changed intake: flawed code that commits before the job exists. */
 import {Kafka} from 'kafkajs';
 
 import {store} from './store';
@@ -257,8 +257,8 @@ interface SchemaChanged {
 }
 
 export async function consume(): Promise<void> {
-  // TODO: this draft commits before the job exists, enqueues entities of any size as one job,
-  // re-scans schemas it has already seen, and trusts the payload shape. Review all four.
+  // TODO: this starter commits before the job exists, enqueues entities of any size as one job,
+  // re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
   const consumer = kafka.consumer({groupId: 'metasense'});
   await consumer.connect();
   await consumer.subscribe({topic: 'schema.changed'});
@@ -377,8 +377,8 @@ func (s *JobStore) Enqueue(ctx context.Context, job Job) error { return nil }
 
 var store = &JobStore{}
 
-// TODO: this draft lets the client commit on its own schedule, enqueues entities of any size as
-// one job, re-scans schemas it has already seen, and trusts the payload shape. Review all four.
+// TODO: this starter lets the client commit on its own schedule, enqueues entities of any size as
+// one job, re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
 func consume(ctx context.Context) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{"kafka:9092"},
@@ -532,8 +532,8 @@ import spray.json._
 final case class Job(entity: String, owner: String, columns: List[String])
 
 object ScanIntake {
-  // TODO: this draft lets the client commit on its own schedule, enqueues entities of any size as
-  // one job, re-scans schemas it has already seen, and trusts the payload shape. Review all four.
+  // TODO: this starter lets the client commit on its own schedule, enqueues entities of any size as
+  // one job, re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
   def consume(): Unit = {
     val props = new Properties()
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
@@ -648,8 +648,8 @@ struct JobStore {
 
 JobStore store;
 
-// TODO: this draft lets the client commit on its own schedule, enqueues entities of any size as
-// one job, re-scans schemas it has already seen, and trusts the payload shape. Review all four.
+// TODO: this starter lets the client commit on its own schedule, enqueues entities of any size as
+// one job, re-scans schemas it has already seen, and trusts the payload shape. Fix all four.
 void consume() {
   std::string err;
   std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
@@ -778,5 +778,5 @@ void consume() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you understand what an offset commit promises. It says "everything before this record is handled", and the draft says it before anything is handled: auto-commit moves the offset on a timer, and the explicit commit at the top of the loop moves it before the enqueue. Four separate defects are being checked: the commit position (enqueue, then commit, so a crash replays instead of loses), validation with a dead-letter topic (a poison record must neither crash the consumer forever nor become a job), deduplication by schema hash (the source's service is paid per entity scanned, and re-emitted events for unchanged schemas are the cheapest thing to skip), and the 150-column split the Metasense team added after seeing the model lose attention on wide tables. Real intakes add a schema registry for the event itself, per-platform rate limits on the producer side, and the mini-batch window the source uses to group requests before they hit the model.`,
+  debrief: `The interviewer is testing whether you understand what an offset commit promises. It says "everything before this record is handled", and the starter says it before anything is handled: auto-commit moves the offset on a timer, and the explicit commit at the top of the loop moves it before the enqueue. Four separate defects are being checked: the commit position (enqueue, then commit, so a crash replays instead of loses), validation with a dead-letter topic (a poison record must neither crash the consumer forever nor become a job), deduplication by schema hash (the source's service is paid per entity scanned, and re-emitted events for unchanged schemas are the cheapest thing to skip), and the 150-column split the Metasense team added after seeing the model lose attention on wide tables. Real intakes add a schema registry for the event itself, per-platform rate limits on the producer side, and the mini-batch window the source uses to group requests before they hit the model.`,
 };

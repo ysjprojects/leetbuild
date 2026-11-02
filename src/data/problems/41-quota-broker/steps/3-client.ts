@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['broker', 'capacity', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the capacity service,
+**Starting point.** The starter is working code: it calls the capacity service,
 catches whatever comes back, and carries on. The demo shows a reservation because the demo service
-always answers. Review it like the platform owner, fix it, and prove the fix.
+always answers. Debug it like the platform owner, fix it, and prove the fix.
 
 Implement the capacity confirmation the reserve path makes before it writes the ledger:
 
@@ -18,15 +18,15 @@ Implement the capacity confirmation the reserve path makes before it writes the 
   amount)\` RPC. The reply carries the granted amount and a \`source_version\` — the capacity
   service’s own generation counter — and that version is recorded with the reservation so a grant
   can be traced back to the pool state it was made against.
-- Every attempt carries a **250 ms deadline**. The draft has none, so one slow capacity service
+- Every attempt carries a **250 ms deadline**. The starter has none, so one slow capacity service
   pins the handler and every request queued behind it.
 - A deadline or an unavailable service is **not** approval. It answers **503**
   \`{"error": "TRY_AGAIN", "retriable": true}\` and **records no reservation** — the ledger is never
   touched, so an uncertain answer cannot hold capacity. This is the flaw the checks target: the
-  draft proceeds with the reservation because the Redis check already passed, and the GPUs it
+  starter proceeds with the reservation because the Redis check already passed, and the GPUs it
   promised are already promised to someone else.
 - \`RESOURCE_EXHAUSTED\` is **not retried**. When the pool itself is empty, retrying cannot create
-  GPUs; the answer is **409** \`{"error": "capacity_exhausted"}\`, immediately. The draft retries a
+  GPUs; the answer is **409** \`{"error": "capacity_exhausted"}\`, immediately. The starter retries a
   quota-exhausted error until the deadline and turns a real shortage into a slow 503.
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are worth retrying, and at most **2 attempts** per
   reserve. The first confirmation that succeeds is the one recorded.
@@ -77,7 +77,7 @@ grant.`,
       id: 'deadline',
       title: 'Gives every attempt a 250 ms deadline',
       detail:
-        'Each RPC carries a 250 ms deadline from a named constant. The draft calls without one, so a slow capacity service blocks the reserve path indefinitely.',
+        'Each RPC carries a 250 ms deadline from a named constant. The starter calls without one, so a slow capacity service blocks the reserve path indefinitely.',
       match: {
         python: {all: [/DEADLINE_MS/, /timeout=/]},
         typescript: {all: [/DEADLINE_MS/, /deadline/]},
@@ -90,7 +90,7 @@ grant.`,
       id: 'timeout-denies',
       title: 'A timeout is 503 with no reservation recorded',
       detail:
-        'An unanswered confirmation becomes **503 `{"error": "TRY_AGAIN"}`** and the ledger is never written — the confirm happens before the reserve. The draft treats the failure as tacit approval because the Redis check already passed, so the capacity is promised twice.',
+        'An unanswered confirmation becomes **503 `{"error": "TRY_AGAIN"}`** and the ledger is never written — the confirm happens before the reserve. The starter treats the failure as tacit approval because the Redis check already passed, so the capacity is promised twice.',
       match: {
         python: {
           all: [/status_code\s*=\s*503/, /TRY_AGAIN/, /except CapacityUnavailable/],
@@ -115,7 +115,7 @@ grant.`,
       id: 'exhausted-not-retried',
       title: 'Does not retry a quota-exhausted team',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are treated as retriable; `RESOURCE_EXHAUSTED` answers **409** on the first reply. The draft retries the exhausted error until the deadline, turning a shortage into a slow failure.',
+        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are treated as retriable; `RESOURCE_EXHAUSTED` answers **409** on the first reply. The starter retries the exhausted error until the deadline, turning a shortage into a slow failure.',
       match: {
         python: {all: [/RESOURCE_EXHAUSTED/, /RETRIABLE/]},
         typescript: {all: [/RESOURCE_EXHAUSTED/, /RETRIABLE/]},
@@ -128,7 +128,7 @@ grant.`,
       id: 'source-version',
       title: 'Records the capacity source version',
       detail:
-        'The version from the confirmation is written with the reservation, so a grant can be traced to the pool generation it was checked against. The draft records nothing — it never writes the reservation at all.',
+        'The version from the confirmation is written with the reservation, so a grant can be traced to the pool generation it was checked against. The starter records nothing — it never writes the reservation at all.',
       match: {
         python: {all: [/source_version/]},
         typescript: {all: [/source_version/]},
@@ -140,7 +140,7 @@ grant.`,
   ],
   code: {
     python: {
-      starter: `"""Capacity confirmation: a model-generated draft that fails open on a timeout."""
+      starter: `"""Capacity confirmation: flawed code that fails open on a timeout."""
 import grpc
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
@@ -170,7 +170,7 @@ ledger = Ledger()
 
 
 def confirm_capacity(team: str, window: str, resource_class: str, amount: int):
-    # TODO: this draft proceeds with the reservation when the capacity call fails, because the
+    # TODO: this starter proceeds with the reservation when the capacity call fails, because the
     # Redis check already passed, and it retries a quota-exhausted error until the deadline. Give
     # every attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice,
     # deny with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
@@ -284,7 +284,7 @@ def reserve(team: str, body: ReserveRequest, caller: str = Header(alias="X-Team-
 `,
     },
     typescript: {
-      starter: `/** Capacity confirmation: a model-generated draft that fails open on a timeout. */
+      starter: `/** Capacity confirmation: flawed code that fails open on a timeout. */
 import Fastify from 'fastify';
 
 import {capacity} from './capacity';
@@ -298,7 +298,7 @@ interface ReserveBody {
 }
 
 async function confirmCapacity(team: string, window: string, resourceClass: string, amount: number) {
-  // TODO: this draft proceeds with the reservation when the capacity call fails, because the Redis
+  // TODO: this starter proceeds with the reservation when the capacity call fails, because the Redis
   // check already passed, and it retries a quota-exhausted error until the deadline. Give every
   // attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice, deny
   // with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
@@ -419,7 +419,7 @@ type reserveRequest struct {
 }
 
 func confirmCapacity(ctx context.Context, team, window, resourceClass string, amount int) (*capacitypb.ConfirmReply, error) {
-	// TODO: this draft proceeds with the reservation when the capacity call fails, because the Redis
+	// TODO: this starter proceeds with the reservation when the capacity call fails, because the Redis
 	// check already passed, and it retries a quota-exhausted error until the deadline. Give every
 	// attempt a 250 ms deadline, retry only Unavailable/DeadlineExceeded and at most twice, deny
 	// with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
@@ -578,7 +578,7 @@ object ClientApi {
   implicit val reserveFormat: RootJsonFormat[ReserveRequest] = jsonFormat3(ReserveRequest)
 
   def confirmCapacity(team: String, window: String, resourceClass: String, amount: Int): Future[ConfirmReply] = {
-    // TODO: this draft proceeds with the reservation when the capacity call fails, because the
+    // TODO: this starter proceeds with the reservation when the capacity call fails, because the
     // Redis check already passed, and it retries a quota-exhausted error until the deadline. Give
     // every attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice,
     // deny with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source
@@ -699,7 +699,7 @@ using json = nlohmann::json;
 std::unique_ptr<CapacityService::Stub> capacity;
 
 json confirm_capacity(const std::string& team, const std::string& window, const std::string& resource_class, int amount) {
-  // TODO: this draft proceeds with the reservation when the capacity call fails, because the Redis
+  // TODO: this starter proceeds with the reservation when the capacity call fails, because the Redis
   // check already passed, and it retries a quota-exhausted error until the deadline. Give every
   // attempt a 250 ms deadline, retry only UNAVAILABLE/DEADLINE_EXCEEDED and at most twice, deny
   // with a 503 TRY_AGAIN and no ledger write on uncertainty, and record the capacity source

@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it serialises the comment,
+**Starting point.** The starter is working code: it serialises the comment,
 produces one event to \`comment.event\` and lets read models rebuild themselves. It compiles, the
-analytics pipeline fills up, and it hides three production flaws. Review it like the service owner,
+analytics pipeline fills up, and it hides three production flaws. Debug it like the service owner,
 fix it, and prove the fix with the checks below.
 
 Publish comment lifecycle events to the topic \`comment.event\`.
@@ -32,7 +32,7 @@ Publish comment lifecycle events to the topic \`comment.event\`.
 - Edits carry the new **revision**, so a consumer can drop an out-of-order or duplicate edit
   instead of overwriting newer text with older text.
 
-**Failure mode the checks target.** The draft gets the key, the moment and the payload wrong at
+**Failure mode the checks target.** The starter gets the key, the moment and the payload wrong at
 once. Keying by the **author** scatters one thread's events across partitions, so a thread's stream
 arrives interleaved with every other thread that author touches and a read model can apply an edit
 before the comment it edits exists. It **produces before the insert**, so a crash between the two
@@ -58,7 +58,7 @@ is the one field that must not be copied into a retained, replicated, long-lived
       id: 'topic-key',
       title: 'Publishes to comment.event keyed by thread',
       detail:
-        'The message key is the thread id, so every event of one thread lands on one partition and a thread’s stream stays ordered. The draft keys by the author, which interleaves threads.',
+        'The message key is the thread id, so every event of one thread lands on one partition and a thread’s stream stays ordered. The starter keys by the author, which interleaves threads.',
       match: {
         python: {all: [/TOPIC = "comment\.event"/, /key=comment\["thread_id"\]/]},
         typescript: {all: [/TOPIC = 'comment\.event'/, /key: comment\.thread_id/]},
@@ -71,7 +71,7 @@ is the one field that must not be copied into a retained, replicated, long-lived
       id: 'after-commit',
       title: 'Publishes only after the change commits',
       detail:
-        'The durable write happens before the produce in every publisher. The draft produces first, so a crash in between advertises a comment the store never wrote.',
+        'The durable write happens before the produce in every publisher. The starter produces first, so a crash in between advertises a comment the store never wrote.',
       match: {
         python: {order: [/store\.insert\(/, /producer\.send\(/]},
         typescript: {order: [/store\.insert\(/, /producer\.send\(/]},
@@ -97,7 +97,7 @@ is the one field that must not be copied into a retained, replicated, long-lived
       id: 'no-body',
       title: 'Never puts the body in the event',
       detail:
-        'No payload field carries comment text. The draft ships the body into a retained, replicated topic, so every consumer holds a copy of tenant content.',
+        'No payload field carries comment text. The starter ships the body into a retained, replicated topic, so every consumer holds a copy of tenant content.',
       match: {
         python: {all: [/EVENT_FIELDS/], none: [/["']body["']/]},
         typescript: {all: [/EVENT_FIELDS/], none: [/\bbody\b/]},
@@ -139,8 +139,8 @@ store = CommentStore()
 
 
 def publish(comment: dict) -> None:
-    # TODO: this draft keys by the author, publishes before the comment commits, and ships the body
-    # so read models avoid a fetch. Review all three.
+    # TODO: this starter keys by the author, publishes before the comment commits, and ships the body
+    # so read models avoid a fetch. Fix all three.
     payload = json.dumps(
         {"id": comment["id"], "author_id": comment["author_id"], "body": comment["body"]}
     ).encode()
@@ -211,7 +211,7 @@ def publish_deleted(comment: dict) -> None:
 `,
     },
     typescript: {
-      starter: `/** comment.event: a model-generated draft that keys by author and publishes too early. */
+      starter: `/** comment.event: flawed code that keys by author and publishes too early. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'comments-service', brokers: ['kafka:9092']});
@@ -227,8 +227,8 @@ interface Comment {
 }
 
 export async function publish(comment: Comment): Promise<void> {
-  // TODO: this draft keys by the author, publishes before the comment commits, and ships the body
-  // so read models avoid a fetch. Review all three.
+  // TODO: this starter keys by the author, publishes before the comment commits, and ships the body
+  // so read models avoid a fetch. Fix all three.
   await producer.send({
     topic: 'comment.event',
     messages: [{key: comment.author_id, value: JSON.stringify({id: comment.id, body: comment.text})}],
@@ -323,8 +323,8 @@ func (s *CommentStore) Insert(ctx context.Context, comment *Comment) error { ret
 
 var store = &CommentStore{}
 
-// TODO: this draft keys by the author, publishes before the comment commits, and ships the text so
-// read models avoid a fetch. Review all three.
+// TODO: this starter keys by the author, publishes before the comment commits, and ships the text so
+// read models avoid a fetch. Fix all three.
 func publish(ctx context.Context, comment *Comment) error {
 	payload, _ := json.Marshal(map[string]any{"id": comment.ID, "body": comment.Text})
 	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(comment.AuthorID), Value: payload}); err != nil {
@@ -416,8 +416,8 @@ object CommentEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val store = CommentStore.open()
 
-  // TODO: this draft keys by the author, publishes before the comment commits, and ships the text
-  // so read models avoid a fetch. Review all three.
+  // TODO: this starter keys by the author, publishes before the comment commits, and ships the text
+  // so read models avoid a fetch. Fix all three.
   def publish(comment: Comment): Unit = {
     val payload = Map("id" -> comment.id, "body" -> comment.text).toJson.compactPrint
     producer.send(new ProducerRecord("comment.event", comment.authorId, payload))
@@ -499,8 +499,8 @@ struct Comment {
 CommentStore store;
 std::unique_ptr<RdKafka::Producer> producer;
 
-// TODO: this draft keys by the author, publishes before the comment commits, and ships the text so
-// read models avoid a fetch. Review all three.
+// TODO: this starter keys by the author, publishes before the comment commits, and ships the text so
+// read models avoid a fetch. Fix all three.
 void publish(const Comment& comment) {
   const json event = {{"id", comment.id}, {"body", comment.text}};
   const auto payload = event.dump();

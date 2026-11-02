@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'registry', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it authenticates the tenant,
+**Starting point.** The starter is working code: it authenticates the tenant,
 registers the route and returns a tool record from Redis. It runs, and it serves the demo — one
-catalog, one trusted caller — while hiding three production flaws. Review it like the platform
+catalog, one trusted caller — while hiding three production flaws. Debug it like the platform
 owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/tools/{name}\`, the resolve endpoint an agent calls before it uses a tool:
@@ -28,7 +28,7 @@ Implement \`GET /v1/tools/{name}\`, the resolve endpoint an agent calls before i
   \`side_effect\` (\`read\`, \`write\` or \`irreversible\`) and \`definition\` (the JSON Schema). No
   owner-team endpoint or base URL, no credential reference, no internal schema blob.
 
-**Failure mode the checks target.** The draft serves whatever the active catalog holds, so an agent
+**Failure mode the checks target.** The starter serves whatever the active catalog holds, so an agent
 that pinned a catalog to keep a reviewed definition is silently flipped onto the newest one
 mid-plan. It never consults the allowlist, so any authenticated caller can resolve any tool —
 including the irreversible ones it was never granted. And it returns the stored record field by
@@ -66,9 +66,9 @@ leaking.`,
     ],
   },
   hints: [
-    'Resolve the version before you touch the snapshot: read `X-Catalog-Version` off the request and fall back to the `catalog:active` pointer only when it is absent, then answer the entry with one `HGET catalog:{version} {name}`. The draft reads the pointer unconditionally, so the pin never gets a chance to matter.',
-    'Authorize with the caller’s context, not the request: the allowlist arrives with the authenticated caller, so check membership after authentication and answer the same **404** you answer for a missing tool. The draft never looks at it, so every caller can resolve every tool.',
-    'Build the reply field by field instead of echoing the stored record: the record carries `owner_endpoint`, `credentials_ref` and `internal_schema` for the platform’s own use, and the public contract calls the served schema `definition`, not `schema`. The draft ships the internal names verbatim.',
+    'Resolve the version before you touch the snapshot: read `X-Catalog-Version` off the request and fall back to the `catalog:active` pointer only when it is absent, then answer the entry with one `HGET catalog:{version} {name}`. The starter reads the pointer unconditionally, so the pin never gets a chance to matter.',
+    'Authorize with the caller’s context, not the request: the allowlist arrives with the authenticated caller, so check membership after authentication and answer the same **404** you answer for a missing tool. The starter never looks at it, so every caller can resolve every tool.',
+    'Build the reply field by field instead of echoing the stored record: the record carries `owner_endpoint`, `credentials_ref` and `internal_schema` for the platform’s own use, and the public contract calls the served schema `definition`, not `schema`. The starter ships the internal names verbatim.',
   ],
   checks: [
     {
@@ -88,7 +88,7 @@ leaking.`,
       id: 'pin',
       title: 'Serves the caller’s pinned catalog, not whatever is active',
       detail:
-        '`X-Catalog-Version` selects the snapshot (`catalog:version:{version}`); `catalog:active` is the fallback only when the caller pinned nothing, so a pinned agent keeps the definition it reviewed for the whole run. The draft ignores the pin and serves the latest catalog.',
+        '`X-Catalog-Version` selects the snapshot (`catalog:version:{version}`); `catalog:active` is the fallback only when the caller pinned nothing, so a pinned agent keeps the definition it reviewed for the whole run. The starter ignores the pin and serves the latest catalog.',
       match: {
         python: {
           all: [/X-Catalog-Version/, /catalog_version\(/, /catalog:version:\{version\}/],
@@ -116,7 +116,7 @@ leaking.`,
       id: 'allowlist',
       title: 'Answers 404 for a tool outside the caller’s allowlist',
       detail:
-        'The allowlist comes from the authenticated caller’s context — never the path, body or query string — and a tool it does not name is **404**, the same answer as a missing tool, so the endpoint cannot be used to enumerate the catalog. The draft serves any authenticated caller any tool.',
+        'The allowlist comes from the authenticated caller’s context — never the path, body or query string — and a tool it does not name is **404**, the same answer as a missing tool, so the endpoint cannot be used to enumerate the catalog. The starter serves any authenticated caller any tool.',
       match: {
         python: {all: [/def authenticate\(/, /allowed_tools/, /404/]},
         typescript: {all: [/function authenticate\(/, /allowedTools/, /404/]},
@@ -129,7 +129,7 @@ leaking.`,
       id: 'no-internal',
       title: 'No owner endpoint, credential or internal schema in the reply',
       detail:
-        'The reply carries the public contract only. The draft returns the stored record field by field, shipping the owner team’s internal endpoint, its credential reference and the internal schema blob to every caller.',
+        'The reply carries the public contract only. The starter returns the stored record field by field, shipping the owner team’s internal endpoint, its credential reference and the internal schema blob to every caller.',
       match: {
         python: {none: [/owner_endpoint/, /credentials_ref/, /internal_schema/]},
         typescript: {none: [/owner_endpoint/, /credentials_ref/, /internal_schema/]},
@@ -142,7 +142,7 @@ leaking.`,
       id: 'definition',
       title: 'Carries the definition, the side-effect class and the version served',
       detail:
-        'The reply maps the stored record onto the public shape: `name`, `version` (the version served from the resolved snapshot), `side_effect` and `definition` (the JSON Schema) — not the stored field’s internal name. The draft returns the schema under `schema`.',
+        'The reply maps the stored record onto the public shape: `name`, `version` (the version served from the resolved snapshot), `side_effect` and `definition` (the JSON Schema) — not the stored field’s internal name. The starter returns the schema under `schema`.',
       match: {
         python: {all: [/["']definition["']/, /["']side_effect["']/, /["']version["']/]},
         typescript: {all: [/\bdefinition\b/, /\bside_effect\b/, /\bversion\b/]},
@@ -169,7 +169,7 @@ def latest_catalog() -> str:
 
 @app.get("/v1/tools/{name}")
 def resolve(name: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
-    # TODO: review this draft before it ships. It resolves against whatever the active catalog
+    # TODO: debug this starter before it ships. It resolves against whatever the active catalog
     # holds and ignores the caller's pin, never consults the caller's allowlist, and returns the
     # stored record field by field — owner endpoint, credential reference and internal schema
     # included.
@@ -249,7 +249,7 @@ def resolve(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/tools/:name: a model-generated draft that resolves against the active catalog. */
+      starter: `/** GET /v1/tools/:name: flawed code that resolves against the active catalog. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -273,7 +273,7 @@ async function latestCatalog(): Promise<string> {
 app.get('/v1/tools/:name', async (request, reply) => {
   const {name} = request.params as {name: string};
   const tenant = request.headers['x-tenant-id'];
-  // TODO: review this draft before it ships. It resolves against whatever the active catalog holds
+  // TODO: debug this starter before it ships. It resolves against whatever the active catalog holds
   // and ignores the caller's pin, never consults the caller's allowlist, and returns the stored
   // record field by field — owner endpoint, credential reference and internal schema included.
   if (typeof tenant !== 'string' || tenant === '')
@@ -402,7 +402,7 @@ func latestCatalog(ctx context.Context) string {
 func resolve(rw http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	tenant := r.Header.Get("X-Tenant-Id")
-	// TODO: review this draft before it ships. It resolves against whatever the active catalog
+	// TODO: debug this starter before it ships. It resolves against whatever the active catalog
 	// holds and ignores the caller's pin, never consults the caller's allowlist, and returns the
 	// stored record field by field — owner endpoint, credential reference and internal schema
 	// included.
@@ -573,7 +573,7 @@ object ToolReadApi {
     path("v1" / "tools" / Segment) { name =>
       get {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          // TODO: review this draft before it ships. It resolves against whatever the active
+          // TODO: debug this starter before it ships. It resolves against whatever the active
           // catalog holds and ignores the caller's pin, never consults the caller's allowlist, and
           // returns the stored record field by field — owner endpoint, credential reference and
           // internal schema included.
@@ -694,7 +694,7 @@ int main() {
 
   svr.Get("/v1/tools/:name", [](const httplib::Request& req, httplib::Response& res) {
     const auto tenant = req.get_header_value("X-Tenant-Id");
-    // TODO: review this draft before it ships. It resolves against whatever the active catalog
+    // TODO: debug this starter before it ships. It resolves against whatever the active catalog
     // holds and ignores the caller's pin, never consults the caller's allowlist, and returns the
     // stored record field by field — owner endpoint, credential reference and internal schema
     // included.

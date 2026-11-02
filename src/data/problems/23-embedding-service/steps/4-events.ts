@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'outbox', 'topic', 'indexer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: once the vectors are stored it
+**Starting point.** The starter is working code: once the vectors are stored it
 publishes one \`embed.ready\` per chunk. The demo's single document arrives in order. It hides three
 failures that only show up when documents are large or the broker is down. Find them and fix them.
 
@@ -17,7 +17,7 @@ Implement \`publish_ready(document_id, content_hashes)\` and \`event_key(documen
 - Publish **\`embed.ready\`** keyed by the **document id**, not the content hash. Keyed by document id
   every chunk of one document lands on one partition, so the indexer updates a document's chunks in
   order; keyed by content hash the chunks of one document scatter across partitions.
-- Publish **only after the cache write commits**. The draft publishes first, so a crash between the
+- Publish **only after the cache write commits**. The starter publishes first, so a crash between the
   two leaves an indexed document whose vectors were never written.
 - Set **\`acks=all\`** so the produce is durable across replicas.
 - When the produce is **rejected** — a full local queue or an unavailable broker — write an **outbox**
@@ -49,7 +49,7 @@ outbox turns one broker outage into a document that is never indexed.`,
       id: 'key',
       title: 'Keys the event by document id',
       detail:
-        'The event key is the `document_id`, so every chunk of one document lands on the same partition. The draft keys by content hash, so the chunks scatter.',
+        'The event key is the `document_id`, so every chunk of one document lands on the same partition. The starter keys by content hash, so the chunks scatter.',
       match: {
         python: {all: [/def event_key\(/, /document_id/]},
         typescript: {all: [/function eventKey\(/, /documentId/]},
@@ -62,7 +62,7 @@ outbox turns one broker outage into a document that is never indexed.`,
       id: 'acks',
       title: 'Produces with acks=all',
       detail:
-        'The producer is configured for `acks=all` so the event is durable across replicas. The draft leaves the default acks and loses an event when the leader fails.',
+        'The producer is configured for `acks=all` so the event is durable across replicas. The starter leaves the default acks and loses an event when the leader fails.',
       match: {
         python: {all: [/def publish_ready\(/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/function publishReady\(/, /acks:\s*['"]all['"]/]},
@@ -75,7 +75,7 @@ outbox turns one broker outage into a document that is never indexed.`,
       id: 'persist-first',
       title: 'Publishes only after the cache write commits',
       detail:
-        'The cache write happens before the event is produced. The draft publishes first, so a crash leaves an event for a document that was never stored.',
+        'The cache write happens before the event is produced. The starter publishes first, so a crash leaves an event for a document that was never stored.',
       match: {
         python: {order: [/store\.put\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.put\(/, /producer\.send\(/]},
@@ -88,7 +88,7 @@ outbox turns one broker outage into a document that is never indexed.`,
       id: 'outbox',
       title: 'Records an outbox row when the produce is rejected',
       detail:
-        'A rejected produce writes an `outbox` row keyed by the document, so a relay can publish it later. The draft drops the event and leaves the document unindexed.',
+        'A rejected produce writes an `outbox` row keyed by the document, so a relay can publish it later. The starter drops the event and leaves the document unindexed.',
       match: {
         python: {all: [/outbox/, /document_id/]},
         typescript: {all: [/outbox/, /documentId/]},
@@ -101,7 +101,7 @@ outbox turns one broker outage into a document that is never indexed.`,
       id: 'topic',
       title: 'Publishes to the embed.ready topic',
       detail:
-        'The event goes to `embed.ready`, the topic the indexer consumes. The draft names the topic in a string literal at the call site instead of a named constant.',
+        'The event goes to `embed.ready`, the topic the indexer consumes. The starter names the topic in a string literal at the call site instead of a named constant.',
       match: {
         python: {all: [/EMBED_READY_TOPIC\s*=\s*["']embed\.ready["']/]},
         typescript: {all: [/EMBED_READY_TOPIC\s*=\s*['"]embed\.ready['"]/]},
@@ -122,8 +122,8 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})  # acks defaults to 1
 
 
 def publish_ready(document_id: str, content_hashes: list[str]) -> None:
-    # TODO: key by document id (the draft keys by content hash, so chunks scatter), publish only
-    # after the cache write commits (the draft publishes first) and record an outbox row when the
+    # TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
+    # after the cache write commits (the starter publishes first) and record an outbox row when the
     # produce is rejected.
     for content_hash in content_hashes:
         producer.produce(topic="embed.ready", key=content_hash, value=json.dumps({"document_id": document_id}))
@@ -170,8 +170,8 @@ const kafka = new Kafka({brokers: ['kafka:9092']});
 const producer = kafka.producer();
 
 export async function publishReady(documentId: string, contentHashes: string[]): Promise<void> {
-  // TODO: key by document id (the draft keys by content hash, so chunks scatter), publish only
-  // after the cache write commits (the draft publishes first) and record an outbox row when the
+  // TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
+  // after the cache write commits (the starter publishes first) and record an outbox row when the
   // produce is rejected.
   for (const contentHash of contentHashes) {
     await producer.send({
@@ -227,8 +227,8 @@ import (
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092")}
 
 func publishReady(ctx context.Context, documentID string, contentHashes []string) error {
-	// TODO: key by document id (the draft keys by content hash, so chunks scatter), publish only
-	// after the cache write commits (the draft publishes first) and record an outbox row when the
+	// TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
+	// after the cache write commits (the starter publishes first) and record an outbox row when the
 	// produce is rejected.
 	for _, contentHash := range contentHashes {
 		payload, _ := json.Marshal(map[string]any{"document_id": documentID})
@@ -292,8 +292,8 @@ object EventPublisher {
   val producer = new KafkaProducer[String, String](props)
 
   def publishReady(documentId: String, contentHashes: List[String]): Unit = {
-    // TODO: key by document id (the draft keys by content hash, so chunks scatter), publish only
-    // after the cache write commits (the draft publishes first) and record an outbox row when the
+    // TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
+    // after the cache write commits (the starter publishes first) and record an outbox row when the
     // produce is rejected.
     contentHashes.foreach { contentHash =>
       producer.send(new ProducerRecord[String, String]("embed.ready", contentHash, s"""{"document_id":"$documentId"}"""))
@@ -347,8 +347,8 @@ int publish_ready(
     RdKafka::Producer* producer,
     const std::string& document_id,
     const std::vector<std::string>& content_hashes) {
-  // TODO: key by document id (the draft keys by content hash, so chunks scatter), publish only
-  // after the cache write commits (the draft publishes first) and record an outbox row when the
+  // TODO: key by document id (the starter keys by content hash, so chunks scatter), publish only
+  // after the cache write commits (the starter publishes first) and record an outbox row when the
   // produce is rejected.
   for (const auto& content_hash : content_hashes) {
     RdKafka::ErrorCode err = producer->produce(

@@ -8,9 +8,9 @@ export const translateEndpointStep: Step = {
   focus: ['client', 'api', 'glossary', 'detector'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route,
+**Starting point.** The starter is working code: it registers the route,
 parses the body, calls the detector and returns a translation. It compiles, it serves the demo, and
-it hides three production flaws. Review it like the service owner, fix it, and prove the fix with
+it hides three production flaws. Debug it like the service owner, fix it, and prove the fix with
 the checks below.
 
 Implement \`POST /v1/translations\` with body \`{"text": "…", "source": "en", "target": "fr",
@@ -62,7 +62,7 @@ it, and no downstream system can tell a fallback from a translation.`,
       id: 'text-cap',
       title: 'Caps the text at 16 KiB and rejects an empty body',
       detail:
-        '`text` over `1 << 14` bytes is **413**; an empty or non-string `text` is **400**. The draft reads `text` without touching either cap, so one request can push an unbounded payload into the detector and the model.',
+        '`text` over `1 << 14` bytes is **413**; an empty or non-string `text` is **400**. The starter reads `text` without touching either cap, so one request can push an unbounded payload into the detector and the model.',
       match: {
         python: {all: [/MAX_TEXT_BYTES/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -75,7 +75,7 @@ it, and no downstream system can tell a fallback from a translation.`,
       id: 'language-pair',
       title: 'Checks both languages against the platform allowlist',
       detail:
-        '`source` and `target` are checked against `en`/`fr`/`de`/`es`/`ja`/`pt` and an unknown code is **400**. The draft accepts any tag the caller sends.',
+        '`source` and `target` are checked against `en`/`fr`/`de`/`es`/`ja`/`pt` and an unknown code is **400**. The starter accepts any tag the caller sends.',
       match: {
         python: {all: [/ALLOWED_LANGUAGES/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_LANGUAGES/, /code\(\s*400\s*\)/]},
@@ -88,7 +88,7 @@ it, and no downstream system can tell a fallback from a translation.`,
       id: 'same-language',
       title: 'Refuses to translate into the source language and marks identity',
       detail:
-        '`source == target` is **400**, and a confident detection that the text is already in the target language returns the input text with an `untranslated` marker instead of a plain success. The draft returns that input as a normal translation with the target locale stamped on it.',
+        '`source == target` is **400**, and a confident detection that the text is already in the target language returns the input text with an `untranslated` marker instead of a plain success. The starter returns that input as a normal translation with the target locale stamped on it.',
       match: {
         python: {all: [/SAME_LANGUAGE/, /UNTRANSLATED_MARKER/, /status_code\s*=\s*400/]},
         typescript: {all: [/SAME_LANGUAGE/, /UNTRANSLATED_MARKER/, /code\(\s*400\s*\)/]},
@@ -101,7 +101,7 @@ it, and no downstream system can tell a fallback from a translation.`,
       id: 'glossary-binding',
       title: 'Binds the request to the tenant glossary version',
       detail:
-        'The glossary is resolved by `(tenant, version)` and an unknown version is **404**; the resolved terms travel with the request. The draft never resolves the version, so a caller that asks for a version that does not exist is translated with no glossary at all.',
+        'The glossary is resolved by `(tenant, version)` and an unknown version is **404**; the resolved terms travel with the request. The starter never resolves the version, so a caller that asks for a version that does not exist is translated with no glossary at all.',
       match: {
         python: {all: [/resolve_glossary/, /status_code\s*=\s*404/]},
         typescript: {all: [/resolveGlossary/, /code\(\s*404\s*\)/]},
@@ -141,9 +141,9 @@ def translate_text(text: str, source: str, target: str) -> str:
 
 @app.post("/v1/translations")
 def translate(body: TranslateRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft trusts any language tags, ignores glossary_version entirely, and reports the
+    # TODO: this starter trusts any language tags, ignores glossary_version entirely, and reports the
     # input text as a successful translation when the detector says the source is already the
-    # target. Review all three before this reaches production.
+    # target. Fix all three before this reaches production.
     if detect_language(body.text) == body.target:
         return JSONResponse({"translation": body.text, "target": body.target}, status_code=200)
     logger.info("translate tenant=%s source=%s target=%s", tenant, body.source, body.target)
@@ -245,7 +245,7 @@ def translate(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/translations: a model-generated draft that trusts its caller. */
+      starter: `/** POST /v1/translations: flawed code that trusts its caller. */
 import Fastify from 'fastify';
 
 import {detectLanguage} from './detector';
@@ -261,9 +261,9 @@ interface TranslateBody {
 }
 
 app.post('/v1/translations', async (request, reply) => {
-  // TODO: this draft trusts any language tags, ignores glossary_version entirely, and reports the
+  // TODO: this starter trusts any language tags, ignores glossary_version entirely, and reports the
   // input text as a successful translation when the detector says the source is already the
-  // target. Review all three.
+  // target. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as TranslateBody;
   if ((await detectLanguage(body.text)) === body.target)
@@ -364,9 +364,9 @@ func translate(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft trusts any language tags, ignores GlossaryVersion entirely, and reports the
+	// TODO: this starter trusts any language tags, ignores GlossaryVersion entirely, and reports the
 	// input text as a successful translation when the detector says the source is already the
-	// target. Review all three.
+	// target. Fix all three.
 	detected, _ := detectLanguage(body.Text)
 	if detected == body.Target {
 		writeJSON(rw, http.StatusOK, map[string]any{"translation": body.Text, "target": body.Target})
@@ -519,9 +519,9 @@ object TranslateApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[TranslateRequest]) { body =>
-            // TODO: this draft trusts any language tags, ignores glossary_version entirely, and
+            // TODO: this starter trusts any language tags, ignores glossary_version entirely, and
             // reports the input text as a successful translation when the detector says the source
-            // is already the target. Review all three.
+            // is already the target. Fix all three.
             if (Detector.detect(body.text).contains(body.target)) {
               complete(StatusCodes.OK, s"""{"translation":"\${body.text}","target":"\${body.target}"}""")
             } else {
@@ -631,9 +631,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft trusts any language tags, ignores glossary_version entirely, and reports the
+    // TODO: this starter trusts any language tags, ignores glossary_version entirely, and reports the
     // input text as a successful translation when the detector says the source is already the
-    // target. Review all three.
+    // target. Fix all three.
     const auto text = body["text"].get<std::string>();
     const auto source = body.value("source", std::string());
     const auto target = body.value("target", std::string());
@@ -763,5 +763,5 @@ int main() {
     '`glossary_version` is not a hint, it is a binding: resolve `(tenant, version)` up front and hand the terms to the model call. A version the store does not know is a **404** — ignoring it silently changes what the customer asked for.',
     'The detector disagreement is the defect candidates miss: returning the input with the target locale looks like success, but downstream caches and reviewers cannot tell it apart from a real translation. Return the text with `"marker": "untranslated"` so every consumer can decide what to do.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary of a localization system. The draft reads fine because the demo sends a valid pair and a glossary version that exists. Three separate defects are checked: input caps (cheap rejections before expensive work), the language allowlist plus the source==target refusal (a caller bug must not become a paid model call), and glossary binding (a version that does not resolve is a 404, not a silent no-glossary translation). The marked identity response is the one candidates miss: an unmarked fallback is indistinguishable from a translation once it is cached, so real services carry a marker, a quality signal and a retriable status all the way out.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary of a localization system. The starter reads fine because the demo sends a valid pair and a glossary version that exists. Three separate defects are checked: input caps (cheap rejections before expensive work), the language allowlist plus the source==target refusal (a caller bug must not become a paid model call), and glossary binding (a version that does not resolve is a 404, not a silent no-glossary translation). The marked identity response is the one candidates miss: an unmarked fallback is indistinguishable from a translation once it is cached, so real services carry a marker, a quality signal and a retriable status all the way out.`,
 };

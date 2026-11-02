@@ -8,9 +8,9 @@ export const rerankClientStep: Step = {
   focus: ['api', 'reranker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it slices the candidates, calls
-the reranker over gRPC and concatenates the scores. It serves the happy path and it hides three
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it slices the candidates, calls the reranker over
+gRPC and concatenates the scores. It serves the happy path and it hides three production flaws.
+Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Call the reranker model over gRPC in **batches of 64** with a **700 ms deadline per batch**. The call
 is allowed to fail without failing the request:
@@ -24,7 +24,7 @@ is allowed to fail without failing the request:
   scores, so a partial outage degrades one slice of the list instead of the whole response.
 - The returned scores must model "no score" in the type: an optional per passage, not a magic value.
 
-**Failure mode the checks target.** The draft retries every error forever inside \`while\`/\`for\`
+**Failure mode the checks target.** The starter retries every error forever inside \`while\`/\`for\`
 until it succeeds, assigns \`NEUTRAL_SCORE\` to a failed batch so infra failures look like genuine
 relevance and silently reorder results, and on a non-retryable error it returns an empty list — one
 bad batch discards every good score the request had already paid for.`,
@@ -44,7 +44,7 @@ bad batch discards every good score the request had already paid for.`,
       id: 'batch-size',
       title: 'Calls the model in batches of 64',
       detail:
-        "The batch size is `64`, so one call cannot exceed the model's comfortable sequence budget. The draft uses 128.",
+        "The batch size is `64`, so one call cannot exceed the model's comfortable sequence budget. The starter uses 128.",
       match: {
         python: {all: [/BATCH_SIZE\s*=\s*64/]},
         typescript: {all: [/BATCH_SIZE\s*=\s*64/]},
@@ -57,7 +57,7 @@ bad batch discards every good score the request had already paid for.`,
       id: 'deadline',
       title: 'Sets a 700 ms deadline per batch',
       detail:
-        'Each batch call carries a `700` ms deadline so a slow batch cannot hold the request open. The draft waits five seconds.',
+        'Each batch call carries a `700` ms deadline so a slow batch cannot hold the request open. The starter waits five seconds.',
       match: {
         python: {all: [/BATCH_DEADLINE_MS\s*=\s*700/]},
         typescript: {all: [/BATCH_DEADLINE_MS\s*=\s*700/]},
@@ -83,7 +83,7 @@ bad batch discards every good score the request had already paid for.`,
       id: 'terminal-malformed',
       title: 'Treats INVALID_ARGUMENT as terminal',
       detail:
-        'A malformed batch returns `INVALID_ARGUMENT` and ends the call; the code never loops forever retrying it. The draft retries until the batch happens to succeed.',
+        'A malformed batch returns `INVALID_ARGUMENT` and ends the call; the code never loops forever retrying it. The starter retries until the batch happens to succeed.',
       match: {
         python: {all: [/INVALID_ARGUMENT/], none: [/while\s+True/]},
         typescript: {all: [/INVALID_ARGUMENT/], none: [/while\s*\(\s*true\s*\)/]},
@@ -96,7 +96,7 @@ bad batch discards every good score the request had already paid for.`,
       id: 'partial-results',
       title: 'Completes the remaining batches after a failure',
       detail:
-        'A failed batch is recorded and the loop moves on; the request is never aborted with an empty result. The draft throws away every score when one batch fails.',
+        'A failed batch is recorded and the loop moves on; the request is never aborted with an empty result. The starter throws away every score when one batch fails.',
       match: {
         python: {all: [/BATCH_SIZE/], none: [/return\s+\[\]/]},
         typescript: {all: [/BATCH_SIZE/], none: [/return\s+\[\]/]},
@@ -130,7 +130,7 @@ def rerank_passages(query, candidates, model_version, stub):
             except grpc.RpcError as exc:
                 if exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
                     continue
-                # TODO: this draft retries every error forever, assigns a neutral score to failed
+                # TODO: this starter retries every error forever, assigns a neutral score to failed
                 # batches so unscored passages outrank real ones, and aborts the whole request when
                 # one batch fails. Make a malformed batch terminal and mark failures unscored.
                 scores.extend([NEUTRAL_SCORE for _ in batch])
@@ -185,7 +185,7 @@ export async function rerankPassages(
         break;
       } catch (err) {
         if ((err as grpc.ServiceError).code === grpc.status.DEADLINE_EXCEEDED) continue;
-        // TODO: this draft retries every error forever, assigns a neutral score to failed batches
+        // TODO: this starter retries every error forever, assigns a neutral score to failed batches
         // so unscored passages outrank real ones, and aborts the whole request when one batch
         // fails. Make a malformed batch terminal and mark failures unscored.
         scores.push(...batch.map(() => NEUTRAL_SCORE));
@@ -259,7 +259,7 @@ func rerankPassages(ctx context.Context, query string, candidates []Candidate, m
 			if status.Code(err) == codes.DeadlineExceeded {
 				continue
 			}
-			// TODO: this draft retries every error forever, assigns a neutral score to failed
+			// TODO: this starter retries every error forever, assigns a neutral score to failed
 			// batches so unscored passages outrank real ones, and aborts the whole request when one
 			// batch fails. Make a malformed batch terminal and mark failures unscored.
 			for range batch {
@@ -339,7 +339,7 @@ object RerankerClient {
         } catch {
           case _: DeadlineExceeded => ()
           case _: Throwable =>
-            // TODO: this draft retries every error forever, assigns a neutral score to failed
+            // TODO: this starter retries every error forever, assigns a neutral score to failed
             // batches so unscored passages outrank real ones, and aborts the whole request when one
             // batch fails. Make a malformed batch terminal and mark failures unscored.
             scores ++= batch.map(_ => NeutralScore)
@@ -411,7 +411,7 @@ std::vector<double> rerankPassages(const std::string& query, const std::vector<C
         break;
       }
       if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) continue;
-      // TODO: this draft retries every error forever, assigns a neutral score to failed batches so
+      // TODO: this starter retries every error forever, assigns a neutral score to failed batches so
       // unscored passages outrank real ones, and aborts the whole request when one batch fails.
       // Make a malformed batch terminal and mark failures unscored.
       for (std::size_t i = 0; i < batch.size(); ++i) scores.push_back(NEUTRAL_SCORE);
@@ -465,7 +465,7 @@ std::vector<std::optional<double>> rerankPassages(const std::string& query, cons
     'A batch failure is a slice, not the request. Catch it, record unscored markers for that batch, `continue` to the next one, and return the mixed list — partial results beat a blank page.',
   ],
   debrief: `The interviewer is testing whether you can keep a partial failure from becoming a silent quality change.
-The draft reads fine because the demo's model never fails. Three defects are being checked: a
+The starter reads fine because the demo's model never fails. Three defects are being checked: a
 neutral score standing in for a failure (so a down model looks like mid-tier relevance), an unbounded
 retry around a malformed batch (so a bad request becomes a hot loop), and an abort that discards the
 scores already computed (so one bad batch costs the whole response). The optional score type is the

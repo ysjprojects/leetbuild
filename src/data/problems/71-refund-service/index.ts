@@ -7,12 +7,12 @@ import {refundEventsStep} from './steps/4-events';
 import {refundReadStep} from './steps/5-read';
 
 /**
- * Refund service on the AI-era track: the course is not "call the PSP from an endpoint", it is the
- * review you owe a model-generated money path before it refunds twice. Validated, idempotent
- * endpoint → one atomic Redis ledger per payment with a lifetime cap → a PSP call with a deadline
- * and a stable idempotency key that records unknowns as pending → payment-keyed refund events with
- * an outbox and confirm-before-publish → a read endpoint that reconstructs the balance from the
- * durable records and reconciles the cache.
+ * Refund service: the course is not "call the PSP from an endpoint", it is the debugging you owe a
+ * money path before it refunds twice. Validated, idempotent endpoint → one atomic Redis ledger per
+ * payment with a lifetime cap → a PSP call with a deadline and a stable idempotency key that
+ * records unknowns as pending → payment-keyed refund events with an outbox and
+ * confirm-before-publish → a read endpoint that reconstructs the balance from the durable records
+ * and reconciles the cache.
  */
 export const refundServiceProblem: Problem = {
   id: 'refund-service',
@@ -20,7 +20,6 @@ export const refundServiceProblem: Problem = {
   tagline: 'Refunds capped by the original payment, executed once, and visible immediately.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Refund Service
 
@@ -64,13 +63,13 @@ One service, **refundd**, with five pieces:
    reconciled with the PSP and called out with their references, and a foreign payment id answered
    with **404**.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version. In a refund service the failures are especially
-quiet: a double refund looks like a happy customer until finance closes the month.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real payments feature: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version. In a refund service the failures
+are especially quiet: a double refund looks like a happy customer until finance closes the month.
 
 ## Left out on purpose
 

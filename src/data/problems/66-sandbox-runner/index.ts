@@ -7,8 +7,8 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Sandbox runner on the AI-era track: the course is not "run code in a container", it is the review
- * you owe a model-authored execution path before it touches a host. Declarative submissions with
+ * Sandbox runner: the course is not "run code in a container", it is the debugging you owe an
+ * execution path before it runs model-authored code on a host. Declarative submissions with
  * default-deny capabilities → Redis leases that carry the hard wall-clock limit → a container call
  * with a deadline and an isolation check → job events keyed by job, carrying digests instead of
  * bodies → a read endpoint that returns the used profile, resource usage and a verified output.
@@ -19,7 +19,7 @@ export const sandboxRunnerProblem: Problem = {
   tagline: 'Execute model-authored code in isolation with hard limits and reproducible logs.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Sandbox Runner
 
@@ -63,12 +63,12 @@ One service, **sandboxd**, with five pieces:
    actually used**, and a digest-verified download for the output; a foreign job is **404** and an
    unfinished job is **409**.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real AI platform feature: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

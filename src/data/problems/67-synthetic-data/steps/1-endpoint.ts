@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'synth', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the recipe and starts generating. It compiles, it serves the demo, and it expands a seed nobody can
-account for. Review it like the service owner, fix it, and prove the fix with the checks below.
+account for. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/synthetic/jobs\` with body
 \`{"seed_dataset": "wiki-dump", "seed_version": "2026-04-01", "recipe": "qa-pairs", "max_records": 1000}\`.
@@ -33,10 +33,10 @@ Implement \`POST /v1/synthetic/jobs\` with body
 - Log the job id, the seed dataset and the cap — never the seed content.
 
 **Failure mode the checks target.** An unregistered seed means the corpus cannot be traced or
-licensed at all, and the draft expands whatever file path or dataset name the caller sends. The
+licensed at all, and the starter expands whatever file path or dataset name the caller sends. The
 license flag is the subtle one: a dataset can be perfectly registered and still be *forbidden* to
 derive from, so the registry lookup and the license decision are two different checks. The missing
-cap is the expensive one — the draft keeps generating until the client disconnects, so one request
+cap is the expensive one — the starter keeps generating until the client disconnects, so one request
 can produce an unbounded, unlicensed, unmeasured dataset.`,
   sequence: {
     participants: ['Data curator', 'Synthetic Data API', 'seed registry'],
@@ -77,7 +77,7 @@ can produce an unbounded, unlicensed, unmeasured dataset.`,
       id: 'licensed-seed',
       title: 'Refuses an unregistered seed or a no-derivatives license with 422',
       detail:
-        'The seed dataset *and* version are resolved in `SEED_REGISTRY`, and its `derivative_ok` license flag is required; an unknown seed or a no-derivatives license is **422**. The draft expands whatever dataset name it is handed and never reads a license flag.',
+        'The seed dataset *and* version are resolved in `SEED_REGISTRY`, and its `derivative_ok` license flag is required; an unknown seed or a no-derivatives license is **422**. The starter expands whatever dataset name it is handed and never reads a license flag.',
       match: {
         python: {all: [/SEED_REGISTRY/, /derivative_ok/, /status_code\s*=\s*422/]},
         typescript: {all: [/seedRegistry/, /derivativeOk/, /code\(\s*422\s*\)/]},
@@ -90,7 +90,7 @@ can produce an unbounded, unlicensed, unmeasured dataset.`,
       id: 'record-cap',
       title: 'Enforces the service-side 1..100000 record cap',
       detail:
-        '`max_records` must be an integer in `1..MAX_RECORDS` (**400** otherwise) and the accepted value is stored on the job, so the service stops at the cap instead of generating until the client disconnects. The draft has no cap at all.',
+        '`max_records` must be an integer in `1..MAX_RECORDS` (**400** otherwise) and the accepted value is stored on the job, so the service stops at the cap instead of generating until the client disconnects. The starter has no cap at all.',
       match: {
         python: {all: [/MAX_RECORDS\s*=\s*100000/, /status_code\s*=\s*400/, /body\.max_records/]},
         typescript: {all: [/MAX_RECORDS\s*=\s*100000/, /code\(\s*400\s*\)/, /max_records/]},
@@ -103,7 +103,7 @@ can produce an unbounded, unlicensed, unmeasured dataset.`,
       id: 'idempotent-submit',
       title: 'Requires the tenant and Idempotency-Key, and resumes the stored job',
       detail:
-        'A missing `X-Tenant-Id` is **401**, a missing `Idempotency-Key` is **400**, and the job is stored under `(tenant, key)` so a replay returns the job that already exists. The draft ignores both headers.',
+        'A missing `X-Tenant-Id` is **401**, a missing `Idempotency-Key` is **400**, and the job is stored under `(tenant, key)` so a replay returns the job that already exists. The starter ignores both headers.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/, /Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/, /idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -116,7 +116,7 @@ can produce an unbounded, unlicensed, unmeasured dataset.`,
       id: 'license-before-generate',
       title: 'Decides the license before any generation is enqueued',
       detail:
-        'The license read (`derivative_ok`) appears above the call that enqueues generation, so a forbidden seed never produces a single derivative. The draft enqueues first and would have to delete rows after the fact.',
+        'The license read (`derivative_ok`) appears above the call that enqueues generation, so a forbidden seed never produces a single derivative. The starter enqueues first and would have to delete rows after the fact.',
       match: {
         python: {order: [/derivative_ok/, /enqueue\(/]},
         typescript: {order: [/derivativeOk/, /enqueue\(/]},
@@ -128,7 +128,7 @@ can produce an unbounded, unlicensed, unmeasured dataset.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/synthetic/jobs: a model-generated draft that expands whatever seed it is handed."""
+      starter: `"""POST /v1/synthetic/jobs: flawed code that expands whatever seed it is handed."""
 import uuid
 
 from fastapi import FastAPI, Header
@@ -149,7 +149,7 @@ def start_expansion(job_id: str, seed_dataset: str, recipe: str) -> None:
 
 @app.post("/v1/synthetic/jobs")
 def create_job(body: JobRequest, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> dict:
-    # TODO: this draft expands whatever seed_dataset the caller sends, never consults the registry or
+    # TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
     # the seed's license, has no record cap, and validates neither header: no tenant check and no
     # idempotency, so one client retry expands the same seed a second time.
     job_id = str(uuid.uuid4())
@@ -257,7 +257,7 @@ def create_job(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/synthetic/jobs: a model-generated draft that expands whatever seed the caller sends. */
+      starter: `/** POST /v1/synthetic/jobs: flawed code that expands whatever seed the caller sends. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -278,7 +278,7 @@ async function startExpansion(jobId: string, seedDataset: string, seedVersion: s
 }
 
 app.post('/v1/synthetic/jobs', async (request, reply) => {
-  // TODO: this draft expands whatever seed_dataset the caller sends, never consults the registry or
+  // TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
   // the seed's license, has no record cap, and validates neither header: no tenant check and no
   // idempotency, so one client retry expands the same seed a second time.
   const tenant = request.headers['x-tenant-id'];
@@ -372,7 +372,7 @@ void app.listen({port: 8080, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// POST /v1/synthetic/jobs: a model-generated draft that expands whatever seed the caller sends.
+      starter: `// POST /v1/synthetic/jobs: flawed code that expands whatever seed the caller sends.
 package main
 
 import (
@@ -404,7 +404,7 @@ func submitJob(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft expands whatever seed_dataset the caller sends, never consults the registry or
+	// TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
 	// the seed's license, has no record cap, and validates neither header: no tenant check and no
 	// idempotency, so one client retry expands the same seed a second time.
 	jobID := uuid.NewString()
@@ -572,7 +572,7 @@ object SynthApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[JobRequest]) { body =>
-            // TODO: this draft expands whatever seed_dataset the caller sends, never consults the
+            // TODO: this starter expands whatever seed_dataset the caller sends, never consults the
             // registry or the seed's license, has no record cap, and validates neither header: no
             // tenant check and no idempotency, so one client retry expands the seed twice.
             val jobId = UUID.randomUUID().toString
@@ -680,7 +680,7 @@ object SynthApi {
 `,
     },
     cpp: {
-      starter: `// POST /v1/synthetic/jobs: a model-generated draft that expands whatever seed the caller sends.
+      starter: `// POST /v1/synthetic/jobs: flawed code that expands whatever seed the caller sends.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -711,7 +711,7 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft expands whatever seed_dataset the caller sends, never consults the registry or
+    // TODO: this starter expands whatever seed_dataset the caller sends, never consults the registry or
     // the seed's license, has no record cap, and validates neither header: no tenant check and no
     // idempotency, so one client retry expands the same seed a second time.
     const auto jobId = uuidString();
@@ -835,5 +835,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the license boundary. The draft reads fine because the demo always sends a seed the platform owns and never retries. Five separate defects are being checked: authentication, the request cap, the registry lookup, the license decision, and the order the two happen in. The subtle one is the license: most candidates stop at "the dataset exists", but a registered dataset whose license forbids derivatives turns every generated record into a legal problem, and the fix has to run before generation starts, not after. The idempotency key is what makes a retried submit safe: without it, one client retry doubles the corpus against the same seed and the cap you validated is now two caps. Real services add a seed registry audit trail, per-tenant seed allowlists, and a license term record pinned to the job.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the license boundary. The starter reads fine because the demo always sends a seed the platform owns and never retries. Five separate defects are being checked: authentication, the request cap, the registry lookup, the license decision, and the order the two happen in. The subtle one is the license: most candidates stop at "the dataset exists", but a registered dataset whose license forbids derivatives turns every generated record into a legal problem, and the fix has to run before generation starts, not after. The idempotency key is what makes a retried submit safe: without it, one client retry doubles the corpus against the same seed and the cap you validated is now two caps. Real services add a seed registry audit trail, per-tenant seed allowlists, and a license term record pinned to the job.`,
 };

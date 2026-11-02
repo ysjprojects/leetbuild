@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, decodes
+**Starting point.** The starter is working code: it registers the route, decodes
 the body and returns an inference id. It compiles, it serves the demo, and it hides three production
-flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/inferences\` with body
 \`{"image": "tenants/acme/images/9f2c…c41.jpg", "task": "classify"}\`.
@@ -28,7 +28,7 @@ Implement \`POST /v1/inferences\` with body
   **stored inference** with 200 instead of running the model a second time.
 - Log the decision with tenant, task and digest — never the caller's raw reference.
 
-**Failure mode the checks target.** The draft hands the caller's string straight to the fetch helper,
+**Failure mode the checks target.** The starter hands the caller's string straight to the fetch helper,
 so a crafted reference is a server-side request forgery probe against every bucket the service can
 reach. It accepts any task name, so an unknown task reaches the model router and fails there instead
 of at the boundary. And it keys nothing: every client retry re-runs inference on the same bytes, which
@@ -62,7 +62,7 @@ bills the tenant twice for one image.`,
       id: 'tenant',
       title: 'Authenticates the tenant before anything else',
       detail:
-        'A request without `X-Tenant-Id` is **401**. The draft reads the header and uses it as a label, so an anonymous caller still gets a fetch.',
+        'A request without `X-Tenant-Id` is **401**. The starter reads the header and uses it as a label, so an anonymous caller still gets a fetch.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
@@ -75,7 +75,7 @@ bills the tenant twice for one image.`,
       id: 'task',
       title: 'Whitelists the task',
       detail:
-        '`task` is checked against `classify` / `detect` / `embed` and an unknown value is **400**. The draft forwards whatever string the caller sent to the model.',
+        '`task` is checked against `classify` / `detect` / `embed` and an unknown value is **400**. The starter forwards whatever string the caller sent to the model.',
       match: {
         python: {all: [/ALLOWED_TASKS/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_TASKS/, /code\(\s*400\s*\)/]},
@@ -88,7 +88,7 @@ bills the tenant twice for one image.`,
       id: 'scope',
       title: 'Refuses a foreign storage prefix with 403 before the fetch',
       detail:
-        'The key must start with the tenant prefix and must not carry a scheme or a `..` segment; a violation is **403** and the check lands before `fetch_object` is called. The draft fetches first, so this order is the whole point.',
+        'The key must start with the tenant prefix and must not carry a scheme or a `..` segment; a violation is **403** and the check lands before `fetch_object` is called. The starter fetches first, so this order is the whole point.',
       match: {
         python: {all: [/TENANT_PREFIX/, /status_code\s*=\s*403/], order: [/status_code\s*=\s*403/, /fetch_object\(/]},
         typescript: {all: [/TENANT_PREFIX/, /code\(\s*403\s*\)/], order: [/code\(\s*403\s*\)/, /fetchObject\(/]},
@@ -101,7 +101,7 @@ bills the tenant twice for one image.`,
       id: 'idempotency',
       title: 'Keys retries by (tenant, content hash)',
       detail:
-        '`Idempotency-Key` is required and the inference is stored under `(tenant, content_hash)`; a replay returns the stored inference instead of running the model again. The draft ignores the header and the digest entirely.',
+        '`Idempotency-Key` is required and the inference is stored under `(tenant, content_hash)`; a replay returns the stored inference instead of running the model again. The starter ignores the header and the digest entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /content_hash/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /content_hash/, /store\.get\(/, /store\.put\(/]},
@@ -113,7 +113,7 @@ bills the tenant twice for one image.`,
   ],
   code: {
     python: {
-      starter: `"""POST /v1/inferences: a model-generated draft that fetches whatever the caller names."""
+      starter: `"""POST /v1/inferences: flawed code that fetches whatever the caller names."""
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -141,8 +141,8 @@ store = InferenceStore()
 
 @app.post("/v1/inferences")
 def create_inference(body: InferenceRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft dereferences whatever object URL the caller sends, accepts any task name,
-    # and collapses nothing — every retry runs the model again. Review all three.
+    # TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
+    # and collapses nothing — every retry runs the model again. Fix all three.
     payload = fetch_object(body.image)
     return JSONResponse(
         {"id": "inf-1", "tenant": tenant, "task": body.task, "bytes": len(payload)},
@@ -234,7 +234,7 @@ def fetch_object(key: str) -> bytes:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/inferences: a model-generated draft that fetches whatever the caller names. */
+      starter: `/** POST /v1/inferences: flawed code that fetches whatever the caller names. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -245,8 +245,8 @@ interface InferenceBody {
 }
 
 app.post('/v1/inferences', async (request, reply) => {
-  // TODO: this draft dereferences whatever object URL the caller sends, accepts any task name,
-  // and collapses nothing — every retry runs the model again. Review all three.
+  // TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
+  // and collapses nothing — every retry runs the model again. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as InferenceBody;
   const payload = await fetchObject(body.image);
@@ -346,8 +346,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createInference(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft dereferences whatever object URL the caller sends, accepts any task name,
-	// and collapses nothing — every retry runs the model again. Review all three.
+	// TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
+	// and collapses nothing — every retry runs the model again. Fix all three.
 	tenant := r.Header.Get("X-Tenant-Id")
 	var body InferenceRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -517,7 +517,7 @@ object VisionApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[InferenceRequest]) { body =>
-            // TODO: this draft dereferences whatever object URL the caller sends, accepts any task
+            // TODO: this starter dereferences whatever object URL the caller sends, accepts any task
             // name, and collapses nothing — every retry runs the model again.
             val payload = fetchObject(body.image)
             complete(
@@ -624,8 +624,8 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/inferences", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft dereferences whatever object URL the caller sends, accepts any task name,
-    // and collapses nothing — every retry runs the model again. Review all three.
+    // TODO: this starter dereferences whatever object URL the caller sends, accepts any task name,
+    // and collapses nothing — every retry runs the model again. Fix all three.
     const auto tenant = req.get_header_value("X-Tenant-Id");
     json body = json::parse(req.body, nullptr, false);
     if (!body.is_object()) {
@@ -745,8 +745,8 @@ std::string fetchObject(const std::string& key) { return key; }
     "The scope check is a prefix test on the tenant's own key space — `tenants/{tenant}/images/` — plus a refusal of any scheme or `..` segment. It is not a deny-list of internal hostnames: a deny-list loses to the next URL form you did not think of.",
     'The digest is already in the key (`…/<sha256>.jpg`), which is what lets the idempotency lookup happen before the fetch: `store.get(tenant, content_hash)` on a replay answers with the first inference and never re-reads the object.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary. The
-draft reads fine because the demo posts one well-formed key from one tenant and never retries. Three
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary. The
+starter reads fine because the demo posts one well-formed key from one tenant and never retries. Three
 separate defects are being checked: authentication (the tenant is never optional), a scoped key
 contract (the caller names a key inside its own prefix, never a URL the service dereferences), and
 idempotency keyed by the content hash so a retry cannot bill the same bytes twice. The subtle one is

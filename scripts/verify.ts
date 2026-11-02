@@ -350,6 +350,30 @@ function verifyProblem(problem: Problem): string[] {
     if (sources.length === 0)
       errors.push(`${problem.id}: a deep-learning problem cites its sources (paper, code, posts)`);
   } else if (problem.sources !== undefined) errors.push(`${problem.id}: lists sources but names no company`);
+  // A systems course whose starter is flawed code says so as code to debug, fix and optimize, never as a
+  // model's draft; the tag marks a system with a model at its core, which only a systems course is.
+  if (problem.tag !== undefined && problem.track !== undefined)
+    errors.push(`${problem.id}: only a systems course carries a tag`);
+  if (problem.track !== 'dllm') {
+    const copy = [
+      problem.title,
+      problem.tagline,
+      problem.statement,
+      ...problem.steps.flatMap(step => [
+        step.task,
+        step.debrief,
+        ...step.hints,
+        ...step.checks.flatMap(check => [check.title, check.detail]),
+        ...problemLanguages(problem).flatMap(language => {
+          const code = codeFor(step, language);
+          return [code.starter, code.solution];
+        }),
+      ]),
+    ].join('\n');
+    const story = /model-generated|AI-generated|AI draft|AI-era|Review premise/i.exec(copy);
+    if (story !== null)
+      errors.push(`${problem.id}: the starter is flawed code to debug, not a model's draft (found "${story[0]}")`);
+  }
   const urls = new Set<string>();
   for (const s of sources) {
     if (!/^https:\/\/\S+$/.test(s.url)) errors.push(`${problem.id}: source '${s.title}' needs an https URL`);

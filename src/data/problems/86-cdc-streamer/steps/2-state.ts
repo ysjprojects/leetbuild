@@ -8,9 +8,9 @@ export const lsnCursorStep: Step = {
   focus: ['redis', 'replicator', 'sink', 'pg'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the tailer reads the change
+**Starting point.** The starter is working code: the tailer reads the change
 stream, applies each batch to the sink and keeps a cursor in Redis so the demo survives a restart.
-It compiles, it replays the demo cleanly, and it hides three production flaws. Review it like the
+It compiles, it replays the demo cleanly, and it hides three production flaws. Debug it like the
 replication owner, fix it, and prove the fix with the checks below.
 
 Keep the durable cursor the tailer resumes from:
@@ -30,7 +30,7 @@ Keep the durable cursor the tailer resumes from:
   not applied yet are.
 
 **Failure mode the checks target.** The confirmed LSN per (subscription, table) has to be stored
-durably and advanced only after downstream confirmation, with no expiry. The draft stores the cursor
+durably and advanced only after downstream confirmation, with no expiry. The starter stores the cursor
 in a cache key with a 12-hour TTL under a subscription-only key, so a quiet weekend resets the
 stream to the current LSN and silently drops the backlog, and it advances the cursor as soon as the
 changes are read. The fix has to prove the cursor has no expiry, that it moves only after
@@ -72,7 +72,7 @@ confirmation, and that a restart resumes exactly at the confirmed LSN rather tha
       id: 'per-table-key',
       title: 'One cursor key per (subscription, table)',
       detail:
-        'The key is `cdc:cursor:{subscription}:{table}`, built by `cursor_key`/`cursorKey`. The draft keeps one subscription-wide key, so two tables of the same subscription overwrite each other and one of them resumes from the other table’s LSN.',
+        'The key is `cdc:cursor:{subscription}:{table}`, built by `cursor_key`/`cursorKey`. The starter keeps one subscription-wide key, so two tables of the same subscription overwrite each other and one of them resumes from the other table’s LSN.',
       match: {
         python: {all: [/def cursor_key\(/, /cdc:cursor/, /\{subscription\}:\{table\}/]},
         typescript: {all: [/function cursorKey\(/, /cdc:cursor/, /\$\{subscription\}:\$\{table\}/]},
@@ -85,7 +85,7 @@ confirmation, and that a restart resumes exactly at the confirmed LSN rather tha
       id: 'after-confirmation',
       title: 'Advances the cursor only after the sink applied the batch',
       detail:
-        '`confirm` runs after `sink.apply(...)`: the tailer applies the batch downstream first and moves the cursor second. The draft moves it as soon as the changes are read, so a crash between read and apply loses that batch forever.',
+        '`confirm` runs after `sink.apply(...)`: the tailer applies the batch downstream first and moves the cursor second. The starter moves it as soon as the changes are read, so a crash between read and apply loses that batch forever.',
       match: {
         python: {order: [/sink\.apply\(/, /confirm\(/]},
         typescript: {order: [/sink\.apply\(/, /confirm\(/]},
@@ -98,7 +98,7 @@ confirmation, and that a restart resumes exactly at the confirmed LSN rather tha
       id: 'resume-confirmed',
       title: 'A restart resumes at the confirmed LSN, never the head',
       detail:
-        '`load_cursor`/`loadCursor` reads the confirmed LSN and the tailer starts exactly there. Asking the source for `head_lsn`/`current_lsn` resumes past everything that happened while the tailer was down — the draft does that and drops the backlog.',
+        '`load_cursor`/`loadCursor` reads the confirmed LSN and the tailer starts exactly there. Asking the source for `head_lsn`/`current_lsn` resumes past everything that happened while the tailer was down — the starter does that and drops the backlog.',
       match: {
         python: {all: [/def load_cursor\(/], none: [/\bhead_lsn\(/, /\bcurrent_lsn\(/]},
         typescript: {all: [/function loadCursor\(/], none: [/headLsn\(|currentLsn\(/]},
@@ -152,9 +152,9 @@ sink = Sink()
 
 
 async def tail(conn: redis.Redis, source: Source, subscription: str, table: str) -> None:
-    # TODO: this draft caches the cursor under a subscription-only key with a 12-hour expiry,
+    # TODO: this starter caches the cursor under a subscription-only key with a 12-hour expiry,
     # advances it as soon as the changes are read, and resumes from the source head, so a quiet
-    # weekend silently drops the backlog. Review all three.
+    # weekend silently drops the backlog. Fix all three.
     key = f"cdc:cursor:{subscription}"
     lsn = int(await conn.get(key) or source.head_lsn())
     async for batch in source.read_from(lsn):
@@ -220,7 +220,7 @@ async def tail(
 `,
     },
     typescript: {
-      starter: `/** CDC tailer: a model-generated draft that keeps the cursor in a cache key. */
+      starter: `/** CDC tailer: flawed code that keeps the cursor in a cache key. */
 import {Redis} from 'ioredis';
 
 const CURSOR_EXPIRY_S = 12 * 60 * 60;
@@ -246,9 +246,9 @@ export async function tail(
   subscription: string,
   table: string,
 ): Promise<void> {
-  // TODO: this draft caches the cursor under a subscription-only key with a 12-hour expiry,
+  // TODO: this starter caches the cursor under a subscription-only key with a 12-hour expiry,
   // advances it as soon as the changes are read, and resumes from the source head, so a quiet
-  // weekend silently drops the backlog. Review all three.
+  // weekend silently drops the backlog. Fix all three.
   const key = \`cdc:cursor:\${subscription}\`;
   let lsn = Number((await conn.get(key)) ?? (await source.headLsn()));
   for await (const batch of source.readFrom(lsn)) {
@@ -342,9 +342,9 @@ type Sink interface {
 }
 
 func tail(ctx context.Context, conn *redis.Client, source Source, sink Sink, subscription, table string) error {
-	// TODO: this draft caches the cursor under a subscription-only key with a 12-hour expiry,
+	// TODO: this starter caches the cursor under a subscription-only key with a 12-hour expiry,
 	// advances it as soon as the changes are read, and resumes from the source head, so a quiet
-	// weekend silently drops the backlog. Review all three.
+	// weekend silently drops the backlog. Fix all three.
 	key := fmt.Sprintf("cdc:cursor:%s", subscription)
 	head, err := source.headLSN(ctx)
 	if err != nil {
@@ -469,9 +469,9 @@ trait Sink {
 object Tailer {
   val CursorExpirySeconds = 12L * 60 * 60
 
-  // TODO: this draft caches the cursor under a subscription-only key with a 12-hour expiry,
+  // TODO: this starter caches the cursor under a subscription-only key with a 12-hour expiry,
   // advances it as soon as the changes are read, and resumes from the source head, so a quiet
-  // weekend silently drops the backlog. Review all three.
+  // weekend silently drops the backlog. Fix all three.
   def tail(jedis: Jedis, source: Source, sink: Sink, subscription: String, table: String): Unit = {
     val key = s"cdc:cursor:$subscription"
     val head = source.headLsn()
@@ -557,9 +557,9 @@ class Sink {
 
 void tail(sw::redis::Redis& redis, Source& source, Sink& sink, const std::string& subscription,
           const std::string& table) {
-  // TODO: this draft caches the cursor under a subscription-only key with a 12-hour expiry,
+  // TODO: this starter caches the cursor under a subscription-only key with a 12-hour expiry,
   // advances it as soon as the changes are read, and resumes from the source head, so a quiet
-  // weekend silently drops the backlog. Review all three.
+  // weekend silently drops the backlog. Fix all three.
   const auto key = "cdc:cursor:" + subscription;
   const auto stored = redis.get(key);
   std::int64_t lsn = stored ? std::stoll(*stored) : source.headLsn();
@@ -633,5 +633,5 @@ void tail(sw::redis::Redis& redis, Source& source, Sink& sink, const std::string
     '`confirm` is the only writer and it writes with `HSET` alone — no `EXPIRE`, no `SET ... EX`, no TTL anywhere on that key. And move it *after* `await sink.apply(...)`: advancing on read loses every batch that was read but not shipped when the process dies.',
     'A confirmation is monotonic: read the stored LSN, drop the write when `lsn <= confirmed`, and hand the sink’s applied LSN back. On restart, `load_cursor(...)` gives the starting position — never ask the source for its head, which is already past the changes you have not applied.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated replication loop whose whole correctness rests on one key. The draft works on the demo because the demo runs for a minute: the cursor is a cache entry with a 12-hour TTL, it is written as soon as changes are read, and the restart path asks the source for its head. Three defects are being checked. Durability is first — a cursor is bookkeeping, not a cache, so it is written with \`HSET\` and never given an expiry; a TTL here means a Monday morning that either re-delivers every change or, worse, resumes at the head and drops the weekend. Order of operations is second, and it is the one that is invisible until a crash: apply to the sink, then confirm, so the confirmed LSN never runs ahead of what downstream holds. Monotonicity is third — confirmations arrive out of order after retries, and a stale one must not drag the cursor backwards over already-applied changes. Real streamers add one cursor per (subscription, table) inside a single key or an HA store, compare the LSN against the slot’s restart point, and record the sink’s acknowledgement before the WAL slot is allowed to advance.`,
+  debrief: `The interviewer is testing whether you can debug a replication loop whose whole correctness rests on one key. The starter works on the demo because the demo runs for a minute: the cursor is a cache entry with a 12-hour TTL, it is written as soon as changes are read, and the restart path asks the source for its head. Three defects are being checked. Durability is first — a cursor is bookkeeping, not a cache, so it is written with \`HSET\` and never given an expiry; a TTL here means a Monday morning that either re-delivers every change or, worse, resumes at the head and drops the weekend. Order of operations is second, and it is the one that is invisible until a crash: apply to the sink, then confirm, so the confirmed LSN never runs ahead of what downstream holds. Monotonicity is third — confirmations arrive out of order after retries, and a stale one must not drag the cursor backwards over already-applied changes. Real streamers add one cursor per (subscription, table) inside a single key or an HA store, compare the LSN against the slot’s restart point, and record the sink’s acknowledgement before the WAL slot is allowed to advance.`,
 };

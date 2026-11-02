@@ -8,8 +8,8 @@ export const dependencyStep: Step = {
   focus: ['api', 'crm', 'worker', 'store'],
   task: `## Task
 
-The starter is a plausible model-generated draft: an agent posts a note, the draft pushes it to the
-CRM, the demo answers 201, and nothing looks wrong. It hides four production flaws. Review it
+**Starting point.** The starter is working code: an agent posts a note, the starter pushes it to
+the CRM, the demo answers 201, and nothing looks wrong. It hides four production flaws. Debug it
 like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`ticketd\`'s CRM client: the request path that accepts a note, and the worker pass that
@@ -34,7 +34,7 @@ syncs notes to the CRM over gRPC.
   permanent status is quarantined too; a note whose retryable attempts are exhausted stays pending
   for the next pass (\`return False\` / \`return false\`).
 
-**Failure mode the checks target.** The draft syncs inline before it answers, so one CRM outage
+**Failure mode the checks target.** The starter syncs inline before it answers, so one CRM outage
 blocks every agent's post; it sends no key, so its endless retries create a new CRM note each time —
 the agent's reply duplicates in the customer's record; it treats \`INVALID_ARGUMENT\` like every other
 error and retries it forever; and with no deadline the call can hang the worker indefinitely. All
@@ -72,16 +72,16 @@ four are invisible in a demo where the CRM is healthy and fast.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)`, `set_deadline`) — wrapping the call changes nothing. And the idempotency key is the note id, built once and replayed on every attempt: the draft sends neither a note id nor a key, so the CRM cannot see two attempts as one record.',
-    'Keep the CRM off the request path: commit the note and its outbox row together (`store.commit_note` / `store.commitNote`), answer 201, and let the worker drain the pending rows. The draft calls the CRM inside the handler, so a CRM outage is a failed agent request — the outbox row is what turns that failure into a pending row instead.',
-    'Split the statuses instead of catching everything: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt under a `MAX_ATTEMPTS = 3` cap; `INVALID_ARGUMENT` is the CRM refusing the note, so it must be quarantined with a reason (`store.quarantine(note.id, …)`) instead of retried. The draft’s `while` loop has no exit for it.',
+    'The deadline is an argument on the call itself (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)`, `set_deadline`) — wrapping the call changes nothing. And the idempotency key is the note id, built once and replayed on every attempt: the starter sends neither a note id nor a key, so the CRM cannot see two attempts as one record.',
+    'Keep the CRM off the request path: commit the note and its outbox row together (`store.commit_note` / `store.commitNote`), answer 201, and let the worker drain the pending rows. The starter calls the CRM inside the handler, so a CRM outage is a failed agent request — the outbox row is what turns that failure into a pending row instead.',
+    'Split the statuses instead of catching everything: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt under a `MAX_ATTEMPTS = 3` cap; `INVALID_ARGUMENT` is the CRM refusing the note, so it must be quarantined with a reason (`store.quarantine(note.id, …)`) instead of retried. The starter’s `while` loop has no exit for it.',
   ],
   checks: [
     {
       id: 'sync-deadline',
       title: 'Every sync attempt carries a 3 s deadline',
       detail:
-        'The `SyncNote` call is created with a **3-second** deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)` or `set_deadline`. The draft calls with no deadline at all: one CRM that accepts the connection and then says nothing pins the sync worker forever.',
+        'The `SyncNote` call is created with a **3-second** deadline — `timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout(ctx, deadlineS*time.Second)`, `withDeadlineAfter(DeadlineS, TimeUnit.SECONDS)` or `set_deadline`. The starter calls with no deadline at all: one CRM that accepts the connection and then says nothing pins the sync worker forever.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*3/, /timeout=DEADLINE_S/, /\.SyncNote\(/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*3000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.syncNote\(/]},
@@ -96,7 +96,7 @@ four are invisible in a demo where the CRM is healthy and fast.`,
       id: 'idempotent-sync',
       title: 'The note id is the idempotency key, so a retry updates one record',
       detail:
-        'The note id travels with the request as the idempotency key (`idempotency_key=note.id`, `idempotencyKey: note.id`, `IdempotencyKey: note.ID`, `set_idempotency_key(note.id)`), so the CRM can dedupe a retry onto the record it already made. No key is minted per attempt. The draft sends neither the note id nor a key, so every attempt is a new CRM note and the agent’s reply duplicates in the customer’s record.',
+        'The note id travels with the request as the idempotency key (`idempotency_key=note.id`, `idempotencyKey: note.id`, `IdempotencyKey: note.ID`, `set_idempotency_key(note.id)`), so the CRM can dedupe a retry onto the record it already made. No key is minted per attempt. The starter sends neither the note id nor a key, so every attempt is a new CRM note and the agent’s reply duplicates in the customer’s record.',
       match: {
         python: {all: [/idempotency_key=note\.id/], none: [/uuid4\(/]},
         typescript: {all: [/idempotencyKey:\s*note\.id/], none: [/randomUUID\(/]},
@@ -109,7 +109,7 @@ four are invisible in a demo where the CRM is healthy and fast.`,
       id: 'quarantine-schema',
       title: 'A schema rejection is quarantined with a reason',
       detail:
-        '`INVALID_ARGUMENT` is a permanent refusal, not a transient failure: the note is quarantined with the status as its reason (`store.quarantine(note.id, …)` / `Quarantine(ctx, note.ID, …)`) and the sync stops instead of retrying. The draft catches every error and loops forever, so a note the CRM will never accept is retried until the worker is killed.',
+        '`INVALID_ARGUMENT` is a permanent refusal, not a transient failure: the note is quarantined with the status as its reason (`store.quarantine(note.id, …)` / `Quarantine(ctx, note.ID, …)`) and the sync stops instead of retrying. The starter catches every error and loops forever, so a note the CRM will never accept is retried until the worker is killed.',
       match: {
         python: {
           all: [/StatusCode\.INVALID_ARGUMENT/, /quarantine\(note\.id,/, /return False/],
@@ -137,7 +137,7 @@ four are invisible in a demo where the CRM is healthy and fast.`,
       id: 'nonblocking-sync',
       title: 'The CRM never blocks the ticket UI',
       detail:
-        'The handler commits the note and its outbox row in one transaction (`store.commit_note` / `store.commitNote` / `Store.CommitNote`) and answers without touching the CRM; a separate drain (`drain_outbox` / `drainOutbox` / `DrainOutbox`) reads the pending rows and makes the RPC. The draft calls the CRM from the handler, so a CRM outage is a failed post for the agent and a stalled ticket page.',
+        'The handler commits the note and its outbox row in one transaction (`store.commit_note` / `store.commitNote` / `Store.CommitNote`) and answers without touching the CRM; a separate drain (`drain_outbox` / `drainOutbox` / `DrainOutbox`) reads the pending rows and makes the RPC. The starter calls the CRM from the handler, so a CRM outage is a failed post for the agent and a stalled ticket page.',
       match: {
         python: {
           all: [/def post_note\(/, /store\.commit_note\(/, /def drain_outbox\(/],
@@ -167,7 +167,7 @@ four are invisible in a demo where the CRM is healthy and fast.`,
       id: 'retry-policy',
       title: 'Bounded attempts on the retryable statuses only',
       detail:
-        'Attempts are capped by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried, with the same idempotency key each time; a permanent status exits instead of spinning. There is no unbounded `while True` / `for (;;)` / `for (;; attempt++)` loop. The draft retries every failure forever.',
+        'Attempts are capped by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried, with the same idempotency key each time; a permanent status exits instead of spinning. There is no unbounded `while True` / `for (;;)` / `for (;; attempt++)` loop. The starter retries every failure forever.',
       match: {
         python: {
           all: [
@@ -204,7 +204,7 @@ four are invisible in a demo where the CRM is healthy and fast.`,
   ],
   code: {
     python: {
-      starter: `"""ticketd's CRM client: a model-generated draft that pushes a note to the CRM as it is posted."""
+      starter: `"""ticketd's CRM client: flawed code that pushes a note to the CRM as it is posted."""
 import grpc
 
 import crm_pb2
@@ -214,7 +214,7 @@ crm = crm_pb2_grpc.CrmStub(grpc.insecure_channel("crm:9000"))
 
 
 def post_note(note, store) -> int:
-    """POST /v1/tickets/{id}/notes — the draft answers only after the CRM has taken the note."""
+    """POST /v1/tickets/{id}/notes — the starter answers only after the CRM has taken the note."""
     store.append_note(note)
     # TODO: never call the CRM from the request path (a CRM outage blocks the agent), put a 3 s
     # deadline on the call, send the note id as the idempotency key so a retry updates one CRM
@@ -304,7 +304,7 @@ def drain_outbox(store, crm_stub=crm) -> None:
 `,
     },
     typescript: {
-      starter: `/** ticketd's CRM client: a model-generated draft that pushes a note to the CRM as it is posted. */
+      starter: `/** ticketd's CRM client: flawed code that pushes a note to the CRM as it is posted. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'trainer'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it produces an event per sample and the trainer
+**Starting point.** The starter is working code: it produces an event per sample and the trainer
 consumes it, so the demo shows data flowing. Four contracts are broken. Find them, fix them, and
 prove the fix.
 
@@ -55,7 +55,7 @@ accepted.`,
       id: 'dataset-key',
       title: 'Keys the sample by dataset id',
       detail:
-        'The produced record’s key is the **dataset id** (`key=event.dataset_id`, `key: event.dataset_id`, `Key: []byte(...DatasetID)`, `ProducerRecord(topic, dataset_id, …)`), so one dataset keeps one order in the topic. The draft keys by the job id.',
+        'The produced record’s key is the **dataset id** (`key=event.dataset_id`, `key: event.dataset_id`, `Key: []byte(...DatasetID)`, `ProducerRecord(topic, dataset_id, …)`), so one dataset keeps one order in the topic. The starter keys by the job id.',
       match: {
         python: {all: [/produce\(\s*TOPIC\s*,\s*key=event\.dataset_id/]},
         typescript: {all: [/key:\s*event\.dataset_id/]},
@@ -68,7 +68,7 @@ accepted.`,
       id: 'dedupe-filter',
       title: 'Never produces a duplicate hash',
       detail:
-        'The dedupe index is consulted (`dedupe.is_duplicate(...)`) **before** the produce, and a duplicate returns without publishing. The draft publishes first and checks the hash afterwards, so the sample that the filter rejected still reaches the topic.',
+        'The dedupe index is consulted (`dedupe.is_duplicate(...)`) **before** the produce, and a duplicate returns without publishing. The starter publishes first and checks the hash afterwards, so the sample that the filter rejected still reaches the topic.',
       match: {
         python: {order: [/\.is_duplicate\(/, /producer\.produce\(/]},
         typescript: {order: [/\.isDuplicate\(/, /producer\.send\(/]},
@@ -81,7 +81,7 @@ accepted.`,
       id: 'version-and-hash',
       title: 'Carries the teacher version and the dedupe hash',
       detail:
-        'The payload carries `teacher_version` and `dedupe_hash` beside the ids, so a bad run can be traced to the exact teacher version and a duplicate can be recognised downstream. The draft drops the teacher version and ships the raw prompt instead.',
+        'The payload carries `teacher_version` and `dedupe_hash` beside the ids, so a bad run can be traced to the exact teacher version and a duplicate can be recognised downstream. The starter drops the teacher version and ships the raw prompt instead.',
       match: {
         python: {all: [/teacher_version/, /dedupe_hash/]},
         typescript: {all: [/teacher_version/, /dedupe_hash/]},
@@ -94,7 +94,7 @@ accepted.`,
       id: 'outbox-fallback',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce calls `insertOutbox(...)` inside the error branch instead of dropping the event, so a relay can republish it. The draft ignores the broker result entirely and the sample is lost while the job still counts it accepted.',
+        'A rejected produce calls `insertOutbox(...)` inside the error branch instead of dropping the event, so a relay can republish it. The starter ignores the broker result entirely and the sample is lost while the job still counts it accepted.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
         typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
@@ -107,7 +107,7 @@ accepted.`,
       id: 'no-prompt-text',
       title: 'No prompt text in the event or the logs',
       detail:
-        'Neither the payload nor any log line carries the prompt text: the topic is retained and replicated, so tenant content written there outlives every retention policy the pipeline has. The draft copies the prompt into both.',
+        'Neither the payload nor any log line carries the prompt text: the topic is retained and replicated, so tenant content written there outlives every retention policy the pipeline has. The starter copies the prompt into both.',
       match: {
         python: {none: [/\bprompt\b/i]},
         typescript: {none: [/\bprompt\b/i]},
@@ -142,9 +142,9 @@ class SampleRecord(BaseModel):
 
 
 def publish(record: SampleRecord) -> None:
-    # TODO: this draft keys by job id so two jobs over one dataset interleave, publishes the sample
+    # TODO: this starter keys by job id so two jobs over one dataset interleave, publishes the sample
     # before the dedupe filter has had a say, keeps the prompt in the payload and the log, and drops
-    # the produce error on the floor. Review all four.
+    # the produce error on the floor. Fix all four.
     payload = record.model_dump_json().encode("utf-8")
     logger.info("distill sample job=%s prompt=%r", record.job_id, record.prompt)
     producer.produce(TOPIC, key=record.job_id, value=payload)
@@ -216,7 +216,7 @@ def publish(event: SampleEvent) -> bool:
 `,
     },
     typescript: {
-      starter: `/** distill.sample: a model-generated draft that publishes before it filters. */
+      starter: `/** distill.sample: flawed code that publishes before it filters. */
 import {Kafka, type Producer} from 'kafkajs';
 
 const TOPIC = 'distill.sample';
@@ -236,9 +236,9 @@ export interface SampleRecord {
 }
 
 export async function publish(record: SampleRecord): Promise<void> {
-  // TODO: this draft keys by job id so two jobs over one dataset interleave, publishes the sample
+  // TODO: this starter keys by job id so two jobs over one dataset interleave, publishes the sample
   // before the dedupe filter has had a say, keeps the prompt in the payload and the log, and drops
-  // the produce error on the floor. Review all four.
+  // the produce error on the floor. Fix all four.
   const payload = JSON.stringify(record);
   console.log({job_id: record.job_id, prompt: record.prompt}, 'sample published');
   await producer.send({topic: TOPIC, messages: [{key: record.job_id, value: payload}]});
@@ -314,9 +314,9 @@ type SampleRecord struct {
 }
 
 func Publish(ctx context.Context, event SampleRecord) error {
-	// TODO: this draft keys by job id so two jobs over one dataset interleave, publishes the sample
+	// TODO: this starter keys by job id so two jobs over one dataset interleave, publishes the sample
 	// before the dedupe filter has had a say, keeps the prompt in the payload and the log, and drops
-	// the produce error on the floor. Review all four.
+	// the produce error on the floor. Fix all four.
 	payload, _ := json.Marshal(event)
 	log.Printf("distill sample job=%s prompt=%q", event.JobID, event.Prompt)
 	_ = sampleWriter.WriteMessages(ctx, kafka.Message{Key: []byte(event.JobID), Value: payload})
@@ -409,9 +409,9 @@ object SampleEvents {
       tokens: Int
   )
 
-  // TODO: this draft keys by job id so two jobs over one dataset interleave, publishes the sample
+  // TODO: this starter keys by job id so two jobs over one dataset interleave, publishes the sample
   // before the dedupe filter has had a say, keeps the prompt in the payload and the log, and drops
-  // the produce error on the floor. Review all four.
+  // the produce error on the floor. Fix all four.
   def publish(event: SampleRecord): Unit = {
     log.info(s"distill sample job=\${event.job_id} prompt=\${event.prompt}")
     val payload = Map[String, String](
@@ -499,9 +499,9 @@ std::set<std::string> seen;
 
 void publish(const std::string& jobId, const std::string& datasetId, const std::string& dedupeHash,
              const std::string& prompt, int tokens) {
-  // TODO: this draft keys by job id so two jobs over one dataset interleave, publishes the sample
+  // TODO: this starter keys by job id so two jobs over one dataset interleave, publishes the sample
   // before the dedupe filter has had a say, keeps the prompt in the payload and the log, and drops
-  // the produce error on the floor. Review all four.
+  // the produce error on the floor. Fix all four.
   const json event = {
       {"job_id", jobId}, {"dataset_id", datasetId}, {"dedupe_hash", dedupeHash}, {"prompt", prompt}, {"tokens", tokens}};
   const auto payload = event.dump();
@@ -569,5 +569,5 @@ void publish(const std::string& sampleId, const std::string& jobId, const std::s
 `,
     },
   },
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong. First, the key is an ordering contract: partition by dataset and the trainer sees one dataset in one order; key by job and two runs interleave. Second, the filter has to be upstream of the produce — a payload the dedupe filter rejected must not be able to reach the topic through a second path, because the trainer trusts the topic. Third, a broker is not a database: a rejected produce needs an outbox row and a relay, and the producer needs idempotence with acks=all for the retry that follows. The prompt leak is the quiet one: topics are retained and replicated, so whatever you write there outlives the request, the tenant and the retention policy. Real platforms add schema registry validation, per-dataset quotas, and a dead-letter topic for events a consumer can never process.`,
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong. First, the key is an ordering contract: partition by dataset and the trainer sees one dataset in one order; key by job and two runs interleave. Second, the filter has to be upstream of the produce — a payload the dedupe filter rejected must not be able to reach the topic through a second path, because the trainer trusts the topic. Third, a broker is not a database: a rejected produce needs an outbox row and a relay, and the producer needs idempotence with acks=all for the retry that follows. The prompt leak is the quiet one: topics are retained and replicated, so whatever you write there outlives the request, the tenant and the retention policy. Real platforms add schema registry validation, per-dataset quotas, and a dead-letter topic for events a consumer can never process.`,
 };

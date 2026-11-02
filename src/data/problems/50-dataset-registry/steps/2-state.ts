@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['registry', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the registry state module: it
+**Starting point.** The starter is working code for the registry state module: it
 keeps a latest-version pointer, records an audit entry, and moves consumer pins. It runs against a
-local Redis, it serves the demo, and it hides three production flaws. Review it like the owner of the
+local Redis, it serves the demo, and it hides three production flaws. Debug it like the owner of the
 pointer every training run reads, fix it, and prove the fix.
 
 Implement \`POST /v1/datasets/{dataset}/promote\` over the dataset state below.
@@ -18,7 +18,7 @@ Implement \`POST /v1/datasets/{dataset}/promote\` over the dataset state below.
 - \`latest_key(dataset)\` is the pointer training reads. It is **durable**: nothing ever sets a TTL on
   it, because a quiet week must not silently reset a dataset to "no version".
 - \`promote(dataset, version, validator)\` swaps the pointer **and appends the audit record in one
-  atomic unit** (one \`EVAL\`/\`MULTI\`) and returns the previous version. The draft does \`GET\`,
+  atomic unit** (one \`EVAL\`/\`MULTI\`) and returns the previous version. The starter does \`GET\`,
   \`SET\`, \`RPUSH\` and the pin rewrite as separate commands, so a promotion racing a purge leaves
   consumers pointing at purged bytes.
 - \`pin(dataset, consumer, version)\` pins one consumer to a concrete version. A promotion must
@@ -59,7 +59,7 @@ having a latest version after an idle period, and training silently starts from 
       id: 'atomic-promotion',
       title: 'Pointer swap and audit record are one unit',
       detail:
-        'The pointer swap and the audit append run in one server-side script (`_PROMOTE_LUA`), so a purge cannot observe a half-applied promotion. The draft separates them into independent commands.',
+        'The pointer swap and the audit append run in one server-side script (`_PROMOTE_LUA`), so a purge cannot observe a half-applied promotion. The starter separates them into independent commands.',
       match: {
         python: {all: [/_PROMOTE_LUA/, /redis\.eval\(\s*_PROMOTE_LUA/]},
         typescript: {all: [/PROMOTE_LUA/, /\.eval\(\s*PROMOTE_LUA/]},
@@ -72,7 +72,7 @@ having a latest version after an idle period, and training silently starts from 
       id: 'durable-pointer',
       title: 'The latest pointer never expires',
       detail:
-        '`latest_key(dataset)` is written without a TTL and nothing calls `expire`/`EXPIRE` on it. The draft sets a 3600-second expiry, so an idle dataset loses its latest version.',
+        '`latest_key(dataset)` is written without a TTL and nothing calls `expire`/`EXPIRE` on it. The starter sets a 3600-second expiry, so an idle dataset loses its latest version.',
       match: {
         python: {all: [/def latest_key\(/], none: [/\.expire\(\s*[^)]*latest_key\(/]},
         typescript: {all: [/function latestKey\(/], none: [/\.expire\(\s*[^)]*latestKey\(/]},
@@ -85,7 +85,7 @@ having a latest version after an idle period, and training silently starts from 
       id: 'fail-closed',
       title: 'A missing pointer fails closed',
       detail:
-        'Reading the latest version raises `LatestVersionMissing` when the pointer is absent instead of serving an unversioned view. The draft returns an empty string, which a caller reads as "latest".',
+        'Reading the latest version raises `LatestVersionMissing` when the pointer is absent instead of serving an unversioned view. The starter returns an empty string, which a caller reads as "latest".',
       match: {
         python: {all: [/LatestVersionMissing/, /is None/]},
         typescript: {all: [/LatestVersionMissing/, /===\s*null/]},
@@ -98,7 +98,7 @@ having a latest version after an idle period, and training silently starts from 
       id: 'pins-independent',
       title: 'Pins survive promotion and block purge',
       detail:
-        'Consumers pin a version under their own key, and `purge` refuses a version any consumer still pins (`VersionPinned`). The draft rewrites every pin to the new version inside the promotion, so a pinned consumer silently moves.',
+        'Consumers pin a version under their own key, and `purge` refuses a version any consumer still pins (`VersionPinned`). The starter rewrites every pin to the new version inside the promotion, so a pinned consumer silently moves.',
       match: {
         python: {all: [/def purge\(/, /VersionPinned/]},
         typescript: {all: [/function purge\(/, /VersionPinned/]},
@@ -143,9 +143,9 @@ def pins_key(dataset: str) -> str:
 
 
 def promote(dataset: str, version: str, validator: str) -> str:
-    # TODO: this draft writes the pointer, the audit record and the consumer pins in separate
+    # TODO: this starter writes the pointer, the audit record and the consumer pins in separate
     # commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-    # expires the pointer key so a quiet period resets the dataset to nothing. Review both.
+    # expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
     previous = redis.get(latest_key(dataset))
     redis.set(latest_key(dataset), version)
     redis.expire(latest_key(dataset), POINTER_TTL_S)
@@ -258,7 +258,7 @@ def promote_version(
 `,
     },
     typescript: {
-      starter: `/** Latest-version pointers and consumer pins: a model-generated draft. */
+      starter: `/** Latest-version pointers and consumer pins: flawed code. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -285,9 +285,9 @@ function pinsKey(dataset: string): string {
 }
 
 async function promote(dataset: string, version: string, validator: string): Promise<string> {
-  // TODO: this draft writes the pointer, the audit record and the consumer pins in separate
+  // TODO: this starter writes the pointer, the audit record and the consumer pins in separate
   // commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-  // expires the pointer key so a quiet period resets the dataset to nothing. Review both.
+  // expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
   const previous = await redis.get(latestKey(dataset));
   await redis.set(latestKey(dataset), version);
   await redis.expire(latestKey(dataset), POINTER_TTL_S);
@@ -406,9 +406,9 @@ func auditKey(dataset string) string  { return "ds:" + dataset + ":audit" }
 func pinsKey(dataset string) string   { return "ds:" + dataset + ":pins" }
 
 func promote(ctx context.Context, rdb *redis.Client, dataset, version, validator string) (string, error) {
-	// TODO: this draft writes the pointer, the audit record and the consumer pins in separate
+	// TODO: this starter writes the pointer, the audit record and the consumer pins in separate
 	// commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-	// expires the pointer key so a quiet period resets the dataset to nothing. Review both.
+	// expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
 	previous, err := rdb.Get(ctx, latestKey(dataset)).Result()
 	if err != nil && err != redis.Nil {
 		return "", err
@@ -587,9 +587,9 @@ object DatasetStateApi {
   def pinsKey(dataset: String): String = s"ds:$dataset:pins"
 
   def promote(dataset: String, version: String, validator: String): Option[String] = {
-    // TODO: this draft writes the pointer, the audit record and the consumer pins in separate
+    // TODO: this starter writes the pointer, the audit record and the consumer pins in separate
     // commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-    // expires the pointer key so a quiet period resets the dataset to nothing. Review both.
+    // expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
     val previous = Option(jedis.get(latestKey(dataset)))
     jedis.set(latestKey(dataset), version)
     jedis.expire(latestKey(dataset), PointerTtlSeconds)
@@ -715,9 +715,9 @@ std::string pinsKey(const std::string& dataset) { return "ds:" + dataset + ":pin
 
 static std::optional<std::string> promote(redis::Redis& rdb, const std::string& dataset, const std::string& version,
                                          const std::string& validator) {
-  // TODO: this draft writes the pointer, the audit record and the consumer pins in separate
+  // TODO: this starter writes the pointer, the audit record and the consumer pins in separate
   // commands, so a promotion racing a purge leaves consumers pointing at purged data, and it
-  // expires the pointer key so a quiet period resets the dataset to nothing. Review both.
+  // expires the pointer key so a quiet period resets the dataset to nothing. Fix both.
   const auto previous = rdb.get(latestKey(dataset));
   rdb.set(latestKey(dataset), version);
   rdb.expire(latestKey(dataset), kPointerTtlSeconds);
@@ -840,5 +840,5 @@ int main() {
     'The pointer key has no expiry. Consumers move because they read the pointer, not because you rewrite their pins: a promotion that edits `pins` is moving a consumer that explicitly asked to stay put.',
     'A purge is only safe for a version nobody pins. `hvals(pins)` then `VersionPinned` is the guard; a read with no pointer is not an empty string, it is `LatestVersionMissing`, because an unversioned view is worse than an error.',
   ],
-  debrief: `The interviewer is watching how you reason about Redis as a multi-writer store. The draft looks correct because the happy path has one writer and no purge. Three defects are checked: the promotion is not atomic (four commands where one script belongs, so a purge can interleave), the pointer expires (an idle dataset silently loses its latest version), and a read of a missing pointer returns an empty string, which callers treat as a version. Pins are the fourth idea, expressed through \`purge\` refusing a pinned version: a consumer pin is a lease, and leases are released by the consumer, never by a promotion. Real registries add a promotion token so a stale writer cannot promote over a newer one, a monotonic generation counter in the audit record, and lag-aware reads so a replica cannot serve an older pointer than the client already saw.`,
+  debrief: `The interviewer is watching how you reason about Redis as a multi-writer store. The starter looks correct because the happy path has one writer and no purge. Three defects are checked: the promotion is not atomic (four commands where one script belongs, so a purge can interleave), the pointer expires (an idle dataset silently loses its latest version), and a read of a missing pointer returns an empty string, which callers treat as a version. Pins are the fourth idea, expressed through \`purge\` refusing a pinned version: a consumer pin is a lease, and leases are released by the consumer, never by a promotion. Real registries add a promotion token so a stale writer cannot promote over a newer one, a monotonic generation counter in the audit record, and lag-aware reads so a replica cannot serve an older pointer than the client already saw.`,
 };

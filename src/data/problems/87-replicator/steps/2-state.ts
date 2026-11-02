@@ -8,7 +8,7 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'target'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it keeps a per-shard offset in
+**Starting point.** The starter is working code: it keeps a per-shard offset in
 Redis and moves it forward as changes are read. It compiles, the demo converges, and it breaks the
 one invariant that makes a replica restartable. Find the flaws, fix them, and prove the fix.
 
@@ -21,7 +21,7 @@ and \`resume_offset\`.
   overwrite every other shard's progress.
 - The key is **durable**: no \`EX\`, no \`EXPIRE\`, no \`SETEX\`, no TTL of any kind. An offset that
   expires during a quiet period is forgotten, so the next change read for that shard starts from
-  zero and the target re-applies months of history — the exact incident this course reviews.
+  zero and the target re-applies months of history — the exact incident this course debugs.
 - The offset is **advanced only after the target confirms** the change was applied: apply, check the
   confirmation, and only then move the offset. Advancing while reading is progress you have not
   earned, and a crash between the two loses the change for good.
@@ -33,7 +33,7 @@ and \`resume_offset\`.
 - \`resume_offset(replication_id, shard)\` returns the confirmed offset a restarted shard resumes
   from, and \`0\` **only** when that shard has never confirmed anything.
 
-**Failure mode the checks target.** The draft stores the offset with a one-hour TTL, so any shard
+**Failure mode the checks target.** The starter stores the offset with a one-hour TTL, so any shard
 idle longer than that restarts from zero; it compares offsets as strings, so the shard stalls at the
 first two-digit offset; and it advances the offset while reading changes, before the target has
 confirmed anything, so a lost confirmation is never retried. Each defect is invisible in a
@@ -59,7 +59,7 @@ minutes-long demo and turns into a replay or a stall in production.`,
       id: 'durable-offset',
       title: 'The offset key never expires',
       detail:
-        'The offset is written with a compare-and-set that carries **no expiry** — no `EX`, `EXPIRE` or `SETEX` anywhere. The draft stores it with a one-hour TTL, so a quiet shard forgets its offset and replays its whole history.',
+        'The offset is written with a compare-and-set that carries **no expiry** — no `EX`, `EXPIRE` or `SETEX` anywhere. The starter stores it with a one-hour TTL, so a quiet shard forgets its offset and replays its whole history.',
       match: {
         python: {all: [/offset_script/, /redis\.call\('SET'/], none: [/EXPIRE|SETEX|'EX'/]},
         typescript: {all: [/OFFSET_SCRIPT/, /redis\.call\('SET'/], none: [/EXPIRE|SETEX|'EX'/]},
@@ -72,7 +72,7 @@ minutes-long demo and turns into a replay or a stall in production.`,
       id: 'monotonic',
       title: 'Offsets compare as numbers, so a shard never rewinds',
       detail:
-        'The stored offset is parsed as a number (`tonumber`) and the candidate compared numerically, so an out-of-order confirmation of an older change cannot move it back. The draft compares the two as strings, where `"10" < "9"`.',
+        'The stored offset is parsed as a number (`tonumber`) and the candidate compared numerically, so an out-of-order confirmation of an older change cannot move it back. The starter compares the two as strings, where `"10" < "9"`.',
       match: {
         python: {all: [/tonumber\(redis\.call\('GET', KEYS\[1\]\)/, /candidate <= current/]},
         typescript: {all: [/tonumber\(redis\.call\('GET', KEYS\[1\]\)/, /candidate <= current/]},
@@ -85,7 +85,7 @@ minutes-long demo and turns into a replay or a stall in production.`,
       id: 'advance-after-confirm',
       title: 'The offset advances only after the target confirms',
       detail:
-        'The apply call is made first, its confirmation is captured, and the offset advance happens only behind that confirmation. The draft advances the offset while reading the changes.',
+        'The apply call is made first, its confirmation is captured, and the offset advance happens only behind that confirmation. The starter advances the offset while reading the changes.',
       match: {
         python: {order: [/confirmed = apply_to_target\(/, /advance_offset\(/]},
         typescript: {order: [/const confirmed = await applyToTarget\(/, /advanceOffset\(/]},
@@ -98,7 +98,7 @@ minutes-long demo and turns into a replay or a stall in production.`,
       id: 'shard-key',
       title: 'One durable key per (replication, shard)',
       detail:
-        'The key is `offset:{replication_id}:{shard}`: namespaced by the replication and by the shard, so two shards cannot overwrite each other’s progress. The draft keys the whole replication under one key.',
+        'The key is `offset:{replication_id}:{shard}`: namespaced by the replication and by the shard, so two shards cannot overwrite each other’s progress. The starter keys the whole replication under one key.',
       match: {
         python: {all: [/offset:\{replication_id\}:\{shard\}/, /def offset_key\(/]},
         typescript: {all: [/offset:\$\{replicationId\}:\$\{shard\}/, /function offsetKey\(/]},
@@ -116,7 +116,7 @@ minutes-long demo and turns into a replay or a stall in production.`,
       id: 'resume',
       title: 'A restart resumes at the confirmed offset, zero only when there is none',
       detail:
-        '`resume_offset` reads the durable key and parses it as a number; it answers 0 only when the shard has never confirmed anything. The draft returns 0 unconditionally, so every restart replays the shard.',
+        '`resume_offset` reads the durable key and parses it as a number; it answers 0 only when the shard has never confirmed anything. The starter returns 0 unconditionally, so every restart replays the shard.',
       match: {
         python: {all: [/def resume_offset\(/, /offset_key\(replication_id, shard\)/, /int\(raw\)/]},
         typescript: {all: [/function resumeOffset\(/, /offsetKey\(replicationId, shard\)/, /Number\(raw\)/]},
@@ -136,7 +136,7 @@ OFFSET_TTL_SECONDS = 3600
 PAIR_KEY = "offset:{replication}->{shard}"
 
 
-# TODO: the draft keeps each shard's offset in an expiring key, so a quiet shard forgets where it
+# TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
 # stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
 # greater than "9" and the shard stalls; and it writes the offset while reading the changes, before
 # the target has confirmed anything.
@@ -217,7 +217,7 @@ interface Change {
   payload: string;
 }
 
-// TODO: the draft keeps each shard's offset in an expiring key, so a quiet shard forgets where it
+// TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
 // stopped and replays its whole history from zero; it compares offsets as strings, so '10' is not
 // greater than '9' and the shard stalls; and it writes the offset while reading the changes, before
 // the target has confirmed anything.
@@ -313,7 +313,7 @@ type Change struct {
 	Payload  []byte \`json:"payload"\`
 }
 
-// TODO: the draft keeps each shard's offset in an expiring key, so a quiet shard forgets where it
+// TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
 // stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
 // greater than "9" and the shard stalls; and it writes the offset while reading the changes, before
 // the target has confirmed anything.
@@ -429,7 +429,7 @@ object OffsetStore {
   private val jedis = new Jedis("redis", 6379)
   val OffsetTtlSeconds = 3600
 
-  // TODO: the draft keeps each shard's offset in an expiring key, so a quiet shard forgets where it
+  // TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
   // stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
   // greater than "9" and the shard stalls; and it writes the offset while reading the changes,
   // before the target has confirmed anything.
@@ -512,7 +512,7 @@ std::string pairCacheKey(const std::string& replicationId, int shard) {
   return "offset:" + replicationId + "->" + std::to_string(shard);
 }
 
-// TODO: the draft keeps each shard's offset in an expiring key, so a quiet shard forgets where it
+// TODO: the starter keeps each shard's offset in an expiring key, so a quiet shard forgets where it
 // stopped and replays its whole history from zero; it compares offsets as strings, so "10" is not
 // greater than "9" and the shard stalls; and it writes the offset while reading the changes, before
 // the target has confirmed anything.
@@ -596,5 +596,5 @@ int64_t resumeOffset(const std::string& replicationId, int shard) {
     'Do the compare-and-set in one round trip (a Lua `EVAL`, or a `WATCH`/`MULTI` loop): read the stored offset, parse it as a number, and write only when the candidate is strictly greater. Comparing `"10"` with `"9"` as strings is the bug that stalls a shard at the first two-digit offset.',
     'Order the shard loop as apply → confirm → advance, and keep the key namespaced by both ids: `offset:{replication_id}:{shard}`. Then `resume_offset` is just a `GET` plus a numeric parse, with 0 reserved for "this shard never confirmed anything".',
   ],
-  debrief: `The interviewer is testing whether you can review generated state handling for the two ways a checkpoint fails: it disappears, or it moves backwards. The TTL is the loud one once you say it out loud — an offset with an expiry is a shard that replays its history after any quiet period — but the string comparison is the one that survives review, because it works for the first nine offsets and then stops the replication entirely. The third defect, advancing the offset while reading, is the correctness one: the offset is a claim about what the target has, so it may only move after the confirmation. Real replicators store the offset in the same transaction as the applied rows where they can, keep a per-shard offset with a fencing token so two controllers cannot both advance it, and alert on the offset's age rather than its TTL.`,
+  debrief: `The interviewer is testing whether you can debug state handling for the two ways a checkpoint fails: it disappears, or it moves backwards. The TTL is the loud one once you say it out loud — an offset with an expiry is a shard that replays its history after any quiet period — but the string comparison is the one that survives a code review, because it works for the first nine offsets and then stops the replication entirely. The third defect, advancing the offset while reading, is the correctness one: the offset is a claim about what the target has, so it may only move after the confirmation. Real replicators store the offset in the same transaction as the applied rows where they can, keep a per-shard offset with a fencing token so two controllers cannot both advance it, and alert on the offset's age rather than its TTL.`,
 };

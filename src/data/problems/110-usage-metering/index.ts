@@ -7,12 +7,11 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * Usage metering on the AI-era track: the course is not "increment a counter per request", it is the
- * review you owe a model-generated metering layer before an invoice depends on it. Validated,
- * request-id-deduped reports → one atomic Redis window per account with the cap written as an
- * overage flag → a deadline-bounded, idempotent billing close keyed by a derived close id → account-
- * keyed rollup events with no request content → a tenant-scoped read that ties out with the same
- * counters.
+ * Usage metering: the course is not "increment a counter per request", it is the debugging you owe
+ * a metering layer before an invoice depends on it. Validated, request-id-deduped reports → one
+ * atomic Redis window per account with the cap written as an overage flag → a deadline-bounded,
+ * idempotent billing close keyed by a derived close id → account-keyed rollup events with no
+ * request content → a tenant-scoped read that ties out with the same counters.
  */
 export const usageMeteringProblem: Problem = {
   id: 'usage-metering',
@@ -20,7 +19,6 @@ export const usageMeteringProblem: Problem = {
   tagline: 'API usage counted once per request, capped by plan and reconciled with billing.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Usage Metering
 
@@ -59,12 +57,12 @@ One service, **meterd**, with five pieces:
 5. \`GET /v1/accounts/{account}/usage\`: the current window's units with cap state, overage and the
    last reconciled close id, authorized against the authenticated caller.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real metering
-feature: read the draft against the failure modes, name the subtle one, fix it, and prove the fix with
-checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real metering feature: debug
+it against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the
+fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

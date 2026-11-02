@@ -13,16 +13,16 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'audit'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every transition publishes a
+**Starting point.** The starter is working code: every transition publishes a
 \`workflow.step\` event and the audit consumer appends it to the run's history, so the demo shows a
 run's story from start to finish. It compiles, it produces, and it hides five production flaws.
-Review it like the worker's owner, fix it, and prove the fix with the checks below.
+Debug it like the worker's owner, fix it, and prove the fix with the checks below.
 
 \`publish_step(run_id, step, effect_id, outcome)\` — \`publishStep\` in the other languages — is the
 worker's only way to report a transition.
 
 - The message key is the **run id**, so every event about one run lands on one partition and the
-  audit consumer reads that run's history in order. The draft keys by the workflow definition name,
+  audit consumer reads that run's history in order. The starter keys by the workflow definition name,
   so one run's events scatter across partitions and a replay cannot rebuild the run.
 - The event carries \`step\`, \`effect_id\`, \`outcome\` and \`run_id\` — and **never the step's
   document**. The topic is retained for days and replicated, so whatever the step received outlives
@@ -30,17 +30,17 @@ worker's only way to report a transition.
 - \`outcome\` is one of the four names the engine understands: \`started\`, \`succeeded\`, \`failed\`,
   \`skipped\` — the \`OUTCOMES\` set in python and typescript, \`Outcomes\` in scala, \`kOutcomes\` in
   cpp, \`outcomeStarted\` and \`outcomeSucceeded\` in go. The caller publishes \`started\` before the
-  step runs and \`succeeded\` after it returns. The draft reports \`"done"\`, so a retried step looks
+  step runs and \`succeeded\` after it returns. The starter reports \`"done"\`, so a retried step looks
   finished while it is still running.
 - An **outbox row is written before the produce** and deleted **only after the broker acknowledged**
   the record — \`outbox.insert(...)\` → produce → \`outbox.delete(...)\` — so a transition survives a
   broker outage instead of vanishing from the history.
 - The producer is **durable and idempotent**: \`acks=all\` with \`enable.idempotence\` (KafkaJS
   \`idempotent: true\` with \`acks: -1\`, kafka-go \`RequiredAcks: kafka.RequireAll\` with a
-  \`Completion\` callback). The draft leaves the defaults, so a record it called published can be
+  \`Completion\` callback). The starter leaves the defaults, so a record it called published can be
   lost on a leader failover and a producer retry can duplicate it.
 
-**Failure mode the checks target.** The draft is a working publisher that answers the wrong
+**Failure mode the checks target.** The starter is a working publisher that answers the wrong
 questions: keying by the workflow definition name scatters one run's history, so the auditor's
 replay sees another run's events interleaved; \`"done"\` is not an outcome, so the history cannot
 tell a step that is running from one that finished, and a step that retries after reporting its
@@ -71,7 +71,7 @@ replicas.`,
       id: 'key-run',
       title: 'Keys every event by run id',
       detail:
-        'The message key is the run id — `key=run_id`, `key: runId`, `Key: []byte(runID)`, `new ProducerRecord[String, String]("workflow.step", runId, …)`, `runId.data()`. Every event about one run then lands on one partition and the audit consumer reads that run’s history in order. The draft keys by the workflow definition name, so one run’s events scatter and a replay cannot rebuild the run.',
+        'The message key is the run id — `key=run_id`, `key: runId`, `Key: []byte(runID)`, `new ProducerRecord[String, String]("workflow.step", runId, …)`, `runId.data()`. Every event about one run then lands on one partition and the audit consumer reads that run’s history in order. The starter keys by the workflow definition name, so one run’s events scatter and a replay cannot rebuild the run.',
       match: {
         python: {all: [/"workflow\.step"/, /key=run_id/]},
         typescript: {all: [/workflow\.step/, /key: runId/]},
@@ -84,7 +84,7 @@ replicas.`,
       id: 'outcome',
       title: 'Publishes the step outcomes from a fixed set',
       detail:
-        'The vocabulary is the four names the engine understands — `OUTCOMES` in python and typescript, `Outcomes` in scala, `kOutcomes` in cpp, `outcomeStarted` and `outcomeSucceeded` in go — and the caller publishes `started` before the step runs and `succeeded` once it returns. The draft reports `"done"`, so a step that retried after reporting its start looks finished while it is still running.',
+        'The vocabulary is the four names the engine understands — `OUTCOMES` in python and typescript, `Outcomes` in scala, `kOutcomes` in cpp, `outcomeStarted` and `outcomeSucceeded` in go — and the caller publishes `started` before the step runs and `succeeded` once it returns. The starter reports `"done"`, so a step that retried after reporting its start looks finished while it is still running.',
       match: {
         python: {all: [/OUTCOMES/, /"started"/, /"succeeded"/]},
         typescript: {all: [/OUTCOMES/, /'started'/, /'succeeded'/]},
@@ -97,7 +97,7 @@ replicas.`,
       id: 'no-payload',
       title: 'Keeps the step payload out of the event',
       detail:
-        'The event carries the run id, the step name, the `effect_id` and the `outcome` — and nothing the step received. The topic is retained for days and replicated, so the step’s document written there outlives every retention policy the run has. The draft ships the document in the event, so the auditor reads a customer’s input on a topic that never expires it.',
+        'The event carries the run id, the step name, the `effect_id` and the `outcome` — and nothing the step received. The topic is retained for days and replicated, so the step’s document written there outlives every retention policy the run has. The starter ships the document in the event, so the auditor reads a customer’s input on a topic that never expires it.',
       match: {
         python: {all: [/effect_id/, /"outcome"/], none: [/"payload"/]},
         typescript: {all: [/effectId/, /outcome/], none: [/payload/]},
@@ -110,7 +110,7 @@ replicas.`,
       id: 'outbox',
       title: 'Writes an outbox row before the produce',
       detail:
-        '`outbox.insert(...)` runs before the produce and `outbox.delete(...)` runs only after the broker acknowledged the record, so a transition survives a broker outage: the row stays behind for a relay to republish. The draft produces with no row at all, so the history loses the transition exactly when the broker is down.',
+        '`outbox.insert(...)` runs before the produce and `outbox.delete(...)` runs only after the broker acknowledged the record, so a transition survives a broker outage: the row stays behind for a relay to republish. The starter produces with no row at all, so the history loses the transition exactly when the broker is down.',
       match: {
         python: {all: [/outbox\.delete\(/], order: [/outbox\.insert\(/, /producer\.produce\(/]},
         typescript: {all: [/outbox\.delete\(/], order: [/outbox\.insert\(/, /producer\.send\(/]},
@@ -123,7 +123,7 @@ replicas.`,
       id: 'acks',
       title: 'Configures a durable, idempotent producer',
       detail:
-        '`acks=all` with `enable.idempotence` (KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a `Completion` callback) means an acknowledged record is replicated and a producer retry cannot duplicate it. The draft leaves the defaults, so "published" does not mean "durable" and a leader failover can lose a transition the worker already reported.',
+        '`acks=all` with `enable.idempotence` (KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a `Completion` callback) means an acknowledged record is replicated and a producer retry cannot duplicate it. The starter leaves the defaults, so "published" does not mean "durable" and a leader failover can lose a transition the worker already reported.',
       match: {
         python: {all: [/"acks":\s*"all"/, /"enable\.idempotence":\s*True/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -144,7 +144,7 @@ producer = Producer({"bootstrap.servers": "kafka:9092"})
 
 def publish_step(run_id: str, workflow: str, step: str, document: dict) -> None:
     """Report one step transition to the workflow.step topic."""
-    # TODO: this draft keys by the workflow definition name instead of the run id, reports "done"
+    # TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
     # instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
     # outbox row, and leaves the producer on its default settings.
     event = {
@@ -219,7 +219,7 @@ def run_step(run_id: str, step: str, effect_id: str, effect: Callable[[], None])
 `,
     },
     typescript: {
-      starter: `/** workflow.step: a model-generated draft that keys by the workflow definition name. */
+      starter: `/** workflow.step: flawed code that keys by the workflow definition name. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'workflow', brokers: ['kafka:9092']});
@@ -233,7 +233,7 @@ export async function publishStep(
   step: string,
   document: Record<string, unknown>,
 ): Promise<void> {
-  // TODO: this draft keys by the workflow definition name instead of the run id, reports "done"
+  // TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
   // instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
   // outbox row, and leaves the producer on its default settings.
   const event = {run_id: runId, workflow, step, document, outcome: 'done'};
@@ -313,7 +313,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// The draft writes straight to the topic with the workflow definition name as the key.
+// The starter writes straight to the topic with the workflow definition name as the key.
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "workflow.step"}
 
 type stepEvent struct {
@@ -325,7 +325,7 @@ type stepEvent struct {
 }
 
 // PublishStep reports one step transition to the workflow.step topic.
-// TODO: this draft keys by the workflow definition name instead of the run id, reports "done"
+// TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
 // instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
 // outbox row, and leaves the writer on its default acknowledgements.
 func PublishStep(ctx context.Context, runID string, workflow string, step string, document map[string]any) error {
@@ -445,7 +445,7 @@ object StepEvents {
     props
   })
 
-  // TODO: this draft keys by the workflow definition name instead of the run id, reports "done"
+  // TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
   // instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
   // outbox row, and leaves the producer on its default settings.
   def publishStep(runId: String, workflow: String, step: String, document: String): Unit = {
@@ -522,7 +522,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-// TODO: this draft keys by the workflow definition name instead of the run id, reports "done"
+// TODO: this starter keys by the workflow definition name instead of the run id, reports "done"
 // instead of the engine's outcome vocabulary, ships the step's document in the event, writes no
 // outbox row, and leaves the producer on its default acknowledgements.
 void publishStep(RdKafka::Producer& producer, const std::string& runId, const std::string& workflow,
@@ -618,5 +618,5 @@ void runStep(RdKafka::Producer& producer, const std::string& runId, const std::s
     'The outbox row is the durability half, and its order matters: insert the row first, produce second, and delete the row only after the broker acknowledged the record. A produce the broker refused leaves the row behind for a relay to republish, instead of dropping the transition. And keep the step’s document out of the event — the topic’s retention is measured in days, so anything written there outlives the run.',
     'Configure durability on the producer, not per call: `acks=all` with `enable.idempotence=true` (KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` with a `Completion` callback). Then report the vocabulary the engine understands — `started` before the step runs, `succeeded` after it returns — and never `"done"`, which cannot tell a running step from a finished one.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated producer at the point where a worker's transition becomes an audit trail. The draft reads fine because the demo runs one workflow once, the broker stays up and nobody replays the topic. Five defects are being checked, and each one is a class of production incident: keyed by the definition name, a run's history is scattered across partitions, so a replay interleaves other runs and cannot rebuild the sequence; "done" is not an outcome, so the history cannot distinguish a step that is running from one that finished, and a step that retried after reporting its start looks complete while it is still in flight; the step's document in the event is a leak that outlives the run, because the topic's retention is measured in days and every replica keeps a copy; a produce with no outbox row loses the transition exactly when the broker is down, which is when the history matters most; and default acknowledgements make "published" a statement about the client's socket rather than about the replicas. The order matters as much as the pieces: the row is inserted before the produce and deleted only after the broker acknowledged, so a crash between the two replays the row instead of losing the transition. In a real engine the consumer is what turns the topic into the run's history, the relay republishes rows the broker rejected, and the event also carries the definition version and a monotonically increasing sequence number so the auditor can order a run without trusting the clock.`,
+  debrief: `The interviewer is testing whether you can debug a producer at the point where a worker's transition becomes an audit trail. The starter reads fine because the demo runs one workflow once, the broker stays up and nobody replays the topic. Five defects are being checked, and each one is a class of production incident: keyed by the definition name, a run's history is scattered across partitions, so a replay interleaves other runs and cannot rebuild the sequence; "done" is not an outcome, so the history cannot distinguish a step that is running from one that finished, and a step that retried after reporting its start looks complete while it is still in flight; the step's document in the event is a leak that outlives the run, because the topic's retention is measured in days and every replica keeps a copy; a produce with no outbox row loses the transition exactly when the broker is down, which is when the history matters most; and default acknowledgements make "published" a statement about the client's socket rather than about the replicas. The order matters as much as the pieces: the row is inserted before the produce and deleted only after the broker acknowledged, so a crash between the two replays the row instead of losing the transition. In a real engine the consumer is what turns the topic into the run's history, the relay republishes rows the broker rejected, and the event also carries the definition version and a monotonically increasing sequence number so the auditor can order a run without trusting the clock.`,
 };

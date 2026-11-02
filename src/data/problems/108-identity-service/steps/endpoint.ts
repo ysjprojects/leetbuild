@@ -8,10 +8,10 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the signup endpoint: it
-registers \`POST /v1/users\`, parses the body and writes a user row. It compiles, it serves the demo
-— one signup, from one browser, typed in lowercase — and it hides three production flaws. Review it
-like the identity service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the signup endpoint: it registers
+\`POST /v1/users\`, parses the body and writes a user row. It compiles, it serves the demo — one
+signup, from one browser, typed in lowercase — and it hides three production flaws. Debug it like
+the identity service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/users\` with body \`{"email": "…", "phone": "…"}\`.
 
@@ -38,7 +38,7 @@ Implement \`POST /v1/users\` with body \`{"email": "…", "phone": "…"}\`.
 
 **Failure mode the checks target.** Comparing raw strings makes \`Alice@x.com\` and \`alice@x.com\`
 — and \`(415) 555-0100\` and \`+14155550100\` — two identities, so one human ends up with two
-accounts and neither of them is unique. Because the draft ignores \`Idempotency-Key\`, every client
+accounts and neither of them is unique. Because the starter ignores \`Idempotency-Key\`, every client
 retry (the confirmation email is slow, the flaky network re-sends) creates another account and
 another pending verification. And the 409 it returns interpolates the submitted address —
 \`"email … already exists"\` — so an unauthenticated caller can walk addresses through signup and
@@ -84,7 +84,7 @@ learn from the response which ones already have accounts.`,
       id: 'normalize-email',
       title: 'Folds case and the domain alias policy before the email lookup',
       detail:
-        'A named `normalize_email`/`normalizeEmail` helper case-folds the address and, for a domain in `FOLD_ALIAS_DOMAINS`, folds out dots and `+` aliases, and the canonical form — not the raw string — is what the email claim compares. The draft compares raw strings, so `Alice@x.com` and `alice@x.com` become two accounts.',
+        'A named `normalize_email`/`normalizeEmail` helper case-folds the address and, for a domain in `FOLD_ALIAS_DOMAINS`, folds out dots and `+` aliases, and the canonical form — not the raw string — is what the email claim compares. The starter compares raw strings, so `Alice@x.com` and `alice@x.com` become two accounts.',
       match: {
         python: {
           all: [/def normalize_email\(/, /FOLD_ALIAS_DOMAINS/, /\.lower\(\)/, /store\.claim_email\(/],
@@ -112,7 +112,7 @@ learn from the response which ones already have accounts.`,
       id: 'claim-phone',
       title: 'Normalizes the phone and claims it before the email lookup',
       detail:
-        '`normalize_phone`/`normalizePhone` canonicalizes to E.164 with an 8–15 digit rule, and the canonical number is claimed atomically — `SET NX`, not a read-then-insert — before the email claim. The draft compares raw phone strings, so two spellings of one number become two identities.',
+        '`normalize_phone`/`normalizePhone` canonicalizes to E.164 with an 8–15 digit rule, and the canonical number is claimed atomically — `SET NX`, not a read-then-insert — before the email claim. The starter compares raw phone strings, so two spellings of one number become two identities.',
       match: {
         python: {
           all: [/def normalize_phone\(/, /PHONE_MIN_DIGITS/, /store\.claim_phone\(/],
@@ -140,7 +140,7 @@ learn from the response which ones already have accounts.`,
       id: 'idempotency-key',
       title: 'Replays the Idempotency-Key as the original account',
       detail:
-        'The `Idempotency-Key` is looked up before any claim or write; a hit answers **200** with the **original** `user_id` read back from the stored record and creates nothing, while **201** marks the request that created the account. The record is written as part of the same handler, so the retry that arrives when the confirmation mail is slow finds it. The draft ignores the header and creates a second account on every retry.',
+        'The `Idempotency-Key` is looked up before any claim or write; a hit answers **200** with the **original** `user_id` read back from the stored record and creates nothing, while **201** marks the request that created the account. The record is written as part of the same handler, so the retry that arrives when the confirmation mail is slow finds it. The starter ignores the header and creates a second account on every retry.',
       match: {
         python: {
           all: [
@@ -181,7 +181,7 @@ learn from the response which ones already have accounts.`,
       id: 'no-disclosure',
       title: 'Collides with one neutral 409 and creates nothing on replay',
       detail:
-        'Both collisions answer **409** with the same fixed constant body (`{"error": "signup_conflict"}`) that names no field and echoes no address, and the idempotency lookup happens before the create call, so a replay writes no second row. The draft interpolates the address into its 409 (`"email … already exists"`), which turns signup into an existence oracle for unauthenticated callers.',
+        'Both collisions answer **409** with the same fixed constant body (`{"error": "signup_conflict"}`) that names no field and echoes no address, and the idempotency lookup happens before the create call, so a replay writes no second row. The starter interpolates the address into its 409 (`"email … already exists"`), which turns signup into an existence oracle for unauthenticated callers.',
       match: {
         python: {
           all: [/SIGNUP_CONFLICT/, /def conflict\(/, /status_code\s*=\s*409/],
@@ -252,10 +252,10 @@ def signup(
     body: SignupRequest,
     idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JSONResponse:
-    # TODO: this draft compares raw strings, so Alice@x.com and alice@x.com become two accounts
+    # TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
     # and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
     # creates another account on every retry; and its 409 interpolates the submitted address, so
-    # an unauthenticated caller can confirm which addresses already have accounts. Review all three.
+    # an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
     email = body.email.strip()
     phone = body.phone.strip()
     if store.find_by_email(email) is not None:
@@ -388,7 +388,7 @@ def signup(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/users: a model-generated draft of the signup endpoint. */
+      starter: `/** POST /v1/users: flawed code of the signup endpoint. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -403,10 +403,10 @@ interface SignupBody {
 }
 
 app.post('/v1/users', async (request, reply) => {
-  // TODO: this draft compares raw strings, so Alice@x.com and alice@x.com become two accounts
+  // TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
   // and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
   // creates another account on every retry; and its 409 interpolates the submitted address, so
-  // an unauthenticated caller can confirm which addresses already have accounts. Review all three.
+  // an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
   const idemKey = request.headers['idempotency-key'];
   const body = request.body as SignupBody;
   request.log.info({idemKey}, 'signup');
@@ -553,10 +553,10 @@ func signup(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft compares raw strings, so Alice@x.com and alice@x.com become two accounts
+	// TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
 	// and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
 	// creates another account on every retry; and its 409 interpolates the submitted address, so
-	// an unauthenticated caller can confirm which addresses already have accounts. Review all three.
+	// an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
 	email := body.Email
 	phone := body.Phone
 	if _, found := store.FindByEmail(r.Context(), email); found {
@@ -791,11 +791,11 @@ object SignupApi {
       post {
         optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
           entity(as[SignupRequest]) { body =>
-            // TODO: this draft compares raw strings, so Alice@x.com and alice@x.com become two
+            // TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two
             // accounts and (415) 555-0100 and +14155550100 become two identities; it ignores
             // Idempotency-Key and creates another account on every retry; and its 409
             // interpolates the submitted address, so an unauthenticated caller can confirm
-            // which addresses already have accounts. Review all three.
+            // which addresses already have accounts. Fix all three.
             val email = body.email.trim
             val phone = body.phone.trim
             store.findByEmail(email) match {
@@ -954,10 +954,10 @@ int main() {
       res.set_content(R"({"error":"email and phone are required"})", "application/json");
       return;
     }
-    // TODO: this draft compares raw strings, so Alice@x.com and alice@x.com become two accounts
+    // TODO: this starter compares raw strings, so Alice@x.com and alice@x.com become two accounts
     // and (415) 555-0100 and +14155550100 become two identities; it ignores Idempotency-Key and
     // creates another account on every retry; and its 409 interpolates the submitted address, so
-    // an unauthenticated caller can confirm which addresses already have accounts. Review all three.
+    // an unauthenticated caller can confirm which addresses already have accounts. Fix all three.
     const auto email = body["email"].get<std::string>();
     const auto phone = body["phone"].get<std::string>();
     if (store.findByEmail(email)) {
@@ -1120,11 +1120,11 @@ int main() {
   },
   hints: [
     'Normalization is not cosmetic: the index has to hold one canonical form. Write `normalize_email`/`normalizeEmail`, fold case everywhere, and fold dots and `+` aliases only for the domains in `FOLD_ALIAS_DOMAINS` — then compare and store what the helper returns, never the raw string the caller sent.',
-    'The comment says the draft creates an account per retry, and the fix is not a flag on the client. Look up `Idempotency-Key` before any claim or write and answer **200** with the `user_id` recorded in the stored row — the retry that arrives while the confirmation mail is in flight must not mint a second account.',
+    'The comment says the starter creates an account per retry, and the fix is not a flag on the client. Look up `Idempotency-Key` before any claim or write and answer **200** with the `user_id` recorded in the stored row — the retry that arrives while the confirmation mail is in flight must not mint a second account.',
     'The phone claim must be atomic: `SET NX` on the canonical number, not a lookup followed by an insert, so two signups racing the same recycled number cannot both win. And reuse one constant body for every collision — interpolating the address into the 409 hands an unauthenticated caller an existence oracle for any address.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the identity trust boundary.
-The draft reads fine because the demo signs up once, in lowercase, from one browser and never retries. Three
+  debrief: `The interviewer is testing whether you can debug a handler at the identity trust boundary.
+The starter reads fine because the demo signs up once, in lowercase, from one browser and never retries. Three
 defects are being checked. First, identity is a normalization contract: the index may only ever hold the canonical
 form. Case folding is universal; dots and \`+\` aliases are per-domain policy, which is why \`FOLD_ALIAS_DOMAINS\` is a
 set rather than a blanket \`gsub\`. Second, uniqueness must be a claim, not a check: \`find\` followed by \`create\` is a

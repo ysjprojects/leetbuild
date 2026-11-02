@@ -7,11 +7,11 @@ import {citationEventsStep} from './steps/4-events';
 import {readCitationsStep} from './steps/5-read';
 
 /**
- * Citation store on the AI-era track: the course is not "save a quote and a link", it is the
- * review you owe a model-generated citation store before anyone trusts the answer it supports.
- * Spans that must resolve at write time → a Redis span cache keyed by immutable version → a gRPC
- * document fetch with a deadline that marks unanchored citations broken → document-keyed lineage
- * events with an outbox → a read that names its evidence and reports the worst status.
+ * Citation store: the course is not "save a quote and a link", it is the debugging you owe a
+ * citation store before anyone trusts the answer it supports. Spans that must resolve at write time
+ * → a Redis span cache keyed by immutable version → a gRPC document fetch with a deadline that marks
+ * unanchored citations broken → document-keyed lineage events with an outbox → a read that names its
+ * evidence and reports the worst status.
  */
 export const citationStoreProblem: Problem = {
   id: 'citation-store',
@@ -19,7 +19,7 @@ export const citationStoreProblem: Problem = {
   tagline: 'Citations that point at exact spans and stay valid as documents are versioned.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Citation Store
 
@@ -65,12 +65,12 @@ One service, **citations**, with five pieces:
    offset range for the owning tenant — **404** for a foreign citation — plus an answer's citation
    list that reports the worst status, \`degraded\` when any citation is broken.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

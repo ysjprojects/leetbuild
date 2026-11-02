@@ -7,11 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Vision inference on the AI-era track: the course is not "call a model with an image", it is the
- * review you owe a model-generated vision service before it serves tenants. A validated, scoped,
- * idempotent upload contract → a per-tenant GPU admission pool with an owner-checked release → a
- * model call with a deadline that downgrades honestly instead of inventing a label → per-version
- * quality events with digests and an outbox → a read path with a tenant scope and a shelf life.
+ * Vision inference: the course is not "call a model with an image", it is the debugging you owe a
+ * vision service before it serves tenants. A validated, scoped, idempotent upload contract → a
+ * per-tenant GPU admission pool with an owner-checked release → a model call with a deadline that
+ * downgrades honestly instead of inventing a label → per-version quality events with digests and
+ * an outbox → a read path with a tenant scope and a shelf life.
  */
 export const visionInferenceProblem: Problem = {
   id: 'vision-inference',
@@ -19,7 +19,7 @@ export const visionInferenceProblem: Problem = {
   tagline: 'Image inference with tenant quotas, honest fallbacks and results that expire.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Vision Inference
 
@@ -59,12 +59,12 @@ One service, **visiond**, with five pieces:
 5. \`GET /v1/inferences/{id}\`: 404 for another tenant's id, 410 with metadata once the result has
    expired, 202 while the worker is still writing it.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,21 +8,21 @@ export const readStep: Step = {
   focus: ['api', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it lists a user's sessions from a cache so
-the page loads fast. It compiles, it serves the demo, and it hides three production flaws. Review it like the
-service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it lists a user's sessions from a cache so
+the page loads fast. It compiles, it serves the demo, and it hides three production flaws. Debug it
+like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/users/{user_id}/sessions\` and \`DELETE /v1/users/{user_id}/sessions\`.
 
 - **Only your own sessions.** The caller's \`user_id\` comes from the validated claims; asking for another
-  user's sessions is **403**. The draft serves anyone's sessions to anyone.
+  user's sessions is **403**. The starter serves anyone's sessions to anyone.
 - **Active only.** A session past \`ABSOLUTE_TTL_S\` is not listed; the endpoint reads the live record and skips
   expired ones rather than trusting a cached summary.
 - **Fresh last-seen.** Each session reports \`last_seen\` from the live record, accurate to within
   \`LAST_SEEN_WINDOW_S\` = 60 seconds, not the last-seen value from an hour-old cache.
 - **Rotation count.** Each session reports its \`rotation\` count, so a user can see how often the id has changed.
 - **Revoke-all invalidates first.** \`DELETE\` removes every one of the user's session ids **before** it returns,
-  so no id in the list is still authenticating after the response. The draft drops the cache and returns while
+  so no id in the list is still authenticating after the response. The starter drops the cache and returns while
   the ids keep working.
 
 **Failure mode the checks target.** A read endpoint that trusts the path parameter serves one user's session
@@ -50,7 +50,7 @@ a "signed out everywhere" screen with sessions still authenticating.`,
       id: 'authz',
       title: 'Refuses to list another user’s sessions',
       detail:
-        'The caller’s claim is compared with the path user id and a mismatch is **403**, so session metadata never crosses users. The draft lists anyone’s sessions for anyone.',
+        'The caller’s claim is compared with the path user id and a mismatch is **403**, so session metadata never crosses users. The starter lists anyone’s sessions for anyone.',
       match: {
         python: {all: [/caller\s*!=\s*user_id/, /status_code\s*=\s*403/]},
         typescript: {all: [/caller\s*!==\s*userId/, /code\(\s*403\s*\)/]},
@@ -63,7 +63,7 @@ a "signed out everywhere" screen with sessions still authenticating.`,
       id: 'active-only',
       title: 'Lists only sessions inside the absolute cap',
       detail:
-        'A session older than `ABSOLUTE_TTL_S` is skipped, so the page never advertises a session the store would reject. The draft reads a cached summary that includes expired ids.',
+        'A session older than `ABSOLUTE_TTL_S` is skipped, so the page never advertises a session the store would reject. The starter reads a cached summary that includes expired ids.',
       match: {
         python: {all: [/ABSOLUTE_TTL_S/, /continue/]},
         typescript: {all: [/ABSOLUTE_TTL_S/, /continue/]},
@@ -76,7 +76,7 @@ a "signed out everywhere" screen with sessions still authenticating.`,
       id: 'last-seen',
       title: 'Reports last-seen from the live record within a minute',
       detail:
-        '`last_seen` comes from the live record and is compared against `LAST_SEEN_WINDOW_S` = 60 seconds. The draft returns the value cached an hour ago.',
+        '`last_seen` comes from the live record and is compared against `LAST_SEEN_WINDOW_S` = 60 seconds. The starter returns the value cached an hour ago.',
       match: {
         python: {all: [/LAST_SEEN_WINDOW_S\s*=\s*60/, /last_seen/]},
         typescript: {all: [/LAST_SEEN_WINDOW_S\s*=\s*60/, /last_seen/]},
@@ -89,7 +89,7 @@ a "signed out everywhere" screen with sessions still authenticating.`,
       id: 'rotation-count',
       title: 'Reports each session’s rotation count',
       detail:
-        'The response carries the `rotation` count so a user can see how often the id has changed. The draft omits it.',
+        'The response carries the `rotation` count so a user can see how often the id has changed. The starter omits it.',
       match: {
         python: {all: [/rotation/]},
         typescript: {all: [/rotation/]},
@@ -102,7 +102,7 @@ a "signed out everywhere" screen with sessions still authenticating.`,
       id: 'revoke-all',
       title: 'Invalidates every id before the response',
       detail:
-        '`DELETE` deletes each of the user’s session keys and clears the index before returning. The draft drops a cache entry and returns while the ids still authenticate.',
+        '`DELETE` deletes each of the user’s session keys and clears the index before returning. The starter drops a cache entry and returns while the ids still authenticate.',
       match: {
         python: {all: [/store\.clear\(/, /delete\(f"session:\{session_id\}"\)/]},
         typescript: {all: [/store\.clear\(/, /del\(`session:\$\{sessionId\}`\)/]},
@@ -596,5 +596,5 @@ void register_read_routes(httplib::Server& svr, RedisClient& redis) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated read endpoint for authorization, freshness and the meaning of "signed out". Three defects are being checked: trusting the path parameter serves one user's session metadata to another; a cached summary makes the last-seen value a lie and advertises sessions the store would reject; and a revoke-all that returns before the ids are gone leaves sessions authenticating behind a "signed out everywhere" screen. The habits to name out loud are: authorize the resource against the claims, read the value that must be fresh from the live record, and make the destructive action complete before you answer. Real systems add pagination for users with many sessions, a per-session "current device" marker, and an audit event for every revoke-all.`,
+  debrief: `The interviewer is testing whether you can debug a read endpoint for authorization, freshness and the meaning of "signed out". Three defects are being checked: trusting the path parameter serves one user's session metadata to another; a cached summary makes the last-seen value a lie and advertises sessions the store would reject; and a revoke-all that returns before the ids are gone leaves sessions authenticating behind a "signed out everywhere" screen. The habits to name out loud are: authorize the resource against the claims, read the value that must be fresh from the live record, and make the destructive action complete before you answer. Real systems add pagination for users with many sessions, a per-session "current device" marker, and an audit event for every revoke-all.`,
 };

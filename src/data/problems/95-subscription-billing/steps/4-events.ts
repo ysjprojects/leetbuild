@@ -8,28 +8,28 @@ export const invoiceEventsStep: Step = {
   focus: ['billing', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes an invoice outcome
+**Starting point.** The starter is working code: it publishes an invoice outcome
 on the right topic and the demo's happy path works end to end. It keys by the customer, publishes
 before the processor answers, only ever announces a successful charge, and uses a default producer
-with no outbox. Review it like the billing owner, fix it, and prove the fix with the checks below.
+with no outbox. Debug it like the billing owner, fix it, and prove the fix with the checks below.
 
 Once the processor has answered the charge for a (subscription, period), the outcome is published to
 the topic \`billing.invoice\`.
 
 - Every record goes to \`billing.invoice\` with the **subscription id** as the message key. The key
   is the partition key, so one subscription's billing history lands on one partition in produce order
-  and a consumer replays it without gaps. The draft keys by the customer id: the moment a
+  and a consumer replays it without gaps. The starter keys by the customer id: the moment a
   subscription changes owner or tenant, its history scatters across partitions and a consumer can
   apply a later outcome before an earlier one.
 - The event carries \`invoice_id\`, \`subscription_id\`, \`period_start\`, \`period_end\`,
   \`amount_cents\` and \`state\` — \`charged\` or \`failed\` — plus the processor's \`reference\`
   when the charge went through. It carries **no card data**: the topic is retained for days and
-  replicated to every broker, so the masked card the draft ships outlives every retention policy the
+  replicated to every broker, so the masked card the starter ships outlives every retention policy the
   invoice store has.
-- The produce happens **after** the \`ChargeResult\` is known. The draft publishes first and charges
+- The produce happens **after** the \`ChargeResult\` is known. The starter publishes first and charges
   afterwards, so a declined attempt is announced as a charge that never happened.
 - Failed attempts are published too, with \`state\` \`failed\` and the processor's \`reason\`. The
-  draft only ever builds a success, so the topic shows a subscription whose history simply stopped
+  starter only ever builds a success, so the topic shows a subscription whose history simply stopped
   after a decline — a gap in the topic is a gap in support's answer.
 - The producer is idempotent with required acks \`all\`: Python \`{"enable.idempotence": True,
   "acks": "all"}\`, KafkaJS \`{idempotent: true, maxInFlightRequests: 1}\`, kafka-go \`RequiredAcks:
@@ -40,10 +40,10 @@ the topic \`billing.invoice\`.
   for the relay to republish. It is never dropped, and a Kafka outage does not fail the caller.
 
 **Failure mode the checks target.** Keyed by the customer, ordering per subscription is gone; a
-produce that runs before the processor answers advertises a decline as a charge; a draft that only
-emits successes is silent exactly when support needs to explain a failure; and a default producer
-with no outbox turns a broker hiccup into a duplicated record or a lost one. Every one of these is
-invisible on the happy path the demo walks.`,
+produce that runs before the processor answers advertises a decline as a charge; a publisher that
+only emits successes is silent exactly when support needs to explain a failure; and a default
+producer with no outbox turns a broker hiccup into a duplicated record or a lost one. Every one of
+these is invisible on the happy path the demo walks.`,
   sequence: {
     participants: ['Payment processor', 'Billing Service', 'billing.invoice', 'billing db', 'Ledger projector'],
     messages: [
@@ -94,7 +94,7 @@ invisible on the happy path the demo walks.`,
       id: 'subscription-key',
       title: 'Keys by subscription, not by customer',
       detail:
-        "The message key is the subscription id, so every event for one subscription lands in the same partition and its billing history stays ordered. The draft keys by customer, so one subscription's history is scattered across partitions.",
+        "The message key is the subscription id, so every event for one subscription lands in the same partition and its billing history stays ordered. The starter keys by customer, so one subscription's history is scattered across partitions.",
       match: {
         python: {all: [/billing\.invoice/, /key=subscription_id/]},
         typescript: {all: [/billing\.invoice/, /key:\s*subscriptionId/]},
@@ -107,7 +107,7 @@ invisible on the happy path the demo walks.`,
       id: 'publish-after-confirm',
       title: 'Publishes only after the processor confirms',
       detail:
-        'The produce happens after the charge result is known, so an event never announces a charge that did not happen. The draft publishes first and charges afterwards.',
+        'The produce happens after the charge result is known, so an event never announces a charge that did not happen. The starter publishes first and charges afterwards.',
       match: {
         python: {order: [/processor\.Charge\(/, /producer\.produce\(/]},
         typescript: {order: [/processor\.Charge\(/, /producer\.send\(/]},
@@ -120,7 +120,7 @@ invisible on the happy path the demo walks.`,
       id: 'failed-published',
       title: 'Failed attempts are published with their reason',
       detail:
-        "A declined charge is published like a successful one, with `state` `failed` and the processor's `reason`, so the history has no silent gap. The draft only ever emits successes.",
+        "A declined charge is published like a successful one, with `state` `failed` and the processor's `reason`, so the history has no silent gap. The starter only ever emits successes.",
       match: {
         python: {all: [/state/, /"failed"/, /reason/]},
         typescript: {all: [/state/, /'failed'/, /reason/]},
@@ -133,7 +133,7 @@ invisible on the happy path the demo walks.`,
       id: 'outbox',
       title: 'Writes an outbox row when the broker rejects',
       detail:
-        'A rejected produce inserts the event into the outbox for a relay to republish; the event is never dropped and the caller is not failed. The draft loses the event.',
+        'A rejected produce inserts the event into the outbox for a relay to republish; the event is never dropped and the caller is not failed. The starter loses the event.',
       match: {
         python: {all: [/insert_outbox\(/, /except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch/]},
@@ -146,7 +146,7 @@ invisible on the happy path the demo walks.`,
       id: 'idempotent-producer',
       title: 'Idempotent producer with required acks',
       detail:
-        'The producer is configured for idempotence with `acks=all` (KafkaJS `idempotent: true`, kafka-go `RequiredAcks: kafka.RequireAll` with a hash balancer, librdkafka `enable.idempotence`), so a retried produce cannot duplicate a record. The draft uses a default producer.',
+        'The producer is configured for idempotence with `acks=all` (KafkaJS `idempotent: true`, kafka-go `RequiredAcks: kafka.RequireAll` with a hash balancer, librdkafka `enable.idempotence`), so a retried produce cannot duplicate a record. The starter uses a default producer.',
       match: {
         python: {all: [/enable\.idempotence/, /"acks"/]},
         typescript: {all: [/idempotent:\s*true/, /maxInFlightRequests/]},
@@ -179,7 +179,7 @@ processor = processor_pb2_grpc.ProcessorStub(grpc.insecure_channel("processor:90
 
 
 def publish(invoice: dict) -> None:
-    # TODO: a model-generated draft. It keys the record by the customer id instead of the
+    # TODO: flawed code. It keys the record by the customer id instead of the
     # subscription id, publishes before the processor answers — so a declined charge is announced
     # anyway — only ever builds a state="charged" event (a failed attempt is never published and no
     # reason is carried), ships the masked card, and uses a default producer: no idempotence, no
@@ -288,7 +288,7 @@ def bill_period(invoice: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** billing.invoice: a model draft that keys by customer and publishes before the charge. */
+      starter: `/** billing.invoice: a version that keys by customer and publishes before the charge. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
@@ -333,7 +333,7 @@ const {processor: proto} = grpc.loadPackageDefinition(protoLoader.loadSync('proc
 const processor = new proto.Processor('processor:9000', grpc.credentials.createInsecure());
 
 async function publish(invoice: Invoice): Promise<void> {
-  // TODO: a model-generated draft. It keys by the customer id instead of the subscription id,
+  // TODO: flawed code. It keys by the customer id instead of the subscription id,
   // publishes before the processor answers — so a declined charge is announced anyway — only ever
   // builds state 'charged' (a failed attempt is never published and no reason is carried), ships
   // the masked card, and uses a default producer: no idempotent, no maxInFlightRequests, and no
@@ -505,7 +505,7 @@ func newProcessorClient() pb.ProcessorClient {
 	return pb.NewProcessorClient(conn)
 }
 
-// Publish writes the outcome. TODO: a model-generated draft. It keys by the customer id instead of
+// Publish writes the outcome. TODO: flawed code. It keys by the customer id instead of
 // the subscription id, produces before the processor answers — so a declined charge is announced
 // anyway — only ever builds State "charged" (a failed attempt is never published and no Reason is
 // carried), ships the masked card, and writes with a default writer: no RequiredAcks, no hash
@@ -646,7 +646,7 @@ import io.grpc.ManagedChannelBuilder
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import spray.json._
 
-/** billing.invoice: a model draft that keys by customer and publishes before the charge. */
+/** billing.invoice: a version that keys by customer and publishes before the charge. */
 object BillingEvents {
   val TopicBillingInvoice = "billing.invoice"
 
@@ -669,7 +669,7 @@ object BillingEvents {
       amountCents: Long,
   )
 
-  // TODO: a model-generated draft. It keys by the customer id instead of the subscription id,
+  // TODO: flawed code. It keys by the customer id instead of the subscription id,
   // publishes before the processor answers — so a declined charge is announced anyway — only ever
   // builds state "charged" (a failed attempt is never published and no reason is carried), ships
   // the masked card, and uses a bare producer: no enable.idempotence, no ACKS_CONFIG, and no
@@ -780,7 +780,7 @@ object BillingEvents {
 
 using json = nlohmann::json;
 
-// billing.invoice: a model draft that keys by customer and publishes before the charge.
+// billing.invoice: a version that keys by customer and publishes before the charge.
 const std::string kTopicBillingInvoice = "billing.invoice";
 constexpr int kDeadlineMs = 5000;
 
@@ -797,7 +797,7 @@ struct Invoice {
 std::unique_ptr<RdKafka::Producer> producer(
     RdKafka::Producer::create(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL).get(), err));
 
-// TODO: a model-generated draft. It keys by the customer id instead of the subscription id,
+// TODO: flawed code. It keys by the customer id instead of the subscription id,
 // produces before the processor answers — so a declined charge is announced anyway — only ever
 // builds a state "charged" event (a failed attempt is never published and no reason is carried),
 // ships the masked card, and uses a default producer: no enable.idempotence, no acks=all, and no

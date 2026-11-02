@@ -7,11 +7,11 @@ import {cacheEventsStep} from './steps/4-events';
 import {cacheReadStep} from './steps/5-read';
 
 /**
- * Prompt cache on the AI-era track: the course is not "hash the prompt and store the completion", it
- * is the review you owe a model-generated cache before a tenant trusts it. A cache key built from
- * tenant, prompt version and prefix digest → one conditional Redis fill with a version-scoped TTL →
- * a bounded model call that caches only deterministic answers → tenant-keyed cache events carrying
- * digests → a stats read that reports the slice a rollout decision can act on.
+ * Prompt cache: the course is not "hash the prompt and store the completion", it is the debugging
+ * you owe a cache before a tenant trusts it. A cache key built from tenant, prompt version and
+ * prefix digest → one conditional Redis fill with a version-scoped TTL → a bounded model call that
+ * caches only deterministic answers → tenant-keyed cache events carrying digests → a stats read
+ * that reports the slice a rollout decision can act on.
  */
 export const promptCacheProblem: Problem = {
   id: 'prompt-cache',
@@ -19,7 +19,7 @@ export const promptCacheProblem: Problem = {
   tagline: 'Exact-prefix completion caching that is tenant-safe, version-aware and honest about hits.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Prompt Cache
 
@@ -64,12 +64,12 @@ One service, the prompt cache, with five pieces:
    from the same counters, savings priced by a versioned rate table, \`fill_latency_ms\` from the events,
    and a **403** for a foreign tenant's slice.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

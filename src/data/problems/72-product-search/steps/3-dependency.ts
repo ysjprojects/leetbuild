@@ -8,29 +8,29 @@ export const dependencyStep: Step = {
   focus: ['search', 'shard-a', 'shard-b'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it walks the shard list, calls
+**Starting point.** The starter is working code: it walks the shard list, calls
 \`Search\` on each, collects the products, and returns them. It compiles, it answers the demo with
-every shard healthy, and it hides four production flaws. Review it like the service owner, fix it,
+every shard healthy, and it hides four production flaws. Debug it like the service owner, fix it,
 and prove the fix with the checks below.
 
 Implement the gRPC fan-out used by \`GET /v1/search\`.
 
 - Every shard call runs under a **350 ms deadline** (\`SHARD_DEADLINE_MS = 350\`): the stub carries
   \`timeout=\` / a deadline / \`WithTimeout\` / \`deadlineAfter\`, and the merge never waits for the
-  slowest shard. The draft has no deadline, so one hung shard holds the request forever.
+  slowest shard. The starter has no deadline, so one hung shard holds the request forever.
 - The fan-out answers when **all shards reply or a majority do** (\`majority = len(shards) // 2 + 1\`).
   A reply count below the quorum fails the query rather than returning an empty page.
 - The merge **dedupes by product id** (\`seen\` set / map), because a product can be indexed on more
-  than one shard and the draft concatenates the duplicates.
+  than one shard and the starter concatenates the duplicates.
 - The response is marked **partial** whenever a shard missed: \`partial = missed > 0\`. Answering with
   a silently truncated page is the bug that makes a shopper think a product does not exist.
 - Retries are **bounded by the deadline budget**: compute \`remaining = deadline - now\` before each
-  attempt, stop when it is exhausted, and only the shard that failed is retried. The draft retries
+  attempt, stop when it is exhausted, and only the shard that failed is retried. The starter retries
   every shard on timeout, healthy ones included.
 
 **Failure mode the checks target.** A fan-out is a distributed system wearing a function call: with
 no deadline it inherits the slowest shard's latency, and with no partial flag it hides the failure.
-The draft's three flaws compound — an unbounded wait amplifies load, blind retries multiply it, and
+The starter's three flaws compound — an unbounded wait amplifies load, blind retries multiply it, and
 duplicate merges inflate the page so the caller cannot tell a re-indexed product from two products.
 The fix is a deadline shared by the whole fan-out, a quorum, a per-id dedupe, and an honest
 \`partial\` flag.`,
@@ -50,7 +50,7 @@ The fix is a deadline shared by the whole fan-out, a quorum, a per-id dedupe, an
       id: 'deadline',
       title: 'Runs every shard call under a 350 ms deadline',
       detail:
-        'The fan-out carries a 350 ms deadline into every shard call (`SHARD_DEADLINE_MS = 350` with `timeout=` / a deadline / `WithTimeout` / `deadlineAfter`). The draft has no deadline, so a stuck shard blocks the request indefinitely.',
+        'The fan-out carries a 350 ms deadline into every shard call (`SHARD_DEADLINE_MS = 350` with `timeout=` / a deadline / `WithTimeout` / `deadlineAfter`). The starter has no deadline, so a stuck shard blocks the request indefinitely.',
       match: {
         python: {all: [/SHARD_DEADLINE_MS\s*=\s*350/, /timeout=/]},
         typescript: {all: [/SHARD_DEADLINE_MS\s*=\s*350/, /deadline/]},
@@ -63,7 +63,7 @@ The fix is a deadline shared by the whole fan-out, a quorum, a per-id dedupe, an
       id: 'partial-result',
       title: 'Marks the response partial when a shard missed',
       detail:
-        'The result carries `partial = missed > 0`, so a page that lost a shard says so. The draft returns a silently truncated page, and an absent shard looks like an absent product.',
+        'The result carries `partial = missed > 0`, so a page that lost a shard says so. The starter returns a silently truncated page, and an absent shard looks like an absent product.',
       match: {
         python: {all: [/\bpartial\b/, /\bmissed\b/]},
         typescript: {all: [/\bpartial\b/, /\bmissed\b/]},
@@ -76,7 +76,7 @@ The fix is a deadline shared by the whole fan-out, a quorum, a per-id dedupe, an
       id: 'dedupe',
       title: 'Dedupes merged products by id',
       detail:
-        'The merge keeps a `seen` set of product ids and skips a product that arrives from a second shard. The draft concatenates shard pages, so a re-indexed product appears twice.',
+        'The merge keeps a `seen` set of product ids and skips a product that arrives from a second shard. The starter concatenates shard pages, so a re-indexed product appears twice.',
       match: {
         python: {all: [/\bseen\b/, /\bid\b/]},
         typescript: {all: [/\bseen\b/, /\bid\b/]},
@@ -89,7 +89,7 @@ The fix is a deadline shared by the whole fan-out, a quorum, a per-id dedupe, an
       id: 'quorum',
       title: 'Answers on all replies or a majority',
       detail:
-        'The fan-out requires a majority of shards (`majority = len(shards) // 2 + 1`) or every shard to answer; below that it fails instead of returning a partial page as if it were complete. The draft ignores how many shards answered.',
+        'The fan-out requires a majority of shards (`majority = len(shards) // 2 + 1`) or every shard to answer; below that it fails instead of returning a partial page as if it were complete. The starter ignores how many shards answered.',
       match: {
         python: {all: [/majority/, /len\(shards\)\s*\/\/\s*2/]},
         typescript: {all: [/majority/, /shards\.length\s*\/\s*2/]},
@@ -102,7 +102,7 @@ The fix is a deadline shared by the whole fan-out, a quorum, a per-id dedupe, an
       id: 'retry-budget',
       title: 'Stops retrying when the deadline budget is gone',
       detail:
-        'Each attempt computes `remaining = deadline - now` and the shard is retried only while budget remains and only when it failed. The draft retries every shard — including the healthy ones — with no bound.',
+        'Each attempt computes `remaining = deadline - now` and the shard is retried only while budget remains and only when it failed. The starter retries every shard — including the healthy ones — with no bound.',
       match: {
         python: {all: [/deadline/, /\bremaining\b/]},
         typescript: {all: [/deadline/, /\bremaining\b/]},
@@ -122,9 +122,9 @@ MAX_ATTEMPTS = 3
 
 
 async def search_shards(shards: list[str], make_stub, request) -> dict:
-    # TODO: this draft waits for the slowest shard with no deadline, retries every shard on timeout
+    # TODO: this starter waits for the slowest shard with no deadline, retries every shard on timeout
     # including healthy ones, and merges duplicate shard results without dedupe by product id.
-    # Review all three.
+    # Fix all three.
     merged = []
     for shard in shards:
         for attempt in range(MAX_ATTEMPTS):
@@ -198,7 +198,7 @@ async def search_shards(shards: list[str], make_stub, request) -> SearchPage:
 `,
     },
     typescript: {
-      starter: `/** Shard fan-out: a model-generated draft that waits for the slowest shard. */
+      starter: `/** Shard fan-out: flawed code that waits for the slowest shard. */
 import * as grpc from '@grpc/grpc-js';
 
 interface ShardReply {
@@ -216,9 +216,9 @@ export async function searchShards(
   makeClient: (address: string) => ShardClient,
   request: {q: string; page: number; page_size: number},
 ): Promise<{results: Array<{id: string; title: string}>; page: number}> {
-  // TODO: this draft waits for the slowest shard with no deadline, retries every shard on timeout
+  // TODO: this starter waits for the slowest shard with no deadline, retries every shard on timeout
   // including healthy ones, and merges duplicate shard results without dedupe by product id.
-  // Review all three.
+  // Fix all three.
   const merged: Array<{id: string; title: string}> = [];
   for (const shard of shards) {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -335,9 +335,9 @@ import (
 const maxAttempts = 3
 
 func searchShards(ctx context.Context, shards []string, dial func(string) pb.ShardClient, req *pb.SearchRequest) map[string]any {
-	// TODO: this draft waits for the slowest shard with no deadline, retries every shard on timeout
+	// TODO: this starter waits for the slowest shard with no deadline, retries every shard on timeout
 	// including healthy ones, and merges duplicate shard results without dedupe by product id.
-	// Review all three.
+	// Fix all three.
 	results := make([]map[string]any, 0)
 	for _, shard := range shards {
 		client := dial(shard)
@@ -456,9 +456,9 @@ object ShardFanout {
   val MaxAttempts = 3
 
   def searchShards(shards: Seq[String], dial: String => ManagedChannel, request: SearchRequest): Map[String, Any] = {
-    // TODO: this draft waits for the slowest shard with no deadline, retries every shard on timeout
+    // TODO: this starter waits for the slowest shard with no deadline, retries every shard on timeout
     // including healthy ones, and merges duplicate shard results without dedupe by product id.
-    // Review all three.
+    // Fix all three.
     val merged = mutable.ArrayBuffer.empty[Map[String, Any]]
     for (shard <- shards) {
       val stub = ShardGrpc.blockingStub(dial(shard))
@@ -553,9 +553,9 @@ using grpc::Channel;
 constexpr int kMaxAttempts = 3;
 
 std::vector<std::string> searchShards(const std::vector<std::string>& shards, const shard::SearchRequest& request) {
-  // TODO: this draft waits for the slowest shard with no deadline, retries every shard on timeout
+  // TODO: this starter waits for the slowest shard with no deadline, retries every shard on timeout
   // including healthy ones, and merges duplicate shard results without dedupe by product id.
-  // Review all three.
+  // Fix all three.
   std::vector<std::string> results;
   for (const auto& shard : shards) {
     auto stub = shard::Shard::NewStub(grpc::CreateChannel(shard, grpc::InsecureChannelCredentials()));
@@ -651,5 +651,5 @@ SearchPage searchShards(const std::vector<std::string>& shards, const shard::Sea
     'Dedupe belongs in the merge, keyed by product id: a `seen` set (or a map) checked before the product is appended. Concatenating shard pages is how the same product that got re-indexed on two shards shows up twice in one page.',
     'The partial flag is the honesty of the whole design: `missed` counts the shards you gave up on and `partial = missed > 0` rides back to the caller. Without it a truncated page is indistinguishable from a complete one, which is the difference between "not in stock" and "we could not ask shard B".',
   ],
-  debrief: `The interviewer is probing whether you can write a fan-out that fails honestly. The draft is the shape everyone writes first: iterate, call, retry forever, concatenate. Each simplification is a production defect — no deadline means the p99 of the slowest shard is your p99, unbounded retries double the load on shards that are already struggling, and an undeduped merge inflates pages. The fix is one deadline shared by the fan-out, a quorum so a single survivor does not masquerade as a full answer, per-id dedupe, and a partial flag the caller can surface. Real systems go further: hedged requests against the tail, per-shard circuit breakers, and a merge that keeps relevance scores stable so a partial page is not silently reordered.`,
+  debrief: `The interviewer is probing whether you can write a fan-out that fails honestly. The starter is the shape everyone writes first: iterate, call, retry forever, concatenate. Each simplification is a production defect — no deadline means the p99 of the slowest shard is your p99, unbounded retries double the load on shards that are already struggling, and an undeduped merge inflates pages. The fix is one deadline shared by the fan-out, a quorum so a single survivor does not masquerade as a full answer, per-id dedupe, and a partial flag the caller can surface. Real systems go further: hedged requests against the tail, per-shard circuit breakers, and a merge that keeps relevance scores stable so a partial page is not silently reordered.`,
 };

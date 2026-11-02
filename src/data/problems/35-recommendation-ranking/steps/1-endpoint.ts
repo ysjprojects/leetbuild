@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'recsvc', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route,
+**Starting point.** The starter is working code: it registers the route,
 decodes the body and answers \`200\` with a ranked list. It compiles, it serves the demo, and it
-lets the caller pick whose recommendations come back. Review it like the service owner, fix it, and
+lets the caller pick whose recommendations come back. Debug it like the service owner, fix it, and
 prove the fix with the checks below.
 
 Implement \`POST /v1/recommendations\` with body
@@ -23,7 +23,7 @@ Implement \`POST /v1/recommendations\` with body
   **404** before the ranker is called — a surface nobody configured would rank with the wrong
   version and the wrong fallback anyway.
 - \`candidate_ids\` is required and bounded by \`MAX_CANDIDATES = 500\`; an empty or oversized list is
-  **400**. The draft caps nothing, so one request can hand the ranking pool a list big enough to
+  **400**. The starter caps nothing, so one request can hand the ranking pool a list big enough to
   stall it.
 - The response holds at most \`MAX_ITEMS = 30\` items — the top of the order, trimmed after ranking —
   and each item carries its \`id\`, its \`score\` and its zero-based \`position\`.
@@ -33,7 +33,7 @@ Implement \`POST /v1/recommendations\` with body
   catalog. A rejected request never reaches the ranking pool.
 - Log the decision with tenant, user, surface and counts — not the candidate array.
 
-**Failure mode the checks target.** The draft resolves the user from the body, so any caller can ask
+**Failure mode the checks target.** The starter resolves the user from the body, so any caller can ask
 for another user's personalized list and the mistake stays invisible until someone reads the
 impressions; it accepts an unbounded candidate list, so one request can stall ranking for everyone
 behind it; it returns as many items as the ranker produced, so a demo list becomes a 500-item
@@ -83,7 +83,7 @@ numbers the release gate reads.`,
       id: 'auth-user',
       title: 'Resolves the user from the X-User-Id header, never the body',
       detail:
-        'The user comes from the authenticated `X-User-Id` header and a missing header is **401**; a `user_id` in the body is never trusted, so one caller cannot request another user’s personalized list. The draft prefers `body.user_id` over the header and rejects nothing.',
+        'The user comes from the authenticated `X-User-Id` header and a missing header is **401**; a `user_id` in the body is never trusted, so one caller cannot request another user’s personalized list. The starter prefers `body.user_id` over the header and rejects nothing.',
       match: {
         python: {all: [/X-User-Id/, /status_code\s*=\s*401/], none: [/body\.user_id/]},
         typescript: {all: [/X-User-Id/, /code\(\s*401\s*\)/], none: [/body\.user_id/]},
@@ -96,7 +96,7 @@ numbers the release gate reads.`,
       id: 'candidate-cap',
       title: 'Rejects an empty or oversized candidate list',
       detail:
-        '`candidate_ids` must hold between 1 and `MAX_CANDIDATES = 500` ids; an empty or oversized list is **400** before anything is ranked. The draft caps nothing, so one request can stall the ranking pool with a list of any size.',
+        '`candidate_ids` must hold between 1 and `MAX_CANDIDATES = 500` ids; an empty or oversized list is **400** before anything is ranked. The starter caps nothing, so one request can stall the ranking pool with a list of any size.',
       match: {
         python: {all: [/MAX_CANDIDATES\s*=\s*500/, /candidate_ids/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_CANDIDATES\s*=\s*500/, /candidate_ids/, /code\(\s*400\s*\)/]},
@@ -109,7 +109,7 @@ numbers the release gate reads.`,
       id: 'top-k',
       title: 'Returns at most MAX_ITEMS = 30 items with id, score and position',
       detail:
-        'The ranked list is trimmed to `MAX_ITEMS = 30` after ranking and every item carries its `id`, `score` and zero-based `position`. The draft returns whatever the ranker produced, so a 500-candidate request becomes a 500-item payload.',
+        'The ranked list is trimmed to `MAX_ITEMS = 30` after ranking and every item carries its `id`, `score` and zero-based `position`. The starter returns whatever the ranker produced, so a 500-candidate request becomes a 500-item payload.',
       match: {
         python: {all: [/MAX_ITEMS\s*=\s*30/, /\[:\s*MAX_ITEMS\]/, /"position"/, /"score"/]},
         typescript: {all: [/MAX_ITEMS\s*=\s*30/, /slice\(\s*0\s*,\s*MAX_ITEMS\s*\)/, /\bposition\b/, /\bscore\b/]},
@@ -122,7 +122,7 @@ numbers the release gate reads.`,
       id: 'model-version',
       title: 'Stamps the response with the version that produced the order',
       detail:
-        'The response carries `model_version`, taken from the ranking result that produced this order. The draft answers with items only, so an A/B read of two releases sees different lists and no way to attribute which model ranked them.',
+        'The response carries `model_version`, taken from the ranking result that produced this order. The starter answers with items only, so an A/B read of two releases sees different lists and no way to attribute which model ranked them.',
       match: {
         python: {all: [/model_version/, /result\.model_version/]},
         typescript: {all: [/model_version/, /result\.model_version/]},
@@ -165,8 +165,8 @@ def recommend(
     tenant: str = Header(alias="X-Tenant-Id"),
     header_user: str | None = Header(default=None, alias="X-User-Id"),
 ) -> JSONResponse:
-    # TODO: this draft lets the body pick the user, caps neither the candidate list nor the result,
-    # and never says which model produced the order. Review it before it ships.
+    # TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
+    # and never says which model produced the order. Fix all three before it ships.
     user_id = body.user_id or header_user or tenant
     items = ranker.rank(tenant, user_id, body.surface, body.candidate_ids)
     return JSONResponse({"items": items}, status_code=200)
@@ -259,7 +259,7 @@ def recommend(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/recommendations: a model-generated draft that trusts whatever the caller sends. */
+      starter: `/** POST /v1/recommendations: flawed code that trusts whatever the caller sends. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -289,8 +289,8 @@ async function rank(
 }
 
 app.post('/v1/recommendations', async (request, reply) => {
-  // TODO: this draft lets the body pick the user, caps neither the candidate list nor the result,
-  // and never says which model produced the order. Review it before it ships.
+  // TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
+  // and never says which model produced the order. Fix all three before it ships.
   const tenant = request.headers['x-tenant-id'] as string;
   const headerUser = request.headers['x-user-id'] as string | undefined;
   const body = request.body as RecommendBody;
@@ -436,8 +436,8 @@ func recommend(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft lets the body pick the user, caps neither the candidate list nor the result,
-	// and never says which model produced the order. Review it before it ships.
+	// TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
+	// and never says which model produced the order. Fix all three before it ships.
 	userID := r.Header.Get("X-User-Id")
 	if body.UserID != "" {
 		userID = body.UserID
@@ -585,13 +585,13 @@ import spray.json.RootJsonFormat
 
 final case class RecommendRequest(surface: String, candidate_ids: List[String], user_id: Option[String])
 final case class ScoredItem(id: String, score: Double)
-final case class DraftRanking(items: List[ScoredItem])
+final case class RankingBody(items: List[ScoredItem])
 
 object RecApi {
   implicit val system: ActorSystem = ActorSystem("recsvc")
   implicit val requestFormat: RootJsonFormat[RecommendRequest] = jsonFormat3(RecommendRequest)
   implicit val itemFormat: RootJsonFormat[ScoredItem] = jsonFormat2(ScoredItem)
-  implicit val draftFormat: RootJsonFormat[DraftRanking] = jsonFormat1(DraftRanking)
+  implicit val bodyFormat: RootJsonFormat[RankingBody] = jsonFormat1(RankingBody)
 
   def rank(tenant: String, userId: String, surface: String, candidateIds: List[String]): List[ScoredItem] =
     Nil
@@ -601,10 +601,10 @@ object RecApi {
       post {
         optionalHeaderValueByName("X-User-Id") { headerUser =>
           entity(as[RecommendRequest]) { body =>
-            // TODO: this draft lets the body pick the user, caps neither the candidate list nor the
-            // result, and never says which model produced the order. Review it before it ships.
+            // TODO: this starter lets the body pick the user, caps neither the candidate list nor the
+            // result, and never says which model produced the order. Fix all three before it ships.
             val userId = body.user_id.getOrElse(headerUser.getOrElse(""))
-            complete(StatusCodes.OK, DraftRanking(rank("", userId, body.surface, body.candidate_ids)))
+            complete(StatusCodes.OK, RankingBody(rank("", userId, body.surface, body.candidate_ids)))
           }
         }
       }
@@ -714,8 +714,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft lets the body pick the user, caps neither the candidate list nor the result,
-    // and never says which model produced the order. Review it before it ships.
+    // TODO: this starter lets the body pick the user, caps neither the candidate list nor the result,
+    // and never says which model produced the order. Fix all three before it ships.
     auto userId = body.value("user_id", std::string());
     if (userId.empty()) userId = headerUser;
     const auto items = rank(tenant, userId, body.value("surface", std::string()),
@@ -832,5 +832,5 @@ int main() {
     'Identity is the whole point of this endpoint: the user is `X-User-Id` and nothing else. Do not "prefer the header over the body" — drop `user_id` from the request model entirely, so a body that carries one cannot reach the ranking call even by accident.',
     'Trim on the way out, not before ranking: rank all accepted candidates, then `items[:MAX_ITEMS]` (or the language equivalent) and number what remains. Stamp `model_version` from the ranking result into the same response — the trimmed order plus its version is the record the A/B read compares.',
   ],
-  debrief: `The interviewer is testing the intake boundary of a personalization service, where the caller is untrusted and the expensive thing is one call away. The draft reads fine because the demo always posts the caller's own id and a short candidate list. Four defects are being checked: identity (the user comes from the authenticated \`X-User-Id\` header, and a body \`user_id\` is not a weaker source but no source at all), intake caps (an unbounded candidate list lets one request stall the ranking pool for everyone behind it), output caps (the product contract is at most 30 items, and truncating after ranking keeps the top of the order instead of the first 30 candidates), and attribution (\`model_version\` in the response is what makes two releases comparable offline). Real services add candidate dedupe before ranking, per-tenant surface grants, a request-level deadline shared with the ranker (step 3), and surfacing the caps through the surface config (step 5) instead of hardcoding them — but the guard order at the edge is the part that never moves.`,
+  debrief: `The interviewer is testing the intake boundary of a personalization service, where the caller is untrusted and the expensive thing is one call away. The starter reads fine because the demo always posts the caller's own id and a short candidate list. Four defects are being checked: identity (the user comes from the authenticated \`X-User-Id\` header, and a body \`user_id\` is not a weaker source but no source at all), intake caps (an unbounded candidate list lets one request stall the ranking pool for everyone behind it), output caps (the product contract is at most 30 items, and truncating after ranking keeps the top of the order instead of the first 30 candidates), and attribution (\`model_version\` in the response is what makes two releases comparable offline). Real services add candidate dedupe before ranking, per-tenant surface grants, a request-level deadline shared with the ranker (step 3), and surfacing the caps through the surface config (step 5) instead of hardcoding them — but the guard order at the edge is the part that never moves.`,
 };

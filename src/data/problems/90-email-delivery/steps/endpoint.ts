@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'redis', 'relay'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it accepts a send request and
-hands it to the relay. It compiles, it serves the demo, and it hides three production flaws. Review
-it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it accepts a send request and hands it to the
+relay. It compiles, it serves the demo, and it hides three production flaws. Debug it like the
+service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/emails\` with body \`{"recipient": "…", "template_id": "…", "variables": {…},
 "subject": "…"}\`.
@@ -21,10 +21,10 @@ Implement \`POST /v1/emails\` with body \`{"recipient": "…", "template_id": "�
 - \`variables\` is a map of merge values capped at **8 KiB** (\`1 << 13\` bytes) of UTF-8 in total;
   larger payloads are **413**.
 - \`subject\` and every merge value must be rejected with **400** if they contain CRLF or header
-  separators (\`\\r\`, \`\\n\`, or a lone \`\\r\`); the draft sends them straight into the relay call.
+  separators (\`\\r\`, \`\\n\`, or a lone \`\\r\`); the starter sends them straight into the relay call.
 - \`Idempotency-Key\` is required (**400** when missing). A retry with the same
   \`(recipient, key)\` returns the stored message id instead of sending again.
-- The suppression check happens **before** the relay is called; the draft checks it after queuing.
+- The suppression check happens **before** the relay is called; the starter checks it after queuing.
 
 **Failure mode the checks target.** Checking suppression after queuing means a suppressed address is
 mailed anyway; a missing \`Idempotency-Key\` turns a client retry into a second send; and raw subject
@@ -57,7 +57,7 @@ text with \`\\r\\n\` smuggles extra headers into the message the relay builds.`,
       id: 'suppression-first',
       title: 'Consults the suppression list before calling the relay',
       detail:
-        'A suppressed recipient is refused with **409** and the relay is never called. The draft queues the relay call first and checks suppression afterwards.',
+        'A suppressed recipient is refused with **409** and the relay is never called. The starter queues the relay call first and checks suppression afterwards.',
       match: {
         python: {all: [/is_suppressed\(/, /status_code\s*=\s*409/], order: [/is_suppressed\(/, /relay\.send\(/]},
         typescript: {all: [/isSuppressed\(/, /code\(\s*409\s*\)/], order: [/isSuppressed\(/, /relay\.send\(/]},
@@ -70,7 +70,7 @@ text with \`\\r\\n\` smuggles extra headers into the message the relay builds.`,
       id: 'idempotency-key',
       title: 'Keys retries by (recipient, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the message id is stored under `(recipient, key)`; a replay returns the stored id instead of sending twice. The draft ignores the header entirely.',
+        '`Idempotency-Key` is required and the message id is stored under `(recipient, key)`; a replay returns the stored id instead of sending twice. The starter ignores the header entirely.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(/, /store\.put\(/]},
         typescript: {all: [/idempotency-key/, /store\.get\(/, /store\.put\(/]},
@@ -83,7 +83,7 @@ text with \`\\r\\n\` smuggles extra headers into the message the relay builds.`,
       id: 'validate-template-variables',
       title: 'Validates the template id and the 8 KiB merge-variable cap',
       detail:
-        'Unknown template ids are **400** and merge variables over `1 << 13` bytes are **413**. The draft accepts any id and never measures the variables.',
+        'Unknown template ids are **400** and merge variables over `1 << 13` bytes are **413**. The starter accepts any id and never measures the variables.',
       match: {
         python: {all: [/KNOWN_TEMPLATES/, /MAX_VARIABLES_BYTES/, /status_code\s*=\s*400/, /status_code\s*=\s*413/]},
         typescript: {all: [/KNOWN_TEMPLATES/, /MAX_VARIABLES_BYTES/, /code\(\s*400\s*\)/, /code\(\s*413\s*\)/]},
@@ -98,7 +98,7 @@ text with \`\\r\\n\` smuggles extra headers into the message the relay builds.`,
       id: 'reject-crlf',
       title: 'Rejects CRLF and header separators in subject and variables',
       detail:
-        'Subject and merge values containing `\\r` or `\\n` are **400** so they cannot inject headers. The draft passes raw text to the relay.',
+        'Subject and merge values containing `\\r` or `\\n` are **400** so they cannot inject headers. The starter passes raw text to the relay.',
       match: {
         python: {all: [/has_crlf\(/, /\\r/, /\\n/, /status_code\s*=\s*400/]},
         typescript: {all: [/hasCrlf\(/, /\\r/, /\\n/, /code\(\s*400\s*\)/]},
@@ -150,9 +150,9 @@ relay = Relay()
 
 @app.post("/v1/emails")
 def send(body: SendRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft queues the relay call before checking suppression, has no
+    # TODO: this starter queues the relay call before checking suppression, has no
     # Idempotency-Key so a client retry sends twice, and passes the raw subject into the relay
-    # where a \\r\\n smuggles extra headers. Review all three.
+    # where a \\r\\n smuggles extra headers. Fix all three.
     message_id = relay.send(body.recipient, body.template_id, body.variables, body.subject)
     if is_suppressed(body.recipient):
         return JSONResponse({"error": "suppressed"}, status_code=409)
@@ -269,9 +269,9 @@ const relay: Relay = {
 };
 
 app.post('/v1/emails', async (request, reply) => {
-  // TODO: this draft queues the relay call before checking suppression, has no
+  // TODO: this starter queues the relay call before checking suppression, has no
   // Idempotency-Key so a client retry sends twice, and passes the raw subject into the relay
-  // where a \\r\\n smuggles extra headers. Review all three.
+  // where a \\r\\n smuggles extra headers. Fix all three.
   const body = request.body as SendBody;
   const messageId = await relay.send(body.recipient, body.template_id, body.variables, body.subject);
   if (await isSuppressed(body.recipient)) {
@@ -387,9 +387,9 @@ type Relay interface {
 
 func Register(mux *http.ServeMux, store MessageStore, relay Relay) {
 	mux.HandleFunc("POST /v1/emails", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: this draft queues the relay call before checking suppression, has no
+		// TODO: this starter queues the relay call before checking suppression, has no
 		// Idempotency-Key so a client retry sends twice, and passes the raw subject into the relay
-		// where a \\r\\n smuggles extra headers. Review all three.
+		// where a \\r\\n smuggles extra headers. Fix all three.
 		var body SendBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -522,9 +522,9 @@ object Api {
   def routes(store: MessageStore, relay: Relay): Route =
     path("v1" / "emails") {
       post {
-        // TODO: this draft queues the relay call before checking suppression, has no
+        // TODO: this starter queues the relay call before checking suppression, has no
         // Idempotency-Key so a client retry sends twice, and passes the raw subject into the relay
-        // where a \\r\\n smuggles extra headers. Review all three.
+        // where a \\r\\n smuggles extra headers. Fix all three.
         entity(as[SendBody]) { body =>
           val messageId = relay.send(body.recipient, body.templateId, body.variables, body.subject)
           if (isSuppressed(body.recipient)) {
@@ -627,9 +627,9 @@ class Relay {
 
 void Register(httplib::Server& svr, MessageStore& store, Relay& relay) {
   svr.Post("/v1/emails", [&](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft queues the relay call before checking suppression, has no
+    // TODO: this starter queues the relay call before checking suppression, has no
     // Idempotency-Key so a client retry sends twice, and passes the raw subject into the relay
-    // where a \\r\\n smuggles extra headers. Review all three.
+    // where a \\r\\n smuggles extra headers. Fix all three.
     const json body = json::parse(req.body);
     const std::string message_id = relay.send(body["recipient"], body["template_id"],
                                               body["variables"], body["subject"]);
@@ -745,5 +745,5 @@ void Register(httplib::Server& svr, MessageStore& store, Relay& relay) {
     'A client retry is the same send: require `Idempotency-Key` and key the stored message id by `(recipient, key)`, returning the stored id on a replay.',
     'Header injection is a validation problem: reject `\\r` and `\\n` in the subject and in every merge value before the relay builds the message.',
   ],
-  debrief: `The interviewer is testing whether you can review a send endpoint at the trust boundary. The draft reads fine because the demo sends to one recipient and never retries. Three separate defects are being checked: ordering (suppression before the relay call), idempotency (keyed by recipient so a retry cannot send twice), and header injection (CRLF in subject or variables). Real senders also validate the recipient syntax, cap total message size, and record the suppression decision in the same transaction as the send decision.`,
+  debrief: `The interviewer is testing whether you can debug a send endpoint at the trust boundary. The starter reads fine because the demo sends to one recipient and never retries. Three separate defects are being checked: ordering (suppression before the relay call), idempotency (keyed by recipient so a retry cannot send twice), and header injection (CRLF in subject or variables). Real senders also validate the recipient syntax, cap total message size, and record the suppression decision in the same transaction as the send decision.`,
 };

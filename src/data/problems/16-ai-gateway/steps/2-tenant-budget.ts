@@ -8,7 +8,7 @@ export const tenantBudgetStep: Step = {
   focus: ['gateway', 'budget'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it passes the happy path — a tenant with budget
+The starter is working code: it passes the happy path — a tenant with budget
 left gets its request through — but it hides a race and a leak. Find them, fix them, and prove the
 fix.
 
@@ -752,5 +752,5 @@ await app.listen({host: '0.0.0.0', port: 8443});
 `,
     },
   },
-  debrief: `The interview signal is **distributed-state review**: can you see that a correct-looking happy path becomes wrong the moment two requests overlap, and that a key without an expiry is a correctness bug rather than an optimisation? The fix is one Lua script because Redis executes it atomically on the server; the client-side version has a real interleaving where both requests read the same remaining budget. Setting \`EX\` on the first write makes the daily window self-healing. A real gateway also records the reservation against the request id so a failed provider call can refund it, and uses a per-tenant rate limiter as well as a token budget.`,
+  debrief: `The interview signal is **distributed-state debugging**: can you see that a correct-looking happy path becomes wrong the moment two requests overlap, and that a key without an expiry is a correctness bug rather than an optimisation? The fix is one Lua script because Redis executes it atomically on the server; the client-side version has a real interleaving where both requests read the same remaining budget. Setting \`EX\` on the first write makes the daily window self-healing. A real gateway also records the reservation against the request id so a failed provider call can refund it, and uses a per-tenant rate limiter as well as a token budget.`,
 };

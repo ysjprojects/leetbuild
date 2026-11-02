@@ -8,9 +8,9 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'consumer', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: every state change publishes a
+**Starting point.** The starter is working code: every state change publishes a
 \`returns.event\` record and the refund consumer updates the return, so one customer returning one
-damaged item looks right in the demo. Review it like the service owner, fix it, and prove the fix
+damaged item looks right in the demo. Debug it like the service owner, fix it, and prove the fix
 with the checks below.
 
 Implement the returns event pipeline: \`requested\`, \`received\`, \`graded\` and \`refunded\` each
@@ -33,7 +33,7 @@ publish one record to \`returns.event\`.
   commits the offset. Commit first and a crash between the two leaves the return saying
   \`requested\` while the money has already left.
 
-**Failure mode the checks target.** The draft keys every record by the customer, so one return's
+**Failure mode the checks target.** The starter keys every record by the customer, so one return's
 history is interleaved with that customer's other returns across partitions; it puts the photo's
 week-long CDN URL in the payload; it logs a refused produce instead of persisting it; and it commits
 the consumer's offset before the state write.`,
@@ -83,7 +83,7 @@ the consumer's offset before the state write.`,
       id: 'event-fields',
       title: 'Carries state, grade and refund amount — and no long-lived photo link',
       detail:
-        'The event carries `state`, `grade` and `refund_cents`, and the photo reference is a short-lived signed URL (or absent). A CDN URL with a week-long expiry is a permanent handle to the customer’s evidence; the draft ships exactly that.',
+        'The event carries `state`, `grade` and `refund_cents`, and the photo reference is a short-lived signed URL (or absent). A CDN URL with a week-long expiry is a permanent handle to the customer’s evidence; the starter ships exactly that.',
       match: {
         python: {
           all: [/["']state["']\s*:/, /["']grade["']\s*:/, /["']refund_cents["']\s*:/],
@@ -111,7 +111,7 @@ the consumer's offset before the state write.`,
       id: 'outbox-on-reject',
       title: 'Persists a refused record to the outbox',
       detail:
-        'A synchronous produce error and an asynchronous delivery failure both write an outbox row for the same key and payload. The draft logs the refusal and moves on, so a refunded event can vanish.',
+        'A synchronous produce error and an asynchronous delivery failure both write an outbox row for the same key and payload. The starter logs the refusal and moves on, so a refunded event can vanish.',
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery=_delivered/, /BufferError|err is not None/]},
         typescript: {all: [/outbox\.insert\(/, /producer\.send\(/, /catch/]},

@@ -7,12 +7,11 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Tool registry on the AI-era track: the course is not "store some tool definitions in a table",
- * it is the review you owe a model-generated registry before agents are allowed to act on what it
- * serves. Role-gated registration with an immutable version → one atomic Redis promotion agents
- * resolve through, per-run pins → a sandbox validation over gRPC that fails closed → tool-keyed
- * lifecycle events published only after the verdict → a resolve endpoint bounded by the caller's
- * pin and allowlist.
+ * Tool registry: the course is not "store some tool definitions in a table", it is the debugging
+ * you owe a registry before agents are allowed to act on what it serves. Role-gated registration
+ * with an immutable version → one atomic Redis promotion agents resolve through, per-run pins → a
+ * sandbox validation over gRPC that fails closed → tool-keyed lifecycle events published only after
+ * the verdict → a resolve endpoint bounded by the caller's pin and allowlist.
  */
 export const toolRegistryProblem: Problem = {
   id: 'tool-registry',
@@ -20,7 +19,7 @@ export const toolRegistryProblem: Problem = {
   tagline: 'A curated catalog of agent tools with side-effect classes and pinned versions.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Tool Registry
 
@@ -68,12 +67,12 @@ One service, **toolsd**, with five pieces:
    version when the caller pinned one, a **404** for a tool outside the allowlist, and no internal
    endpoint, credential or owner-only field in the response.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

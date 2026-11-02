@@ -8,8 +8,8 @@ export const invoiceEndpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers all three invoice
-routes and serves the happy path, and it hides three production flaws. Review it like the service
+**Starting point.** The starter is working code: it registers all three invoice
+routes and serves the happy path, and it hides three production flaws. Debug it like the service
 owner, fix it, and prove the fix with the checks below.
 
 Implement the draft/final lifecycle of an invoice:
@@ -32,7 +32,7 @@ Implement the draft/final lifecycle of an invoice:
   validation has passed, and store the finalized document under the idempotency key.
 - Money is integer minor units end to end: \`subtotal_cents = Σ quantity × unit_price_cents\`.
 
-**Failure mode the checks target.** The draft treats \`finalize\` as a label instead of a lock. The
+**Failure mode the checks target.** The starter treats \`finalize\` as a label instead of a lock. The
 update handler never looks at \`status\`, so line items of an issued — even paid — invoice can be
 re-written weeks later and every downstream reconciliation built on that document silently becomes
 wrong. The finalize handler never looks at the line items, so an empty invoice is issued as a zero
@@ -107,7 +107,7 @@ invoice with a second number. None of the three throws; all three corrupt the bo
       id: 'immutable-final',
       title: 'A finalized invoice rejects every field update with 409',
       detail:
-        'The update path loads the invoice, refuses to touch it once its status is `finalized` and answers **409** — the lock, not the label. The draft has no such guard: it re-writes `line_items` of an issued invoice and returns 200, which is the incident the whole step exists for.',
+        'The update path loads the invoice, refuses to touch it once its status is `finalized` and answers **409** — the lock, not the label. The starter has no such guard: it re-writes `line_items` of an issued invoice and returns 200, which is the incident the whole step exists for.',
       match: {
         python: {all: [/\bFINALIZED\s*=/, /def\s+require_draft\(/, /status_code\s*=\s*409/]},
         typescript: {all: [/const FINALIZED\s*=/, /function requireDraft\(/, /HttpError\(\s*409\b/]},
@@ -120,7 +120,7 @@ invoice with a second number. None of the three throws; all three corrupt the bo
       id: 'empty-final',
       title: 'An empty invoice cannot finalize',
       detail:
-        'Finalization looks at the line items before it locks anything: an invoice with none is **422** `invoice has no line items`, so a zero-total document is never issued. The draft finalizes it happily, which is how a “valid” invoice with a total of 0 reaches the ledger.',
+        'Finalization looks at the line items before it locks anything: an invoice with none is **422** `invoice has no line items`, so a zero-total document is never issued. The starter finalizes it happily, which is how a “valid” invoice with a total of 0 reaches the ledger.',
       match: {
         python: {
           all: [/len\(invoice\["line_items"\]\)\s*==\s*0/, /status_code\s*=\s*422/, /invoice has no line items/],
@@ -177,7 +177,7 @@ invoice with a second number. None of the three throws; all three corrupt the bo
   ],
   code: {
     python: {
-      starter: `"""api.py — a model-generated first draft of the invoice lifecycle."""
+      starter: `"""api.py — a first version of the invoice lifecycle."""
 import uuid
 
 from fastapi import FastAPI, Header
@@ -200,9 +200,9 @@ class InvoiceDraft(BaseModel):
     line_items: list[LineItem] = Field(default_factory=list)
 
 
-# TODO: this draft treats finalize as a label instead of a lock — an update still lands on a
+# TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
 # finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-# mints another invoice because Idempotency-Key is ignored. Review all three.
+# mints another invoice because Idempotency-Key is ignored. Fix all three.
 
 
 @app.post("/v1/invoices")
@@ -413,7 +413,7 @@ def finalize_invoice(
 `,
     },
     typescript: {
-      starter: `/** api.ts — a model-generated first draft of the invoice lifecycle. */
+      starter: `/** api.ts — a first version of the invoice lifecycle. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -438,9 +438,9 @@ interface Invoice {
 
 const drafts = new Map<string, Invoice>();
 
-// TODO: this draft treats finalize as a label instead of a lock — an update still lands on a
+// TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
 // finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-// mints another invoice because Idempotency-Key is ignored. Review all three.
+// mints another invoice because Idempotency-Key is ignored. Fix all three.
 
 app.post('/v1/invoices', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'] as string;
@@ -659,7 +659,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// api.go — a model-generated first draft of the invoice lifecycle.
+      starter: `// api.go — a first version of the invoice lifecycle.
 package main
 
 import (
@@ -694,9 +694,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 	json.NewEncoder(rw).Encode(body)
 }
 
-// TODO: this draft treats finalize as a label instead of a lock — an update still lands on a
+// TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
 // finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-// mints another invoice because Idempotency-Key is ignored. Review all three.
+// mints another invoice because Idempotency-Key is ignored. Fix all three.
 
 func createInvoice(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -1043,7 +1043,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `// Api.scala — a model-generated first draft of the invoice lifecycle.
+      starter: `// Api.scala — a first version of the invoice lifecycle.
 import java.util.UUID
 
 import org.apache.pekko.actor.ActorSystem
@@ -1078,9 +1078,9 @@ object InvoiceApi {
   def subtotalCents(lines: List[LineItem]): Long =
     lines.map(line => line.quantity.toLong * line.unit_price_cents).sum
 
-  // TODO: this draft treats finalize as a label instead of a lock — an update still lands on a
+  // TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
   // finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-  // mints another invoice because Idempotency-Key is ignored. Review all three.
+  // mints another invoice because Idempotency-Key is ignored. Fix all three.
 
   val routes: Route =
     path("v1" / "invoices") {
@@ -1280,7 +1280,7 @@ object InvoiceApi {
 `,
     },
     cpp: {
-      starter: `// api.cpp — a model-generated first draft of the invoice lifecycle.
+      starter: `// api.cpp — a first version of the invoice lifecycle.
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -1316,9 +1316,9 @@ int main() {
     res.set_content(invoice.dump(), "application/json");
   });
 
-  // TODO: this draft treats finalize as a label instead of a lock — an update still lands on a
+  // TODO: this starter treats finalize as a label instead of a lock — an update still lands on a
   // finalized invoice, an invoice with no line items finalizes with a zero total, and every retry
-  // mints another invoice because Idempotency-Key is ignored. Review all three.
+  // mints another invoice because Idempotency-Key is ignored. Fix all three.
 
   svr.Patch(R"(/v1/invoices/(\\d+))", [](const httplib::Request& req, httplib::Response& res) {
     const auto invoiceId = req.matches[1].str();

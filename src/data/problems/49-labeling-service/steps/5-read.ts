@@ -8,11 +8,11 @@ export const progressReadStep: Step = {
   focus: ['client', 'service', 'redis', 'quality'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the route is registered, the
+**Starting point.** The starter is working code: the route is registered, the
 task resolves, and for the one-annotator demo the numbers add up and the body looks complete. With a
 real team it is wrong in three ways — it hands every peer's submitted labels to everyone "so the team
 can align", it averages agreement over the whole annotator pool including the annotators quality
-review has flagged, and it reads labels straight off the mutable item records. Review it like the
+review has flagged, and it reads labels straight off the mutable item records. Debug it like the
 service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/tasks/{task_id}/progress\`:
@@ -47,15 +47,15 @@ Implement \`GET /v1/tasks/{task_id}/progress\`:
   \`agreement:{task_id}:{value}\` counters are the fast dashboard path and cannot be used here: a
   counter cannot be un-counted once quality review flags the annotator who moved it.
 
-**Failure mode the checks target.** Three boundaries in one read. Visibility: the draft lets a peer
+**Failure mode the checks target.** Three boundaries in one read. Visibility: the starter lets a peer
 read labels they have not answered yet, which is a copying channel and a poisoned metric, and the fix
 is a null for the peer, not an empty list. Fairness: filtering the flagged annotators out of the
 *display* while leaving them in the *denominator* makes the percentage move for reasons no client can
 see. Provenance: computing from item records ties the number to whatever the records currently say, and
 folding the consumer's live counters ties it to the flags that existed when the counter moved — a
 counter cannot be un-counted when quality review flags an annotator afterwards. The projection is the
-one input that is the same for every reader. The draft fails all three while looking finished, which
-is exactly the review a generated endpoint deserves.`,
+one input that is the same for every reader. The starter fails all three while looking finished, which
+is exactly why it needs debugging before it ships.`,
   sequence: {
     participants: ['Client', 'labeld', 'Redis', 'Events consumer'],
     messages: [
@@ -97,7 +97,7 @@ is exactly the review a generated endpoint deserves.`,
       id: 'route',
       title: 'Handles GET /v1/tasks/{id}/progress',
       detail:
-        'Register the progress read on `GET /v1/tasks/{task_id}/progress` with the task id taken from the path. The draft already does this — it is the one contract it keeps — so the failures that matter start below it: tenancy, visibility, fairness and provenance.',
+        'Register the progress read on `GET /v1/tasks/{task_id}/progress` with the task id taken from the path. The starter already does this — it is the one contract it keeps — so the failures that matter start below it: tenancy, visibility, fairness and provenance.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/tasks\/\{task_id\}\/progress["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/tasks\/:task_id\/progress['"]/]},
@@ -110,7 +110,7 @@ is exactly the review a generated endpoint deserves.`,
       id: 'hidden-until-submitted',
       title: 'Peer labels stay hidden until that peer submits',
       detail:
-        'A row carries `labels` only for the caller (from `X-Annotator-Id`) or for an annotator who has already submitted; a peer who has not gets `null`. The draft streams every submitted label to every annotator so they can "align", so a peer can read a label before answering that item and the agreement number is computed over answers that were copied.',
+        'A row carries `labels` only for the caller (from `X-Annotator-Id`) or for an annotator who has already submitted; a peer who has not gets `null`. The starter streams every submitted label to every annotator so they can "align", so a peer can read a label before answering that item and the agreement number is computed over answers that were copied.',
       match: {
         python: {all: [/X-Annotator-Id/, /def visible_labels\(/, /return None/]},
         typescript: {all: [/X-Annotator-Id/i, /function visibleLabels\(/, /return null/]},
@@ -123,7 +123,7 @@ is exactly the review a generated endpoint deserves.`,
       id: 'agreement-excludes-flagged',
       title: 'Agreement excludes annotators flagged by quality review',
       detail:
-        'Every annotator the math touches is checked with `SISMEMBER` against `flagged:{task_id}`, flagged annotators leave the agreement denominator, and their row is marked `excluded: true`. The draft averages over the raw annotator pool, so one reviewer quality review has already removed still moves the percentage for the whole task.',
+        'Every annotator the math touches is checked with `SISMEMBER` against `flagged:{task_id}`, flagged annotators leave the agreement denominator, and their row is marked `excluded: true`. The starter averages over the raw annotator pool, so one reviewer quality review has already removed still moves the percentage for the whole task.',
       match: {
         python: {all: [/sismember\(/, /f"flagged:\{task_id\}"/, /"excluded"/]},
         typescript: {all: [/sismember\(/, /`flagged:\$\{[\w]+\}`/, /excluded/]},
@@ -136,7 +136,7 @@ is exactly the review a generated endpoint deserves.`,
       id: 'metrics-from-events',
       title: 'The metrics rebuild from label.submitted events alone',
       detail:
-        '`rebuild_progress()` folds the task’s `label.submitted` records into completed, per-annotator and per-label metrics, and the endpoint serves that fold over the per-task projection `label.submitted:{task_id}` rather than over the item records or the consumer’s mutable counters. The draft reads labels off the mutable records, so its numbers depend on what those records happen to say and a replayed event changes nothing at all.',
+        '`rebuild_progress()` folds the task’s `label.submitted` records into completed, per-annotator and per-label metrics, and the endpoint serves that fold over the per-task projection `label.submitted:{task_id}` rather than over the item records or the consumer’s mutable counters. The starter reads labels off the mutable records, so its numbers depend on what those records happen to say and a replayed event changes nothing at all.',
       match: {
         python: {all: [/def rebuild_progress\(/, /lrange\(/, /f"label\.submitted:\{task_id\}"/]},
         typescript: {all: [/function rebuildProgress\(/, /lrange\(/, /`label\.submitted:\$\{[\w]+\}`/]},
@@ -149,7 +149,7 @@ is exactly the review a generated endpoint deserves.`,
       id: 'progress-shape',
       title: 'Reports completion and per-label agreement',
       detail:
-        'The 200 body carries `task_id`, `completed`, `total`, one `annotators` row per annotator with `annotator`/`submitted`/`excluded`/`labels`, and an `agreement` block per label with `annotated` and `percent_agreement`. The draft has no `excluded` flag and reports a bare `percent`, so a client cannot tell a dropped annotator from a counted one and cannot reconcile the percentage against the roster.',
+        'The 200 body carries `task_id`, `completed`, `total`, one `annotators` row per annotator with `annotator`/`submitted`/`excluded`/`labels`, and an `agreement` block per label with `annotated` and `percent_agreement`. The starter has no `excluded` flag and reports a bare `percent`, so a client cannot tell a dropped annotator from a counted one and cannot reconcile the percentage against the roster.',
       match: {
         python: {
           all: [
@@ -181,7 +181,7 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 @app.get("/v1/tasks/{task_id}/progress")
 def progress(task_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft streams every submitted label to every annotator on the task so they can
+    # TODO: this starter streams every submitted label to every annotator on the task so they can
     # "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
     # and reads labels straight from the item records instead of the event projection. Hide a peer's
     # labels until that peer submits, consult SISMEMBER on flagged:{task_id}, and serve the metrics
@@ -322,7 +322,7 @@ def progress(
 `,
     },
     typescript: {
-      starter: `/** A model-generated progress read: every submitted label, for everyone who asks. */
+      starter: `/** A progress read: every submitted label, for everyone who asks. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 
@@ -330,7 +330,7 @@ export const app = Fastify();
 const r = new Redis('redis://redis:6379');
 
 app.get('/v1/tasks/:task_id/progress', async (request, reply) => {
-  // TODO: this draft streams every submitted label to every annotator on the task so they can
+  // TODO: this starter streams every submitted label to every annotator on the task so they can
   // "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
   // and reads labels straight from the item records instead of the event projection. Hide a peer's
   // labels until that peer submits, consult SISMEMBER on flagged:{task_id}, and serve the metrics
@@ -494,7 +494,7 @@ func progress(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	taskID := r.PathValue("task_id")
-	// TODO: this draft streams every submitted label to every annotator on the task so they can
+	// TODO: this starter streams every submitted label to every annotator on the task so they can
 	// "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
 	// and reads labels straight from the item records instead of the event projection. Hide a peer's
 	// labels until that peer submits, consult SIsMember on flagged:{task_id}, and serve the metrics
@@ -782,7 +782,7 @@ object ProgressApi {
     path("v1" / "tasks" / Segment / "progress") { taskId =>
       get {
         headerValueByName("X-Tenant-Id") { _ =>
-          // TODO: this draft streams every submitted label to every annotator on the task so they
+          // TODO: this starter streams every submitted label to every annotator on the task so they
           // can "align", counts agreement over the unfiltered annotator pool (flagged annotators
           // included), and reads labels straight from the item records instead of the event
           // projection. Hide a peer's labels until that peer submits, drop the annotators that
@@ -977,7 +977,7 @@ int main() {
       return;
     }
     const std::string task_id = req.matches[1];
-    // TODO: this draft streams every submitted label to every annotator on the task so they can
+    // TODO: this starter streams every submitted label to every annotator on the task so they can
     // "align", counts agreement over the unfiltered annotator pool (flagged annotators included),
     // and reads labels straight from the item records instead of the event projection. Hide a
     // peer's labels until that peer submits, drop the annotators SISMEMBER reports on
@@ -1188,7 +1188,7 @@ and a shared label turns the queue into a copying exercise that quietly poisons 
 the endpoint exists to report. Fairness is the second: quality review's \`flagged:{task_id}\` veto has
 to reach the denominator, not just the display, or an annotator who cannot do the task drags the
 percentage for everyone else, and \`excluded: true\` is what keeps that removal auditable. Provenance
-is the third and the one reviewers miss: metrics computed from mutable item records change with the
+is the third and the one candidates miss: metrics computed from mutable item records change with the
 in-flight state of the queue, and the consumer's \`agreement:{task_id}:{value}\` counters freeze in the
 flags that existed when they were incremented — a counter cannot be un-counted when quality review
 flags an annotator later. A pure fold over the per-task \`label.submitted\` projection is the same for

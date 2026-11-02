@@ -7,13 +7,13 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Browser agent on the AI-era track: the course is not "click a button from a script", it is the
- * review you owe a model-generated browser driver before it points a real browser at a real page
- * with a real tenant's credentials. A session started with a policy and a budget instead of a URL →
- * Redis state with a step lease and a TTL so a crashed driver's session is reusable → driver calls
- * with a deadline that never replay a side effect → session-keyed, redacted step events whose trace
- * is appended before the offset commits → a replay that pages the trace, scopes it to the tenant and
- * hands out only an expiring screenshot reference.
+ * Browser agent: the course is not "click a button from a script", it is the debugging you owe a
+ * browser driver before it points a real browser at a real page with a real tenant's credentials.
+ * A session started with a policy and a budget instead of a URL → Redis state with a step lease
+ * and a TTL so a crashed driver's session is reusable → driver calls with a deadline that never
+ * replay a side effect → session-keyed, redacted step events whose trace is appended before the
+ * offset commits → a replay that pages the trace, scopes it to the tenant and hands out only an
+ * expiring screenshot reference.
  */
 export const browserAgentProblem: Problem = {
   id: 'browser-agent',
@@ -21,7 +21,7 @@ export const browserAgentProblem: Problem = {
   tagline: 'Drive real browsers through scripts with bounded steps, resumable sessions and safe egress.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Browser Agent
 
@@ -75,12 +75,12 @@ One service, **browserd**, with five pieces:
    Redis hash the worker writes, and a screenshot reference that expires within 15 minutes — with a
    foreign session answered exactly like a missing one.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real agent feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

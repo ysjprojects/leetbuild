@@ -8,10 +8,9 @@ export const dependencyStep: Step = {
   focus: ['registry', 'validator', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the validator client: it
+**Starting point.** The starter is working code for the validator client: it
 calls the validator, reads the result and promotes on a pass. It compiles, it passes the demo
-because the validator is fast and the object is small, and it hides three production flaws. Review
-it like the owner of the gate in front of every promotion.
+because the validator is fast and the object is small, and it hides three production flaws. Debug it like the owner of the gate in front of every promotion.
 
 Implement \`POST /v1/datasets/{dataset}/versions/{version}/validate\`.
 
@@ -19,13 +18,13 @@ Implement \`POST /v1/datasets/{dataset}/versions/{version}/validate\`.
   timeout, \`withDeadlineAfter\`, \`set_deadline\`. Without it a stuck validator holds the request
   open and the candidate is never decided.
 - A **timeout never promotes.** On \`DEADLINE_EXCEEDED\` mark the candidate \`pending\`, keep the
-  previous version as latest, and answer \`202\`. The draft promotes on timeout, so unvalidated data
+  previous version as latest, and answer \`202\`. The starter promotes on timeout, so unvalidated data
   reaches training under a clean version name.
 - The report must say **how much of the object was covered**: \`rows_scanned\` and \`rows_total\`, or
   an explicit coverage figure. A check that only ever inspected the first 1000 rows is not a check
   of the dataset, and the caller has to be able to see that.
 - Review comments **create a new candidate version** (\`next_candidate_version\` → \`-r2\`, \`-r3\`, …)
-  through \`rework_candidate\`. The draft edits the reviewed candidate in place, so the artifact the
+  through \`rework_candidate\`. The starter edits the reviewed candidate in place, so the artifact the
   reviewer approved is not the artifact that gets promoted.
 
 **Failure mode the checks target.** A deadline that promotes on expiry is worse than no deadline:
@@ -64,7 +63,7 @@ actually passed.`,
       id: 'deadline',
       title: 'The validator call has a 30-second deadline',
       detail:
-        'The call is created with a 30 000 ms deadline (`VALIDATION_DEADLINE_S`, `validationDeadline`, `ValidationDeadlineSeconds`, `kValidationDeadlineSeconds`). The draft calls the validator with no deadline at all.',
+        'The call is created with a 30 000 ms deadline (`VALIDATION_DEADLINE_S`, `validationDeadline`, `ValidationDeadlineSeconds`, `kValidationDeadlineSeconds`). The starter calls the validator with no deadline at all.',
       match: {
         python: {all: [/VALIDATION_DEADLINE_S\s*=\s*30/, /timeout=VALIDATION_DEADLINE_S/]},
         typescript: {all: [/VALIDATION_DEADLINE_S\s*=\s*30/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -77,7 +76,7 @@ actually passed.`,
       id: 'timeout-no-promote',
       title: 'A timeout marks the candidate pending and holds the previous version',
       detail:
-        '`DEADLINE_EXCEEDED` raises a timeout error, the candidate is marked pending and the previous version stays latest. The draft promotes on timeout, so unvalidated bytes reach training.',
+        '`DEADLINE_EXCEEDED` raises a timeout error, the candidate is marked pending and the previous version stays latest. The starter promotes on timeout, so unvalidated bytes reach training.',
       match: {
         python: {all: [/ValidationTimedOut/, /pending/]},
         typescript: {all: [/ValidationTimedOut/, /pending/]},
@@ -90,7 +89,7 @@ actually passed.`,
       id: 'coverage',
       title: 'Validation reports its coverage of the object',
       detail:
-        'The report carries `rows_scanned` and `rows_total` (or an explicit coverage), so a partial scan is visible instead of implied. The draft samples a 1000-row prefix and reports it as a pass.',
+        'The report carries `rows_scanned` and `rows_total` (or an explicit coverage), so a partial scan is visible instead of implied. The starter samples a 1000-row prefix and reports it as a pass.',
       match: {
         python: {all: [/rows_scanned/, /rows_total/]},
         typescript: {all: [/rowsScanned/, /rowsTotal/]},
@@ -157,8 +156,8 @@ channel = grpc.insecure_channel("validator:50051")
 
 
 def validate_candidate(stub, candidate: Candidate) -> dict:
-    # TODO: this draft promotes on timeout, validates only the first 1000 rows, and mutates a
-    # candidate in place after review comments. Review all three.
+    # TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
+    # candidate in place after review comments. Fix all three.
     request = registry_pb2.ValidateRequest(
         dataset=candidate.dataset, version=candidate.version, limit=VALIDATOR_SAMPLE_ROWS
     )
@@ -187,7 +186,7 @@ def validate(
 
 
 def apply_review(candidate: Candidate, comments: str) -> Candidate:
-    """The draft edits the reviewed candidate in place."""
+    """The starter edits the reviewed candidate in place."""
     candidate.notes = comments
     return candidate
 `,
@@ -302,7 +301,7 @@ def rework_candidate(candidate: Candidate, comments: str) -> Candidate:
 `,
     },
     typescript: {
-      starter: `/** Validator client: a model-generated draft. */
+      starter: `/** Validator client: flawed code. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import Fastify from 'fastify';
@@ -335,8 +334,8 @@ interface Candidate {
 const stub = new registry.registry.ValidatorClient('validator:50051', grpc.credentials.createInsecure());
 
 function validateCandidate(candidate: Candidate): Promise<{checked: number; passed: boolean}> {
-  // TODO: this draft promotes on timeout, validates only the first 1000 rows, and mutates a
-  // candidate in place after review comments. Review all three.
+  // TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
+  // candidate in place after review comments. Fix all three.
   const {promise, resolve, reject} = Promise.withResolvers<{checked: number; passed: boolean}>();
   stub.Validate(
     {dataset: candidate.dataset, version: candidate.version, limit: VALIDATOR_SAMPLE_ROWS},
@@ -362,7 +361,7 @@ app.post('/v1/datasets/:dataset/versions/:version/validate', async (request, rep
 });
 
 function applyReview(candidate: Candidate, comments: string): Candidate {
-  // The draft edits the reviewed candidate in place.
+  // The starter edits the reviewed candidate in place.
   candidate.notes = comments;
   return candidate;
 }
@@ -507,8 +506,8 @@ type ValidationReport struct {
 }
 
 func validateCandidate(ctx context.Context, client registrypb.ValidatorClient, candidate Candidate) (ValidationReport, error) {
-	// TODO: this draft promotes on timeout, validates only the first 1000 rows, and mutates a
-	// candidate in place after review comments. Review all three.
+	// TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
+	// candidate in place after review comments. Fix all three.
 	response, err := client.Validate(ctx, &registrypb.ValidateRequest{
 		Dataset: candidate.Dataset,
 		Version: candidate.Version,
@@ -709,8 +708,8 @@ object Client {
   )
 
   def validateCandidate(candidate: Candidate): ValidationReport = {
-    // TODO: this draft promotes on timeout, validates only the first 1000 rows, and mutates a
-    // candidate in place after review comments. Review all three.
+    // TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
+    // candidate in place after review comments. Fix all three.
     val response = stub.validate(ValidateRequest(candidate.dataset, candidate.version, SampleRows))
     ValidationReport(SampleRows, response.passed)
   }
@@ -849,8 +848,8 @@ struct ValidationReport {
 
 static ValidationReport validateCandidate(Registry::Validator::Stub& stub, const std::string& dataset,
                                           const std::string& version) {
-  // TODO: this draft promotes on timeout, validates only the first 1000 rows, and mutates a
-  // candidate in place after review comments. Review all three.
+  // TODO: this starter promotes on timeout, validates only the first 1000 rows, and mutates a
+  // candidate in place after review comments. Fix all three.
   ValidateRequest request;
   request.set_dataset(dataset);
   request.set_version(version);
@@ -997,5 +996,5 @@ int main() {
     'On `DEADLINE_EXCEEDED` the candidate is `pending` and the previous version is still latest: return 202 with the held version. Promoting on timeout turns "I do not know" into "validated" — exactly the failure this gate exists to prevent.',
     'A report without `rows_scanned`/`rows_total` hides a prefix scan. And review comments are a new artifact: `rework_candidate` derives `-r2`; editing the reviewed candidate in place means the approved bytes are not the promoted bytes.',
   ],
-  debrief: `The interviewer is testing the gate in front of a promotion, not the gRPC call itself. The draft looks right because the validator is fast, the object is small and nobody has left review comments yet. Three defects are checked: a missing deadline, a timeout that promotes, and a report with no coverage — a 1000-row sample presented as a pass. The fourth idea is version identity: review feedback has to create a new candidate, because a version name that can be edited after approval cannot be relied on by anyone downstream. Real registries add schema conformance and license compatibility to the same report, cache the report by (content hash, validator version), and require the validator's own version in the promotion record so a validator upgrade can invalidate old passes.`,
+  debrief: `The interviewer is testing the gate in front of a promotion, not the gRPC call itself. The starter looks right because the validator is fast, the object is small and nobody has left review comments yet. Three defects are checked: a missing deadline, a timeout that promotes, and a report with no coverage — a 1000-row sample presented as a pass. The fourth idea is version identity: review feedback has to create a new candidate, because a version name that can be edited after approval cannot be relied on by anyone downstream. Real registries add schema conformance and license compatibility to the same report, cache the report by (content hash, validator version), and require the validator's own version in the promotion record so a validator upgrade can invalidate old passes.`,
 };

@@ -8,20 +8,20 @@ export const readRedactionStep: Step = {
   focus: ['client', 'redactor', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the endpoint returns what it
+**Starting point.** The starter is working code: the endpoint returns what it
 stored, it is fast, and the demo always asks for its own document. It hides two flaws — one that
 leaks across tenants, and one that quietly turns the audit endpoint back into a copy of the data.
-Review it, fix it, and prove the fix.
+Debug it, fix it, and prove the fix.
 
 Implement \`GET /v1/documents/{document_id}/redaction\`:
 
 - The tenant comes from \`X-Tenant-Id\` (**401** when absent) and the lookup is scoped by it:
-  \`WHERE id = $1 AND tenant_id = $2\`. The draft resolves by document id alone, so any tenant can
+  \`WHERE id = $1 AND tenant_id = $2\`. The starter resolves by document id alone, so any tenant can
   read any document's redaction record.
 - A missing **or foreign** document is **404**, never 403: a 403 confirms the document exists, which
   is itself information the caller is not entitled to. One code for both cases.
 - The response is \`{"document_id", "spans", "entity_types", "pattern_version", "redacted_length"}\`
-  and **no text field of any kind** — not the original, not even the stored redacted text. The draft
+  and **no text field of any kind** — not the original, not even the stored redacted text. The starter
   returns \`redacted_text\` "for convenience"; the audit endpoint must not become a second copy of
   what redaction produced.
 - Each span is \`{start, end, entity, replacement}\` and the response carries
@@ -69,7 +69,7 @@ projection of the same fact.`,
       id: 'tenant-scope',
       title: 'Scopes the lookup by id and tenant',
       detail:
-        '`WHERE id = $1 AND tenant_id = $2`: the document id alone is an IDOR. The draft looks up by id only, so any tenant reads any document’s redaction record.',
+        '`WHERE id = $1 AND tenant_id = $2`: the document id alone is an IDOR. The starter looks up by id only, so any tenant reads any document’s redaction record.',
       match: {
         python: {all: [/WHERE id = %s AND tenant_id = %s/]},
         typescript: {all: [/WHERE id = \$1 AND tenant_id = \$2/]},
@@ -82,7 +82,7 @@ projection of the same fact.`,
       id: 'no-text',
       title: 'The response never contains text',
       detail:
-        '`spans`, `entity_types`, `pattern_version` and `redacted_length` are in; `text`, `original`, `redacted_text` and any sampled values are out. The draft returns `redacted_text` for convenience.',
+        '`spans`, `entity_types`, `pattern_version` and `redacted_length` are in; `text`, `original`, `redacted_text` and any sampled values are out. The starter returns `redacted_text` for convenience.',
       match: {
         python: {
           all: [/"spans"/, /entity_types/, /pattern_version/],
@@ -110,7 +110,7 @@ projection of the same fact.`,
       id: 'not-found',
       title: 'Missing or foreign documents are 404',
       detail:
-        'A row that does not exist and a row owned by another tenant both answer **404**. A 403 would confirm the document exists; the draft answers 200 with an empty record instead.',
+        'A row that does not exist and a row owned by another tenant both answer **404**. A 403 would confirm the document exists; the starter answers 200 with an empty record instead.',
       match: {
         python: {all: [/status_code\s*=\s*404/], none: [/status_code\s*=\s*403/]},
         typescript: {all: [/code\(\s*404\s*\)/], none: [/code\(\s*403\s*\)/]},
@@ -143,7 +143,7 @@ app = FastAPI()
 
 @app.get("/v1/documents/{document_id}/redaction")
 def read_redaction(document_id: str, cur=None) -> JSONResponse:
-    # TODO: this draft returns the redacted text for convenience and resolves the document by id
+    # TODO: this starter returns the redacted text for convenience and resolves the document by id
     # alone, so any tenant can read any document. Return spans only and scope the query.
     cur.execute("SELECT redacted_text FROM redactions WHERE id = %s", (document_id,))
     row = cur.fetchone()
@@ -199,13 +199,13 @@ def read_redaction(
 `,
     },
     typescript: {
-      starter: `/** A model-generated audit read that returns the redacted text and skips the tenant check. */
+      starter: `/** A audit read that returns the redacted text and skips the tenant check. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
 
 app.get('/v1/documents/:document_id/redaction', async (request, reply) => {
-  // TODO: this draft returns the redacted text for convenience and resolves the document by id
+  // TODO: this starter returns the redacted text for convenience and resolves the document by id
   // alone, so any tenant can read any document. Return spans only and scope the query.
   const {document_id} = request.params as {document_id: string};
   const {rows} = await db.query('SELECT redacted_text FROM redactions WHERE id = $1', [document_id]);
@@ -263,7 +263,7 @@ import (
 
 func readRedaction(rw http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("document_id")
-	// TODO: this draft returns the redacted text for convenience and resolves the document by id
+	// TODO: this starter returns the redacted text for convenience and resolves the document by id
 	// alone, so any tenant can read any document. Return spans only and scope the query.
 	var redacted string
 	err := db.QueryRowContext(r.Context(), "SELECT redacted_text FROM redactions WHERE id = $1", documentID).Scan(&redacted)
@@ -360,7 +360,7 @@ object AuditApi {
   val route: Route =
     path("v1" / "documents" / Segment / "redaction") { documentId =>
       get {
-        // TODO: this draft returns the redacted text for convenience and resolves the document by
+        // TODO: this starter returns the redacted text for convenience and resolves the document by
         // id alone, so any tenant can read any document. Return spans only and scope the query.
         val redacted = db.lookupRedactedText(documentId).getOrElse("")
         complete(StatusCodes.OK, s"""{"document_id":"$documentId","redacted_text":"$redacted"}""")
@@ -453,7 +453,7 @@ int main() {
 
   svr.Get(R"(/v1/documents/([\\w-]+)/redaction)", [](const httplib::Request& req, httplib::Response& res) {
     const std::string document_id = req.matches[1];
-    // TODO: this draft returns the redacted text for convenience and resolves the document by id
+    // TODO: this starter returns the redacted text for convenience and resolves the document by id
     // alone, so any tenant can read any document. Return spans only and scope the query.
     const std::string redacted = lookup_redacted_text(document_id);
     res.status = 200;

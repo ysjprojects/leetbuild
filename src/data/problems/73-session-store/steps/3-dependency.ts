@@ -8,9 +8,10 @@ export const dependencyStep: Step = {
   focus: ['api', 'auth'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the auth service to validate a
-token and caches the answer so every request does not pay a round trip. It compiles, it serves the demo, and it
-hides four production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code: it calls the auth service to validate a
+token and caches the answer so every request does not pay a round trip. It compiles, it serves the
+demo, and it hides four production flaws. Debug it like the service owner, fix it, and prove the fix
+with the checks below.
 
 Implement \`validate(token)\` against the auth service's gRPC \`Validate\` method.
 
@@ -18,14 +19,14 @@ Implement \`validate(token)\` against the auth service's gRPC \`Validate\` metho
   hold the request open.
 - **Short positive cache.** A successful validation may be cached, but only for \`CACHE_TTL_S\` = **30 seconds**,
   so a revocation is visible inside the window.
-- **Fail closed.** A timeout or an unavailable auth service **denies** the request; the draft's habit of
+- **Fail closed.** A timeout or an unavailable auth service **denies** the request; the starter's habit of
   returning the last known claims on failure is exactly how a revoked session keeps working during an outage.
 - **Revocation reaches the cache.** \`revoke(token)\` drops the cached entry immediately, so the next request
   re-validates rather than trusting the copy.
 - **Rejections are terminal.** \`UNAUTHENTICATED\` and \`PERMISSION_DENIED\` are never retried; only a transient
   failure may be retried, and even then the deadline still applies.
 
-**Failure mode the checks target.** The draft caches a validation for an hour and, when the auth service is down,
+**Failure mode the checks target.** The starter caches a validation for an hour and, when the auth service is down,
 answers from that cache — so a token revoked ten minutes ago still authenticates. It has no deadline, so a slow
 auth service becomes a slow session layer. And it retries a rejection three times, turning a correct "no" into
 load on a service that already said no.`,
@@ -41,7 +42,7 @@ load on a service that already said no.`,
     ],
   },
   hints: [
-    'What should a request do when the auth service cannot answer? The draft answers with the last copy it saw — say out loud why that is a revocation bypass.',
+    'What should a request do when the auth service cannot answer? The starter answers with the last copy it saw — say out loud why that is a revocation bypass.',
     'A cache is only as safe as its window. How long may a validated token stay trusted after the auth service has already revoked it?',
     'Not every gRPC status is retryable. Which two mean "the caller is wrong" and must end the request on the first answer?',
   ],
@@ -50,7 +51,7 @@ load on a service that already said no.`,
       id: 'deadline',
       title: 'Sets a 150 ms deadline on every validation',
       detail:
-        'Each `Validate` call carries `DEADLINE_MS` = 150, so a slow auth service cannot hold a session request open. The draft calls the stub with a 5-second timeout and no deadline constant.',
+        'Each `Validate` call carries `DEADLINE_MS` = 150, so a slow auth service cannot hold a session request open. The starter calls the stub with a 5-second timeout and no deadline constant.',
       match: {
         python: {all: [/DEADLINE_MS/, /timeout\s*=/]},
         typescript: {all: [/DEADLINE_MS/, /deadline\s*:/]},
@@ -63,7 +64,7 @@ load on a service that already said no.`,
       id: 'short-cache',
       title: 'Caches a positive validation for 30 seconds',
       detail:
-        'A hit is served from `cache` only within `CACHE_TTL_S` = 30 seconds. The draft caches for an hour, so a revocation takes an hour to be seen.',
+        'A hit is served from `cache` only within `CACHE_TTL_S` = 30 seconds. The starter caches for an hour, so a revocation takes an hour to be seen.',
       match: {
         python: {all: [/CACHE_TTL_S\s*=\s*30/, /cache\.get\(/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*30/, /cache\.get\(/]},
@@ -76,7 +77,7 @@ load on a service that already said no.`,
       id: 'fail-closed',
       title: 'Denies the request when the auth service times out',
       detail:
-        'A deadline miss or an unavailable auth service denies the request instead of returning stale claims. The draft returns the cached copy — fail open.',
+        'A deadline miss or an unavailable auth service denies the request instead of returning stale claims. The starter returns the cached copy — fail open.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/, /return None/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /return null/]},
@@ -89,7 +90,7 @@ load on a service that already said no.`,
       id: 'revoke-visible',
       title: 'Drops the cached entry on revocation',
       detail:
-        '`revoke(token)` deletes the cache entry, so the next request re-validates. The draft’s revoke never touches the cache, so a revoked token keeps validating until the TTL ends.',
+        '`revoke(token)` deletes the cache entry, so the next request re-validates. The starter’s revoke never touches the cache, so a revoked token keeps validating until the TTL ends.',
       match: {
         python: {all: [/def revoke\(/, /cache\.pop\(/]},
         typescript: {all: [/function revoke\(/, /cache\.delete\(/]},
@@ -102,7 +103,7 @@ load on a service that already said no.`,
       id: 'terminal-reject',
       title: 'Treats a rejection as terminal',
       detail:
-        '`UNAUTHENTICATED` and `PERMISSION_DENIED` are classified as terminal and never retried. The draft retries every status three times.',
+        '`UNAUTHENTICATED` and `PERMISSION_DENIED` are classified as terminal and never retried. The starter retries every status three times.',
       match: {
         python: {all: [/TERMINAL_CODES/, /PERMISSION_DENIED/]},
         typescript: {all: [/TERMINAL_CODES/, /PERMISSION_DENIED/]},
@@ -559,5 +560,5 @@ void revoke(const std::string& token) {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated dependency for the failure modes that matter when the dependency is unavailable. Four defects are being checked: a long cache window means a revocation is not seen until the window ends; a missing deadline turns a slow auth service into a slow session layer; failing open on a timeout returns the exact stale claims a revoker was trying to invalidate; and retrying a rejection multiplies a correct "no" into load. The habits to name out loud are: bound every remote call with a deadline, keep the trust window short and invalidate it on the event that matters, deny when you cannot verify, and never retry a decision the server has already made. Real services add a negative cache with a very short TTL, a circuit breaker on the auth path, and a metric on cache hit rate next to one on revocation-to-invalidation latency.`,
+  debrief: `The interviewer is testing whether you can debug a dependency call for the failure modes that matter when the dependency is unavailable. Four defects are being checked: a long cache window means a revocation is not seen until the window ends; a missing deadline turns a slow auth service into a slow session layer; failing open on a timeout returns the exact stale claims a revoker was trying to invalidate; and retrying a rejection multiplies a correct "no" into load. The habits to name out loud are: bound every remote call with a deadline, keep the trust window short and invalidate it on the event that matters, deny when you cannot verify, and never retry a decision the server has already made. Real services add a negative cache with a very short TTL, a circuit breaker on the auth path, and a metric on cache hit rate next to one on revocation-to-invalidation latency.`,
 };

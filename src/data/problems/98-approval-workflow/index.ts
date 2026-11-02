@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Approval workflow on the AI-era track: the course is not "record a yes in a database", it is the
- * review you owe a model-generated approval service before it signs off on spend. A submit that
- * resolves approvers from the pinned policy instead of the caller → one Redis compare-and-swap per
- * decision, with no TTL on a chain that waits weeks → an eligibility gate over gRPC that denies
- * when it cannot verify → request-keyed approval events published after the state commit → a trail
- * that reports every step, its own state, skips and delegations.
+ * Approval workflow: the course is not "record a yes in a database", it is the debugging you owe an
+ * approval service before it signs off on spend. A submit that resolves approvers from the pinned
+ * policy instead of the caller → one Redis compare-and-swap per decision, with no TTL on a chain
+ * that waits weeks → an eligibility gate over gRPC that denies when it cannot verify →
+ * request-keyed approval events published after the state commit → a trail that reports every
+ * step, its own state, skips and delegations.
  */
 export const approvalWorkflowProblem: Problem = {
   id: 'approval-workflow',
@@ -20,7 +20,6 @@ export const approvalWorkflowProblem: Problem = {
   tagline: 'Chained approvals with eligibility checks, atomic states and no self-approval.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Approval Workflow
 
@@ -64,12 +63,12 @@ One service, **approvals**, with five pieces:
 5. \`GET /v1/requests/{id}\`: the pinned chain with every step's own state, the skipped steps with
    their reasons, the delegations, and a 404 for a request that belongs to another tenant.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

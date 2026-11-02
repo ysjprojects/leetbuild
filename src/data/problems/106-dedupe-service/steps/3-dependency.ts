@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'similarity', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the similarity client. It
-compiles, it works when the similarity service is healthy, and it hides three production flaws.
-Review it like the on-call engineer, fix it, and prove the fix with the checks below.
+**Starting point.** The starter is working code for the similarity client. It compiles, it works
+when the similarity service is healthy, and it hides three production flaws. Debug it like the
+on-call engineer, fix it, and prove the fix with the checks below.
 
 Implement the fuzzy-resolution client that the check endpoint calls.
 
@@ -23,7 +23,7 @@ Implement the fuzzy-resolution client that the check endpoint calls.
 - **No retries inside the request path**: a retry doubles the caller's latency and hides the failure
   from the operator. Retries belong in a background job, not in a synchronous check.
 
-**Failure mode the checks target.** The draft waits without a deadline, retries a timeout inside the
+**Failure mode the checks target.** The starter waits without a deadline, retries a timeout inside the
 request, and treats the timeout as "not a duplicate" — so a real duplicate slips through silently and
 the caller believes the fuzzy comparison ran.`,
   sequence: {
@@ -59,7 +59,7 @@ the caller believes the fuzzy comparison ran.`,
       id: 'deadline',
       title: 'Sets a 200 ms deadline on the call',
       detail:
-        'The call carries a 200 ms deadline so a slow similarity service cannot hold the request open. The draft waits without a deadline.',
+        'The call carries a 200 ms deadline so a slow similarity service cannot hold the request open. The starter waits without a deadline.',
       match: {
         python: {all: [/SIMILARITY_DEADLINE_MS/, /timeout\s*=/]},
         typescript: {all: [/SIMILARITY_DEADLINE_MS/, /deadline/]},
@@ -72,7 +72,7 @@ the caller believes the fuzzy comparison ran.`,
       id: 'degrade',
       title: 'Degrades a timeout to exact-only',
       detail:
-        'A timeout or unavailable similarity service is caught and answered with an exact-only result carrying the marker, not raised and not treated as a miss. The draft returns "no match" without the marker.',
+        'A timeout or unavailable similarity service is caught and answered with an exact-only result carrying the marker, not raised and not treated as a miss. The starter returns "no match" without the marker.',
       match: {
         python: {all: [/grpc\.RpcError/, /exact_only/]},
         typescript: {all: [/DEADLINE_EXCEEDED|UNAVAILABLE/, /exact_only/]},
@@ -85,7 +85,7 @@ the caller believes the fuzzy comparison ran.`,
       id: 'marker',
       title: 'Marks the degraded result exact-only',
       detail:
-        'The degraded response sets the `exact_only` marker true, so the caller knows the fuzzy comparison did not run. The draft answers with a bare "no match".',
+        'The degraded response sets the `exact_only` marker true, so the caller knows the fuzzy comparison did not run. The starter answers with a bare "no match".',
       match: {
         python: {all: [/"exact_only"\s*:\s*True/]},
         typescript: {all: [/exact_only\s*:\s*true/]},
@@ -98,7 +98,7 @@ the caller believes the fuzzy comparison ran.`,
       id: 'no-retry',
       title: 'Keeps retries out of the request path',
       detail:
-        "The client does not retry a timeout inside the synchronous check: a retry doubles the caller's latency and hides the failure. The draft loops up to three attempts inside the request.",
+        "The client does not retry a timeout inside the synchronous check: a retry doubles the caller's latency and hides the failure. The starter loops up to three attempts inside the request.",
       match: {
         python: {none: [/for\s+attempt\s+in\s+range\(/]},
         typescript: {none: [/for\s*\(\s*let\s+attempt/]},
@@ -118,8 +118,8 @@ class SimilarityClient:
         self.stub = similarity_pb2_grpc.SimilarityStub(channel)
 
     def resolve(self, scope: str, candidate: dict) -> dict:
-        # TODO: this draft waits without a deadline, retries a timeout inside the request, and treats a
-        # timeout as "not a duplicate" without marking the result exact-only. Review all three.
+        # TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
+        # timeout as "not a duplicate" without marking the result exact-only. Fix all three.
         request = similarity_pb2.ResolveRequest(scope=scope, keys=candidate["keys"], fuzzy=candidate["fuzzy"])
         for attempt in range(3):
             try:
@@ -166,8 +166,8 @@ interface Candidate {
 }
 
 async function resolve(scope: string, candidate: Candidate): Promise<{match: unknown}> {
-  // TODO: this draft waits without a deadline, retries a timeout inside the request, and treats a
-  // timeout as "not a duplicate" without marking the result exact-only. Review all three.
+  // TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
+  // timeout as "not a duplicate" without marking the result exact-only. Fix all three.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const reply = await new Promise<{record_id: string; score: number}>((accept, reject) =>
@@ -241,8 +241,8 @@ type SimilarityClient struct {
 }
 
 func (c *SimilarityClient) Resolve(ctx context.Context, scope string, candidate Candidate) (map[string]any, error) {
-	// TODO: this draft waits without a deadline, retries a timeout inside the request, and treats a
-	// timeout as "not a duplicate" without marking the result exact-only. Review all three.
+	// TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
+	// timeout as "not a duplicate" without marking the result exact-only. Fix all three.
 	for attempt := 0; attempt < 3; attempt++ {
 		reply, err := c.client.Resolve(ctx, &ResolveRequest{Scope: scope, Keys: candidate.Keys, Fuzzy: candidate.Fuzzy})
 		if err == nil {
@@ -295,8 +295,8 @@ final case class Resolution(matchResult: Option[Hit], exact_only: Boolean)
 
 class SimilarityClient(stub: SimilarityGrpc.SimilarityStub)(implicit ec: ExecutionContext) {
   def resolve(scope: String, candidate: Candidate): Future[Resolution] = {
-    // TODO: this draft waits without a deadline, retries a timeout inside the request, and treats a
-    // timeout as "not a duplicate" without marking the result exact-only. Review all three.
+    // TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
+    // timeout as "not a duplicate" without marking the result exact-only. Fix all three.
     var attempt = 0
     while (attempt < 3) {
       try {
@@ -363,8 +363,8 @@ class SimilarityClient {
       : stub_(Similarity::NewStub(channel)) {}
 
   json resolve(const std::string& scope, const Candidate& candidate) {
-    // TODO: this draft waits without a deadline, retries a timeout inside the request, and treats a
-    // timeout as "not a duplicate" without marking the result exact-only. Review all three.
+    // TODO: this starter waits without a deadline, retries a timeout inside the request, and treats a
+    // timeout as "not a duplicate" without marking the result exact-only. Fix all three.
     ResolveRequest request;
     request.set_scope(scope);
     request.set_fuzzy(candidate.fuzzy);
@@ -434,5 +434,5 @@ class SimilarityClient {
     "Degrade, don't fail: a similarity timeout returns an exact-only result carrying the `exact_only` marker, so the check still answers and the caller knows the fuzzy pass did not run. A timeout is neither a duplicate nor a miss — it is a downgrade.",
     'The marker is the contract. A degraded result must never claim thoroughness; if the response says `exact_only: false` after a timeout, the caller merges on a comparison that never happened.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated client at the failure boundary. Three defects are being checked: the deadline (waiting without one lets a slow dependency hold the request open), the retry loop (it doubles latency and hides the failure), and the silent degradation (a timeout reported as "no match" is a real duplicate slipping through). The subtle part is the marker: degrading without saying so is worse than failing loudly, because the caller cannot tell a thorough check from a downgraded one. Real clients add a per-call deadline that is shorter than the request budget, a circuit breaker around the dependency, and metrics that count degraded checks so the similarity service's health is visible.`,
+  debrief: `The interviewer is testing whether you can debug a client at the failure boundary. Three defects are being checked: the deadline (waiting without one lets a slow dependency hold the request open), the retry loop (it doubles latency and hides the failure), and the silent degradation (a timeout reported as "no match" is a real duplicate slipping through). The subtle part is the marker: degrading without saying so is worse than failing loudly, because the caller cannot tell a thorough check from a downgraded one. Real clients add a per-call deadline that is shorter than the request budget, a circuit breaker around the dependency, and metrics that count degraded checks so the similarity service's health is visible.`,
 };

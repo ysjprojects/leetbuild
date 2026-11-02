@@ -8,7 +8,7 @@ export const modelCallStep: Step = {
   focus: ['api', 'model'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it builds a prompt, calls
+**Starting point.** The starter is working code: it builds a prompt, calls
 the model and returns the text, so the demo answers questions. Every boundary in it is missing.
 Five production flaws; find them, fix them, prove the fix.
 
@@ -34,7 +34,7 @@ Implement \`answer(document, question)\` for the model layer, over \`Model.Compl
 **Failure mode the checks target.** A concatenated prompt has no boundary the model can hold onto:
 the source shows a few hundred control-character tokens in the question making GPT-3.5 forget
 everything before them, and a repeated phrase replacing the answer with memorised text. With no
-canary and no schema, the draft returns whatever came back — the instructions, the repeated phrase,
+canary and no schema, the starter returns whatever came back — the instructions, the repeated phrase,
 a 32 K-token loop — and with no deadline it waits for all of it.`,
   sequence: {
     participants: ['promptguard', 'Model'],
@@ -67,7 +67,7 @@ a 32 K-token loop — and with no deadline it waits for all of it.`,
       id: 'template',
       title: 'Separates instructions, document and question with escaped delimiters',
       detail:
-        'The prompt is built from named sections: `DOC_OPEN` / `DOC_CLOSE` around the document, triple backticks around the question, and `escape_untrusted` applied to both. The draft concatenates instructions, document and question into one string.',
+        'The prompt is built from named sections: `DOC_OPEN` / `DOC_CLOSE` around the document, triple backticks around the question, and `escape_untrusted` applied to both. The starter concatenates instructions, document and question into one string.',
       match: {
         python: {all: [/DOC_OPEN\s*=/, /DOC_CLOSE\s*=/, /escape_untrusted\(/]},
         typescript: {all: [/DOC_OPEN\s*=/, /DOC_CLOSE\s*=/, /escapeUntrusted\(/]},
@@ -80,7 +80,7 @@ a 32 K-token loop — and with no deadline it waits for all of it.`,
       id: 'canary',
       title: 'Plants a per-request canary and checks the reply for leaks',
       detail:
-        'A random canary is generated for every request, written into the instructions, and `leaks_instructions` checks the reply for it and for every instruction line. The draft has no way to tell an answer from an echoed prompt.',
+        'A random canary is generated for every request, written into the instructions, and `leaks_instructions` checks the reply for it and for every instruction line. The starter has no way to tell an answer from an echoed prompt.',
       match: {
         python: {all: [/secrets\.token_hex\(/, /canary/, /leaks_instructions\(/]},
         typescript: {all: [/randomBytes\(/, /canary/, /leaksInstructions\(/]},
@@ -93,7 +93,7 @@ a 32 K-token loop — and with no deadline it waits for all of it.`,
       id: 'deadline-retry',
       title: 'Five-second deadline, max_tokens 256, at most two attempts',
       detail:
-        'Each call carries `DEADLINE_S = 5` and `MAX_ANSWER_TOKENS = 256`; attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` / `DEADLINE_EXCEEDED` are retried. The draft calls once with no deadline and no output cap.',
+        'Each call carries `DEADLINE_S = 5` and `MAX_ANSWER_TOKENS = 256`; attempts are bounded by `MAX_ATTEMPTS = 2` and only `UNAVAILABLE` / `DEADLINE_EXCEEDED` are retried. The starter calls once with no deadline and no output cap.',
       match: {
         python: {
           all: [
@@ -150,7 +150,7 @@ a 32 K-token loop — and with no deadline it waits for all of it.`,
       id: 'schema',
       title: 'Validates the reply against the answer schema',
       detail:
-        '`parse_answer` parses the reply as JSON and checks `answer` is a string and `spans` a list of strings. The draft returns the raw text, so a diverged model’s output goes straight to the user.',
+        '`parse_answer` parses the reply as JSON and checks `answer` is a string and `spans` a list of strings. The starter returns the raw text, so a diverged model’s output goes straight to the user.',
       match: {
         python: {all: [/parse_answer\(/, /json\.loads\(/, /isinstance\(/]},
         typescript: {all: [/parseAnswer\(/, /JSON\.parse\(/, /Array\.isArray\(/]},
@@ -163,7 +163,7 @@ a 32 K-token loop — and with no deadline it waits for all of it.`,
       id: 'refuse-on-leak',
       title: 'Raises Rejected instead of returning a leaked or malformed reply',
       detail:
-        'A reply that carries the canary, an instruction line, or does not match the schema raises `Rejected`; the caller refuses. The draft has no refusal path at all.',
+        'A reply that carries the canary, an instruction line, or does not match the schema raises `Rejected`; the caller refuses. The starter has no refusal path at all.',
       match: {
         python: {all: [/class Rejected\(/, /raise Rejected\(/]},
         typescript: {all: [/class Rejected extends/, /throw new Rejected\(/]},
@@ -198,9 +198,9 @@ class ModelAnswer:
 
 
 def answer(document: str, question: str) -> ModelAnswer:
-    # TODO: this draft concatenates instructions, document and question into one string, plants
+    # TODO: this starter concatenates instructions, document and question into one string, plants
     # no canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-    # checking its shape. Review all five.
+    # checking its shape. Fix all five.
     prompt = INSTRUCTIONS + "\\n\\n" + document + "\\n\\n" + question
     reply = model.Complete(model_pb2.CompleteRequest(prompt=prompt))
     return ModelAnswer(answer=reply.text)
@@ -300,7 +300,7 @@ def answer(document: str, question: str) -> ModelAnswer:
 `,
     },
     typescript: {
-      starter: `/** Model call: a model-generated draft that concatenates the prompt and trusts the reply. */
+      starter: `/** Model call: flawed code that concatenates the prompt and trusts the reply. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -325,9 +325,9 @@ const INSTRUCTIONS =
   'Answer the question using only the document below. If the document does not contain the answer, say that you cannot answer from this document.';
 
 export async function answer(document: string, question: string): Promise<ModelAnswer> {
-  // TODO: this draft concatenates instructions, document and question into one string, plants
+  // TODO: this starter concatenates instructions, document and question into one string, plants
   // no canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-  // checking its shape. Review all five.
+  // checking its shape. Fix all five.
   const prompt = INSTRUCTIONS + '\\n\\n' + document + '\\n\\n' + question;
   const {promise, resolve, reject} = Promise.withResolvers<string>();
   client.Complete({prompt}, (error, reply) => (error ? reject(error) : resolve(reply.text)));
@@ -467,9 +467,9 @@ type ModelAnswer struct {
 
 var modelClient pb.ModelClient
 
-// TODO: this draft concatenates instructions, document and question into one string, plants no
+// TODO: this starter concatenates instructions, document and question into one string, plants no
 // canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-// checking its shape. Review all five.
+// checking its shape. Fix all five.
 func answer(ctx context.Context, document, question string) (ModelAnswer, error) {
 	prompt := instructions + "\\n\\n" + document + "\\n\\n" + question
 	reply, err := modelClient.Complete(ctx, &pb.CompleteRequest{Prompt: prompt})
@@ -616,9 +616,9 @@ object ModelCall {
 
   val stub = ModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("model", 9000).usePlaintext().build())
 
-  // TODO: this draft concatenates instructions, document and question into one string, plants no
+  // TODO: this starter concatenates instructions, document and question into one string, plants no
   // canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-  // checking its shape. Review all five.
+  // checking its shape. Fix all five.
   def answer(document: String, question: String): ModelAnswer = {
     val prompt = Instructions + "\\n\\n" + document + "\\n\\n" + question
     val reply = stub.complete(CompleteRequest(prompt = prompt))
@@ -737,9 +737,9 @@ const std::string kInstructions =
 std::unique_ptr<Model::Stub> stub =
     Model::NewStub(grpc::CreateChannel("model:9000", grpc::InsecureChannelCredentials()));
 
-// TODO: this draft concatenates instructions, document and question into one string, plants no
+// TODO: this starter concatenates instructions, document and question into one string, plants no
 // canary, sets no deadline or max_tokens, never retries, and returns the raw text without
-// checking its shape. Review all five.
+// checking its shape. Fix all five.
 ModelAnswer answer(const std::string& document, const std::string& question) {
   grpc::ClientContext ctx;
   CompleteRequest request;

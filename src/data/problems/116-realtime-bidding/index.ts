@@ -7,8 +7,8 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Realtime bidding on the AI-era track: the course is not "call a model and return a price", it is
- * the review you owe a model-generated bidder before it spends real money on auctions it cannot
+ * Realtime bidding: the course is not "call a model and return a price", it is
+ * the debugging you owe a bidder before it spends real money on auctions it cannot
  * finish. A validated endpoint that shares one auction budget → an atomic Redis claim released on
  * every loss → tiered feature deadlines that skip what does not fit → auction-keyed events carrying
  * the loss reason with an outbox → a stats read that reports timeouts and degradation honestly.
@@ -19,7 +19,6 @@ export const realtimeBiddingProblem: Problem = {
   tagline: "Bid within the auction's deadline, degrade in tiers and lose gracefully.",
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Realtime Bidding
 
@@ -63,12 +62,12 @@ One service, **biddingd**, with five pieces:
 5. \`GET /v1/bidders/{id}/stats\`: win rate against every auction seen, bid rate, timeout rate,
    degradation share, and spend versus cap — readable only by the bidder it belongs to.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the demo,
-and it sounds confident. Your job in every step is the job you will have on a real bidding team: read
-the draft against the failure modes of the exchange, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with a flaw: it compiles, it serves the demo, and it
+looks right. Your job in every step is the job you will have on a real bidding team: debug the
+starter against the failure modes of the exchange, name the subtle one, fix it, optimize what is
+wasteful, and prove the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

@@ -8,8 +8,8 @@ export const readStep: Step = {
   focus: ['reader', 'collector', 'redis', 'storage'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it loads the trace and renders a
-tree, and the tree looks tidy because the draft removes whatever did not fit. A partial trace renders
+**Starting point.** The starter is working code: it loads the trace and renders a
+tree, and the tree looks tidy because the starter removes whatever did not fit. A partial trace renders
 as complete, the missing spans vanish so the waterfall is shorter than the truth, and any tenant can
 read any trace. Three defects, one habit: the read path tells a nicer story than the data.
 
@@ -25,12 +25,12 @@ Implement \`GET /v1/traces/{trace_id}\`.
   show durations, so a 400 ms span cannot be placed against the request it slowed down.
 - Every parent reference that never got its span is reported in **\`gaps\`** (its \`parent_span_id\`
   and how many stored spans name it as their parent) and the trace is marked **\`partial\`** when the
-  gap list is not empty. The draft drops the orphans instead, so the tree it returns is shorter than
+  gap list is not empty. The starter drops the orphans instead, so the tree it returns is shorter than
   the request that actually ran. A trace that stopped half way is a finding, not a formatting
   problem.
 - A missing trace is **404**, and a malformed trace id is **422** before the state is read.
 
-**Failure mode the checks target.** This is the step where an incident review is misled. The draft's
+**Failure mode the checks target.** This is the step where an incident review is misled. The starter's
 answer is internally consistent — every span it returns has a parent — so nobody doubts it; the
 latency it shows is simply the sum of the spans that happen to be present. And because the endpoint
 never compares the trace's owner with the caller, one tenant can read another tenant's checkout
@@ -83,7 +83,7 @@ latency, which is both a correctness bug and a data leak.`,
       id: 'partial-marker',
       title: 'A partial trace is marked partial',
       detail:
-        'The gap count decides an explicit `partial` marker in the response, so a trace whose child never arrived cannot be read as a complete one. The draft hardcodes a complete trace.',
+        'The gap count decides an explicit `partial` marker in the response, so a trace whose child never arrived cannot be read as a complete one. The starter hardcodes a complete trace.',
       match: {
         python: {all: [/partial/, /missing = len\(gaps\)/]},
         typescript: {all: [/partial/, /missing = gaps\.length/]},
@@ -96,7 +96,7 @@ latency, which is both a correctness bug and a data leak.`,
       id: 'gaps-visible',
       title: 'Missing children appear as gaps',
       detail:
-        'Every `refs:{span_id}` whose span is not in the state is reported in `gaps` with the number of spans waiting for it. The draft filters those spans out so the tree looks shorter, never empty.',
+        'Every `refs:{span_id}` whose span is not in the state is reported in `gaps` with the number of spans waiting for it. The starter filters those spans out so the tree looks shorter, never empty.',
       match: {
         python: {all: [/gaps/, /refs/]},
         typescript: {all: [/gaps/, /refs/]},
@@ -109,7 +109,7 @@ latency, which is both a correctness bug and a data leak.`,
       id: 'absolute-timestamps',
       title: 'Spans carry absolute start and end timestamps',
       detail:
-        'Each span reports `start_ms`, `duration_ms` and `end_ms` (`start_ms + duration_ms`), so the waterfall places every span on the request’s absolute timeline. The draft returns durations only.',
+        'Each span reports `start_ms`, `duration_ms` and `end_ms` (`start_ms + duration_ms`), so the waterfall places every span on the request’s absolute timeline. The starter returns durations only.',
       match: {
         python: {all: [/start_ms/, /duration_ms/, /end_ms/]},
         typescript: {all: [/start_ms/, /duration_ms/, /end_ms/]},
@@ -122,7 +122,7 @@ latency, which is both a correctness bug and a data leak.`,
       id: 'tenant-scope',
       title: 'Trace access is scoped to the owning tenant',
       detail:
-        'The trace’s recorded owner is compared with the authenticated caller and a foreign trace is **404**, so the read path cannot be used to enumerate or read another tenant’s traces. The draft serves any trace to any caller.',
+        'The trace’s recorded owner is compared with the authenticated caller and a foreign trace is **404**, so the read path cannot be used to enumerate or read another tenant’s traces. The starter serves any trace to any caller.',
       match: {
         python: {all: [/owner != tenant/, /status_code\s*=\s*404/]},
         typescript: {all: [/owner !== tenant/, /code\(\s*404\s*\)/]},
@@ -150,7 +150,7 @@ store = TraceReader()
 
 @app.get("/v1/traces/{trace_id}")
 def read_trace(trace_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    # TODO: the draft renders every trace as complete, drops the spans whose parent is not in the
+    # TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
     # state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
     # gaps, mark the trace partial and scope the read to the tenant that owns it.
     trace = store.load(trace_id)
@@ -235,7 +235,7 @@ def read_trace(trace_id: str, tenant: str | None = Header(default=None, alias="X
 `,
     },
     typescript: {
-      starter: `/** GET /v1/traces/{id}: a model-generated draft that tidies the tree up. */
+      starter: `/** GET /v1/traces/{id}: flawed code that tidies the tree up. */
 import Fastify from 'fastify';
 
 import {store} from './trace_store';
@@ -251,7 +251,7 @@ interface Span {
 }
 
 app.get('/v1/traces/:trace_id', async (request, reply) => {
-  // TODO: the draft renders every trace as complete, drops the spans whose parent is not in the
+  // TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
   // state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
   // gaps, mark the trace partial and scope the read to the tenant that owns it.
   const {trace_id: traceId} = request.params as {trace_id: string};
@@ -358,7 +358,7 @@ type traceState struct {
 func readTrace(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	traceID := r.PathValue("trace_id")
-	// TODO: the draft renders every trace as complete, drops the spans whose parent is not in the
+	// TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
 	// state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
 	// gaps, mark the trace partial and scope the read to the tenant that owns it.
 	trace := store.Load(r.Context(), traceID)
@@ -517,7 +517,7 @@ object ReadApi {
     path("v1" / "traces" / Segment) { traceId =>
       get {
         headerValueByName("X-Tenant-Id") { tenant =>
-          // TODO: the draft renders every trace as complete, drops the spans whose parent is not in
+          // TODO: the starter renders every trace as complete, drops the spans whose parent is not in
           // the state so the waterfall looks shorter, and serves any tenant's trace to any caller.
           // Report the gaps, mark the trace partial and scope the read to the tenant that owns it.
           val trace = store.load(traceId)
@@ -666,7 +666,7 @@ int main() {
 
   svr.Get(R"(/v1/traces/([0-9a-f]{32}))", [](const httplib::Request& req, httplib::Response& res) {
     const std::string traceId = req.matches[1];
-    // TODO: the draft renders every trace as complete, drops the spans whose parent is not in the
+    // TODO: the starter renders every trace as complete, drops the spans whose parent is not in the
     // state so the waterfall looks shorter, and serves any tenant's trace to any caller. Report the
     // gaps, mark the trace partial and scope the read to the tenant that owns it.
     const traceState trace = loadTrace(traceId);
@@ -785,5 +785,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether the read path tells the truth. A trace that stopped half way is the normal case, not the exception: a service crashed, an exporter flushed before its parent arrived, a span was dropped by a sampler. The draft's answer hides all of that and stays internally consistent, which is precisely why it is dangerous — an on-call engineer reads a shorter waterfall and concludes the request was fast. Reporting the gaps and marking the trace partial turns an unreliable trace into a usable answer: here is the tree, here is what is missing, do not draw a latency conclusion from it. The owner check is the other half: traces carry a tenant, so the read path is a data boundary, and returning 404 for someone else's trace keeps it from being used to enumerate what exists. Real platforms add per-tenant read quotas, a redaction pass over attributes before they reach a browser, and a "trace is older than the retention window" answer — all of which assume the read path is already honest about the state it holds.`,
+  debrief: `The interviewer is testing whether the read path tells the truth. A trace that stopped half way is the normal case, not the exception: a service crashed, an exporter flushed before its parent arrived, a span was dropped by a sampler. The starter's answer hides all of that and stays internally consistent, which is precisely why it is dangerous — an on-call engineer reads a shorter waterfall and concludes the request was fast. Reporting the gaps and marking the trace partial turns an unreliable trace into a usable answer: here is the tree, here is what is missing, do not draw a latency conclusion from it. The owner check is the other half: traces carry a tenant, so the read path is a data boundary, and returning 404 for someone else's trace keeps it from being used to enumerate what exists. Real platforms add per-tenant read quotas, a redaction pass over attributes before they reach a browser, and a "trace is older than the retention window" answer — all of which assume the read path is already honest about the state it holds.`,
 };

@@ -7,9 +7,9 @@ import {invoiceEventsStep} from './steps/4-events';
 import {invoiceReadStep} from './steps/5-read';
 
 /**
- * Invoice service on the AI-era track: the course is not "POST an invoice and store it", it is the
- * review you owe a model-generated billing service before it issues a document a business is taxed
- * on. Drafts stay editable → finalization takes a per-tenant number atomically → tax is quoted under
+ * Invoice service: the course is not "POST an invoice and store it", it is the debugging you owe a
+ * billing service before it issues a document a business is taxed on. Drafts stay editable →
+ * finalization takes a per-tenant number atomically → tax is quoted under
  * a deadline and an unsure answer holds the invoice → lifecycle events are keyed by invoice with
  * line digests → the read serves the issuer's copy and the customer's copy from one stored invoice.
  */
@@ -19,7 +19,6 @@ export const invoiceServiceProblem: Problem = {
   tagline: 'Invoices that number once, tax before finalize and never mutate after issuance.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Invoice Service
 
@@ -67,12 +66,12 @@ One service, **invoiced**, with five pieces:
    and the customer's copy with internal notes and cost margins removed — with drafts hidden from
    customers and a foreign invoice answered as **404**.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real billing
-feature: read the draft against the failure modes, name the subtle one, fix it, and prove the fix
-with checks that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real billing feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

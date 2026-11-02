@@ -7,12 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Service discovery on the AI-era track: the course is not "put the instances in Redis", it is the
- * review you owe a model-generated registry before it routes production traffic. Scoped registration
- * inside the deployment CIDR → one atomic Redis renewal with a heartbeat-derived TTL and a single
- * address per identity → gRPC health probes with a deadline before traffic, shared through a cached
- * verdict → membership events keyed by service with an outbox → a read API that returns only
- * fresh, healthy instances and explains every exclusion.
+ * Service discovery: the course is not "put the instances in Redis", it is the debugging you owe a
+ * registry before it routes production traffic. Scoped registration inside the deployment CIDR →
+ * one atomic Redis renewal with a heartbeat-derived TTL and a single address per identity → gRPC
+ * health probes with a deadline before traffic, shared through a cached verdict → membership
+ * events keyed by service with an outbox → a read API that returns only fresh, healthy instances
+ * and explains every exclusion.
  */
 export const serviceDiscoveryProblem: Problem = {
   id: 'service-discovery',
@@ -20,7 +20,6 @@ export const serviceDiscoveryProblem: Problem = {
   tagline: 'Instances register with heartbeats and only healthy backends receive traffic.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Service Discovery
 
@@ -65,12 +64,12 @@ One service, **discoveryd**, with five pieces:
    last heartbeat, exclusions explained as \`expired\`, \`stale\` or \`unhealthy\`, and enumeration
    gated behind the internal scope.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real platform team: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

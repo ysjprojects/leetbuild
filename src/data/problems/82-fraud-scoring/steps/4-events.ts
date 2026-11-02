@@ -8,7 +8,7 @@ export const eventsStep: Step = {
   focus: ['scorer', 'kafka', 'consumer', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it produces an event on the
+**Starting point.** The starter is working code: it produces an event on the
 happy path and the consumer moves a counter, so the demo shows numbers going up. Four production
 contracts are broken, one of them a data leak with a long tail. Find them, fix them, and prove the
 fix with the checks below.
@@ -18,7 +18,7 @@ Publish one \`fraud.scored\` event per decision and consume those events into th
 - The message key is the **account reference** (\`key=account_ref\`, \`key: accountRef\`,
   \`Key: []byte(accountRef)\`, \`ProducerRecord(Topic, accountRef, …)\`). The key is the partition key,
   so keying by account keeps one account's decisions ordered — which is the only way an analyst can
-  read a burst in the order it happened. The draft keys by device id, so the same account's history
+  read a burst in the order it happened. The starter keys by device id, so the same account's history
   arrives interleaved with every other account on that device.
 - The event id is the **transaction id**, and the payload carries the **band**, the **fallback
   marker**, the **feature digest** and the model version. Compute the digest with
@@ -53,7 +53,7 @@ duplicates on retry, and commit-before-process turns one crash into a permanentl
       id: 'account-key',
       title: 'Keyed by account reference, id is the transaction id',
       detail:
-        'The message key is the account reference, so every decision for one account lands on the same partition and keeps its order, and the event id is the transaction id. The draft keys by device id, which interleaves the account’s history with every other account that shared the device.',
+        'The message key is the account reference, so every decision for one account lands on the same partition and keeps its order, and the event id is the transaction id. The starter keys by device id, which interleaves the account’s history with every other account that shared the device.',
       match: {
         python: {all: [/key=account_ref/, /transaction_id/]},
         typescript: {all: [/key:\s*accountRef/, /transaction_id|transactionId/]},
@@ -79,7 +79,7 @@ duplicates on retry, and commit-before-process turns one crash into a permanentl
       id: 'digest-not-features',
       title: 'The payload carries a feature digest, never the features',
       detail:
-        '`feature_digest(features)` hashes the canonical feature vector (sha256) and the payload carries only that digest. The draft publishes `raw_features` into a retained, replicated topic, which is the leak the review team never asked for.',
+        '`feature_digest(features)` hashes the canonical feature vector (sha256) and the payload carries only that digest. The starter publishes `raw_features` into a retained, replicated topic, which is the leak the review team never asked for.',
       match: {
         python: {all: [/hashlib\.sha256/, /feature_digest/], none: [/raw_features/]},
         typescript: {all: [/createHash\(\s*'sha256'\)/, /feature_digest/], none: [/raw_features/]},
@@ -92,7 +92,7 @@ duplicates on retry, and commit-before-process turns one crash into a permanentl
       id: 'band-and-marker',
       title: 'The event carries the band and the fallback marker',
       detail:
-        'Downstream alerting needs the decision, not the score alone: the payload carries the band and the fallback marker so an outage can be separated from a genuine decline without re-scoring anything. The draft publishes the raw score instead.',
+        'Downstream alerting needs the decision, not the score alone: the payload carries the band and the fallback marker so an outage can be separated from a genuine decline without re-scoring anything. The starter publishes the raw score instead.',
       match: {
         python: {all: [/["']band["']/, /["']fallback["']/]},
         typescript: {all: [/band:/, /fallback:/]},
@@ -105,7 +105,7 @@ duplicates on retry, and commit-before-process turns one crash into a permanentl
       id: 'counters-before-commit',
       title: 'Counters move before the offset is committed',
       detail:
-        'The consumer does `HINCRBY` and only then commits the offset, so a crash between the two replays the record instead of losing the counter update. The draft commits first — the one order that turns a crash into a permanently missing alert.',
+        'The consumer does `HINCRBY` and only then commits the offset, so a crash between the two replays the record instead of losing the counter update. The starter commits first — the one order that turns a crash into a permanently missing alert.',
       match: {
         python: {order: [/hincrby\(/, /commit\(/]},
         typescript: {order: [/hincrby\(/, /commitOffsets\(/]},
@@ -135,8 +135,8 @@ producer = KafkaProducer(
 
 
 def publish_scored(verdict: dict, account_ref: str, device_id: str, features: dict) -> None:
-    # TODO: the draft keys by device id, publishes the raw feature vector for the review team, and
-    # commits the consumer offset before the alerting counters move. Review all three.
+    # TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
+    # commits the consumer offset before the alerting counters move. Fix all three.
     event = {
         "id": verdict["transaction_id"],
         "account_ref": account_ref,
@@ -208,7 +208,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** fraud.scored publishing and alerting — a model-generated draft. */
+      starter: `/** fraud.scored publishing and alerting — flawed code. */
 import {Kafka} from 'kafkajs';
 import Redis from 'ioredis';
 
@@ -230,8 +230,8 @@ export async function publishScored(
   deviceId: string,
   features: Record<string, unknown>,
 ): Promise<void> {
-  // TODO: the draft keys by device id, publishes the raw feature vector for the review team, and
-  // commits the consumer offset before the alerting counters move. Review all three.
+  // TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
+  // commits the consumer offset before the alerting counters move. Fix all three.
   const event: ScoredEvent = {
     id: verdict.transaction_id,
     account_ref: accountRef,
@@ -358,8 +358,8 @@ type ScoredEvent struct {
 	RawFeatures map[string]any \`json:"raw_features"\`
 }
 
-// TODO: the draft keys by device id, publishes the raw feature vector for the review team, and
-// commits the consumer offset before the alerting counters move. Review all three.
+// TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
+// commits the consumer offset before the alerting counters move. Fix all three.
 func publishScored(ctx context.Context, verdict ScoredVerdict, accountRef, deviceID string, features map[string]any) error {
 	event := ScoredEvent{ID: verdict.TransactionID, AccountRef: accountRef, Score: verdict.Score, RawFeatures: features}
 	payload, err := json.Marshal(event)
@@ -505,8 +505,8 @@ object ScoredEvents {
 
   case class ScoredVerdict(transactionId: String, score: Double, band: String, fallback: Boolean, modelVersion: String)
 
-  // TODO: the draft keys by device id, publishes the raw feature vector for the review team, and
-  // commits the consumer offset before the alerting counters move. Review all three.
+  // TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
+  // commits the consumer offset before the alerting counters move. Fix all three.
   def publishScored(verdict: ScoredVerdict, accountRef: String, deviceId: String, features: Map[String, Any]): Unit = {
     val rawFeatures = JsObject(features.map { case (key, value) => key -> JsString(String.valueOf(value)) })
     val event = JsObject(
@@ -595,7 +595,7 @@ object ScoredEvents {
 `,
     },
     cpp: {
-      starter: `// fraud.scored publishing and alerting — a model-generated draft.
+      starter: `// fraud.scored publishing and alerting — flawed code.
 #include <string>
 
 #include <librdkafka/rdkafkacpp.h>
@@ -611,8 +611,8 @@ struct ScoredVerdict {
   double score = 0.0;
 };
 
-// TODO: the draft keys by device id, publishes the raw feature vector for the review team, and
-// commits the consumer offset before the alerting counters move. Review all three.
+// TODO: the starter keys by device id, publishes the raw feature vector for the review team, and
+// commits the consumer offset before the alerting counters move. Fix all three.
 static void publishScored(RdKafka::Producer* producer, const json& verdict, const std::string& account_ref,
                           const std::string& device_id, const json& features, RdKafka::Topic* topic) {
   const json event = {

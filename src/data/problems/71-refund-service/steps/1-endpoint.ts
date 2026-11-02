@@ -8,9 +8,9 @@ export const refundEndpointStep: Step = {
   focus: ['client', 'api', 'ledger', 'records', 'psp'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the route, reads
+**Starting point.** The starter is working code: it registers the route, reads
 the payment's refundable balance and returns a refund. It compiles, it returns a body the console
-renders, and it hides four production flaws. Review it like the payments engineer on call, fix it,
+renders, and it hides four production flaws. Debug it like the payments engineer on call, fix it,
 and prove the fix with the checks below.
 
 Implement \`POST /v1/refunds\` with body
@@ -85,7 +85,7 @@ someone else's charge.`,
       id: 'cap',
       title: 'Refuses an amount above the remaining balance with 422',
       detail:
-        'An amount larger than `paid_minor` minus the refunded total is answered **422** with the remaining balance in the body; the draft refunds whatever the caller asks for. The cap is `paid_minor`, enforced at the claim.',
+        'An amount larger than `paid_minor` minus the refunded total is answered **422** with the remaining balance in the body; the starter refunds whatever the caller asks for. The cap is `paid_minor`, enforced at the claim.',
       match: {
         python: {all: [/status_code\s*=\s*422/, /paid_minor/]},
         typescript: {all: [/\.code\(\s*422\s*\)/, /paid_minor/]},
@@ -98,7 +98,7 @@ someone else's charge.`,
       id: 'tenant-scope',
       title: 'Authenticates the tenant and 404s a foreign payment',
       detail:
-        'A missing `X-Tenant-Id` is **401** and a payment owned by another tenant is **404**, checked before the ledger is touched. The draft refunds whatever payment id the path or body names.',
+        'A missing `X-Tenant-Id` is **401** and a payment owned by another tenant is **404**, checked before the ledger is touched. The starter refunds whatever payment id the path or body names.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /status_code\s*=\s*404/]},
         typescript: {all: [/\.code\(\s*401\s*\)/, /\.code\(\s*404\s*\)/]},
@@ -111,7 +111,7 @@ someone else's charge.`,
       id: 'idempotency-key',
       title: 'Requires Idempotency-Key and replays the first refund',
       detail:
-        '`Idempotency-Key` is required (**400** when absent) and the refund is stored under `(tenant, key)`; a replay returns the stored refund instead of refunding again. The draft never reads the header.',
+        '`Idempotency-Key` is required (**400** when absent) and the refund is stored under `(tenant, key)`; a replay returns the stored refund instead of refunding again. The starter never reads the header.',
       match: {
         python: {all: [/Idempotency-Key/, /status_code\s*=\s*400/, /refunds\.get\(/, /refunds\.put\(/]},
         typescript: {all: [/'idempotency-key'/, /\.code\(\s*400\s*\)/, /refunds\.get\(/, /refunds\.put\(/]},
@@ -124,7 +124,7 @@ someone else's charge.`,
       id: 'remaining-balance',
       title: 'Leaves the reduced balance visible immediately',
       detail:
-        'The accepted response carries the new `remaining_minor` computed from the payment total and the refunded amount, so a partial refund shows the reduced balance at once. The draft returns no balance at all.',
+        'The accepted response carries the new `remaining_minor` computed from the payment total and the refunded amount, so a partial refund shows the reduced balance at once. The starter returns no balance at all.',
       match: {
         python: {all: [/remaining_minor/, /paid_minor/]},
         typescript: {all: [/remaining_minor/, /paid_minor/]},
@@ -167,9 +167,9 @@ refunds = RefundStore()
 
 @app.post("/v1/refunds")
 def create_refund(body: RefundRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft refunds whatever the client asks for. It reads the balance and never checks
+    # TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
     # it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-    # concurrent requests refund the same payment twice. Review all four.
+    # concurrent requests refund the same payment twice. Fix all four.
     logger.info("refund tenant=%s payment=%s amount=%d", tenant, body.payment_id, body.amount_minor)
     return JSONResponse(
         {
@@ -290,7 +290,7 @@ def create_refund(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/refunds: a model-generated draft that refunds whatever the client asks for. */
+      starter: `/** POST /v1/refunds: flawed code that refunds whatever the client asks for. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -302,9 +302,9 @@ interface RefundBody {
 }
 
 app.post('/v1/refunds', async (request, reply) => {
-  // TODO: this draft refunds whatever the client asks for. It reads the balance and never checks
+  // TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
   // it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-  // concurrent requests refund the same payment twice. Review all four.
+  // concurrent requests refund the same payment twice. Fix all four.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as RefundBody;
   request.log.info({tenant, payment_id: body.payment_id, amount_minor: body.amount_minor}, 'refund accepted');
@@ -428,9 +428,9 @@ func createRefund(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	body := RefundRequest{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this draft refunds whatever the client asks for. It reads the balance and never checks
+	// TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
 	// it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-	// concurrent requests refund the same payment twice. Review all four.
+	// concurrent requests refund the same payment twice. Fix all four.
 	log.Printf("refund tenant=%s payment=%s amount=%d", tenant, body.PaymentID, body.AmountMinor)
 	writeJSON(rw, http.StatusOK, map[string]any{
 		"payment_id":   body.PaymentID,
@@ -605,9 +605,9 @@ object Api {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[RefundRequest]) { body =>
-            // TODO: this draft refunds whatever the client asks for. It reads the balance and never
+            // TODO: this starter refunds whatever the client asks for. It reads the balance and never
             // checks it, ignores Idempotency-Key, never proves the payment belongs to the tenant,
-            // and lets two concurrent requests refund the same payment twice. Review all four.
+            // and lets two concurrent requests refund the same payment twice. Fix all four.
             system.log.info(s"refund tenant=$tenant payment=\${body.payment_id} amount=\${body.amount_minor}")
             complete(
               StatusCodes.OK,
@@ -747,9 +747,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft refunds whatever the client asks for. It reads the balance and never checks
+    // TODO: this starter refunds whatever the client asks for. It reads the balance and never checks
     // it, ignores Idempotency-Key, never proves the payment belongs to the tenant, and lets two
-    // concurrent requests refund the same payment twice. Review all four.
+    // concurrent requests refund the same payment twice. Fix all four.
     std::cerr << "refund tenant=" << tenant << " payment=" << body.value("payment_id", std::string()) << "\\n";
     res.status = 200;
     res.set_content(
@@ -883,5 +883,5 @@ int main() {
     'The cap belongs to the payment, not to the request: pass `paid_minor` into the ledger call as the cap and answer **422** — not 400, not 200 — when the atomic check-and-add refuses. Reading the balance here and comparing it is check-then-act: two concurrent requests both see room that only one of them can spend.',
     'The replay lookup is `(tenant, key)` → the stored refund, resolved **before** anything is claimed, and the refund is written under the same key immediately after the claim. Return the stored body unchanged on a replay, so one client intent keeps one `refund_id`.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler at the trust boundary and at the money boundary. The draft reads fine because the demo posts well-formed requests from one tenant with one refund. Four defects are being checked: authentication and payment ownership (tenant always required, a foreign payment is 404), input validation (cheap rejections before any ledger work), the lifetime cap (an amount above the remaining balance is 422, decided by the atomic claim rather than by a read), and idempotency keyed by \`(tenant, key)\` so a retry returns the first refund instead of paying twice. The response shape is the fifth: a partial refund must show the reduced balance immediately, because the support tool and finance reconcile against the same number. Real refund services add a refund window (only within N days of capture), per-reason approval limits, and a manual-approval queue above an amount threshold.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the trust boundary and at the money boundary. The starter reads fine because the demo posts well-formed requests from one tenant with one refund. Four defects are being checked: authentication and payment ownership (tenant always required, a foreign payment is 404), input validation (cheap rejections before any ledger work), the lifetime cap (an amount above the remaining balance is 422, decided by the atomic claim rather than by a read), and idempotency keyed by \`(tenant, key)\` so a retry returns the first refund instead of paying twice. The response shape is the fifth: a partial refund must show the reduced balance immediately, because the support tool and finance reconcile against the same number. Real refund services add a refund window (only within N days of capture), per-reason approval limits, and a manual-approval queue above an amount threshold.`,
 };

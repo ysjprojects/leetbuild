@@ -14,10 +14,10 @@ export const stateStep: Step = {
   focus: ['api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft of the reservation counter: it
+**Starting point.** The starter is working code for the reservation counter: it
 reads the available stock, compares the quantity in the handler, decrements, and mirrors the hold, so
 the demo sells the last unit to one buyer at a time. Under a flash sale both buyers read the same
-number. Review the draft as the owner of the inventory service, fix it, and prove the fix with the
+number. Debug the starter as the owner of the inventory service, fix it, and prove the fix with the
 checks below.
 
 Implement the Redis side of the reservation — the \`StockCounter\` module every reserve call goes
@@ -36,7 +36,7 @@ through. No route belongs here; the handler in step 1 calls it.
 - **The hold mirrors the reservation's TTL exactly.** The script writes
   \`SET hold:{reservation_id} <sku:quantity> EX <ttl>\` in the same atomic call, where the TTL is the
   reservation's expiry — \`RESERVATION_TTL_S = 900\` seconds. A hold written with a different duration
-  (the draft hardcodes \`3600\`) keeps stock reserved past the reservation's own expiry, so a unit the
+  (the starter hardcodes \`3600\`) keeps stock reserved past the reservation's own expiry, so a unit the
   buyer released never returns to the free set.
 - **\`reserve(sku, quantity, reservation_id, ttl_s)\` returns the outcome**, not a boolean:
   \`RESERVED\`, \`INSUFFICIENT_STOCK\` or \`UNKNOWN_SKU\`. \`INSUFFICIENT_STOCK\` is a **409** conflict —
@@ -46,7 +46,7 @@ through. No route belongs here; the handler in step 1 calls it.
   because only one of them can be the script that passes the floor check and decrements. There is no
   read-modify-write anywhere in the path.
 
-**Failure mode the checks target.** The draft's \`get\` → compare → \`decrby\` is the oversell the whole
+**Failure mode the checks target.** The starter's \`get\` → compare → \`decrby\` is the oversell the whole
 course is about: it is correct in every serial test and wrong the first time two buyers press *Buy* in
 the same second. The 3600-second hold is the quiet one — the reservation expires after 900 seconds and
 the hold outlives it by 45 minutes.`,
@@ -78,14 +78,14 @@ the hold outlives it by 45 minutes.`,
   hints: [
     'Anything you can only check and then write is a race. The read, the comparison and the `DECRBY` have to happen in one script, because that is the only place Redis runs them with nothing in between; the handler only builds the keys and the arguments and reads the integer that comes back.',
     'Lua sees Redis values as strings, so compare `tonumber(stock)` with `tonumber(ARGV[1])`. A missing key comes back as `false`, which is the `-1` unknown-sku case; when the comparison fails return `-2` before touching the counter, so a refusal cannot decrement anything.',
-    "The hold must expire exactly when the reservation does. Pass the reservation's TTL into the script as an argument and write the hold with `SET ... EX` in the same call; the draft's hardcoded 3600-second hold outlives the 900-second reservation by 45 minutes.",
+    "The hold must expire exactly when the reservation does. Pass the reservation's TTL into the script as an argument and write the hold with `SET ... EX` in the same call; the starter's hardcoded 3600-second hold outlives the 900-second reservation by 45 minutes.",
   ],
   checks: [
     {
       id: 'lua-decrement',
       title: 'One registered script reads the counter and decrements it',
       detail:
-        'The floor check and the `DECRBY` are in one Lua script registered once with the client (`register_script` / `defineCommand` / `NewScript` / `scriptLoad` / `script_load`), so every call is one atomic step. The draft has no script at all: it reads, compares and writes as three separate client calls.',
+        'The floor check and the `DECRBY` are in one Lua script registered once with the client (`register_script` / `defineCommand` / `NewScript` / `scriptLoad` / `script_load`), so every call is one atomic step. The starter has no script at all: it reads, compares and writes as three separate client calls.',
       match: {
         python: {
           all: [/\bDECREMENT_SCRIPT\b/, /register_script\(\s*DECREMENT_SCRIPT\s*\)/, LUA_DECRBY],
@@ -106,7 +106,7 @@ the hold outlives it by 45 minutes.`,
       id: 'floor',
       title: 'Refuses below zero inside the script',
       detail:
-        'The script reads `stock:{sku}`, returns `-1` for a missing key and `-2` when the requested quantity is not there, and only then runs the `DECRBY`. The draft compares in the handler and decrements unconditionally, so the counter can go negative.',
+        'The script reads `stock:{sku}`, returns `-1` for a missing key and `-2` when the requested quantity is not there, and only then runs the `DECRBY`. The starter compares in the handler and decrements unconditionally, so the counter can go negative.',
       match: {
         python: {order: [LUA_GET_STOCK, LUA_UNKNOWN, LUA_INSUFFICIENT, LUA_DECRBY]},
         typescript: {order: [LUA_GET_STOCK, LUA_UNKNOWN, LUA_INSUFFICIENT, LUA_DECRBY]},
@@ -119,7 +119,7 @@ the hold outlives it by 45 minutes.`,
       id: 'atomic',
       title: 'No read-then-decrement in the host path',
       detail:
-        'The handler calls the script and reads its sentinel; there is no client-side `GET` followed by a comparison followed by a separate `DECRBY`. A bare `available >= quantity` guard in the handler is exactly the race the script removes — the draft has it, and the losing buyer then decrements anyway.',
+        'The handler calls the script and reads its sentinel; there is no client-side `GET` followed by a comparison followed by a separate `DECRBY`. A bare `available >= quantity` guard in the handler is exactly the race the script removes — the starter has it, and the losing buyer then decrements anyway.',
       match: {
         python: {
           all: [/register_script\(\s*DECREMENT_SCRIPT\s*\)/, /\bdecrement_script\(/],
@@ -147,7 +147,7 @@ the hold outlives it by 45 minutes.`,
       id: 'concurrent-last-unit',
       title: 'Two racers against the last unit: one winner',
       detail:
-        'The script result is mapped to an outcome enum — one racing caller gets `RESERVED`, the other `INSUFFICIENT_STOCK`, which the API maps to a **409** conflict the caller must not retry blindly. The draft returns a boolean from a read-modify-write, so both racers pass the check.',
+        'The script result is mapped to an outcome enum — one racing caller gets `RESERVED`, the other `INSUFFICIENT_STOCK`, which the API maps to a **409** conflict the caller must not retry blindly. The starter returns a boolean from a read-modify-write, so both racers pass the check.',
       match: {
         python: {
           all: [/RESERVED/, /INSUFFICIENT_STOCK/, /UNKNOWN_SKU/, /\b409\b/],
@@ -175,7 +175,7 @@ the hold outlives it by 45 minutes.`,
       id: 'hold-ttl',
       title: "Mirrors the reservation's TTL on the hold key",
       detail:
-        "The hold is written in the same script with `SET hold:{reservation_id} <sku:quantity> EX ttl`, and the TTL is the reservation's own `RESERVATION_TTL_S = 900`, passed in as `ttl_s` / `ttlS`. The draft hardcodes a different duration (`3600`), so the hold outlives the reservation it mirrors.",
+        "The hold is written in the same script with `SET hold:{reservation_id} <sku:quantity> EX ttl`, and the TTL is the reservation's own `RESERVATION_TTL_S = 900`, passed in as `ttl_s` / `ttlS`. The starter hardcodes a different duration (`3600`), so the hold outlives the reservation it mirrors.",
       match: {
         python: {
           all: [/RESERVATION_TTL_S\s*=\s*900/, LUA_SET_HOLD, /ttl_s/],
@@ -197,7 +197,7 @@ the hold outlives it by 45 minutes.`,
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# The reservation expires after 900 seconds; the draft mirrors the hold with its own longer window.
+# The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
 HOLD_TTL_S = 3600
 
 
@@ -212,7 +212,7 @@ def hold_key(reservation_id: str) -> str:
 class StockCounter:
     def reserve(self, sku: str, quantity: int, reservation_id: str) -> str:
         """Takes quantity units of sku and mirrors the hold for the reservation."""
-        # TODO: this draft reads the counter with GET, compares in the handler and only then
+        # TODO: this starter reads the counter with GET, compares in the handler and only then
         # DECRBYs, so two concurrent buyers both pass the check and the stock goes negative; it
         # mirrors the hold with a hardcoded 3600-second TTL instead of the reservation's 900
         # seconds; and it never runs the check and the decrement as one atomic script. Run the whole
@@ -299,12 +299,12 @@ class StockCounter:
 `,
     },
     typescript: {
-      starter: `/** The reservation counter: a model-generated draft that reads, checks and then decrements. */
+      starter: `/** The reservation counter: flawed code that reads, checks and then decrements. */
 import Redis from 'ioredis';
 
 export const redis = new Redis({host: 'redis', port: 6379});
 
-// The reservation expires after 900 seconds; the draft mirrors the hold with its own longer window.
+// The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
 export const HOLD_TTL_S = 3600;
 
 export function stockKey(sku: string): string {
@@ -317,7 +317,7 @@ export function holdKey(reservationId: string): string {
 
 export class StockCounter {
   async reserve(sku: string, quantity: number, reservationId: string): Promise<string> {
-    // TODO: this draft reads the counter with GET, compares in the handler and only then DECRBYs,
+    // TODO: this starter reads the counter with GET, compares in the handler and only then DECRBYs,
     // so two concurrent buyers both pass the check and the stock goes negative; it mirrors the hold
     // with a hardcoded 3600-second TTL instead of the reservation's 900 seconds; and it never runs
     // the check and the decrement as one atomic script. Run the whole transition in one registered
@@ -423,7 +423,7 @@ import (
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// The reservation expires after 900 seconds; the draft mirrors the hold with its own longer window.
+// The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
 const holdTTLS = 3600
 
 func stockKey(sku string) string {
@@ -436,7 +436,7 @@ func holdKey(reservationID string) string {
 
 type StockCounter struct{}
 
-// TODO: this draft reads the counter with Get, compares in the handler and only then DecrBy's, so
+// TODO: this starter reads the counter with Get, compares in the handler and only then DecrBy's, so
 // two concurrent buyers both pass the check and the stock goes negative; it mirrors the hold with a
 // hardcoded 3600-second TTL instead of the reservation's 900 seconds; and it never runs the check
 // and the decrement as one atomic script. Run the whole transition in one registered Lua script and
@@ -558,14 +558,14 @@ func (StockCounter) Reserve(ctx context.Context, sku string, quantity int, reser
 object StockCounter {
   val jedis = new Jedis("redis", 6379)
 
-  // The reservation expires after 900 seconds; the draft mirrors the hold with its own longer window.
+  // The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
   val HoldTtlS = 3600L
 
   def stockKey(sku: String): String = s"stock:$sku"
 
   def holdKey(reservationId: String): String = s"hold:$reservationId"
 
-  // TODO: this draft reads the counter with get, compares in the handler and only then decrBy's, so
+  // TODO: this starter reads the counter with get, compares in the handler and only then decrBy's, so
   // two concurrent buyers both pass the check and the stock goes negative; it mirrors the hold with a
   // hardcoded 3600-second TTL instead of the reservation's 900 seconds; and it never runs the check
   // and the decrement as one atomic script. Run the whole transition in one registered Lua script
@@ -659,13 +659,13 @@ object StockCounter {
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-// The reservation expires after 900 seconds; the draft mirrors the hold with its own longer window.
+// The reservation expires after 900 seconds; the starter mirrors the hold with its own longer window.
 constexpr int kHoldTtlS = 3600;
 
 std::string stockKey(const std::string& sku) { return "stock:" + sku; }
 std::string holdKey(const std::string& reservationId) { return "hold:" + reservationId; }
 
-// TODO: this draft reads the counter with get, compares in the handler and only then decrby's, so
+// TODO: this starter reads the counter with get, compares in the handler and only then decrby's, so
 // two concurrent buyers both pass the check and the stock goes negative; it mirrors the hold with a
 // hardcoded 3600-second TTL instead of the reservation's 900 seconds; and it never runs the check
 // and the decrement as one atomic script. Run the whole transition in one registered Lua script and

@@ -8,18 +8,18 @@ export const readStep: Step = {
   focus: ['client', 'api', 'monitor', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it reads two versions of stats
+**Starting point.** The starter is working code: it reads two versions of stats
 and returns a mean and a drift boolean. It answers 200 for every request, including the one it should
 have shouted about. Find the flaws, fix them, and prove the fix with the checks below.
 
 Implement \`GET /v1/features/{name}/versions/{v}/stats\`:
 
 - Report the **distribution** of the version: \`mean\`, \`std\`, \`p50\`, \`p95\`.
-- Report the **null rate** and the baseline's null rate. The draft reports means only, and a mean that
+- Report the **null rate** and the baseline's null rate. The starter reports means only, and a mean that
   looks stable hides the rows that stopped arriving — the single most common way a feature silently
   degrades.
 - The baseline is **pinned to a declared version** (\`baseline_version\`), not to whatever version
-  happened to be last. The draft compares against \`v - 1\`, so the baseline walks forward with every
+  happened to be last. The starter compares against \`v - 1\`, so the baseline walks forward with every
   deployment and real drift is measured against a moving target.
 - Flag **\`drift\`** when the version's null rate moved more than **three standard deviations** from the
   baseline's null rate (\`null_rate_mean + 3 × null_rate_std\`).
@@ -83,7 +83,7 @@ version the baseline is, and the threshold the comparison uses.`,
       id: 'null-rate',
       title: 'Surfaces the null rate',
       detail:
-        'The response carries `null_rate`, the fraction of rows that arrived empty, alongside the distribution. The draft hides it and reports a mean that cannot show rows that stopped arriving.',
+        'The response carries `null_rate`, the fraction of rows that arrived empty, alongside the distribution. The starter hides it and reports a mean that cannot show rows that stopped arriving.',
       match: {
         python: {all: [/null_rate/]},
         typescript: {all: [/null_rate/]},
@@ -96,7 +96,7 @@ version the baseline is, and the threshold the comparison uses.`,
       id: 'pinned-baseline',
       title: 'Pins the baseline to a declared version',
       detail:
-        'The comparison uses a declared `baseline_version` (1), not the previous version, so the baseline cannot walk forward with each deployment. The draft compares against `v - 1`.',
+        'The comparison uses a declared `baseline_version` (1), not the previous version, so the baseline cannot walk forward with each deployment. The starter compares against `v - 1`.',
       match: {
         python: {all: [/BASELINE_VERSION/, /baseline/]},
         typescript: {all: [/BASELINE_VERSION/, /baseline/]},
@@ -109,7 +109,7 @@ version the baseline is, and the threshold the comparison uses.`,
       id: 'three-sigma-drift',
       title: 'Flags a null rate more than three σ from the baseline',
       detail:
-        '`drift` is true when the version’s null rate exceeds `null_rate_mean + 3 × null_rate_std` of the pinned baseline. The draft flags any worsening mean, which is both the wrong statistic and the wrong baseline.',
+        '`drift` is true when the version’s null rate exceeds `null_rate_mean + 3 × null_rate_std` of the pinned baseline. The starter flags any worsening mean, which is both the wrong statistic and the wrong baseline.',
       match: {
         python: {all: [/DRIFT_SIGMA/, /drift/]},
         typescript: {all: [/DRIFT_SIGMA/, /drift/]},
@@ -122,7 +122,7 @@ version the baseline is, and the threshold the comparison uses.`,
       id: 'freshness-stale',
       title: 'Reports freshness and a stale flag',
       detail:
-        'The response carries `freshness_s` and `stale`, so a feature whose newest value is older than its SLO is visibly stale instead of silently averaged. The draft reports neither.',
+        'The response carries `freshness_s` and `stale`, so a feature whose newest value is older than its SLO is visibly stale instead of silently averaged. The starter reports neither.',
       match: {
         python: {all: [/freshness_s/, /stale/]},
         typescript: {all: [/freshness_s/, /stale/]},
@@ -208,7 +208,7 @@ def stats(name: str, v: int) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** GET /v1/features/:name/versions/:v/stats: a model-generated draft that reports means. */
+      starter: `/** GET /v1/features/:name/versions/:v/stats: flawed code that reports means. */
 import Fastify from 'fastify';
 import {Redis} from 'ioredis';
 

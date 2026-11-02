@@ -8,9 +8,9 @@ export const bookingReadStep: Step = {
   focus: ['client', 'api', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the availability
+**Starting point.** The starter is working code: it registers the availability
 route, reads a set of slots and returns them. Guests will book from it, so every slot it reports must
-be a slot the booking path will actually accept. Review it like the service owner, fix it, and prove
+be a slot the booking path will actually accept. Debug it like the service owner, fix it, and prove
 the fix with the checks below.
 
 Implement \`GET /v1/resources/{resource_id}/availability?from=YYYY-MM-DD&to=YYYY-MM-DD&tz=…\`.
@@ -31,7 +31,7 @@ Implement \`GET /v1/resources/{resource_id}/availability?from=YYYY-MM-DD&to=YYYY
   \`booked:{booking_id}\` is a confirmed booking, and a hold id is live while \`hold:{id}\` still
   exists. Both are excluded, so availability never advertises a slot the booking path would refuse.
 
-**Failure mode the checks target.** The draft reads a nightly \`availability:{resource}:{day}\` set that
+**Failure mode the checks target.** The starter reads a nightly \`availability:{resource}:{day}\` set that
 is stale by construction, returns slots that are already held inside the payment window, accepts any
 timezone string from the caller without answering which zone it used, and lets one request ask for a
 range of years.`,
@@ -63,7 +63,7 @@ range of years.`,
       id: 'range-cap',
       title: 'Rejects a range over 90 days with 400',
       detail:
-        'A `from`/`to` span of `90` days or more is **400** with `range_too_long`, before any slot work. The draft enumerates every day it is asked for.',
+        'A `from`/`to` span of `90` days or more is **400** with `range_too_long`, before any slot work. The starter enumerates every day it is asked for.',
       match: {
         python: {all: [/MAX_AVAILABILITY_DAYS/, /range_too_long/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_AVAILABILITY_DAYS/, /range_too_long/, /code\(\s*400\s*\)/]},
@@ -76,7 +76,7 @@ range of years.`,
       id: 'live-hold-map',
       title: 'Reads the same slot map the booking path writes',
       detail:
-        'Free slots come from `HGETALL` of `resource:{id}:slots` at request time, so a hold taken a second ago is already gone from the next read. The draft reads a nightly materialization.',
+        'Free slots come from `HGETALL` of `resource:{id}:slots` at request time, so a hold taken a second ago is already gone from the next read. The starter reads a nightly materialization.',
       match: {
         python: {all: [/hgetall/, /slots_key\(/], none: [/materializ/i]},
         typescript: {all: [/hgetall/, /slotsKey\(/], none: [/materializ/i]},
@@ -89,7 +89,7 @@ range of years.`,
       id: 'held-excluded',
       title: 'Excludes live holds and confirmed bookings',
       detail:
-        'A slot is free only when the map has no entry, or its entry is neither `booked:` nor a hold id whose `hold:{id}` key still exists. The draft returns everything the materialization recorded.',
+        'A slot is free only when the map has no entry, or its entry is neither `booked:` nor a hold id whose `hold:{id}` key still exists. The starter returns everything the materialization recorded.',
       match: {
         python: {all: [/def is_free\(/, /booked:/, /hold:/]},
         typescript: {all: [/function isFree\(/, /booked:/, /hold:/]},
@@ -102,7 +102,7 @@ range of years.`,
       id: 'timezone-echo',
       title: 'Names the resolved timezone and rejects an unknown one',
       detail:
-        'The response carries the `timezone` it resolved, a caller-supplied zone overrides the resource default only when it is valid, and an unknown zone is **400** with `unknown_timezone`. The draft echoes nothing and silently treats every input as UTC.',
+        'The response carries the `timezone` it resolved, a caller-supplied zone overrides the resource default only when it is valid, and an unknown zone is **400** with `unknown_timezone`. The starter echoes nothing and silently treats every input as UTC.',
       match: {
         python: {all: [/timezone/, /unknown_timezone/, /status_code\s*=\s*400/]},
         typescript: {all: [/timezone/, /unknown_timezone/, /code\(\s*400\s*\)/]},
@@ -131,7 +131,7 @@ def availability(
     date_to: date = Query(alias="to"),
     tz: str = Query(default="UTC"),
 ) -> JSONResponse:
-    # TODO: this draft reads a nightly materialization instead of the hold map the booking path
+    # TODO: this starter reads a nightly materialization instead of the hold map the booking path
     # writes, returns slots that are already held, has no cap on the range, and never says which
     # timezone it resolved. Read the live slot map, drop live holds, cap the range and echo the zone.
     slots: list[str] = []
@@ -216,7 +216,7 @@ export const app = Fastify();
 export const redis = new Redis({host: 'redis', port: 6379});
 
 app.get('/v1/resources/:resourceId/availability', async (request, reply) => {
-  // TODO: this draft reads a nightly materialization instead of the hold map the booking path
+  // TODO: this starter reads a nightly materialization instead of the hold map the booking path
   // writes, returns slots that are already held, has no cap on the range, and never says which
   // timezone it resolved. Read the live slot map, drop live holds, cap the range and echo the zone.
   const {resourceId} = request.params as {resourceId: string};
@@ -312,7 +312,7 @@ import (
 )
 
 func availability(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft reads a nightly materialization instead of the hold map the booking path
+	// TODO: this starter reads a nightly materialization instead of the hold map the booking path
 	// writes, returns slots that are already held, has no cap on the range, and never says which
 	// timezone it resolved. Read the live slot map, drop live holds, cap the range and echo the zone.
 	resourceID := r.PathValue("resourceID")
@@ -462,7 +462,7 @@ object AvailabilityApi {
     path("v1" / "resources" / Segment / "availability") { resourceId =>
       get {
         parameter("from", "to", "tz".?) { (from, to, requestedZone) =>
-          // TODO: this draft reads a nightly materialization instead of the hold map the booking
+          // TODO: this starter reads a nightly materialization instead of the hold map the booking
           // path writes, returns slots that are already held, has no cap on the range, and never
           // says which timezone it resolved. Read the live slot map, drop live holds, cap the range
           // and echo the zone.
@@ -573,7 +573,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get(R"(/v1/resources/([^/]+)/availability)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft reads a nightly materialization instead of the hold map the booking path
+    // TODO: this starter reads a nightly materialization instead of the hold map the booking path
     // writes, returns slots that are already held, has no cap on the range, and never says which
     // timezone it resolved. Read the live slot map, drop live holds, cap the range and echo the zone.
     const std::string resourceId = req.matches[1];

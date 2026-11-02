@@ -7,12 +7,12 @@ import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
 
 /**
- * KYC verification on the AI-era track: the course is not "call an identity vendor from an
- * endpoint", it is the review you owe a model-generated verification flow before it decides who
- * gets an account. A submission endpoint whose verdict is never the caller's → atomic attempt and
- * case state in Redis → a vendor call with a 10-second deadline whose only failure outcome is a
- * human → applicant-keyed decision events carrying digests instead of documents → a scoped status
- * read that hands out short-lived document links.
+ * KYC verification: the course is not "call an identity vendor from an endpoint", it is the
+ * debugging you owe a verification flow before it decides who gets an account. A submission
+ * endpoint whose verdict is never the caller's → atomic attempt and case state in Redis → a vendor
+ * call with a 10-second deadline whose only failure outcome is a human → applicant-keyed decision
+ * events carrying digests instead of documents → a scoped status read that hands out short-lived
+ * document links.
  */
 export const kycVerificationProblem: Problem = {
   id: 'kyc-verification',
@@ -20,7 +20,6 @@ export const kycVerificationProblem: Problem = {
   tagline: 'Identity verification with attempts bounded, vendors decided once and documents scoped.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# KYC Verification
 
@@ -66,14 +65,14 @@ One service, **kycd**, with five pieces:
    \`degraded\` or awaiting a human. A foreign applicant is **404**, refusal reasons are the
    customer-facing set, and document images are reachable only through a short-lived signed link.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real KYC feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version. The subtle ones here are the failures that keep
-conversion up — approving on a timeout, letting a caller set the verdict, handing out a URL that
-never expires — because each of them looks like a feature until the regulator asks.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real KYC feature: debug it
+against the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix
+with checks that fail on the starter and pass on your version. The subtle ones here are the failures
+that keep conversion up — approving on a timeout, letting a caller set the verdict, handing out a
+URL that never expires — because each of them looks like a feature until the regulator asks.
 
 ## Left out on purpose
 

@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'media', 'pricing'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: when the media and pricing
+**Starting point.** The starter is working code: when the media and pricing
 services are healthy the product publishes, so the demo passes. Every failure path publishes
-something worse than nothing. Review it, fix it, and prove the fix.
+something worse than nothing. Debug it, fix it, and prove the fix.
 
 Implement the validation the publish path runs before the pointer moves.
 
@@ -28,7 +28,7 @@ Implement the validation the publish path runs before the pointer moves.
 - **A held-back publish leaves the pointer on the previous version.** The validation runs **before**
   the swap, so a failure means the storefront keeps serving what it already had.
 
-**Failure mode the checks target.** The draft publishes the moment the **first** rendition succeeds
+**Failure mode the checks target.** The starter publishes the moment the **first** rendition succeeds
 and marks the rest best-effort, so a product goes live missing its main image; it retries a rejected
 pricing table forever, so a bad draft becomes a hot loop against pricing; and because validation is
 best-effort, the pointer moves even when the version is incomplete.`,
@@ -61,7 +61,7 @@ best-effort, the pointer moves even when the version is incomplete.`,
       id: 'renditions-required',
       title: 'A missing rendition holds the whole version back',
       detail:
-        'Every rendition in `RENDITIONS` is checked and validated, and a missing or not-ready one raises a held-back publish (`PublishHeld`) instead of being skipped. The draft publishes as soon as the first rendition succeeds and calls the rest best-effort.',
+        'Every rendition in `RENDITIONS` is checked and validated, and a missing or not-ready one raises a held-back publish (`PublishHeld`) instead of being skipped. The starter publishes as soon as the first rendition succeeds and calls the rest best-effort.',
       match: {
         python: {all: [/RENDITIONS/, /def validate_renditions/, /raise PublishHeld/], none: [/best_effort/]},
         typescript: {all: [/RENDITIONS/, /validateRenditions\(/, /PublishHeld/], none: [/bestEffort/]},
@@ -90,7 +90,7 @@ best-effort, the pointer moves even when the version is incomplete.`,
       id: 'hold-back',
       title: 'Validates before the pointer swap',
       detail:
-        'Validation runs before the published pointer is swapped, so a failure holds the version back and the storefront keeps the previous one. The draft validates best-effort and swaps anyway.',
+        'Validation runs before the published pointer is swapped, so a failure holds the version back and the storefront keeps the previous one. The starter validates best-effort and swaps anyway.',
       match: {
         python: {order: [/validate_renditions\(/, /swap_published\(/]},
         typescript: {order: [/validateRenditions\(/, /swapPublished\(/]},
@@ -128,8 +128,8 @@ pricing = pricing_pb2_grpc.PricingStub(grpc.insecure_channel("pricing:9000"))
 
 
 def publish(product_id: str, draft: dict) -> dict:
-    # TODO: this draft publishes as soon as the first rendition lands, treats the rest as
-    # best-effort, and retries a rejected pricing table until it passes. Review all three.
+    # TODO: this starter publishes as soon as the first rendition lands, treats the rest as
+    # best-effort, and retries a rejected pricing table until it passes. Fix all three.
     for rendition in draft["renditions"].values():
         try:
             media.Validate(
@@ -214,7 +214,7 @@ def publish(product_id: str, draft: dict) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Publish validation: a model-generated draft that publishes on the first rendition. */
+      starter: `/** Publish validation: flawed code that publishes on the first rendition. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -232,8 +232,8 @@ const {media, pricing} = grpc.loadPackageDefinition(protoLoader.loadSync('catalo
 };
 
 export async function publish(productId: string, draft: DraftView): Promise<number> {
-  // TODO: this draft publishes as soon as the first rendition lands, treats the rest as
-  // best-effort, and retries a rejected pricing table until it passes. Review all three.
+  // TODO: this starter publishes as soon as the first rendition lands, treats the rest as
+  // best-effort, and retries a rejected pricing table until it passes. Fix all three.
   for (const rendition of Object.values(draft.renditions)) {
     try {
       await call(media, {product_id: productId, rendition: rendition.name}, {deadline: Date.now() + 8000});
@@ -366,8 +366,8 @@ func publish(
 	productID string,
 	draft DraftView,
 ) (int, error) {
-	// TODO: this draft publishes as soon as the first rendition lands, treats the rest as
-	// best-effort, and retries a rejected pricing table until it passes. Review all three.
+	// TODO: this starter publishes as soon as the first rendition lands, treats the rest as
+	// best-effort, and retries a rejected pricing table until it passes. Fix all three.
 	for _, rendition := range draft.Renditions {
 		callCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		_, err := media.Validate(callCtx, &pb.RenditionRequest{ProductId: productID, Rendition: rendition.Name})
@@ -484,8 +484,8 @@ object PublishValidation {
   val media = MediaGrpc.blockingStub(ManagedChannelBuilder.forAddress("media", 9000).usePlaintext().build())
   val pricing = PricingGrpc.blockingStub(ManagedChannelBuilder.forAddress("pricing", 9000).usePlaintext().build())
 
-  // TODO: this draft publishes as soon as the first rendition lands, treats the rest as
-  // best-effort, and retries a rejected pricing table until it passes. Review all three.
+  // TODO: this starter publishes as soon as the first rendition lands, treats the rest as
+  // best-effort, and retries a rejected pricing table until it passes. Fix all three.
   def publish(productId: String, draft: DraftView): Int = {
     draft.renditions.values.foreach { rendition =>
       try {
@@ -576,8 +576,8 @@ object PublishValidation {
 int swapPublished(const std::string& productId, int version);
 
 int publish(Media::Stub& media, Pricing::Stub& pricing, const std::string& productId, const DraftView& draft) {
-  // TODO: this draft publishes as soon as the first rendition lands, treats the rest as
-  // best-effort, and retries a rejected pricing table until it passes. Review all three.
+  // TODO: this starter publishes as soon as the first rendition lands, treats the rest as
+  // best-effort, and retries a rejected pricing table until it passes. Fix all three.
   for (const auto& [name, rendition] : draft.renditions()) {
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(8));
@@ -679,5 +679,5 @@ int publish(Media::Stub& media, Pricing::Stub& pricing, const std::string& produ
     'Loop over the declared renditions and raise on the first one that is missing or not `ready` — the loop is over `RENDITIONS`, not over the draft\'s own renditions, because a draft with no main image has nothing to iterate. "Best effort" here means "publish a broken product".',
     'Validation is a precondition of the swap, not a side effect of it: run it before `swapPublished(...)` and let the exception propagate, so the previous version stays live. Fingerprint the draft instead of retrying the rejection, so a stale rejection cannot block a corrected draft.',
   ],
-  debrief: `The interviewer is checking whether you can review failure handling on a path whose happy case is already written. Three defects: partial success treated as success (publish on the first rendition), an unbounded retry against a service that has already said no (a hot loop that also blocks the publish), and validation that does not gate the pointer swap — so even a validated failure can leave a half-published product. The pattern to internalise is "all-or-nothing across dependencies": validate everything under a deadline, raise on the first failure, and let the state change (the pointer swap) be the *last* thing that happens. Real catalogs add a per-rendition readiness webhook, a pricing evaluation cache keyed by draft fingerprint, and a compensating hold that tells merchandising why the version did not go live.`,
+  debrief: `The interviewer is checking whether you can debug failure handling on a path whose happy case is already written. Three defects: partial success treated as success (publish on the first rendition), an unbounded retry against a service that has already said no (a hot loop that also blocks the publish), and validation that does not gate the pointer swap — so even a validated failure can leave a half-published product. The pattern to internalise is "all-or-nothing across dependencies": validate everything under a deadline, raise on the first failure, and let the state change (the pointer swap) be the *last* thing that happens. Real catalogs add a per-rendition readiness webhook, a pricing evaluation cache keyed by draft fingerprint, and a compensating hold that tells merchandising why the version did not go live.`,
 };

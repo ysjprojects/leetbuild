@@ -8,7 +8,7 @@ export const pullReadStep: Step = {
   focus: ['device', 'sync', 'revisions', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it returns changes for a
+**Starting point.** The starter is working code: it returns changes for a
 device, the demo client renders them, and the watermark makes it look like a proper sync protocol.
 Two of its three answers are lies, and both of them make a device believe it is caught up when it is
 not. Find them, fix them, and prove the fix.
@@ -75,7 +75,7 @@ and no concurrent writers.`,
       id: 'watermark-covers-returned',
       title: 'The watermark covers exactly the returned entries',
       detail:
-        'The watermark is derived from the entries actually returned (`covered_watermark(entries, cursor)`), falling back to the device’s cursor when the page is empty — never the newest write in the system. The draft answers with the latest revision regardless of what it returned.',
+        'The watermark is derived from the entries actually returned (`covered_watermark(entries, cursor)`), falling back to the device’s cursor when the page is empty — never the newest write in the system. The starter answers with the latest revision regardless of what it returned.',
       match: {
         python: {all: [/covered_watermark\(/, /"watermark"/], none: [/latest_revision/]},
         typescript: {all: [/coveredWatermark\(/, /watermark/], none: [/latestRevision/]},
@@ -88,7 +88,7 @@ and no concurrent writers.`,
       id: 'cursor-pagination',
       title: 'Paginates by cursor, never by offset',
       detail:
-        'The query is expressed as "changes after this revision" (`start_after` / `startAfter`), so a concurrent write cannot shift the next page. The draft paginates by `offset`, which duplicates or skips changes while writes are happening.',
+        'The query is expressed as "changes after this revision" (`start_after` / `startAfter`), so a concurrent write cannot shift the next page. The starter paginates by `offset`, which duplicates or skips changes while writes are happening.',
       match: {
         python: {all: [/start_after/], none: [/\boffset\b/]},
         typescript: {all: [/startAfter/], none: [/\boffset\b/]},
@@ -101,7 +101,7 @@ and no concurrent writers.`,
       id: 'page-cap',
       title: 'Caps the page at 1000 entries',
       detail:
-        'The store is asked for at most `MAX_DELTA_ENTRIES` (1000) entries, and the constant is what the handler passes to the query. The draft has an unrelated page constant and no cap contract.',
+        'The store is asked for at most `MAX_DELTA_ENTRIES` (1000) entries, and the constant is what the handler passes to the query. The starter has an unrelated page constant and no cap contract.',
       match: {
         python: {all: [/MAX_DELTA_ENTRIES\s*=\s*1000/, /changes_after\(cursor, MAX_DELTA_ENTRIES\)/]},
         typescript: {all: [/MAX_DELTA_ENTRIES\s*=\s*1000/, /startAfter:\s*cursor, limit: MAX_DELTA_ENTRIES/]},
@@ -114,7 +114,7 @@ and no concurrent writers.`,
       id: 'cap-resumable',
       title: 'A full page returns a resumable cursor',
       detail:
-        'Reaching the cap sets `has_more` and returns the `next_cursor` that resumes exactly where this response stopped, so the device pulls again instead of skipping. The draft returns no cursor and no flag, so a capped device silently stops.',
+        'Reaching the cap sets `has_more` and returns the `next_cursor` that resumes exactly where this response stopped, so the device pulls again instead of skipping. The starter returns no cursor and no flag, so a capped device silently stops.',
       match: {
         python: {all: [/next_cursor/, /has_more/, /len\(entries\)\s*==\s*MAX_DELTA_ENTRIES/]},
         typescript: {all: [/next_cursor/, /has_more/, /entries\.length === MAX_DELTA_ENTRIES/]},
@@ -206,7 +206,7 @@ def pull(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/sync/pull: a model-generated draft that answers with the newest revision. */
+      starter: `/** GET /v1/sync/pull: flawed code that answers with the newest revision. */
 import Fastify from 'fastify';
 
 import {store} from './revisions';

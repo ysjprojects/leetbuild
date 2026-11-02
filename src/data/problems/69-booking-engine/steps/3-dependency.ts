@@ -8,9 +8,9 @@ export const bookingClientStep: Step = {
   focus: ['api', 'calendar'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it calls the calendar, retries
+**Starting point.** The starter is working code: it calls the calendar, retries
 when something goes wrong, and cancels the booking if it cannot. It is also how you get two calendar
-events for one booking and a cancelled booking whose invitation is still in everyone's inbox. Review
+events for one booking and a cancelled booking whose invitation is still in everyone's inbox. Debug
 it like the service owner, fix it, and prove the fix with the checks below.
 
 Confirmation calls the external calendar over gRPC. That call is where a local booking becomes a real
@@ -32,7 +32,7 @@ reservation, so it needs a deadline, an identity, and a failure policy that neve
   and only cancel the local booking when the calendar confirms no event exists. Cancelling on a
   timeout is how a guest arrives to a booking the system no longer believes in.
 
-**Failure mode the checks target.** The draft loops until it succeeds, sends no idempotency key (so
+**Failure mode the checks target.** The starter loops until it succeeds, sends no idempotency key (so
 every retry creates another event), and treats a timeout as proof that nothing happened — it cancels
 the booking while the invitation is already in the calendar.`,
   sequence: {
@@ -58,7 +58,7 @@ the booking while the invitation is already in the calendar.`,
       id: 'deadline',
       title: 'Bounds every attempt with a 3000 ms deadline',
       detail:
-        'Each sync attempt carries a `3000` ms deadline, so a hanging calendar cannot hold the request open. The draft calls with a one-second timeout on some paths and none on others.',
+        'Each sync attempt carries a `3000` ms deadline, so a hanging calendar cannot hold the request open. The starter calls with a one-second timeout on some paths and none on others.',
       match: {
         python: {all: [/SYNC_DEADLINE_MS\s*=\s*3000/, /timeout=SYNC_DEADLINE_MS/]},
         typescript: {all: [/SYNC_DEADLINE_MS\s*=\s*3000/, /Date\.now\(\) \+ SYNC_DEADLINE_MS/]},
@@ -71,7 +71,7 @@ the booking while the invitation is already in the calendar.`,
       id: 'idempotency-key',
       title: 'Sends the booking idempotency key so a retry updates one event',
       detail:
-        'The sync request carries the booking’s `idempotency_key`, which makes the calendar upsert: a retried sync updates the same event. The draft sends the booking id only, so every retry creates another event.',
+        'The sync request carries the booking’s `idempotency_key`, which makes the calendar upsert: a retried sync updates the same event. The starter sends the booking id only, so every retry creates another event.',
       match: {
         python: {all: [/idempotency_key/, /def sync_event\(/, /timeout=SYNC_DEADLINE_MS/]},
         typescript: {all: [/idempotency_key/, /function syncEvent\(/, /SYNC_DEADLINE_MS/]},
@@ -84,7 +84,7 @@ the booking while the invitation is already in the calendar.`,
       id: 'timeout-reconcile',
       title: 'Records an unknown state and reconciles before cancelling',
       detail:
-        'A timeout after every attempt records `sync_unknown`, looks the event up by the idempotency key, and only then decides. The draft cancels the local booking on the first timeout.',
+        'A timeout after every attempt records `sync_unknown`, looks the event up by the idempotency key, and only then decides. The starter cancels the local booking on the first timeout.',
       match: {
         python: {
           all: [/SYNC_UNKNOWN/, /def reconcile_event\(/],
@@ -112,7 +112,7 @@ the booking while the invitation is already in the calendar.`,
       id: 'non-retryable-release',
       title: 'Releases the hold when the calendar refuses the booking',
       detail:
-        'A permanent rejection is not retried: the code frees the hold instead of leaving it to expire, so a refused booking does not block the slot for the payment window. The draft treats every error the same.',
+        'A permanent rejection is not retried: the code frees the hold instead of leaving it to expire, so a refused booking does not block the slot for the payment window. The starter treats every error the same.',
       match: {
         python: {all: [/INVALID_ARGUMENT/, /release_hold\(/]},
         typescript: {all: [/INVALID_ARGUMENT/, /releaseHold\(/]},
@@ -125,7 +125,7 @@ the booking while the invitation is already in the calendar.`,
       id: 'bounded-retry',
       title: 'Retries only retryable failures, at most 3 times',
       detail:
-        'Only `DEADLINE_EXCEEDED` and `UNAVAILABLE` are retried, with a `3`-attempt cap. The draft loops forever on every error.',
+        'Only `DEADLINE_EXCEEDED` and `UNAVAILABLE` are retried, with a `3`-attempt cap. The starter loops forever on every error.',
       match: {
         python: {all: [/MAX_SYNC_ATTEMPTS\s*=\s*3/, /UNAVAILABLE/], none: [/while\s+True/]},
         typescript: {all: [/MAX_SYNC_ATTEMPTS\s*=\s*3/, /UNAVAILABLE/], none: [/while\s*\(\s*true\s*\)/]},
@@ -141,14 +141,14 @@ the booking while the invitation is already in the calendar.`,
 
 
 def sync_event(stub, booking, attempt: int):
-    # TODO: this draft sends no idempotency_key, so every retry creates another calendar event,
+    # TODO: this starter sends no idempotency_key, so every retry creates another calendar event,
     # and its timeout is inconsistent.
     request = {"booking_id": booking["booking_id"], "start": booking["start"], "end": booking["end"]}
     return stub.Sync(request, timeout=1)
 
 
 def confirm_booking(store, stub, booking) -> str:
-    # TODO: this draft retries every error forever and cancels the local booking on the first
+    # TODO: this starter retries every error forever and cancels the local booking on the first
     # timeout, even though the external event may already exist. Bound the attempts, send the
     # idempotency key, and reconcile before cancelling.
     while True:
@@ -225,12 +225,12 @@ export interface Booking {
 }
 
 export function syncEvent(client: grpc.Client, booking: Booking, attempt: number): Promise<{event_id: string}> {
-  // TODO: this draft sends no idempotency_key, so every retry creates another calendar event.
+  // TODO: this starter sends no idempotency_key, so every retry creates another calendar event.
   return callSync(client, {booking_id: booking.bookingId, start: booking.start, end: booking.end}, 1000);
 }
 
 export async function confirmBooking(store: BookingStore, client: grpc.Client, booking: Booking): Promise<string> {
-  // TODO: this draft retries every error forever and cancels the local booking on the first
+  // TODO: this starter retries every error forever and cancels the local booking on the first
   // timeout, even though the external event may already exist. Bound the attempts, send the
   // idempotency key, and reconcile before cancelling.
   while (true) {
@@ -336,7 +336,7 @@ import (
 )
 
 func syncEvent(ctx context.Context, client CalendarClient, booking Booking, attempt int) (*Event, error) {
-	// TODO: this draft sends no idempotency_key, so every retry creates another calendar event,
+	// TODO: this starter sends no idempotency_key, so every retry creates another calendar event,
 	// and its timeout is inconsistent.
 	callCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
@@ -344,7 +344,7 @@ func syncEvent(ctx context.Context, client CalendarClient, booking Booking, atte
 }
 
 func confirmBooking(store BookingStore, client CalendarClient, booking Booking) (string, error) {
-	// TODO: this draft retries every error forever and cancels the local booking on the first
+	// TODO: this starter retries every error forever and cancels the local booking on the first
 	// timeout, even though the external event may already exist. Bound the attempts, send the
 	// idempotency key, and reconcile before cancelling.
 	for {
@@ -460,11 +460,11 @@ final case class CalendarError(status: io.grpc.Status.Code) extends RuntimeExcep
 
 object CalendarSync {
   def syncEvent(client: CalendarClient, booking: Booking, attempt: Int): Event =
-    // TODO: this draft sends no idempotency_key, so every retry creates another calendar event.
+    // TODO: this starter sends no idempotency_key, so every retry creates another calendar event.
     Await.result(client.sync(SyncRequest(bookingId = booking.id, start = booking.start, end = booking.end)), 1.second)
 
   def confirmBooking(store: BookingStore, client: CalendarClient, booking: Booking): String = {
-    // TODO: this draft retries every error forever and cancels the local booking on the first
+    // TODO: this starter retries every error forever and cancels the local booking on the first
     // timeout, even though the external event may already exist. Bound the attempts, send the
     // idempotency key, and reconcile before cancelling.
     var outcome = ""
@@ -571,7 +571,7 @@ object CalendarSync {
 #include <string>
 
 std::string syncEvent(Calendar::Stub* stub, const Booking& booking, int attempt) {
-  // TODO: this draft sends no idempotency_key, so every retry creates another calendar event,
+  // TODO: this starter sends no idempotency_key, so every retry creates another calendar event,
   // and its deadline is inconsistently short.
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(1));
@@ -581,7 +581,7 @@ std::string syncEvent(Calendar::Stub* stub, const Booking& booking, int attempt)
 }
 
 std::string confirmBooking(BookingStore& store, Calendar::Stub* stub, const Booking& booking) {
-  // TODO: this draft retries every error forever and cancels the local booking on the first
+  // TODO: this starter retries every error forever and cancels the local booking on the first
   // timeout, even though the external event may already exist. Bound the attempts, send the
   // idempotency key, and reconcile before cancelling.
   while (true) {

@@ -7,8 +7,8 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Content classifier on the AI-era track: the course is not "call a model and return its labels", it
- * is the review you owe a model-generated classifier before downstream routing trusts it. Labels
+ * Content classifier: the course is not "call a model and return its labels", it
+ * is the debugging you owe a classifier before downstream routing trusts it. Labels
  * bound to a tenant's taxonomy version → a tenant-scoped Redis cache with windowed counters → a
  * gRPC model call with a deadline, a terminal refusal and a rules fallback that never invents
  * evidence → tenant-keyed events carrying a digest instead of the document → immutable versioned
@@ -20,7 +20,7 @@ export const contentClassifierProblem: Problem = {
   tagline: 'Taxonomy-bound classification with calibrated fallbacks and per-tenant metrics.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
+  tag: 'ai-systems',
   minutes: 70,
   statement: `# Content Classifier
 
@@ -64,12 +64,12 @@ One service, **classifierd**, with five pieces:
 5. \`GET /v1/taxonomies/{id}\`: an immutable version with its changelog, scoped to the tenant, and a
    classification record that names the exact version it used.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

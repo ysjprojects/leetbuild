@@ -8,9 +8,9 @@ export const dependencyStep: Step = {
   focus: ['api', 'warehouse'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it writes a partition, retries
+**Starting point.** The starter is working code: it writes a partition, retries
 when the warehouse is slow, and returns a row count. It appends a fresh statement on every retry, so
-the demo load is fast and the retried load is wrong. Review it like the service owner, fix it, and
+the demo load is fast and the retried load is wrong. Debug it like the service owner, fix it, and
 prove the fix.
 
 Implement the warehouse client that writes one partition of a manifest over gRPC.
@@ -61,7 +61,7 @@ burns the retry budget on a request that can never succeed.`,
       id: 'deadline',
       title: 'Puts a 30-second deadline on every attempt',
       detail:
-        'Each attempt calls the warehouse under a `DEADLINE_S` (30s) deadline. The draft calls without one, so a slow warehouse pins the worker forever.',
+        'Each attempt calls the warehouse under a `DEADLINE_S` (30s) deadline. The starter calls without one, so a slow warehouse pins the worker forever.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_S/, /DEADLINE_S \* 1000/]},
@@ -74,7 +74,7 @@ burns the retry budget on a request that can never succeed.`,
       id: 'merge-key',
       title: 'Merges on (manifest id, partition id) so a retry replaces itself',
       detail:
-        'The statement is a `MERGE` matching `t.manifest_id = … AND t.partition_id = …`. The draft builds a fresh `INSERT … SELECT` on every retry, so the retried partition is written twice.',
+        'The statement is a `MERGE` matching `t.manifest_id = … AND t.partition_id = …`. The starter builds a fresh `INSERT … SELECT` on every retry, so the retried partition is written twice.',
       match: {
         python: {all: [/MERGE/, /manifest_id/, /partition_id/]},
         typescript: {all: [/MERGE/, /manifest_id/, /partition_id/]},
@@ -87,7 +87,7 @@ burns the retry budget on a request that can never succeed.`,
       id: 'retry-classification',
       title: 'Retries only the retryable statuses and stops on PERMISSION_DENIED',
       detail:
-        '`UNAVAILABLE` and `DEADLINE_EXCEEDED` retry; `PERMISSION_DENIED` stops the load with a visible reason and no further attempt. The draft catches every error and retries forever.',
+        '`UNAVAILABLE` and `DEADLINE_EXCEEDED` retry; `PERMISSION_DENIED` stops the load with a visible reason and no further attempt. The starter catches every error and retries forever.',
       match: {
         python: {all: [/UNAVAILABLE/, /PERMISSION_DENIED/, /RETRYABLE/]},
         typescript: {all: [/UNAVAILABLE/, /PERMISSION_DENIED/, /RETRYABLE/]},
@@ -100,7 +100,7 @@ burns the retry budget on a request that can never succeed.`,
       id: 'bounded-attempts',
       title: 'Bounds the attempts and backs off',
       detail:
-        'At most `MAX_ATTEMPTS` (3) attempts, sleeping between them. The draft loops without a bound, so one bad partition retries forever.',
+        'At most `MAX_ATTEMPTS` (3) attempts, sleeping between them. The starter loops without a bound, so one bad partition retries forever.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /time\.sleep\(/]},
         typescript: {all: [/MAX_ATTEMPTS/, /setTimeout\(/]},
@@ -113,7 +113,7 @@ burns the retry budget on a request that can never succeed.`,
       id: 'reconcile',
       title: 'Reports the warehouse count for the successful attempt',
       detail:
-        'The count comes from the reply of the attempt that succeeded and is assigned, not accumulated: `rows_written = reply.rows_written`. The draft does `rows_written += reply.rows_written` inside the loop, so every retry inflates the total.',
+        'The count comes from the reply of the attempt that succeeded and is assigned, not accumulated: `rows_written = reply.rows_written`. The starter does `rows_written += reply.rows_written` inside the loop, so every retry inflates the total.',
       match: {
         python: {all: [/reply\.rows_written/], none: [/rows_written\s*\+=/]},
         typescript: {all: [/reply\.rows_written/], none: [/rowsWritten\s*\+=/]},
@@ -132,9 +132,9 @@ from warehouse_pb2_grpc import WarehouseStub
 
 
 def write_partition(stub: WarehouseStub, target: str, manifest_id: str, partition_id: str, transform_sql: str, mode: str) -> int:
-    # TODO: this draft builds a fresh append statement on every retry, calls without a deadline,
+    # TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
     # retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-    # total. Review all four.
+    # total. Fix all four.
     statement = f"INSERT INTO {target} SELECT * FROM ({transform_sql}) AS s"
     request = WritePartitionRequest(target=target, partition_id=partition_id, statement=statement)
     rows_written = 0
@@ -211,7 +211,7 @@ def write_partition(
 `,
     },
     typescript: {
-      starter: `/** Warehouse writes: a model-generated draft that appends a fresh statement on every retry. */
+      starter: `/** Warehouse writes: flawed code that appends a fresh statement on every retry. */
 import * as grpc from '@grpc/grpc-js';
 
 interface WriteRequest {
@@ -236,9 +236,9 @@ export async function writePartition(
   transformSql: string,
   mode: string,
 ): Promise<number> {
-  // TODO: this draft builds a fresh append statement on every retry, calls without a deadline,
+  // TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
   // retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-  // total. Review all four.
+  // total. Fix all four.
   let rowsWritten = 0;
   for (;;) {
     const statement = \`INSERT INTO \${target} SELECT * FROM (\${transformSql}) AS s\`;
@@ -388,9 +388,9 @@ import (
 
 // WritePartition writes one partition of a manifest and returns the rows it wrote.
 func WritePartition(ctx context.Context, client pb.WarehouseClient, target, manifestID, partitionID, transformSQL, mode, token string) (int64, error) {
-	// TODO: this draft builds a fresh append statement on every retry, calls without a deadline,
+	// TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
 	// retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-	// total. Review all four.
+	// total. Fix all four.
 	statement := fmt.Sprintf("INSERT INTO %s SELECT * FROM (%s) AS s", target, transformSQL)
 	request := &pb.WritePartitionRequest{Target: target, PartitionId: partitionID, Statement: statement}
 	rowsWritten := int64(0)
@@ -493,9 +493,9 @@ import loader.warehouse.{WarehouseGrpc, WritePartitionRequest}
 object WarehouseWriter {
   def writePartition(stub: WarehouseGrpc.WarehouseBlockingStub, target: String, manifestId: String, partitionId: String,
                      transformSql: String, mode: String): Long = {
-    // TODO: this draft builds a fresh append statement on every retry, calls without a deadline,
+    // TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
     // retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-    // total. Review all four.
+    // total. Fix all four.
     var rowsWritten = 0L
     var done = false
     while (!done) {
@@ -584,9 +584,9 @@ object WarehouseWriter {
 // Writes one partition of a manifest and returns the rows it wrote.
 long writePartition(warehouse::Warehouse::Stub* stub, const std::string& target, const std::string& manifestId,
                     const std::string& partitionId, const std::string& transformSql, const std::string& mode) {
-  // TODO: this draft builds a fresh append statement on every retry, calls without a deadline,
+  // TODO: this starter builds a fresh append statement on every retry, calls without a deadline,
   // retries every error including PERMISSION_DENIED, and adds each attempt's rows to a running
-  // total. Review all four.
+  // total. Fix all four.
   long rowsWritten = 0;
   for (;;) {
     grpc::ClientContext ctx;
@@ -679,7 +679,7 @@ long writePartition(warehouse::Warehouse::Stub* stub, const std::string& target,
     },
   },
   debrief: `The interviewer is testing retry semantics, which is where data platforms lose data quietly. The
-draft's retry looks careful — it re-sends a statement and reports a total — but the statement is an
+starter's retry looks careful — it re-sends a statement and reports a total — but the statement is an
 append, so attempt two writes the partition's rows a second time, and the total is accumulated from
 every attempt, so the inflated number looks like success. The fix is three coupled decisions: the
 statement is built once and keyed by (manifest id, partition id) so the warehouse itself dedupes the

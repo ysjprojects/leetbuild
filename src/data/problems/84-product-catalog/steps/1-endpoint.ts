@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it creates a product, it
+**Starting point.** The starter is working code: it creates a product, it
 accepts a publish, and the demo shows a live product. It compiles, it serves the happy path, and it
-hides three production flaws. Review it like the catalog owner, fix it, and prove the fix with the
+hides three production flaws. Debug it like the catalog owner, fix it, and prove the fix with the
 checks below.
 
 Implement the write side of the catalog on \`POST /v1/products\`, \`PATCH /v1/products/{id}\` and
@@ -29,7 +29,7 @@ Implement the write side of the catalog on \`POST /v1/products\`, \`PATCH /v1/pr
   returns the **same** version instead of minting a new one; a missing key is **400**. Publishing
   twice must not produce two live versions.
 
-**Failure mode the checks target.** The draft edits the published record in place, so an
+**Failure mode the checks target.** The starter edits the published record in place, so an
 unpublished edit is immediately visible on the storefront; it publishes happily with the price or
 the tax class missing, so the page goes live unpriced; and it re-publishes on every retry, so a
 client timeout plus retry mints a second version of the same product.`,
@@ -64,7 +64,7 @@ client timeout plus retry mints a second version of the same product.`,
       id: 'draft-write',
       title: 'Edits write the draft row, never the published version',
       detail:
-        'An edit goes through the draft (`writeDraft`/`write_draft`) and the publish reads the draft (`draftOf`/`draft_of`) — nothing updates a published row. The draft writes every edit straight into the published record, so an unpublished change is live immediately.',
+        'An edit goes through the draft (`writeDraft`/`write_draft`) and the publish reads the draft (`draftOf`/`draft_of`) — nothing updates a published row. The starter writes every edit straight into the published record, so an unpublished change is live immediately.',
       match: {
         python: {all: [/write_draft\(/, /draft_of\(/], none: [/update_published\(/]},
         typescript: {all: [/writeDraft\(/, /draftOf\(/], none: [/updatePublished\(/]},
@@ -77,7 +77,7 @@ client timeout plus retry mints a second version of the same product.`,
       id: 'required-fields',
       title: 'A publish missing a required field is 422 naming it',
       detail:
-        'The required fields are declared (`REQUIRED_FIELDS`) and checked before the publish: a missing one answers **422 Unprocessable Entity** whose body carries the name of the missing field. The draft publishes with the price and the tax class unset.',
+        'The required fields are declared (`REQUIRED_FIELDS`) and checked before the publish: a missing one answers **422 Unprocessable Entity** whose body carries the name of the missing field. The starter publishes with the price and the tax class unset.',
       match: {
         python: {all: [/REQUIRED_FIELDS/, /status_code\s*=\s*422/, /missing/]},
         typescript: {all: [/REQUIRED_FIELDS/, /code\(\s*422\s*\)/, /missing/]},
@@ -90,7 +90,7 @@ client timeout plus retry mints a second version of the same product.`,
       id: 'publish-idempotency',
       title: 'Keys a publish action by (product, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required and the recorded publish result is looked up under `(product_id, key)` **before** the publish runs, so a replay returns the stored version instead of minting a new one. The draft ignores the header and promotes again.',
+        '`Idempotency-Key` is required and the recorded publish result is looked up under `(product_id, key)` **before** the publish runs, so a replay returns the stored version instead of minting a new one. The starter ignores the header and promotes again.',
       match: {
         python: {
           all: [/Idempotency-Key/, /published_result\(/, /\.publish\(/],
@@ -153,8 +153,8 @@ class ProductBody(BaseModel):
 
 @app.post("/v1/products")
 def create_product(body: ProductBody) -> JSONResponse:
-    # TODO: this draft edits the published record in place, publishes with the required fields
-    # missing (price, tax class), and re-publishes on every retry. Review all three.
+    # TODO: this starter edits the published record in place, publishes with the required fields
+    # missing (price, tax class), and re-publishes on every retry. Fix all three.
     product_id = str(uuid.uuid4())
     row = store.upsert(product_id, body.model_dump(exclude_none=True))
     row["status"] = "published"
@@ -253,7 +253,7 @@ def publish_product(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/products: a model-generated draft that publishes whatever it is given. */
+      starter: `/** POST /v1/products: flawed code that publishes whatever it is given. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -271,8 +271,8 @@ export async function upsert(productId: string, fields: ProductBody): Promise<Re
 }
 
 app.post('/v1/products', async (request, reply) => {
-  // TODO: this draft edits the published record in place, publishes with the required fields
-  // missing (price, tax class), and re-publishes on every retry. Review all three.
+  // TODO: this starter edits the published record in place, publishes with the required fields
+  // missing (price, tax class), and re-publishes on every retry. Fix all three.
   const body = request.body as ProductBody;
   const row = await upsert(randomUUID(), body);
   row.status = 'published';
@@ -379,8 +379,8 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func createProduct(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft edits the published record in place, publishes with the required fields
-	// missing (price, tax class), and re-publishes on every retry. Review all three.
+	// TODO: this starter edits the published record in place, publishes with the required fields
+	// missing (price, tax class), and re-publishes on every retry. Fix all three.
 	body := ProductBody{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	row, _ := store.Upsert(uuid.NewString(), map[string]any{"title": body.Title})
@@ -564,8 +564,8 @@ object CatalogApi {
     path("v1" / "products") {
       post {
         entity(as[ProductBody]) { body =>
-          // TODO: this draft edits the published record in place, publishes with the required
-          // fields missing (price, tax class), and re-publishes on every retry. Review all three.
+          // TODO: this starter edits the published record in place, publishes with the required
+          // fields missing (price, tax class), and re-publishes on every retry. Fix all three.
           val row = store.upsert("new", Map("title" -> body.title.getOrElse("")))
           complete(StatusCodes.OK, row.toJson.compactPrint)
         }
@@ -680,8 +680,8 @@ int main() {
   httplib::Server svr;
 
   svr.Post("/v1/products", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft edits the published record in place, publishes with the required fields
-    // missing (price, tax class), and re-publishes on every retry. Review all three.
+    // TODO: this starter edits the published record in place, publishes with the required fields
+    // missing (price, tax class), and re-publishes on every retry. Fix all three.
     const json body = json::parse(req.body, nullptr, false);
     json row = store.upsert("new", body);
     row["status"] = "published";
@@ -782,5 +782,5 @@ int main() {
     'Validate before you publish: build the list of required fields (`REQUIRED_FIELDS`) and answer `422` with the first missing name. A publish that only checks the fields it was given will happily go live with no price.',
     'The `Idempotency-Key` is the publish action’s identity. Look the recorded result up under `(product_id, key)` before promoting; on a hit, return the stored version. Without it, a client retry after a timeout mints a second published version of the same product.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler where the *data model* is the bug. Three separate defects are being checked: the draft writes the published record in place (so unpublished edits leak to the storefront), required fields are not validated before the publish (so an unpriced product goes live), and the publish action has no idempotency key (so a retry mints a second version). The immutable published version is what makes rollbacks and cache invalidation possible at all: if the published row can be rewritten, there is nothing stable to point a CDN or a stored version id at. Real catalogs add a version history with authors and timestamps, a two-person approval before a publish, and a scheduled release window per channel.`,
+  debrief: `The interviewer is testing whether you can debug a handler where the *data model* is the bug. Three separate defects are being checked: the starter writes the published record in place (so unpublished edits leak to the storefront), required fields are not validated before the publish (so an unpriced product goes live), and the publish action has no idempotency key (so a retry mints a second version). The immutable published version is what makes rollbacks and cache invalidation possible at all: if the published row can be rewritten, there is nothing stable to point a CDN or a stored version id at. Real catalogs add a version history with authors and timestamps, a two-person approval before a publish, and a scheduled release window per channel.`,
 };

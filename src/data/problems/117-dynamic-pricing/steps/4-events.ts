@@ -14,10 +14,10 @@ export const eventsStep: Step = {
   focus: ['api', 'kafka', 'db', 'relay'],
   task: `## Task
 
-**Review premise.** \`events\` — the publish path of **priced** — is a plausible model-generated
-draft: it produces \`price.changed\` on the happy path, every consumer sees a price move, and the demo
-looks finished. Four contracts are broken and none of them is visible until the day it matters: the
-draft keys the record by the **model version** that proposed the price, produces inside the same
+**Starting point.** \`events\` — the publish path of **priced** — is working code with a flaw: it
+produces \`price.changed\` on the happy path, every consumer sees a price move, and the demo looks
+finished. Four contracts are broken and none of them is visible until the day it matters: the
+starter keys the record by the **model version** that proposed the price, produces inside the same
 block *before* \`store.publish\` commits, ships an envelope that keeps only the new price, and never
 looks at the produce result, so a record the broker rejects is simply gone.
 
@@ -68,7 +68,7 @@ idempotent producer are what keep the stream complete.`,
   },
   hints: [
     'The message key is the partition key: `key=sku`, `key: sku`, `Key: []byte(sku)`, `ProducerRecord("price.changed", sku, …)`. Keyed by the model version, one sku’s price history lands in different partitions every time the model behind it changes — and a consumer replaying the topic can no longer answer what this sku’s price did.',
-    'Commit, then announce: read the old price with `store.get_sku(sku)`, call `store.publish(sku, price_cents, reason, source, update_id)`, and only then produce. The draft produces inside the same block *before* the commit, so a price the store rolled back still reaches every consumer.',
+    'Commit, then announce: read the old price with `store.get_sku(sku)`, call `store.publish(sku, price_cents, reason, source, update_id)`, and only then produce. The starter produces inside the same block *before* the commit, so a price the store rolled back still reaches every consumer.',
     'The outbox is the durability half, and the producer config is what makes the retry safe: wrap the produce and, when the broker rejects it, `store.insert_outbox(sku, event)`; have the relay loop over `store.pending_outbox(limit)` and produce each row under the same sku key; and configure `enable.idempotence=true` with `acks=all` (KafkaJS `idempotent: true` with `acks: -1`, kafka-go `RequiredAcks: kafka.RequireAll` and a `kafka.Hash` balancer), or the republish can duplicate a price move.',
   ],
   checks: [
@@ -76,7 +76,7 @@ idempotent producer are what keep the stream complete.`,
       id: 'sku-key',
       title: 'Keyed by sku, not by the model version',
       detail:
-        'The `price.changed` record is produced with the sku as its message key, so one sku’s price history stays in one partition and in order. The draft keys by the model version, so a sku’s history scatters the moment a different model suggests its price.',
+        'The `price.changed` record is produced with the sku as its message key, so one sku’s price history stays in one partition and in order. The starter keys by the model version, so a sku’s history scatters the moment a different model suggests its price.',
       match: {
         python: {all: [/price\.changed/, /key=sku\b/]},
         typescript: {all: [/price\.changed/, /key:\s*sku\b/]},
@@ -89,7 +89,7 @@ idempotent producer are what keep the stream complete.`,
       id: 'publish-after-commit',
       title: 'Produced only after the price store commits',
       detail:
-        '`store.publish(...)` (Go: `store.Publish(...)`) commits the price before the produce, so the topic never announces a price that was rolled back or a proposal the guard refused. The draft produces first and commits afterwards.',
+        '`store.publish(...)` (Go: `store.Publish(...)`) commits the price before the produce, so the topic never announces a price that was rolled back or a proposal the guard refused. The starter produces first and commits afterwards.',
       match: {
         python: {order: [/store\.publish\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.publish\(/, /producer\.send\(/]},
@@ -102,7 +102,7 @@ idempotent producer are what keep the stream complete.`,
       id: 'envelope',
       title: 'The envelope carries both prices and the reason',
       detail:
-        'The event carries `sku`, `old_price_cents`, `new_price_cents` and `reason`, so an audit reader can reconstruct what moved and why. The draft publishes the model version and the new price only, losing the old price and the reason.',
+        'The event carries `sku`, `old_price_cents`, `new_price_cents` and `reason`, so an audit reader can reconstruct what moved and why. The starter publishes the model version and the new price only, losing the old price and the reason.',
       match: {
         python: {all: [/old_price_cents/, /new_price_cents/, /"sku":/, /"reason":/]},
         typescript: {all: [/old_price_cents/, /new_price_cents/, /sku:/, /reason:/]},
@@ -115,7 +115,7 @@ idempotent producer are what keep the stream complete.`,
       id: 'headroom-in-event',
       title: 'The event carries the window headroom',
       detail:
-        'The event carries `moved_bp`, the basis points this change consumed from the window’s allowance, and `headroom_bp`, what is left of it — the figures the guard’s `EVAL` returned. The draft publishes neither, so a consumer can never see how close the sku is to `MAX_MOVE_BP`.',
+        'The event carries `moved_bp`, the basis points this change consumed from the window’s allowance, and `headroom_bp`, what is left of it — the figures the guard’s `EVAL` returned. The starter publishes neither, so a consumer can never see how close the sku is to `MAX_MOVE_BP`.',
       match: {
         python: {all: [/moved_bp/, /headroom_bp/]},
         typescript: {all: [/moved_bp/, /headroom_bp/]},
@@ -147,7 +147,7 @@ idempotent producer are what keep the stream complete.`,
   ],
   code: {
     python: {
-      starter: `"""price.changed: a model-generated draft that emits a price event on the happy path."""
+      starter: `"""price.changed: flawed code that emits a price event on the happy path."""
 import json
 
 from confluent_kafka import Producer
@@ -177,9 +177,9 @@ class PriceBody(BaseModel):
 
 
 def publish_change(body: PriceBody, reservation: dict) -> dict:
-    # TODO: this draft keys price.changed by the model version, produces inside the same block
+    # TODO: this starter keys price.changed by the model version, produces inside the same block
     # before store.publish commits, drops the old price, the reason and the guardrail headroom from
-    # the envelope, and never looks at the produce result. Review all four.
+    # the envelope, and never looks at the produce result. Fix all four.
     event = {"sku": body.sku, "model_version": body.model_version, "price_cents": body.price_cents}
     producer.produce(TOPIC, key=body.model_version, value=json.dumps(event))
     producer.flush()
@@ -303,7 +303,7 @@ def relay_once(limit: int = 100) -> int:
 `,
     },
     typescript: {
-      starter: `/** price.changed: a model-generated draft that emits a price event on the happy path. */
+      starter: `/** price.changed: flawed code that emits a price event on the happy path. */
 import {Kafka} from 'kafkajs';
 
 const TOPIC = 'price.changed';
@@ -336,9 +336,9 @@ export const store = {
 };
 
 export async function publishChange(body: PriceBody, reservation: Reservation): Promise<{published: boolean}> {
-  // TODO: this draft keys price.changed by the model version, produces inside the same block before
+  // TODO: this starter keys price.changed by the model version, produces inside the same block before
   // store.publish commits, drops the old price, the reason and the guardrail headroom from the
-  // envelope, and never looks at the produce result. Review all four.
+  // envelope, and never looks at the produce result. Fix all four.
   const event = {sku: body.sku, model_version: body.model_version, price_cents: body.price_cents};
   await producer.send({
     topic: TOPIC,
@@ -475,7 +475,7 @@ export async function relayOnce(limit = 100): Promise<number> {
 `,
     },
     go: {
-      starter: `// price.changed: a model-generated draft that emits a price event on the happy path.
+      starter: `// price.changed: flawed code that emits a price event on the happy path.
 package events
 
 import (
@@ -508,9 +508,9 @@ type Reservation struct {
 	Window int64 \`json:"window"\`
 }
 
-// TODO: this draft keys price.changed by the model version, produces inside the same block before
+// TODO: this starter keys price.changed by the model version, produces inside the same block before
 // store.Publish commits, drops the old price, the reason and the guardrail headroom from the
-// envelope, and never looks at the produce result. Review all four.
+// envelope, and never looks at the produce result. Fix all four.
 func publishChange(ctx context.Context, body PriceBody, reservation Reservation) error {
 	event := map[string]any{
 		"sku":           body.SKU,
@@ -660,7 +660,7 @@ func relayOnce(ctx context.Context, limit int) (int, error) {
 `,
     },
     scala: {
-      starter: `// price.changed: a model-generated draft that emits a price event on the happy path.
+      starter: `// price.changed: flawed code that emits a price event on the happy path.
 import java.util.Properties
 
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
@@ -677,9 +677,9 @@ object Events {
 
   case class Reservation(moved: Int, left: Int, window: Long)
 
-  // TODO: this draft keys price.changed by the model version, produces inside the same block before
+  // TODO: this starter keys price.changed by the model version, produces inside the same block before
   // store.publish commits, drops the old price, the reason and the guardrail headroom from the
-  // envelope, and never looks at the produce result. Review all four.
+  // envelope, and never looks at the produce result. Fix all four.
   def publishChange(body: PriceBody, reservation: Reservation): Unit = {
     val event =
       Map("sku" -> body.sku, "model_version" -> body.modelVersion, "price_cents" -> body.priceCents).toJson.compactPrint
@@ -772,7 +772,7 @@ object Events {
 `,
     },
     cpp: {
-      starter: `// price.changed: a model-generated draft that emits a price event on the happy path.
+      starter: `// price.changed: flawed code that emits a price event on the happy path.
 #include <librdkafka/rdkafkacpp.h>
 
 #include <memory>
@@ -802,9 +802,9 @@ struct PriceStore {
 
 PriceStore store;
 
-// TODO: this draft keys price.changed by the model version, produces inside the same block before
+// TODO: this starter keys price.changed by the model version, produces inside the same block before
 // store.publish commits, drops the old price, the reason and the guardrail headroom from the
-// envelope, and never looks at the produce result. Review all four.
+// envelope, and never looks at the produce result. Fix all four.
 void publish_change(
     const std::string& sku,
     const std::string& model_version,
@@ -943,7 +943,7 @@ int relay_once(int limit) {
 `,
     },
   },
-  debrief: `The interviewer is checking three things a generated Kafka snippet almost always gets wrong.
+  debrief: `The interviewer is checking three things a Kafka snippet almost always gets wrong.
 First, the message key is an ordering contract: partition by sku and one sku's price history arrives
 in one partition in order, which is what lets an analyst or a consumer replay "what did this price
 do" — key by the model version and the same sku's events scatter across partitions the moment the

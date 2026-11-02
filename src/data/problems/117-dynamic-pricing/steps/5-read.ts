@@ -8,7 +8,7 @@ export const readStep: Step = {
   focus: ['storefront', 'operator', 'api', 'db', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers
+**Starting point.** The starter is working code: it registers
 \`GET /v1/prices/{sku}\`, reads a row and the demo storefront renders a price. It is also serving an
 unshipped experiment candidate to every caller, labeling the number with the model version as if
 that were provenance, and answering none of the questions the platform will be asked later — where
@@ -34,10 +34,10 @@ Implement \`GET /v1/prices/{sku}\`.
   (\`store.last_approved(sku)\`), the \`guardrail\` object carries \`stale: true\`; otherwise
   \`stale: false\`. A fallback may serve a price, but it may not present it as current.
 
-**Failure mode the checks target.** The draft fails in the direction a demo cannot show: every
+**Failure mode the checks target.** The starter fails in the direction a demo cannot show: every
 reader sees the recommendation as a price, and nobody can tell afterwards that the number was never
 published. The read is the platform’s honesty surface — the one place a merchandiser, an auditor
-and the storefront all look — and the draft answers it with a price plus a model label: no
+and the storefront all look — and the starter answers it with a price plus a model label: no
 \`source\`, no \`updated_at\`, no guardrail state, and therefore no way to see which bound the window
 hit or that the value came from a stale fallback. A leaked candidate charges customers a number no
 one approved; a read with no provenance makes every later publish impossible to audit.`,
@@ -88,7 +88,7 @@ one approved; a read with no provenance makes every later publish impossible to 
       id: 'published-only',
       title: 'A plain read serves the published row, 404 otherwise',
       detail:
-        'A storefront read (no preview scope) answers from `store.published(sku)`; an unknown sku is **404**, never a synthesized price. The draft hands every caller the experiment candidate and never 404s.',
+        'A storefront read (no preview scope) answers from `store.published(sku)`; an unknown sku is **404**, never a synthesized price. The starter hands every caller the experiment candidate and never 404s.',
       match: {
         python: {all: [/store\.published\(/, /status_code\s*=\s*404/]},
         typescript: {all: [/store\.published\(/, /code\(\s*404\s*\)/]},
@@ -101,7 +101,7 @@ one approved; a read with no provenance makes every later publish impossible to 
       id: 'preview-scope',
       title: 'Experiment candidates are operator-only',
       detail:
-        'The candidate is served only to a caller presenting `X-Operator-Scope: preview`; every other caller gets the published row. The draft has no scope check, so a storefront read returns an experiment price.',
+        'The candidate is served only to a caller presenting `X-Operator-Scope: preview`; every other caller gets the published row. The starter has no scope check, so a storefront read returns an experiment price.',
       match: {
         python: {all: [/X-Operator-Scope/, /==\s*"preview"/, /store\.candidate\(/]},
         typescript: {all: [/x-operator-scope/, /===\s*'preview'/, /store\.candidate\(/]},
@@ -114,7 +114,7 @@ one approved; a read with no provenance makes every later publish impossible to 
       id: 'source-and-timestamp',
       title: 'Names the source and the timestamp of the served price',
       detail:
-        'The body carries `source` and `updated_at` as separate fields next to `price_cents`, so a reader can tell a published price from model output and see when it was set. The draft stamps the model version and reports no source and no timestamp.',
+        'The body carries `source` and `updated_at` as separate fields next to `price_cents`, so a reader can tell a published price from model output and see when it was set. The starter stamps the model version and reports no source and no timestamp.',
       match: {
         python: {all: [/"source"/, /"updated_at"/]},
         typescript: {all: [/source\s*:/, /updated_at\s*:/]},
@@ -127,7 +127,7 @@ one approved; a read with no provenance makes every later publish impossible to 
       id: 'guardrail-state',
       title: 'Reports the window, the consumed headroom and the bound',
       detail:
-        'The body carries a `guardrail` object with `window`, `moved_bp` (from `guard:{sku}:{window}`), `limit_bp` (`MAX_MOVE_BP` = 2000) and `bound` — the furthest price the window still allows — plus `stale: true` when the price came from `store.last_approved(sku)`. The draft returns no guardrail state and no stale marker.',
+        'The body carries a `guardrail` object with `window`, `moved_bp` (from `guard:{sku}:{window}`), `limit_bp` (`MAX_MOVE_BP` = 2000) and `bound` — the furthest price the window still allows — plus `stale: true` when the price came from `store.last_approved(sku)`. The starter returns no guardrail state and no stale marker.',
       match: {
         python: {
           all: [
@@ -199,7 +199,7 @@ one approved; a read with no provenance makes every later publish impossible to 
   ],
   code: {
     python: {
-      starter: `"""GET /v1/prices/{sku}: a model-generated draft that serves the experiment candidate to everyone."""
+      starter: `"""GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone."""
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -307,7 +307,7 @@ def read_price(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/prices/:sku: a model-generated draft that serves the experiment candidate to everyone. */
+      starter: `/** GET /v1/prices/:sku: flawed code that serves the experiment candidate to everyone. */
 import Fastify from 'fastify';
 
 import {store} from './price_store';
@@ -390,7 +390,7 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
-      starter: `// GET /v1/prices/{sku}: a model-generated draft that serves the experiment candidate to everyone.
+      starter: `// GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone.
 package main
 
 import (
@@ -549,7 +549,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `/** GET /v1/prices/{sku}: a model-generated draft that serves the experiment candidate to everyone. */
+      starter: `/** GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone. */
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
@@ -670,7 +670,7 @@ object PriceApi {
 `,
     },
     cpp: {
-      starter: `/** GET /v1/prices/{sku}: a model-generated draft that serves the experiment candidate to everyone. */
+      starter: `/** GET /v1/prices/{sku}: flawed code that serves the experiment candidate to everyone. */
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -788,7 +788,7 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is checking whether you review a read path the way you review a write. Three
+  debrief: `The interviewer is checking whether you debug a read path the way you debug a write. Three
 contracts are exercised. Audience: the storefront gets the published price, and only a caller
 holding \`X-Operator-Scope: preview\` sees the experiment candidate — one endpoint, two audiences,
 two different facts, and mixing them up charges customers a number no one approved. Provenance:

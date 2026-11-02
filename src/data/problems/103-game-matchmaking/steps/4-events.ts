@@ -8,29 +8,28 @@ export const eventsStep: Step = {
   focus: ['matchmaker', 'kafka', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it publishes a "found" event
-when a match forms and a "joined" event when a player joins. It compiles, the analytics topic fills
-up, and it hides three flaws — one of which makes a whole class of failures invisible. Review it,
-fix it, and prove the fix.
+**Starting point.** The starter is working code: it publishes a "found" event when a match forms and
+a "joined" event when a player joins. It compiles, the analytics topic fills up, and it hides three
+flaws — one of which makes a whole class of failures invisible. Debug it, fix it, and prove the fix.
 
 Implement the lifecycle publisher for the matchmaker:
 
 - Publish **\`match.found\`**, **\`match.joined\`**, **\`match.started\`** and **\`match.abandoned\`** on
   the topic **\`match.event\`**, keyed by **match id**. The key decides the partition, so keying by
-  match id is what keeps one match's lifecycle in order; the draft keys by skill bucket, so a match's
+  match id is what keeps one match's lifecycle in order; the starter keys by skill bucket, so a match's
   events are spread across partitions and can be consumed out of order.
 - Every event carries the **player ids** and the **server id** it is about (the server id is absent
   until the match is allocated, the reason is present only on an abandoned match).
 - **\`match.started\` may only be published after every join is confirmed.** Gate the publish on
   \`all_joins_confirmed(match_id)\`; if any participant is still pending, refuse and do not publish.
-  The draft publishes "started" the moment the count is decided, so consumers see a game start while
+  The starter publishes "started" the moment the count is decided, so consumers see a game start while
   a player is still connecting.
 - **Abandoned matches are published with a reason.** A match that fails to allocate, or whose roster
-  dissolves, must not vanish: publish \`match.abandoned\` with the players and the reason. The draft
+  dissolves, must not vanish: publish \`match.abandoned\` with the players and the reason. The starter
   only has happy-path publishers, so every failure is invisible to the consumers that reconcile
   matches against games.
 - When the broker **rejects** the produce, write an **outbox** row so the event can be replayed
-  instead of dropped. The draft lets the exception escape and the event is lost.
+  instead of dropped. The starter lets the exception escape and the event is lost.
 
 **Failure mode the checks target.** The key is the subtle one: everything works in a demo with one
 matchmaker, and only shows up when two matches are consumed in parallel and the events of one match
@@ -60,7 +59,7 @@ platform most needs to explain are exactly the ones that never reach the topic.`
       id: 'key-match-id',
       title: 'Keys every event by match id',
       detail:
-        'The producer writes to `match.event` with the **match id** as the message key, so one match lands on one partition and its lifecycle stays ordered. The draft keys by skill bucket, which scatters a single match across partitions.',
+        'The producer writes to `match.event` with the **match id** as the message key, so one match lands on one partition and its lifecycle stays ordered. The starter keys by skill bucket, which scatters a single match across partitions.',
       match: {
         python: {all: [/match\.event/, /key=match_id/]},
         typescript: {all: [/match\.event/, /key:\s*matchId/]},
@@ -73,7 +72,7 @@ platform most needs to explain are exactly the ones that never reach the topic.`
       id: 'started-after-joins',
       title: 'Publishes started only after every join is confirmed',
       detail:
-        '`match.started` is gated on `all_joins_confirmed(match_id)`: with a pending participant the publisher refuses instead of announcing a game that has not started. The draft publishes "started" as soon as the roster is decided.',
+        '`match.started` is gated on `all_joins_confirmed(match_id)`: with a pending participant the publisher refuses instead of announcing a game that has not started. The starter publishes "started" as soon as the roster is decided.',
       match: {
         python: {all: [/all_joins_confirmed\(/, /"started"/]},
         typescript: {all: [/allJoinsConfirmed\(/, /'started'/]},
@@ -86,7 +85,7 @@ platform most needs to explain are exactly the ones that never reach the topic.`
       id: 'abandoned',
       title: 'Publishes abandoned matches with a reason',
       detail:
-        'A match that fails — allocation, roster dissolution — is published as `match.abandoned` carrying the players and a **reason**. The draft has no abandoned publisher, so failures never reach the topic.',
+        'A match that fails — allocation, roster dissolution — is published as `match.abandoned` carrying the players and a **reason**. The starter has no abandoned publisher, so failures never reach the topic.',
       match: {
         python: {all: [/abandoned/, /reason/]},
         typescript: {all: [/abandoned/, /reason/]},
@@ -99,7 +98,7 @@ platform most needs to explain are exactly the ones that never reach the topic.`
       id: 'outbox',
       title: 'Writes an outbox row when the broker rejects the produce',
       detail:
-        'A rejected produce is not an event that may be dropped: the event is written to the **outbox** so a runner can replay it once the broker recovers. The draft lets the produce error escape.',
+        'A rejected produce is not an event that may be dropped: the event is written to the **outbox** so a runner can replay it once the broker recovers. The starter lets the produce error escape.',
       match: {
         python: {all: [/outbox/, /insert/]},
         typescript: {all: [/outbox/i, /insert/]},
@@ -112,7 +111,7 @@ platform most needs to explain are exactly the ones that never reach the topic.`
       id: 'event-ids',
       title: 'Carries player ids and the server id',
       detail:
-        'Each event names the players it is about and the server assigned to them, so consumers can join the event stream to the match read without a second lookup. The draft is the same here — this is the one check it already satisfies.',
+        'Each event names the players it is about and the server assigned to them, so consumers can join the event stream to the match read without a second lookup. The starter is the same here — this is the one check it already satisfies.',
       match: {
         python: {all: [/player_ids/, /server_id/]},
         typescript: {all: [/playerIds/, /serverId/]},
@@ -124,7 +123,7 @@ platform most needs to explain are exactly the ones that never reach the topic.`
   ],
   code: {
     python: {
-      starter: `"""Match events: a model-generated draft that keys by bucket and hides failures."""
+      starter: `"""Match events: flawed code that keys by bucket and hides failures."""
 import json
 
 from kafka import KafkaProducer
@@ -136,7 +135,7 @@ producer = KafkaProducer(bootstrap_servers=["kafka:9092"])
 
 
 def publish(bucket: int, payload: dict) -> None:
-    # TODO: this draft keys every event by skill bucket, so one match's lifecycle scatters across
+    # TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
     # partitions; it publishes "started" before every join is confirmed; it never publishes an
     # abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
     # gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
@@ -201,7 +200,7 @@ def publish_abandoned(match_id: str, player_ids: list[str], reason: str) -> None
 `,
     },
     typescript: {
-      starter: `/** Match events: a model-generated draft that keys by bucket and hides failures. */
+      starter: `/** Match events: flawed code that keys by bucket and hides failures. */
 import {Kafka} from 'kafkajs';
 
 const kafka = new Kafka({clientId: 'matchmakerd', brokers: ['kafka:9092']});
@@ -218,7 +217,7 @@ interface MatchEvent {
 }
 
 export async function publish(bucket: number, event: MatchEvent): Promise<void> {
-  // TODO: this draft keys every event by skill bucket, so one match's lifecycle scatters across
+  // TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
   // partitions; it publishes "started" before every join is confirmed; it never publishes an
   // abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
   // gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
@@ -296,7 +295,7 @@ type MatchEvent struct {
 }
 
 func publish(ctx context.Context, bucket int, event MatchEvent) error {
-	// TODO: this draft keys every event by skill bucket, so one match's lifecycle scatters across
+	// TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
 	// partitions; it publishes "started" before every join is confirmed; it never publishes an
 	// abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
 	// gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
@@ -384,7 +383,7 @@ object MatchEvents {
   val producer: KafkaProducer[String, String] = new KafkaProducer[String, String](producerProps)
 
   def publish(bucket: Int, payload: String): Unit = {
-    // TODO: this draft keys every event by skill bucket, so one match's lifecycle scatters across
+    // TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
     // partitions; it publishes "started" before every join is confirmed; it never publishes an
     // abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
     // gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row
@@ -458,7 +457,7 @@ object MatchEvents {
 const std::string kMatchEventTopic = "match.event";
 
 void publish(RdKafka::Producer* producer, const std::string& bucket, const std::string& payload) {
-  // TODO: this draft keys every event by skill bucket, so one match's lifecycle scatters across
+  // TODO: this starter keys every event by skill bucket, so one match's lifecycle scatters across
   // partitions; it publishes "started" before every join is confirmed; it never publishes an
   // abandoned match; and it drops the event when the broker rejects the produce. Key by match id,
   // gate "started" on the joins, publish abandoned matches with a reason, and write an outbox row on

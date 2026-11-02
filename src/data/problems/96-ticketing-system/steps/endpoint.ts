@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['requester', 'agent', 'api', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers \`POST /v1/tickets\`,
+**Starting point.** The starter is working code: it registers \`POST /v1/tickets\`,
 reads the requester header, and stores whatever the caller sends. It compiles, it serves the demo, and
-it hides five production flaws. Review it like the service owner, fix it, and prove the fix with the
+it hides five production flaws. Debug it like the service owner, fix it, and prove the fix with the
 checks below.
 
 Implement \`POST /v1/tickets\` — one route for intake and for updates.
@@ -78,7 +78,7 @@ customer content: logging them ships a customer's message into every log sink on
       id: 'transition-guard',
       title: 'Guards every state change with the allowed-transition table',
       detail:
-        'The allowed set is a table the handler consults, and a move outside it answers **409** carrying the states that are allowed from here. The draft assigns the request body’s `state` straight onto the ticket, so `open → closed` succeeds and a customer can close their own ticket.',
+        'The allowed set is a table the handler consults, and a move outside it answers **409** carrying the states that are allowed from here. The starter assigns the request body’s `state` straight onto the ticket, so `open → closed` succeeds and a customer can close their own ticket.',
       match: {
         python: {all: [/allowed_?transitions/i, /\b409\b/]},
         typescript: {all: [/allowed_?transitions/i, /\b409\b/]},
@@ -91,7 +91,7 @@ customer content: logging them ships a customer's message into every log sink on
       id: 'actor-scope',
       title: 'Scopes a requester to their own ticket',
       detail:
-        'The role is read from `X-Actor-Role`: an agent may update any ticket, a requester only their own, and another requester’s ticket answers **403**. The draft never reads the role and never compares the ticket’s owner, so any caller edits any ticket by id.',
+        'The role is read from `X-Actor-Role`: an agent may update any ticket, a requester only their own, and another requester’s ticket answers **403**. The starter never reads the role and never compares the ticket’s owner, so any caller edits any ticket by id.',
       match: {
         python: {all: [/x-actor-role/i, /\b403\b/]},
         typescript: {all: [/x-actor-role/i, /\b403\b/]},
@@ -104,7 +104,7 @@ customer content: logging them ships a customer's message into every log sink on
       id: 'reopen-window',
       title: 'Reopens a closed ticket only inside the window',
       detail:
-        '`closed → open` is allowed only while the ticket was closed within a named window in seconds (7 days); the ticket stores when it was closed, and a stale reopen is **409** with an empty allowed set. The draft has no window and no close timestamp at all.',
+        '`closed → open` is allowed only while the ticket was closed within a named window in seconds (7 days); the ticket stores when it was closed, and a stale reopen is **409** with an empty allowed set. The starter has no window and no close timestamp at all.',
       match: {
         python: {all: [/reopen_?window_?seconds/i, /closed_?at/i]},
         typescript: {all: [/reopen_?window_?seconds/i, /closed_?at/i]},
@@ -117,7 +117,7 @@ customer content: logging them ships a customer's message into every log sink on
       id: 'no-content-in-logs',
       title: 'Logs ids and states, never the subject or the body',
       detail:
-        'The write path is logged with ids, roles and states; the subject and the body text never reach a log line. The draft logs `subject` and `body` on every create.',
+        'The write path is logged with ids, roles and states; the subject and the body text never reach a log line. The starter logs `subject` and `body` on every create.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*(subject|body|content)/i]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*(subject|body|content)/i]},
@@ -172,9 +172,9 @@ def tickets(
     body: TicketBody,
     requester_id: str = Header(alias="X-Requester-Id"),
 ) -> JSONResponse:
-    # TODO: this draft copies the caller's state string onto the ticket, has no allowed-transition
+    # TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
     # table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-    # the body text. Review all five before this serves a real tenant.
+    # the body text. Fix all five before this serves a real tenant.
     if body.id is None:
         ticket = {
             "id": str(uuid.uuid4()),
@@ -307,7 +307,7 @@ def tickets(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/tickets: a model-generated draft that stores whatever state the caller sends. */
+      starter: `/** POST /v1/tickets: flawed code that stores whatever state the caller sends. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -331,9 +331,9 @@ interface Ticket {
 }
 
 app.post('/v1/tickets', async (request, reply) => {
-  // TODO: this draft copies the caller's state string onto the ticket, has no allowed-transition
+  // TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
   // table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-  // the body text. Review all five before this serves a real tenant.
+  // the body text. Fix all five before this serves a real tenant.
   const requesterId = request.headers['x-requester-id'] as string;
   const body = request.body as TicketBody;
 
@@ -500,9 +500,9 @@ func tickets(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft copies the caller's state string onto the ticket, has no allowed-transition
+	// TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
 	// table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-	// the body text. Review all five before this serves a real tenant.
+	// the body text. Fix all five before this serves a real tenant.
 	if in.ID == "" {
 		state := in.State
 		if state == "" {
@@ -703,9 +703,9 @@ object TicketApi {
       post {
         headerValueByName("X-Requester-Id") { requesterId =>
           entity(as[TicketRequest]) { req =>
-            // TODO: this draft copies the caller's state string onto the ticket, has no
+            // TODO: this starter copies the caller's state string onto the ticket, has no
             // allowed-transition table, lets any caller edit any ticket by id, has no reopen
-            // window, and logs the subject and the body text. Review all five.
+            // window, and logs the subject and the body text. Fix all five.
             req.id match {
               case None =>
                 val ticket =
@@ -870,9 +870,9 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft copies the caller's state string onto the ticket, has no allowed-transition
+    // TODO: this starter copies the caller's state string onto the ticket, has no allowed-transition
     // table, lets any caller edit any ticket by id, has no reopen window, and logs the subject and
-    // the body text. Review all five before this serves a real tenant.
+    // the body text. Fix all five before this serves a real tenant.
     if (!body.contains("id")) {
       json ticket = {
           {"id", uuidString()},
@@ -1030,7 +1030,7 @@ int main() {
     'Make the machine data: `ALLOWED_TRANSITIONS[from]` is the set of legal `to` states, the handler compares the requested state against that set, answers **409** with `allowed` when it is missing, and stores the state the table approved — never the string the caller sent.',
     'Ownership is a field on the ticket, not a header: `requester` means `ticket.requester_id == X-Requester-Id`. The reopen window reads the ticket’s own `closed_at` against the clock, so a stale `closed` ticket refuses `open` with an empty allowed set.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated handler against a state machine instead of against a schema. The draft is believable because the demo only ever creates tickets and sets \`open\`; the flaws appear the moment a caller sends \`closed\`, sends someone else's ticket id, or returns to a ticket that was closed last year. Four review habits are being checked: transitions are data, not strings copied from the body (so the state machine lives in one table the handler consults, and the 409 answers with the legal moves); authorization is per record, not per session (the role header says what kind of actor you are, the ticket says whether it is yours); time-bound rules need both a clock and a stored timestamp, so reopening has an expiry the handler can evaluate; and support content is customer content, so logs carry ids and states only.
+  debrief: `The interviewer is testing whether you can debug a handler against a state machine instead of against a schema. The starter is believable because the demo only ever creates tickets and sets \`open\`; the flaws appear the moment a caller sends \`closed\`, sends someone else's ticket id, or returns to a ticket that was closed last year. Four debugging habits are being checked: transitions are data, not strings copied from the body (so the state machine lives in one table the handler consults, and the 409 answers with the legal moves); authorization is per record, not per session (the role header says what kind of actor you are, the ticket says whether it is yours); time-bound rules need both a clock and a stored timestamp, so reopening has an expiry the handler can evaluate; and support content is customer content, so logs carry ids and states only.
 
 What candidates miss is usually the last two. They guard the transition table but treat reopen as just another edge, so nothing ages out and a closed ticket can be resurrected forever. And they add a \`log.info\` with the subject while debugging the create path, which then ships the customer's message into every log sink on every write — the one line in the diff that a security review will catch and the demo never will.
 

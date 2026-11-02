@@ -8,11 +8,11 @@ export const eventsStep: Step = {
   focus: ['worker', 'kafka', 'consumer', 'store'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the worker publishes one
+**Starting point.** The starter is working code: the worker publishes one
 \`browser.step\` record per driver action and the trace consumer appends each record to the session's
 trace, so the demo shows a trace growing. It hides four production flaws — a record keyed by the
 step index, a payload that ships what the agent typed "for debugging", an offset committed before
-the trace is durable, and a producer left at its defaults. Review it like the owner of the trace
+the trace is durable, and a producer left at its defaults. Debug it like the owner of the trace
 pipeline, fix it, and prove the fix with the checks below.
 
 Implement the worker's event path and the trace consumer for browser sessions. Every driver action
@@ -25,7 +25,7 @@ the worker completes produces **exactly one** \`browser.step\` record, and a con
 - The payload carries \`session_id\`, \`step_index\`, \`action\`, \`target_digest\`, \`outcome\` and
   \`redacted_fields\`, and nothing else. Page content and **typed values never leave the worker**: a
   password typed into a form must not reach the topic, and it must not reach the logs either.
-- Redaction is a helper, not a review habit: a \`REDACTED_FIELDS\` constant plus \`redact(typed_input)\`
+- Redaction is a helper, not a code-review habit: a \`REDACTED_FIELDS\` constant plus \`redact(typed_input)\`
   reduce typed input to the **names** of the fields it filled, and the target is published as a
   digest. Writing the typed value anywhere — "temporarily, for debugging" — is the bug.
 - The producer is **idempotent with \`acks=all\`** (\`enable.idempotence=true\` with \`"acks": "all"\`,
@@ -39,7 +39,7 @@ the worker completes produces **exactly one** \`browser.step\` record, and a con
   \`session:{id}\` — the state step's key — and a relay republishes it. The worker never fails the
   session for a broker hiccup.
 
-**Failure mode the checks target.** The draft keys the record by \`step_index\`, so one session's
+**Failure mode the checks target.** The starter keys the record by \`step_index\`, so one session's
 trace is reassembled from several partitions and can land out of order — wrong in a way nobody
 notices until a customer reads the trace. It puts \`typed_values\` in the payload and logs the event,
 so the password the agent typed is now in the topic and in the log aggregator, where it outlives
@@ -71,7 +71,7 @@ its defaults with no dedupe key, so a retry duplicates the step and a rejected p
       id: 'session-key',
       title: 'Keys every event by the session id',
       detail:
-        'The produced record is keyed by the **session id** — one session, one partition, so its steps are consumed in order. The draft keys by the step index, so two steps of the same session land in different partitions and the trace is written out of order.',
+        'The produced record is keyed by the **session id** — one session, one partition, so its steps are consumed in order. The starter keys by the step index, so two steps of the same session land in different partitions and the trace is written out of order.',
       match: {
         python: {all: [/key=session_id/], none: [/key=step_index/]},
         typescript: {all: [/key:\s*sessionId\b/], none: [/key:\s*stepIndex\b/]},
@@ -87,7 +87,7 @@ its defaults with no dedupe key, so a retry duplicates the step and a rejected p
       id: 'no-typed-values',
       title: 'Never publishes the typed values',
       detail:
-        'Typed input is reduced by the compile-time `redact(...)` helper before the record is built: the payload carries field names and a digest, never the values the agent typed into the page. The draft adds `typed_values` "for debugging" and logs the whole event.',
+        'Typed input is reduced by the compile-time `redact(...)` helper before the record is built: the payload carries field names and a digest, never the values the agent typed into the page. The starter adds `typed_values` "for debugging" and logs the whole event.',
       match: {
         python: {all: [/def redact\(/], none: [/typed_values/]},
         typescript: {all: [/function redact\(/], none: [/typed_values/]},
@@ -113,7 +113,7 @@ its defaults with no dedupe key, so a retry duplicates the step and a rejected p
       id: 'store-before-commit',
       title: 'Appends the trace before committing the offset',
       detail:
-        'The consumer appends the step to the trace store **before** it commits the offset, so a crash between the two replays the record instead of losing it. The draft commits first: the offset then claims a step the trace never received.',
+        'The consumer appends the step to the trace store **before** it commits the offset, so a crash between the two replays the record instead of losing it. The starter commits first: the offset then claims a step the trace never received.',
       match: {
         python: {order: [/store\.append_step\(/, /consumer\.commit\(/]},
         typescript: {order: [/store\.appendStep\(/, /commitOffsets\(/]},
@@ -126,7 +126,7 @@ its defaults with no dedupe key, so a retry duplicates the step and a rejected p
       id: 'producer-durability',
       title: 'Produces idempotently, deduped per (session, step)',
       detail:
-        'The producer is configured for idempotence and `acks=all` and each record carries an `idempotency_key` of `{session_id}:{step_index}`, so a retry cannot duplicate a step. A produce the broker rejects records a pending step on `session:{id}` instead of being dropped. The draft ships a default producer with no dedupe key and ignores the produce result.',
+        'The producer is configured for idempotence and `acks=all` and each record carries an `idempotency_key` of `{session_id}:{step_index}`, so a retry cannot duplicate a step. A produce the broker rejects records a pending step on `session:{id}` instead of being dropped. The starter ships a default producer with no dedupe key and ignores the produce result.',
       match: {
         python: {
           all: [/enable\.idempotence/, /"acks":\s*"all"/, /idempotency_key/, /store\.record_pending_step\(/],
@@ -191,7 +191,7 @@ store = SessionStore()
 
 @app.post("/internal/sessions/{session_id}/steps")
 def publish_step(session_id: str, body: StepEvent) -> dict:
-    # TODO: the draft keys the record by the step index instead of the session, ships the typed
+    # TODO: the starter keys the record by the step index instead of the session, ships the typed
     # values in the payload "for debugging", and commits the offset before the trace append.
     event = {
         "session_id": session_id,
@@ -308,7 +308,7 @@ def consume() -> None:
 `,
     },
     typescript: {
-      starter: `/** browser.step: a model-generated draft that keys by step index and commits before the append. */
+      starter: `/** browser.step: flawed code that keys by step index and commits before the append. */
 import Fastify from 'fastify';
 import {Kafka} from 'kafkajs';
 
@@ -337,7 +337,7 @@ interface SessionStore {
 declare const store: SessionStore;
 
 app.post('/internal/sessions/:sessionId/steps', async (request, reply) => {
-  // TODO: the draft keys the record by the step index instead of the session, ships the typed values
+  // TODO: the starter keys the record by the step index instead of the session, ships the typed values
   // in the payload "for debugging", and commits the offset before the trace append.
   const {sessionId} = request.params as {sessionId: string};
   const body = request.body as StepBody;
@@ -504,7 +504,7 @@ func publishStep(rw http.ResponseWriter, r *http.Request) {
 		Outcome    string         \`json:"outcome"\`
 	}{}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: the draft keys the record by the step index instead of the session, ships the typed
+	// TODO: the starter keys the record by the step index instead of the session, ships the typed
 	// values in the payload "for debugging", and commits the offset before the trace append.
 	event := map[string]any{
 		"session_id":    sessionID,
@@ -664,7 +664,7 @@ object BrowserEvents {
   val producer = new KafkaProducer[String, String](new Properties())
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: the draft keys the record by the step index instead of the session, ships the typed values
+  // TODO: the starter keys the record by the step index instead of the session, ships the typed values
   // in the payload "for debugging", and commits the offset before the trace append.
   def publishStep(sessionId: String, stepIndex: Int, action: String, target: String, typedInput: Map[String, String], outcome: String): Unit = {
     val payload = Map(
@@ -802,7 +802,7 @@ struct SessionStore {
 
 SessionStore store;
 
-// TODO: the draft keys the record by the step index instead of the session, ships the typed values in
+// TODO: the starter keys the record by the step index instead of the session, ships the typed values in
 // the payload "for debugging", and commits the offset before the trace append.
 void publishStep(const std::string& sessionId, int stepIndex, const std::string& action, const std::string& target, const json& typedInput, const std::string& outcome) {
   const json event = {{"session_id", sessionId}, {"step_index", stepIndex}, {"action", action}, {"target_digest", target}, {"outcome", outcome}, {"typed_values", typedInput}};
@@ -915,8 +915,8 @@ void consume() {
   },
   hints: [
     'The record key is the ordering contract: `key=session_id` (`Key: []byte(sessionID)`, `ProducerRecord("browser.step", sessionId, …)`). Keyed by the step index, two steps of one session land in different partitions and the trace can be replayed out of order.',
-    'Redaction belongs in a helper, not in a reviewer’s habit: a `REDACTED_FIELDS` constant plus `redact(typed_input)` leave only the names of the fields the agent filled, and the target travels as a digest. The typed value itself must never be serialized or logged — "temporarily, for debugging" included.',
+    'Redaction belongs in a helper, not in a code reviewer’s habit: a `REDACTED_FIELDS` constant plus `redact(typed_input)` leave only the names of the fields the agent filled, and the target travels as a digest. The typed value itself must never be serialized or logged — "temporarily, for debugging" included.',
     'Order is the whole check. In the consumer, append the step to the trace store and commit the offset last, so a crash in between replays the record. In the producer, idempotence plus `acks=all` plus an `idempotency_key` of `{session_id}:{step_index}` make the retry safe, and a broker rejection writes `record_pending_step(...)` on `session:{id}` — the state step’s key — instead of dropping the event.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated Kafka path as a privacy and durability contract instead of a publish call. The draft looks fine because the demo runs in a quiet cluster on a clean page: one session, no retry, no crash, nothing typed. Four separate defects are being checked. The key is the ordering contract — keyed by the step index, a session’s trace is scattered across partitions and reassembled out of order. The payload is the privacy contract — building the event from the request body puts the password the agent typed into the topic and the log, where it outlives every retention policy. The consumer’s order is the completeness contract — commit the offset first and a crash drops a step the page really took while the offset claims it was processed; append first and the replay lands on an idempotent (session_id, step_index) append. And the producer is the retry contract — idempotence with acks=all plus an idempotency_key of {session_id}:{step_index} stops a retry duplicating a step, and record_pending_step on session:{id} keeps a rejected produce alive for the relay. The quiet one is the redaction: it never shows up in a test, only in an incident review, because the leak is a field nobody meant to publish. Real pipelines add a schema registry that refuses an unknown field, field-level encryption for the truly sensitive values, and a tombstone/replay path for traces whose offsets were committed too early.`,
+  debrief: `The interviewer is testing whether you can debug a Kafka path as a privacy and durability contract instead of a publish call. The starter looks fine because the demo runs in a quiet cluster on a clean page: one session, no retry, no crash, nothing typed. Four separate defects are being checked. The key is the ordering contract — keyed by the step index, a session’s trace is scattered across partitions and reassembled out of order. The payload is the privacy contract — building the event from the request body puts the password the agent typed into the topic and the log, where it outlives every retention policy. The consumer’s order is the completeness contract — commit the offset first and a crash drops a step the page really took while the offset claims it was processed; append first and the replay lands on an idempotent (session_id, step_index) append. And the producer is the retry contract — idempotence with acks=all plus an idempotency_key of {session_id}:{step_index} stops a retry duplicating a step, and record_pending_step on session:{id} keeps a rejected produce alive for the relay. The quiet one is the redaction: it never shows up in a test, only in an incident review, because the leak is a field nobody meant to publish. Real pipelines add a schema registry that refuses an unknown field, field-level encryption for the truly sensitive values, and a tombstone/replay path for traces whose offsets were committed too early.`,
 };

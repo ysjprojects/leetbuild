@@ -48,13 +48,13 @@ export const endpointStep: Step = {
   },
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. A tenant complained that a thumbs-down
+**Starting point.** You are the AI platform engineer on call. A tenant complained that a thumbs-down
 they left on a bad answer vanished from the dashboard, while a support macro that posts an empty
-rating has been quietly counting as neutral. The model-generated handler below registers the route and
+rating has been quietly counting as neutral. The handler below registers the route and
 writes a row, so it looks finished — but it trusts the caller for the request id, keeps an unbounded
 comment, and turns silence into a \`0\`.
 
-Review \`api\` before you trust the dashboard, then fix it so the row it writes can only describe a
+Debug \`api\` before you trust the dashboard, then fix it so the row it writes can only describe a
 request this tenant really served.
 
 - The handler must read the tenant from the \`X-Tenant-Id\` header and reject a request without one
@@ -180,8 +180,8 @@ feedback = FeedbackStore()
 
 @app.post("/v1/feedback")
 def submit(body: FeedbackRequest, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft stores whatever request id the caller sends, keeps an unbounded comment,
-    # and turns a missing rating into 0 so silence counts as neutral. Review all three.
+    # TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
+    # and turns a missing rating into 0 so silence counts as neutral. Fix all three.
     record = {
         "feedback_id": str(uuid.uuid4()),
         "tenant": tenant,
@@ -260,7 +260,7 @@ def submit(
 `,
     },
     typescript: {
-      starter: `/** POST /v1/feedback: a model-generated draft that trusts the caller's request id. */
+      starter: `/** POST /v1/feedback: flawed code that trusts the caller's request id. */
 import {randomUUID} from 'node:crypto';
 
 import Fastify from 'fastify';
@@ -294,8 +294,8 @@ export const servedRequests = new ServedRequestsStore();
 export const feedback = new FeedbackStore();
 
 app.post('/v1/feedback', async (request, reply) => {
-  // TODO: this draft stores whatever request id the caller sends, keeps an unbounded comment,
-  // and turns a missing rating into 0 so silence counts as neutral. Review all three.
+  // TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
+  // and turns a missing rating into 0 so silence counts as neutral. Fix all three.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as FeedbackBody;
   const record = {
@@ -435,8 +435,8 @@ func submit(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft stores whatever request id the caller sends, keeps an unbounded comment,
-	// and turns a missing rating into 0 so silence counts as neutral. Review all three.
+	// TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
+	// and turns a missing rating into 0 so silence counts as neutral. Fix all three.
 	record := map[string]any{
 		"feedback_id": uuid.NewString(),
 		"tenant":      tenant,
@@ -592,7 +592,7 @@ object FeedbackApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[FeedbackRequest]) { body =>
-            // TODO: this draft stores whatever request id the caller sends, keeps an unbounded
+            // TODO: this starter stores whatever request id the caller sends, keeps an unbounded
             // comment, and turns a missing rating into 0 so silence counts as neutral.
             val rating = body.rating.getOrElse(0)
             val record =
@@ -710,8 +710,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft stores whatever request id the caller sends, keeps an unbounded comment,
-    // and turns a missing rating into 0 so silence counts as neutral. Review all three.
+    // TODO: this starter stores whatever request id the caller sends, keeps an unbounded comment,
+    // and turns a missing rating into 0 so silence counts as neutral. Fix all three.
     const json record = {
         {"feedback_id", uuidString()},
         {"tenant", tenant},

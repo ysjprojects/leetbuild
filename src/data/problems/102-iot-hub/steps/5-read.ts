@@ -8,12 +8,11 @@ export const readStep: Step = {
   focus: ['client', 'hub', 'shadow'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the route answers, the demo
-device shows its state and the dashboard renders a document, so nothing looks wrong. It hides three
-flaws. It merges the two sides of the shadow into one document, so the divergence the shadow exists
-to expose disappears; it reports the newer version as if it were both versions; and it serves any
-device to any caller. Review it like the service owner, fix it, and prove the fix with the checks
-below.
+**Starting point.** The starter is working code: the route answers, the demo device shows its state
+and the dashboard renders a document, so nothing looks wrong. It hides three flaws. It merges the
+two sides of the shadow into one document, so the divergence the shadow exists to expose
+disappears; it reports the newer version as if it were both versions; and it serves any device to
+any caller. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/devices/{device_id}/shadow\`.
 
@@ -74,7 +73,7 @@ device's shadow by guessing an id.`,
       id: 'both-documents',
       title: 'Serves the desired and reported documents side by side',
       detail:
-        'The response carries both documents untouched under `desired` and `reported`, read through the shadow store. The draft merges them into one `document`, so the desired values overwrite the reported ones and nothing downstream can tell the device is behind.',
+        'The response carries both documents untouched under `desired` and `reported`, read through the shadow store. The starter merges them into one `document`, so the desired values overwrite the reported ones and nothing downstream can tell the device is behind.',
       match: {
         python: {all: [/"desired":/, /"reported":/, /shadows\.read\(/]},
         typescript: {all: [/desired:\s*shadow\.desired/, /reported:\s*shadow\.reported/, /shadows\.read\(/]},
@@ -87,7 +86,7 @@ device's shadow by guessing an id.`,
       id: 'both-versions-exact',
       title: 'Both versions are returned exactly as the store holds them',
       detail:
-        'The response reports `desired_version` and `reported_version` as the counter each side actually carries: a device reporting version 3 while the operator is on version 7 comes back with 7 and 3, not 7 on both. The draft collapses the two into the newer version.',
+        'The response reports `desired_version` and `reported_version` as the counter each side actually carries: a device reporting version 3 while the operator is on version 7 comes back with 7 and 3, not 7 on both. The starter collapses the two into the newer version.',
       match: {
         python: {
           all: [
@@ -112,7 +111,7 @@ device's shadow by guessing an id.`,
       id: 'divergence-list',
       title: 'Divergence is computed from both documents and listed',
       detail:
-        '`divergence` names every top-level field of `desired` whose value the `reported` document does not match, sorted, so a converged device answers with an empty list and a behind device says exactly what is outstanding. The draft merges the documents, so the divergent field disappears behind the desired value.',
+        '`divergence` names every top-level field of `desired` whose value the `reported` document does not match, sorted, so a converged device answers with an empty list and a behind device says exactly what is outstanding. The starter merges the documents, so the divergent field disappears behind the desired value.',
       match: {
         python: {all: [/"divergence":\s*divergent_fields\(/, /reported\.get\(field\)\s*!=\s*desired\[field\]/]},
         typescript: {
@@ -130,7 +129,7 @@ device's shadow by guessing an id.`,
       id: 'foreign-device-404',
       title: 'A device the caller does not own is 404',
       detail:
-        'The device is looked up and its owner compared with the authenticated tenant before the shadow is read; a foreign device answers **404**, indistinguishable from a device that does not exist. The draft serves any device to any caller.',
+        'The device is looked up and its owner compared with the authenticated tenant before the shadow is read; a foreign device answers **404**, indistinguishable from a device that does not exist. The starter serves any device to any caller.',
       match: {
         python: {all: [/assert_tenant_owns\(/, /devices\.get\(device_id\)/, /status_code\s*=\s*404/]},
         typescript: {all: [/assertTenantOwns\(/, /device\.owner !== tenant/, /statusCode = 404/]},
@@ -171,9 +170,9 @@ shadows = ShadowStore()
 
 @app.get("/v1/devices/{device_id}/shadow")
 def read_shadow(device_id: str) -> JSONResponse:
-    # TODO: this draft merges the desired and reported documents so divergence cannot be seen,
+    # TODO: this starter merges the desired and reported documents so divergence cannot be seen,
     # reports the newer version as if it were both versions, and serves any device to any caller.
-    # Review all three.
+    # Fix all three.
     shadow = shadows.read(device_id)
     merged = {**shadow["reported"], **shadow["desired"]}
     version = max(shadow["desired_version"], shadow["reported_version"])
@@ -253,7 +252,7 @@ def read_shadow(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/devices/:id/shadow: a model-generated draft that merges the shadow. */
+      starter: `/** GET /v1/devices/:id/shadow: flawed code that merges the shadow. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -275,9 +274,9 @@ const shadows = new ShadowStore();
 
 app.get('/v1/devices/:deviceId/shadow', async (request, reply) => {
   const {deviceId} = request.params as {deviceId: string};
-  // TODO: this draft merges the desired and reported documents so divergence cannot be seen,
+  // TODO: this starter merges the desired and reported documents so divergence cannot be seen,
   // reports the newer version as if it were both versions, and serves any device to any caller.
-  // Review all three.
+  // Fix all three.
   const shadow = await shadows.read(deviceId);
   const merged = {...shadow.reported, ...shadow.desired};
   const version = Math.max(shadow.desired_version, shadow.reported_version);
@@ -377,9 +376,9 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 }
 
 func readShadow(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft merges the desired and reported documents so divergence cannot be seen,
+	// TODO: this starter merges the desired and reported documents so divergence cannot be seen,
 	// reports the newer version as if it were both versions, and serves any device to any caller.
-	// Review all three.
+	// Fix all three.
 	deviceID := r.PathValue("device_id")
 	shadow, err := shadows.Read(r.Context(), deviceID)
 	if err != nil {
@@ -558,9 +557,9 @@ object ShadowReadApi {
   val route: Route =
     path("v1" / "devices" / Segment / "shadow") { deviceId =>
       get {
-        // TODO: this draft merges the desired and reported documents so divergence cannot be seen,
+        // TODO: this starter merges the desired and reported documents so divergence cannot be seen,
         // reports the newer version as if it were both versions, and serves any device to any
-        // caller. Review all three.
+        // caller. Fix all three.
         val shadow = shadows.read(deviceId)
         val merged = JsObject(shadow.reported ++ shadow.desired)
         val version = math.max(shadow.desired_version, shadow.reported_version)
@@ -683,9 +682,9 @@ int main() {
 
   svr.Get(R"(/v1/devices/([^/]+)/shadow)", [](const httplib::Request& req, httplib::Response& res) {
     const auto deviceId = req.matches[1].str();
-    // TODO: this draft merges the desired and reported documents so divergence cannot be seen,
+    // TODO: this starter merges the desired and reported documents so divergence cannot be seen,
     // reports the newer version as if it were both versions, and serves any device to any caller.
-    // Review all three.
+    // Fix all three.
     const auto shadow = shadows.read(deviceId);
     json merged = shadow.reported;
     merged.update(shadow.desired);
@@ -787,5 +786,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a read endpoint whose whole purpose is to surface disagreement. A device shadow is two documents with independent versions — the operator's desired configuration and what the device last reported — and merging them destroys the only thing the endpoint exists to show: the merged document reads as converged while the device is still running an older configuration, and the operator's change looks applied before the device ever acknowledged it. Reporting one version for both hides which side is stale: the pair is what tells support whether to wait or to escalate. The divergence list is the part that makes it actionable, and it has to be computed from the two documents rather than inferred from the versions, because a device can report a newer version while still missing one field. The ownership check is the security half of the same review — a device id is guessable, so the answer for someone else's device is 404, not 403 and not 200. Real hubs return deeper field paths, expose a reconciliation target for the next desired write, and alert when a divergence ages past an SLA.`,
+  debrief: `The interviewer is testing whether you can debug a read endpoint whose whole purpose is to surface disagreement. A device shadow is two documents with independent versions — the operator's desired configuration and what the device last reported — and merging them destroys the only thing the endpoint exists to show: the merged document reads as converged while the device is still running an older configuration, and the operator's change looks applied before the device ever acknowledged it. Reporting one version for both hides which side is stale: the pair is what tells support whether to wait or to escalate. The divergence list is the part that makes it actionable, and it has to be computed from the two documents rather than inferred from the versions, because a device can report a newer version while still missing one field. The ownership check is the security half of the same fix — a device id is guessable, so the answer for someone else's device is 404, not 403 and not 200. Real hubs return deeper field paths, expose a reconciliation target for the next desired write, and alert when a divergence ages past an SLA.`,
 };

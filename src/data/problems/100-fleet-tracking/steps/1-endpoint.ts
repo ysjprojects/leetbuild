@@ -8,9 +8,9 @@ export const endpointStep: Step = {
   focus: ['device', 'gateway', 'api', 'state'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it accepts a batch of
+**Starting point.** The starter is working code: it accepts a batch of
 position updates, parses them and writes them straight through. It compiles, it serves the demo,
-and it hides three production flaws. Review it like the service owner, fix it, and prove the fix
+and it hides three production flaws. Debug it like the service owner, fix it, and prove the fix
 with the checks below.
 
 Implement \`POST /v1/vehicles/positions\` with body
@@ -34,7 +34,7 @@ Implement \`POST /v1/vehicles/positions\` with body
 - Log accepted updates with tenant, vehicle id, sequence and timestamp — never raw coordinates and
   never driver identity.
 
-**Failure mode the checks target.** The draft accepts any timestamp and any sequence, so a device
+**Failure mode the checks target.** The starter accepts any timestamp and any sequence, so a device
 with a wrong clock writes positions dated last year and a replayed batch re-applies old positions;
 it also logs raw coordinates. The checks verify the skew bound, the sequence high-water dedupe, the
 no-regression rule, and log hygiene.`,
@@ -66,7 +66,7 @@ no-regression rule, and log hygiene.`,
       id: 'skew',
       title: 'Rejects timestamps outside the accepted skew',
       detail:
-        'A device timestamp more than `MAX_SKEW_MS` (300 000 ms) from the server clock is rejected with **400**. The draft accepts any timestamp, so a wrong-clock device writes positions dated last year.',
+        'A device timestamp more than `MAX_SKEW_MS` (300 000 ms) from the server clock is rejected with **400**. The starter accepts any timestamp, so a wrong-clock device writes positions dated last year.',
       match: {
         python: {all: [/MAX_SKEW_MS/, /abs\([^)]*device_timestamp_ms[^)]*\)/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_SKEW_MS/, /Math\.abs\(/, /code\(\s*400\s*\)/]},
@@ -79,7 +79,7 @@ no-regression rule, and log hygiene.`,
       id: 'sequence',
       title: 'Dedupes replayed sequences by a per-vehicle high-water mark',
       detail:
-        'The server tracks the highest accepted `sequence` per vehicle and drops any update at or below it, counting it as `duplicate`. The draft applies every sequence, so a replayed batch re-applies old positions.',
+        'The server tracks the highest accepted `sequence` per vehicle and drops any update at or below it, counting it as `duplicate`. The starter applies every sequence, so a replayed batch re-applies old positions.',
       match: {
         python: {all: [/high_water/, /duplicate/, /sequence/]},
         typescript: {all: [/highWater/, /duplicate/, /sequence/]},
@@ -92,7 +92,7 @@ no-regression rule, and log hygiene.`,
       id: 'no-regression',
       title: 'Never regresses a vehicle latest state',
       detail:
-        'An update is forwarded only when its timestamp is newer than the vehicle last timestamp, or equal with a larger sequence. The draft writes whatever arrives last.',
+        'An update is forwarded only when its timestamp is newer than the vehicle last timestamp, or equal with a larger sequence. The starter writes whatever arrives last.',
       match: {
         python: {all: [/last_timestamp_ms/, />/, /sequence/]},
         typescript: {all: [/lastTimestampMs/, />/, /sequence/]},
@@ -105,7 +105,7 @@ no-regression rule, and log hygiene.`,
       id: 'no-dump-log',
       title: 'Logs ids, never raw coordinates or driver identity',
       detail:
-        'Accepted updates are logged with tenant, vehicle id, sequence and timestamp; raw coordinates and driver identity never reach a log line. The draft logs latitude and longitude.',
+        'Accepted updates are logged with tenant, vehicle id, sequence and timestamp; raw coordinates and driver identity never reach a log line. The starter logs latitude and longitude.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*(lat|lon|driver)/]},
         typescript: {all: [/log\.info\(/], none: [/log\.\w+\([^)]*(lat|lon|driver)/]},
@@ -137,8 +137,8 @@ store = PositionStore()
 
 @app.post("/v1/vehicles/positions")
 def positions(body: dict, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft accepts any timestamp and any sequence, writes every update through, and
-    # logs raw coordinates. Review the skew bound, the sequence high-water mark and log hygiene.
+    # TODO: this starter accepts any timestamp and any sequence, writes every update through, and
+    # logs raw coordinates. Check the skew bound, the sequence high-water mark and log hygiene.
     updates = body.get("updates", [])
     for u in updates:
         store.upsert(tenant, u["vehicle_id"], u)
@@ -229,7 +229,7 @@ def positions(body: dict, tenant: str | None = Header(default=None, alias="X-Ten
 `,
     },
     typescript: {
-      starter: `/** POST /v1/vehicles/positions: a model-generated draft that writes every update. */
+      starter: `/** POST /v1/vehicles/positions: flawed code that writes every update. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -243,8 +243,8 @@ interface Update {
 }
 
 app.post('/v1/vehicles/positions', async (request, reply) => {
-  // TODO: this draft accepts any timestamp and any sequence, writes every update through, and
-  // logs raw coordinates. Review the skew bound, the sequence high-water mark and log hygiene.
+  // TODO: this starter accepts any timestamp and any sequence, writes every update through, and
+  // logs raw coordinates. Check the skew bound, the sequence high-water mark and log hygiene.
   const tenant = request.headers['x-tenant-id'] as string;
   const body = request.body as {updates?: Update[]} | null;
   const updates = body?.updates ?? [];
@@ -364,8 +364,8 @@ func positions(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts any timestamp and any sequence, writes every update through, and
-	// logs raw coordinates. Review the skew bound, the sequence high-water mark and log hygiene.
+	// TODO: this starter accepts any timestamp and any sequence, writes every update through, and
+	// logs raw coordinates. Check the skew bound, the sequence high-water mark and log hygiene.
 	log.Printf("positions tenant=%s lat=%f lon=%f", tenant, batch.Updates[0].Lat, batch.Updates[0].Lon)
 	writeJSON(rw, http.StatusOK, map[string]any{"accepted": len(batch.Updates), "duplicate": 0})
 }
@@ -517,8 +517,8 @@ object PositionApi {
       post {
         headerValueByName("X-Tenant-Id") { tenant =>
           entity(as[Batch]) { batch =>
-            // TODO: this draft accepts any timestamp and any sequence, writes every update
-            // through, and logs raw coordinates. Review the skew bound, the sequence high-water
+            // TODO: this starter accepts any timestamp and any sequence, writes every update
+            // through, and logs raw coordinates. Check the skew bound, the sequence high-water
             // mark and log hygiene.
             system.log.info(s"positions tenant=$tenant lat=\${batch.updates.headOption.map(_.lat)} lon=\${batch.updates.headOption.map(_.lon)}")
             complete(StatusCodes.OK, s"""{"accepted":\${batch.updates.size},"duplicate":0}""")
@@ -640,8 +640,8 @@ int main() {
       res.set_content(R"({"error":"invalid json"})", "application/json");
       return;
     }
-    // TODO: this draft accepts any timestamp and any sequence, writes every update through, and
-    // logs raw coordinates. Review the skew bound, the sequence high-water mark and log hygiene.
+    // TODO: this starter accepts any timestamp and any sequence, writes every update through, and
+    // logs raw coordinates. Check the skew bound, the sequence high-water mark and log hygiene.
     const auto updates = body.value("updates", json::array());
     for (const auto& u : updates) {
       store.upsert(tenant, u.value("vehicle_id", std::string()), u);
@@ -761,5 +761,5 @@ int main() {
     'The high-water sequence is what makes replays idempotent: keep the largest accepted `sequence` per vehicle and drop any update at or below it, counting it as `duplicate` while still returning **200**.',
     'Never log raw coordinates or driver identity. Log the tenant, vehicle id, sequence and timestamp; if you need coordinates for debugging, log a coarse cell or a hash.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated batch-ingestion endpoint. The draft reads fine because the demo sends well-formed updates from one device with a correct clock and never replays a batch. Three defects are being checked: the skew bound (a wrong-clock device cannot write the past), the sequence high-water mark (a replay cannot re-apply old positions), and log hygiene (coordinates are sensitive and never reach a log line). Real fleets add per-device skew allowances, a server-assigned monotonic sequence for devices that cannot be trusted, and back-pressure on the batch size.`,
+  debrief: `The interviewer is testing whether you can debug a batch-ingestion endpoint. The starter reads fine because the demo sends well-formed updates from one device with a correct clock and never replays a batch. Three defects are being checked: the skew bound (a wrong-clock device cannot write the past), the sequence high-water mark (a replay cannot re-apply old positions), and log hygiene (coordinates are sensitive and never reach a log line). Real fleets add per-device skew allowances, a server-assigned monotonic sequence for devices that cannot be trusted, and back-pressure on the batch size.`,
 };

@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['registry', 'eval'],
   task: `## Task
 
-The starter is a plausible model-generated draft: when the eval service is healthy it returns a
+The starter is working code: when the eval service is healthy it returns a
 verdict and the promotion goes through, so the demo ships. Every failure path promotes anyway. Find
 them, fix them, and prove the fix.
 
@@ -27,7 +27,7 @@ Implement the eval gate the promotion path calls before it moves any pointer:
 - The promotion records the **eval id** it was gated on, so a year later the audit can say which run
   justified the release.
 
-**Failure mode the checks target.** Treating an error as consent is the whole bug: the draft
+**Failure mode the checks target.** Treating an error as consent is the whole bug: the starter
 \`except\`s the RPC failure and promotes, so a deadline turns into a release. Caching a failed eval
 for a day is the same decision made twice, and retrying a rejection converts a measured "no" into
 enough attempts to get lucky.`,
@@ -76,7 +76,7 @@ enough attempts to get lucky.`,
       id: 'retry-policy',
       title: 'Three bounded attempts, only the two retryable codes',
       detail:
-        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried. The draft loops `while True` and retries every failure, including a `failed` verdict.',
+        'Attempts are bounded by `MAX_ATTEMPTS = 3` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried. The starter loops `while True` and retries every failure, including a `failed` verdict.',
       match: {
         python: {
           all: [
@@ -114,7 +114,7 @@ enough attempts to get lucky.`,
       id: 'block-on-error',
       title: 'A timeout or an RPC error blocks the promotion',
       detail:
-        'The error branch returns the blocking decision — an eval that timed out or failed carried no verdict, so it cannot promote. The draft promotes in the `except`/`catch`/`err != nil` branch.',
+        'The error branch returns the blocking decision — an eval that timed out or failed carried no verdict, so it cannot promote. The starter promotes in the `except`/`catch`/`err != nil` branch.',
       match: {
         python: {all: [/except\s+grpc\.RpcError/, /DECISION_BLOCK/]},
         typescript: {all: [/catch\s*\(\s*error\s*\)/, /BLOCK/]},
@@ -127,7 +127,7 @@ enough attempts to get lucky.`,
       id: 'fail-terminal',
       title: 'A failed verdict is terminal and is not cached for a day',
       detail:
-        'A completed `passed: false` verdict blocks immediately and is never retried into a pass; the gate never reuses a stale failure from a long TTL. The draft caches an eval result for `86400` seconds and retries the rejection.',
+        'A completed `passed: false` verdict blocks immediately and is never retried into a pass; the gate never reuses a stale failure from a long TTL. The starter caches an eval result for `86400` seconds and retries the rejection.',
       match: {
         python: {all: [/reply\.passed/, /DECISION_BLOCK/], none: [/86400/]},
         typescript: {all: [/reply\.passed/, /BLOCK/], none: [/86400/]},
@@ -140,7 +140,7 @@ enough attempts to get lucky.`,
       id: 'record-eval',
       title: 'Records the eval id and the content hash it gated',
       detail:
-        'The promotion stores the `eval_id` and the `content_hash` it was gated on, so the audit can prove what justified the release — and a changed version has to earn a fresh eval. The draft promotes with no eval reference at all.',
+        'The promotion stores the `eval_id` and the `content_hash` it was gated on, so the audit can prove what justified the release — and a changed version has to earn a fresh eval. The starter promotes with no eval reference at all.',
       match: {
         python: {all: [/eval_id/, /content_hash/, /store\.promote\(/]},
         typescript: {all: [/evalId/, /contentHash/, /store\.promote\(/]},
@@ -258,7 +258,7 @@ def promote(name: str, version: int, content_hash: str, actor: str) -> tuple[str
 `,
     },
     typescript: {
-      starter: `/** Eval gate: a model-generated draft that treats every eval failure as consent. */
+      starter: `/** Eval gate: flawed code that treats every eval failure as consent. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 

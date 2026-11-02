@@ -8,9 +8,10 @@ export const mtClientStep: Step = {
   focus: ['api', 'mt', 'detector'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated MT client: it calls the translator,
+**Starting point.** The starter is working code for the MT client: it calls the translator,
 catches failures and always returns something. It compiles, the demo always shows text, and it hides
-two production flaws. Review it, fix it, and prove the fix with the checks below.
+two production flaws. Debug it like the owner of the client, fix it, and prove the fix with the
+checks below.
 
 Implement the machine-translation client used by \`POST /v1/translations\`.
 
@@ -24,9 +25,9 @@ Implement the machine-translation client used by \`POST /v1/translations\`.
 - A marked fallback is **not a translation**: \`isCacheable\` must answer \`false\` for it, so the
   translation-memory cache can never replay a failure as localized content.
 
-**Failure mode the checks target.** The draft returns the source text as a success and stamps the
+**Failure mode the checks target.** The starter returns the source text as a success and stamps the
 target locale on it. Downstream, that is indistinguishable from a real translation: the CDN caches
-it, the quality metric counts it, and a user in Paris reads English. The same draft retries a
+it, the quality metric counts it, and a user in Paris reads English. The same code retries a
 language-pair rejection because it catches every \`RpcError\` the same way, so a 400-shaped caller
 bug becomes three wasted round trips.`,
   sequence: {
@@ -51,7 +52,7 @@ bug becomes three wasted round trips.`,
       id: 'deadline',
       title: 'Puts a two-second deadline on every MT attempt',
       detail:
-        'Every `Translate` call carries a **2 second** deadline. The draft uses a ten-second timeout and then swallows the failure, so one slow provider stalls the whole request path.',
+        'Every `Translate` call carries a **2 second** deadline. The starter uses a ten-second timeout and then swallows the failure, so one slow provider stalls the whole request path.',
       match: {
         python: {all: [/MT_DEADLINE_SECONDS/, /timeout=/]},
         typescript: {all: [/MT_DEADLINE_MS/, /deadline/]},
@@ -64,7 +65,7 @@ bug becomes three wasted round trips.`,
       id: 'marked-fallback',
       title: 'Marks the fallback and answers with a retriable status',
       detail:
-        'A failed call returns the source text with the `untranslated` marker and a **503**, never a 200 carrying the target locale. The draft returns the input text as a successful translation of the target language.',
+        'A failed call returns the source text with the `untranslated` marker and a **503**, never a 200 carrying the target locale. The starter returns the input text as a successful translation of the target language.',
       match: {
         python: {all: [/UNTRANSLATED_MARKER/, /status_code\s*=\s*503/]},
         typescript: {all: [/UNTRANSLATED_MARKER/, /statusCode\s*=\s*503/]},
@@ -77,7 +78,7 @@ bug becomes three wasted round trips.`,
       id: 'retriable-only',
       title: 'Retries only retriable codes and never a language-pair rejection',
       detail:
-        'Only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; an `INVALID_ARGUMENT` language-pair rejection is surfaced immediately. The draft retries every `RpcError`.',
+        'Only `UNAVAILABLE`/`DEADLINE_EXCEEDED` are retried; an `INVALID_ARGUMENT` language-pair rejection is surfaced immediately. The starter retries every `RpcError`.',
       match: {
         python: {all: [/RETRIABLE_CODES/, /UNSUPPORTED_PAIR/]},
         typescript: {all: [/RETRIABLE_CODES/, /UNSUPPORTED_PAIR/]},
@@ -90,7 +91,7 @@ bug becomes three wasted round trips.`,
       id: 'attempts',
       title: 'Bounds the attempts instead of retrying forever',
       detail:
-        'At most three attempts per segment. The draft loops until the call returns, so an outage becomes a hot retry loop against an already-struggling provider.',
+        'At most three attempts per segment. The starter loops until the call returns, so an outage becomes a hot retry loop against an already-struggling provider.',
       match: {
         python: {all: [/MAX_MT_ATTEMPTS/, /range\(/]},
         typescript: {all: [/MAX_MT_ATTEMPTS/, /for\s*\(/]},
@@ -103,7 +104,7 @@ bug becomes three wasted round trips.`,
       id: 'never-cache-marked',
       title: 'A marked fallback is never cacheable',
       detail:
-        '`isCacheable` answers `false` for a marked response, so the translation-memory write is skipped. The draft caches whatever it returned, failure or not, and serves it as a translation.',
+        '`isCacheable` answers `false` for a marked response, so the translation-memory write is skipped. The starter caches whatever it returned, failure or not, and serves it as a translation.',
       match: {
         python: {all: [/is_cacheable/, /UNTRANSLATED_MARKER/]},
         typescript: {all: [/isCacheable/, /UNTRANSLATED_MARKER/]},
@@ -136,9 +137,9 @@ class MtResult:
 
 
 def translate_segment(text: str, source: str, target: str, terms: list[dict]) -> MtResult:
-    # TODO: this draft returns the source text as a success with the target locale stamped on it
+    # TODO: this starter returns the source text as a success with the target locale stamped on it
     # when the MT call fails, and it retries every RpcError including a rejected language pair.
-    # Review both before downstream caches treat a failure as a translation.
+    # Fix both before downstream caches treat a failure as a translation.
     while True:
         try:
             reply = mt.Translate(
@@ -221,7 +222,7 @@ def translate_segment(text: str, source: str, target: str, terms: list[dict]) ->
 `,
     },
     typescript: {
-      starter: `/** The model-generated MT client: always returns something, retries everything. */
+      starter: `/** The MT client: always returns something, retries everything. */
 import {status as GrpcStatus, type ServiceError} from '@grpc/grpc-js';
 
 import {callTranslate} from './mt';
@@ -237,8 +238,8 @@ export async function translateSegment(
   target: string,
   terms: Term[],
 ): Promise<MtResult> {
-  // TODO: this draft returns the source text as a success with the target locale stamped on it when
-  // the MT call fails, and it retries every error including a rejected language pair. Review both.
+  // TODO: this starter returns the source text as a success with the target locale stamped on it when
+  // the MT call fails, and it retries every error including a rejected language pair. Fix both.
   for (;;) {
     try {
       const reply = await callTranslate({text, source, target, glossary: terms}, {deadline: new Date(Date.now() + 10_000)});
@@ -329,9 +330,9 @@ type MtResult struct {
 var mtClient MtServiceClient
 
 func translateSegment(ctx context.Context, text, source, target string, terms []Term) (MtResult, error) {
-	// TODO: this draft returns the source text as a success with the target locale stamped on it
+	// TODO: this starter returns the source text as a success with the target locale stamped on it
 	// when the MT call fails, and it retries every error including a rejected language pair.
-	// Review both.
+	// Fix both.
 	for {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		reply, err := mtClient.Translate(ctx, &TranslateRequest{Text: text, Source: source, Target: target})
@@ -431,9 +432,9 @@ object MtClient {
   val deadline = new java.util.Date(System.currentTimeMillis() + 10000)
 
   def translateSegment(text: String, source: String, target: String, terms: List[Term]): Future[MtResult] =
-    // TODO: this draft returns the source text as a success with the target locale stamped on it
+    // TODO: this starter returns the source text as a success with the target locale stamped on it
     // when the MT call fails, and it retries every failure including a rejected language pair.
-    // Review both.
+    // Fix both.
     retryForever(text, source, target)
 
   private def retryForever(text: String, source: String, target: String): Future[MtResult] =
@@ -497,8 +498,8 @@ struct MtResult {
 
 MtResult translateSegment(const std::string& text, const std::string& source, const std::string& target,
                           const std::vector<Term>& terms) {
-  // TODO: this draft returns the source text as a success with the target locale stamped on it when
-  // the MT call fails, and it retries every error including a rejected language pair. Review both.
+  // TODO: this starter returns the source text as a success with the target locale stamped on it when
+  // the MT call fails, and it retries every error including a rejected language pair. Fix both.
   for (;;) {
     const auto reply = mtClient.translate(text, source, target, std::chrono::seconds(10));
     if (reply) return MtResult{*reply, target};
@@ -553,8 +554,8 @@ MtResult translateSegment(const std::string& text, const std::string& source, co
   },
   hints: [
     'The deadline is per attempt, not per request: each `Translate` gets its own two-second budget, and the attempts are bounded to three. That bounds the worst case a user can experience without letting an outage turn into a retry storm.',
-    'Classify before you retry. `UNAVAILABLE` and `DEADLINE_EXCEEDED` are the provider being sick and are worth a retry; `INVALID_ARGUMENT` is your caller being wrong and must surface immediately — the draft treats both as "try again".',
+    'Classify before you retry. `UNAVAILABLE` and `DEADLINE_EXCEEDED` are the provider being sick and are worth a retry; `INVALID_ARGUMENT` is your caller being wrong and must surface immediately — the starter treats both as "try again".',
     'The fallback is a value with a marker, not an exception to hide: return the source text with `untranslated` and a 503, and make `isCacheable` say no. Anything you cache here becomes localized-looking content that no one can correct.',
   ],
-  debrief: `The interviewer is testing failure semantics, which is where generated MT clients are usually wrong. Two defects are checked: an unbounded retry loop with a ten-second timeout that turns a provider incident into a queue of stalled requests, and a fallback that returns the source text as a successful translation. The marker plus the retriable status is the fix that makes the failure visible end to end, and \`isCacheable\` is what keeps it out of translation memory. Real services add jitter to the retry, a circuit breaker per provider, per-locale quality counters for fallback rate, and an alert when the marked-fallback ratio crosses a threshold.`,
+  debrief: `The interviewer is testing failure semantics, which is where MT clients are usually wrong. Two defects are checked: an unbounded retry loop with a ten-second timeout that turns a provider incident into a queue of stalled requests, and a fallback that returns the source text as a successful translation. The marker plus the retriable status is the fix that makes the failure visible end to end, and \`isCacheable\` is what keeps it out of translation memory. Real services add jitter to the retry, a circuit breaker per provider, per-locale quality counters for fallback rate, and an alert when the marked-fallback ratio crosses a threshold.`,
 };

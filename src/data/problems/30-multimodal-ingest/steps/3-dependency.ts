@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['ingest', 'vision', 'objects', 'indexer'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it asks the vision service for a
+**Starting point.** The starter is working code: it asks the vision service for a
 caption and gets one on the happy path, so the demo looks complete. It hides a missing deadline, an
 error handler that cannot tell a refusal from an outage, and a placeholder that poisons the index.
 Find them, fix them, and prove the fix.
@@ -27,7 +27,7 @@ Implement the vision client ingest uses when the request carried no caption.
 - Whatever happens, the literal caption **"an image"** never enters the index: a placeholder matches
   every query, so one vision outage turns into hundreds of poisoned retrievals.
 
-**Failure mode the checks target.** The draft's \`except\`/\`catch\` is the whole failure policy, and by
+**Failure mode the checks target.** The starter's \`except\`/\`catch\` is the whole failure policy, and by
 returning a placeholder it converts an outage into silently wrong search results — the worst possible
 outcome, because nothing alerts and nothing can be re-run. The second bug is the policy rejection:
 swallowing it retries a request that will never succeed, and indexing that asset text-only hides a
@@ -53,7 +53,7 @@ moderation decision inside a caption failure.`,
       id: 'deadline',
       title: 'Calls Caption with a 3-second deadline',
       detail:
-        'The client sets `VISION_DEADLINE_S = 3` / `VISION_DEADLINE_MS = 3000` (`visionDeadline`, `VisionDeadline`, `kVisionDeadlineMs`) and passes it as the gRPC deadline. The draft calls without one, so a stalled vision service stalls ingest.',
+        'The client sets `VISION_DEADLINE_S = 3` / `VISION_DEADLINE_MS = 3000` (`visionDeadline`, `VisionDeadline`, `kVisionDeadlineMs`) and passes it as the gRPC deadline. The starter calls without one, so a stalled vision service stalls ingest.',
       match: {
         python: {all: [/VISION_DEADLINE_S\s*=\s*3/, /timeout=VISION_DEADLINE_S/]},
         typescript: {all: [/VISION_DEADLINE_MS\s*=\s*3000/, /deadline:/]},
@@ -66,7 +66,7 @@ moderation decision inside a caption failure.`,
       id: 'policy',
       title: 'A policy rejection fails the asset with a reason',
       detail:
-        '`PERMISSION_DENIED` is mapped to `ContentPolicyError` / `ErrContentPolicy` carrying `POLICY_REJECTED`, and the call is not retried. The draft treats a moderation decision as a transient error and falls back to indexing the asset anyway.',
+        '`PERMISSION_DENIED` is mapped to `ContentPolicyError` / `ErrContentPolicy` carrying `POLICY_REJECTED`, and the call is not retried. The starter treats a moderation decision as a transient error and falls back to indexing the asset anyway.',
       match: {
         python: {all: [/ContentPolicyError/, /POLICY_REJECTED/], none: [/except Exception/]},
         typescript: {all: [/ContentPolicyError/, /grpc\.status\.PERMISSION_DENIED/]},
@@ -92,7 +92,7 @@ moderation decision inside a caption failure.`,
       id: 'no-placeholder',
       title: 'No placeholder caption ever reaches the index',
       detail:
-        'The fallback path carries `caption: null` (`None` / `nil` / `std::nullopt`), so no asset is indexed with the literal string `an image`. The draft invents that caption and search cannot tell it from a real one.',
+        'The fallback path carries `caption: null` (`None` / `nil` / `std::nullopt`), so no asset is indexed with the literal string `an image`. The starter invents that caption and search cannot tell it from a real one.',
       match: {
         python: {all: [/caption = None/], none: [/an image/]},
         typescript: {all: [/caption: null/], none: [/an image/]},
@@ -126,7 +126,7 @@ import vision_pb2_grpc
 
 
 def caption_asset(channel: grpc.Channel, asset_id: str, mime: str) -> dict:
-    # TODO: this draft calls without a deadline, swallows every vision error — a content-policy
+    # TODO: this starter calls without a deadline, swallows every vision error — a content-policy
     # rejection included — and substitutes the literal string "an image" as the caption, so an
     # outage becomes hundreds of quietly wrong search results.
     stub = vision_pb2_grpc.VisionStub(channel)
@@ -204,7 +204,7 @@ interface Captioning {
 
 export async function captionAsset(assetId: string, mime: string): Promise<Captioning> {
   try {
-    // TODO: this draft calls without a deadline, swallows every vision error — a content-policy
+    // TODO: this starter calls without a deadline, swallows every vision error — a content-policy
     // rejection included — and substitutes the literal string "an image" as the caption, so an
     // outage becomes hundreds of quietly wrong search results.
     const reply = await visionClient.Caption({asset_id: assetId, mime});
@@ -282,7 +282,7 @@ type Captioning struct {
 }
 
 func CaptionAsset(ctx context.Context, client visionpb.VisionClient, assetID, mime string) Captioning {
-	// TODO: this draft calls without a deadline, swallows every vision error — a content-policy
+	// TODO: this starter calls without a deadline, swallows every vision error — a content-policy
 	// rejection included — and substitutes the literal string "an image" as the caption, so an
 	// outage becomes hundreds of quietly wrong search results.
 	reply, err := client.Caption(ctx, &visionpb.CaptionRequest{AssetId: assetID, Mime: mime})
@@ -349,7 +349,7 @@ final case class Captioning(caption: Option[String], embeddingKind: String)
 
 object Client {
   def captionAsset(channel: ManagedChannel, assetId: String, mime: String): Captioning = {
-    // TODO: this draft calls without a deadline, swallows every vision error — a content-policy
+    // TODO: this starter calls without a deadline, swallows every vision error — a content-policy
     // rejection included — and substitutes the literal string "an image" as the caption, so an
     // outage becomes hundreds of quietly wrong search results.
     try {
@@ -404,7 +404,7 @@ struct Captioning {
 };
 
 Captioning caption_asset(const std::string& asset_id, const std::string& mime) {
-  // TODO: this draft calls without a deadline, swallows every vision error — a content-policy
+  // TODO: this starter calls without a deadline, swallows every vision error — a content-policy
   // rejection included — and substitutes the literal string "an image" as the caption, so an
   // outage becomes hundreds of quietly wrong search results.
   vision::CaptionRequest request;
@@ -463,7 +463,7 @@ Captioning caption_asset(const std::string& asset_id, const std::string& mime) {
     },
   },
   debrief: `The interviewer is testing whether you can tell a dependency failure from a dependency decision. A
-vision call has three outcomes, not two, and the draft collapses them: success, an outage it can
+vision call has three outcomes, not two, and the starter collapses them: success, an outage it can
 absorb, and a refusal it must not absorb. Absorbing a refusal silently indexes content moderation
 refused, and retrying it wastes a queue.
 

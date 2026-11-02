@@ -8,9 +8,9 @@ export const readStep: Step = {
   focus: ['client', 'query', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers the series route,
+**Starting point.** The starter is working code: it registers the series route,
 reads the points and answers, so the dashboard draws. It compiles, the demo passes, and it hides four
-production flaws — each one a way for a single refresh to read years of every tenant's data. Review it
+production flaws — each one a way for a single refresh to read years of every tenant's data. Debug it
 like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`GET /v1/series?series=…&from=…&to=…&cursor=…&limit=…\`:
@@ -34,7 +34,7 @@ Implement \`GET /v1/series?series=…&from=…&to=…&cursor=…&limit=…\`:
 - The page is explicit: the request takes \`limit\` and an opaque \`cursor\`, and the response carries
   the next \`cursor\` when a page fills, instead of silently truncating the series.
 
-**Failure mode the checks target.** The draft passes an open lower bound and a far-future \`to\`
+**Failure mode the checks target.** The starter passes an open lower bound and a far-future \`to\`
 straight to the store, so one refresh reads the entire retention; it returns every raw point at full
 resolution forever, so a chatty series is hundreds of thousands of rows per call; and it answers for
 any series name in any tenant, which turns the query API into an enumeration oracle over everyone's
@@ -67,7 +67,7 @@ metrics.`,
       id: 'range-cap',
       title: 'Caps the range at 7 days with 400',
       detail:
-        'Both bounds are required, `to` must be after `from`, and the window may span at most **7 days** (`MAX_RANGE_DAYS`); a longer range — or a missing `from`, an open lower bound — is **400** before the store runs. The draft passes an open bound and a far-future `to` straight through, so one request scans the whole retention.',
+        'Both bounds are required, `to` must be after `from`, and the window may span at most **7 days** (`MAX_RANGE_DAYS`); a longer range — or a missing `from`, an open lower bound — is **400** before the store runs. The starter passes an open bound and a far-future `to` straight through, so one request scans the whole retention.',
       match: {
         python: {
           all: [/@app\.get\(\s*["']\/v1\/series["']/, /MAX_RANGE_DAYS\s*=\s*7/, /status_code\s*=\s*400/],
@@ -95,7 +95,7 @@ metrics.`,
       id: 'series-cap',
       title: 'Caps a query at 50 series',
       detail:
-        'At most **50 series** (`MAX_SERIES`) may be named in one query; a longer list is **400** before the store is touched. The draft accepts any number of names, so a scan of one series is multiplied by an unbounded list.',
+        'At most **50 series** (`MAX_SERIES`) may be named in one query; a longer list is **400** before the store is touched. The starter accepts any number of names, so a scan of one series is multiplied by an unbounded list.',
       match: {
         python: {all: [/MAX_SERIES\s*=\s*50/, /len\(names\)\s*>\s*MAX_SERIES/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_SERIES\s*=\s*50/, /names\.length\s*>\s*MAX_SERIES/, /code\(\s*400\s*\)/]},
@@ -108,7 +108,7 @@ metrics.`,
       id: 'downsample',
       title: 'Downsamples to 10-second buckets and names the method',
       detail:
-        'Points are aggregated to at most one per **10 seconds** (`RESOLUTION_SECONDS`) per series and the method is named in the response (`"downsample": {"method": "max"}`). The draft returns raw points at full resolution, so a chatty series is hundreds of thousands of rows per call.',
+        'Points are aggregated to at most one per **10 seconds** (`RESOLUTION_SECONDS`) per series and the method is named in the response (`"downsample": {"method": "max"}`). The starter returns raw points at full resolution, so a chatty series is hundreds of thousands of rows per call.',
       match: {
         python: {all: [/RESOLUTION_SECONDS\s*=\s*10/, /downsample_max\(/, /"method":\s*"max"/]},
         typescript: {all: [/RESOLUTION_SECONDS\s*=\s*10/, /downsampleMax\(/, /method:\s*'max'/]},
@@ -121,7 +121,7 @@ metrics.`,
       id: 'cursor-pagination',
       title: 'Pages with a limit and a cursor',
       detail:
-        'The request takes a `limit` and an opaque `cursor`, and the response carries the next `cursor` when a page fills. The draft returns everything it read at once, so a long series either truncates silently or arrives whole.',
+        'The request takes a `limit` and an opaque `cursor`, and the response carries the next `cursor` when a page fills. The starter returns everything it read at once, so a long series either truncates silently or arrives whole.',
       match: {
         python: {all: [/cursor/, /limit/, /"cursor":/]},
         typescript: {all: [/cursor/, /limit/, /cursor:/]},
@@ -134,7 +134,7 @@ metrics.`,
       id: 'tenant-isolation',
       title: 'A foreign tenant series is 404',
       detail:
-        "Each name is resolved with `owner(name)` and its tenant compared with the caller's `X-Tenant-Id`; a mismatch answers **404**, exactly like an unknown name. The draft serves any tenant's series by name, so the query API doubles as an existence oracle.",
+        "Each name is resolved with `owner(name)` and its tenant compared with the caller's `X-Tenant-Id`; a mismatch answers **404**, exactly like an unknown name. The starter serves any tenant's series by name, so the query API doubles as an existence oracle.",
       match: {
         python: {all: [/X-Tenant-Id/, /owner/, /status_code\s*=\s*404/]},
         typescript: {all: [/x-tenant-id/, /owner/, /code\(\s*404\s*\)/]},
@@ -146,7 +146,7 @@ metrics.`,
   ],
   code: {
     python: {
-      starter: `"""GET /v1/series: a model-generated draft with an open-ended range."""
+      starter: `"""GET /v1/series: flawed code with an open-ended range."""
 from fastapi import FastAPI
 
 app = FastAPI()
@@ -163,7 +163,7 @@ store = SeriesStore()
 
 @app.get("/v1/series")
 def series(series: str, to_s: int | None = None) -> dict:
-    # TODO: this draft takes an open lower bound and a far-future to, returns raw points at full
+    # TODO: this starter takes an open lower bound and a far-future to, returns raw points at full
     # resolution, and serves any tenant's series by name. Bound the range and the series list,
     # downsample to 10 s buckets, page with a cursor and 404 a series the caller does not own.
     names = series.split(",")
@@ -254,7 +254,7 @@ def series(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/series: a model-generated draft with an open-ended range. */
+      starter: `/** GET /v1/series: flawed code with an open-ended range. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -271,7 +271,7 @@ export interface SeriesStore {
 declare const store: SeriesStore;
 
 app.get('/v1/series', async (request, reply) => {
-  // TODO: this draft takes an open lower bound and a far-future to, returns raw points at full
+  // TODO: this starter takes an open lower bound and a far-future to, returns raw points at full
   // resolution, and serves any tenant's series by name. Bound the range and the series list,
   // downsample to 10 s buckets, page with a cursor and 404 a series the caller does not own.
   const query = request.query as {series?: string; to?: string};
@@ -393,7 +393,7 @@ func writeJSON(rw http.ResponseWriter, status int, body any) {
 
 func Series(store Store) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: this draft takes an open lower bound and a far-future to, returns raw points at
+		// TODO: this starter takes an open lower bound and a far-future to, returns raw points at
 		// full resolution, and serves any tenant's series by name. Bound the range and the series
 		// list, downsample to 10 s buckets, page with a cursor and 404 a series the caller does
 		// not own.
@@ -569,7 +569,7 @@ object SeriesQuery {
     path("v1" / "series") {
       get {
         parameters("series".?, "to".as[Long].?) { (series, toOpt) =>
-          // TODO: this draft takes an open lower bound and a far-future to, returns raw points at
+          // TODO: this starter takes an open lower bound and a far-future to, returns raw points at
           // full resolution, and serves any tenant's series by name. Bound the range and the series
           // list, downsample to 10 s buckets, page with a cursor and 404 a foreign series.
           val names = series.getOrElse("").split(",").filter(_.nonEmpty).toIndexedSeq
@@ -688,7 +688,7 @@ SeriesStore store;
 
 void registerSeriesRoutes(httplib::Server& svr) {
   svr.Get("/v1/series", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft takes an open lower bound and a far-future to, returns raw points at full
+    // TODO: this starter takes an open lower bound and a far-future to, returns raw points at full
     // resolution, and serves any tenant's series by name. Bound the range and the series list,
     // downsample to 10 s buckets, page with a cursor and 404 a series the caller does not own.
     std::vector<std::string> names;

@@ -12,13 +12,13 @@ export const dependencyStep: Step = {
   focus: ['bidding', 'features', 'model'],
   task: `## Task
 
-**Review premise.** You are the AI platform engineer on call. The bidding service's p99 is 180 ms on a
+**Starting point.** You are the bidding platform engineer on call. The bidding service's p99 is 180 ms on a
 100 ms budget, every bid is answered late, and the median response still carries a model score even
-though the feature fetch alone consumed the auction. The model-generated client below waits the full
+though the feature fetch alone consumed the auction. The client below waits the full
 latency of both feature calls with no per-tier deadline, retries the identity lookup once inside the
 auction, and scores the model unconditionally.
 
-Review \`client\` and give each tier a slice of the auction budget, then prove the fix.
+Debug \`client\` and give each tier a slice of the auction budget, then prove the fix.
 
 - Two feature tiers, each with its own slice of the budget: **identity at 30 ms** and **contextual at
   50 ms**. Define both as named constants.
@@ -29,10 +29,10 @@ Review \`client\` and give each tier a slice of the auction budget, then prove t
   fabricated score.
 - A skipped model (or a feature tier that failed) yields a **conservative bid**: priced at the floor,
   marked \`degraded\`, with a reason the stats read can count. Define it as a named function.
-- **No tier retries**: one attempt per tier, inside that tier's slice. The draft's second identity
+- **No tier retries**: one attempt per tier, inside that tier's slice. The starter's second identity
   attempt starts after the first timeout and eats whatever the remaining tiers needed.
 
-**Failure mode the checks target.** The draft treats the auction budget as decoration. It waits the
+**Failure mode the checks target.** The starter treats the auction budget as decoration. It waits the
 feature service's own latency, retries the identity lookup once — a retry that cannot finish inside a
 100 ms auction but is issued anyway — and then asks the model for a score no matter how little time is
 left. The result is the symptom from the briefing: bids that are always late and a score that is only
@@ -65,7 +65,7 @@ ever computed from a budget that was already spent.`,
       id: 'tier-deadlines',
       title: 'Identity gets 30 ms and contextual features get 50 ms',
       detail:
-        'Both tiers carry their own named slice of the auction budget: identity **30 ms**, contextual **50 ms**. The draft has no per-tier budget at all, so each call runs to the feature service’s own timeout.',
+        'Both tiers carry their own named slice of the auction budget: identity **30 ms**, contextual **50 ms**. The starter has no per-tier budget at all, so each call runs to the feature service’s own timeout.',
       match: {
         python: {all: [/IDENTITY_DEADLINE_MS = 30/, /CONTEXT_DEADLINE_MS = 50/]},
         typescript: {all: [/IDENTITY_DEADLINE_MS = 30/, /CONTEXT_DEADLINE_MS = 50/]},
@@ -78,7 +78,7 @@ ever computed from a budget that was already spent.`,
       id: 'budget-clamp',
       title: 'A tier spends the smaller of its slice and what is left',
       detail:
-        'One helper computes `min(remaining_ms, tier_ms)` and both feature calls go through it, so a 30 ms slice inside a 20 ms budget is a 20 ms call. The draft passes no budget to either call.',
+        'One helper computes `min(remaining_ms, tier_ms)` and both feature calls go through it, so a 30 ms slice inside a 20 ms budget is a 20 ms call. The starter passes no budget to either call.',
       match: {
         python: {all: [/def tier_slice\(/, /min\(deadline\.remaining_ms\(\), tier_ms\)/]},
         typescript: {
@@ -97,7 +97,7 @@ ever computed from a budget that was already spent.`,
       id: 'skip-model',
       title: 'The model score is skipped when the budget cannot fit it',
       detail:
-        'The remaining budget is compared against `MODEL_MIN_BUDGET_MS` before the scoring call, and the degraded flag is set when a tier fails or the score is skipped. The draft always scores.',
+        'The remaining budget is compared against `MODEL_MIN_BUDGET_MS` before the scoring call, and the degraded flag is set when a tier fails or the score is skipped. The starter always scores.',
       match: {
         python: {all: [/remaining_ms\(\) < MODEL_MIN_BUDGET_MS/, /degraded = True/]},
         typescript: {all: [/remainingMs\(\) < MODEL_MIN_BUDGET_MS/, /degraded = true/]},
@@ -110,7 +110,7 @@ ever computed from a budget that was already spent.`,
       id: 'conservative-bid',
       title: 'A degraded path bids conservatively at the floor',
       detail:
-        'A named `conservative_bid` prices the degraded bid at the floor and marks it `"degraded": true` with a reason, so the answer stays inside the auction and the stats can count it. The draft has no degraded path.',
+        'A named `conservative_bid` prices the degraded bid at the floor and marks it `"degraded": true` with a reason, so the answer stays inside the auction and the stats can count it. The starter has no degraded path.',
       match: {
         python: {all: [/def conservative_bid\(/, /"degraded": True/]},
         typescript: {all: [/function conservativeBid\(/, /degraded: true/]},
@@ -123,7 +123,7 @@ ever computed from a budget that was already spent.`,
       id: 'no-retry',
       title: 'No tier retries inside the auction',
       detail:
-        'Each tier is called once: a retry inside a 100 ms auction cannot complete anyway, and the attempt it burns is the attempt the remaining tiers needed. The draft loops the identity lookup twice.',
+        'Each tier is called once: a retry inside a 100 ms auction cannot complete anyway, and the attempt it burns is the attempt the remaining tiers needed. The starter loops the identity lookup twice.',
       match: {
         python: {all: [/self\.identity\.fetch\(/], none: [/for attempt in range\(/, /retry|sleep\(/i]},
         typescript: {all: [/deps\.identity\.fetch\(/], none: [/attempt|retry/i]},
@@ -154,7 +154,7 @@ class BidClient:
         self.floor_cents = floor_cents
 
     def collect(self, deadline, user_hash: str, auction_id: str) -> dict:
-        # TODO: this draft gives neither tier a slice of the auction budget, retries the identity
+        # TODO: this starter gives neither tier a slice of the auction budget, retries the identity
         # lookup once (which cannot finish inside the auction and eats the remaining tiers), and
         # asks the model for a score even when nothing is left, so every bid is late.
         for attempt in range(2):
@@ -247,7 +247,7 @@ export class BidClient {
   ) {}
 
   async collect(deadline: {remainingMs(): number}, userHash: string, auctionId: string) {
-    // TODO: this draft gives neither tier a slice of the auction budget, retries the identity
+    // TODO: this starter gives neither tier a slice of the auction budget, retries the identity
     // lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
     // the model for a score even when nothing is left, so every bid is late.
     let identity: Record<string, number> = {};
@@ -371,7 +371,7 @@ type BidClient struct {
 }
 
 func (c *BidClient) Collect(ctx context.Context, deadline *Deadline, userHash, auctionID string) map[string]any {
-	// TODO: this draft gives neither tier a slice of the auction budget, retries the identity
+	// TODO: this starter gives neither tier a slice of the auction budget, retries the identity
 	// lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
 	// the model for a score even when nothing is left, so every bid is late.
 	var identity map[string]float64
@@ -510,7 +510,7 @@ class BidClient(identity: IdentityFeatures, context: ContextFeatures, scorer: Sc
   val FeatureTimeoutS = 0.2
 
   def collect(deadline: Deadline, userHash: String, auctionId: String): Map[String, Any] = {
-    // TODO: this draft gives neither tier a slice of the auction budget, retries the identity
+    // TODO: this starter gives neither tier a slice of the auction budget, retries the identity
     // lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
     // the model for a score even when nothing is left, so every bid is late.
     var identityFeatures = Map.empty[String, Double]
@@ -613,7 +613,7 @@ class BidClient {
       : identity_(identity), context_(context), scorer_(scorer), floorCents_(floorCents) {}
 
   std::map<std::string, int> collect(const std::string& userHash, const std::string& auctionId) {
-    // TODO: this draft gives neither tier a slice of the auction budget, retries the identity
+    // TODO: this starter gives neither tier a slice of the auction budget, retries the identity
     // lookup once (which cannot finish inside the auction and eats the remaining tiers), and asks
     // the model for a score even when nothing is left, so every bid is late.
     std::map<std::string, double> features;
@@ -720,7 +720,7 @@ class BidClient {
     'Skip, do not guess: before the scoring call compare `remaining_ms() < MODEL_MIN_BUDGET_MS` and return a conservative bid at the floor, marked degraded. A score computed from an exhausted budget is a fabricated one, and it is worse than an honest low bid.',
     'Delete the retry. One attempt per tier, inside its slice — a second identity attempt after a 30 ms timeout is issued into a budget that no longer exists, and whatever it burns is what the contextual tier and the model needed.',
   ],
-  debrief: `The interviewer is testing whether you can turn a latency budget into a decision policy. The draft
+  debrief: `The interviewer is testing whether you can turn a latency budget into a decision policy. The starter
 reads fine because the feature service is fast in the demo, so nobody notices that the auction's 100 ms
 is never consulted.
 

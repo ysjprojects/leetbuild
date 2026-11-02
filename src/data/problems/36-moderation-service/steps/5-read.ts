@@ -8,25 +8,25 @@ export const readStep: Step = {
   focus: ['api', 'db', 'console'],
   task: `## Task
 
-The starter is a plausible model-generated draft: a caller with a case id gets the case. The draft
+**Starting point.** The starter is working code: a caller with a case id gets the case. The starter
 treats the case id as the only proof of access, and the case file as a place to be helpful. Fix the
 scope, the reporter's identity and the free text, and prove the fix.
 
 Implement \`GET /v1/moderation/items/{case_id}\`:
 
 - The case is scoped to the **content owner's tenant**: resolve the case's tenant from the catalogue
-  and answer **404** — not 403 — when it belongs to someone else or does not exist. The draft
+  and answer **404** — not 403 — when it belongs to someone else or does not exist. The starter
   returns any case by id across tenants, so a case id is a skeleton key to another tenant's reports.
 - The body carries the status, the action history and links to the moderated content. The
   **reporter's identity is included only for the \`surveyor\` role**; for every other role it is
-  absent, not blanked, not hashed. The draft volunteers it "for context" to anyone who asks.
+  absent, not blanked, not hashed. The starter volunteers it "for context" to anyone who asks.
 - The free-text **detail is truncated** to \`MAX_DETAIL_CHARS\` and **escaped** before it is returned,
   so the case file is not a stored-XSS payload and not an unbounded copy of a private statement.
-  The draft echoes it raw.
+  The starter echoes it raw.
 - A missing tenant is **401**.
 
 **Failure mode the checks target.** A case file is a dossier that names the person who reported
-someone else, so it is the most sensitive read in the service. The draft fails on authorisation
+someone else, so it is the most sensitive read in the service. The starter fails on authorisation
 (the case id is not an access token), on data minimisation (reporter identity for everyone), and on
 output handling (raw free text straight back to the caller).`,
   sequence: {
@@ -66,7 +66,7 @@ output handling (raw free text straight back to the caller).`,
       id: 'tenant-scope',
       title: 'Hides a case that belongs to another tenant',
       detail:
-        'The case’s tenant is resolved from the catalogue and a mismatch is **404** — indistinguishable from a case that does not exist. The draft returns any case by id, so a guessed id leaks another tenant’s reports.',
+        'The case’s tenant is resolved from the catalogue and a mismatch is **404** — indistinguishable from a case that does not exist. The starter returns any case by id, so a guessed id leaks another tenant’s reports.',
       match: {
         python: {all: [/CASE_TENANT/, /status_code\s*=\s*404/]},
         typescript: {all: [/CASE_TENANT/, /code\(\s*404\s*\)/]},
@@ -79,7 +79,7 @@ output handling (raw free text straight back to the caller).`,
       id: 'surveyor-only',
       title: 'Shows reporter identity only to the surveyor role',
       detail:
-        'The reporter’s identity is added to the body only when the caller’s role is `surveyor`. The draft includes it for every caller, handing the reported user the name of the person who reported them.',
+        'The reporter’s identity is added to the body only when the caller’s role is `surveyor`. The starter includes it for every caller, handing the reported user the name of the person who reported them.',
       match: {
         python: {all: [/SURVEYOR_ROLE/, /reporter_id/]},
         typescript: {all: [/SURVEYOR_ROLE/, /reporter_id/]},
@@ -92,7 +92,7 @@ output handling (raw free text straight back to the caller).`,
       id: 'detail-truncated',
       title: 'Truncates the free-text detail',
       detail:
-        'The detail is cut to `MAX_DETAIL_CHARS` before it is returned. The draft echoes the whole field, so one report can carry a wall of private text into every case-file view.',
+        'The detail is cut to `MAX_DETAIL_CHARS` before it is returned. The starter echoes the whole field, so one report can carry a wall of private text into every case-file view.',
       match: {
         python: {all: [/MAX_DETAIL_CHARS/]},
         typescript: {all: [/MAX_DETAIL_CHARS/]},
@@ -105,7 +105,7 @@ output handling (raw free text straight back to the caller).`,
       id: 'detail-escaped',
       title: 'Escapes the free-text detail',
       detail:
-        'The detail is HTML-escaped before it is returned, so a report cannot store markup that executes in the reviewer’s console. The draft echoes it raw.',
+        'The detail is HTML-escaped before it is returned, so a report cannot store markup that executes in the reviewer’s console. The starter echoes it raw.',
       match: {
         python: {all: [/html\.escape/]},
         typescript: {all: [/escapeHtml/]},
@@ -127,7 +127,7 @@ cases = CaseStore()
 
 @app.get("/v1/moderation/items/{case_id}")
 def read_case(case_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> JSONResponse:
-    # TODO: this draft returns any case by id across tenants, includes the reporter identity for
+    # TODO: this starter returns any case by id across tenants, includes the reporter identity for
     # context, and echoes the free-text detail raw.
     record = cases.get(case_id)
     return JSONResponse(
@@ -202,13 +202,13 @@ def read_case(
 `,
     },
     typescript: {
-      starter: `/** GET /v1/moderation/items/{id}: a model-generated draft that treats the case id as access. */
+      starter: `/** GET /v1/moderation/items/{id}: flawed code that treats the case id as access. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
 
 app.get('/v1/moderation/items/:caseId', async (request, reply) => {
-  // TODO: this draft returns any case by id across tenants, includes the reporter identity for
+  // TODO: this starter returns any case by id across tenants, includes the reporter identity for
   // context, and echoes the free-text detail raw.
   const {caseId} = request.params as {caseId: string};
   const record = await cases.get(caseId);
@@ -277,7 +277,7 @@ import (
 )
 
 func readCase(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this draft returns any case by id across tenants, includes the reporter identity for
+	// TODO: this starter returns any case by id across tenants, includes the reporter identity for
 	// context, and echoes the free-text detail raw.
 	caseID := r.PathValue("case_id")
 	record, _ := cases.Get(caseID)
@@ -389,7 +389,7 @@ object CaseFileApi {
   val route: Route =
     path("v1" / "moderation" / "items" / Segment) { caseId =>
       get {
-        // TODO: this draft returns any case by id across tenants, includes the reporter identity
+        // TODO: this starter returns any case by id across tenants, includes the reporter identity
         // for context, and echoes the free-text detail raw.
         cases.get(caseId) match {
           case None => complete(StatusCodes.NotFound, """{"error":"unknown case"}""")
@@ -483,7 +483,7 @@ int main() {
   httplib::Server svr;
 
   svr.Get("/v1/moderation/items/([A-Za-z0-9_]+)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this draft returns any case by id across tenants, includes the reporter identity for
+    // TODO: this starter returns any case by id across tenants, includes the reporter identity for
     // context, and echoes the free-text detail raw.
     const auto caseId = req.matches[1];
     const json record = cases.get(caseId);
@@ -597,5 +597,5 @@ int main() {
     'Reporter identity is a named exception, not a default. Build the body without it, then add `reporter_id` only inside the `surveyor` branch. Minimising the response is easier to review than blanking fields later.',
     'Output is not “just data”: escape the detail before it reaches the reviewer’s console so a report cannot store markup, and truncate it to `MAX_DETAIL_CHARS` so the case file stays a summary rather than a copy of someone’s private statement.',
   ],
-  debrief: `The interviewer is testing whether you can review the read side of a sensitive record with the same care as the write side. The draft looks fine because the demo fetches its own case. Three defects are being checked: tenant scoping on a resource addressed by an opaque id, minimisation of the reporter’s identity to a single privileged role, and safe rendering of free text (escaped and truncated). Real systems add an access log per case view, a break-glass flow for surveyors with a recorded reason, field-level auditing so you can answer “who saw the reporter?”, and a retention policy that seals the raw detail separately from the case metadata.`,
+  debrief: `The interviewer is testing whether you can debug the read side of a sensitive record with the same care as the write side. The starter looks fine because the demo fetches its own case. Three defects are being checked: tenant scoping on a resource addressed by an opaque id, minimisation of the reporter’s identity to a single privileged role, and safe rendering of free text (escaped and truncated). Real systems add an access log per case view, a break-glass flow for surveyors with a recorded reason, field-level auditing so you can answer “who saw the reporter?”, and a retention policy that seals the raw detail separately from the case metadata.`,
 };

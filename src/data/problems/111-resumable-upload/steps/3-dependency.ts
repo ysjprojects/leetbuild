@@ -8,23 +8,23 @@ export const dependencyStep: Step = {
   focus: ['api', 'store', 'redis'],
   task: `## Task
 
-The starter is a plausible model-generated draft: it opens a gRPC channel to the object store, sends
+The starter is working code: it opens a gRPC channel to the object store, sends
 the part and marks it stored. The demo works because the store accepts everything. Three defects hide
 behind that acceptance. Find them, fix them, and prove the fix.
 
 Implement the part writer that moves one part from the API to the object store over gRPC.
 
 - Every \`WritePart\` call carries a **30-second deadline** (\`WRITE_DEADLINE_S\`); a store that hangs
-  must not hold the request open. The draft calls \`WritePart\` with no deadline at all.
+  must not hold the request open. The starter calls \`WritePart\` with no deadline at all.
 - The store returns the **checksum it computed** for the bytes it received. The writer must compare
   that against the checksum the client computed and mark the part stored **only on a match**
-  (**stored requires a checksum match**). The draft marks stored as soon as the call returns, so a
+  (**stored requires a checksum match**). The starter marks stored as soon as the call returns, so a
   part the store corrupted is discovered only at finalize — and the whole upload is retried.
-- A failed or mismatched part is retried **alone**, at most \`MAX_PART_ATTEMPTS\` (3) times. The draft
+- A failed or mismatched part is retried **alone**, at most \`MAX_PART_ATTEMPTS\` (3) times. The starter
   retries the entire upload on one part's failure, so a 5 GiB upload re-sends 4.99 GiB to recover a
   64 MiB part.
 - \`resume_list(upload_id, part_count, manifest)\` returns the **exact part numbers** still missing,
-  in order, so the client re-sends only those. The draft's callers get a percentage, not a list.
+  in order, so the client re-sends only those. The starter's callers get a percentage, not a list.
 
 **Failure mode the checks target.** Marking a part stored when the store *accepted* the request — not
 when the checksum *verified* — moves the discovery of corruption to finalize, after the client has
@@ -51,7 +51,7 @@ request.`,
       id: 'deadline',
       title: 'Every WritePart carries a 30-second deadline',
       detail:
-        'The gRPC call sets a 30-second deadline (`WRITE_DEADLINE_S`). The draft calls `WritePart` with no deadline, so a stuck store holds the request open.',
+        'The gRPC call sets a 30-second deadline (`WRITE_DEADLINE_S`). The starter calls `WritePart` with no deadline, so a stuck store holds the request open.',
       match: {
         python: {all: [/WRITE_DEADLINE_S/, /timeout=/]},
         typescript: {all: [/WRITE_DEADLINE_S/, /deadline/]},
@@ -64,7 +64,7 @@ request.`,
       id: 'checksum-verify',
       title: 'Compares the store’s checksum before storing',
       detail:
-        'The reply checksum is compared against the client’s computed checksum; a mismatch is treated as a failed part. The draft never looks at the checksum the store returns.',
+        'The reply checksum is compared against the client’s computed checksum; a mismatch is treated as a failed part. The starter never looks at the checksum the store returns.',
       match: {
         python: {all: [/reply\.checksum/, /part\.checksum/]},
         typescript: {all: [/reply\.checksum/, /part\.checksum/]},
@@ -77,7 +77,7 @@ request.`,
       id: 'per-part-retry',
       title: 'Retries the failed part alone, bounded',
       detail:
-        'The retry loop is per part and bounded by `MAX_PART_ATTEMPTS` (3); a failure does not restart the upload. The draft retries the whole upload on one part’s failure.',
+        'The retry loop is per part and bounded by `MAX_PART_ATTEMPTS` (3); a failure does not restart the upload. The starter retries the whole upload on one part’s failure.',
       match: {
         python: {all: [/MAX_PART_ATTEMPTS/, /range\(MAX_PART_ATTEMPTS\)/]},
         typescript: {all: [/MAX_PART_ATTEMPTS/, /attempt < MAX_PART_ATTEMPTS/]},
@@ -90,7 +90,7 @@ request.`,
       id: 'stored-after-verify',
       title: 'Marks stored only after the checksum matches',
       detail:
-        '`mark_stored` runs after the checksum comparison succeeds — not as soon as the call returns. The draft marks the part stored when the store accepts the request.',
+        '`mark_stored` runs after the checksum comparison succeeds — not as soon as the call returns. The starter marks the part stored when the store accepts the request.',
       match: {
         python: {order: [/reply\.checksum/, /mark_stored\(/]},
         typescript: {order: [/reply\.checksum/, /markStored\(/]},
@@ -103,7 +103,7 @@ request.`,
       id: 'resume-list',
       title: 'Names the exact missing parts',
       detail:
-        '`resume_list` returns the part numbers in `1..part_count` that the manifest does not hold, so the client re-sends only the gaps. The draft’s callers get a percentage.',
+        '`resume_list` returns the part numbers in `1..part_count` that the manifest does not hold, so the client re-sends only the gaps. The starter’s callers get a percentage.',
       match: {
         python: {all: [/resume_list/, /part_count/, /not in manifest|if number/]},
         typescript: {all: [/resumeList/, /partCount/, /manifest/]},
@@ -131,7 +131,7 @@ class Part:
 
 
 def write_part(stub, upload_id: str, part: Part) -> None:
-    # TODO: this draft marks each part stored when the store accepts the request, retries the whole
+    # TODO: this starter marks each part stored when the store accepts the request, retries the whole
     # upload when a single part fails, and never checks the checksum the store returns.
     request = WritePartRequest(upload_id=upload_id, part_number=part.number, data=part.data)
     stub.WritePart(request)
@@ -189,7 +189,7 @@ def resume_list(upload_id: str, part_count: int, manifest: dict) -> list[int]:
 `,
     },
     typescript: {
-      starter: `/** WritePart: a model-generated draft that marks a part stored on the store's acceptance. */
+      starter: `/** WritePart: flawed code that marks a part stored on the store's acceptance. */
 import * as grpc from '@grpc/grpc-js';
 
 const WRITE_DEADLINE_S = 30;
@@ -212,7 +212,7 @@ export async function writePart(
   uploadId: string,
   part: Part,
 ): Promise<void> {
-  // TODO: this draft marks each part stored when the store accepts the request, retries the whole
+  // TODO: this starter marks each part stored when the store accepts the request, retries the whole
   // upload when a single part fails, and never checks the checksum the store returns.
   await new Promise<void>((resolve, reject) => {
     client.writePart(
@@ -301,7 +301,7 @@ import (
 const writeDeadlineS = 30
 
 func WritePart(ctx context.Context, client StoreClient, uploadID string, part Part) error {
-	// TODO: this draft marks each part stored when the store accepts the request, retries the whole
+	// TODO: this starter marks each part stored when the store accepts the request, retries the whole
 	// upload when a single part fails, and never checks the checksum the store returns.
 	_, err := client.WritePart(ctx, &WritePartRequest{
 		UploadId:   uploadID,
@@ -386,7 +386,7 @@ object PartWriter {
   val WriteDeadlineS: Long = 30
 
   def writePart(stub: StoreGrpc.StoreBlockingStub, uploadId: String, part: Part): Unit = {
-    // TODO: this draft marks each part stored when the store accepts the request, retries the whole
+    // TODO: this starter marks each part stored when the store accepts the request, retries the whole
     // upload when a single part fails, and never checks the checksum the store returns.
     val request = WritePartRequest(uploadId = uploadId, partNumber = part.number, data = part.data)
     stub.writePart(request)
@@ -454,7 +454,7 @@ object PartWriter {
 constexpr int kWriteDeadlineS = 30;
 
 void WritePart(std::shared_ptr<grpc::Channel> channel, const std::string& uploadId, const Part& part) {
-  // TODO: this draft marks each part stored when the store accepts the request, retries the whole
+  // TODO: this starter marks each part stored when the store accepts the request, retries the whole
   // upload when a single part fails, and never checks the checksum the store returns.
   auto stub = Store::NewStub(channel);
   grpc::ClientContext context;

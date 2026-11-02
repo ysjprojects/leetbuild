@@ -8,7 +8,7 @@ export const storageClientStep: Step = {
   focus: ['api', 'store', 'verifier'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: against a healthy store it
+**Starting point.** The starter is working code: against a healthy store it
 writes every chunk and acknowledges it, so the demo uploads. Against a slow, corrupting or
 unauthorized store it is wrong in three ways. Find them, fix them, and prove the fix with the checks
 below.
@@ -18,7 +18,7 @@ Implement \`put_chunk(upload_id, index, payload)\` for the checkpoint store's ob
 - Every store call carries a **30-second deadline**. A call without one lets one stuck store pin the
   chunk writer for the life of the process.
 - The chunk is written with \`WriteChunk\`, and it is acknowledged **only after** the store confirms
-  the checksum for that chunk (\`VerifyChunk\` returns \`stored\` and a matching digest). The draft
+  the checksum for that chunk (\`VerifyChunk\` returns \`stored\` and a matching digest). The starter
   acknowledges as soon as the write returns and verifies later in a background pass, so corruption
   is discovered *after* a training run has already resumed from that chunk.
 - The digest is computed locally (\`sha256\` of the payload) and compared with what the store
@@ -51,7 +51,7 @@ that hangs instead of one that fails with a reason.`,
       id: 'store-deadline',
       title: 'Puts a 30-second deadline on every store call',
       detail:
-        'Each `WriteChunk`/`VerifyChunk` runs under a 30-second deadline. The draft calls the store with no deadline, so one hung store pins the writer indefinitely.',
+        'Each `WriteChunk`/`VerifyChunk` runs under a 30-second deadline. The starter calls the store with no deadline, so one hung store pins the writer indefinitely.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:/]},
@@ -64,7 +64,7 @@ that hangs instead of one that fails with a reason.`,
       id: 'verify-before-ack',
       title: 'Acknowledges only after the store verifies the chunk',
       detail:
-        'The write is followed by a verification of that chunk, and the acknowledgment comes last. The draft acknowledges right after the write and verifies in a background pass, so corruption surfaces after a resume has consumed the chunk.',
+        'The write is followed by a verification of that chunk, and the acknowledgment comes last. The starter acknowledges right after the write and verifies in a background pass, so corruption surfaces after a resume has consumed the chunk.',
       match: {
         python: {order: [/WriteChunk\(/, /VerifyChunk\(/]},
         typescript: {order: [/\.WriteChunk\(/, /\.VerifyChunk\(/]},
@@ -77,7 +77,7 @@ that hangs instead of one that fails with a reason.`,
       id: 'checksum-confirmed',
       title: 'Compares the store’s checksum with the local digest',
       detail:
-        'The payload is digested with **sha256** and the digest is what the store confirms; a mismatch or a `stored: false` fails the chunk. The draft never compares a checksum on the write path.',
+        'The payload is digested with **sha256** and the digest is what the store confirms; a mismatch or a `stored: false` fails the chunk. The starter never compares a checksum on the write path.',
       match: {
         python: {all: [/sha256\(/, /VerifyChunk\(/]},
         typescript: {all: [/createHash\(\s*['"]sha256['"]\s*\)/, /\.VerifyChunk\(/]},
@@ -90,7 +90,7 @@ that hangs instead of one that fails with a reason.`,
       id: 'bounded-retry',
       title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED, at most 3 times',
       detail:
-        'A named retryable set contains exactly `UNAVAILABLE` and `DEADLINE_EXCEEDED`, and the loop is bounded by a maximum attempt count. The draft catches every error and loops forever.',
+        'A named retryable set contains exactly `UNAVAILABLE` and `DEADLINE_EXCEEDED`, and the loop is bounded by a maximum attempt count. The starter catches every error and loops forever.',
       match: {
         python: {all: [/RETRYABLE/, /MAX_ATTEMPTS/]},
         typescript: {all: [/RETRYABLE/, /MAX_ATTEMPTS/]},
@@ -103,7 +103,7 @@ that hangs instead of one that fails with a reason.`,
       id: 'permission-stops',
       title: 'Stops the upload on PERMISSION_DENIED with a visible reason',
       detail:
-        '`PERMISSION_DENIED` is not retried: the upload stops and the error carries the status (`UploadRejected`). The draft treats it like any other failure and retries until the process dies.',
+        '`PERMISSION_DENIED` is not retried: the upload stops and the error carries the status (`UploadRejected`). The starter treats it like any other failure and retries until the process dies.',
       match: {
         python: {all: [/PERMISSION_DENIED/, /UploadRejected/]},
         typescript: {all: [/PERMISSION_DENIED/, /UploadRejected/]},
@@ -125,7 +125,7 @@ store = store_pb2_grpc.CheckpointStoreStub(channel)
 
 
 def put_chunk(upload_id: str, index: int, payload: bytes) -> None:
-    # TODO: this draft acknowledges the chunk as soon as the write returns, verifies later in a
+    # TODO: this starter acknowledges the chunk as soon as the write returns, verifies later in a
     # background pass, retries every error forever with no deadline, and treats an authorization
     # rejection like a transient failure. Verify the checksum before acknowledging, bound the
     # retries, and stop the upload when the store denies permission.
@@ -190,7 +190,7 @@ def put_chunk(upload_id: str, index: int, payload: bytes) -> str:
 `,
     },
     typescript: {
-      starter: `/** Object-store client: a model-generated draft that acknowledges before verifying. */
+      starter: `/** Object-store client: flawed code that acknowledges before verifying. */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
@@ -232,7 +232,7 @@ const {store} = grpc.loadPackageDefinition(protoLoader.loadSync('store.proto')) 
 const client = new store.CheckpointStore('store:9000', grpc.credentials.createInsecure());
 
 export async function putChunk(uploadId: string, index: number, payload: Buffer): Promise<void> {
-  // TODO: this draft acknowledges the chunk as soon as the write returns, verifies later in a
+  // TODO: this starter acknowledges the chunk as soon as the write returns, verifies later in a
   // background pass, retries every error forever with no deadline, and treats an authorization
   // rejection like a transient failure. Verify the checksum before acknowledging, bound the
   // retries, and stop the upload when the store denies permission.
@@ -368,7 +368,7 @@ type chunkStoreClient interface {
 }
 
 func putChunk(store chunkStoreClient, uploadID string, index int, payload []byte) error {
-	// TODO: this draft acknowledges the chunk as soon as the write returns, verifies later in a
+	// TODO: this starter acknowledges the chunk as soon as the write returns, verifies later in a
 	// background pass, retries every error forever with no deadline, and treats an authorization
 	// rejection like a transient failure. Verify the checksum before acknowledging, bound the
 	// retries, and stop the upload when the store denies permission.
@@ -455,7 +455,7 @@ import io.grpc.StatusRuntimeException
 
 object Client {
   def putChunk(stub: CheckpointStoreGrpc.CheckpointStoreBlockingStub, uploadId: String, index: Int, payload: Array[Byte]): Unit = {
-    // TODO: this draft acknowledges the chunk as soon as the write returns, verifies later in a
+    // TODO: this starter acknowledges the chunk as soon as the write returns, verifies later in a
     // background pass, retries every error forever with no deadline, and treats an authorization
     // rejection like a transient failure. Verify the checksum before acknowledging, bound the
     // retries, and stop the upload when the store denies permission.
@@ -537,7 +537,7 @@ object Client {
 #include "store.grpc.pb.h"
 
 std::string putChunk(CheckpointStore::Stub& store, const std::string& uploadId, int index, const std::string& payload) {
-  // TODO: this draft acknowledges the chunk as soon as the write returns, verifies later in a
+  // TODO: this starter acknowledges the chunk as soon as the write returns, verifies later in a
   // background pass, retries every error forever with no deadline, and treats an authorization
   // rejection like a transient failure. Verify the checksum before acknowledging, bound the
   // retries, and stop the upload when the store denies permission.
@@ -642,5 +642,5 @@ std::string putChunk(CheckpointStore::Stub& store, const std::string& uploadId, 
     'The digest has to be computed locally and compared with what the store returns (`stored` and `digest`). If the store cannot confirm the bytes it persisted, the chunk has not been persisted as sent, and the upload must fail rather than continue.',
     'Bound the failure policy: `MAX_ATTEMPTS = 3`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, and give every call a 30-second deadline. `PERMISSION_DENIED` is terminal — raise a typed error with the status in it so on-call sees an expired credential instead of a hang.',
   ],
-  debrief: `The interviewer is testing whether you can review a generated client against the failure it hides. The draft is the throughput-optimized shape: acknowledge fast, verify in the background, retry everything. Each choice is individually plausible and jointly wrong, because the platform's correctness argument runs through the acknowledgment: the trainer resumes from the last chunk the client said was durable. Real stores add per-chunk checksums returned by the object store, a resumable digest computed over the chunk list, retry budgets shared across chunks, and a token refresh path so a permission error is retried once after re-authenticating rather than swallowed.`,
+  debrief: `The interviewer is testing whether you can debug a client against the failure it hides. The starter is the throughput-optimized shape: acknowledge fast, verify in the background, retry everything. Each choice is individually plausible and jointly wrong, because the platform's correctness argument runs through the acknowledgment: the trainer resumes from the last chunk the client said was durable. Real stores add per-chunk checksums returned by the object store, a resumable digest computed over the chunk list, retry budgets shared across chunks, and a token refresh path so a permission error is retried once after re-authenticating rather than swallowed.`,
 };

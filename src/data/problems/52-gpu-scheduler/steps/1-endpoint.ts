@@ -8,15 +8,15 @@ export const endpointStep: Step = {
   focus: ['client', 'scheduler', 'registry', 'redis'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: it registers \`POST /v1/placements\`,
+**Starting point.** The starter is working code: it registers \`POST /v1/placements\`,
 parses the body and answers with a node. It compiles, it places the demo job, and it hides four
-production flaws. Review it like the service owner, fix it, and prove the fix with the checks below.
+production flaws. Debug it like the service owner, fix it, and prove the fix with the checks below.
 
 Implement \`POST /v1/placements\` with body
 \`{"gpu_type": "a100", "count": 4, "memory_gb": 80, "max_hourly_bid": 3.5}\`.
 
 - \`gpu_type\` must be one of the known types — \`a100\`, \`h100\`, \`l40s\` — and anything else is
-  **400**. The draft treats an unlisted type as *whatever is free*, so a typo silently lands a job on
+  **400**. The starter treats an unlisted type as *whatever is free*, so a typo silently lands a job on
   an arbitrary node instead of failing the caller.
 - \`count\` must be a positive integer (**400** otherwise) and must not exceed the largest node's
   capacity — the constant is \`MAX_NODE_GPUS\` (**8** here). A request no node can ever satisfy is
@@ -24,7 +24,7 @@ Implement \`POST /v1/placements\` with body
 - \`memory_gb\` and \`max_hourly_bid\` must be numbers (**400** otherwise).
 - Capacity is read from the node registry **once per request** (\`node_registry.list_nodes()\`) and the
   read carries a \`capacity_as_of\` timestamp. A snapshot older than \`CAPACITY_TTL_S\` is marked stale
-  (**503 \`STALE_CAPACITY\`**) instead of being trusted. The draft schedules against \`BOOT_CAPACITY\`,
+  (**503 \`STALE_CAPACITY\`**) instead of being trusted. The starter schedules against \`BOOT_CAPACITY\`,
   the snapshot loaded while the process booted, so a node that filled up an hour ago still looks empty.
 - The placement decision is logged with the placement id, the node id and the counters
   (\`count\`, \`free\`) — never with the request body. A GPU request carries tenant payloads, and the
@@ -84,7 +84,7 @@ and bids into the log pipeline on every placement.`,
       id: 'route-shape',
       title: 'Registers POST /v1/placements and validates the body shape',
       detail:
-        'The route is registered on `POST /v1/placements`, `gpu_type` is checked against the known types, `count` against a positive-integer helper, and `memory_gb` / `max_hourly_bid` against a number helper — each rejection a **400**. The draft accepts any value the JSON parser tolerates, so `count: 0` or a missing bid reaches the queue.',
+        'The route is registered on `POST /v1/placements`, `gpu_type` is checked against the known types, `count` against a positive-integer helper, and `memory_gb` / `max_hourly_bid` against a number helper — each rejection a **400**. The starter accepts any value the JSON parser tolerates, so `count: 0` or a missing bid reaches the queue.',
       match: {
         python: {
           all: [
@@ -126,7 +126,7 @@ and bids into the log pipeline on every placement.`,
       id: 'unknown-type',
       title: 'Rejects an unknown GPU type with 400 before queueing',
       detail:
-        'An unknown `gpu_type` is a **400** raised before the placement is enqueued, and the order is the point: a fallback to "whatever is free" sends a typo to a node that cannot run the job, and queueing before the check makes the rejection impossible. The draft picks the first node it finds instead.',
+        'An unknown `gpu_type` is a **400** raised before the placement is enqueued, and the order is the point: a fallback to "whatever is free" sends a typo to a node that cannot run the job, and queueing before the check makes the rejection impossible. The starter picks the first node it finds instead.',
       match: {
         python: {
           all: [/status_code=400/],
@@ -154,7 +154,7 @@ and bids into the log pipeline on every placement.`,
       id: 'capacity-ceiling',
       title: 'Rejects a count above the largest node before queueing',
       detail:
-        '`count` is compared against the per-node ceiling (`MAX_NODE_GPUS` / `maxNodeGpus` / `MaxNodeGpus` / `kMaxNodeGpus`) and the rejection happens before `enqueue`. A request that exceeds every node is unsatisfiable, so queueing it first leaves permanent backlog. The draft never looks at the number.',
+        '`count` is compared against the per-node ceiling (`MAX_NODE_GPUS` / `maxNodeGpus` / `MaxNodeGpus` / `kMaxNodeGpus`) and the rejection happens before `enqueue`. A request that exceeds every node is unsatisfiable, so queueing it first leaves permanent backlog. The starter never looks at the number.',
       match: {
         python: {all: [/status_code=400/], order: [/count > MAX_NODE_GPUS/, /\benqueue\(/]},
         typescript: {all: [/code\(\s*400\s*\)/], order: [/count > MAX_NODE_GPUS/, /\benqueue\(/]},
@@ -167,7 +167,7 @@ and bids into the log pipeline on every placement.`,
       id: 'fresh-capacity',
       title: 'Reads capacity fresh per request, with the boot snapshot gone',
       detail:
-        "Every request reads the registry live (`node_registry.list_nodes()` / `nodeRegistry.list()` / `nodeRegistry.ListNodes()` / `nodeRegistry.list()`) and keeps the read's `capacity_as_of` timestamp, so a stale snapshot can be detected (`CAPACITY_TTL_S` / `CAPACITY_TTL_MS` / `capacityTtlSec` / `CapacityTtlSeconds` / `kCapacityTtlSeconds`) rather than trusted. The draft schedules from `BOOT_CAPACITY` — a snapshot taken at boot — which any later allocation invalidates.",
+        "Every request reads the registry live (`node_registry.list_nodes()` / `nodeRegistry.list()` / `nodeRegistry.ListNodes()` / `nodeRegistry.list()`) and keeps the read's `capacity_as_of` timestamp, so a stale snapshot can be detected (`CAPACITY_TTL_S` / `CAPACITY_TTL_MS` / `capacityTtlSec` / `CapacityTtlSeconds` / `kCapacityTtlSeconds`) rather than trusted. The starter schedules from `BOOT_CAPACITY` — a snapshot taken at boot — which any later allocation invalidates.",
       match: {
         python: {
           all: [/node_registry\.list_nodes\(\)/, /capacity_as_of/, /CAPACITY_TTL_S/],
@@ -195,7 +195,7 @@ and bids into the log pipeline on every placement.`,
       id: 'log-no-payload',
       title: 'Logs the placement with node id and counters, never the body',
       detail:
-        "The placement decision is logged with the placement id, the node id and the counters. The request body never reaches a log line: the draft logs it verbatim, shipping the tenant's memory footprint and hourly bid into every log sink, where it outlives the request and the retention policy.",
+        "The placement decision is logged with the placement id, the node id and the counters. The request body never reaches a log line: the starter logs it verbatim, shipping the tenant's memory footprint and hourly bid into every log sink, where it outlives the request and the retention policy.",
       match: {
         python: {
           all: [/logger\.info\(/, /node_id/],
@@ -247,8 +247,8 @@ node_registry = NodeRegistry()
 
 @app.post("/v1/placements")
 def place(body: PlacementRequest) -> JSONResponse:
-    # TODO: this draft accepts any count, treats an unlisted gpu_type as whatever is free, places
-    # against the capacity snapshot taken at boot, and logs the request body. Review all four.
+    # TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
+    # against the capacity snapshot taken at boot, and logs the request body. Fix all four.
     node = next((n for n in BOOT_CAPACITY if n["gpu_type"] == body.gpu_type), BOOT_CAPACITY[0])
     placement_id = node_registry.enqueue(body.model_dump(), node)
     logger.info("placement queued payload=%r", body.model_dump())
@@ -357,7 +357,7 @@ async def place(request: Request) -> JSONResponse:
 `,
     },
     typescript: {
-      starter: `/** POST /v1/placements: a model-generated draft that trusts a boot-time capacity snapshot. */
+      starter: `/** POST /v1/placements: flawed code that trusts a boot-time capacity snapshot. */
 import Fastify from 'fastify';
 
 export const app = Fastify();
@@ -380,8 +380,8 @@ const nodeRegistry = {
 };
 
 app.post('/v1/placements', async (request, reply) => {
-  // TODO: this draft accepts any count, treats an unlisted gpu_type as whatever is free, places
-  // against the capacity snapshot taken at boot, and logs the request body. Review all four.
+  // TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
+  // against the capacity snapshot taken at boot, and logs the request body. Fix all four.
   const body = request.body as Record<string, unknown>;
   const node =
     BOOT_CAPACITY.find(candidate => candidate.gpuType === body.gpu_type) ?? BOOT_CAPACITY[0];
@@ -509,8 +509,8 @@ func place(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	// TODO: this draft accepts any count, treats an unlisted gpu_type as whatever is free, places
-	// against the capacity snapshot taken at boot, and logs the request body. Review all four.
+	// TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
+	// against the capacity snapshot taken at boot, and logs the request body. Fix all four.
 	node := bootCapacity[0]
 	for _, candidate := range bootCapacity {
 		if candidate.GpuType == body.GpuType {
@@ -718,7 +718,7 @@ object PlacementApi {
     path("v1" / "placements") {
       post {
         entity(as[PlacementRequest]) { body =>
-          // TODO: this draft accepts any count, treats an unlisted gpu_type as whatever is free,
+          // TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free,
           // places against the capacity snapshot taken at boot, and logs the request body.
           val node = BootCapacity.find(_.gpu_type == body.gpu_type).getOrElse(BootCapacity.head)
           val placementId = nodeRegistry.enqueue(body, node)
@@ -857,8 +857,8 @@ int main() {
 
   svr.Post("/v1/placements", [](const httplib::Request& req, httplib::Response& res) {
     const json body = json::parse(req.body, nullptr, false);
-    // TODO: this draft accepts any count, treats an unlisted gpu_type as whatever is free, places
-    // against the capacity snapshot taken at boot, and logs the request body. Review all four.
+    // TODO: this starter accepts any count, treats an unlisted gpu_type as whatever is free, places
+    // against the capacity snapshot taken at boot, and logs the request body. Fix all four.
     const auto gpuType = body.value("gpu_type", std::string("a100"));
     const NodeRecord* node = &kBootCapacity.front();
     for (const auto& candidate : kBootCapacity) {
@@ -998,5 +998,5 @@ int main() {
 `,
     },
   },
-  debrief: `The interviewer is testing whether you can review a generated handler at the admission boundary of a scheduler. The draft reads fine because the demo sends a well-formed request for a type that exists and fits: nothing in it exercises a typo, a count larger than the fleet, or a node that filled up since the process booted. Four defects are being checked, and they are ordered by how expensive they are to find in production. The unknown-type fallback is the loud one: a caller's typo becomes a placement on a machine that cannot run the job, and the GPU is wasted until someone notices. The uncapped count is the quiet one: nothing fails, the request simply sits in the queue forever, and the caller has no signal that it was impossible from the start. The boot-time capacity snapshot is the dangerous one, because it is *correct on the first request* and drifts afterwards — every later allocation the rest of the system performs is invisible to it, so the scheduler keeps handing out GPUs that are already taken. Reading capacity fresh per request, and carrying the read's \`capacity_as_of\` timestamp so a stale answer can be refused rather than trusted, is the same discipline the rest of this course applies to the Redis counters: never schedule from memory that something else can invalidate. The log line is the one candidates miss: a GPU request carries tenant ids, memory footprints and private bids, so the placement log must be ids and counters only. Real schedulers push further — a registry watch rather than a pull, a cache with an explicit invalidation epoch, per-tenant admission quotas before the capacity check, and a structured audit event for every rejected placement so that "why did my job never start" has an answer.`,
+  debrief: `The interviewer is testing whether you can debug a handler at the admission boundary of a scheduler. The starter reads fine because the demo sends a well-formed request for a type that exists and fits: nothing in it exercises a typo, a count larger than the fleet, or a node that filled up since the process booted. Four defects are being checked, and they are ordered by how expensive they are to find in production. The unknown-type fallback is the loud one: a caller's typo becomes a placement on a machine that cannot run the job, and the GPU is wasted until someone notices. The uncapped count is the quiet one: nothing fails, the request simply sits in the queue forever, and the caller has no signal that it was impossible from the start. The boot-time capacity snapshot is the dangerous one, because it is *correct on the first request* and drifts afterwards — every later allocation the rest of the system performs is invisible to it, so the scheduler keeps handing out GPUs that are already taken. Reading capacity fresh per request, and carrying the read's \`capacity_as_of\` timestamp so a stale answer can be refused rather than trusted, is the same discipline the rest of this course applies to the Redis counters: never schedule from memory that something else can invalidate. The log line is the one candidates miss: a GPU request carries tenant ids, memory footprints and private bids, so the placement log must be ids and counters only. Real schedulers push further — a registry watch rather than a pull, a cache with an explicit invalidation epoch, per-tenant admission quotas before the capacity check, and a structured audit event for every rejected placement so that "why did my job never start" has an answer.`,
 };

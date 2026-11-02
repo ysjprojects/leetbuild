@@ -8,7 +8,7 @@ export const dependencyStep: Step = {
   focus: ['scheduler', 'agent', 'fleet'],
   task: `## Task
 
-The starter is a plausible model-generated draft: the happy path places the demo workload, the
+The starter is working code: the happy path places the demo workload, the
 agent acknowledges, and the placement looks running. Every failure path is wrong. Find them, fix
 them, and prove the fix.
 
@@ -19,19 +19,19 @@ Implement \`start_workload(node_id, workload_id)\` for the scheduler’s node-ag
   \`kStartDeadlineS\`) set on the call itself, not the client’s default.
 - The placement is marked \`RUNNING\` only after the agent reports **health**
   (\`WaitForHealthy\` / \`waitHealthy\`). An acknowledgement means the request was received, not
-  that the workload runs — the draft marks the placement running as soon as the agent
+  that the workload runs — the starter marks the placement running as soon as the agent
   acknowledges.
 - An **image-pull rejection** (\`IMAGE_PULL_FAILED\` / \`ImagePullFailed\`) stops after **one
-  node** and returns a clear reason instead of retrying every node in the fleet. The draft’s
+  node** and returns a clear reason instead of retrying every node in the fleet. The starter’s
   blanket handler walks the fleet.
 - A start that exceeds the deadline is **rolled back** and the allocation is **released**
-  (\`rollback_placement\` / \`release_allocation\`), so the GPUs return to the pool. The draft
+  (\`rollback_placement\` / \`release_allocation\`), so the GPUs return to the pool. The starter
   leaks the allocation: no rollback, no release.
 - Retry on another node happens only for **retryable** outcomes (\`DEADLINE_EXCEEDED\` /
   \`UNAVAILABLE\`), classified through \`is_retryable\` and \`RETRYABLE_CODES\`, with the attempt
-  counter bounded. The draft retries every error on every node.
+  counter bounded. The starter retries every error on every node.
 
-**Failure mode the checks target.** The draft’s blanket \`except\`/\`catch\` treats an image-pull
+**Failure mode the checks target.** The starter’s blanket \`except\`/\`catch\` treats an image-pull
 rejection like a transient network error, walks the whole fleet, and leaks the allocation on every
 slow start. Marking the placement running on the acknowledgement is the quiet one: a workload that
 never becomes healthy looks placed but cannot serve, and the scheduler hands the same node to
@@ -48,7 +48,7 @@ another tenant.`,
     ],
   },
   hints: [
-    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with a constant and a `for` loop: the draft’s blanket `except`/`catch` has no exit for a permanent error like an image-pull rejection.',
+    'The deadline is an argument on the call itself (`timeout=`, `deadline:`, `WithTimeout`, `withDeadlineAfter`, `set_deadline`) — wrapping the call changes nothing. Bound the attempts with a constant and a `for` loop: the starter’s blanket `except`/`catch` has no exit for a permanent error like an image-pull rejection.',
     'A placement is running only after the agent reports health. Call `WaitForHealthy`/`waitHealthy` and only then write the `RUNNING` state — the acknowledgement only means the request was received. Use an explicit constant such as `START_DEADLINE_S` so the 20-second bound is visible on the call.',
     'An image-pull rejection is permanent: classify it as non-retryable and return the reason instead of walking the fleet. A deadline that passes is a rollback: release the allocation so the GPUs return to the pool, and only retry the outcomes that are actually retryable.',
   ],
@@ -57,7 +57,7 @@ another tenant.`,
       id: 'deadline',
       title: 'Start call carries an explicit 20-second deadline',
       detail:
-        'The gRPC `Start` call sets a 20-second deadline explicitly (a named constant such as `START_DEADLINE_S`, set on the call), not the client default. The draft’s unary call has no deadline at all.',
+        'The gRPC `Start` call sets a 20-second deadline explicitly (a named constant such as `START_DEADLINE_S`, set on the call), not the client default. The starter’s unary call has no deadline at all.',
       match: {
         python: {all: [/START_DEADLINE_S/, /timeout\s*=\s*START_DEADLINE_S/]},
         typescript: {all: [/START_DEADLINE_MS/, /deadline\s*:\s*Date\.now\(\)\s*\+\s*START_DEADLINE_MS/]},
@@ -70,7 +70,7 @@ another tenant.`,
       id: 'health-gate',
       title: 'Running only after the agent reports healthy',
       detail:
-        'The placement is marked `RUNNING` only after the agent reports health (`WaitForHealthy`/`waitHealthy`); the health check precedes the running write. The draft marks it running as soon as the agent acknowledges the start request.',
+        'The placement is marked `RUNNING` only after the agent reports health (`WaitForHealthy`/`waitHealthy`); the health check precedes the running write. The starter marks it running as soon as the agent acknowledges the start request.',
       match: {
         python: {order: [/wait_healthy|WaitForHealthy|waitHealthy/, /RUNNING/]},
         typescript: {order: [/waitHealthy|WaitForHealthy/, /RUNNING/]},
@@ -83,7 +83,7 @@ another tenant.`,
       id: 'image-pull-stop',
       title: 'Image-pull rejection stops after one node with a reason',
       detail:
-        'An image-pull rejection (`IMAGE_PULL_FAILED`/`ImagePullFailed`) stops after one node and returns a clear reason instead of retrying the whole fleet. The draft’s blanket handler walks every node.',
+        'An image-pull rejection (`IMAGE_PULL_FAILED`/`ImagePullFailed`) stops after one node and returns a clear reason instead of retrying the whole fleet. The starter’s blanket handler walks every node.',
       match: {
         python: {all: [/IMAGE_PULL_FAILED/, /return\s+.*reason/]},
         typescript: {all: [/IMAGE_PULL_FAILED/, /return\s+.*reason/]},
@@ -96,7 +96,7 @@ another tenant.`,
       id: 'rollback',
       title: 'Deadline exceeded rolls back and releases the allocation',
       detail:
-        'A start that exceeds the deadline is rolled back and the allocation is released (`rollback_placement`/`release_allocation`). The draft leaks the allocation: no rollback, no release.',
+        'A start that exceeds the deadline is rolled back and the allocation is released (`rollback_placement`/`release_allocation`). The starter leaks the allocation: no rollback, no release.',
       match: {
         python: {all: [/rollback_placement/, /release_allocation/]},
         typescript: {all: [/rollbackPlacement/, /releaseAllocation/]},
@@ -109,7 +109,7 @@ another tenant.`,
       id: 'retry-classification',
       title: 'Retries only retryable outcomes with a bounded attempt counter',
       detail:
-        'Retry on another node happens only for retryable outcomes (`DEADLINE_EXCEEDED`/`UNAVAILABLE`), classified through `is_retryable` and `RETRYABLE_CODES`, with the attempt counter bounded. The draft retries every error on every node.',
+        'Retry on another node happens only for retryable outcomes (`DEADLINE_EXCEEDED`/`UNAVAILABLE`), classified through `is_retryable` and `RETRYABLE_CODES`, with the attempt counter bounded. The starter retries every error on every node.',
       match: {
         python: {all: [/RETRYABLE_CODES/, /is_retryable/]},
         typescript: {all: [/RETRYABLE_CODES/, /isRetryable/]},
@@ -192,7 +192,7 @@ def start_workload(node_id: str, workload_id: str) -> dict:
 `,
     },
     typescript: {
-      starter: `/** Node-agent start: a model-generated draft that marks running on the acknowledgement. */
+      starter: `/** Node-agent start: flawed code that marks running on the acknowledgement. */
 import * as grpc from '@grpc/grpc-js';
 
 export async function startWorkload(nodeId: string, workloadId: string): Promise<{status: string}> {
@@ -531,14 +531,14 @@ std::string startWorkload(Agent::Stub* agent, const std::string& node_id, const 
 `,
     },
   },
-  debrief: `The reviewer is testing whether you can tell a placement that is *running* from one that
+  debrief: `The interviewer is testing whether you can tell a placement that is *running* from one that
 merely exists. The acknowledgement is not a health report: a workload image can pull, start, and
 crash before the first health probe, so the running write must be gated on \`WaitForHealthy\`, not
 on the \`Start\` reply. The deadline is the bound on the gate: a 20-second start that never reports
 health must be rolled back and the allocation released, or the GPUs stay reserved for a workload
 that will never run and the scheduler refuses a tenant that could have used them. The image-pull
 rejection is the classification half: a permanent failure must stop after one node with a reason,
-not walk the fleet turning a bad image into a fleet-wide outage. The draft looks fine because the
+not walk the fleet turning a bad image into a fleet-wide outage. The starter looks fine because the
 demo image pulls and the first node answers. Real schedulers add rolling retries with jittered
 backoff across a bounded node set, per-node health caches, and a reconciliation loop that releases
 allocations for placements that have no running workload.`,

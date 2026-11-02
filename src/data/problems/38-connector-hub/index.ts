@@ -7,13 +7,12 @@ import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
 
 /**
- * Connector hub on the AI-era track: the course is not "call a third-party API", it is the review
- * you owe a model-generated connector platform before it holds your customers' OAuth tokens and
- * their vendors' rate limits. Validated, idempotent registration against a held base URL → a
- * durable Redis cursor that only moves after a page is committed → a vendor fetch that backs off,
- * gives up on permanent failures and trips a breaker → connector-keyed sync events with tokens
- * redacted and the cursor before the offset commit → a health read that alerts on lag instead of
- * reassuring on a recent run.
+ * Connector hub: the course is not "call a third-party API", it is the debugging you owe a
+ * connector platform before it holds your customers' OAuth tokens and their vendors' rate limits.
+ * Validated, idempotent registration against a held base URL → a durable Redis cursor that only
+ * moves after a page is committed → a vendor fetch that backs off, gives up on permanent failures
+ * and trips a breaker → connector-keyed sync events with tokens redacted and the cursor before the
+ * offset commit → a health read that alerts on lag instead of reassuring on a recent run.
  */
 export const connectorHubProblem: Problem = {
   id: 'connector-hub',
@@ -21,7 +20,6 @@ export const connectorHubProblem: Problem = {
   tagline: 'Third-party connectors that sync on cursors, retry politely and never leak tokens.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
-  track: 'ai',
   minutes: 70,
   statement: `# Connector Hub
 
@@ -80,12 +78,12 @@ One service, **connectord**, with five pieces:
 5. \`GET /v1/connectors/{id}/health\`: tenant-scoped, a lag and breaker-state read that turns
    unhealthy after two missed sync intervals.
 
-## The review habit
+## The debugging habit
 
-Every starter on this track is a plausible model-generated draft. It compiles, it serves the happy
-path, and it sounds confident. Your job in every step is the job you will have on a real AI feature:
-read the draft against the failure modes, name the subtle one, fix it, and prove the fix with checks
-that fail on the draft and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. Your job in every step is the job you will have on a real feature: debug it against
+the failure modes, name the subtle one, fix it, optimize what is wasteful, and prove the fix with
+checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 

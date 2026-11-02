@@ -8,9 +8,9 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: publish a product and the
+**Starting point.** The starter is working code: publish a product and the
 storefront reads the new fields, so the demo passes. It hides three production flaws that only show
-up under concurrency. Review it, fix it, and prove the fix.
+up under concurrency. Debug it, fix it, and prove the fix.
 
 Implement the published snapshot store used by both the publish path and the storefront read.
 
@@ -28,7 +28,7 @@ Implement the published snapshot store used by both the publish path and the sto
   global pointer and a per-region pointer updated separately lets regions disagree about what is
   live.
 
-**Failure mode the checks target.** The draft applies the publish field by field into the shared
+**Failure mode the checks target.** The starter applies the publish field by field into the shared
 catalog hash, so a concurrent reader sees a product assembled from two versions; it keeps two
 pointers that are updated one after the other, so a region can serve the version the other one has
 already replaced; and its pointer write is unconditional, so a publish that fails halfway still
@@ -50,7 +50,7 @@ moves what the storefront reads.`,
       id: 'atomic-swap',
       title: 'Swaps the published pointer in one atomic write',
       detail:
-        'The pointer is moved by a single server-side write (`EVAL`/`NewScript`/`eval`) that sets the pointer key, and the snapshot is written under its own key first. The draft writes the fields into a shared hash and then moves the pointer, so a reader can observe a half-applied publish.',
+        'The pointer is moved by a single server-side write (`EVAL`/`NewScript`/`eval`) that sets the pointer key, and the snapshot is written under its own key first. The starter writes the fields into a shared hash and then moves the pointer, so a reader can observe a half-applied publish.',
       match: {
         python: {all: [/PUBLISH_LUA/, /\.eval\(/, /'SET'|"SET"/]},
         typescript: {all: [/PUBLISH_LUA/, /\.eval\(/, /'SET'|"SET"/]},
@@ -102,7 +102,7 @@ moves what the storefront reads.`,
       id: 'cas-swap',
       title: 'Only swaps the pointer a publish still expects',
       detail:
-        'The swap is conditional on the version the caller expected (`expected` threaded into the script), so a publish that fails after writing its snapshot leaves the previous pointer untouched. The draft sets the pointer unconditionally.',
+        'The swap is conditional on the version the caller expected (`expected` threaded into the script), so a publish that fails after writing its snapshot leaves the previous pointer untouched. The starter sets the pointer unconditionally.',
       match: {
         python: {all: [/PUBLISH_LUA/, /expected/], none: [/\.set\([^)]*pointer/]},
         typescript: {all: [/PUBLISH_LUA/, /expected/], none: [/\.set\([^)]*pointer/]},
@@ -120,9 +120,9 @@ r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
 def publish_snapshot(product_id: str, draft: dict) -> int:
-    # TODO: this draft swaps per-field values into one shared hash, keeps a global and a per-region
+    # TODO: this starter swaps per-field values into one shared hash, keeps a global and a per-region
     # pointer updated separately, and swaps the pointer unconditionally, so a failed publish still
-    # moves what the storefront reads. Review all three.
+    # moves what the storefront reads. Fix all three.
     r.hset(f"catalog:{product_id}", mapping=draft["fields"])
     r.set(f"catalog:{product_id}:pointer", draft["version"])
     r.set(f"catalog:{product_id}:region:{draft['region']}:pointer", draft["version"])
@@ -181,7 +181,7 @@ def read_published(product_id: str) -> dict | None:
 `,
     },
     typescript: {
-      starter: `/** Published snapshot: a model-generated draft that swaps fields one by one. */
+      starter: `/** Published snapshot: flawed code that swaps fields one by one. */
 import {Redis} from 'ioredis';
 
 const r = new Redis('redis://redis:6379');
@@ -193,9 +193,9 @@ interface Draft {
 }
 
 export async function publishSnapshot(productId: string, draft: Draft): Promise<number> {
-  // TODO: this draft swaps per-field values into one shared hash, keeps a global and a per-region
+  // TODO: this starter swaps per-field values into one shared hash, keeps a global and a per-region
   // pointer updated separately, and swaps the pointer unconditionally, so a failed publish still
-  // moves what the storefront reads. Review all three.
+  // moves what the storefront reads. Fix all three.
   await r.hset(\`catalog:\${productId}\`, draft.fields);
   await r.set(\`catalog:\${productId}:pointer\`, String(draft.version));
   await r.set(\`catalog:\${productId}:region:\${draft.region}:pointer\`, String(draft.version));
@@ -270,9 +270,9 @@ import (
 var rdb *redis.Client
 
 func publishSnapshot(ctx context.Context, productID string, draft map[string]any) (int, error) {
-	// TODO: this draft swaps per-field values into one shared hash, keeps a global and a per-region
+	// TODO: this starter swaps per-field values into one shared hash, keeps a global and a per-region
 	// pointer updated separately, and swaps the pointer unconditionally, so a failed publish still
-	// moves what the storefront reads. Review all three.
+	// moves what the storefront reads. Fix all three.
 	if err := rdb.HSet(ctx, "catalog:"+productID, draft["fields"]).Err(); err != nil {
 		return 0, err
 	}
@@ -357,9 +357,9 @@ import scala.jdk.CollectionConverters._
 object CatalogState {
   val jedis = new Jedis("redis", 6379)
 
-  // TODO: this draft swaps per-field values into one shared hash, keeps a global and a per-region
+  // TODO: this starter swaps per-field values into one shared hash, keeps a global and a per-region
   // pointer updated separately, and swaps the pointer unconditionally, so a failed publish still
-  // moves what the storefront reads. Review all three.
+  // moves what the storefront reads. Fix all three.
   def publishSnapshot(productId: String, version: Int, region: String, fields: Map[String, String]): Int = {
     fields.foreach { case (field, value) => jedis.hset(s"catalog:$productId", field, value) }
     jedis.set(s"catalog:$productId:pointer", version.toString)
@@ -424,9 +424,9 @@ using Redis = sw::redis::Redis;
 
 bool publishSnapshot(Redis& redis, const std::string& productId, int version, const std::string& region,
                      const std::map<std::string, std::string>& fields) {
-  // TODO: this draft swaps per-field values into one shared hash, keeps a global and a per-region
+  // TODO: this starter swaps per-field values into one shared hash, keeps a global and a per-region
   // pointer updated separately, and swaps the pointer unconditionally, so a failed publish still
-  // moves what the storefront reads. Review all three.
+  // moves what the storefront reads. Fix all three.
   redis.hset("catalog:" + productId, fields.begin(), fields.end());
   redis.set("catalog:" + productId + ":pointer", std::to_string(version));
   redis.set("catalog:" + productId + ":region:" + region + ":pointer", std::to_string(version));

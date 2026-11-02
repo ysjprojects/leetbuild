@@ -8,11 +8,11 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'worker'],
   task: `## Task
 
-**Review premise.** The starter is a plausible model-generated draft: the step loop keeps the session
+**Starting point.** The starter is working code: the step loop keeps the session
 in a module-level dictionary — \`step_index\`, \`budget_remaining\`, and the page itself — and the demo
 passes because one process runs the whole session and nobody restarts it. It hides a budget that a
 driver restart throws away, a session document that grows with every page the agent visits, and a key
-that never expires. Review it like the owner of the state layer, fix it, and prove the fix with the
+that never expires. Debug it like the owner of the state layer, fix it, and prove the fix with the
 checks below.
 
 Session state lives in **Redis** under one hash per session, \`session:{id}\`:
@@ -33,7 +33,7 @@ Session state lives in **Redis** under one hash per session, \`session:{id}\`:
 - The budget is charged **once per accepted action**, and when it reaches zero the session's status
   records \`budget_exhausted\` rather than letting the loop run on.
 
-**Failure mode the checks target.** The draft's state is process-local, so the moment the driver
+**Failure mode the checks target.** The starter's state is process-local, so the moment the driver
 restarts the session "starts over" with a fresh budget — the exact bug the platform's cost model
 cannot survive. It writes the page's HTML into the session document "so the next action can read it",
 turning a state key into a copy of every page the agent touched, and it sets no expiry at all, so an
@@ -55,7 +55,7 @@ at one session both advance it.`,
       id: 'state-key',
       title: 'Keeps session state in Redis under session:{id}',
       detail:
-        'Every piece of session state — step index, budget, page reference, lease — is read and written in one Redis hash built by a `session_key(session_id)` helper, so the driver process owns nothing. The draft keeps a module-level dictionary of sessions in the driver, so a restart loses the budget and the step index.',
+        'Every piece of session state — step index, budget, page reference, lease — is read and written in one Redis hash built by a `session_key(session_id)` helper, so the driver process owns nothing. The starter keeps a module-level dictionary of sessions in the driver, so a restart loses the budget and the step index.',
       match: {
         python: {all: [/def session_key\(/, /r\.hset\(|r\.hgetall\(/], none: [/^SESSIONS\s*=/m]},
         typescript: {all: [/function sessionKey\(/, /redis\.hset\(|redis\.hgetall\(/], none: [/const SESSIONS/]},
@@ -68,7 +68,7 @@ at one session both advance it.`,
       id: 'lease-ttl',
       title: 'Extends a 45-second lease on every action',
       detail:
-        'Each accepted action refreshes a `LEASE_TTL_S = 45` lease on the session key in the same atomic script that takes it, so a driver that dies mid-action loses the lease within 45 seconds and its session becomes recoverable. The draft sets no expiry anywhere: a crashed driver leaves a session nobody can take over and a key that never goes away.',
+        'Each accepted action refreshes a `LEASE_TTL_S = 45` lease on the session key in the same atomic script that takes it, so a driver that dies mid-action loses the lease within 45 seconds and its session becomes recoverable. The starter sets no expiry anywhere: a crashed driver leaves a session nobody can take over and a key that never goes away.',
       match: {
         python: {all: [/LEASE_TTL_S = 45/, /EXPIRE/, /eval\(/]},
         typescript: {all: [/LEASE_TTL_S = 45/, /expire\(/, /eval\(/]},
@@ -81,7 +81,7 @@ at one session both advance it.`,
       id: 'lease-guard',
       title: 'Refuses a second worker on a leased session',
       detail:
-        'The script reads `lease_owner` and returns 0 when another worker holds the lease, and the caller answers **409** instead of advancing the session. The draft has no lease at all, so two workers pointed at one session both charge its budget and both drive the browser.',
+        'The script reads `lease_owner` and returns 0 when another worker holds the lease, and the caller answers **409** instead of advancing the session. The starter has no lease at all, so two workers pointed at one session both charge its budget and both drive the browser.',
       match: {
         python: {all: [/lease_owner/, /409/]},
         typescript: {all: [/lease_owner/, /409/]},
@@ -94,7 +94,7 @@ at one session both advance it.`,
       id: 'budget-in-state',
       title: 'Keeps the budget in the hash so a restart resumes it',
       detail:
-        'The remaining budget is a field of `session:{id}` — charged with `HINCRBY` and read back with `HGETALL` — so a restarted driver resumes the same budget instead of minting a new one. The draft decrements a Python/JS object, so the budget dies with the process and the session "starts over" after a restart.',
+        'The remaining budget is a field of `session:{id}` — charged with `HINCRBY` and read back with `HGETALL` — so a restarted driver resumes the same budget instead of minting a new one. The starter decrements a Python/JS object, so the budget dies with the process and the session "starts over" after a restart.',
       match: {
         python: {all: [/budget_remaining/, /hincrby\(/, /hgetall\(|hget\(/]},
         typescript: {all: [/budget_remaining/, /hincrby\(/, /hgetall\(|hget\(/]},
@@ -107,7 +107,7 @@ at one session both advance it.`,
       id: 'reference-not-content',
       title: 'Stores a page reference, never the page content',
       detail:
-        'The document carries `page_ref` — a handle the driver resolves — and no page markup: the session key must not become a copy of every page the agent visited. The draft writes the page’s HTML into the session document "so the next action can read it", which is how a state key turns into a second copy of the customer’s browsing.',
+        'The document carries `page_ref` — a handle the driver resolves — and no page markup: the session key must not become a copy of every page the agent visited. The starter writes the page’s HTML into the session document "so the next action can read it", which is how a state key turns into a second copy of the customer’s browsing.',
       match: {
         python: {all: [/page_ref/], none: [/html/i]},
         typescript: {all: [/page_ref/], none: [/html/i]},
@@ -134,9 +134,9 @@ SESSIONS = {}
 
 @app.post("/v1/browser/sessions/{session_id}/steps")
 def advance(session_id: str, worker: str = Header(alias="X-Worker-Id")) -> JSONResponse:
-    # TODO: the draft keeps every session in this process's SESSIONS dict, so a driver restart loses
+    # TODO: the starter keeps every session in this process's SESSIONS dict, so a driver restart loses
     # the budget and the step index; it stores the page's html in the session "so the next action can
-    # read it"; and it never expires anything. Review all three.
+    # read it"; and it never expires anything. Fix all three.
     session = SESSIONS.setdefault(
         session_id, {"step_index": 0, "budget_remaining": 20, "page": {"html": "<html>…"}}
     )
@@ -230,9 +230,9 @@ export const app = Fastify();
 const SESSIONS: Record<string, {step_index: number; budget_remaining: number; page: {html: string}}> = {};
 
 app.post('/v1/browser/sessions/:sessionId/steps', async (request, reply) => {
-  // TODO: the draft keeps every session in this process's SESSIONS map, so a driver restart loses the
+  // TODO: the starter keeps every session in this process's SESSIONS map, so a driver restart loses the
   // budget and the step index; it stores the page's html in the session "so the next action can read
-  // it"; and it never expires anything. Review all three.
+  // it"; and it never expires anything. Fix all three.
   const {sessionId} = request.params as {sessionId: string};
   const worker = request.headers['x-worker-id'] as string;
   const session = (SESSIONS[sessionId] ??= {step_index: 0, budget_remaining: 20, page: {html: '<html>…'}});
@@ -325,9 +325,9 @@ import (
 var SESSIONS = map[string]map[string]any{}
 
 func advance(w http.ResponseWriter, r *http.Request) {
-	// TODO: the draft keeps every session in this process's SESSIONS map, so a driver restart loses
+	// TODO: the starter keeps every session in this process's SESSIONS map, so a driver restart loses
 	// the budget and the step index; it stores the page's html in the session "so the next action can
-	// read it"; and it never expires anything. Review all three.
+	// read it"; and it never expires anything. Fix all three.
 	sessionID := r.PathValue("session_id")
 	session, ok := SESSIONS[sessionID]
 	if !ok {
@@ -482,9 +482,9 @@ object SessionState {
   val route: Route =
     path("v1" / "browser" / "sessions" / Segment / "steps") { sessionId =>
       post {
-        // TODO: the draft keeps every session in this process's SESSIONS map, so a driver restart
+        // TODO: the starter keeps every session in this process's SESSIONS map, so a driver restart
         // loses the budget and the step index; it stores the page's html in the session "so the next
-        // action can read it"; and it never expires anything. Review all three.
+        // action can read it"; and it never expires anything. Fix all three.
         val session = SESSIONS.getOrElseUpdate(sessionId, Map("step_index" -> 0, "budget_remaining" -> 20, "html" -> "<html>…"))
         complete(StatusCodes.Accepted, jsonEntity(s"""{"session_id":"$sessionId","step_index":1}"""))
       }
@@ -602,9 +602,9 @@ int main() {
   httplib::Server svr;
 
   svr.Post(R"(/v1/browser/sessions/([^/]+)/steps)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: the draft keeps every session in this process's SESSIONS map, so a driver restart loses
+    // TODO: the starter keeps every session in this process's SESSIONS map, so a driver restart loses
     // the budget and the step index; it stores the page's html in the session "so the next action can
-    // read it"; and it never expires anything. Review all three.
+    // read it"; and it never expires anything. Fix all three.
     const auto sessionId = req.matches[1].str();
     auto& session = SESSIONS[sessionId];
     if (session.is_null())
@@ -700,5 +700,5 @@ int main() {
     'The lease is the whole point: 45 seconds (`LEASE_TTL_S = 45`), refreshed on every accepted action, taken and checked in one atomic script so two workers cannot both advance the session. Read the owner field, refuse a second worker with **409**, and let the TTL do the recovery — an expired lease means the next worker may take the session, which is how a crashed driver stops being a stuck session. Refresh the key’s own expiry too, so an abandoned session is reaped rather than kept forever.',
     'The document holds a **reference**, never the page. `page_ref` is a handle the driver resolves; page markup in the state key turns a cache into a second copy of everything the agent browsed. Charge the budget once per accepted action and record `budget_exhausted` when it hits zero, so the read path and the loop agree on what remains.',
   ],
-  debrief: `The interviewer is testing whether you can review a state layer as a *recovery* mechanism rather than a cache. The draft reads fine because one process runs one session and nothing crashes in a demo. Three defects are being checked. First, ownership: session state in the driver process means a restart silently resets the budget, so the platform's cost model is wrong exactly when it matters — a hash per session makes the process replaceable. Second, the lease: without one, a second worker (or a retried action) advances the same session twice, and a crashed driver leaves the session locked forever; a 45-second lease refreshed on progress gives you mutual exclusion and reaping in the same primitive. Third, the payload: storing page markup in the session key is how a convenience cache becomes a copy of the customer's browsing, and the state key is the wrong place for anything the driver can re-fetch from a reference. Real platforms add per-session Redis keyspaces, a fencing token in the lease so a stale worker cannot write, and an explicit \`reap\` sweeper that closes browser processes whose lease expired.`,
+  debrief: `The interviewer is testing whether you can debug a state layer as a *recovery* mechanism rather than a cache. The starter reads fine because one process runs one session and nothing crashes in a demo. Three defects are being checked. First, ownership: session state in the driver process means a restart silently resets the budget, so the platform's cost model is wrong exactly when it matters — a hash per session makes the process replaceable. Second, the lease: without one, a second worker (or a retried action) advances the same session twice, and a crashed driver leaves the session locked forever; a 45-second lease refreshed on progress gives you mutual exclusion and reaping in the same primitive. Third, the payload: storing page markup in the session key is how a convenience cache becomes a copy of the customer's browsing, and the state key is the wrong place for anything the driver can re-fetch from a reference. Real platforms add per-session Redis keyspaces, a fencing token in the lease so a stale worker cannot write, and an explicit \`reap\` sweeper that closes browser processes whose lease expired.`,
 };
