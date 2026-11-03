@@ -1,11 +1,18 @@
 import '@/styles/globals.scss';
 
 import type {AppProps} from 'next/app';
-import {JetBrains_Mono, Sora} from 'next/font/google';
+import localFont from 'next/font/local';
 import {type FC, memo} from 'react';
 
-const sora = Sora({subsets: ['latin'], weight: ['400', '500', '600', '700', '800']});
-const mono = JetBrains_Mono({subsets: ['latin'], variable: '--font-code', weight: ['400', '600']});
+// Sora and JetBrains Mono (SIL OFL 1.1, licences beside the files): the latin subset of the variable
+// fonts Google Fonts serves, self-hosted so that building the site never depends on fetching them.
+const sora = localFont({src: '../fonts/Sora-latin.woff2', weight: '400 800', display: 'swap'});
+const mono = localFont({
+  src: '../fonts/JetBrainsMono-latin.woff2',
+  weight: '400 600',
+  variable: '--font-code',
+  display: 'swap',
+});
 
 const App: FC<AppProps> = memo(({Component, pageProps}) => (
   <div className={`${sora.className} ${mono.variable}`}>
